@@ -1,0 +1,26 @@
+[project]
+name = "mlx-ollama"
+version = "0.1.0"
+description = "Ollama API-compatible server using Apple MLX for inference"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "mlx-lm>=0.20",
+    "huggingface-hub>=0.20",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "mlx-vlm>=0.3.12",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+]
+
+[project.scripts]
+mlx-ollama = "mlx_ollama.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
