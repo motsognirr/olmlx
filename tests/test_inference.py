@@ -9,8 +9,10 @@ from mlx_ollama.engine.inference import (
     _build_generate_kwargs,
     _extract_images,
     _inference_lock,
+    _inference_locked,
     _inject_tools_into_system,
     _apply_chat_template_text,
+    _safe_sync,
     generate_chat,
     generate_completion,
     generate_embeddings,
@@ -573,3 +575,46 @@ class TestGenerateEmbeddingsAcquiresLock:
         order.append("embeddings_done")
         assert order == ["lock_released", "embeddings_done"]
         assert len(result) == 1
+
+
+class TestSafeSync:
+    def test_success(self):
+        """_safe_sync() should not raise when mx.synchronize() succeeds."""
+        with patch("mlx_ollama.engine.inference.mx") as mock_mx:
+            _safe_sync()
+            mock_mx.synchronize.assert_called_once()
+
+    def test_suppresses_exception(self):
+        """_safe_sync() should suppress exceptions from mx.synchronize()."""
+        with patch("mlx_ollama.engine.inference.mx") as mock_mx:
+            mock_mx.synchronize.side_effect = RuntimeError("Metal error")
+            _safe_sync()  # should not raise
+
+
+class TestInferenceLocked:
+    @pytest.mark.asyncio
+    async def test_acquires_and_releases_lock(self):
+        """_inference_locked() should acquire lock on entry and release on exit."""
+        with patch("mlx_ollama.engine.inference.mx"):
+            assert not _inference_lock.locked()
+            async with _inference_locked():
+                assert _inference_lock.locked()
+            assert not _inference_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_releases_lock_on_exception(self):
+        """_inference_locked() should release lock even if body raises."""
+        with patch("mlx_ollama.engine.inference.mx"):
+            with pytest.raises(ValueError):
+                async with _inference_locked():
+                    raise ValueError("test error")
+            assert not _inference_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_syncs_on_entry_and_exit(self):
+        """_inference_locked() should call mx.synchronize on entry and exit."""
+        with patch("mlx_ollama.engine.inference.mx") as mock_mx:
+            async with _inference_locked():
+                pass
+            # Called at least twice: entry sync + exit sync
+            assert mock_mx.synchronize.call_count >= 2

@@ -20,6 +20,26 @@ logger = logging.getLogger(__name__)
 _inference_lock = asyncio.Lock()
 
 
+def _safe_sync():
+    """Synchronize Metal GPU state, suppressing and logging any errors."""
+    try:
+        mx.synchronize()
+    except Exception:
+        logger.debug("mx.synchronize() failed", exc_info=True)
+
+
+@contextlib.asynccontextmanager
+async def _inference_locked():
+    """Async context manager that acquires the inference lock with Metal sync on entry/exit."""
+    await _inference_lock.acquire()
+    _safe_sync()
+    try:
+        yield
+    finally:
+        _safe_sync()
+        _inference_lock.release()
+
+
 @contextlib.contextmanager
 def _inference_ref(lm: LoadedModel):
     """Track active inference on a model to prevent expiry during use."""
@@ -194,10 +214,7 @@ async def _stream_completion(
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
     await _inference_lock.acquire()
-    try:
-        mx.synchronize()  # Ensure clean Metal state before starting
-    except Exception:
-        pass
+    _safe_sync()
     stream = async_mlx_stream(
         lm.model, lm.tokenizer, prompt,
         max_tokens=max_tokens,
@@ -236,11 +253,7 @@ async def _stream_completion(
             if stream._thread is not None and stream._thread.is_alive():
                 stream._thread.join(timeout=30)
         finally:
-            # Always sync ALL Metal streams before releasing lock
-            try:
-                mx.synchronize()
-            except Exception:
-                pass
+            _safe_sync()
             _inference_lock.release()
 
 
@@ -252,22 +265,11 @@ async def _full_completion(
     stats: TimingStats,
     images: list[str] | None = None,
 ) -> dict:
-    await _inference_lock.acquire()
-    try:
-        mx.synchronize()  # Ensure clean Metal state
-    except Exception:
-        pass
-    try:
+    async with _inference_locked():
         with _inference_ref(lm):
             return await _full_completion_inner(
                 lm, prompt, max_tokens, gen_kwargs, stats, images,
             )
-    finally:
-        try:
-            mx.synchronize()
-        except Exception:
-            pass
-        _inference_lock.release()
 
 
 async def _full_completion_inner(
@@ -377,12 +379,7 @@ async def generate_embeddings(
     """Generate embeddings using the model's hidden states or embed_tokens layer."""
     lm = await manager.ensure_loaded(model_name, keep_alive)
 
-    await _inference_lock.acquire()
-    try:
-        mx.synchronize()  # Ensure clean Metal state
-    except Exception:
-        pass
-    try:
+    async with _inference_locked():
         embeddings = []
 
         tokenizer = lm.tokenizer
@@ -427,9 +424,3 @@ async def generate_embeddings(
 
         mx.synchronize()
         return embeddings
-    finally:
-        try:
-            mx.synchronize()
-        except Exception:
-            pass
-        _inference_lock.release()
