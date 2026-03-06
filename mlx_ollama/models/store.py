@@ -21,6 +21,7 @@ def _extract_metadata(model_dir: Path) -> dict:
     """Extract model metadata from config.json if available."""
     config_path = model_dir / "config.json"
     meta = {"family": "", "parameter_size": "", "quantization_level": ""}
+    cfg = None
     if config_path.exists():
         try:
             with open(config_path) as f:
@@ -37,7 +38,7 @@ def _extract_metadata(model_dir: Path) -> dict:
                     meta["parameter_size"] = f"{params / 1e6:.0f}M"
         except Exception:
             pass
-    # Check for quantization
+    # Check for quantization — GPTQ models use a separate file
     quant_config = model_dir / "quantize_config.json"
     if quant_config.exists():
         try:
@@ -48,19 +49,12 @@ def _extract_metadata(model_dir: Path) -> dict:
                 meta["quantization_level"] = f'{meta["quantization_level"]}-bit'
         except Exception:
             pass
-    # Also check mlx config for quantization info
-    weights_config = model_dir / "config.json"
-    if weights_config.exists():
-        try:
-            with open(weights_config) as f:
-                cfg = json.load(f)
-            if "quantization" in cfg:
-                q = cfg["quantization"]
-                bits = q.get("bits", "")
-                if bits:
-                    meta["quantization_level"] = f"{bits}-bit"
-        except Exception:
-            pass
+    # Also check config.json for MLX quantization info (reuse already-loaded cfg)
+    if cfg and "quantization" in cfg:
+        q = cfg["quantization"]
+        bits = q.get("bits", "")
+        if bits:
+            meta["quantization_level"] = f"{bits}-bit"
     return meta
 
 
