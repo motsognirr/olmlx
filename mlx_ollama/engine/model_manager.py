@@ -22,7 +22,13 @@ logger = logging.getLogger(__name__)
 # compatible with mlx-lm and should be retried with mlx-vlm.  Errors like
 # ImportError, MemoryError, and RuntimeError indicate real problems that
 # should propagate immediately.
-_FALLBACK_EXCEPTIONS = (ValueError, KeyError, FileNotFoundError, OSError, json.JSONDecodeError)
+_FALLBACK_EXCEPTIONS = (
+    ValueError,
+    KeyError,
+    FileNotFoundError,
+    OSError,
+    json.JSONDecodeError,
+)
 
 
 @dataclass
@@ -126,14 +132,20 @@ class ModelManager:
                 self.registry.add_mapping(name, hf_path)
 
             logger.info("Loading model %s from %s", normalized, hf_path)
-            model, tokenizer, is_vlm, caps = await asyncio.to_thread(self._load_model, hf_path)
+            model, tokenizer, is_vlm, caps = await asyncio.to_thread(
+                self._load_model, hf_path
+            )
 
             ka = self._resolve_keep_alive(keep_alive)
             expires = time.time() + ka if ka is not None else None
 
-            logger.info("Model %s caps: tools=%s, thinking=%s, thinking_tags=%s",
-                        normalized, caps.supports_tools, caps.supports_enable_thinking,
-                        caps.has_thinking_tags)
+            logger.info(
+                "Model %s caps: tools=%s, thinking=%s, thinking_tags=%s",
+                normalized,
+                caps.supports_tools,
+                caps.supports_enable_thinking,
+                caps.has_thinking_tags,
+            )
 
             lm = LoadedModel(
                 name=normalized,
@@ -155,11 +167,19 @@ class ModelManager:
         self._loaded.pop(normalized, None)
 
     # Config keys that indicate a vision-language model
-    _VLM_CONFIG_KEYS = frozenset({
-        "vision_config", "visual", "vision_tower", "vision_model",
-        "image_token_id", "vision_feature_layer", "mm_vision_tower",
-        "visual_config", "vit_config",
-    })
+    _VLM_CONFIG_KEYS = frozenset(
+        {
+            "vision_config",
+            "visual",
+            "vision_tower",
+            "vision_model",
+            "image_token_id",
+            "vision_feature_layer",
+            "mm_vision_tower",
+            "visual_config",
+            "vit_config",
+        }
+    )
 
     def _detect_model_kind(self, hf_path: str) -> str:
         """Return 'text', 'vlm', or 'unknown' by checking config.json against installed libraries."""
@@ -177,6 +197,7 @@ class ModelManager:
         if config is None:
             try:
                 from huggingface_hub import hf_hub_download
+
                 config_path = hf_hub_download(hf_path, "config.json")
                 with open(config_path) as f:
                     config = json.load(f)
@@ -194,6 +215,7 @@ class ModelManager:
             # Verify mlx-vlm can handle it
             try:
                 from mlx_vlm.utils import MODEL_REMAPPING as VLM_REMAP
+
                 mapped = VLM_REMAP.get(model_type, model_type)
                 spec = importlib.util.find_spec(f"mlx_vlm.models.{mapped}")
                 if spec is not None:
@@ -201,12 +223,16 @@ class ModelManager:
             except (ImportError, ModuleNotFoundError):
                 pass
             # Has vision keys but mlx-vlm doesn't recognize it — still try as VLM
-            logger.info("Config has vision keys but model_type '%s' not in mlx-vlm, will try anyway", model_type)
+            logger.info(
+                "Config has vision keys but model_type '%s' not in mlx-vlm, will try anyway",
+                model_type,
+            )
             return "vlm"
 
         # No vision keys — check mlx-lm
         try:
             from mlx_lm.utils import MODEL_REMAPPING as LM_REMAP
+
             mapped = LM_REMAP.get(model_type, model_type)
             spec = importlib.util.find_spec(f"mlx_lm.models.{mapped}")
             if spec is not None:
@@ -217,6 +243,7 @@ class ModelManager:
         # Fallback: check mlx-vlm even without vision keys
         try:
             from mlx_vlm.utils import MODEL_REMAPPING as VLM_REMAP
+
             mapped = VLM_REMAP.get(model_type, model_type)
             spec = importlib.util.find_spec(f"mlx_vlm.models.{mapped}")
             if spec is not None:
@@ -226,16 +253,20 @@ class ModelManager:
 
         return "unknown"
 
-    def _try_lm_then_vlm(self, load_path: str, label: str) -> tuple[Any, Any, bool, TemplateCaps]:
+    def _try_lm_then_vlm(
+        self, load_path: str, label: str
+    ) -> tuple[Any, Any, bool, TemplateCaps]:
         """Try loading with mlx-lm first, fall back to mlx-vlm on failure."""
         try:
             import mlx_lm
+
             model, tokenizer = mlx_lm.load(load_path)
             caps = detect_caps(tokenizer)
             return model, tokenizer, False, caps
         except _FALLBACK_EXCEPTIONS as exc:
             logger.warning("mlx-lm failed for %s (%s), trying mlx-vlm", label, exc)
             import mlx_vlm
+
             model, processor = mlx_vlm.load(load_path)
             tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
             caps = detect_caps(tok)
@@ -249,6 +280,7 @@ class ModelManager:
             local_dir = self.store.local_path(hf_path)
             if not self.store.is_downloaded(hf_path):
                 from huggingface_hub import snapshot_download
+
                 logger.info("Downloading %s to %s", hf_path, local_dir)
                 local_dir.mkdir(parents=True, exist_ok=True)
                 snapshot_download(repo_id=hf_path, local_dir=str(local_dir))
@@ -260,6 +292,7 @@ class ModelManager:
         if kind == "vlm":
             # VLM detected — load with mlx-vlm directly
             import mlx_vlm
+
             model, processor = mlx_vlm.load(load_path)
             tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
             caps = detect_caps(tok)

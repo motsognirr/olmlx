@@ -94,13 +94,18 @@ class TestConvertMessages:
         req = AnthropicMessagesRequest(
             model="test",
             messages=[
-                AnthropicMessage(role="assistant", content=[
-                    AnthropicContentBlock(type="text", text="Let me search"),
-                    AnthropicContentBlock(
-                        type="tool_use", id="toolu_123",
-                        name="search", input={"q": "test"},
-                    ),
-                ]),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        AnthropicContentBlock(type="text", text="Let me search"),
+                        AnthropicContentBlock(
+                            type="tool_use",
+                            id="toolu_123",
+                            name="search",
+                            input={"q": "test"},
+                        ),
+                    ],
+                ),
             ],
         )
         messages = _convert_messages(req)
@@ -114,13 +119,17 @@ class TestConvertMessages:
         req = AnthropicMessagesRequest(
             model="test",
             messages=[
-                AnthropicMessage(role="user", content=[
-                    AnthropicContentBlock(
-                        type="tool_result", tool_use_id="toolu_123",
-                        content="Result data",
-                    ),
-                    AnthropicContentBlock(type="text", text="What does this mean?"),
-                ]),
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        AnthropicContentBlock(
+                            type="tool_result",
+                            tool_use_id="toolu_123",
+                            content="Result data",
+                        ),
+                        AnthropicContentBlock(type="text", text="What does this mean?"),
+                    ],
+                ),
             ],
         )
         messages = _convert_messages(req)
@@ -135,12 +144,19 @@ class TestConvertMessages:
         req = AnthropicMessagesRequest(
             model="test",
             messages=[
-                AnthropicMessage(role="user", content=[
-                    AnthropicContentBlock(
-                        type="tool_result", tool_use_id="toolu_456",
-                        content=[{"type": "text", "text": "result1"}, {"type": "text", "text": "result2"}],
-                    ),
-                ]),
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        AnthropicContentBlock(
+                            type="tool_result",
+                            tool_use_id="toolu_456",
+                            content=[
+                                {"type": "text", "text": "result1"},
+                                {"type": "text", "text": "result2"},
+                            ],
+                        ),
+                    ],
+                ),
             ],
         )
         messages = _convert_messages(req)
@@ -152,10 +168,13 @@ class TestConvertMessages:
         req = AnthropicMessagesRequest(
             model="test",
             messages=[
-                AnthropicMessage(role="assistant", content=[
-                    AnthropicContentBlock(type="thinking", text="Deep thoughts"),
-                    AnthropicContentBlock(type="text", text="The answer"),
-                ]),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        AnthropicContentBlock(type="thinking", text="Deep thoughts"),
+                        AnthropicContentBlock(type="text", text="The answer"),
+                    ],
+                ),
             ],
         )
         messages = _convert_messages(req)
@@ -202,6 +221,7 @@ class TestWithKeepalivePings:
     @pytest.mark.asyncio
     async def test_pings_during_delay(self):
         """Slow async gen should produce ping sentinels while waiting."""
+
         async def slow_gen():
             await asyncio.sleep(12)
             yield {"text": "hello", "done": False}
@@ -215,11 +235,14 @@ class TestWithKeepalivePings:
                     break
 
         pings = [r for r in results if r is _PING_SENTINEL]
-        assert len(pings) >= 2, f"Expected at least 2 pings during 12s delay, got {len(pings)}"
+        assert len(pings) >= 2, (
+            f"Expected at least 2 pings during 12s delay, got {len(pings)}"
+        )
 
     @pytest.mark.asyncio
     async def test_no_pings_when_fast(self):
         """Immediate yields should produce no ping sentinels."""
+
         async def fast_gen():
             yield {"text": "a", "done": False}
             yield {"text": "b", "done": False}
@@ -235,6 +258,7 @@ class TestWithKeepalivePings:
     @pytest.mark.asyncio
     async def test_cleanup_on_early_exit(self):
         """Verify task cancellation when breaking out early."""
+
         async def infinite_gen():
             while True:
                 await asyncio.sleep(10)
@@ -258,13 +282,18 @@ class TestAnthropicEndpoint:
         stats = TimingStats(prompt_eval_count=10, eval_count=20)
         mock_result = {"text": "Hello from MLX!", "done": True, "stats": stats}
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 100,
-            })
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -281,16 +310,22 @@ class TestAnthropicEndpoint:
         stats = TimingStats()
         mock_result = {
             "text": "<think>reasoning</think>The answer is 42.",
-            "done": True, "stats": stats,
+            "done": True,
+            "stats": stats,
         }
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "think"}],
-                "max_tokens": 100,
-            })
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "think"}],
+                    "max_tokens": 100,
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -303,21 +338,32 @@ class TestAnthropicEndpoint:
         stats = TimingStats()
         mock_result = {
             "text": '<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>',
-            "done": True, "stats": stats,
+            "done": True,
+            "stats": stats,
         }
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "search for test"}],
-                "max_tokens": 100,
-                "tools": [{
-                    "name": "search",
-                    "description": "Search",
-                    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
-                }],
-            })
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "search for test"}],
+                    "max_tokens": 100,
+                    "tools": [
+                        {
+                            "name": "search",
+                            "description": "Search",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"q": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -331,13 +377,18 @@ class TestAnthropicEndpoint:
         stats = TimingStats()
         mock_result = {"text": "", "done": True, "stats": stats}
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 100,
-            })
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -352,15 +403,21 @@ class TestAnthropicEndpoint:
                 yield {"text": "Hello", "done": False}
                 yield {"text": " world", "done": False}
                 yield {"text": "", "done": True, "stats": TimingStats(eval_count=5)}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 100,
-                "stream": True,
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers["content-type"]
@@ -383,15 +440,21 @@ class TestAnthropicEndpoint:
                 yield {"text": "</think>", "done": False}
                 yield {"text": "answer", "done": False}
                 yield {"text": "", "done": True, "stats": TimingStats()}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "think"}],
-                "max_tokens": 100,
-                "stream": True,
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "think"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         text = resp.text
@@ -402,22 +465,36 @@ class TestAnthropicEndpoint:
     async def test_streaming_with_tools_buffered(self, app_client):
         async def mock_stream(*args, **kwargs):
             async def gen():
-                yield {"text": '<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>', "done": False}
+                yield {
+                    "text": '<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>',
+                    "done": False,
+                }
                 yield {"text": "", "done": True, "stats": TimingStats(eval_count=10)}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "search"}],
-                "max_tokens": 100,
-                "stream": True,
-                "tools": [{
-                    "name": "search",
-                    "description": "Search",
-                    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
-                }],
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "search"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                    "tools": [
+                        {
+                            "name": "search",
+                            "description": "Search",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"q": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
 
         assert resp.status_code == 200
         text = resp.text
@@ -430,15 +507,21 @@ class TestAnthropicEndpoint:
         async def mock_stream(*args, **kwargs):
             async def gen():
                 yield {"text": "", "done": True, "stats": TimingStats()}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 100,
-                "stream": True,
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         text = resp.text
@@ -449,19 +532,26 @@ class TestAnthropicEndpoint:
     @pytest.mark.asyncio
     async def test_streaming_thinking_ends_midstream(self, app_client):
         """Test state machine when model ends while in thinking state."""
+
         async def mock_stream(*args, **kwargs):
             async def gen():
                 yield {"text": "<think>incomplete thinking", "done": False}
                 yield {"text": "", "done": True, "stats": TimingStats()}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 100,
-                "stream": True,
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         text = resp.text
@@ -471,18 +561,25 @@ class TestAnthropicEndpoint:
     @pytest.mark.asyncio
     async def test_streaming_no_output_at_all(self, app_client):
         """Test state machine when model produces no output (stays in init)."""
+
         async def mock_stream(*args, **kwargs):
             async def gen():
                 yield {"text": "", "done": True, "stats": TimingStats()}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 100,
-                "stream": True,
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         text = resp.text
@@ -494,20 +591,27 @@ class TestAnthropicEndpoint:
     @pytest.mark.asyncio
     async def test_streaming_text_only_with_text_started(self, app_client):
         """Test that text block is properly closed."""
+
         async def mock_stream(*args, **kwargs):
             async def gen():
                 yield {"text": "Hello", "done": False}
                 yield {"text": " world!", "done": False}
                 yield {"text": "", "done": True, "stats": TimingStats(eval_count=3)}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 100,
-                "stream": True,
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         text = resp.text
@@ -518,25 +622,40 @@ class TestAnthropicEndpoint:
     @pytest.mark.asyncio
     async def test_streaming_tools_with_thinking(self, app_client):
         """Test buffered tool mode with thinking blocks."""
+
         async def mock_stream(*args, **kwargs):
             async def gen():
                 yield {"text": "<think>reasoning</think>", "done": False}
-                yield {"text": '<tool_call>{"name": "search", "arguments": {"q": "t"}}</tool_call>', "done": False}
+                yield {
+                    "text": '<tool_call>{"name": "search", "arguments": {"q": "t"}}</tool_call>',
+                    "done": False,
+                }
                 yield {"text": "", "done": True, "stats": TimingStats(eval_count=10)}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "search"}],
-                "max_tokens": 100,
-                "stream": True,
-                "tools": [{
-                    "name": "search",
-                    "description": "Search",
-                    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
-                }],
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "search"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                    "tools": [
+                        {
+                            "name": "search",
+                            "description": "Search",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"q": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
 
         assert resp.status_code == 200
         text = resp.text
@@ -546,20 +665,27 @@ class TestAnthropicEndpoint:
     @pytest.mark.asyncio
     async def test_streaming_partial_think_tag(self, app_client):
         """Test state machine when <think> tag arrives across multiple tokens."""
+
         async def mock_stream(*args, **kwargs):
             async def gen():
                 yield {"text": "<thi", "done": False}
                 yield {"text": "nk>deep thought</think>answer", "done": False}
                 yield {"text": "", "done": True, "stats": TimingStats()}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 100,
-                "stream": True,
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         text = resp.text
@@ -575,22 +701,36 @@ class TestAnthropicEndpoint:
             async def gen():
                 # Simulate slow generation — but pings are time-based, hard to test.
                 yield {"text": "some text", "done": False}
-                yield {"text": '<tool_call>{"name": "search", "arguments": {"q": "t"}}</tool_call>', "done": False}
+                yield {
+                    "text": '<tool_call>{"name": "search", "arguments": {"q": "t"}}</tool_call>',
+                    "done": False,
+                }
                 yield {"text": "", "done": True, "stats": TimingStats(eval_count=5)}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "search"}],
-                "max_tokens": 100,
-                "stream": True,
-                "tools": [{
-                    "name": "search",
-                    "description": "Search",
-                    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
-                }],
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "search"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                    "tools": [
+                        {
+                            "name": "search",
+                            "description": "Search",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"q": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
 
         assert resp.status_code == 200
         text = resp.text
@@ -599,24 +739,36 @@ class TestAnthropicEndpoint:
     @pytest.mark.asyncio
     async def test_streaming_tools_text_only_no_tool_calls(self, app_client):
         """Test buffered mode when tools are available but model doesn't call any."""
+
         async def mock_stream(*args, **kwargs):
             async def gen():
                 yield {"text": "I'll just respond normally.", "done": False}
                 yield {"text": "", "done": True, "stats": TimingStats(eval_count=5)}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hello"}],
-                "max_tokens": 100,
-                "stream": True,
-                "tools": [{
-                    "name": "search",
-                    "description": "Search",
-                    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
-                }],
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                    "tools": [
+                        {
+                            "name": "search",
+                            "description": "Search",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"q": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
 
         assert resp.status_code == 200
         text = resp.text
@@ -627,19 +779,29 @@ class TestAnthropicEndpoint:
     async def test_streaming_long_thinking_chunked(self, app_client):
         """Test that long thinking blocks are emitted in chunks."""
         long_thought = "A" * 500
+
         async def mock_stream(*args, **kwargs):
             async def gen():
-                yield {"text": f"<think>{long_thought}</think>short answer", "done": False}
+                yield {
+                    "text": f"<think>{long_thought}</think>short answer",
+                    "done": False,
+                }
                 yield {"text": "", "done": True, "stats": TimingStats()}
+
             return gen()
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 100,
-                "stream": True,
-            })
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         text = resp.text
@@ -651,14 +813,19 @@ class TestAnthropicEndpoint:
         stats = TimingStats()
         mock_result = {"text": "I am helpful", "done": True, "stats": stats}
 
-        with patch("mlx_ollama.routers.anthropic.generate_chat", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/v1/messages", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "who are you?"}],
-                "system": "You are a helpful assistant.",
-                "max_tokens": 100,
-            })
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "who are you?"}],
+                    "system": "You are a helpful assistant.",
+                    "max_tokens": 100,
+                },
+            )
 
         assert resp.status_code == 200
         # Verify system message was passed

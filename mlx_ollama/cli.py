@@ -115,7 +115,8 @@ def cmd_service_status(_args):
     """Show the status of the launchd service."""
     result = subprocess.run(
         ["launchctl", "list", PLIST_LABEL],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if result.returncode == 0:
         print(f"Service {PLIST_LABEL} is loaded")

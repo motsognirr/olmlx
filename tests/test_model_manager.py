@@ -106,7 +106,9 @@ class TestModelManager:
 
     @pytest.mark.asyncio
     async def test_ensure_loaded_evicts_lru(self, registry, mock_store, monkeypatch):
-        monkeypatch.setattr("mlx_ollama.engine.model_manager.settings.max_loaded_models", 1)
+        monkeypatch.setattr(
+            "mlx_ollama.engine.model_manager.settings.max_loaded_models", 1
+        )
         manager = ModelManager(registry, mock_store)
 
         # Pre-load a model
@@ -124,7 +126,8 @@ class TestModelManager:
         mock_tokenizer = MagicMock()
         mock_tokenizer.chat_template = None
         with patch.object(
-            manager, "_load_model",
+            manager,
+            "_load_model",
             return_value=(mock_model, mock_tokenizer, False, TemplateCaps()),
         ):
             lm = await manager.ensure_loaded("qwen3")
@@ -167,9 +170,13 @@ class TestDetectModelKind:
         assert kind == "text"
 
     def test_vlm_with_vision_keys(self, tmp_path, registry, mock_store):
-        config_path = self._make_config(tmp_path, {
-            "model_type": "qwen2_vl", "vision_config": {"hidden_size": 1024},
-        })
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "qwen2_vl",
+                "vision_config": {"hidden_size": 1024},
+            },
+        )
         manager = self._make_manager(registry, mock_store)
 
         with patch("huggingface_hub.hf_hub_download", return_value=config_path):
@@ -178,7 +185,9 @@ class TestDetectModelKind:
 
     def test_config_download_fails(self, registry, mock_store):
         manager = self._make_manager(registry, mock_store)
-        with patch("huggingface_hub.hf_hub_download", side_effect=Exception("not found")):
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=Exception("not found")
+        ):
             kind = manager._detect_model_kind("nonexistent/model")
         assert kind == "unknown"
 
@@ -191,12 +200,17 @@ class TestDetectModelKind:
         assert kind == "unknown"
 
     def test_vlm_no_spec_found(self, tmp_path, registry, mock_store):
-        config_path = self._make_config(tmp_path, {
-            "model_type": "custom_vlm", "vision_config": {},
-        })
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "custom_vlm",
+                "vision_config": {},
+            },
+        )
         manager = self._make_manager(registry, mock_store)
 
         import importlib.util
+
         real_find_spec = importlib.util.find_spec
 
         def none_for_models(name, *args, **kwargs):
@@ -290,7 +304,9 @@ class TestLoadModel:
             mock_mlx_lm.load.side_effect = ValueError("unsupported")
             mock_mlx_vlm = MagicMock()
             mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
-            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}):
+            with patch.dict(
+                "sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}
+            ):
                 model, tokenizer, is_vlm, caps = manager._load_model("test/path")
 
         assert is_vlm is True
@@ -323,7 +339,9 @@ class TestLoadModel:
             mock_mlx_lm.load.side_effect = ValueError("fail")
             mock_mlx_vlm = MagicMock()
             mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
-            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}):
+            with patch.dict(
+                "sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}
+            ):
                 model, tokenizer, is_vlm, caps = manager._load_model("test/path")
 
         assert is_vlm is True
@@ -392,7 +410,9 @@ class TestTryLmThenVlmFallback:
         mock_mlx_vlm = MagicMock()
         mock_mlx_vlm.load.return_value = (MagicMock(), mock_processor)
 
-        with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}):
+        with patch.dict(
+            "sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}
+        ):
             _, _, is_vlm, _ = manager._try_lm_then_vlm("test/path", "test")
         assert is_vlm is True
 
@@ -407,7 +427,9 @@ class TestTryLmThenVlmFallback:
         mock_mlx_vlm = MagicMock()
         mock_mlx_vlm.load.return_value = (MagicMock(), mock_processor)
 
-        with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}):
+        with patch.dict(
+            "sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}
+        ):
             _, _, is_vlm, _ = manager._try_lm_then_vlm("test/path", "test")
         assert is_vlm is True
 
@@ -458,7 +480,8 @@ class TestExpiryChecker:
         # Run one cycle of expiry check manually
         now = time.time()
         expired = [
-            name for name, m in manager._loaded.items()
+            name
+            for name, m in manager._loaded.items()
             if m.expires_at is not None and m.expires_at <= now
         ]
         for name in expired:
@@ -480,7 +503,8 @@ class TestExpiryChecker:
 
         now = time.time()
         expired = [
-            name for name, m in manager._loaded.items()
+            name
+            for name, m in manager._loaded.items()
             if m.expires_at is not None and m.expires_at <= now
         ]
         for name in expired:
@@ -505,7 +529,8 @@ class TestExpiryChecker:
         # Simulate one cycle of _check_expiry_loop logic
         now = time.time()
         expired = [
-            name for name, m in manager._loaded.items()
+            name
+            for name, m in manager._loaded.items()
             if m.expires_at is not None and m.expires_at <= now and m.active_refs == 0
         ]
         for name in expired:
@@ -532,7 +557,8 @@ class TestExpiryChecker:
         held_ref = lm
         now = time.time()
         expired = [
-            name for name, m in manager._loaded.items()
+            name
+            for name, m in manager._loaded.items()
             if m.expires_at is not None and m.expires_at <= now and m.active_refs == 0
         ]
         for name in expired:

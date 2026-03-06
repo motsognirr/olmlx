@@ -33,7 +33,9 @@ _PARAM_TAG_RE = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
 _MISTRAL_TOOL_RE = re.compile(r"\[TOOL_CALLS\]\s*(\[.*?\])", re.DOTALL)
 
 # Llama 3.x: <|python_tag|> followed by JSON
-_LLAMA_TOOL_RE = re.compile(r"<\|python_tag\|>\s*(\{.*?\})\s*(?:<\|eom_id\|>|$)", re.DOTALL)
+_LLAMA_TOOL_RE = re.compile(
+    r"<\|python_tag\|>\s*(\{.*?\})\s*(?:<\|eom_id\|>|$)", re.DOTALL
+)
 
 # DeepSeek: <|tool_calls_begin|>...<|tool_calls_end|>
 _DEEPSEEK_TOOL_RE = re.compile(
@@ -93,12 +95,14 @@ def _try_qwen(text: str) -> tuple[list[dict], str]:
                 except (json.JSONDecodeError, ValueError):
                     pass
                 params[pm.group(1).strip()] = pval
-            tool_uses.append({
-                "type": "tool_use",
-                "id": _make_tool_use_id(),
-                "name": name,
-                "input": params,
-            })
+            tool_uses.append(
+                {
+                    "type": "tool_use",
+                    "id": _make_tool_use_id(),
+                    "name": name,
+                    "input": params,
+                }
+            )
         else:
             logger.warning("Failed to parse <tool_call> block: %r", inner[:500])
 
@@ -136,7 +140,9 @@ def _try_llama(text: str) -> tuple[list[dict], str]:
             if result:
                 tool_uses.append(result)
         except (json.JSONDecodeError, AttributeError):
-            logger.warning("Failed to parse <|python_tag|> block: %r", match.group(1)[:500])
+            logger.warning(
+                "Failed to parse <|python_tag|> block: %r", match.group(1)[:500]
+            )
     if tool_uses:
         text = _LLAMA_TOOL_RE.sub("", text)
     return tool_uses, text
@@ -156,12 +162,14 @@ def _try_deepseek(text: str) -> tuple[list[dict], str]:
             arguments = json.loads(args_str) if args_str else {}
         except json.JSONDecodeError:
             arguments = {}
-        tool_uses.append({
-            "type": "tool_use",
-            "id": _make_tool_use_id(),
-            "name": name,
-            "input": arguments,
-        })
+        tool_uses.append(
+            {
+                "type": "tool_use",
+                "id": _make_tool_use_id(),
+                "name": name,
+                "input": arguments,
+            }
+        )
     if tool_uses:
         text = _DEEPSEEK_TOOL_RE.sub("", text)
     return tool_uses, text
@@ -181,17 +189,17 @@ def _extract_json_object(text: str, start: int) -> str | None:
         ch = text[i]
         if escape:
             escape = False
-        elif ch == '\\' and in_string:
+        elif ch == "\\" and in_string:
             escape = True
         elif ch == '"' and not escape:
             in_string = not in_string
         elif not in_string:
-            if ch == '{':
+            if ch == "{":
                 depth += 1
-            elif ch == '}':
+            elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    return text[start:i + 1]
+                    return text[start : i + 1]
         i += 1
     return None
 
@@ -256,7 +264,8 @@ def parse_model_output(
                 if tu["name"] not in tool_names:
                     logger.warning(
                         "Parsed tool call '%s' not in provided tool set: %s",
-                        tu["name"], tool_names,
+                        tu["name"],
+                        tool_names,
                     )
 
     visible_text = text.strip()

@@ -3,6 +3,7 @@ from pydantic import BaseModel
 
 class ModelOptions(BaseModel, extra="allow"):
     """Ollama model options / parameters."""
+
     num_keep: int | None = None
     seed: int | None = None
     num_predict: int | None = None

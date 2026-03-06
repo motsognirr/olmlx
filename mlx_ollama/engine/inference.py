@@ -114,13 +114,16 @@ def _inject_tools_into_system(messages: list[dict], tools: list[dict]) -> list[d
         )
     tool_block = (
         "You have access to the following tools. To call a tool, output a JSON object "
-        "with \"name\" and \"arguments\" keys.\n\n"
+        'with "name" and "arguments" keys.\n\n'
         "Available tools:\n" + "\n".join(tool_desc_parts)
     )
 
     messages = list(messages)  # shallow copy
     if messages and messages[0].get("role") == "system":
-        messages[0] = {**messages[0], "content": messages[0]["content"] + "\n\n" + tool_block}
+        messages[0] = {
+            **messages[0],
+            "content": messages[0]["content"] + "\n\n" + tool_block,
+        }
     else:
         messages.insert(0, {"role": "system", "content": tool_block})
     return messages
@@ -147,7 +150,9 @@ def _apply_chat_template_text(
             kwargs["enable_thinking"] = False
     elif tools and not caps.supports_tools:
         # Template doesn't support tools natively — inject into system message
-        logger.info("Template lacks tool support, injecting tool descriptions into system message")
+        logger.info(
+            "Template lacks tool support, injecting tool descriptions into system message"
+        )
         messages = _inject_tools_into_system(messages, tools)
 
     try:
@@ -155,7 +160,10 @@ def _apply_chat_template_text(
     except Exception as exc:
         # If tools kwarg caused the error, retry without it (injecting instead)
         if tools and "tools" in kwargs:
-            logger.warning("apply_chat_template failed with tools kwarg (%s), retrying with injection", exc)
+            logger.warning(
+                "apply_chat_template failed with tools kwarg (%s), retrying with injection",
+                exc,
+            )
             del kwargs["tools"]
             kwargs.pop("enable_thinking", None)
             messages = _inject_tools_into_system(messages, tools)
@@ -234,7 +242,9 @@ async def _stream_completion(
     # Sync default stream before starting — same purpose as _inference_locked entry.
     _safe_sync()
     stream = async_mlx_stream(
-        lm.model, lm.tokenizer, prompt,
+        lm.model,
+        lm.tokenizer,
+        prompt,
         max_tokens=max_tokens,
         is_vlm=lm.is_vlm,
         images=images,
@@ -255,8 +265,10 @@ async def _stream_completion(
         stats.total_duration = total_timer.duration_ns
         logger.info(
             "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
-            stats.prompt_eval_count, prompt_tps,
-            stats.eval_count, gen_tps,
+            stats.prompt_eval_count,
+            prompt_tps,
+            stats.eval_count,
+            gen_tps,
             total_timer.duration_ns / 1e9,
         )
         yield {"text": "", "done": True, "stats": stats}
@@ -288,7 +300,12 @@ async def _full_completion(
     async with _inference_locked():
         with _inference_ref(lm):
             return await _full_completion_inner(
-                lm, prompt, max_tokens, gen_kwargs, stats, images,
+                lm,
+                prompt,
+                max_tokens,
+                gen_kwargs,
+                stats,
+                images,
             )
 
 
@@ -305,16 +322,25 @@ async def _full_completion_inner(
         before the thread returns to the pool."""
         if lm.is_vlm:
             import mlx_vlm
+
             result = mlx_vlm.generate(
-                lm.model, lm.tokenizer, prompt=prompt, image=images,
-                max_tokens=max_tokens, **gen_kwargs,
+                lm.model,
+                lm.tokenizer,
+                prompt=prompt,
+                image=images,
+                max_tokens=max_tokens,
+                **gen_kwargs,
             )
             from mlx_vlm.generate import generation_stream
         else:
             import mlx_lm
+
             result = mlx_lm.generate(
-                lm.model, lm.tokenizer, prompt=prompt,
-                max_tokens=max_tokens, **gen_kwargs,
+                lm.model,
+                lm.tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                **gen_kwargs,
             )
             from mlx_lm.generate import generation_stream
         # Sync the generation_stream specifically — mlx_lm/mlx_vlm run GPU
@@ -335,7 +361,10 @@ async def _full_completion_inner(
     total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
     logger.info(
         "Generation complete: %d prompt tokens, %d tokens generated (%.1f tok/s), %.2fs total",
-        stats.prompt_eval_count, stats.eval_count, gen_tps, total_secs,
+        stats.prompt_eval_count,
+        stats.eval_count,
+        gen_tps,
+        total_secs,
     )
 
     # mlx_vlm.generate returns GenerationResult dataclass
@@ -377,7 +406,9 @@ async def generate_chat(
         tokenizer = lm.tokenizer
         if lm.is_vlm and hasattr(tokenizer, "tokenizer"):
             tokenizer = tokenizer.tokenizer
-        prompt = _apply_chat_template_text(tokenizer, messages, tools, caps=lm.template_caps)
+        prompt = _apply_chat_template_text(
+            tokenizer, messages, tools, caps=lm.template_caps
+        )
         if tools:
             logger.info("Chat prompt with %d tools", len(tools))
         logger.debug("Prompt (first 1000 chars): %s", prompt[:1000])

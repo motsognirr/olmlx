@@ -10,7 +10,17 @@ from mlx_ollama.config import settings
 from mlx_ollama.engine.model_manager import ModelManager
 from mlx_ollama.engine.registry import ModelRegistry
 from mlx_ollama.models.store import ModelStore
-from mlx_ollama.routers import anthropic, blobs, chat, embed, generate, manage, models, openai, status
+from mlx_ollama.routers import (
+    anthropic,
+    blobs,
+    chat,
+    embed,
+    generate,
+    manage,
+    models,
+    openai,
+    status,
+)
 
 logger = logging.getLogger("mlx_ollama")
 
@@ -30,9 +40,7 @@ async def lifespan(app: FastAPI):
     app.state.model_manager = manager
     app.state.model_store = store
 
-    logger.info(
-        "MLX Ollama server started on %s:%d", settings.host, settings.port
-    )
+    logger.info("MLX Ollama server started on %s:%d", settings.host, settings.port)
     yield
 
     # Shutdown
@@ -59,8 +67,12 @@ class ForceJSONMiddleware(BaseHTTPMiddleware):
 
 
 def _make_error_response(
-    path: str, status_code: int, msg: str,
-    anthropic_type: str, openai_type: str, openai_code: str,
+    path: str,
+    status_code: int,
+    msg: str,
+    anthropic_type: str,
+    openai_type: str,
+    openai_code: str,
 ) -> JSONResponse:
     """Build a JSON error response in the appropriate format for the API surface."""
     if path.startswith("/v1/messages"):
@@ -81,8 +93,12 @@ def create_app() -> FastAPI:
         msg = str(exc)
         logger.warning("ValueError on %s: %s", request.url.path, msg)
         return _make_error_response(
-            request.url.path, 400, msg,
-            "invalid_request_error", "invalid_request_error", "invalid_value",
+            request.url.path,
+            400,
+            msg,
+            "invalid_request_error",
+            "invalid_request_error",
+            "invalid_value",
         )
 
     @app.exception_handler(RuntimeError)
@@ -90,18 +106,30 @@ def create_app() -> FastAPI:
         msg = str(exc)
         logger.error("RuntimeError on %s: %s", request.url.path, msg)
         return _make_error_response(
-            request.url.path, 500, msg,
-            "api_error", "server_error", "internal_error",
+            request.url.path,
+            500,
+            msg,
+            "api_error",
+            "server_error",
+            "internal_error",
         )
 
     @app.exception_handler(Exception)
     async def general_error_handler(request: Request, exc: Exception):
         msg = f"{type(exc).__name__}: {exc}"
-        logger.error("Unhandled exception on %s: %s\n%s",
-                      request.url.path, msg, traceback.format_exc())
+        logger.error(
+            "Unhandled exception on %s: %s\n%s",
+            request.url.path,
+            msg,
+            traceback.format_exc(),
+        )
         return _make_error_response(
-            request.url.path, 500, msg,
-            "api_error", "server_error", "internal_error",
+            request.url.path,
+            500,
+            msg,
+            "api_error",
+            "server_error",
+            "internal_error",
         )
 
     app.include_router(status.router)

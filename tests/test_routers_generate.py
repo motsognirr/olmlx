@@ -13,13 +13,18 @@ class TestGenerateRouter:
         stats = TimingStats(eval_count=5)
         mock_result = {"text": "Generated text", "done": True, "stats": stats}
 
-        with patch("mlx_ollama.routers.generate.generate_completion", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/api/generate", json={
-                "model": "qwen3",
-                "prompt": "Hello",
-                "stream": False,
-            })
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "Hello",
+                    "stream": False,
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -33,14 +38,20 @@ class TestGenerateRouter:
             async def gen():
                 yield {"text": "Hello", "done": False}
                 yield {"text": "", "done": True, "stats": TimingStats()}
+
             return gen()
 
-        with patch("mlx_ollama.routers.generate.generate_completion", side_effect=mock_stream):
-            resp = await app_client.post("/api/generate", json={
-                "model": "qwen3",
-                "prompt": "Hello",
-                "stream": True,
-            })
+        with patch(
+            "mlx_ollama.routers.generate.generate_completion", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "Hello",
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         assert "ndjson" in resp.headers["content-type"]
@@ -49,14 +60,19 @@ class TestGenerateRouter:
     async def test_generate_with_system(self, app_client):
         mock_result = {"text": "result", "done": True, "stats": TimingStats()}
 
-        with patch("mlx_ollama.routers.generate.generate_completion", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/api/generate", json={
-                "model": "qwen3",
-                "prompt": "Hello",
-                "system": "You are helpful",
-                "stream": False,
-            })
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "Hello",
+                    "system": "You are helpful",
+                    "stream": False,
+                },
+            )
 
         assert resp.status_code == 200
         # System should be prepended to prompt
@@ -69,15 +85,20 @@ class TestGenerateRouter:
     async def test_generate_raw_ignores_system(self, app_client):
         mock_result = {"text": "result", "done": True, "stats": TimingStats()}
 
-        with patch("mlx_ollama.routers.generate.generate_completion", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/api/generate", json={
-                "model": "qwen3",
-                "prompt": "Hello",
-                "system": "You are helpful",
-                "raw": True,
-                "stream": False,
-            })
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "Hello",
+                    "system": "You are helpful",
+                    "raw": True,
+                    "stream": False,
+                },
+            )
 
         assert resp.status_code == 200
         call_args = mock_gen.call_args

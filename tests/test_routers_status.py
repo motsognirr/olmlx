@@ -44,6 +44,7 @@ class TestStatusRouter:
     @pytest.mark.asyncio
     async def test_ps_with_expiry(self, app_client):
         import time
+
         manager = app_client._transport.app.state.model_manager
         lm = manager._loaded["qwen3:latest"]
         lm.expires_at = time.time() + 300

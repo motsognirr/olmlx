@@ -201,7 +201,9 @@ class TestTryBareJson:
 
 class TestBareJsonMultiline:
     def test_bare_json_multiline(self):
-        text = '{\n  "name": "get_weather",\n  "arguments": {\n    "city": "NYC"\n  }\n}'
+        text = (
+            '{\n  "name": "get_weather",\n  "arguments": {\n    "city": "NYC"\n  }\n}'
+        )
         tool_uses, remaining = _try_bare_json(text)
         assert len(tool_uses) == 1
         assert tool_uses[0]["name"] == "get_weather"
@@ -275,7 +277,9 @@ class TestParseModelOutput:
     def test_tool_name_validation(self):
         text = '<tool_call>{"name": "unknown_func", "arguments": {}}</tool_call>'
         thinking, visible, tools = parse_model_output(
-            text, has_tools=True, tool_names={"search", "get_weather"},
+            text,
+            has_tools=True,
+            tool_names={"search", "get_weather"},
         )
         # Still parses, but logs a warning
         assert len(tools) == 1

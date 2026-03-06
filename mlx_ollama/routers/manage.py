@@ -18,6 +18,7 @@ async def pull_model(req: PullRequest, request: Request):
     store = request.app.state.model_store
 
     if req.stream:
+
         async def stream_progress():
             try:
                 async for event in store.pull(req.model):
@@ -25,18 +26,14 @@ async def pull_model(req: PullRequest, request: Request):
             except Exception as e:
                 yield json.dumps({"status": "error", "error": str(e)}) + "\n"
 
-        return StreamingResponse(
-            stream_progress(), media_type="application/x-ndjson"
-        )
+        return StreamingResponse(stream_progress(), media_type="application/x-ndjson")
     else:
         events = []
         try:
             async for event in store.pull(req.model):
                 events.append(event)
         except Exception as e:
-            return JSONResponse(
-                {"error": str(e)}, status_code=500
-            )
+            return JSONResponse({"error": str(e)}, status_code=500)
         return events[-1] if events else {"status": "success"}
 
 
@@ -57,7 +54,9 @@ async def delete_model(req: DeleteRequest, request: Request):
     deleted = store.delete(req.model)
     registry.remove(req.model)
     if not deleted:
-        return JSONResponse({"error": f"model '{req.model}' not found"}, status_code=404)
+        return JSONResponse(
+            {"error": f"model '{req.model}' not found"}, status_code=404
+        )
     return Response(status_code=200)
 
 
@@ -101,10 +100,12 @@ async def create_model(req: CreateRequest, request: Request):
     registry.add_alias(normalized, from_model)
 
     if req.stream:
+
         async def stream():
             yield json.dumps({"status": "reading model metadata"}) + "\n"
             yield json.dumps({"status": "creating model layer"}) + "\n"
             yield json.dumps({"status": "success"}) + "\n"
+
         return StreamingResponse(stream(), media_type="application/x-ndjson")
     return {"status": "success"}
 

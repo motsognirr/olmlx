@@ -9,12 +9,30 @@ from mlx_ollama.schemas.anthropic import (
     AnthropicToolInputSchema,
     AnthropicUsage,
 )
-from mlx_ollama.schemas.chat import ChatRequest, ChatResponse, Message, Tool, ToolCall, ToolCallFunction
+from mlx_ollama.schemas.chat import (
+    ChatRequest,
+    ChatResponse,
+    Message,
+    Tool,
+    ToolCall,
+    ToolCallFunction,
+)
 from mlx_ollama.schemas.common import ModelOptions
-from mlx_ollama.schemas.embed import EmbedRequest, EmbedResponse, EmbeddingsRequest, EmbeddingsResponse
+from mlx_ollama.schemas.embed import (
+    EmbedRequest,
+    EmbedResponse,
+    EmbeddingsRequest,
+    EmbeddingsResponse,
+)
 from mlx_ollama.schemas.generate import GenerateRequest, GenerateResponse
 from mlx_ollama.schemas.manage import CopyRequest, CreateRequest, DeleteRequest
-from mlx_ollama.schemas.models import ModelDetails, ModelInfo, ShowRequest, ShowResponse, TagsResponse
+from mlx_ollama.schemas.models import (
+    ModelDetails,
+    ModelInfo,
+    ShowRequest,
+    ShowResponse,
+    TagsResponse,
+)
 from mlx_ollama.schemas.openai import (
     OpenAIChatMessage,
     OpenAIChatRequest,
@@ -55,7 +73,10 @@ class TestGenerateSchemas:
 
     def test_generate_response(self):
         resp = GenerateResponse(
-            model="test", created_at="now", response="hello", done=True,
+            model="test",
+            created_at="now",
+            response="hello",
+            done=True,
         )
         assert resp.response == "hello"
         assert resp.done is True
@@ -180,8 +201,12 @@ class TestOpenAISchemas:
 
     def test_chat_response(self):
         resp = OpenAIChatResponse(
-            id="test", created=0, model="m",
-            choices=[OpenAIChoice(message=OpenAIChatMessage(role="assistant", content="hi"))],
+            id="test",
+            created=0,
+            model="m",
+            choices=[
+                OpenAIChoice(message=OpenAIChatMessage(role="assistant", content="hi"))
+            ],
         )
         assert resp.object == "chat.completion"
 
@@ -191,7 +216,9 @@ class TestOpenAISchemas:
 
     def test_completion_response(self):
         resp = OpenAICompletionResponse(
-            id="test", created=0, model="m",
+            id="test",
+            created=0,
+            model="m",
             choices=[OpenAICompletionChoice(text="world")],
         )
         assert resp.object == "text_completion"
@@ -256,13 +283,18 @@ class TestAnthropicSchemas:
 
     def test_content_block_tool_use(self):
         block = AnthropicContentBlock(
-            type="tool_use", id="toolu_123", name="func", input={"x": 1},
+            type="tool_use",
+            id="toolu_123",
+            name="func",
+            input={"x": 1},
         )
         assert block.name == "func"
 
     def test_content_block_tool_result(self):
         block = AnthropicContentBlock(
-            type="tool_result", tool_use_id="toolu_123", content="result",
+            type="tool_result",
+            tool_use_id="toolu_123",
+            content="result",
         )
         assert block.tool_use_id == "toolu_123"
 

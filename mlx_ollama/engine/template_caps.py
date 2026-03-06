@@ -22,6 +22,7 @@ def _find_template_variables(tpl: str) -> set[str] | None:
     try:
         import jinja2
         import jinja2.meta
+
         env = jinja2.Environment()
         ast = env.parse(tpl)
         return jinja2.meta.find_undeclared_variables(ast)

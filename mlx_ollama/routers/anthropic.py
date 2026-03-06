@@ -29,20 +29,23 @@ def _make_msg_id() -> str:
 
 # --- Tool/message conversion ---
 
+
 def _convert_tools(req: AnthropicMessagesRequest) -> list[dict] | None:
     """Convert Anthropic tool definitions to OpenAI-style for chat templates."""
     if not req.tools:
         return None
     tools = []
     for tool in req.tools:
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.input_schema.model_dump(exclude_none=True),
-            },
-        })
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": tool.input_schema.model_dump(exclude_none=True),
+                },
+            }
+        )
     return tools
 
 
@@ -76,16 +79,21 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
                 elif block.type == "text" and block.text:
                     text_parts.append(block.text)
                 elif block.type == "tool_use":
-                    tool_calls.append({
-                        "id": block.id or _make_tool_use_id(),
-                        "type": "function",
-                        "function": {
-                            "name": block.name,
-                            "arguments": block.input or {},
-                        },
-                    })
+                    tool_calls.append(
+                        {
+                            "id": block.id or _make_tool_use_id(),
+                            "type": "function",
+                            "function": {
+                                "name": block.name,
+                                "arguments": block.input or {},
+                            },
+                        }
+                    )
 
-            entry = {"role": "assistant", "content": " ".join(text_parts) if text_parts else ""}
+            entry = {
+                "role": "assistant",
+                "content": " ".join(text_parts) if text_parts else "",
+            }
             if tool_calls:
                 entry["tool_calls"] = tool_calls
             messages.append(entry)
@@ -104,11 +112,13 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
                             b.get("text", "") if isinstance(b, dict) else str(b)
                             for b in block.content
                         )
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": block.tool_use_id or "",
-                        "content": result_content,
-                    })
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": block.tool_use_id or "",
+                            "content": result_content,
+                        }
+                    )
             if text_parts:
                 messages.append({"role": "user", "content": " ".join(text_parts)})
 
@@ -129,6 +139,7 @@ def _build_options(req: AnthropicMessagesRequest) -> dict:
 
 
 # --- SSE helpers ---
+
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -164,23 +175,44 @@ async def _with_keepalive_pings(aiter, interval=KEEPALIVE_PING_INTERVAL):
                 pass
 
 
-def _emit_content_block(block_idx: int, block_type: str, delta_type: str,
-                        content_key: str, content: str, chunk_size: int) -> list[str]:
+def _emit_content_block(
+    block_idx: int,
+    block_type: str,
+    delta_type: str,
+    content_key: str,
+    content: str,
+    chunk_size: int,
+) -> list[str]:
     """Emit SSE strings for a complete content block (start + deltas + stop)."""
     events = []
-    events.append(_sse("content_block_start", {
-        "type": "content_block_start",
-        "index": block_idx,
-        "content_block": {"type": block_type, content_key: ""},
-    }))
+    events.append(
+        _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_idx,
+                "content_block": {"type": block_type, content_key: ""},
+            },
+        )
+    )
     if content:
         for i in range(0, len(content), chunk_size):
-            events.append(_sse("content_block_delta", {
-                "type": "content_block_delta",
-                "index": block_idx,
-                "delta": {"type": delta_type, content_key: content[i:i + chunk_size]},
-            }))
-    events.append(_sse("content_block_stop", {"type": "content_block_stop", "index": block_idx}))
+            events.append(
+                _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_idx,
+                        "delta": {
+                            "type": delta_type,
+                            content_key: content[i : i + chunk_size],
+                        },
+                    },
+                )
+            )
+    events.append(
+        _sse("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+    )
     return events
 
 
@@ -205,44 +237,72 @@ async def _stream_buffered_with_tools(result, tool_names):
     logger.info("Raw model output (%d chars): %s", len(full_text), full_text[:1000])
 
     thinking, visible_text, tool_uses = parse_model_output(
-        full_text, True, tool_names=tool_names,
+        full_text,
+        True,
+        tool_names=tool_names,
     )
 
     if tool_uses:
-        logger.info("Parsed %d tool call(s): %s",
-                     len(tool_uses), [tu["name"] for tu in tool_uses])
+        logger.info(
+            "Parsed %d tool call(s): %s",
+            len(tool_uses),
+            [tu["name"] for tu in tool_uses],
+        )
 
     block_idx = 0
 
     if thinking:
-        for event in _emit_content_block(block_idx, "thinking", "thinking_delta", "thinking", thinking, THINKING_CHUNK_SIZE):
+        for event in _emit_content_block(
+            block_idx,
+            "thinking",
+            "thinking_delta",
+            "thinking",
+            thinking,
+            THINKING_CHUNK_SIZE,
+        ):
             yield event
         block_idx += 1
 
-    for event in _emit_content_block(block_idx, "text", "text_delta", "text", visible_text, TEXT_CHUNK_SIZE):
+    for event in _emit_content_block(
+        block_idx, "text", "text_delta", "text", visible_text, TEXT_CHUNK_SIZE
+    ):
         yield event
     block_idx += 1
 
     for tool_use in tool_uses:
-        yield _sse("content_block_start", {
-            "type": "content_block_start",
-            "index": block_idx,
-            "content_block": {
-                "type": "tool_use",
-                "id": tool_use["id"],
-                "name": tool_use["name"],
-                "input": {},
+        yield _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_use["id"],
+                    "name": tool_use["name"],
+                    "input": {},
+                },
             },
-        })
-        yield _sse("content_block_delta", {
-            "type": "content_block_delta",
-            "index": block_idx,
-            "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_use["input"])},
-        })
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+        )
+        yield _sse(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": block_idx,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": json.dumps(tool_use["input"]),
+                },
+            },
+        )
+        yield _sse(
+            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
+        )
         block_idx += 1
 
-    yield {"stop_reason": "tool_use" if tool_uses else "end_turn", "output_tokens": output_tokens}
+    yield {
+        "stop_reason": "tool_use" if tool_uses else "end_turn",
+        "output_tokens": output_tokens,
+    }
 
 
 async def _stream_thinking_state_machine(result):
@@ -271,11 +331,14 @@ async def _stream_thinking_state_machine(result):
                 if buffer.startswith("<think>"):
                     state = "thinking"
                     buffer = buffer[7:]
-                    yield _sse("content_block_start", {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {"type": "thinking", "thinking": ""},
-                    })
+                    yield _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_idx,
+                            "content_block": {"type": "thinking", "thinking": ""},
+                        },
+                    )
                 elif len(buffer) < 7 and "<think>".startswith(buffer):
                     break
                 else:
@@ -286,41 +349,59 @@ async def _stream_thinking_state_machine(result):
                 if end_idx >= 0:
                     thinking_chunk = buffer[:end_idx]
                     if thinking_chunk:
-                        yield _sse("content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": block_idx,
-                            "delta": {"type": "thinking_delta", "thinking": thinking_chunk},
-                        })
-                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_idx,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": thinking_chunk,
+                                },
+                            },
+                        )
+                    yield _sse(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": block_idx},
+                    )
                     block_idx += 1
-                    buffer = buffer[end_idx + 8:]
+                    buffer = buffer[end_idx + 8 :]
                     state = "text"
                 elif len(buffer) > 8:
                     safe = buffer[:-8]
                     buffer = buffer[-8:]
-                    yield _sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "thinking_delta", "thinking": safe},
-                    })
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {"type": "thinking_delta", "thinking": safe},
+                        },
+                    )
                     break
                 else:
                     break
 
             elif state == "text":
                 if not text_block_started:
-                    yield _sse("content_block_start", {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {"type": "text", "text": ""},
-                    })
+                    yield _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_idx,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                    )
                     text_block_started = True
                 if buffer:
-                    yield _sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "text_delta", "text": buffer},
-                    })
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {"type": "text_delta", "text": buffer},
+                        },
+                    )
                     buffer = ""
                 break
 
@@ -329,50 +410,81 @@ async def _stream_thinking_state_machine(result):
     # Flush remaining buffer
     if state == "thinking":
         if buffer:
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta",
-                "index": block_idx,
-                "delta": {"type": "thinking_delta", "thinking": buffer},
-            })
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "thinking_delta", "thinking": buffer},
+                },
+            )
+        yield _sse(
+            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
+        )
         block_idx += 1
-        yield _sse("content_block_start", {
-            "type": "content_block_start",
-            "index": block_idx,
-            "content_block": {"type": "text", "text": ""},
-        })
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_idx})
-    elif text_block_started:
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_idx})
-    elif state == "text" and not text_block_started:
-        yield _sse("content_block_start", {
-            "type": "content_block_start",
-            "index": block_idx,
-            "content_block": {"type": "text", "text": ""},
-        })
-        if buffer:
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta",
+        yield _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
                 "index": block_idx,
-                "delta": {"type": "text_delta", "text": buffer},
-            })
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+        yield _sse(
+            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
+        )
+    elif text_block_started:
+        yield _sse(
+            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
+        )
+    elif state == "text" and not text_block_started:
+        yield _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_idx,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+        if buffer:
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "text_delta", "text": buffer},
+                },
+            )
+        yield _sse(
+            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
+        )
     else:
         # state == "init" — no output at all, emit empty text block
-        yield _sse("content_block_start", {
-            "type": "content_block_start",
-            "index": block_idx,
-            "content_block": {"type": "text", "text": ""},
-        })
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+        yield _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_idx,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+        yield _sse(
+            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
+        )
 
     yield {"stop_reason": "end_turn", "output_tokens": output_tokens}
 
 
 @router.post("/v1/messages")
 async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
-    logger.info("Anthropic request: model=%s stream=%s tools=%d messages=%d max_tokens=%d",
-                req.model, req.stream, len(req.tools or []), len(req.messages), req.max_tokens)
+    logger.info(
+        "Anthropic request: model=%s stream=%s tools=%d messages=%d max_tokens=%d",
+        req.model,
+        req.stream,
+        len(req.tools or []),
+        len(req.messages),
+        req.max_tokens,
+    )
     manager = request.app.state.model_manager
     messages = _convert_messages(req)
     options = _build_options(req)
@@ -384,32 +496,44 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
 
     if req.stream:
         result = await generate_chat(
-            manager, req.model, messages, options,
-            tools=tools, stream=True, max_tokens=req.max_tokens,
+            manager,
+            req.model,
+            messages,
+            options,
+            tools=tools,
+            stream=True,
+            max_tokens=req.max_tokens,
         )
 
         async def stream_sse():
             try:
-                yield _sse("message_start", {
-                    "type": "message_start",
-                    "message": {
-                        "id": msg_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": req.model,
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": {
-                            "input_tokens": 0, "output_tokens": 0,
-                            "cache_creation_input_tokens": 0,
-                            "cache_read_input_tokens": 0,
+                yield _sse(
+                    "message_start",
+                    {
+                        "type": "message_start",
+                        "message": {
+                            "id": msg_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": req.model,
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "cache_creation_input_tokens": 0,
+                                "cache_read_input_tokens": 0,
+                            },
                         },
                     },
-                })
+                )
 
-                path = _stream_buffered_with_tools(result, tool_names) if has_tools \
+                path = (
+                    _stream_buffered_with_tools(result, tool_names)
+                    if has_tools
                     else _stream_thinking_state_machine(result)
+                )
 
                 meta = {}
                 async for event in path:
@@ -418,11 +542,17 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                     else:
                         yield event
 
-                yield _sse("message_delta", {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": meta.get("stop_reason", "end_turn"), "stop_sequence": None},
-                    "usage": {"output_tokens": meta.get("output_tokens", 0)},
-                })
+                yield _sse(
+                    "message_delta",
+                    {
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": meta.get("stop_reason", "end_turn"),
+                            "stop_sequence": None,
+                        },
+                        "usage": {"output_tokens": meta.get("output_tokens", 0)},
+                    },
+                )
                 yield _sse("message_stop", {"type": "message_stop"})
             finally:
                 await result.aclose()
@@ -430,8 +560,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         return StreamingResponse(stream_sse(), media_type="text/event-stream")
     else:
         result = await generate_chat(
-            manager, req.model, messages, options,
-            tools=tools, stream=False, max_tokens=req.max_tokens,
+            manager,
+            req.model,
+            messages,
+            options,
+            tools=tools,
+            stream=False,
+            max_tokens=req.max_tokens,
         )
         text = result.get("text", "")
         stats = result.get("stats")
@@ -439,28 +574,28 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         logger.debug("Raw model output (%d chars): %s", len(text), text[:500])
 
         thinking, visible_text, tool_uses = parse_model_output(
-            text, has_tools, tool_names=tool_names,
+            text,
+            has_tools,
+            tool_names=tool_names,
         )
 
         content_blocks = []
 
         if thinking:
-            content_blocks.append(
-                AnthropicContentBlock(type="thinking", text=thinking)
-            )
+            content_blocks.append(AnthropicContentBlock(type="thinking", text=thinking))
 
         if visible_text:
-            content_blocks.append(
-                AnthropicContentBlock(type="text", text=visible_text)
-            )
+            content_blocks.append(AnthropicContentBlock(type="text", text=visible_text))
 
         for tu in tool_uses:
-            content_blocks.append(AnthropicContentBlock(
-                type="tool_use",
-                id=tu["id"],
-                name=tu["name"],
-                input=tu["input"],
-            ))
+            content_blocks.append(
+                AnthropicContentBlock(
+                    type="tool_use",
+                    id=tu["id"],
+                    name=tu["name"],
+                    input=tu["input"],
+                )
+            )
 
         if not content_blocks:
             content_blocks.append(AnthropicContentBlock(type="text", text=""))

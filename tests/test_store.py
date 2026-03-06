@@ -5,7 +5,12 @@ import json
 import pytest
 
 from mlx_ollama.models.manifest import ModelManifest
-from mlx_ollama.models.store import ModelStore, _dir_size, _extract_metadata, _safe_dir_name
+from mlx_ollama.models.store import (
+    ModelStore,
+    _dir_size,
+    _extract_metadata,
+    _safe_dir_name,
+)
 
 
 class TestSafeDirName:
@@ -194,7 +199,9 @@ class TestModelStore:
         from unittest.mock import patch
 
         models_json = tmp_path / "models.json"
-        monkeypatch.setattr("mlx_ollama.engine.registry.settings.models_config", models_json)
+        monkeypatch.setattr(
+            "mlx_ollama.engine.registry.settings.models_config", models_json
+        )
 
         with patch("huggingface_hub.snapshot_download"):
             async for _ in mock_store.pull("qwen3"):

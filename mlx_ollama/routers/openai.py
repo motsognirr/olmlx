@@ -6,7 +6,11 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from mlx_ollama.engine.inference import generate_chat, generate_completion, generate_embeddings
+from mlx_ollama.engine.inference import (
+    generate_chat,
+    generate_completion,
+    generate_embeddings,
+)
 from mlx_ollama.schemas.openai import (
     OpenAIChatMessage,
     OpenAIChatRequest,
@@ -30,7 +34,9 @@ def _make_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
 
-async def _stream_openai_sse(result, response_id, model, created, object_type, format_content, format_done):
+async def _stream_openai_sse(
+    result, response_id, model, created, object_type, format_content, format_done
+):
     """Shared SSE streaming for OpenAI-compatible endpoints.
 
     format_content(text) -> choices[0] dict for content chunks
@@ -89,23 +95,40 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
 
     if req.stream:
         result = await generate_chat(
-            manager, req.model, messages, options,
-            tools=req.tools, stream=True, max_tokens=max_tokens,
+            manager,
+            req.model,
+            messages,
+            options,
+            tools=req.tools,
+            stream=True,
+            max_tokens=max_tokens,
         )
 
         return StreamingResponse(
             _stream_openai_sse(
-                result, chat_id, req.model, created,
+                result,
+                chat_id,
+                req.model,
+                created,
                 "chat.completion.chunk",
-                lambda text: {"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None},
+                lambda text: {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": text},
+                    "finish_reason": None,
+                },
                 lambda: {"index": 0, "delta": {}, "finish_reason": "stop"},
             ),
             media_type="text/event-stream",
         )
     else:
         result = await generate_chat(
-            manager, req.model, messages, options,
-            tools=req.tools, stream=False, max_tokens=max_tokens,
+            manager,
+            req.model,
+            messages,
+            options,
+            tools=req.tools,
+            stream=False,
+            max_tokens=max_tokens,
         )
         text = result.get("text", "")
         stats = result.get("stats")
@@ -140,13 +163,20 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
 
     if req.stream:
         result = await generate_completion(
-            manager, req.model, prompt, options,
-            stream=True, max_tokens=max_tokens,
+            manager,
+            req.model,
+            prompt,
+            options,
+            stream=True,
+            max_tokens=max_tokens,
         )
 
         return StreamingResponse(
             _stream_openai_sse(
-                result, comp_id, req.model, created,
+                result,
+                comp_id,
+                req.model,
+                created,
                 "text_completion",
                 lambda text: {"index": 0, "text": text, "finish_reason": None},
                 lambda: {"index": 0, "text": "", "finish_reason": "stop"},
@@ -155,8 +185,12 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
         )
     else:
         result = await generate_completion(
-            manager, req.model, prompt, options,
-            stream=False, max_tokens=max_tokens,
+            manager,
+            req.model,
+            prompt,
+            options,
+            stream=False,
+            max_tokens=max_tokens,
         )
         return OpenAICompletionResponse(
             id=comp_id,
@@ -176,10 +210,7 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
 async def openai_list_models(request: Request):
     registry = request.app.state.registry
     models = registry.list_models()
-    data = [
-        OpenAIModel(id=name, created=int(time.time()))
-        for name in models
-    ]
+    data = [OpenAIModel(id=name, created=int(time.time())) for name in models]
     return OpenAIModelList(data=data)
 
 
@@ -189,8 +220,7 @@ async def openai_embeddings(req: OpenAIEmbeddingRequest, request: Request):
     texts = req.input if isinstance(req.input, list) else [req.input]
     embeddings = await generate_embeddings(manager, req.model, texts)
     data = [
-        OpenAIEmbeddingData(index=i, embedding=emb)
-        for i, emb in enumerate(embeddings)
+        OpenAIEmbeddingData(index=i, embedding=emb) for i, emb in enumerate(embeddings)
     ]
     return OpenAIEmbeddingResponse(
         data=data,

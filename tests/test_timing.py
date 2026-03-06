@@ -38,9 +38,12 @@ class TestTimingStats:
         stats = TimingStats()
         d = stats.to_dict()
         assert set(d.keys()) == {
-            "total_duration", "load_duration",
-            "prompt_eval_count", "prompt_eval_duration",
-            "eval_count", "eval_duration",
+            "total_duration",
+            "load_duration",
+            "prompt_eval_count",
+            "prompt_eval_duration",
+            "eval_count",
+            "eval_duration",
         }
 
 

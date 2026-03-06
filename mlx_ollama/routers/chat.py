@@ -20,8 +20,14 @@ async def chat(req: ChatRequest, request: Request):
 
     if req.stream:
         result = await generate_chat(
-            manager, req.model, messages, options, tools=tools,
-            stream=True, keep_alive=req.keep_alive, max_tokens=max_tokens,
+            manager,
+            req.model,
+            messages,
+            options,
+            tools=tools,
+            stream=True,
+            keep_alive=req.keep_alive,
+            max_tokens=max_tokens,
         )
 
         async def stream_response():
@@ -34,7 +40,9 @@ async def chat(req: ChatRequest, request: Request):
                         final = {
                             "model": req.model,
                             "created_at": now,
-                            "message": Message(role="assistant", content="").model_dump(),
+                            "message": Message(
+                                role="assistant", content=""
+                            ).model_dump(),
                             "done": True,
                             "done_reason": "stop",
                         }
@@ -44,29 +52,42 @@ async def chat(req: ChatRequest, request: Request):
                     else:
                         text = chunk.get("text", "")
                         full_text += text
-                        yield json.dumps({
-                            "model": req.model,
-                            "created_at": now,
-                            "message": Message(role="assistant", content=text).model_dump(),
-                            "done": False,
-                        }) + "\n"
+                        yield (
+                            json.dumps(
+                                {
+                                    "model": req.model,
+                                    "created_at": now,
+                                    "message": Message(
+                                        role="assistant", content=text
+                                    ).model_dump(),
+                                    "done": False,
+                                }
+                            )
+                            + "\n"
+                        )
             finally:
                 await result.aclose()
 
-        return StreamingResponse(
-            stream_response(), media_type="application/x-ndjson"
-        )
+        return StreamingResponse(stream_response(), media_type="application/x-ndjson")
     else:
         result = await generate_chat(
-            manager, req.model, messages, options, tools=tools,
-            stream=False, keep_alive=req.keep_alive, max_tokens=max_tokens,
+            manager,
+            req.model,
+            messages,
+            options,
+            tools=tools,
+            stream=False,
+            keep_alive=req.keep_alive,
+            max_tokens=max_tokens,
         )
         now = datetime.now(timezone.utc).isoformat()
         stats = result.get("stats")
         response = {
             "model": req.model,
             "created_at": now,
-            "message": Message(role="assistant", content=result.get("text", "")).model_dump(),
+            "message": Message(
+                role="assistant", content=result.get("text", "")
+            ).model_dump(),
             "done": True,
             "done_reason": "stop",
         }

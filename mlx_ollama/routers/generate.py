@@ -23,8 +23,13 @@ async def generate(req: GenerateRequest, request: Request):
 
     if req.stream:
         result = await generate_completion(
-            manager, req.model, prompt, options, stream=True,
-            keep_alive=req.keep_alive, max_tokens=max_tokens,
+            manager,
+            req.model,
+            prompt,
+            options,
+            stream=True,
+            keep_alive=req.keep_alive,
+            max_tokens=max_tokens,
             images=req.images,
         )
 
@@ -45,22 +50,30 @@ async def generate(req: GenerateRequest, request: Request):
                             final.update(stats.to_dict())
                         yield json.dumps(final) + "\n"
                     else:
-                        yield json.dumps({
-                            "model": req.model,
-                            "created_at": now,
-                            "response": chunk.get("text", ""),
-                            "done": False,
-                        }) + "\n"
+                        yield (
+                            json.dumps(
+                                {
+                                    "model": req.model,
+                                    "created_at": now,
+                                    "response": chunk.get("text", ""),
+                                    "done": False,
+                                }
+                            )
+                            + "\n"
+                        )
             finally:
                 await result.aclose()
 
-        return StreamingResponse(
-            stream_response(), media_type="application/x-ndjson"
-        )
+        return StreamingResponse(stream_response(), media_type="application/x-ndjson")
     else:
         result = await generate_completion(
-            manager, req.model, prompt, options, stream=False,
-            keep_alive=req.keep_alive, max_tokens=max_tokens,
+            manager,
+            req.model,
+            prompt,
+            options,
+            stream=False,
+            keep_alive=req.keep_alive,
+            max_tokens=max_tokens,
             images=req.images,
         )
         now = datetime.now(timezone.utc).isoformat()

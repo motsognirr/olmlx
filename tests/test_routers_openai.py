@@ -21,12 +21,17 @@ class TestOpenAIRouter:
         stats = TimingStats(prompt_eval_count=10, eval_count=20)
         mock_result = {"text": "Hello!", "done": True, "stats": stats}
 
-        with patch("mlx_ollama.routers.openai.generate_chat", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/v1/chat/completions", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-            })
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -43,14 +48,18 @@ class TestOpenAIRouter:
                 yield {"text": "Hello", "done": False}
                 yield {"text": " world", "done": False}
                 yield {"text": "", "done": True, "stats": TimingStats()}
+
             return gen()
 
         with patch("mlx_ollama.routers.openai.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/v1/chat/completions", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": True,
-            })
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers["content-type"]
@@ -62,12 +71,17 @@ class TestOpenAIRouter:
     async def test_completions_non_streaming(self, app_client):
         mock_result = {"text": "Completed text", "done": True, "stats": TimingStats()}
 
-        with patch("mlx_ollama.routers.openai.generate_completion", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.openai.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/v1/completions", json={
-                "model": "qwen3",
-                "prompt": "Once upon a time",
-            })
+            resp = await app_client.post(
+                "/v1/completions",
+                json={
+                    "model": "qwen3",
+                    "prompt": "Once upon a time",
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -78,12 +92,17 @@ class TestOpenAIRouter:
     async def test_completions_list_prompt(self, app_client):
         mock_result = {"text": "result", "done": True, "stats": TimingStats()}
 
-        with patch("mlx_ollama.routers.openai.generate_completion", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.openai.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/v1/completions", json={
-                "model": "qwen3",
-                "prompt": ["first prompt", "second prompt"],
-            })
+            resp = await app_client.post(
+                "/v1/completions",
+                json={
+                    "model": "qwen3",
+                    "prompt": ["first prompt", "second prompt"],
+                },
+            )
 
         assert resp.status_code == 200
         # Should use first prompt
@@ -92,12 +111,17 @@ class TestOpenAIRouter:
 
     @pytest.mark.asyncio
     async def test_embeddings(self, app_client):
-        with patch("mlx_ollama.routers.openai.generate_embeddings", new_callable=AsyncMock) as mock_emb:
+        with patch(
+            "mlx_ollama.routers.openai.generate_embeddings", new_callable=AsyncMock
+        ) as mock_emb:
             mock_emb.return_value = [[0.1, 0.2, 0.3]]
-            resp = await app_client.post("/v1/embeddings", json={
-                "model": "qwen3",
-                "input": "hello world",
-            })
+            resp = await app_client.post(
+                "/v1/embeddings",
+                json={
+                    "model": "qwen3",
+                    "input": "hello world",
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -107,12 +131,17 @@ class TestOpenAIRouter:
 
     @pytest.mark.asyncio
     async def test_embeddings_list_input(self, app_client):
-        with patch("mlx_ollama.routers.openai.generate_embeddings", new_callable=AsyncMock) as mock_emb:
+        with patch(
+            "mlx_ollama.routers.openai.generate_embeddings", new_callable=AsyncMock
+        ) as mock_emb:
             mock_emb.return_value = [[0.1], [0.2]]
-            resp = await app_client.post("/v1/embeddings", json={
-                "model": "qwen3",
-                "input": ["hello", "world"],
-            })
+            resp = await app_client.post(
+                "/v1/embeddings",
+                json={
+                    "model": "qwen3",
+                    "input": ["hello", "world"],
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -125,14 +154,20 @@ class TestOpenAIRouter:
                 yield {"text": "Once", "done": False}
                 yield {"text": " upon", "done": False}
                 yield {"text": "", "done": True, "stats": TimingStats()}
+
             return gen()
 
-        with patch("mlx_ollama.routers.openai.generate_completion", side_effect=mock_stream):
-            resp = await app_client.post("/v1/completions", json={
-                "model": "qwen3",
-                "prompt": "Once upon a time",
-                "stream": True,
-            })
+        with patch(
+            "mlx_ollama.routers.openai.generate_completion", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/completions",
+                json={
+                    "model": "qwen3",
+                    "prompt": "Once upon a time",
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers["content-type"]
@@ -142,18 +177,23 @@ class TestOpenAIRouter:
     async def test_chat_options_mapping(self, app_client):
         mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
 
-        with patch("mlx_ollama.routers.openai.generate_chat", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/v1/chat/completions", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "temperature": 0.5,
-                "top_p": 0.9,
-                "seed": 42,
-                "frequency_penalty": 0.3,
-                "presence_penalty": 0.2,
-                "stop": "END",
-            })
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "temperature": 0.5,
+                    "top_p": 0.9,
+                    "seed": 42,
+                    "frequency_penalty": 0.3,
+                    "presence_penalty": 0.2,
+                    "stop": "END",
+                },
+            )
 
         assert resp.status_code == 200
         call_kwargs = mock_gen.call_args

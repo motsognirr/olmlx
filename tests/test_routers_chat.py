@@ -13,13 +13,18 @@ class TestChatRouter:
         stats = TimingStats(eval_count=10)
         mock_result = {"text": "Hello!", "done": True, "stats": stats}
 
-        with patch("mlx_ollama.routers.chat.generate_chat", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/api/chat", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": False,
-            })
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                },
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -34,14 +39,18 @@ class TestChatRouter:
             async def gen():
                 yield {"text": "Hi", "done": False}
                 yield {"text": "", "done": True, "stats": TimingStats()}
+
             return gen()
 
         with patch("mlx_ollama.routers.chat.generate_chat", side_effect=mock_stream):
-            resp = await app_client.post("/api/chat", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": True,
-            })
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
 
         assert resp.status_code == 200
         assert "ndjson" in resp.headers["content-type"]
@@ -50,14 +59,19 @@ class TestChatRouter:
     async def test_chat_with_options(self, app_client):
         mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
 
-        with patch("mlx_ollama.routers.chat.generate_chat", new_callable=AsyncMock) as mock_gen:
+        with patch(
+            "mlx_ollama.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
             mock_gen.return_value = mock_result
-            resp = await app_client.post("/api/chat", json={
-                "model": "qwen3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": False,
-                "options": {"temperature": 0.5, "num_predict": 100},
-            })
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                    "options": {"temperature": 0.5, "num_predict": 100},
+                },
+            )
 
         assert resp.status_code == 200
         # Verify options were passed

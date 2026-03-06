@@ -19,11 +19,10 @@ async def upload_blob(digest: str, request: Request):
 
     # Verify digest
     import hashlib
+
     computed = "sha256:" + hashlib.sha256(body).hexdigest()
     if digest != computed:
-        return JSONResponse(
-            {"error": "digest mismatch"}, status_code=400
-        )
+        return JSONResponse({"error": "digest mismatch"}, status_code=400)
 
     await store.save_blob(digest, body)
     return Response(status_code=201)

@@ -46,7 +46,7 @@ def _extract_metadata(model_dir: Path) -> dict:
                 qcfg = json.load(f)
             meta["quantization_level"] = qcfg.get("bits", "")
             if meta["quantization_level"]:
-                meta["quantization_level"] = f'{meta["quantization_level"]}-bit'
+                meta["quantization_level"] = f"{meta['quantization_level']}-bit"
         except Exception:
             pass
     # Also check config.json for MLX quantization info (reuse already-loaded cfg)
@@ -177,6 +177,7 @@ class ModelStore:
 
     def delete(self, name: str) -> bool:
         import shutil
+
         model_dir = self._resolve_model_dir(name)
         if model_dir is not None:
             shutil.rmtree(model_dir)

@@ -8,9 +8,14 @@ from mlx_ollama.config import Settings
 class TestSettings:
     def test_defaults(self, monkeypatch):
         # Clear any env vars
-        for key in ("MLX_OLLAMA_HOST", "MLX_OLLAMA_PORT", "MLX_OLLAMA_MODELS_DIR",
-                     "MLX_OLLAMA_MODELS_CONFIG", "MLX_OLLAMA_DEFAULT_KEEP_ALIVE",
-                     "MLX_OLLAMA_MAX_LOADED_MODELS"):
+        for key in (
+            "MLX_OLLAMA_HOST",
+            "MLX_OLLAMA_PORT",
+            "MLX_OLLAMA_MODELS_DIR",
+            "MLX_OLLAMA_MODELS_CONFIG",
+            "MLX_OLLAMA_DEFAULT_KEEP_ALIVE",
+            "MLX_OLLAMA_MAX_LOADED_MODELS",
+        ):
             monkeypatch.delenv(key, raising=False)
         s = Settings()
         assert s.host == "0.0.0.0"

@@ -33,7 +33,9 @@ class CancellableStream:
     before releasing locks).
     """
 
-    def __init__(self, gen_factory: Callable[[threading.Event], Generator], is_vlm: bool = False):
+    def __init__(
+        self, gen_factory: Callable[[threading.Event], Generator], is_vlm: bool = False
+    ):
         """
         Args:
             gen_factory: Called with a cancel_event; should return a generator
@@ -83,11 +85,14 @@ class CancellableStream:
             tb = traceback.format_exc()
             try:
                 asyncio.run_coroutine_threadsafe(
-                    self._queue.put({
-                        _ERROR_KEY: str(exc),
-                        "__exc_type__": type(exc).__name__,
-                        "__traceback__": tb,
-                    }), self._loop
+                    self._queue.put(
+                        {
+                            _ERROR_KEY: str(exc),
+                            "__exc_type__": type(exc).__name__,
+                            "__traceback__": tb,
+                        }
+                    ),
+                    self._loop,
                 ).result(timeout=_QUEUE_PUT_TIMEOUT)
             except Exception:
                 pass
@@ -108,6 +113,7 @@ class CancellableStream:
             # catch any Metal operations not on the generation stream.
             try:
                 import mlx.core as mx
+
                 if self._is_vlm:
                     from mlx_vlm.generate import generation_stream
                 else:
@@ -117,6 +123,7 @@ class CancellableStream:
             except Exception:
                 try:
                     import mlx.core as mx
+
                     mx.synchronize()
                 except Exception:
                     pass
@@ -154,7 +161,9 @@ class CancellableStream:
                     if self._thread is None or not self._thread.is_alive():
                         break
                     # Thread still running (e.g. long prefill) — keep waiting
-                    logger.debug("drain_and_join: thread still alive, continuing to wait")
+                    logger.debug(
+                        "drain_and_join: thread still alive, continuing to wait"
+                    )
                     continue
         if self._thread is not None:
             # Wait for the thread to fully exit — no timeout
@@ -171,7 +180,9 @@ class CancellableStream:
             exc_type = item.get("__exc_type__", "RuntimeError")
             tb = item.get("__traceback__", "")
             if tb:
-                logger.error("Inference error (%s): %s\n%s", exc_type, item[_ERROR_KEY], tb)
+                logger.error(
+                    "Inference error (%s): %s\n%s", exc_type, item[_ERROR_KEY], tb
+                )
             raise RuntimeError(f"{exc_type}: {item[_ERROR_KEY]}")
         return item
 
@@ -189,18 +200,28 @@ def async_mlx_stream(
 
     Returns a CancellableStream (started and ready to iterate).
     """
+
     def gen_factory(cancel_event: threading.Event):
         if is_vlm:
             import mlx_vlm
+
             return mlx_vlm.stream_generate(
-                model, tokenizer, prompt=prompt, image=images,
-                max_tokens=max_tokens, **kwargs,
+                model,
+                tokenizer,
+                prompt=prompt,
+                image=images,
+                max_tokens=max_tokens,
+                **kwargs,
             )
         else:
             import mlx_lm
+
             return mlx_lm.stream_generate(
-                model, tokenizer, prompt=prompt,
-                max_tokens=max_tokens, **kwargs,
+                model,
+                tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                **kwargs,
             )
 
     stream = CancellableStream(gen_factory, is_vlm=is_vlm)
