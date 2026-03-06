@@ -1,0 +1,174 @@
+"""Tests for mlx_ollama.app."""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from mlx_ollama.app import ForceJSONMiddleware, _make_error_response, create_app
+
+
+class TestMakeErrorResponse:
+    def test_anthropic_path(self):
+        resp = _make_error_response(
+            "/v1/messages", 400, "bad request",
+            "invalid_request_error", "invalid_request_error", "invalid_value",
+        )
+        assert resp.status_code == 400
+        import json
+        body = json.loads(resp.body)
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "invalid_request_error"
+
+    def test_openai_path(self):
+        resp = _make_error_response(
+            "/v1/chat/completions", 500, "server error",
+            "api_error", "server_error", "internal_error",
+        )
+        import json
+        body = json.loads(resp.body)
+        assert "error" in body
+        assert body["error"]["type"] == "server_error"
+
+    def test_ollama_path(self):
+        resp = _make_error_response(
+            "/api/generate", 400, "bad",
+            "invalid_request_error", "invalid_request_error", "invalid_value",
+        )
+        import json
+        body = json.loads(resp.body)
+        assert body["error"] == "bad"
+
+
+class TestCreateApp:
+    def test_app_created(self):
+        app = create_app()
+        assert app.title == "MLX Ollama"
+
+    def test_routers_registered(self):
+        app = create_app()
+        paths = [route.path for route in app.routes]
+        assert "/" in paths
+        assert "/api/version" in paths
+        assert "/api/tags" in paths
+        assert "/v1/messages" in paths
+        assert "/v1/chat/completions" in paths
+
+
+class TestLifespan:
+    @pytest.mark.asyncio
+    async def test_lifespan_startup_shutdown(self, tmp_path, monkeypatch):
+        """Test that the lifespan creates and cleans up state properly."""
+        from mlx_ollama.app import lifespan
+
+        monkeypatch.setattr("mlx_ollama.app.settings.models_dir", tmp_path / "models")
+        monkeypatch.setattr("mlx_ollama.app.settings.models_config", tmp_path / "models.json")
+        (tmp_path / "models.json").write_text("{}")
+
+        app = MagicMock()
+        app.state = MagicMock()
+
+        async with lifespan(app):
+            assert hasattr(app.state, "registry")
+            assert hasattr(app.state, "model_manager")
+            assert hasattr(app.state, "model_store")
+            assert (tmp_path / "models").exists()
+
+
+class TestForceJSONMiddleware:
+    @pytest.mark.asyncio
+    async def test_non_json_content_type_rewritten(self, app_client):
+        # Send with form content-type — middleware should rewrite to JSON
+        resp = await app_client.post(
+            "/api/show",
+            content='{"model": "nonexistent"}',
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        # Should still parse as JSON successfully
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_json_content_type_unchanged(self, app_client):
+        resp = await app_client.post(
+            "/api/show",
+            json={"model": "nonexistent"},
+        )
+        assert resp.status_code == 200
+
+
+class TestErrorHandlers:
+    @pytest.mark.asyncio
+    async def test_value_error_handler_ollama(self, app_client):
+        from unittest.mock import AsyncMock, patch
+
+        with patch("mlx_ollama.routers.generate.generate_completion", new_callable=AsyncMock) as mock_gen:
+            mock_gen.side_effect = ValueError("bad input")
+            resp = await app_client.post("/api/generate", json={
+                "model": "qwen3", "prompt": "hi", "stream": False,
+            })
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"] == "bad input"
+
+    @pytest.mark.asyncio
+    async def test_value_error_handler_anthropic(self, app_client):
+        from unittest.mock import AsyncMock, patch
+
+        with patch("mlx_ollama.routers.anthropic.generate_chat", new_callable=AsyncMock) as mock_gen:
+            mock_gen.side_effect = ValueError("invalid model")
+            resp = await app_client.post("/v1/messages", json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+            })
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "invalid_request_error"
+
+    @pytest.mark.asyncio
+    async def test_value_error_handler_openai(self, app_client):
+        from unittest.mock import AsyncMock, patch
+
+        with patch("mlx_ollama.routers.openai.generate_chat", new_callable=AsyncMock) as mock_gen:
+            mock_gen.side_effect = ValueError("bad request")
+            resp = await app_client.post("/v1/chat/completions", json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+        assert resp.status_code == 400
+        data = resp.json()
+        assert "error" in data
+        assert data["error"]["type"] == "invalid_request_error"
+
+    @pytest.mark.asyncio
+    async def test_runtime_error_handler(self, app_client):
+        from unittest.mock import AsyncMock, patch
+
+        with patch("mlx_ollama.routers.generate.generate_completion", new_callable=AsyncMock) as mock_gen:
+            mock_gen.side_effect = RuntimeError("engine crashed")
+            resp = await app_client.post("/api/generate", json={
+                "model": "qwen3", "prompt": "hi", "stream": False,
+            })
+        assert resp.status_code == 500
+        data = resp.json()
+        assert data["error"] == "engine crashed"
+
+    @pytest.mark.asyncio
+    async def test_general_error_handler(self, app_client):
+        from unittest.mock import AsyncMock, patch
+
+        with patch("mlx_ollama.routers.generate.generate_completion", new_callable=AsyncMock) as mock_gen:
+            mock_gen.side_effect = TypeError("unexpected error")
+            resp = await app_client.post("/api/generate", json={
+                "model": "qwen3", "prompt": "hi", "stream": False,
+            })
+        assert resp.status_code == 500
+        data = resp.json()
+        assert "TypeError" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_general_endpoints_exist(self, app_client):
+        resp = await app_client.get("/")
+        assert resp.status_code == 200
+        assert "running" in resp.text.lower()
