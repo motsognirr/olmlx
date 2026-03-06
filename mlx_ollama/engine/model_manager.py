@@ -74,6 +74,12 @@ class ModelManager:
                 pass
         self._loaded.clear()
 
+    def _resolve_keep_alive(self, keep_alive: str | None) -> float | None:
+        """Parse keep_alive, falling back to the global default."""
+        return parse_keep_alive(
+            keep_alive if keep_alive is not None else settings.default_keep_alive
+        )
+
     async def ensure_loaded(
         self, name: str, keep_alive: str | None = None
     ) -> LoadedModel:
@@ -83,9 +89,7 @@ class ModelManager:
             if normalized in self._loaded:
                 lm = self._loaded[normalized]
                 # Refresh expiry
-                ka = parse_keep_alive(
-                    keep_alive if keep_alive is not None else settings.default_keep_alive
-                )
+                ka = self._resolve_keep_alive(keep_alive)
                 if ka is not None:
                     lm.expires_at = time.time() + ka
                 else:
@@ -118,9 +122,7 @@ class ModelManager:
             logger.info("Loading model %s from %s", normalized, hf_path)
             model, tokenizer, is_vlm, caps = await asyncio.to_thread(self._load_model, hf_path)
 
-            ka = parse_keep_alive(
-                keep_alive if keep_alive is not None else settings.default_keep_alive
-            )
+            ka = self._resolve_keep_alive(keep_alive)
             expires = time.time() + ka if ka is not None else None
 
             logger.info("Model %s caps: tools=%s, thinking=%s, thinking_tags=%s",
@@ -218,6 +220,21 @@ class ModelManager:
 
         return "unknown"
 
+    def _try_lm_then_vlm(self, load_path: str, label: str) -> tuple[Any, Any, bool, TemplateCaps]:
+        """Try loading with mlx-lm first, fall back to mlx-vlm on failure."""
+        try:
+            import mlx_lm
+            model, tokenizer = mlx_lm.load(load_path)
+            caps = detect_caps(tokenizer)
+            return model, tokenizer, False, caps
+        except Exception as exc:
+            logger.warning("mlx-lm failed for %s (%s), trying mlx-vlm", label, exc)
+            import mlx_vlm
+            model, processor = mlx_vlm.load(load_path)
+            tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            caps = detect_caps(tok)
+            return model, processor, True, caps
+
     def _load_model(self, hf_path: str) -> tuple[Any, Any, bool, TemplateCaps]:
         """Load a model, using config.json inspection to choose the right library."""
         # Ensure model is downloaded to the store
@@ -238,39 +255,12 @@ class ModelManager:
             # VLM detected — load with mlx-vlm directly
             import mlx_vlm
             model, processor = mlx_vlm.load(load_path)
-            # Try to get template caps from underlying tokenizer
             tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
             caps = detect_caps(tok)
             return model, processor, True, caps
 
-        if kind == "text":
-            # Text model — load with mlx-lm, fall back to mlx-vlm if it fails
-            try:
-                import mlx_lm
-                model, tokenizer = mlx_lm.load(load_path)
-                caps = detect_caps(tokenizer)
-                return model, tokenizer, False, caps
-            except Exception as exc:
-                logger.warning("mlx-lm failed for detected-text model %s (%s), trying mlx-vlm", hf_path, exc)
-                import mlx_vlm
-                model, processor = mlx_vlm.load(load_path)
-                tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-                caps = detect_caps(tok)
-                return model, processor, True, caps
-
-        # Unknown — try mlx-lm first, fall back to mlx-vlm
-        try:
-            import mlx_lm
-            model, tokenizer = mlx_lm.load(load_path)
-            caps = detect_caps(tokenizer)
-            return model, tokenizer, False, caps
-        except Exception as exc:
-            logger.info("mlx-lm failed for %s (%s), trying mlx-vlm", hf_path, exc)
-            import mlx_vlm
-            model, processor = mlx_vlm.load(load_path)
-            tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-            caps = detect_caps(tok)
-            return model, processor, True, caps
+        # Text or unknown — try mlx-lm first, fall back to mlx-vlm
+        return self._try_lm_then_vlm(load_path, hf_path)
 
     async def _check_expiry_loop(self):
         while True:
