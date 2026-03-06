@@ -13,7 +13,9 @@ mlx_ollama/
 ├── engine/
 │   ├── inference.py    # generate_chat, generate_completion, generate_embeddings
 │   ├── model_manager.py # Model loading/unloading, keep-alive, LRU eviction
-│   └── registry.py    # Ollama name → HuggingFace repo mapping via models.json
+│   ├── registry.py    # Ollama name → HuggingFace repo mapping via models.json
+│   ├── template_caps.py # Chat template capability detection (tools, thinking)
+│   └── tool_parser.py  # Multi-format tool call parsing (Qwen, Mistral, Llama, DeepSeek, bare JSON)
 ├── models/
 │   ├── manifest.py     # Model manifest/metadata
 │   └── store.py        # Local model storage
@@ -40,7 +42,7 @@ mlx_ollama/
 
 - **Anthropic router** (`routers/anthropic.py`): Buffers full model output before emitting SSE events to properly parse `<think>` blocks (→ thinking content blocks) and `<tool_call>` blocks (→ tool_use content blocks). This is necessary because Qwen 3.5 outputs these as raw text.
 - **Tool format conversion**: Anthropic tool definitions are converted to OpenAI-style `{"type": "function", "function": {...}}` format for `tokenizer.apply_chat_template()`.
-- **Tool call parsing**: Supports Qwen (`<tool_call>`), Mistral (`[TOOL_CALLS]`), and bare JSON formats.
+- **Tool call parsing**: Supports Qwen (`<tool_call>`), Mistral (`[TOOL_CALLS]`), Llama 3.x, DeepSeek, and bare JSON formats.
 - **Message conversion**: `tool_result` blocks → `role: "tool"` messages; `tool_use` blocks → `tool_calls` array; `thinking` blocks in history are skipped.
 - **Model storage**: Models stored by HF repo path (e.g. `Qwen--Qwen3-8B`). `ModelManager` takes a `ModelStore` dependency for local-first config loading and auto-download.
 - **Active inference protection**: `LoadedModel.active_refs` prevents LRU eviction and expiry of models currently serving requests.

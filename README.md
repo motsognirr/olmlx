@@ -4,7 +4,7 @@ Drop-in Ollama API replacement powered by Apple's [MLX](https://github.com/ml-ex
 
 ## Requirements
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
+- macOS with Apple Silicon (M1/M2/M3/M4/M5)
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
 
@@ -150,6 +150,14 @@ print(response["message"]["content"])
 | `/v1/completions` | POST | Text completion |
 | `/v1/models` | GET | List models |
 | `/v1/embeddings` | POST | Generate embeddings |
+
+### Anthropic Messages API
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/messages` | POST | Anthropic Messages API (SSE streaming supported) |
+
+This endpoint allows using the server as a backend for tools that speak the Anthropic API, such as Claude Code. It supports thinking blocks, tool use, and streaming.
 
 ## Configuration
 
