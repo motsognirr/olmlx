@@ -8,7 +8,8 @@ Ollama-compatible API server using Apple MLX for local inference on Apple Silico
 mlx_ollama/
 ├── app.py              # FastAPI app factory, middleware, router registration
 ├── config.py           # Settings (pydantic-settings, MLX_OLLAMA_ env prefix)
-├── __main__.py         # Entry point (uv run mlx-ollama)
+├── cli.py              # CLI with subcommands (serve, service install/uninstall/status)
+├── __main__.py         # Entry point (delegates to cli.py)
 ├── engine/
 │   ├── inference.py    # generate_chat, generate_completion, generate_embeddings
 │   ├── model_manager.py # Model loading/unloading, keep-alive, LRU eviction
@@ -54,7 +55,7 @@ uv run mlx-ollama          # starts on http://localhost:11434
 uv run pytest              # run tests
 ```
 
-Models are configured in `models.json` (gitignored). Copy `models.json.example` to start.
+Models are configured in `~/.mlx_ollama/models.json` (auto-created on first run). For dev, override with `MLX_OLLAMA_MODELS_CONFIG=models.json`.
 
 ### TDD
 

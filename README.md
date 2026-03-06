@@ -8,26 +8,48 @@ Drop-in Ollama API replacement powered by Apple's [MLX](https://github.com/ml-ex
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
 
-## Quick Start
+## Install
+
+### Option 1: Global install (recommended)
 
 ```bash
-# Clone and install
-git clone <repo-url> && cd mlx-for-claude
-uv sync --no-editable
-
-# Configure your models
-cp models.json.example models.json
-# Edit models.json to add your desired model mappings
+# Install globally — no clone needed
+uv tool install git+ssh://git@github.com/dpalmqvist/mlx_ollama.git
 
 # Start the server
+mlx-ollama
+```
+
+On first run, `~/.mlx_ollama/models.json` is created with example model mappings.
+
+### Option 2: From source
+
+```bash
+git clone <repo-url> && cd mlx-for-claude
+uv sync --no-editable
 uv run mlx-ollama
 ```
 
 The server starts on `http://localhost:11434` — the same default port as Ollama.
 
+## Auto-start on Login (macOS)
+
+```bash
+# Install as a launchd service — starts on login, restarts on crash
+mlx-ollama service install
+
+# Check status
+mlx-ollama service status
+
+# Remove the service
+mlx-ollama service uninstall
+```
+
+The service writes logs to `~/.mlx_ollama/mlx-ollama.log`.
+
 ## Model Configuration
 
-Edit `models.json` to map Ollama-style model names to HuggingFace repos. MLX-format models from [mlx-community](https://huggingface.co/mlx-community) work best:
+Edit `~/.mlx_ollama/models.json` to map Ollama-style model names to HuggingFace repos. MLX-format models from [mlx-community](https://huggingface.co/mlx-community) work best:
 
 ```json
 {
@@ -138,7 +160,7 @@ All settings can be overridden with `MLX_OLLAMA_`-prefixed environment variables
 | `MLX_OLLAMA_HOST` | `0.0.0.0` | Bind address |
 | `MLX_OLLAMA_PORT` | `11434` | Port |
 | `MLX_OLLAMA_MODELS_DIR` | `~/.mlx_ollama/models` | Where downloaded models are stored |
-| `MLX_OLLAMA_MODELS_CONFIG` | `models.json` | Path to model mapping file |
+| `MLX_OLLAMA_MODELS_CONFIG` | `~/.mlx_ollama/models.json` | Path to model mapping file |
 | `MLX_OLLAMA_DEFAULT_KEEP_ALIVE` | `5m` | How long idle models stay loaded (`0` = unload immediately, `-1` = never unload) |
 | `MLX_OLLAMA_MAX_LOADED_MODELS` | `1` | Max models loaded concurrently (LRU eviction when exceeded) |
 
