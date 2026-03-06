@@ -14,7 +14,7 @@ Drop-in Ollama API replacement powered by Apple's [MLX](https://github.com/ml-ex
 
 ```bash
 # Install globally — no clone needed
-uv tool install git+ssh://git@github.com/dpalmqvist/mlx_ollama.git
+uv tool install git+ssh://git@github.com/motsognirr/olmlx.git
 
 # Start the server
 mlx-ollama

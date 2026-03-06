@@ -65,5 +65,5 @@ Use test-driven development: write failing tests first, then implement the code 
 
 ## Git
 
-- Remote: `git@github.com:dpalmqvist/mlx_ollama.git`
+- Remote: `git@github.com:motsognirr/olmlx.git`
 - Author: Daniel Palmqvist <daniel.u.palmqvist@gmail.com>
