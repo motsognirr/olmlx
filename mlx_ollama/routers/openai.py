@@ -30,6 +30,37 @@ def _make_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
 
+async def _stream_openai_sse(result, response_id, model, created, object_type, format_content, format_done):
+    """Shared SSE streaming for OpenAI-compatible endpoints.
+
+    format_content(text) -> choices[0] dict for content chunks
+    format_done() -> choices[0] dict for the final chunk
+    """
+    try:
+        async for chunk in result:
+            if chunk.get("done"):
+                data = {
+                    "id": response_id,
+                    "object": object_type,
+                    "created": created,
+                    "model": model,
+                    "choices": [format_done()],
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+                yield "data: [DONE]\n\n"
+            else:
+                data = {
+                    "id": response_id,
+                    "object": object_type,
+                    "created": created,
+                    "model": model,
+                    "choices": [format_content(chunk.get("text", ""))],
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+    finally:
+        await result.aclose()
+
+
 def _build_options(req) -> dict:
     opts = {}
     if req.temperature is not None:
@@ -62,41 +93,15 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             tools=req.tools, stream=True, max_tokens=max_tokens,
         )
 
-        async def stream_sse():
-            try:
-                async for chunk in result:
-                    if chunk.get("done"):
-                        data = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": req.model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop",
-                            }],
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
-                        yield "data: [DONE]\n\n"
-                    else:
-                        text = chunk.get("text", "")
-                        data = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": req.model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": text},
-                                "finish_reason": None,
-                            }],
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
-            finally:
-                await result.aclose()
-
-        return StreamingResponse(stream_sse(), media_type="text/event-stream")
+        return StreamingResponse(
+            _stream_openai_sse(
+                result, chat_id, req.model, created,
+                "chat.completion.chunk",
+                lambda text: {"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None},
+                lambda: {"index": 0, "delta": {}, "finish_reason": "stop"},
+            ),
+            media_type="text/event-stream",
+        )
     else:
         result = await generate_chat(
             manager, req.model, messages, options,
@@ -139,40 +144,15 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
             stream=True, max_tokens=max_tokens,
         )
 
-        async def stream_sse():
-            try:
-                async for chunk in result:
-                    if chunk.get("done"):
-                        data = {
-                            "id": comp_id,
-                            "object": "text_completion",
-                            "created": created,
-                            "model": req.model,
-                            "choices": [{
-                                "index": 0,
-                                "text": "",
-                                "finish_reason": "stop",
-                            }],
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
-                        yield "data: [DONE]\n\n"
-                    else:
-                        data = {
-                            "id": comp_id,
-                            "object": "text_completion",
-                            "created": created,
-                            "model": req.model,
-                            "choices": [{
-                                "index": 0,
-                                "text": chunk.get("text", ""),
-                                "finish_reason": None,
-                            }],
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
-            finally:
-                await result.aclose()
-
-        return StreamingResponse(stream_sse(), media_type="text/event-stream")
+        return StreamingResponse(
+            _stream_openai_sse(
+                result, comp_id, req.model, created,
+                "text_completion",
+                lambda text: {"index": 0, "text": text, "finish_reason": None},
+                lambda: {"index": 0, "text": "", "finish_reason": "stop"},
+            ),
+            media_type="text/event-stream",
+        )
     else:
         result = await generate_completion(
             manager, req.model, prompt, options,
