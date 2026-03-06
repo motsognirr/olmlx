@@ -77,6 +77,29 @@ class ModelStore:
         self.registry = registry
         self.models_dir = settings.models_dir
 
+    def local_path(self, hf_path: str) -> Path:
+        """Return the local directory for a HF repo ID."""
+        return self.models_dir / _safe_dir_name(hf_path)
+
+    def is_downloaded(self, hf_path: str) -> bool:
+        """Check if a model is already downloaded locally."""
+        return (self.local_path(hf_path) / "config.json").exists()
+
+    def _resolve_model_dir(self, name: str) -> Path | None:
+        """Resolve a model name to its local directory, trying HF-path-based naming first."""
+        hf_path = self.registry.resolve(name)
+        if hf_path is not None:
+            d = self.local_path(hf_path)
+            if (d / "manifest.json").exists():
+                return d
+        # Fall back to old name-based directories
+        normalized = self.registry.normalize_name(name)
+        for candidate in [_safe_dir_name(normalized), _safe_dir_name(name)]:
+            d = self.models_dir / candidate
+            if (d / "manifest.json").exists():
+                return d
+        return None
+
     async def pull(self, name: str) -> AsyncGenerator[dict, None]:
         """Pull a model from HuggingFace, yielding progress dicts."""
         hf_path = self.registry.resolve(name)
@@ -86,8 +109,18 @@ class ModelStore:
             else:
                 raise ValueError(f"Model '{name}' not found in config")
 
-        safe_name = _safe_dir_name(name)
-        local_dir = self.models_dir / safe_name
+        local_dir = self.local_path(hf_path)
+
+        # Skip download if already present
+        if self.is_downloaded(hf_path):
+            yield {"status": "pulling manifest"}
+            yield {"status": "already downloaded"}
+            yield {"status": "success"}
+            # Ensure registered
+            if "/" not in name:
+                self.registry.add_mapping(name, hf_path)
+            return
+
         local_dir.mkdir(parents=True, exist_ok=True)
 
         yield {"status": "pulling manifest"}
@@ -121,6 +154,10 @@ class ModelStore:
         )
         manifest.save(local_dir / "manifest.json")
 
+        # Auto-register in models.json
+        if "/" not in name:
+            self.registry.add_mapping(name, hf_path)
+
         yield {"status": "success"}
 
     def list_local(self) -> list[ModelManifest]:
@@ -139,27 +176,15 @@ class ModelStore:
         return models
 
     def show(self, name: str) -> ModelManifest | None:
-        safe_name = _safe_dir_name(self.registry.normalize_name(name))
-        manifest_path = self.models_dir / safe_name / "manifest.json"
-        if manifest_path.exists():
-            return ModelManifest.load(manifest_path)
-        # Try direct name
-        safe_name = _safe_dir_name(name)
-        manifest_path = self.models_dir / safe_name / "manifest.json"
-        if manifest_path.exists():
-            return ModelManifest.load(manifest_path)
+        model_dir = self._resolve_model_dir(name)
+        if model_dir is not None:
+            return ModelManifest.load(model_dir / "manifest.json")
         return None
 
     def delete(self, name: str) -> bool:
         import shutil
-        safe_name = _safe_dir_name(self.registry.normalize_name(name))
-        model_dir = self.models_dir / safe_name
-        if model_dir.exists():
-            shutil.rmtree(model_dir)
-            return True
-        safe_name = _safe_dir_name(name)
-        model_dir = self.models_dir / safe_name
-        if model_dir.exists():
+        model_dir = self._resolve_model_dir(name)
+        if model_dir is not None:
             shutil.rmtree(model_dir)
             return True
         return False

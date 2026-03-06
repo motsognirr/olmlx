@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import importlib
 import json
@@ -5,11 +7,14 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mlx_ollama.config import settings
 from mlx_ollama.engine.registry import ModelRegistry
 from mlx_ollama.engine.template_caps import TemplateCaps, detect_caps
+
+if TYPE_CHECKING:
+    from mlx_ollama.models.store import ModelStore
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +30,7 @@ class LoadedModel:
     loaded_at: float = field(default_factory=time.time)
     expires_at: float | None = None
     size_bytes: int = 0
+    active_refs: int = 0
 
 
 def parse_keep_alive(value: str | int) -> float | None:
@@ -49,8 +55,9 @@ def parse_keep_alive(value: str | int) -> float | None:
 class ModelManager:
     """Manages loading/unloading of MLX models with LRU eviction."""
 
-    def __init__(self, registry: ModelRegistry):
+    def __init__(self, registry: ModelRegistry, store: ModelStore | None = None):
         self.registry = registry
+        self.store = store
         self._loaded: dict[str, LoadedModel] = {}
         self._lock = asyncio.Lock()
         self._expiry_task: asyncio.Task | None = None
@@ -85,11 +92,16 @@ class ModelManager:
                     lm.expires_at = None
                 return lm
 
-            # Evict LRU if at capacity
+            # Evict LRU if at capacity (skip models with active inference)
             while len(self._loaded) >= settings.max_loaded_models:
-                oldest_name = min(
-                    self._loaded, key=lambda k: self._loaded[k].loaded_at
-                )
+                evictable = {
+                    k: v for k, v in self._loaded.items() if v.active_refs == 0
+                }
+                if not evictable:
+                    raise RuntimeError(
+                        "All loaded models are in use, cannot evict to load a new model"
+                    )
+                oldest_name = min(evictable, key=lambda k: evictable[k].loaded_at)
                 logger.info("Evicting model %s", oldest_name)
                 del self._loaded[oldest_name]
 
@@ -98,6 +110,10 @@ class ModelManager:
                 raise ValueError(
                     f"Model '{name}' not found. Add it to models.json or use a HuggingFace path."
                 )
+
+            # Auto-register direct HF paths so future requests find them
+            if "/" in name:
+                self.registry.add_mapping(name, hf_path)
 
             logger.info("Loading model %s from %s", normalized, hf_path)
             model, tokenizer, is_vlm, caps = await asyncio.to_thread(self._load_model, hf_path)
@@ -137,16 +153,27 @@ class ModelManager:
         "visual_config", "vit_config",
     })
 
-    @staticmethod
-    def _detect_model_kind(hf_path: str) -> str:
+    def _detect_model_kind(self, hf_path: str) -> str:
         """Return 'text', 'vlm', or 'unknown' by checking config.json against installed libraries."""
-        try:
-            from huggingface_hub import hf_hub_download
-            config_path = hf_hub_download(hf_path, "config.json")
-            with open(config_path) as f:
-                config = json.load(f)
-        except Exception:
-            return "unknown"
+        config = None
+        # Check local store first
+        if self.store is not None:
+            local_config = self.store.local_path(hf_path) / "config.json"
+            if local_config.exists():
+                try:
+                    with open(local_config) as f:
+                        config = json.load(f)
+                except Exception:
+                    pass
+        # Fall back to HF hub
+        if config is None:
+            try:
+                from huggingface_hub import hf_hub_download
+                config_path = hf_hub_download(hf_path, "config.json")
+                with open(config_path) as f:
+                    config = json.load(f)
+            except Exception:
+                return "unknown"
 
         model_type = config.get("model_type", "").lower()
         if not model_type:
@@ -154,7 +181,7 @@ class ModelManager:
 
         # Check for vision-related config keys — these indicate a VLM regardless
         # of whether the base model_type also exists in mlx-lm
-        has_vision_keys = bool(ModelManager._VLM_CONFIG_KEYS & config.keys())
+        has_vision_keys = bool(self._VLM_CONFIG_KEYS & config.keys())
         if has_vision_keys:
             # Verify mlx-vlm can handle it
             try:
@@ -191,16 +218,26 @@ class ModelManager:
 
         return "unknown"
 
-    @staticmethod
-    def _load_model(hf_path: str) -> tuple[Any, Any, bool, TemplateCaps]:
+    def _load_model(self, hf_path: str) -> tuple[Any, Any, bool, TemplateCaps]:
         """Load a model, using config.json inspection to choose the right library."""
-        kind = ModelManager._detect_model_kind(hf_path)
+        # Ensure model is downloaded to the store
+        load_path: str = hf_path
+        if self.store is not None:
+            local_dir = self.store.local_path(hf_path)
+            if not self.store.is_downloaded(hf_path):
+                from huggingface_hub import snapshot_download
+                logger.info("Downloading %s to %s", hf_path, local_dir)
+                local_dir.mkdir(parents=True, exist_ok=True)
+                snapshot_download(repo_id=hf_path, local_dir=str(local_dir))
+            load_path = str(local_dir)
+
+        kind = self._detect_model_kind(hf_path)
         logger.info("Detected model kind for %s: %s", hf_path, kind)
 
         if kind == "vlm":
             # VLM detected — load with mlx-vlm directly
             import mlx_vlm
-            model, processor = mlx_vlm.load(hf_path)
+            model, processor = mlx_vlm.load(load_path)
             # Try to get template caps from underlying tokenizer
             tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
             caps = detect_caps(tok)
@@ -210,13 +247,13 @@ class ModelManager:
             # Text model — load with mlx-lm, fall back to mlx-vlm if it fails
             try:
                 import mlx_lm
-                model, tokenizer = mlx_lm.load(hf_path)
+                model, tokenizer = mlx_lm.load(load_path)
                 caps = detect_caps(tokenizer)
                 return model, tokenizer, False, caps
             except Exception as exc:
                 logger.warning("mlx-lm failed for detected-text model %s (%s), trying mlx-vlm", hf_path, exc)
                 import mlx_vlm
-                model, processor = mlx_vlm.load(hf_path)
+                model, processor = mlx_vlm.load(load_path)
                 tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
                 caps = detect_caps(tok)
                 return model, processor, True, caps
@@ -224,13 +261,13 @@ class ModelManager:
         # Unknown — try mlx-lm first, fall back to mlx-vlm
         try:
             import mlx_lm
-            model, tokenizer = mlx_lm.load(hf_path)
+            model, tokenizer = mlx_lm.load(load_path)
             caps = detect_caps(tokenizer)
             return model, tokenizer, False, caps
         except Exception as exc:
             logger.info("mlx-lm failed for %s (%s), trying mlx-vlm", hf_path, exc)
             import mlx_vlm
-            model, processor = mlx_vlm.load(hf_path)
+            model, processor = mlx_vlm.load(load_path)
             tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
             caps = detect_caps(tok)
             return model, processor, True, caps
@@ -243,7 +280,9 @@ class ModelManager:
                 expired = [
                     name
                     for name, lm in self._loaded.items()
-                    if lm.expires_at is not None and lm.expires_at <= now
+                    if lm.expires_at is not None
+                    and lm.expires_at <= now
+                    and lm.active_refs == 0
                 ]
                 for name in expired:
                     logger.info("Unloading expired model %s", name)

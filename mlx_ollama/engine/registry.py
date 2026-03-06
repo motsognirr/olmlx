@@ -61,6 +61,19 @@ class ModelRegistry:
         self._aliases[alias] = hf_path
         self._save_aliases()
 
+    def add_mapping(self, name: str, hf_path: str):
+        """Add a name → HF path mapping and persist to models.json."""
+        normalized = self.normalize_name(name)
+        if self._mappings.get(normalized) == hf_path:
+            return  # already exists
+        self._mappings[normalized] = hf_path
+        self._save_mappings()
+
+    def _save_mappings(self):
+        settings.models_config.parent.mkdir(parents=True, exist_ok=True)
+        with open(settings.models_config, "w") as f:
+            json.dump(self._mappings, f, indent=2)
+
     def remove(self, name: str):
         """Remove a model alias."""
         normalized = self.normalize_name(name)

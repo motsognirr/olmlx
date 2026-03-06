@@ -29,27 +29,30 @@ async def generate(req: GenerateRequest, request: Request):
         )
 
         async def stream_response():
-            async for chunk in result:
-                now = datetime.now(timezone.utc).isoformat()
-                if chunk.get("done"):
-                    stats = chunk.get("stats")
-                    final = {
-                        "model": req.model,
-                        "created_at": now,
-                        "response": "",
-                        "done": True,
-                        "done_reason": "stop",
-                    }
-                    if stats:
-                        final.update(stats.to_dict())
-                    yield json.dumps(final) + "\n"
-                else:
-                    yield json.dumps({
-                        "model": req.model,
-                        "created_at": now,
-                        "response": chunk.get("text", ""),
-                        "done": False,
-                    }) + "\n"
+            try:
+                async for chunk in result:
+                    now = datetime.now(timezone.utc).isoformat()
+                    if chunk.get("done"):
+                        stats = chunk.get("stats")
+                        final = {
+                            "model": req.model,
+                            "created_at": now,
+                            "response": "",
+                            "done": True,
+                            "done_reason": "stop",
+                        }
+                        if stats:
+                            final.update(stats.to_dict())
+                        yield json.dumps(final) + "\n"
+                    else:
+                        yield json.dumps({
+                            "model": req.model,
+                            "created_at": now,
+                            "response": chunk.get("text", ""),
+                            "done": False,
+                        }) + "\n"
+            finally:
+                await result.aclose()
 
         return StreamingResponse(
             stream_response(), media_type="application/x-ndjson"

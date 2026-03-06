@@ -20,9 +20,9 @@ async def lifespan(app: FastAPI):
     # Startup
     registry = ModelRegistry()
     registry.load()
-    manager = ModelManager(registry)
-    manager.start_expiry_checker()
     store = ModelStore(registry)
+    manager = ModelManager(registry, store)
+    manager.start_expiry_checker()
 
     settings.models_dir.mkdir(parents=True, exist_ok=True)
 

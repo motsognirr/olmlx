@@ -85,11 +85,14 @@ class TestManageRouter:
 
     @pytest.mark.asyncio
     async def test_delete_model_success(self, app_client, tmp_path):
-        # Create a model directory
+        from mlx_ollama.models.manifest import ModelManifest
+
+        # Create a model directory with manifest
         models_dir = tmp_path / "models"
         model_dir = models_dir / "test_latest"
         model_dir.mkdir(parents=True)
         (model_dir / "file.bin").write_bytes(b"\x00")
+        ModelManifest(name="test:latest", hf_path="test/model").save(model_dir / "manifest.json")
 
         resp = await app_client.request("DELETE", "/api/delete", json={"model": "test"})
         assert resp.status_code == 200

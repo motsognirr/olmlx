@@ -60,12 +60,13 @@ class TestLoadedModel:
 
 
 class TestModelManager:
-    def test_init(self, registry):
-        manager = ModelManager(registry)
+    def test_init(self, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
         assert manager._loaded == {}
+        assert manager.store is mock_store
 
-    def test_get_loaded_empty(self, registry):
-        manager = ModelManager(registry)
+    def test_get_loaded_empty(self, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
         assert manager.get_loaded() == []
 
     def test_get_loaded(self, mock_manager):
@@ -98,15 +99,15 @@ class TestModelManager:
         assert lm.expires_at is None
 
     @pytest.mark.asyncio
-    async def test_ensure_loaded_unknown_model(self, registry):
-        manager = ModelManager(registry)
+    async def test_ensure_loaded_unknown_model(self, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
         with pytest.raises(ValueError, match="not found"):
             await manager.ensure_loaded("unknown_model")
 
     @pytest.mark.asyncio
-    async def test_ensure_loaded_evicts_lru(self, registry, monkeypatch):
+    async def test_ensure_loaded_evicts_lru(self, registry, mock_store, monkeypatch):
         monkeypatch.setattr("mlx_ollama.engine.model_manager.settings.max_loaded_models", 1)
-        manager = ModelManager(registry)
+        manager = ModelManager(registry, mock_store)
 
         # Pre-load a model
         old_lm = LoadedModel(
@@ -123,7 +124,7 @@ class TestModelManager:
         mock_tokenizer = MagicMock()
         mock_tokenizer.chat_template = None
         with patch.object(
-            ModelManager, "_load_model",
+            manager, "_load_model",
             return_value=(mock_model, mock_tokenizer, False, TemplateCaps()),
         ):
             lm = await manager.ensure_loaded("qwen3")
@@ -154,154 +155,224 @@ class TestDetectModelKind:
         config_path.write_text(json.dumps(config_data))
         return str(config_path)
 
-    def test_text_model(self, tmp_path):
+    def _make_manager(self, registry, mock_store):
+        return ModelManager(registry, mock_store)
+
+    def test_text_model(self, tmp_path, registry, mock_store):
         config_path = self._make_config(tmp_path, {"model_type": "llama"})
+        manager = self._make_manager(registry, mock_store)
 
-        mock_hf = MagicMock()
-        mock_hf.hf_hub_download = MagicMock(return_value=config_path)
-
-        with patch.dict("sys.modules", {"huggingface_hub": mock_hf}):
-            with patch("importlib.util.find_spec", return_value=MagicMock()):
-                kind = ModelManager._detect_model_kind("test/model")
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/model")
         assert kind == "text"
 
-    def test_vlm_with_vision_keys(self, tmp_path):
+    def test_vlm_with_vision_keys(self, tmp_path, registry, mock_store):
         config_path = self._make_config(tmp_path, {
             "model_type": "qwen2_vl", "vision_config": {"hidden_size": 1024},
         })
+        manager = self._make_manager(registry, mock_store)
 
-        mock_hf = MagicMock()
-        mock_hf.hf_hub_download = MagicMock(return_value=config_path)
-
-        with patch.dict("sys.modules", {"huggingface_hub": mock_hf}):
-            with patch("importlib.util.find_spec", return_value=MagicMock()):
-                kind = ModelManager._detect_model_kind("test/vlm")
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/vlm")
         assert kind == "vlm"
 
-    def test_config_download_fails(self):
-        mock_hf = MagicMock()
-        mock_hf.hf_hub_download = MagicMock(side_effect=Exception("not found"))
-
-        with patch.dict("sys.modules", {"huggingface_hub": mock_hf}):
-            kind = ModelManager._detect_model_kind("nonexistent/model")
+    def test_config_download_fails(self, registry, mock_store):
+        manager = self._make_manager(registry, mock_store)
+        with patch("huggingface_hub.hf_hub_download", side_effect=Exception("not found")):
+            kind = manager._detect_model_kind("nonexistent/model")
         assert kind == "unknown"
 
-    def test_no_model_type(self, tmp_path):
+    def test_no_model_type(self, tmp_path, registry, mock_store):
         config_path = self._make_config(tmp_path, {"hidden_size": 1024})
+        manager = self._make_manager(registry, mock_store)
 
-        mock_hf = MagicMock()
-        mock_hf.hf_hub_download = MagicMock(return_value=config_path)
-
-        with patch.dict("sys.modules", {"huggingface_hub": mock_hf}):
-            kind = ModelManager._detect_model_kind("test/model")
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/model")
         assert kind == "unknown"
 
-    def test_vlm_no_spec_found(self, tmp_path):
+    def test_vlm_no_spec_found(self, tmp_path, registry, mock_store):
         config_path = self._make_config(tmp_path, {
             "model_type": "custom_vlm", "vision_config": {},
         })
+        manager = self._make_manager(registry, mock_store)
 
-        mock_hf = MagicMock()
-        mock_hf.hf_hub_download = MagicMock(return_value=config_path)
+        import importlib.util
+        real_find_spec = importlib.util.find_spec
 
-        with patch.dict("sys.modules", {"huggingface_hub": mock_hf}):
-            with patch("importlib.util.find_spec", return_value=None):
-                kind = ModelManager._detect_model_kind("test/vlm")
+        def none_for_models(name, *args, **kwargs):
+            if name.startswith(("mlx_lm.models.", "mlx_vlm.models.")):
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            with patch("importlib.util.find_spec", side_effect=none_for_models):
+                kind = manager._detect_model_kind("test/vlm")
         # Has vision keys but spec not found — still returns vlm
         assert kind == "vlm"
 
-    def test_text_model_with_real_imports(self, tmp_path):
+    def test_text_model_with_real_imports(self, tmp_path, registry, mock_store):
         """Test _detect_model_kind with a model_type that exists in mlx-lm."""
         config_path = self._make_config(tmp_path, {"model_type": "llama"})
+        manager = self._make_manager(registry, mock_store)
 
-        mock_hf = MagicMock()
-        mock_hf.hf_hub_download = MagicMock(return_value=config_path)
-
-        with patch.dict("sys.modules", {"huggingface_hub": mock_hf}):
-            kind = ModelManager._detect_model_kind("test/model")
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/model")
         # llama is a known text model type
         assert kind == "text"
 
+    def test_uses_local_config_first(self, tmp_path, registry, mock_store):
+        """When config.json exists locally, skip HF hub download."""
+        # Write config.json in the store's local path
+        local_dir = mock_store.local_path("test/model")
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+
+        manager = self._make_manager(registry, mock_store)
+        # Should NOT call hf_hub_download
+        with patch("huggingface_hub.hf_hub_download") as mock_dl:
+            kind = manager._detect_model_kind("test/model")
+        assert kind == "text"
+        mock_dl.assert_not_called()
+
 
 class TestLoadModel:
-    def test_load_text_model(self):
+    def _make_manager(self, registry, mock_store):
+        return ModelManager(registry, mock_store)
+
+    def _pre_download(self, mock_store, hf_path):
+        """Simulate a downloaded model by creating config.json in the store."""
+        local_dir = mock_store.local_path(hf_path)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}")
+
+    def test_load_text_model(self, registry, mock_store):
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/path")
         mock_model = MagicMock()
         mock_tokenizer = MagicMock()
         mock_tokenizer.chat_template = None
 
-        with patch.object(ModelManager, "_detect_model_kind", return_value="text"):
+        with patch.object(manager, "_detect_model_kind", return_value="text"):
             mock_mlx_lm = MagicMock()
             mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
             with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
-                model, tokenizer, is_vlm, caps = ModelManager._load_model("test/path")
+                model, tokenizer, is_vlm, caps = manager._load_model("test/path")
 
         assert is_vlm is False
         assert model is mock_model
 
-    def test_load_vlm_model(self):
+    def test_load_vlm_model(self, registry, mock_store):
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/vlm")
         mock_model = MagicMock()
         mock_processor = MagicMock()
         mock_processor.tokenizer = MagicMock()
         mock_processor.tokenizer.chat_template = None
 
-        with patch.object(ModelManager, "_detect_model_kind", return_value="vlm"):
+        with patch.object(manager, "_detect_model_kind", return_value="vlm"):
             mock_mlx_vlm = MagicMock()
             mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
             with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
-                model, tokenizer, is_vlm, caps = ModelManager._load_model("test/vlm")
+                model, tokenizer, is_vlm, caps = manager._load_model("test/vlm")
 
         assert is_vlm is True
 
-    def test_load_text_fallback_to_vlm(self):
+    def test_load_text_fallback_to_vlm(self, registry, mock_store):
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/path")
         mock_model = MagicMock()
         mock_processor = MagicMock()
         mock_processor.tokenizer = MagicMock()
         mock_processor.tokenizer.chat_template = None
 
-        with patch.object(ModelManager, "_detect_model_kind", return_value="text"):
+        with patch.object(manager, "_detect_model_kind", return_value="text"):
             mock_mlx_lm = MagicMock()
             mock_mlx_lm.load.side_effect = Exception("unsupported")
             mock_mlx_vlm = MagicMock()
             mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
             with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}):
-                model, tokenizer, is_vlm, caps = ModelManager._load_model("test/path")
+                model, tokenizer, is_vlm, caps = manager._load_model("test/path")
 
         assert is_vlm is True
 
-    def test_load_unknown_tries_mlx_lm_first(self):
+    def test_load_unknown_tries_mlx_lm_first(self, registry, mock_store):
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/path")
         mock_model = MagicMock()
         mock_tokenizer = MagicMock()
         mock_tokenizer.chat_template = None
 
-        with patch.object(ModelManager, "_detect_model_kind", return_value="unknown"):
+        with patch.object(manager, "_detect_model_kind", return_value="unknown"):
             mock_mlx_lm = MagicMock()
             mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
             with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
-                model, tokenizer, is_vlm, caps = ModelManager._load_model("test/path")
+                model, tokenizer, is_vlm, caps = manager._load_model("test/path")
 
         assert is_vlm is False
 
-    def test_load_unknown_fallback_to_vlm(self):
+    def test_load_unknown_fallback_to_vlm(self, registry, mock_store):
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/path")
         mock_model = MagicMock()
         mock_processor = MagicMock()
         mock_processor.tokenizer = MagicMock()
         mock_processor.tokenizer.chat_template = None
 
-        with patch.object(ModelManager, "_detect_model_kind", return_value="unknown"):
+        with patch.object(manager, "_detect_model_kind", return_value="unknown"):
             mock_mlx_lm = MagicMock()
             mock_mlx_lm.load.side_effect = Exception("fail")
             mock_mlx_vlm = MagicMock()
             mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
             with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}):
-                model, tokenizer, is_vlm, caps = ModelManager._load_model("test/path")
+                model, tokenizer, is_vlm, caps = manager._load_model("test/path")
 
         assert is_vlm is True
+
+    def test_load_uses_local_path(self, registry, mock_store):
+        """When model is already downloaded, load from local path, not HF repo ID."""
+        manager = self._make_manager(registry, mock_store)
+        # Create a fake downloaded model
+        local_dir = mock_store.local_path("test/path")
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
+
+        with patch.object(manager, "_detect_model_kind", return_value="text"):
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                manager._load_model("test/path")
+
+        # Should have been called with local path, not HF repo ID
+        call_arg = mock_mlx_lm.load.call_args[0][0]
+        assert call_arg == str(local_dir)
+
+    def test_load_downloads_when_not_cached(self, registry, mock_store):
+        """When model is not downloaded, download it first."""
+        manager = self._make_manager(registry, mock_store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
+
+        with patch.object(manager, "_detect_model_kind", return_value="text"):
+            with patch("huggingface_hub.snapshot_download") as mock_dl:
+                with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                    manager._load_model("test/path")
+
+        mock_dl.assert_called_once()
+        assert mock_dl.call_args[1]["repo_id"] == "test/path"
 
 
 class TestExpiryChecker:
     @pytest.mark.asyncio
-    async def test_expired_models_removed(self, registry):
-        manager = ModelManager(registry)
+    async def test_expired_models_removed(self, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
         lm = LoadedModel(
             name="expired:latest",
             hf_path="test/model",
@@ -323,8 +394,8 @@ class TestExpiryChecker:
         assert "expired:latest" not in manager._loaded
 
     @pytest.mark.asyncio
-    async def test_non_expired_models_kept(self, registry):
-        manager = ModelManager(registry)
+    async def test_non_expired_models_kept(self, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
         lm = LoadedModel(
             name="active:latest",
             hf_path="test/model",

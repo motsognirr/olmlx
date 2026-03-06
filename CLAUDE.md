@@ -41,15 +41,24 @@ mlx_ollama/
 - **Tool format conversion**: Anthropic tool definitions are converted to OpenAI-style `{"type": "function", "function": {...}}` format for `tokenizer.apply_chat_template()`.
 - **Tool call parsing**: Supports Qwen (`<tool_call>`), Mistral (`[TOOL_CALLS]`), and bare JSON formats.
 - **Message conversion**: `tool_result` blocks → `role: "tool"` messages; `tool_use` blocks → `tool_calls` array; `thinking` blocks in history are skipped.
+- **Model storage**: Models stored by HF repo path (e.g. `Qwen--Qwen3-8B`). `ModelManager` takes a `ModelStore` dependency for local-first config loading and auto-download.
+- **Active inference protection**: `LoadedModel.active_refs` prevents LRU eviction and expiry of models currently serving requests.
+- **Stream cleanup**: All streaming routers use `try/finally` with `await result.aclose()` to ensure GPU resources are released on client disconnect.
+- **Auto-registration**: Direct HF paths (e.g. `Qwen/Qwen3-8B`) are auto-registered in `models.json` on first load or pull.
 
 ## Development
 
 ```bash
 uv sync --no-editable
 uv run mlx-ollama          # starts on http://localhost:11434
+uv run pytest              # run tests
 ```
 
 Models are configured in `models.json` (gitignored). Copy `models.json.example` to start.
+
+### TDD
+
+Use test-driven development: write failing tests first, then implement the code to make them pass. For bug fixes, write a test that reproduces the bug before writing the fix.
 
 ## Git
 

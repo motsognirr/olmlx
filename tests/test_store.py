@@ -73,6 +73,29 @@ class TestExtractMetadata:
         assert "bit" in meta["quantization_level"]
 
 
+class TestLocalPath:
+    def test_returns_safe_hf_path(self, mock_store):
+        path = mock_store.local_path("mlx-community/Qwen3.5-27B-mxfp8")
+        assert path.name == "mlx-community_Qwen3.5-27B-mxfp8"
+
+    def test_different_names_same_hf_share_path(self, mock_store):
+        """Multiple Ollama names mapping to the same HF path share one directory."""
+        p1 = mock_store.local_path("org/model")
+        p2 = mock_store.local_path("org/model")
+        assert p1 == p2
+
+
+class TestIsDownloaded:
+    def test_false_when_missing(self, mock_store):
+        assert mock_store.is_downloaded("org/model") is False
+
+    def test_true_when_config_exists(self, mock_store):
+        local_dir = mock_store.local_path("org/model")
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text("{}")
+        assert mock_store.is_downloaded("org/model") is True
+
+
 class TestModelStore:
     def test_list_local_empty(self, mock_store):
         assert mock_store.list_local() == []
@@ -92,7 +115,22 @@ class TestModelStore:
     def test_show_not_found(self, mock_store):
         assert mock_store.show("nonexistent") is None
 
-    def test_show_found(self, mock_store, tmp_path):
+    def test_show_found_hf_path(self, mock_store, tmp_path):
+        """Show finds model stored under HF-path-based directory."""
+        # Store under HF path (new convention)
+        local_dir = mock_store.local_path("test/model")
+        local_dir.mkdir(parents=True)
+        # Register the mapping so resolve works
+        mock_store.registry._mappings["test:latest"] = "test/model"
+        manifest = ModelManifest(name="test:latest", hf_path="test/model")
+        manifest.save(local_dir / "manifest.json")
+
+        result = mock_store.show("test")
+        assert result is not None
+        assert result.name == "test:latest"
+
+    def test_show_found_legacy_dir(self, mock_store, tmp_path):
+        """Show still finds models stored under old name-based directories."""
         models_dir = tmp_path / "models"
         safe_name = "test_latest"
         model_dir = models_dir / safe_name
@@ -112,6 +150,8 @@ class TestModelStore:
         model_dir = models_dir / "test_latest"
         model_dir.mkdir(parents=True)
         (model_dir / "file.bin").write_bytes(b"\x00")
+        manifest = ModelManifest(name="test:latest", hf_path="test/model")
+        manifest.save(model_dir / "manifest.json")
 
         assert mock_store.delete("test") is True
         assert not model_dir.exists()
@@ -134,7 +174,7 @@ class TestModelStore:
 
     @pytest.mark.asyncio
     async def test_pull(self, mock_store, tmp_path):
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import patch
 
         with patch("huggingface_hub.snapshot_download"):
             events = []
@@ -143,6 +183,44 @@ class TestModelStore:
 
         statuses = [e["status"] for e in events]
         assert "pulling manifest" in statuses
+        assert "success" in statuses
+        # Directory should be named after HF path, not Ollama name
+        hf_dir = mock_store.local_path("Qwen/Qwen3-8B-MLX")
+        assert hf_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_pull_auto_registers(self, mock_store, tmp_path, monkeypatch):
+        """Pull should auto-register the mapping in models.json."""
+        from unittest.mock import patch
+
+        models_json = tmp_path / "models.json"
+        monkeypatch.setattr("mlx_ollama.engine.registry.settings.models_config", models_json)
+
+        with patch("huggingface_hub.snapshot_download"):
+            async for _ in mock_store.pull("qwen3"):
+                pass
+
+        # Check that registry was updated
+        assert mock_store.registry.resolve("qwen3") == "Qwen/Qwen3-8B-MLX"
+
+    @pytest.mark.asyncio
+    async def test_pull_skips_if_downloaded(self, mock_store, tmp_path):
+        """Pull should skip download if model is already present."""
+        from unittest.mock import patch
+
+        # Pre-create the model directory with config.json
+        local_dir = mock_store.local_path("Qwen/Qwen3-8B-MLX")
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text("{}")
+
+        with patch("huggingface_hub.snapshot_download") as mock_dl:
+            events = []
+            async for event in mock_store.pull("qwen3"):
+                events.append(event)
+
+        mock_dl.assert_not_called()
+        statuses = [e["status"] for e in events]
+        assert "already downloaded" in statuses
         assert "success" in statuses
 
     @pytest.mark.asyncio

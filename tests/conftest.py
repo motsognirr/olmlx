@@ -56,9 +56,9 @@ def mock_loaded_model():
 
 
 @pytest.fixture
-def mock_manager(registry, mock_loaded_model):
+def mock_manager(registry, mock_loaded_model, mock_store):
     """A ModelManager with mocked loading."""
-    manager = ModelManager(registry)
+    manager = ModelManager(registry, mock_store)
     manager._loaded["qwen3:latest"] = mock_loaded_model
     return manager
 

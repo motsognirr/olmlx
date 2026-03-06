@@ -67,6 +67,23 @@ class TestModelRegistry:
         reg.load()
         assert reg._mappings == {}
 
+    def test_add_mapping(self, registry, tmp_path, monkeypatch):
+        models_json = tmp_path / "models2.json"
+        monkeypatch.setattr("mlx_ollama.engine.registry.settings.models_config", models_json)
+        registry.add_mapping("new-model", "org/new-model-MLX")
+        assert registry.resolve("new-model") == "org/new-model-MLX"
+        # Should be persisted
+        assert models_json.exists()
+        import json
+        saved = json.loads(models_json.read_text())
+        assert saved["new-model:latest"] == "org/new-model-MLX"
+
+    def test_add_mapping_idempotent(self, registry, tmp_path, monkeypatch):
+        models_json = tmp_path / "models2.json"
+        monkeypatch.setattr("mlx_ollama.engine.registry.settings.models_config", models_json)
+        registry.add_mapping("qwen3", "Qwen/Qwen3-8B-MLX")
+        # Should not raise, mapping already exists
+
     def test_list_models_combines_aliases(self, registry, tmp_path):
         registry._aliases_path = tmp_path / "aliases.json"
         registry._aliases["custom:latest"] = "custom/path"

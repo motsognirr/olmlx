@@ -25,30 +25,33 @@ async def chat(req: ChatRequest, request: Request):
         )
 
         async def stream_response():
-            full_text = ""
-            async for chunk in result:
-                now = datetime.now(timezone.utc).isoformat()
-                if chunk.get("done"):
-                    stats = chunk.get("stats")
-                    final = {
-                        "model": req.model,
-                        "created_at": now,
-                        "message": Message(role="assistant", content="").model_dump(),
-                        "done": True,
-                        "done_reason": "stop",
-                    }
-                    if stats:
-                        final.update(stats.to_dict())
-                    yield json.dumps(final) + "\n"
-                else:
-                    text = chunk.get("text", "")
-                    full_text += text
-                    yield json.dumps({
-                        "model": req.model,
-                        "created_at": now,
-                        "message": Message(role="assistant", content=text).model_dump(),
-                        "done": False,
-                    }) + "\n"
+            try:
+                full_text = ""
+                async for chunk in result:
+                    now = datetime.now(timezone.utc).isoformat()
+                    if chunk.get("done"):
+                        stats = chunk.get("stats")
+                        final = {
+                            "model": req.model,
+                            "created_at": now,
+                            "message": Message(role="assistant", content="").model_dump(),
+                            "done": True,
+                            "done_reason": "stop",
+                        }
+                        if stats:
+                            final.update(stats.to_dict())
+                        yield json.dumps(final) + "\n"
+                    else:
+                        text = chunk.get("text", "")
+                        full_text += text
+                        yield json.dumps({
+                            "model": req.model,
+                            "created_at": now,
+                            "message": Message(role="assistant", content=text).model_dump(),
+                            "done": False,
+                        }) + "\n"
+            finally:
+                await result.aclose()
 
         return StreamingResponse(
             stream_response(), media_type="application/x-ndjson"
