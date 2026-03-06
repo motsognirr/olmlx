@@ -33,14 +33,17 @@ class CancellableStream:
     before releasing locks).
     """
 
-    def __init__(self, gen_factory: Callable[[threading.Event], Generator]):
+    def __init__(self, gen_factory: Callable[[threading.Event], Generator], is_vlm: bool = False):
         """
         Args:
             gen_factory: Called with a cancel_event; should return a generator
                          that yields response objects with text/token/etc attrs.
+            is_vlm: Whether the model is a VLM (affects which generation_stream to sync).
         """
         self._gen_factory = gen_factory
+        self._is_vlm = is_vlm
         self._cancel_event = threading.Event()
+        self._stream_done = threading.Event()
         self._queue: asyncio.Queue | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -55,6 +58,7 @@ class CancellableStream:
         self._cancel_event.set()
 
     def _run(self):
+        gen = None
         try:
             gen = self._gen_factory(self._cancel_event)
             for resp in gen:
@@ -88,15 +92,38 @@ class CancellableStream:
             except Exception:
                 pass
         finally:
-            # Synchronize Metal GPU on THIS thread before exiting — ensures all
-            # GPU command buffers submitted by this thread are fully complete.
-            # Without this, a new inference on another thread can hit in-flight
-            # Metal operations, causing 'Completed handler provided after commit'.
+            # Explicitly close the generator FIRST — this triggers
+            # wired_limit.__exit__ inside mlx_lm/mlx_vlm which calls
+            # mx.synchronize(generation_stream), ensuring all GPU work on
+            # the generation stream completes before we signal done.
+            if gen is not None:
+                try:
+                    gen.close()
+                except Exception:
+                    pass
+
+            # Sync both the generation stream and the default stream.
+            # mlx_lm and mlx_vlm run GPU work on their own module-level
+            # generation_stream. We must also sync the default stream to
+            # catch any Metal operations not on the generation stream.
             try:
                 import mlx.core as mx
-                mx.synchronize()
+                if self._is_vlm:
+                    from mlx_vlm.generate import generation_stream
+                else:
+                    from mlx_lm.generate import generation_stream
+                mx.synchronize(generation_stream)
+                mx.synchronize()  # default stream too
             except Exception:
-                pass
+                try:
+                    import mlx.core as mx
+                    mx.synchronize()
+                except Exception:
+                    pass
+
+            # Signal completion before posting sentinel
+            self._stream_done.set()
+
             try:
                 asyncio.run_coroutine_threadsafe(
                     self._queue.put(_SENTINEL), self._loop
@@ -112,10 +139,12 @@ class CancellableStream:
         inference, causing '[_MTLCommandBuffer addCompletedHandler:] failed assertion'.
         """
         self._cancel_event.set()
-        # Drain the queue until we see the sentinel.
-        # Keep waiting as long as the background thread is alive — it will
-        # eventually finish its current MLX operation and post the sentinel.
-        if self._queue is not None:
+        # If the stream already finished (sentinel posted), skip queue draining.
+        # This avoids the 10s timeout when the sentinel was already consumed
+        # by the async for loop (causing StopAsyncIteration).
+        if not self._stream_done.is_set() and self._queue is not None:
+            # Drain the queue until we see the sentinel.
+            # Keep waiting as long as the background thread is alive.
             while True:
                 try:
                     item = await asyncio.wait_for(self._queue.get(), timeout=10.0)
@@ -174,6 +203,6 @@ def async_mlx_stream(
                 max_tokens=max_tokens, **kwargs,
             )
 
-    stream = CancellableStream(gen_factory)
+    stream = CancellableStream(gen_factory, is_vlm=is_vlm)
     stream.start()
     return stream

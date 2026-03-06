@@ -191,31 +191,57 @@ async def _stream_completion(
     stats: TimingStats,
     images: list[str] | None = None,
 ) -> AsyncGenerator[dict, None]:
-    async with _inference_lock:
-        stream = async_mlx_stream(
-            lm.model, lm.tokenizer, prompt,
-            max_tokens=max_tokens,
-            is_vlm=lm.is_vlm,
-            images=images,
-            **gen_kwargs,
+    # Use explicit acquire/release instead of `async with` to prevent
+    # CancelledError from releasing the lock before cleanup completes.
+    await _inference_lock.acquire()
+    try:
+        mx.synchronize()  # Ensure clean Metal state before starting
+    except Exception:
+        pass
+    stream = async_mlx_stream(
+        lm.model, lm.tokenizer, prompt,
+        max_tokens=max_tokens,
+        is_vlm=lm.is_vlm,
+        images=images,
+        **gen_kwargs,
+    )
+    try:
+        with _inference_ref(lm), Timer() as total_timer:
+            with Timer() as eval_timer:
+                async for token in stream:
+                    yield {"text": token.text, "done": False}
+                    stats.eval_count = token.generation_tokens
+                    stats.prompt_eval_count = token.prompt_tokens
+
+            stats.eval_duration = eval_timer.duration_ns
+            prompt_tps = getattr(token, "prompt_tps", 0) or 0
+            gen_tps = getattr(token, "generation_tps", 0) or 0
+
+        stats.total_duration = total_timer.duration_ns
+        logger.info(
+            "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
+            stats.prompt_eval_count, prompt_tps,
+            stats.eval_count, gen_tps,
+            total_timer.duration_ns / 1e9,
         )
+        yield {"text": "", "done": True, "stats": stats}
+    finally:
+        # We MUST wait for the Metal thread to finish before releasing
+        # _inference_lock, otherwise the next inference will hit concurrent
+        # Metal command buffer access.
         try:
-            with _inference_ref(lm), Timer() as total_timer:
-                with Timer() as eval_timer:
-                    async for token in stream:
-                        yield {"text": token.text, "done": False}
-                        stats.eval_count = token.generation_tokens
-                        stats.prompt_eval_count = token.prompt_tokens
-
-                stats.eval_duration = eval_timer.duration_ns
-
-            stats.total_duration = total_timer.duration_ns
-            yield {"text": "", "done": True, "stats": stats}
-        finally:
-            # Shield from cancellation — we MUST wait for the Metal thread
-            # to finish before releasing _inference_lock, otherwise the next
-            # inference will hit concurrent Metal command buffer access.
             await asyncio.shield(stream.drain_and_join())
+        except (asyncio.CancelledError, Exception):
+            # Shield was interrupted — do synchronous thread join as fallback
+            if stream._thread is not None and stream._thread.is_alive():
+                stream._thread.join(timeout=30)
+        finally:
+            # Always sync ALL Metal streams before releasing lock
+            try:
+                mx.synchronize()
+            except Exception:
+                pass
+            _inference_lock.release()
 
 
 async def _full_completion(
@@ -226,11 +252,22 @@ async def _full_completion(
     stats: TimingStats,
     images: list[str] | None = None,
 ) -> dict:
-    async with _inference_lock:
+    await _inference_lock.acquire()
+    try:
+        mx.synchronize()  # Ensure clean Metal state
+    except Exception:
+        pass
+    try:
         with _inference_ref(lm):
             return await _full_completion_inner(
                 lm, prompt, max_tokens, gen_kwargs, stats, images,
             )
+    finally:
+        try:
+            mx.synchronize()
+        except Exception:
+            pass
+        _inference_lock.release()
 
 
 async def _full_completion_inner(
@@ -250,13 +287,17 @@ async def _full_completion_inner(
                 lm.model, lm.tokenizer, prompt=prompt, image=images,
                 max_tokens=max_tokens, **gen_kwargs,
             )
+            from mlx_vlm.generate import generation_stream
         else:
             import mlx_lm
             result = mlx_lm.generate(
                 lm.model, lm.tokenizer, prompt=prompt,
                 max_tokens=max_tokens, **gen_kwargs,
             )
-        mx.synchronize()
+            from mlx_lm.generate import generation_stream
+        # Sync the actual generation_stream, not just the default stream.
+        # mlx_lm/mlx_vlm run GPU work on their own module-level stream.
+        mx.synchronize(generation_stream)
         return result
 
     with Timer() as total_timer:
@@ -265,6 +306,14 @@ async def _full_completion_inner(
 
     stats.eval_duration = eval_timer.duration_ns
     stats.total_duration = total_timer.duration_ns
+
+    eval_secs = stats.eval_duration / 1e9 if stats.eval_duration else 0
+    gen_tps = stats.eval_count / eval_secs if eval_secs > 0 else 0
+    total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
+    logger.info(
+        "Generation complete: %d prompt tokens, %d tokens generated (%.1f tok/s), %.2fs total",
+        stats.prompt_eval_count, stats.eval_count, gen_tps, total_secs,
+    )
 
     # mlx_vlm.generate returns GenerationResult dataclass
     if hasattr(result, "text"):
@@ -326,11 +375,14 @@ async def generate_embeddings(
     keep_alive: str | None = None,
 ) -> list[list[float]]:
     """Generate embeddings using the model's hidden states or embed_tokens layer."""
-    import mlx.core as mx
-
     lm = await manager.ensure_loaded(model_name, keep_alive)
 
-    async with _inference_lock:
+    await _inference_lock.acquire()
+    try:
+        mx.synchronize()  # Ensure clean Metal state
+    except Exception:
+        pass
+    try:
         embeddings = []
 
         tokenizer = lm.tokenizer
@@ -375,3 +427,9 @@ async def generate_embeddings(
 
         mx.synchronize()
         return embeddings
+    finally:
+        try:
+            mx.synchronize()
+        except Exception:
+            pass
+        _inference_lock.release()
