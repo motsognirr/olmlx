@@ -127,7 +127,13 @@ async def push_model():
 async def warmup_model(req: WarmupRequest, request: Request):
     """Preload a model into VRAM to reduce first-request latency."""
     manager = request.app.state.model_manager
-    await manager.ensure_loaded(req.model, keep_alive=req.keep_alive)
+    try:
+        await manager.ensure_loaded(req.model, keep_alive=req.keep_alive)
+    except (ValueError, RuntimeError) as e:
+        return JSONResponse(
+            {"error": f"warmup failed: {e}"},
+            status_code=400,
+        )
     return {"status": "loaded"}
 
 
@@ -142,12 +148,22 @@ async def abort_generation(req: AbortRequest, request: Request):
     logger.info(
         "Abort requested for model %s (no-op, client should disconnect)", req.model
     )
-    return {"status": "aborted"}
+    return {
+        "status": "no-op",
+        "message": "client should disconnect to cancel generation",
+    }
 
 
 @router.post("/api/unload")
 async def unload_model(req: UnloadRequest, request: Request):
     """Manually unload a model from VRAM."""
     manager = request.app.state.model_manager
-    manager.unload(req.model)
+    try:
+        unloaded = manager.unload(req.model)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    if not unloaded:
+        return JSONResponse(
+            {"error": f"model '{req.model}' is not loaded"}, status_code=404
+        )
     return {"status": "unloaded"}
