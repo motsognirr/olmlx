@@ -244,7 +244,7 @@ class TestErrorHandlers:
                     "stream": False,
                 },
             )
-        assert resp.status_code == 413
+        assert resp.status_code == 507
         data = resp.json()
         assert data["error"] == "model too large"
 
@@ -264,7 +264,7 @@ class TestErrorHandlers:
                     "max_tokens": 100,
                 },
             )
-        assert resp.status_code == 413
+        assert resp.status_code == 507
         data = resp.json()
         assert data["type"] == "error"
         assert data["error"]["type"] == "overloaded_error"
@@ -284,7 +284,7 @@ class TestErrorHandlers:
                     "messages": [{"role": "user", "content": "hi"}],
                 },
             )
-        assert resp.status_code == 413
+        assert resp.status_code == 507
         data = resp.json()
         assert data["error"]["code"] == "model_too_large"
 

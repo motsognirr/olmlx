@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib
 import json
 import logging
@@ -9,6 +10,8 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+import mlx.core as mx
 
 from olmlx.config import settings
 from olmlx.engine.registry import ModelRegistry
@@ -70,11 +73,9 @@ def _get_system_memory_bytes() -> int:
     return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
 
 
-def _get_active_memory_bytes() -> int:
-    """Return current MLX active memory in bytes."""
-    import mlx.core as mx
-
-    return mx.get_active_memory()
+def _get_metal_memory_bytes() -> int:
+    """Return current MLX memory in bytes (active + cached Metal allocations)."""
+    return mx.get_active_memory() + mx.get_cache_memory()
 
 
 class ModelManager:
@@ -146,35 +147,46 @@ class ModelManager:
                 self.registry.add_mapping(name, hf_path)
 
             logger.info("Loading model %s from %s", normalized, hf_path)
+            mem_before = _get_metal_memory_bytes()
             model, tokenizer, is_vlm, caps = await asyncio.to_thread(
                 self._load_model, hf_path
             )
 
             # Check if the model fits safely in memory.  On Apple Silicon
-            # the GPU shares system RAM — if the model already uses more than
-            # the configured fraction of total RAM, generation will almost
+            # the GPU shares system RAM — if total Metal memory exceeds the
+            # configured fraction of system RAM, generation will almost
             # certainly OOM and crash the process (Metal abort, not catchable
             # in Python).  Reject early with a clear error instead.
-            active = _get_active_memory_bytes()
+            #
+            # Note: this is a post-hoc check — the model is already loaded.
+            # If loading itself triggers an OOM the process will still crash.
+            # In practice, loading succeeds; it is the KV cache allocation
+            # during generation that causes the abort.
+            mem_after = _get_metal_memory_bytes()
             total = _get_system_memory_bytes()
             limit = int(total * settings.memory_limit_fraction)
-            if active > limit:
-                active_mb = active // (1024 * 1024)
-                limit_mb = limit // (1024 * 1024)
+            if mem_after > limit:
+                model_mb = (mem_after - mem_before) // (1024 * 1024)
                 total_mb = total // (1024 * 1024)
-                # Drop references so the model can be garbage-collected
+                limit_mb = limit // (1024 * 1024)
+                # Drop references and flush Metal allocator so the memory
+                # is actually reclaimed before we raise.
                 del model, tokenizer
+                gc.collect()
+                mx.clear_cache()
                 logger.error(
-                    "Model %s uses %d MB which exceeds the memory limit of %d MB "
+                    "Model %s uses %d MB, pushing Metal memory to %d MB "
+                    "which exceeds the limit of %d MB "
                     "(%.0f%% of %d MB system RAM). Refusing to load.",
                     normalized,
-                    active_mb,
+                    model_mb,
+                    mem_after // (1024 * 1024),
                     limit_mb,
                     settings.memory_limit_fraction * 100,
                     total_mb,
                 )
                 raise MemoryError(
-                    f"Model '{normalized}' requires {active_mb} MB but the memory limit "
+                    f"Model '{normalized}' requires ~{model_mb} MB but the memory limit "
                     f"is {limit_mb} MB ({settings.memory_limit_fraction:.0%} of "
                     f"{total_mb} MB system RAM). Use a smaller/more quantized model, "
                     f"or increase OLMLX_MEMORY_LIMIT_FRACTION (current: "

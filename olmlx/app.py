@@ -116,7 +116,7 @@ def create_app() -> FastAPI:
         logger.error("MemoryError on %s: %s", request.url.path, msg)
         return _make_error_response(
             request.url.path,
-            413,
+            507,
             msg,
             "overloaded_error",
             "server_error",
