@@ -183,3 +183,83 @@ Key internals:
 - **Registry** — resolves Ollama model names to HuggingFace paths via `models.json`
 - **Streaming Bridge** — runs `mlx_lm.stream_generate()` in a thread, feeds tokens through an `asyncio.Queue`
 - **Chat Templates** — uses each model's built-in `tokenizer.apply_chat_template()` for correct prompt formatting
+
+## Troubleshooting
+
+### "Model not found" errors
+
+When you see `Model 'X' not found`, the model name isn't recognized. Fix it by:
+
+1. **Add a mapping** to `~/.olmlx/models.json`:
+   ```json
+   {
+     "my-model:latest": "mlx-community/Model-Repo-Name"
+   }
+   ```
+
+2. **Use a HuggingFace path directly** in API calls:
+   ```bash
+   curl http://localhost:11434/api/generate -d '{
+     "model": "mlx-community/Qwen2.5-3B-Instruct-4bit",
+     "prompt": "Hello"
+   }'
+   ```
+
+### Metal GPU crashes
+
+If the server crashes during inference:
+
+1. **Check available memory** — unload other GPU-heavy apps (video editors, 3D apps)
+2. **Reduce model size** — use 4-bit quantized models instead of 8-bit or 16-bit
+3. **Limit concurrent requests** — set `OLMLX_MAX_LOADED_MODELS=1`
+4. **Check logs** — if running as a service, view `~/.olmlx/olmlx.log`
+
+### Model won't unload / memory pressure
+
+Models stay loaded based on `OLMLX_DEFAULT_KEEP_ALIVE`:
+
+- `5m` (default) — unload after 5 minutes idle
+- `0` — unload immediately after use
+- `-1` — never unload
+
+To force unload a model:
+```bash
+curl -X POST http://localhost:11434/api/unload -d '{"model": "llama3.2:latest"}'
+```
+
+To see loaded models:
+```bash
+curl http://localhost:11434/api/ps
+```
+
+The `active_refs` field shows how many requests are currently using each model. Models with `active_refs > 0` cannot be unloaded until requests complete.
+
+### Context window limits
+
+If responses get cut off or you see context-related errors:
+
+1. **Shorten your prompt** — remove old messages from the conversation
+2. **Use a model with larger context** — some models support 32K+ tokens
+3. **Check model documentation** — verify the model's actual context limit
+
+### Tool calling not working
+
+Tool calling requires:
+1. A model with tool calling capability (Qwen 2.5, Llama 3.1+, Mistral Nemo)
+2. Tools passed in the request
+3. A chat template that supports tools
+
+If the template doesn't support tools, olmlx falls back to injecting tool descriptions into the system message.
+
+## Model Compatibility
+
+| Model Family | Chat | Tools | Thinking | Vision |
+|---|---|---|---|---|
+| Qwen 2.5/3 | ✓ | ✓ | ✓ (Qwen 3) | ✗ |
+| Llama 3.1/3.2 | ✓ | ✓ | ✗ | ✗ |
+| Mistral/Nemo | ✓ | ✓ | ✗ | ✗ |
+| Gemma 2 | ✓ | ✗ | ✗ | ✗ |
+| Phi 3 | ✓ | ✗ | ✗ | ✗ |
+| LLava-based | ✓ | ✗ | ✗ | ✓ |
+
+Check a model's chat template on HuggingFace to verify feature support.

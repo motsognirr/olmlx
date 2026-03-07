@@ -56,10 +56,13 @@ def _parse_json_call(data: dict) -> dict | None:
         return None
     arguments = data.get("arguments") or data.get("parameters") or {}
     if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            return None
+        if arguments.strip():  # Only parse non-empty strings
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                return None
+        else:
+            arguments = {}
     return {
         "type": "tool_use",
         "id": _make_tool_use_id(),

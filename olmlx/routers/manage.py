@@ -4,7 +4,14 @@ import logging
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from olmlx.schemas.manage import CopyRequest, CreateRequest, DeleteRequest
+from olmlx.schemas.manage import (
+    AbortRequest,
+    CopyRequest,
+    CreateRequest,
+    DeleteRequest,
+    UnloadRequest,
+    WarmupRequest,
+)
 from olmlx.schemas.pull import PullRequest
 
 logger = logging.getLogger(__name__)
@@ -76,7 +83,8 @@ async def create_model(req: CreateRequest, request: Request):
         if line.upper().startswith("FROM "):
             from_model = line[5:].strip()
         elif line.upper().startswith("SYSTEM "):
-            line[7:].strip().strip('"')
+            system_prompt = line[7:].strip().strip('"')
+            parameters["system"] = system_prompt
         elif line.upper().startswith("PARAMETER "):
             parts = line[10:].strip().split(None, 1)
             if len(parts) == 2:
@@ -113,3 +121,31 @@ async def push_model():
         {"error": "push is not supported; models are stored on HuggingFace"},
         status_code=501,
     )
+
+
+@router.post("/api/warmup")
+async def warmup_model(req: WarmupRequest, request: Request):
+    """Preload a model into VRAM to reduce first-request latency."""
+    manager = request.app.state.model_manager
+    await manager.ensure_loaded(req.model, keep_alive=req.keep_alive)
+    return {"status": "loaded"}
+
+
+@router.post("/api/abort")
+async def abort_generation(req: AbortRequest, request: Request):
+    """Cancel an in-progress generation.
+
+    Note: This is a no-op in the current implementation since we buffer
+    output for tool parsing. The generation will complete but the client
+    can simply disconnect to stop receiving chunks.
+    """
+    logger.info("Abort requested for model %s (no-op, client should disconnect)", req.model)
+    return {"status": "aborted"}
+
+
+@router.post("/api/unload")
+async def unload_model(req: UnloadRequest, request: Request):
+    """Manually unload a model from VRAM."""
+    manager = request.app.state.model_manager
+    manager.unload(req.model)
+    return {"status": "unloaded"}

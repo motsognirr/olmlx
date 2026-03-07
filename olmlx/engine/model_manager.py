@@ -124,7 +124,8 @@ class ModelManager:
             hf_path = self.registry.resolve(name)
             if hf_path is None:
                 raise ValueError(
-                    f"Model '{name}' not found. Add it to models.json or use a HuggingFace path."
+                    f"Model '{name}' not found. "
+                    f"Add it to {settings.models_config} or use a HuggingFace path like 'mlx-community/Qwen2.5-3B-Instruct-4bit'"
                 )
 
             # Auto-register direct HF paths so future requests find them

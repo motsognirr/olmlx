@@ -11,6 +11,7 @@ class RunningModel(BaseModel):
     details: ModelDetails = ModelDetails()
     expires_at: str = ""
     size_vram: int = 0
+    active_refs: int = 0
 
 
 class PsResponse(BaseModel):
