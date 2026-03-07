@@ -225,9 +225,7 @@ class TestManageRouter:
 
     @pytest.mark.asyncio
     async def test_warmup_model_not_found(self, app_client):
-        resp = await app_client.post(
-            "/api/warmup", json={"model": "nonexistent-model"}
-        )
+        resp = await app_client.post("/api/warmup", json={"model": "nonexistent-model"})
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
