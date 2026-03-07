@@ -110,6 +110,19 @@ def create_app() -> FastAPI:
             "invalid_value",
         )
 
+    @app.exception_handler(MemoryError)
+    async def memory_error_handler(request: Request, exc: MemoryError):
+        msg = str(exc)
+        logger.error("MemoryError on %s: %s", request.url.path, msg)
+        return _make_error_response(
+            request.url.path,
+            413,
+            msg,
+            "overloaded_error",
+            "server_error",
+            "model_too_large",
+        )
+
     @app.exception_handler(RuntimeError)
     async def runtime_error_handler(request: Request, exc: RuntimeError):
         msg = str(exc)

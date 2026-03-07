@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -62,6 +63,18 @@ def parse_keep_alive(value: str | int) -> float | None:
     num, unit = int(match.group(1)), match.group(2)
     multipliers = {"s": 1, "m": 60, "h": 3600}
     return float(num * multipliers[unit])
+
+
+def _get_system_memory_bytes() -> int:
+    """Return total system memory in bytes."""
+    return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+
+
+def _get_active_memory_bytes() -> int:
+    """Return current MLX active memory in bytes."""
+    import mlx.core as mx
+
+    return mx.get_active_memory()
 
 
 class ModelManager:
@@ -136,6 +149,37 @@ class ModelManager:
             model, tokenizer, is_vlm, caps = await asyncio.to_thread(
                 self._load_model, hf_path
             )
+
+            # Check if the model fits safely in memory.  On Apple Silicon
+            # the GPU shares system RAM — if the model already uses more than
+            # the configured fraction of total RAM, generation will almost
+            # certainly OOM and crash the process (Metal abort, not catchable
+            # in Python).  Reject early with a clear error instead.
+            active = _get_active_memory_bytes()
+            total = _get_system_memory_bytes()
+            limit = int(total * settings.memory_limit_fraction)
+            if active > limit:
+                active_mb = active // (1024 * 1024)
+                limit_mb = limit // (1024 * 1024)
+                total_mb = total // (1024 * 1024)
+                # Drop references so the model can be garbage-collected
+                del model, tokenizer
+                logger.error(
+                    "Model %s uses %d MB which exceeds the memory limit of %d MB "
+                    "(%.0f%% of %d MB system RAM). Refusing to load.",
+                    normalized,
+                    active_mb,
+                    limit_mb,
+                    settings.memory_limit_fraction * 100,
+                    total_mb,
+                )
+                raise MemoryError(
+                    f"Model '{normalized}' requires {active_mb} MB but the memory limit "
+                    f"is {limit_mb} MB ({settings.memory_limit_fraction:.0%} of "
+                    f"{total_mb} MB system RAM). Use a smaller/more quantized model, "
+                    f"or increase OLMLX_MEMORY_LIMIT_FRACTION (current: "
+                    f"{settings.memory_limit_fraction})."
+                )
 
             ka = self._resolve_keep_alive(keep_alive)
             expires = time.time() + ka if ka is not None else None

@@ -229,6 +229,66 @@ class TestErrorHandlers:
         assert "TypeError" in data["error"]
 
     @pytest.mark.asyncio
+    async def test_memory_error_handler_ollama(self, app_client):
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = MemoryError("model too large")
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "hi",
+                    "stream": False,
+                },
+            )
+        assert resp.status_code == 413
+        data = resp.json()
+        assert data["error"] == "model too large"
+
+    @pytest.mark.asyncio
+    async def test_memory_error_handler_anthropic(self, app_client):
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = MemoryError("model too large")
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+            )
+        assert resp.status_code == 413
+        data = resp.json()
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "overloaded_error"
+
+    @pytest.mark.asyncio
+    async def test_memory_error_handler_openai(self, app_client):
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = MemoryError("model too large")
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        assert resp.status_code == 413
+        data = resp.json()
+        assert data["error"]["code"] == "model_too_large"
+
+    @pytest.mark.asyncio
     async def test_general_endpoints_exist(self, app_client):
         resp = await app_client.get("/")
         assert resp.status_code == 200

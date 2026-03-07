@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     models_config: Path = Path.home() / ".olmlx" / "models.json"
     default_keep_alive: str = "5m"
     max_loaded_models: int = 1
+    memory_limit_fraction: float = 0.75
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
 
 

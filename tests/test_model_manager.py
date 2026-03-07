@@ -7,7 +7,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from olmlx.engine.model_manager import LoadedModel, ModelManager, parse_keep_alive
+from olmlx.engine.model_manager import (
+    LoadedModel,
+    ModelManager,
+    _get_active_memory_bytes,
+    _get_system_memory_bytes,
+    parse_keep_alive,
+)
 from olmlx.engine.template_caps import TemplateCaps
 
 
@@ -572,3 +578,151 @@ class TestExpiryChecker:
         assert "removed:latest" not in manager._loaded
         assert held_ref.model is model_mock
         assert held_ref.tokenizer is tokenizer_mock
+
+
+class TestMemoryCheck:
+    """Test that models exceeding the memory limit are rejected on load."""
+
+    @pytest.mark.asyncio
+    async def test_model_exceeding_memory_limit_raises(
+        self, registry, mock_store, monkeypatch
+    ):
+        """When active memory after loading exceeds the limit, raise MemoryError."""
+        manager = ModelManager(registry, mock_store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        # Simulate a model that uses 80% of system RAM (above 75% default limit)
+        total_ram = 64 * 1024 * 1024 * 1024  # 64 GB
+        active_after_load = int(total_ram * 0.80)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(mock_model, mock_tokenizer, False, TemplateCaps()),
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_active_memory_bytes",
+                return_value=active_after_load,
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+        ):
+            with pytest.raises(MemoryError, match="memory limit"):
+                await manager.ensure_loaded("qwen3")
+
+        # Model should NOT be in _loaded
+        assert "qwen3:latest" not in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_model_within_memory_limit_loads(
+        self, registry, mock_store, monkeypatch
+    ):
+        """When active memory is within the limit, the model loads normally."""
+        manager = ModelManager(registry, mock_store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        # Simulate a model that uses 50% of system RAM (below 75% default limit)
+        total_ram = 64 * 1024 * 1024 * 1024
+        active_after_load = int(total_ram * 0.50)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(mock_model, mock_tokenizer, False, TemplateCaps()),
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_active_memory_bytes",
+                return_value=active_after_load,
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+        ):
+            lm = await manager.ensure_loaded("qwen3")
+
+        assert lm.name == "qwen3:latest"
+        assert "qwen3:latest" in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_custom_memory_limit_fraction(
+        self, registry, mock_store, monkeypatch
+    ):
+        """Configurable memory_limit_fraction is respected."""
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.memory_limit_fraction", 0.90
+        )
+        manager = ModelManager(registry, mock_store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        total_ram = 64 * 1024 * 1024 * 1024
+        # 80% usage — below the 90% custom limit, should load fine
+        active_after_load = int(total_ram * 0.80)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(mock_model, mock_tokenizer, False, TemplateCaps()),
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_active_memory_bytes",
+                return_value=active_after_load,
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+        ):
+            lm = await manager.ensure_loaded("qwen3")
+
+        assert lm.name == "qwen3:latest"
+
+    @pytest.mark.asyncio
+    async def test_memory_error_message_includes_guidance(
+        self, registry, mock_store
+    ):
+        """The error message should include actionable guidance."""
+        manager = ModelManager(registry, mock_store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        total_ram = 64 * 1024 * 1024 * 1024
+        active_after_load = int(total_ram * 0.80)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(mock_model, mock_tokenizer, False, TemplateCaps()),
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_active_memory_bytes",
+                return_value=active_after_load,
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+        ):
+            with pytest.raises(MemoryError) as exc_info:
+                await manager.ensure_loaded("qwen3")
+
+        msg = str(exc_info.value)
+        assert "OLMLX_MEMORY_LIMIT_FRACTION" in msg
+        assert "smaller" in msg or "quantized" in msg
