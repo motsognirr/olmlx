@@ -10,8 +10,6 @@ import pytest
 from olmlx.engine.model_manager import (
     LoadedModel,
     ModelManager,
-    _get_active_memory_bytes,
-    _get_system_memory_bytes,
     parse_keep_alive,
 )
 from olmlx.engine.template_caps import TemplateCaps
@@ -692,9 +690,7 @@ class TestMemoryCheck:
         assert lm.name == "qwen3:latest"
 
     @pytest.mark.asyncio
-    async def test_memory_error_message_includes_guidance(
-        self, registry, mock_store
-    ):
+    async def test_memory_error_message_includes_guidance(self, registry, mock_store):
         """The error message should include actionable guidance."""
         manager = ModelManager(registry, mock_store)
 
