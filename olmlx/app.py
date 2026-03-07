@@ -3,6 +3,7 @@ import traceback
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -87,12 +88,9 @@ def _make_error_response(
 def create_app() -> FastAPI:
     app = FastAPI(title="olmlx", lifespan=lifespan)
 
-    # CORS middleware for browser-based clients
-    from fastapi.middleware.cors import CORSMiddleware
-
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=settings.cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )

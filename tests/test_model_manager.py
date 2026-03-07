@@ -78,8 +78,15 @@ class TestModelManager:
         assert mock_manager.get_loaded() == []
 
     def test_unload_not_loaded(self, mock_manager):
-        mock_manager.unload("nonexistent")
-        assert len(mock_manager.get_loaded()) == 1  # unchanged
+        assert mock_manager.unload("nonexistent") is False
+
+    def test_unload_active_refs_raises(self, mock_manager):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.active_refs = 1
+        with pytest.raises(RuntimeError, match="active"):
+            mock_manager.unload("qwen3")
+        assert len(mock_manager.get_loaded()) == 1  # still loaded
+        lm.active_refs = 0
 
     @pytest.mark.asyncio
     async def test_ensure_loaded_cached(self, mock_manager):

@@ -163,9 +163,21 @@ class ModelManager:
     def get_loaded(self) -> list[LoadedModel]:
         return list(self._loaded.values())
 
-    def unload(self, name: str):
+    def unload(self, name: str) -> bool:
+        """Unload a model. Returns True if unloaded, False if not loaded.
+
+        Raises RuntimeError if model has active requests.
+        """
         normalized = self.registry.normalize_name(name)
-        self._loaded.pop(normalized, None)
+        lm = self._loaded.get(normalized)
+        if lm is None:
+            return False
+        if lm.active_refs > 0:
+            raise RuntimeError(
+                f"Model '{normalized}' has {lm.active_refs} active request(s)"
+            )
+        self._loaded.pop(normalized)
+        return True
 
     # Config keys that indicate a vision-language model
     _VLM_CONFIG_KEYS = frozenset(

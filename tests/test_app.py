@@ -68,6 +68,20 @@ class TestCreateApp:
         assert "/v1/messages" in paths
         assert "/v1/chat/completions" in paths
 
+    def test_cors_uses_configured_origins(self, monkeypatch):
+        monkeypatch.setattr(
+            "olmlx.app.settings.cors_origins",
+            ["http://localhost:3000", "http://localhost:8080"],
+        )
+        app = create_app()
+        from starlette.middleware.cors import CORSMiddleware
+
+        cors_mw = [m for m in app.user_middleware if m.cls is CORSMiddleware]
+        assert len(cors_mw) == 1
+        origins = cors_mw[0].kwargs["allow_origins"]
+        assert "http://localhost:3000" in origins
+        assert "*" not in origins
+
 
 class TestLifespan:
     @pytest.mark.asyncio

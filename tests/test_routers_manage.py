@@ -194,6 +194,43 @@ class TestManageRouter:
         assert "error" in resp.text
 
     @pytest.mark.asyncio
+    async def test_unload_model_success(self, app_client):
+        resp = await app_client.post("/api/unload", json={"model": "qwen3"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "unloaded"
+
+    @pytest.mark.asyncio
+    async def test_unload_model_not_loaded(self, app_client):
+        resp = await app_client.post("/api/unload", json={"model": "nonexistent"})
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_unload_model_active_refs(self, app_client):
+        manager = app_client._transport.app.state.model_manager
+        lm = manager._loaded["qwen3:latest"]
+        lm.active_refs = 2
+        try:
+            resp = await app_client.post("/api/unload", json={"model": "qwen3"})
+            assert resp.status_code == 409
+            assert "active" in resp.json()["error"].lower()
+        finally:
+            lm.active_refs = 0
+
+    @pytest.mark.asyncio
+    async def test_abort_returns_noop(self, app_client):
+        resp = await app_client.post("/api/abort", json={"model": "qwen3"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "no-op"
+
+    @pytest.mark.asyncio
+    async def test_warmup_model_not_found(self, app_client):
+        resp = await app_client.post(
+            "/api/warmup", json={"model": "nonexistent-model"}
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_pull_error_non_streaming(self, app_client):
         from unittest.mock import patch
 
