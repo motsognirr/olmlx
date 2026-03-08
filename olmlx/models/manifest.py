@@ -30,7 +30,10 @@ class ModelManifest:
         with open(path) as f:
             data = json.load(f)
         # Coerce None/missing to field defaults; raise on null/missing required fields
-        for k, field in cls.__dataclass_fields__.items():
+        field_names = set()
+        for field in dataclasses.fields(cls):
+            k = field.name
+            field_names.add(k)
             is_required = (
                 field.default is dataclasses.MISSING
                 and field.default_factory is dataclasses.MISSING
@@ -45,7 +48,7 @@ class ModelManifest:
                     if field.default is not dataclasses.MISSING
                     else field.default_factory()
                 )
-        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        return cls(**{k: v for k, v in data.items() if k in field_names})
 
     @staticmethod
     def compute_digest(name: str) -> str:

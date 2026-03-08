@@ -133,7 +133,11 @@ def _create_store():
 
     ensure_config()
     registry = ModelRegistry()
-    registry.load()
+    try:
+        registry.load()
+    except Exception as e:
+        print(f"Error loading models config: {e}", file=sys.stderr)
+        sys.exit(1)
     return ModelStore(registry)
 
 
@@ -191,14 +195,16 @@ def cmd_models_pull(args):
     store = _create_store()
 
     async def _pull():
-        try:
-            async for status in store.pull(args.model_name):
-                print(status.get("status", ""), flush=True)
-        except Exception as e:
-            print(f"Error: {e}", file=sys.stderr, flush=True)
-            sys.exit(1)
+        async for status in store.pull(args.model_name):
+            print(status.get("status", ""), flush=True)
 
-    asyncio.run(_pull())
+    try:
+        asyncio.run(_pull())
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
 
 
 def cmd_models_delete(args):

@@ -10,6 +10,7 @@ from olmlx.cli import (
     DEFAULT_MODELS,
     PLIST_LABEL,
     _build_plist,
+    _create_store,
     build_parser,
     cli_main,
     cmd_config_show,
@@ -234,8 +235,6 @@ class TestCliMain:
 class TestCreateStore:
     def test_calls_ensure_config(self, tmp_path, monkeypatch):
         """_create_store must call ensure_config so fresh installs get models.json."""
-        from olmlx.cli import _create_store
-
         config_path = tmp_path / "models.json"
         monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
         monkeypatch.setattr("olmlx.cli.settings.models_dir", tmp_path / "models")
@@ -244,6 +243,16 @@ class TestCreateStore:
         assert config_path.exists()
         data = json.loads(config_path.read_text())
         assert data == DEFAULT_MODELS
+
+    def test_malformed_config_exits_nonzero(self, tmp_path, monkeypatch, capsys):
+        """Malformed models.json should print error to stderr and exit 1."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text("{bad json")
+        monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
+        with pytest.raises(SystemExit) as exc_info:
+            _create_store()
+        assert exc_info.value.code == 1
+        assert "error" in capsys.readouterr().err.lower()
 
 
 @pytest.fixture
