@@ -3,8 +3,6 @@ import json
 import hashlib
 from dataclasses import dataclass, asdict
 from pathlib import Path
-
-
 @dataclass
 class ModelManifest:
     name: str
