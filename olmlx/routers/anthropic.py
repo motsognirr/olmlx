@@ -490,9 +490,19 @@ async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request
     messages = _convert_messages(req)
     tools = _convert_tools(req)
 
-    token_count = count_chat_tokens(
-        lm.text_tokenizer, messages, tools, caps=lm.template_caps
-    )
+    lm.active_refs += 1
+    try:
+        loop = asyncio.get_running_loop()
+        token_count = await loop.run_in_executor(
+            None,
+            count_chat_tokens,
+            lm.text_tokenizer,
+            messages,
+            tools,
+            lm.template_caps,
+        )
+    finally:
+        lm.active_refs -= 1
     return AnthropicTokenCountResponse(input_tokens=token_count)
 
 

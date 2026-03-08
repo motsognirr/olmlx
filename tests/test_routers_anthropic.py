@@ -954,3 +954,19 @@ class TestCountTokens:
         )
         assert resp.status_code == 200
         assert resp.json()["input_tokens"] == 6
+
+    @pytest.mark.asyncio
+    async def test_dict_without_input_ids_errors(self, app_client, mock_loaded_model):
+        """apply_chat_template returning dict without input_ids should error, not silently return 0."""
+        mock_loaded_model.tokenizer.apply_chat_template.return_value = {
+            "token_ids": [1, 2, 3]
+        }
+        resp = await app_client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+            },
+        )
+        assert resp.status_code == 500

@@ -228,7 +228,11 @@ def count_chat_tokens(
 
     # Handle varied return types from apply_chat_template
     if isinstance(result, dict):
-        tokens = result.get("input_ids", [])
+        tokens = result.get("input_ids")
+        if tokens is None:
+            raise TypeError(
+                f"apply_chat_template returned dict without 'input_ids': keys={list(result.keys())}"
+            )
     elif isinstance(result, list) and result and isinstance(result[0], list):
         tokens = result[0]
     elif isinstance(result, list):
