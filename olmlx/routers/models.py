@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Request
+from starlette.responses import JSONResponse
 
 from olmlx.schemas.models import (
     ModelDetails,
@@ -57,7 +58,9 @@ async def show_model(req: ShowRequest, request: Request):
     store = request.app.state.model_store
     manifest = store.show(req.model)
     if manifest is None:
-        return {"error": f"model '{req.model}' not found"}
+        return JSONResponse(
+            {"error": f"model '{req.model}' not found"}, status_code=404
+        )
     return ShowResponse(
         details=ModelDetails(
             format=manifest.format,

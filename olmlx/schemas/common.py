@@ -1,7 +1,8 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
-class ModelOptions(BaseModel, extra="allow"):
+class ModelOptions(BaseModel):
+    model_config = ConfigDict(extra="allow")
     """Ollama model options / parameters."""
 
     num_keep: int | None = None

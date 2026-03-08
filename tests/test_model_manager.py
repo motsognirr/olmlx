@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import time
 from unittest.mock import MagicMock, patch
 
@@ -40,8 +41,26 @@ class TestParseKeepAlive:
     def test_float(self):
         assert parse_keep_alive(30.5) == 30.5
 
-    def test_invalid_format(self):
-        assert parse_keep_alive("invalid") == 300.0  # default
+    def test_invalid_format(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            assert parse_keep_alive("invalid") == 300.0  # default
+        assert "Invalid keep_alive format" in caplog.text
+        assert "'invalid'" in caplog.text
+
+    def test_invalid_format_1d(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            assert parse_keep_alive("1d") == 300.0
+        assert "Invalid keep_alive format" in caplog.text
+
+    def test_invalid_format_abc123(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            assert parse_keep_alive("abc123") == 300.0
+        assert "Invalid keep_alive format" in caplog.text
+
+    def test_invalid_format_empty(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            assert parse_keep_alive("") == 300.0
+        assert "Invalid keep_alive format" in caplog.text
 
     def test_zero_integer(self):
         assert parse_keep_alive(0) == 0.0

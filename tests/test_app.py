@@ -114,8 +114,8 @@ class TestForceJSONMiddleware:
             content='{"model": "nonexistent"}',
             headers={"content-type": "application/x-www-form-urlencoded"},
         )
-        # Should still parse as JSON successfully
-        assert resp.status_code == 200
+        # Should still parse as JSON successfully (404 because model doesn't exist)
+        assert resp.status_code == 404
 
     @pytest.mark.asyncio
     async def test_json_content_type_unchanged(self, app_client):
@@ -123,7 +123,7 @@ class TestForceJSONMiddleware:
             "/api/show",
             json={"model": "nonexistent"},
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 404
 
 
 class TestErrorHandlers:

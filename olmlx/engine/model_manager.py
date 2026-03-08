@@ -74,6 +74,7 @@ def parse_keep_alive(value: str | int) -> float | None:
         return 0.0
     match = re.match(r"^(\d+)(s|m|h)$", value)
     if not match:
+        logger.warning("Invalid keep_alive format: %r, defaulting to 5m", value)
         return 300.0  # default 5m
     num, unit = int(match.group(1)), match.group(2)
     multipliers = {"s": 1, "m": 60, "h": 3600}

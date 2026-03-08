@@ -2,6 +2,7 @@
 
 import json
 import plistlib
+import subprocess
 from unittest.mock import MagicMock
 
 import pytest
@@ -87,6 +88,30 @@ class TestServiceInstall:
         mock_run.assert_called_once_with(
             ["launchctl", "load", str(plist_path)],
             check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_install_handles_launchctl_failure(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "com.dpalmqvist.olmlx.plist"
+        monkeypatch.setattr("olmlx.cli.PLIST_PATH", plist_path)
+        monkeypatch.setattr(
+            "olmlx.cli.settings.models_config", tmp_path / "models.json"
+        )
+        monkeypatch.setattr("olmlx.cli.shutil.which", lambda _: "/usr/local/bin/olmlx")
+
+        def failing_run(*args, **kwargs):
+            raise subprocess.CalledProcessError(1, "launchctl", stderr="Load failed")
+
+        monkeypatch.setattr("olmlx.cli.subprocess.run", failing_run)
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_service_install(None)
+        assert exc_info.value.code == 1
+        assert plist_path.exists()  # plist was written before the failure
+        captured = capsys.readouterr()
+        assert (
+            "could not be loaded" in captured.err.lower()
+            or "could not be loaded" in captured.out.lower()
         )
 
 
@@ -544,6 +569,29 @@ class TestModelsPullCmd:
         with pytest.raises(SystemExit) as exc_info:
             cmd_models_pull(args)
         assert exc_info.value.code == 130
+
+    def test_pull_no_blank_lines(self, capsys, mock_store, _patch_store):
+        """Status dicts without 'status' key should not produce blank lines."""
+
+        async def fake_pull(name):
+            yield {"status": "pulling manifest"}
+            yield {"digest": "sha256:abc123"}  # no "status" key
+            yield {}  # empty dict
+            yield {"status": "success"}
+
+        mock_store.pull = fake_pull
+        args = MagicMock(model_name="qwen2.5:3b")
+        cmd_models_pull(args)
+        out = capsys.readouterr().out
+        assert "pulling manifest" in out
+        assert "success" in out
+        # No blank lines
+        for line in out.split("\n"):
+            assert line == "" or line.strip() != "" or line == out.split("\n")[-1]
+        # More directly: no line should be just whitespace (except trailing)
+        lines = out.rstrip("\n").split("\n")
+        for line in lines:
+            assert line.strip() != "", f"Unexpected blank line in output: {lines!r}"
 
     def test_pull_flushes_output(self, mock_store, _patch_store, monkeypatch):
         """Status lines should be flushed immediately for piped output."""

@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import hashlib
+import typing
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -49,16 +50,18 @@ class ModelManifest:
                     else field.default_factory()
                 )
         # Validate types for non-null values
+        hints = typing.get_type_hints(cls)
         for field in dataclasses.fields(cls):
             k = field.name
             if k in data and data[k] is not None:
+                field_type = hints[k]
                 if (
-                    field.type in (str, int)
+                    field_type in (str, int)
                     and not isinstance(data[k], bool)
-                    and not isinstance(data[k], field.type)
+                    and not isinstance(data[k], field_type)
                 ):
                     raise ValueError(
-                        f"Field '{k}' should be {field.type.__name__}, "
+                        f"Field '{k}' should be {field_type.__name__}, "
                         f"got {type(data[k]).__name__} in {path}"
                     )
         return cls(**{k: v for k, v in data.items() if k in field_names})

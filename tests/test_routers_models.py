@@ -17,7 +17,7 @@ class TestModelsRouter:
     @pytest.mark.asyncio
     async def test_show_not_found(self, app_client):
         resp = await app_client.post("/api/show", json={"model": "nonexistent"})
-        assert resp.status_code == 200
+        assert resp.status_code == 404
         data = resp.json()
         assert "error" in data
 

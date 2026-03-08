@@ -98,7 +98,19 @@ def cmd_service_install(_args):
         plistlib.dump(plist, f)
     print(f"Wrote {PLIST_PATH}")
 
-    subprocess.run(["launchctl", "load", str(PLIST_PATH)], check=True)
+    try:
+        subprocess.run(
+            ["launchctl", "load", str(PLIST_PATH)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(
+            f"Plist was written to {PLIST_PATH} but the service could not be loaded: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     print(f"Service {PLIST_LABEL} loaded")
 
 
@@ -215,7 +227,8 @@ def cmd_models_pull(args):
 
     async def _pull():
         async for status in store.pull(args.model_name):
-            print(status.get("status", ""), flush=True)
+            if msg := status.get("status", ""):
+                print(msg, flush=True)
 
     try:
         asyncio.run(_pull())
