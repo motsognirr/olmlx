@@ -106,8 +106,10 @@ def cmd_service_install(_args):
             text=True,
         )
     except subprocess.CalledProcessError as e:
+        stderr = e.stderr.strip() if e.stderr else "(no output)"
         print(
-            f"Plist was written to {PLIST_PATH} but the service could not be loaded: {e}",
+            f"Plist was written to {PLIST_PATH} but the service could not be loaded.\n"
+            f"launchctl stderr: {stderr}",
             file=sys.stderr,
         )
         sys.exit(1)

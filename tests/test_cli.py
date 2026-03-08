@@ -110,6 +110,7 @@ class TestServiceInstall:
         assert plist_path.exists()  # plist was written before the failure
         captured = capsys.readouterr()
         assert "could not be loaded" in captured.err.lower()
+        assert "Load failed" in captured.err
 
 
 class TestServiceUninstall:
