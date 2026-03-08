@@ -218,6 +218,18 @@ class TestCliMain:
         cli_main()
         mock_fn.assert_called_once()
 
+    def test_models_no_subcommand_shows_help(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "models"])
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main()
+        assert exc_info.value.code == 0
+
+    def test_config_no_subcommand_shows_help(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "config"])
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main()
+        assert exc_info.value.code == 0
+
 
 class TestCreateStore:
     def test_calls_ensure_config(self, tmp_path, monkeypatch):
@@ -290,6 +302,20 @@ class TestModelsListCmd:
         assert "x" * 15 not in data_line
         assert "y" * 15 not in data_line
 
+    def test_handles_none_string_fields(self, capsys, mock_store, _patch_store):
+        """Manifests with None for string fields should not crash."""
+        m = ModelManifest(
+            name="test:latest",
+            hf_path="some/model",
+            size=1_000_000,
+        )
+        m.parameter_size = None
+        m.quantization_level = None
+        mock_store.list_local.return_value = [m]
+        cmd_models_list(None)
+        out = capsys.readouterr().out
+        assert "test:latest" in out
+
     def test_lists_no_models(self, capsys, mock_store, _patch_store):
         mock_store.list_local.return_value = []
         cmd_models_list(None)
@@ -341,9 +367,9 @@ class TestModelsPullCmd:
 
     def test_pull_model_not_found_exits_nonzero(self, capsys, mock_store, _patch_store):
         async def fake_pull(name):
+            if False:
+                yield {}
             raise ValueError(f"Model '{name}' not found in config")
-            # Make it an async generator
-            yield  # pragma: no cover
 
         mock_store.pull = fake_pull
         args = MagicMock(model_name="nonexistent")
@@ -372,8 +398,9 @@ class TestModelsPullCmd:
         self, capsys, mock_store, _patch_store
     ):
         async def fake_pull(name):
+            if False:
+                yield {}
             raise RuntimeError("Something unexpected")
-            yield  # pragma: no cover
 
         mock_store.pull = fake_pull
         args = MagicMock(model_name="qwen2.5:3b")

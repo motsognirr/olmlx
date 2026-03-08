@@ -159,13 +159,9 @@ def cmd_models_list(_args):
     print(f"{'NAME':<30} {'SIZE':<12} {'PARAMS':<10} {'QUANT':<10} {'HF PATH'}")
     print("-" * 90)
     for m in sorted(models, key=lambda x: x.name):
-        name = m.name[:29] if len(m.name) > 29 else m.name
-        params = m.parameter_size[:9] if len(m.parameter_size) > 9 else m.parameter_size
-        quant = (
-            m.quantization_level[:9]
-            if len(m.quantization_level) > 9
-            else m.quantization_level
-        )
+        name = (m.name or "")[:29]
+        params = (m.parameter_size or "")[:9]
+        quant = (m.quantization_level or "")[:9]
         print(
             f"{name:<30} {_format_size(m.size):<12} "
             f"{params:<10} {quant:<10} {m.hf_path}"
@@ -199,7 +195,7 @@ def cmd_models_pull(args):
             async for status in store.pull(args.model_name):
                 print(status.get("status", ""), flush=True)
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error: {e}", flush=True)
             sys.exit(1)
 
     asyncio.run(_pull())

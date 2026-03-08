@@ -28,6 +28,10 @@ class ModelManifest:
     def load(cls, path: Path) -> "ModelManifest":
         with open(path) as f:
             data = json.load(f)
+        # Coerce None to field defaults for str fields
+        for k, field in cls.__dataclass_fields__.items():
+            if k in data and data[k] is None and field.default == "":
+                data[k] = ""
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
     @staticmethod

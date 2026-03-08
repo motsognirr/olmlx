@@ -72,3 +72,19 @@ class TestModelManifest:
         path.write_text(json.dumps(data))
         m = ModelManifest.load(path)
         assert m.name == "test:latest"
+
+    def test_load_coerces_null_strings(self, tmp_path):
+        """Null values for str fields should be coerced to empty strings."""
+        path = tmp_path / "manifest.json"
+        data = {
+            "name": "test:latest",
+            "hf_path": "test/model",
+            "parameter_size": None,
+            "quantization_level": None,
+            "family": None,
+        }
+        path.write_text(json.dumps(data))
+        m = ModelManifest.load(path)
+        assert m.parameter_size == ""
+        assert m.quantization_level == ""
+        assert m.family == ""
