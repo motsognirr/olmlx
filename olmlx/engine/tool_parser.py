@@ -92,6 +92,11 @@ def _try_qwen(text: str) -> tuple[list[dict], str]:
         func_match = _FUNC_TAG_RE.search(inner)
         if func_match:
             name = func_match.group(1).strip()
+            if not name:
+                logger.warning(
+                    "Skipping <function> tag with empty name inside <tool_call>"
+                )
+                continue
             params = {}
             for pm in _PARAM_TAG_RE.finditer(func_match.group(2)):
                 pval = pm.group(2).strip()
@@ -292,6 +297,7 @@ def parse_model_output(
                 break
 
         # Filter out tool calls with unknown names
+        dropped_spans: set[tuple[int, int]] = set()
         if tool_uses and tool_names:
             kept = []
             for tu in tool_uses:
@@ -303,6 +309,8 @@ def parse_model_output(
                         tu["name"],
                         tool_names,
                     )
+                    if "_span" in tu:
+                        dropped_spans.add(tu["_span"])
             if len(kept) < len(tool_uses):
                 logger.warning(
                     "Filtered %d of %d parsed tool call(s) with unknown names",
@@ -312,12 +320,14 @@ def parse_model_output(
             tool_uses = kept
 
         # Strip matched spans from text for kept tool calls only.
-        # Spans are collected from tool_use dicts (set by each parser) and
-        # deduplicated (Mistral/DeepSeek share one span across multiple calls).
-        spans = sorted(
-            {tu.pop("_span") for tu in tool_uses if "_span" in tu}, reverse=True
-        )
-        for start, end in spans:
+        # Skip any span that is shared with a dropped call (Mistral/DeepSeek
+        # pack multiple calls into one span) to avoid losing dropped text.
+        kept_spans: set[tuple[int, int]] = set()
+        for tu in tool_uses:
+            span = tu.pop("_span", None)
+            if span is not None and span not in dropped_spans:
+                kept_spans.add(span)
+        for start, end in sorted(kept_spans, reverse=True):
             text = text[:start] + text[end:]
 
     visible_text = text.strip()

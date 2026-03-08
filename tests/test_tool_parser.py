@@ -102,6 +102,13 @@ class TestTryQwen:
         tool_uses, remaining = _try_qwen(text)
         assert len(tool_uses) == 0  # can't parse as JSON or XML
 
+    def test_empty_name_in_xml_style(self):
+        text = (
+            "<tool_call><function= ><parameter=x>1</parameter></function></tool_call>"
+        )
+        tool_uses, remaining = _try_qwen(text)
+        assert len(tool_uses) == 0
+
 
 class TestTryMistral:
     def test_single_tool_call(self):
@@ -419,6 +426,17 @@ class TestParseModelOutput:
         assert tools[0]["name"] == "search"
         # Dropped call's raw text is preserved in visible_text
         assert "unknown" in visible
+
+    def test_tool_name_filtering_mistral_shared_span(self):
+        """Mistral calls share one span — partial filtering must not strip it."""
+        text = '[TOOL_CALLS] [{"name": "search", "arguments": {}}, {"name": "bad_tool", "arguments": {}}]'
+        _, visible, tools = parse_model_output(
+            text, has_tools=True, tool_names={"search"}
+        )
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
+        # Shared span is NOT stripped because bad_tool was dropped from it
+        assert "bad_tool" in visible
 
     def test_qwen_format_priority(self):
         """Qwen format should be tried first and win."""
