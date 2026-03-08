@@ -131,6 +131,7 @@ def _create_store():
     from olmlx.engine.registry import ModelRegistry
     from olmlx.models.store import ModelStore
 
+    ensure_config()
     registry = ModelRegistry()
     registry.load()
     return ModelStore(registry)
@@ -190,7 +191,7 @@ def cmd_models_pull(args):
         try:
             async for status in store.pull(args.model_name):
                 print(status.get("status", ""))
-        except ValueError as e:
+        except Exception as e:
             print(f"Error: {e}")
 
     asyncio.run(_pull())
@@ -199,6 +200,11 @@ def cmd_models_pull(args):
 def cmd_models_delete(args):
     """Delete a locally downloaded model."""
     store = _create_store()
+    if not args.yes:
+        confirm = input(f"Delete model '{args.model_name}'? [y/N] ")
+        if confirm.strip().lower() != "y":
+            print("Aborted.")
+            return
     if store.delete(args.model_name):
         print(f"Model '{args.model_name}' deleted.")
     else:
@@ -241,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     show_p.add_argument("model_name", help="Model name or HF path")
     del_p = mdl_sub.add_parser("delete", help="Delete a local model")
     del_p.add_argument("model_name", help="Model name or HF path")
+    del_p.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
 
     cfg = sub.add_parser("config", help="Show configuration")
     cfg_sub = cfg.add_subparsers(dest="config_command")

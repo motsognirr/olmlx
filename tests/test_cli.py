@@ -219,6 +219,21 @@ class TestCliMain:
         mock_fn.assert_called_once()
 
 
+class TestCreateStore:
+    def test_calls_ensure_config(self, tmp_path, monkeypatch):
+        """_create_store must call ensure_config so fresh installs get models.json."""
+        from olmlx.cli import _create_store
+
+        config_path = tmp_path / "models.json"
+        monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
+        monkeypatch.setattr("olmlx.cli.settings.models_dir", tmp_path / "models")
+        _create_store()
+        # ensure_config should have created models.json
+        assert config_path.exists()
+        data = json.loads(config_path.read_text())
+        assert data == DEFAULT_MODELS
+
+
 @pytest.fixture
 def mock_store():
     """Create a mock ModelStore for CLI tests."""
@@ -314,21 +329,61 @@ class TestModelsPullCmd:
         out = capsys.readouterr().out
         assert "not found" in out.lower()
 
+    def test_pull_handles_os_error(self, capsys, mock_store, _patch_store):
+        async def fake_pull(name):
+            yield {"status": "pulling manifest"}
+            raise OSError("Disk full")
+
+        mock_store.pull = fake_pull
+        args = MagicMock(model_name="qwen2.5:3b")
+        cmd_models_pull(args)
+        out = capsys.readouterr().out
+        assert "Disk full" in out
+
+    def test_pull_handles_generic_exception(self, capsys, mock_store, _patch_store):
+        async def fake_pull(name):
+            raise RuntimeError("Something unexpected")
+            yield  # pragma: no cover
+
+        mock_store.pull = fake_pull
+        args = MagicMock(model_name="qwen2.5:3b")
+        cmd_models_pull(args)
+        out = capsys.readouterr().out
+        assert "Something unexpected" in out
+
 
 class TestModelsDeleteCmd:
-    def test_delete_model(self, capsys, mock_store, _patch_store):
+    def test_delete_model_with_yes_flag(self, capsys, mock_store, _patch_store):
         mock_store.delete.return_value = True
-        args = MagicMock(model_name="qwen2.5:3b")
+        args = MagicMock(model_name="qwen2.5:3b", yes=True)
         cmd_models_delete(args)
         out = capsys.readouterr().out
         assert "deleted" in out.lower()
 
     def test_delete_not_found(self, capsys, mock_store, _patch_store):
         mock_store.delete.return_value = False
-        args = MagicMock(model_name="nonexistent")
+        args = MagicMock(model_name="nonexistent", yes=True)
         cmd_models_delete(args)
         out = capsys.readouterr().out
         assert "not found" in out.lower()
+
+    def test_delete_prompts_for_confirmation(
+        self, capsys, monkeypatch, mock_store, _patch_store
+    ):
+        mock_store.delete.return_value = True
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        args = MagicMock(model_name="qwen2.5:3b", yes=False)
+        cmd_models_delete(args)
+        out = capsys.readouterr().out
+        assert "deleted" in out.lower()
+
+    def test_delete_aborts_on_no(self, capsys, monkeypatch, mock_store, _patch_store):
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+        args = MagicMock(model_name="qwen2.5:3b", yes=False)
+        cmd_models_delete(args)
+        out = capsys.readouterr().out
+        assert "aborted" in out.lower()
+        mock_store.delete.assert_not_called()
 
 
 class TestConfigShowCmd:
@@ -367,6 +422,17 @@ class TestBuildParserModels:
         assert args.command == "models"
         assert args.models_command == "delete"
         assert args.model_name == "qwen2.5:3b"
+        assert args.yes is False
+
+    def test_models_delete_yes_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["models", "delete", "--yes", "qwen2.5:3b"])
+        assert args.yes is True
+
+    def test_models_delete_y_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["models", "delete", "-y", "qwen2.5:3b"])
+        assert args.yes is True
 
     def test_config_show(self):
         parser = build_parser()
