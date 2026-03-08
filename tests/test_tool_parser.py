@@ -226,18 +226,6 @@ class TestTryXmlFunc:
         assert tool_uses[0]["input"] == {"path": "/tmp/a.txt"}
         assert tool_uses[1]["input"] == {"path": "/tmp/b.txt"}
 
-    def test_with_thinking_and_surrounding_text(self):
-        text = (
-            "I'll read the file for you.\n"
-            "<function=read_file><parameter=path>/tmp/test.py</parameter></function>\n"
-            "Let me know if you need more."
-        )
-        tool_uses, remaining = _try_xml_func(text)
-        assert len(tool_uses) == 1
-        assert tool_uses[0]["name"] == "read_file"
-        assert "I'll read the file for you." in remaining
-        assert "Let me know if you need more." in remaining
-
     def test_multiline_parameter_value(self):
         file_content = "def hello():\n    print('hello')\n    return True"
         text = (
@@ -314,6 +302,19 @@ class TestParseModelOutputXmlFunc:
         assert tools[0]["input"] == {"city": "Tokyo"}
         assert "_span" not in tools[0]  # internal field must be cleaned up
         assert visible == ""
+
+    def test_surrounding_text_preserved(self):
+        text = (
+            "I'll read the file for you.\n"
+            "<function=read_file><parameter=path>/tmp/test.py</parameter></function>\n"
+            "Let me know if you need more."
+        )
+        _, visible, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "read_file"
+        assert "I'll read the file for you." in visible
+        assert "Let me know if you need more." in visible
+        assert "<function=" not in visible
 
     def test_thinking_with_standalone_xml_func(self):
         text = (
@@ -428,15 +429,20 @@ class TestParseModelOutput:
         assert "unknown" in visible
 
     def test_tool_name_filtering_mistral_shared_span(self):
-        """Mistral calls share one span — partial filtering must not strip it."""
+        """Mistral calls share one span — block is stripped if any call is kept.
+
+        For formats where all calls share one span (Mistral/DeepSeek), the
+        entire block is removed when at least one call passes the filter.
+        The dropped call's raw text is unavoidably lost.
+        """
         text = '[TOOL_CALLS] [{"name": "search", "arguments": {}}, {"name": "bad_tool", "arguments": {}}]'
         _, visible, tools = parse_model_output(
             text, has_tools=True, tool_names={"search"}
         )
         assert len(tools) == 1
         assert tools[0]["name"] == "search"
-        # Shared span is NOT stripped because bad_tool was dropped from it
-        assert "bad_tool" in visible
+        # Shared span is stripped because at least one call was kept
+        assert visible == ""
 
     def test_qwen_format_priority(self):
         """Qwen format should be tried first and win."""

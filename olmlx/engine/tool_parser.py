@@ -297,7 +297,6 @@ def parse_model_output(
                 break
 
         # Filter out tool calls with unknown names
-        dropped_spans: set[tuple[int, int]] = set()
         if tool_uses and tool_names:
             kept = []
             for tu in tool_uses:
@@ -309,8 +308,6 @@ def parse_model_output(
                         tu["name"],
                         tool_names,
                     )
-                    if "_span" in tu:
-                        dropped_spans.add(tu["_span"])
             if len(kept) < len(tool_uses):
                 logger.warning(
                     "Filtered %d of %d parsed tool call(s) with unknown names",
@@ -319,13 +316,14 @@ def parse_model_output(
                 )
             tool_uses = kept
 
-        # Strip matched spans from text for kept tool calls only.
-        # Skip any span that is shared with a dropped call (Mistral/DeepSeek
-        # pack multiple calls into one span) to avoid losing dropped text.
+        # Strip matched spans from text for kept tool calls.
+        # For formats where multiple calls share one span (Mistral/DeepSeek),
+        # the span is stripped if any call was kept — the dropped call's raw
+        # text is unavoidably lost since it's embedded in the same block.
         kept_spans: set[tuple[int, int]] = set()
         for tu in tool_uses:
             span = tu.pop("_span", None)
-            if span is not None and span not in dropped_spans:
+            if span is not None:
                 kept_spans.add(span)
         for start, end in sorted(kept_spans, reverse=True):
             text = text[:start] + text[end:]
