@@ -270,6 +270,26 @@ class TestModelsListCmd:
         assert "2.0 GB" in out
         assert "1.5 GB" in out
 
+    def test_truncates_long_names(self, capsys, mock_store, _patch_store):
+        long_name = "a" * 40
+        mock_store.list_local.return_value = [
+            ModelManifest(
+                name=long_name,
+                hf_path="some/model",
+                size=1_000_000,
+                parameter_size="x" * 15,
+                quantization_level="y" * 15,
+            ),
+        ]
+        cmd_models_list(None)
+        out = capsys.readouterr().out
+        lines = out.strip().split("\n")
+        # The data line (after header + separator) should not contain the full 40-char name
+        data_line = lines[2]
+        assert long_name not in data_line
+        assert "x" * 15 not in data_line
+        assert "y" * 15 not in data_line
+
     def test_lists_no_models(self, capsys, mock_store, _patch_store):
         mock_store.list_local.return_value = []
         cmd_models_list(None)
@@ -295,10 +315,12 @@ class TestModelsShowCmd:
         assert "mlx-community/Qwen2.5-3B-Instruct-4bit" in out
         assert "qwen2" in out
 
-    def test_show_not_found(self, capsys, mock_store, _patch_store):
+    def test_show_not_found_exits_nonzero(self, capsys, mock_store, _patch_store):
         mock_store.show.return_value = None
         args = MagicMock(model_name="nonexistent")
-        cmd_models_show(args)
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_models_show(args)
+        assert exc_info.value.code == 1
         out = capsys.readouterr().out
         assert "not found" in out.lower()
 
@@ -317,7 +339,7 @@ class TestModelsPullCmd:
         assert "pulling manifest" in out
         assert "success" in out
 
-    def test_pull_model_not_found(self, capsys, mock_store, _patch_store):
+    def test_pull_model_not_found_exits_nonzero(self, capsys, mock_store, _patch_store):
         async def fake_pull(name):
             raise ValueError(f"Model '{name}' not found in config")
             # Make it an async generator
@@ -325,31 +347,62 @@ class TestModelsPullCmd:
 
         mock_store.pull = fake_pull
         args = MagicMock(model_name="nonexistent")
-        cmd_models_pull(args)
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_models_pull(args)
+        assert exc_info.value.code == 1
         out = capsys.readouterr().out
         assert "not found" in out.lower()
 
-    def test_pull_handles_os_error(self, capsys, mock_store, _patch_store):
+    def test_pull_handles_os_error_exits_nonzero(
+        self, capsys, mock_store, _patch_store
+    ):
         async def fake_pull(name):
             yield {"status": "pulling manifest"}
             raise OSError("Disk full")
 
         mock_store.pull = fake_pull
         args = MagicMock(model_name="qwen2.5:3b")
-        cmd_models_pull(args)
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_models_pull(args)
+        assert exc_info.value.code == 1
         out = capsys.readouterr().out
         assert "Disk full" in out
 
-    def test_pull_handles_generic_exception(self, capsys, mock_store, _patch_store):
+    def test_pull_handles_generic_exception_exits_nonzero(
+        self, capsys, mock_store, _patch_store
+    ):
         async def fake_pull(name):
             raise RuntimeError("Something unexpected")
             yield  # pragma: no cover
 
         mock_store.pull = fake_pull
         args = MagicMock(model_name="qwen2.5:3b")
-        cmd_models_pull(args)
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_models_pull(args)
+        assert exc_info.value.code == 1
         out = capsys.readouterr().out
         assert "Something unexpected" in out
+
+    def test_pull_flushes_output(self, mock_store, _patch_store, monkeypatch):
+        """Status lines should be flushed immediately for piped output."""
+        flush_calls = []
+        original_print = print
+
+        def tracking_print(*args, **kwargs):
+            if kwargs.get("flush"):
+                flush_calls.append(True)
+            original_print(*args, **kwargs)
+
+        monkeypatch.setattr("builtins.print", tracking_print)
+
+        async def fake_pull(name):
+            yield {"status": "pulling manifest"}
+            yield {"status": "success"}
+
+        mock_store.pull = fake_pull
+        args = MagicMock(model_name="qwen2.5:3b")
+        cmd_models_pull(args)
+        assert len(flush_calls) == 2
 
 
 class TestModelsDeleteCmd:
@@ -360,10 +413,12 @@ class TestModelsDeleteCmd:
         out = capsys.readouterr().out
         assert "deleted" in out.lower()
 
-    def test_delete_not_found(self, capsys, mock_store, _patch_store):
+    def test_delete_not_found_exits_nonzero(self, capsys, mock_store, _patch_store):
         mock_store.delete.return_value = False
         args = MagicMock(model_name="nonexistent", yes=True)
-        cmd_models_delete(args)
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_models_delete(args)
+        assert exc_info.value.code == 1
         out = capsys.readouterr().out
         assert "not found" in out.lower()
 
