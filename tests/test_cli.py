@@ -244,15 +244,22 @@ class TestCreateStore:
         data = json.loads(config_path.read_text())
         assert data == DEFAULT_MODELS
 
-    def test_malformed_config_exits_nonzero(self, tmp_path, monkeypatch, capsys):
-        """Malformed models.json should print error to stderr and exit 1."""
+    def test_malformed_config_raises(self, tmp_path, monkeypatch):
+        """Malformed models.json should raise, not sys.exit."""
         config_path = tmp_path / "models.json"
         config_path.write_text("{bad json")
         monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
-        with pytest.raises(SystemExit) as exc_info:
+        with pytest.raises(Exception):
             _create_store()
-        assert exc_info.value.code == 1
-        assert "error" in capsys.readouterr().err.lower()
+
+    def test_ensure_config_permission_error_raises(self, tmp_path, monkeypatch):
+        """Permission error in ensure_config should propagate."""
+        monkeypatch.setattr(
+            "olmlx.cli.ensure_config",
+            lambda: (_ for _ in ()).throw(PermissionError("Permission denied")),
+        )
+        with pytest.raises(PermissionError):
+            _create_store()
 
 
 @pytest.fixture
@@ -266,6 +273,53 @@ def mock_store():
 def _patch_store(monkeypatch, mock_store):
     """Patch _create_store to return mock_store."""
     monkeypatch.setattr("olmlx.cli._create_store", lambda: mock_store)
+
+
+class TestCreateStoreErrorHandlingInCommands:
+    """Commands should catch _create_store errors and exit cleanly."""
+
+    def test_list_handles_store_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "olmlx.cli._create_store",
+            lambda: (_ for _ in ()).throw(Exception("bad config")),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_models_list(None)
+        assert exc_info.value.code == 1
+        assert "bad config" in capsys.readouterr().err
+
+    def test_show_handles_store_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "olmlx.cli._create_store",
+            lambda: (_ for _ in ()).throw(Exception("bad config")),
+        )
+        args = MagicMock(model_name="test")
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_models_show(args)
+        assert exc_info.value.code == 1
+        assert "bad config" in capsys.readouterr().err
+
+    def test_pull_handles_store_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "olmlx.cli._create_store",
+            lambda: (_ for _ in ()).throw(Exception("bad config")),
+        )
+        args = MagicMock(model_name="test")
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_models_pull(args)
+        assert exc_info.value.code == 1
+        assert "bad config" in capsys.readouterr().err
+
+    def test_delete_handles_store_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "olmlx.cli._create_store",
+            lambda: (_ for _ in ()).throw(Exception("bad config")),
+        )
+        args = MagicMock(model_name="test", yes=True)
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_models_delete(args)
+        assert exc_info.value.code == 1
+        assert "bad config" in capsys.readouterr().err
 
 
 class TestModelsListCmd:
@@ -460,6 +514,19 @@ class TestModelsPullCmd:
         captured = capsys.readouterr()
         assert "Model not found" in captured.err
         assert "Model not found" not in captured.out
+
+    def test_pull_keyboard_interrupt_exits_130(self, capsys, mock_store, _patch_store):
+        """Ctrl+C during pull should exit with code 130, not crash."""
+
+        async def fake_pull(name):
+            yield {"status": "pulling manifest"}
+            raise KeyboardInterrupt
+
+        mock_store.pull = fake_pull
+        args = MagicMock(model_name="qwen2.5:3b")
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_models_pull(args)
+        assert exc_info.value.code == 130
 
     def test_pull_flushes_output(self, mock_store, _patch_store, monkeypatch):
         """Status lines should be flushed immediately for piped output."""

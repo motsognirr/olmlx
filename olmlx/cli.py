@@ -127,17 +127,16 @@ def cmd_service_status(_args):
 
 
 def _create_store():
-    """Create a ModelStore instance for CLI use."""
+    """Create a ModelStore instance for CLI use.
+
+    Raises on failure — callers are responsible for catching and exiting.
+    """
     from olmlx.engine.registry import ModelRegistry
     from olmlx.models.store import ModelStore
 
     ensure_config()
     registry = ModelRegistry()
-    try:
-        registry.load()
-    except Exception as e:
-        print(f"Error loading models config: {e}", file=sys.stderr)
-        sys.exit(1)
+    registry.load()
     return ModelStore(registry)
 
 
@@ -154,7 +153,11 @@ def _format_size(size_bytes: int) -> str:
 
 def cmd_models_list(_args):
     """List locally downloaded models."""
-    store = _create_store()
+    try:
+        store = _create_store()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     models = store.list_local()
     if not models:
         print("No models downloaded.")
@@ -174,7 +177,11 @@ def cmd_models_list(_args):
 
 def cmd_models_show(args):
     """Show details for a specific model."""
-    store = _create_store()
+    try:
+        store = _create_store()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     manifest = store.show(args.model_name)
     if manifest is None:
         print(f"Model '{args.model_name}' not found locally.", file=sys.stderr)
@@ -192,7 +199,11 @@ def cmd_models_show(args):
 
 def cmd_models_pull(args):
     """Pull/download a model."""
-    store = _create_store()
+    try:
+        store = _create_store()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     async def _pull():
         async for status in store.pull(args.model_name):
@@ -200,6 +211,9 @@ def cmd_models_pull(args):
 
     try:
         asyncio.run(_pull())
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(130)
     except SystemExit:
         raise
     except Exception as e:
@@ -209,7 +223,11 @@ def cmd_models_pull(args):
 
 def cmd_models_delete(args):
     """Delete a locally downloaded model."""
-    store = _create_store()
+    try:
+        store = _create_store()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     if not args.yes:
         try:
             confirm = input(f"Delete model '{args.model_name}'? [y/N] ")

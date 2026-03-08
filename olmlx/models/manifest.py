@@ -48,6 +48,15 @@ class ModelManifest:
                     if field.default is not dataclasses.MISSING
                     else field.default_factory()
                 )
+        # Validate types for non-null values
+        for field in dataclasses.fields(cls):
+            k = field.name
+            if k in data and data[k] is not None:
+                if field.type in (str, int) and not isinstance(data[k], field.type):
+                    raise ValueError(
+                        f"Field '{k}' should be {field.type.__name__}, "
+                        f"got {type(data[k]).__name__} in {path}"
+                    )
         return cls(**{k: v for k, v in data.items() if k in field_names})
 
     @staticmethod
