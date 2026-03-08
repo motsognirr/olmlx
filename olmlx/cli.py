@@ -1,6 +1,7 @@
-"""CLI for olmlx with serve and service subcommands."""
+"""CLI for olmlx with serve, service, models, and config subcommands."""
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -125,6 +126,149 @@ def cmd_service_status(_args):
         print(f"Service {PLIST_LABEL} is not loaded")
 
 
+def _create_store():
+    """Create a ModelStore instance for CLI use.
+
+    Raises on failure — callers are responsible for catching and exiting.
+    """
+    from olmlx.engine.registry import ModelRegistry
+    from olmlx.models.store import ModelStore
+
+    ensure_config()
+    registry = ModelRegistry()
+    registry.load()
+    return ModelStore(registry)
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format byte size to human-readable string."""
+    if size_bytes >= 1e9:
+        return f"{size_bytes / 1e9:.1f} GB"
+    elif size_bytes >= 1e6:
+        return f"{size_bytes / 1e6:.1f} MB"
+    elif size_bytes >= 1e3:
+        return f"{size_bytes / 1e3:.1f} KB"
+    return f"{size_bytes} B"
+
+
+def cmd_models_list(_args):
+    """List locally downloaded models."""
+    try:
+        store = _create_store()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        models = store.list_local()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not models:
+        print("No models downloaded.")
+        return
+    # Header
+    print(f"{'NAME':<30} {'SIZE':<12} {'PARAMS':<10} {'QUANT':<10} {'HF PATH'}")
+    print("-" * 90)
+    for m in sorted(models, key=lambda x: x.name or ""):
+        name = (m.name or "")[:30]
+        params = (m.parameter_size or "")[:10]
+        quant = (m.quantization_level or "")[:10]
+        print(
+            f"{name:<30} {_format_size(m.size):<12} "
+            f"{params:<10} {quant:<10} {m.hf_path}"
+        )
+
+
+def cmd_models_show(args):
+    """Show details for a specific model."""
+    try:
+        store = _create_store()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        manifest = store.show(args.model_name)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    if manifest is None:
+        print(f"Model '{args.model_name}' not found locally.", file=sys.stderr)
+        sys.exit(1)
+    print(f"Name:           {manifest.name}")
+    print(f"HF Path:        {manifest.hf_path}")
+    print(f"Size:           {_format_size(manifest.size)}")
+    print(f"Format:         {manifest.format}")
+    print(f"Family:         {manifest.family}")
+    print(f"Parameters:     {manifest.parameter_size}")
+    print(f"Quantization:   {manifest.quantization_level}")
+    print(f"Modified:       {manifest.modified_at}")
+    print(f"Digest:         {manifest.digest}")
+
+
+def cmd_models_pull(args):
+    """Pull/download a model."""
+    try:
+        store = _create_store()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    async def _pull():
+        async for status in store.pull(args.model_name):
+            print(status.get("status", ""), flush=True)
+
+    try:
+        asyncio.run(_pull())
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+
+def cmd_models_delete(args):
+    """Delete a locally downloaded model."""
+    try:
+        store = _create_store()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not args.yes:
+        try:
+            confirm = input(f"Delete model '{args.model_name}'? [y/N] ")
+        except EOFError:
+            print("Aborted.")
+            return
+        if confirm.strip().lower() != "y":
+            print("Aborted.")
+            return
+    try:
+        deleted = store.delete(args.model_name)
+    except Exception as e:
+        print(f"Error deleting model '{args.model_name}': {e}", file=sys.stderr)
+        sys.exit(1)
+    if deleted:
+        print(f"Model '{args.model_name}' deleted.")
+    else:
+        print(f"Model '{args.model_name}' not found locally.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_config_show(_args):
+    """Show current configuration."""
+    print(f"Host:                   {settings.host}")
+    print(f"Port:                   {settings.port}")
+    print(f"Models dir:             {settings.models_dir}")
+    print(f"Models config:          {settings.models_config}")
+    print(f"Default keep-alive:     {settings.default_keep_alive}")
+    print(f"Max loaded models:      {settings.max_loaded_models}")
+    print(f"Memory limit fraction:  {settings.memory_limit_fraction}")
+    print(f"CORS origins:           {settings.cors_origins}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="olmlx",
@@ -139,6 +283,21 @@ def build_parser() -> argparse.ArgumentParser:
     svc_sub.add_parser("install", help="Install and start the launchd service")
     svc_sub.add_parser("uninstall", help="Stop and remove the launchd service")
     svc_sub.add_parser("status", help="Show service status")
+
+    mdl = sub.add_parser("models", help="Manage local models")
+    mdl_sub = mdl.add_subparsers(dest="models_command")
+    mdl_sub.add_parser("list", help="List locally downloaded models")
+    pull_p = mdl_sub.add_parser("pull", help="Pull/download a model")
+    pull_p.add_argument("model_name", help="Model name or HF path")
+    show_p = mdl_sub.add_parser("show", help="Show model details")
+    show_p.add_argument("model_name", help="Model name or HF path")
+    del_p = mdl_sub.add_parser("delete", help="Delete a local model")
+    del_p.add_argument("model_name", help="Model name or HF path")
+    del_p.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+
+    cfg = sub.add_parser("config", help="Show configuration")
+    cfg_sub = cfg.add_subparsers(dest="config_command")
+    cfg_sub.add_parser("show", help="Show current configuration")
 
     return parser
 
@@ -158,3 +317,19 @@ def cli_main():
             cmd_service_status(args)
         else:
             parser.parse_args(["service", "--help"])
+    elif args.command == "models":
+        if args.models_command == "list":
+            cmd_models_list(args)
+        elif args.models_command == "pull":
+            cmd_models_pull(args)
+        elif args.models_command == "show":
+            cmd_models_show(args)
+        elif args.models_command == "delete":
+            cmd_models_delete(args)
+        else:
+            parser.parse_args(["models", "--help"])
+    elif args.command == "config":
+        if args.config_command == "show":
+            cmd_config_show(args)
+        else:
+            parser.parse_args(["config", "--help"])

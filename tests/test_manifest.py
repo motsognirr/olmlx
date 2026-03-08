@@ -72,3 +72,88 @@ class TestModelManifest:
         path.write_text(json.dumps(data))
         m = ModelManifest.load(path)
         assert m.name == "test:latest"
+
+    def test_load_coerces_null_strings(self, tmp_path):
+        """Null values for str fields should be coerced to empty strings."""
+        path = tmp_path / "manifest.json"
+        data = {
+            "name": "test:latest",
+            "hf_path": "test/model",
+            "parameter_size": None,
+            "quantization_level": None,
+            "family": None,
+            "format": None,
+        }
+        path.write_text(json.dumps(data))
+        m = ModelManifest.load(path)
+        assert m.parameter_size == ""
+        assert m.quantization_level == ""
+        assert m.family == ""
+        assert m.format == "mlx"
+
+    def test_load_raises_on_null_required_fields(self, tmp_path):
+        """Null values for required str fields (name, hf_path) should raise ValueError."""
+        import pytest
+
+        path = tmp_path / "manifest.json"
+        data = {
+            "name": None,
+            "hf_path": "test/model",
+        }
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="name"):
+            ModelManifest.load(path)
+
+        data = {
+            "name": "test:latest",
+            "hf_path": None,
+        }
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="hf_path"):
+            ModelManifest.load(path)
+
+    def test_load_raises_on_missing_required_fields(self, tmp_path):
+        """Missing required fields (name, hf_path) should raise ValueError."""
+        import pytest
+
+        path = tmp_path / "manifest.json"
+        # Missing 'name' entirely
+        data = {"hf_path": "test/model"}
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="name"):
+            ModelManifest.load(path)
+
+        # Missing 'hf_path' entirely
+        data = {"name": "test:latest"}
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="hf_path"):
+            ModelManifest.load(path)
+
+    def test_load_raises_on_type_mismatch(self, tmp_path):
+        """Non-null wrong types should raise ValueError."""
+        import pytest
+
+        path = tmp_path / "manifest.json"
+        # size should be int, not str
+        data = {"name": "test:latest", "hf_path": "test/model", "size": "2gb"}
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="size"):
+            ModelManifest.load(path)
+
+        # name should be str, not int
+        data = {"name": 123, "hf_path": "test/model"}
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="name"):
+            ModelManifest.load(path)
+
+    def test_load_coerces_null_int_fields(self, tmp_path):
+        """Null values for int fields (e.g. size) should be coerced to their default."""
+        path = tmp_path / "manifest.json"
+        data = {
+            "name": "test:latest",
+            "hf_path": "test/model",
+            "size": None,
+        }
+        path.write_text(json.dumps(data))
+        m = ModelManifest.load(path)
+        assert m.size == 0
