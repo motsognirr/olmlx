@@ -29,14 +29,17 @@ class ModelManifest:
     def load(cls, path: Path) -> "ModelManifest":
         with open(path) as f:
             data = json.load(f)
-        # Coerce None to field defaults; raise on null required fields
+        # Coerce None/missing to field defaults; raise on null/missing required fields
         for k, field in cls.__dataclass_fields__.items():
-            if k in data and data[k] is None:
-                if (
-                    field.default is dataclasses.MISSING
-                    and field.default_factory is dataclasses.MISSING
-                ):
-                    raise ValueError(f"Required field '{k}' is null in manifest {path}")
+            is_required = (
+                field.default is dataclasses.MISSING
+                and field.default_factory is dataclasses.MISSING
+            )
+            if k not in data or data[k] is None:
+                if is_required:
+                    raise ValueError(
+                        f"Required field '{k}' is null or missing in manifest {path}"
+                    )
                 data[k] = (
                     field.default
                     if field.default is not dataclasses.MISSING

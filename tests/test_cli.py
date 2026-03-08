@@ -375,8 +375,9 @@ class TestModelsShowCmd:
         with pytest.raises(SystemExit) as exc_info:
             cmd_models_show(args)
         assert exc_info.value.code == 1
-        out = capsys.readouterr().out
-        assert "not found" in out.lower()
+        captured = capsys.readouterr()
+        assert "not found" in captured.err.lower()
+        assert "not found" not in captured.out.lower()
 
 
 class TestModelsPullCmd:
@@ -487,8 +488,9 @@ class TestModelsDeleteCmd:
         with pytest.raises(SystemExit) as exc_info:
             cmd_models_delete(args)
         assert exc_info.value.code == 1
-        out = capsys.readouterr().out
-        assert "not found" in out.lower()
+        captured = capsys.readouterr()
+        assert "not found" in captured.err.lower()
+        assert "not found" not in captured.out.lower()
 
     def test_delete_prompts_for_confirmation(
         self, capsys, monkeypatch, mock_store, _patch_store

@@ -112,6 +112,23 @@ class TestModelManifest:
         with pytest.raises(ValueError, match="hf_path"):
             ModelManifest.load(path)
 
+    def test_load_raises_on_missing_required_fields(self, tmp_path):
+        """Missing required fields (name, hf_path) should raise ValueError."""
+        import pytest
+
+        path = tmp_path / "manifest.json"
+        # Missing 'name' entirely
+        data = {"hf_path": "test/model"}
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="name"):
+            ModelManifest.load(path)
+
+        # Missing 'hf_path' entirely
+        data = {"name": "test:latest"}
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="hf_path"):
+            ModelManifest.load(path)
+
     def test_load_coerces_null_int_fields(self, tmp_path):
         """Null values for int fields (e.g. size) should be coerced to their default."""
         path = tmp_path / "manifest.json"

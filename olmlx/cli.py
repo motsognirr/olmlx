@@ -173,7 +173,7 @@ def cmd_models_show(args):
     store = _create_store()
     manifest = store.show(args.model_name)
     if manifest is None:
-        print(f"Model '{args.model_name}' not found locally.")
+        print(f"Model '{args.model_name}' not found locally.", file=sys.stderr)
         sys.exit(1)
     print(f"Name:           {manifest.name}")
     print(f"HF Path:        {manifest.hf_path}")
@@ -221,7 +221,7 @@ def cmd_models_delete(args):
     if deleted:
         print(f"Model '{args.model_name}' deleted.")
     else:
-        print(f"Model '{args.model_name}' not found locally.")
+        print(f"Model '{args.model_name}' not found locally.", file=sys.stderr)
         sys.exit(1)
 
 
