@@ -73,6 +73,7 @@ class ModelStore:
         self.models_dir = settings.models_dir
         self._download_locks: dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
+        self._pull_locks: dict[str, asyncio.Lock] = {}
 
     def local_path(self, hf_path: str) -> Path:
         """Return the local directory for a HF repo ID."""
@@ -99,6 +100,10 @@ class ModelStore:
             if (d / "manifest.json").exists():
                 return d
         return None
+
+    def _pull_lock(self, hf_path: str) -> asyncio.Lock:
+        """Return a per-path async lock, creating one if needed."""
+        return self._pull_locks.setdefault(hf_path, asyncio.Lock())
 
     def _download_lock(self, hf_path: str) -> threading.Lock:
         """Return a per-path lock, creating one if needed."""
@@ -161,45 +166,60 @@ class ModelStore:
             else:
                 raise ValueError(f"Model '{name}' not found in config")
 
-        # Skip download if already present
+        # Fast path: skip lock if already downloaded
         if self.is_downloaded(hf_path):
             yield {"status": "pulling manifest"}
             yield {"status": "already downloaded"}
             yield {"status": "success"}
-            # Ensure registered
             if "/" not in name:
                 self.registry.add_mapping(name, hf_path)
             return
 
-        yield {"status": "pulling manifest"}
-        yield {"status": f"downloading {hf_path}"}
+        async with self._pull_lock(hf_path):
+            # Re-check after acquiring lock — another coroutine may have
+            # completed the download while we waited.
+            if self.is_downloaded(hf_path):
+                yield {"status": "pulling manifest"}
+                yield {"status": "already downloaded"}
+                yield {"status": "success"}
+                # Ensure registered
+                if "/" not in name:
+                    self.registry.add_mapping(name, hf_path)
+                return
 
-        local_dir = await asyncio.to_thread(self.ensure_downloaded, hf_path)
+            yield {"status": "pulling manifest"}
+            yield {"status": f"downloading {hf_path}"}
 
-        yield {"status": "verifying"}
+            # ensure_downloaded acquires its own threading.Lock for the same
+            # hf_path — that lock serializes the sync download path used by
+            # ModelManager._load_model().  The asyncio lock here serializes the
+            # async pull path (is_downloaded check → download → manifest write).
+            local_dir = await asyncio.to_thread(self.ensure_downloaded, hf_path)
 
-        # Write manifest
-        meta = _extract_metadata(local_dir)
-        size = _dir_size(local_dir)
-        normalized = self.registry.normalize_name(name)
-        manifest = ModelManifest(
-            name=normalized,
-            hf_path=hf_path,
-            size=size,
-            modified_at=datetime.now(timezone.utc).isoformat(),
-            digest=ModelManifest.compute_digest(normalized),
-            format="mlx",
-            family=meta["family"],
-            parameter_size=meta["parameter_size"],
-            quantization_level=meta["quantization_level"],
-        )
-        manifest.save(local_dir / "manifest.json")
+            yield {"status": "verifying"}
 
-        # Auto-register in models.json
-        if "/" not in name:
-            self.registry.add_mapping(name, hf_path)
+            # Write manifest
+            meta = _extract_metadata(local_dir)
+            size = _dir_size(local_dir)
+            normalized = self.registry.normalize_name(name)
+            manifest = ModelManifest(
+                name=normalized,
+                hf_path=hf_path,
+                size=size,
+                modified_at=datetime.now(timezone.utc).isoformat(),
+                digest=ModelManifest.compute_digest(normalized),
+                format="mlx",
+                family=meta["family"],
+                parameter_size=meta["parameter_size"],
+                quantization_level=meta["quantization_level"],
+            )
+            manifest.save(local_dir / "manifest.json")
 
-        yield {"status": "success"}
+            # Auto-register in models.json
+            if "/" not in name:
+                self.registry.add_mapping(name, hf_path)
+
+            yield {"status": "success"}
 
     def list_local(self) -> list[ModelManifest]:
         """List all locally stored models."""

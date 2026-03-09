@@ -319,6 +319,73 @@ class TestModelStore:
                 pass
 
 
+class TestConcurrentPull:
+    @pytest.mark.asyncio
+    async def test_concurrent_pulls_same_model_download_once(self, mock_store):
+        """Two concurrent pulls of the same model should only trigger one download."""
+        import asyncio
+        from unittest.mock import patch
+
+        call_count = 0
+
+        def counting_download(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            # Simulate download creating config.json
+            local_dir = mock_store.local_path("Qwen/Qwen3-8B-MLX")
+            local_dir.mkdir(parents=True, exist_ok=True)
+            (local_dir / "config.json").write_text("{}")
+
+        async def collect_pull(name: str) -> list[dict]:
+            events = []
+            async for event in mock_store.pull(name):
+                events.append(event)
+            return events
+
+        with patch("huggingface_hub.snapshot_download", side_effect=counting_download):
+            results = await asyncio.gather(
+                collect_pull("qwen3"),
+                collect_pull("qwen3"),
+            )
+
+        assert call_count == 1
+        # Both should complete with success
+        for events in results:
+            statuses = [e["status"] for e in events]
+            assert "success" in statuses
+
+    @pytest.mark.asyncio
+    async def test_concurrent_pull_second_sees_already_downloaded(self, mock_store):
+        """Second concurrent pull should see 'already downloaded' after first completes."""
+        import asyncio
+        from unittest.mock import patch
+
+        def downloading(**kwargs):
+            local_dir = mock_store.local_path("Qwen/Qwen3-8B-MLX")
+            local_dir.mkdir(parents=True, exist_ok=True)
+            (local_dir / "config.json").write_text("{}")
+
+        async def collect_pull(name: str) -> list[dict]:
+            events = []
+            async for event in mock_store.pull(name):
+                events.append(event)
+            return events
+
+        with patch("huggingface_hub.snapshot_download", side_effect=downloading):
+            results = await asyncio.gather(
+                collect_pull("qwen3"),
+                collect_pull("qwen3"),
+            )
+
+        # Exactly one should have "already downloaded"
+        already_downloaded_count = sum(
+            1
+            for events in results
+            if any(e["status"] == "already downloaded" for e in events)
+        )
+        assert already_downloaded_count == 1
+
+
 class TestEnsureDownloaded:
     def test_skips_if_already_downloaded(self, mock_store):
         """Returns local path without downloading if model is already present."""
