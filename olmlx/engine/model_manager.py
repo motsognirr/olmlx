@@ -180,6 +180,7 @@ class ModelManager:
             # If loading itself triggers an OOM the process will still crash.
             # In practice, loading succeeds; it is the KV cache allocation
             # during generation that causes the abort.
+            lm = None
             try:
                 mem_after = _get_metal_memory_bytes()
                 total = _get_system_memory_bytes()
@@ -234,8 +235,10 @@ class ModelManager:
                 # Drop references and flush Metal allocator so the memory
                 # is actually reclaimed before we raise.  Also clean up
                 # lm if it was already constructed (exception between
-                # LoadedModel() and return).
-                if "lm" in locals():
+                # LoadedModel() and return), and pop from _loaded to
+                # prevent a zombie entry holding GPU memory.
+                if lm is not None:
+                    self._loaded.pop(normalized, None)
                     del lm
                 del model, tokenizer
                 gc.collect()
@@ -380,13 +383,10 @@ class ModelManager:
                 local_dir.mkdir(parents=True, exist_ok=True)
                 marker = local_dir / ".downloading"
                 marker.touch()
-                try:
-                    snapshot_download(repo_id=hf_path, local_dir=str(local_dir))
-                except Exception:
-                    # Don't rmtree: partial dir enables snapshot_download to
-                    # resume on retry.  The .downloading marker keeps
-                    # is_downloaded() safe.
-                    raise
+                # Don't rmtree on failure: partial dir lets
+                # snapshot_download resume on retry.  The .downloading
+                # marker keeps is_downloaded() safe.
+                snapshot_download(repo_id=hf_path, local_dir=str(local_dir))
                 marker.unlink(missing_ok=True)
             load_path = str(local_dir)
 
