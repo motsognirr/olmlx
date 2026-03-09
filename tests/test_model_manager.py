@@ -988,3 +988,29 @@ class TestMemoryCheck:
         assert mock_gc.call_count == 2
         assert mock_clear.call_count == 2
         assert "qwen3:latest" not in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_cleanup_when_load_model_itself_fails(self, registry, mock_store):
+        """If _load_model raises (e.g. partial GPU alloc then OOM), GPU cache must be flushed."""
+        manager = ModelManager(registry, mock_store)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                side_effect=RuntimeError("Metal OOM during mlx_lm.load"),
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_metal_memory_bytes",
+                return_value=1 * self.GB,
+            ),
+            patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
+            patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+        ):
+            with pytest.raises(RuntimeError, match="Metal OOM"):
+                await manager.ensure_loaded("qwen3")
+
+        # Pre-load flush + post-failure flush = 2 calls each
+        assert mock_gc.call_count == 2
+        assert mock_clear.call_count == 2
+        assert "qwen3:latest" not in manager._loaded

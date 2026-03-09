@@ -128,18 +128,15 @@ class ModelStore:
 
         marker = local_dir / ".downloading"
         marker.touch()
-        try:
-            await asyncio.to_thread(
-                snapshot_download,
-                repo_id=hf_path,
-                local_dir=str(local_dir),
-            )
-        except BaseException:
-            # Don't rmtree: on CancelledError the download thread may still
-            # be running (asyncio.to_thread doesn't cancel threads), and on
-            # Exception the partial dir enables snapshot_download to resume
-            # on retry.  The .downloading marker keeps is_downloaded() safe.
-            raise
+        # Don't rmtree on failure: on CancelledError the download thread
+        # may still be running (asyncio.to_thread doesn't cancel threads),
+        # and on Exception the partial dir lets snapshot_download resume
+        # on retry.  The .downloading marker keeps is_downloaded() safe.
+        await asyncio.to_thread(
+            snapshot_download,
+            repo_id=hf_path,
+            local_dir=str(local_dir),
+        )
         marker.unlink(missing_ok=True)
 
         yield {"status": "verifying"}

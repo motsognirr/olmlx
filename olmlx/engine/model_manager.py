@@ -166,22 +166,26 @@ class ModelManager:
 
             logger.info("Loading model %s from %s", normalized, hf_path)
             mem_before = _get_metal_memory_bytes()
-            model, tokenizer, is_vlm, caps = await asyncio.to_thread(
-                self._load_model, hf_path
-            )
 
-            # Check if the model fits safely in memory.  On Apple Silicon
-            # the GPU shares system RAM — if total Metal memory exceeds the
-            # configured fraction of system RAM, generation will almost
-            # certainly OOM and crash the process (Metal abort, not catchable
-            # in Python).  Reject early with a clear error instead.
-            #
-            # Note: this is a post-hoc check — the model is already loaded.
-            # If loading itself triggers an OOM the process will still crash.
-            # In practice, loading succeeds; it is the KV cache allocation
-            # during generation that causes the abort.
+            # Initialize before try so the except handler can always
+            # clean up, whether _load_model or the post-load check fails.
+            model = tokenizer = None
             lm = None
             try:
+                model, tokenizer, is_vlm, caps = await asyncio.to_thread(
+                    self._load_model, hf_path
+                )
+
+                # Check if the model fits safely in memory.  On Apple Silicon
+                # the GPU shares system RAM — if total Metal memory exceeds the
+                # configured fraction of system RAM, generation will almost
+                # certainly OOM and crash the process (Metal abort, not catchable
+                # in Python).  Reject early with a clear error instead.
+                #
+                # Note: this is a post-hoc check — the model is already loaded.
+                # If loading itself triggers an OOM the process will still crash.
+                # In practice, loading succeeds; it is the KV cache allocation
+                # during generation that causes the abort.
                 mem_after = _get_metal_memory_bytes()
                 total = _get_system_memory_bytes()
                 limit = int(total * settings.memory_limit_fraction)
