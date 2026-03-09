@@ -339,6 +339,7 @@ class ModelManager:
         """
 
         async def _cleanup() -> None:
+            cancelled = False
             try:
                 await load_task
             except asyncio.CancelledError:
@@ -346,6 +347,7 @@ class ModelManager:
                 # warnings.  The background thread keeps running (Python
                 # can't interrupt native threads) but the task is marked
                 # done so asyncio won't complain at shutdown.
+                cancelled = True
                 load_task.cancel()
                 raise
             except BaseException:
@@ -357,9 +359,15 @@ class ModelManager:
                 # while ours is still running, which is unsafe for the
                 # Metal allocator.  If gc/clear itself fails, still pop
                 # so the model slot isn't permanently bricked.
+                #
+                # Skip gc/clear when cancelled — the background thread is
+                # still active and mx.clear_cache() is not safe to call
+                # concurrently with Metal allocations.  stop() clears the
+                # entries separately.
                 try:
-                    gc.collect()
-                    mx.clear_cache()
+                    if not cancelled:
+                        gc.collect()
+                        mx.clear_cache()
                 finally:
                     self._pending_cleanups.pop(model_name, None)
                     self._pending_load_tasks.pop(model_name, None)
