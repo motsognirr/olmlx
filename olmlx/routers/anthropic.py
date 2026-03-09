@@ -562,6 +562,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                     if isinstance(event, dict) and event.get("cache_info"):
                         cache_read = event.get("cache_read_tokens", 0)
                         cache_creation = event.get("cache_creation_tokens", 0)
+                        logger.debug(
+                            "Cache stats for message_start: read=%d creation=%d",
+                            cache_read,
+                            cache_creation,
+                        )
                     else:
                         first_event = event
                         break

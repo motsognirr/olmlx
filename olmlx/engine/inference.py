@@ -321,11 +321,25 @@ async def _stream_completion(
 
     if use_prompt_cache and prompt_tokens is not None and make_prompt_cache is not None:
         cached = lm.prompt_cache_state
+        logger.debug(
+            "Cache lookup: cached=%s, new prompt=%d tokens",
+            (
+                f"{len(cached.tokens)} tokens (first 5: {cached.tokens[:5]})"
+                if cached
+                else "none"
+            ),
+            len(prompt_tokens),
+        )
 
         prefix_len = (
             _find_common_prefix(prompt_tokens, cached.tokens)
             if cached is not None
             else 0
+        )
+        logger.debug(
+            "Common prefix length: %d / %d prompt tokens",
+            prefix_len,
+            len(prompt_tokens),
         )
 
         if prefix_len > 0:
@@ -410,9 +424,16 @@ async def _stream_completion(
         # Store cache state after successful generation
         prompt_cache = gen_kwargs.get("prompt_cache")
         if prompt_cache is not None and full_prompt_tokens is not None:
+            stored_tokens = list(full_prompt_tokens) + generated_tokens
             lm.prompt_cache_state = CachedPromptState(
-                tokens=list(full_prompt_tokens) + generated_tokens,
+                tokens=stored_tokens,
                 cache=prompt_cache,
+            )
+            logger.debug(
+                "Cache stored: %d tokens (%d prompt + %d generated)",
+                len(stored_tokens),
+                len(full_prompt_tokens),
+                len(generated_tokens),
             )
 
         yield {
@@ -423,6 +444,7 @@ async def _stream_completion(
     finally:
         # Invalidate cache on incomplete generation to avoid inconsistent state
         if not generation_complete and full_prompt_tokens is not None:
+            logger.debug("Cache invalidated: generation did not complete")
             lm.prompt_cache_state = None
         # We MUST wait for the Metal thread to finish before releasing
         # _inference_lock, otherwise the next inference will hit concurrent
@@ -584,6 +606,23 @@ async def generate_chat(
     prompt_tokens = None
     if use_prompt_cache:
         prompt_tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
+        logger.debug(
+            "Prompt cache enabled: %d prompt tokens, existing cache=%s",
+            len(prompt_tokens),
+            (
+                f"{len(lm.prompt_cache_state.tokens)} tokens"
+                if lm.prompt_cache_state
+                else "none"
+            ),
+        )
+    else:
+        logger.debug(
+            "Prompt cache disabled: setting=%s vlm=%s stream=%s make_prompt_cache=%s",
+            settings.prompt_cache,
+            lm.is_vlm,
+            stream,
+            make_prompt_cache is not None,
+        )
 
     if stream:
         return _stream_completion(
