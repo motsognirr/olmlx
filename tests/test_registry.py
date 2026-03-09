@@ -1,10 +1,13 @@
 """Tests for olmlx.engine.registry."""
 
 import json
+import os
+import stat
+from unittest.mock import patch
 
 import pytest
 
-from olmlx.engine.registry import ModelRegistry
+from olmlx.engine.registry import ModelRegistry, _atomic_write_json
 
 
 class TestModelRegistry:
@@ -92,3 +95,40 @@ class TestModelRegistry:
         models = registry.list_models()
         assert "custom:latest" in models
         assert "qwen3:latest" in models
+
+
+class TestAtomicWriteJson:
+    def test_atomic_write_json_creates_valid_file(self, tmp_path):
+        target = tmp_path / "data.json"
+        data = {"key": "value", "nested": {"a": 1}}
+        _atomic_write_json(data, target)
+        assert json.loads(target.read_text()) == data
+
+    def test_atomic_write_json_no_leftover_tmp_files(self, tmp_path):
+        target = tmp_path / "data.json"
+        _atomic_write_json({"a": 1}, target)
+        tmp_files = list(tmp_path.glob("*.tmp"))
+        assert tmp_files == []
+
+    def test_atomic_write_json_cleans_up_on_failure(self, tmp_path):
+        target = tmp_path / "data.json"
+        with patch("olmlx.engine.registry.json.dump", side_effect=IOError("disk full")):
+            with pytest.raises(IOError, match="disk full"):
+                _atomic_write_json({"a": 1}, target)
+        assert not target.exists()
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_atomic_write_json_preserves_original_on_failure(self, tmp_path):
+        target = tmp_path / "data.json"
+        original = {"original": True}
+        target.write_text(json.dumps(original))
+        with patch("olmlx.engine.registry.json.dump", side_effect=IOError("disk full")):
+            with pytest.raises(IOError, match="disk full"):
+                _atomic_write_json({"new": True}, target)
+        assert json.loads(target.read_text()) == original
+
+    def test_atomic_write_json_file_permissions(self, tmp_path):
+        target = tmp_path / "data.json"
+        _atomic_write_json({"a": 1}, target)
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+        assert mode == 0o644

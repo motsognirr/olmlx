@@ -1,6 +1,29 @@
 import json
+import os
+import tempfile
+from pathlib import Path
 
 from olmlx.config import settings
+
+
+def _atomic_write_json(data: dict, path: Path) -> None:
+    """Write JSON data to path atomically using temp file + rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w") as f:
+            fd = -1  # ownership transferred to the file object
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if fd != -1:
+            os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 class ModelRegistry:
@@ -69,9 +92,7 @@ class ModelRegistry:
         self._save_mappings()
 
     def _save_mappings(self):
-        settings.models_config.parent.mkdir(parents=True, exist_ok=True)
-        with open(settings.models_config, "w") as f:
-            json.dump(self._mappings, f, indent=2)
+        _atomic_write_json(self._mappings, settings.models_config)
 
     def remove(self, name: str):
         """Remove a model alias."""
@@ -80,6 +101,4 @@ class ModelRegistry:
         self._save_aliases()
 
     def _save_aliases(self):
-        self._aliases_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._aliases_path, "w") as f:
-            json.dump(self._aliases, f, indent=2)
+        _atomic_write_json(self._aliases, self._aliases_path)
