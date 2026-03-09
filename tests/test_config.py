@@ -2,6 +2,9 @@
 
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from olmlx.config import Settings
 
 
@@ -37,3 +40,13 @@ class TestSettings:
         assert s.port == 8080
         assert s.max_loaded_models == 3
         assert s.model_load_timeout == 120.0
+
+    def test_model_load_timeout_rejects_zero(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_MODEL_LOAD_TIMEOUT", "0")
+        with pytest.raises(ValidationError):
+            Settings()
+
+    def test_model_load_timeout_rejects_negative(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_MODEL_LOAD_TIMEOUT", "-1")
+        with pytest.raises(ValidationError):
+            Settings()

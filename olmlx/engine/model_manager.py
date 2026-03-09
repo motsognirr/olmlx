@@ -324,15 +324,19 @@ class ModelManager:
         async def _cleanup() -> None:
             try:
                 await load_task
+            except asyncio.CancelledError:
+                # Re-raise so the task enters cancelled state.  Don't flush
+                # Metal cache — the background thread is still running.
+                # stop() clears _pending_cleanups separately.
+                raise
             except BaseException:
                 pass
-            finally:
-                gc.collect()
-                mx.clear_cache()
-                self._pending_cleanups.pop(model_name, None)
-                logger.info(
-                    "Deferred GPU cleanup after timeout of '%s' completed", model_name
-                )
+            gc.collect()
+            mx.clear_cache()
+            self._pending_cleanups.pop(model_name, None)
+            logger.info(
+                "Deferred GPU cleanup after timeout of '%s' completed", model_name
+            )
 
         self._pending_cleanups[model_name] = asyncio.create_task(_cleanup())
 

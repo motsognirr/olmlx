@@ -701,7 +701,8 @@ class TestModelLoadTimeout:
         """Retrying a timed-out model while another model loads concurrently.
 
         The cleanup wait for qwen3 must not hold the lock and block a
-        concurrent ensure_loaded for llama3:8b.
+        concurrent ensure_loaded for llama3:8b.  Verified structurally
+        by checking completion order (no timing dependency).
         """
         monkeypatch.setattr(
             "olmlx.engine.model_manager.settings.model_load_timeout", 0.1
@@ -715,12 +716,14 @@ class TestModelLoadTimeout:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                time.sleep(0.8)  # First call: triggers timeout, cleanup takes 0.8s
+                time.sleep(0.5)  # First call: triggers timeout, cleanup takes 0.5s
             return (MagicMock(), MagicMock(), False, TemplateCaps())
 
         total_ram = 64 * self.GB
         mem_before = 1 * self.GB
         mem_after = int(total_ram * 0.50)
+
+        results = []
 
         with (
             patch.object(manager, "_load_model", side_effect=slow_then_fast),
@@ -735,7 +738,7 @@ class TestModelLoadTimeout:
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
-            # Timeout on qwen3 — orphaned thread runs for ~0.8s
+            # Timeout on qwen3 — orphaned thread runs for ~0.5s
             with pytest.raises(TimeoutError):
                 await manager.ensure_loaded("qwen3")
 
@@ -743,27 +746,22 @@ class TestModelLoadTimeout:
                 "olmlx.engine.model_manager.settings.model_load_timeout", None
             )
 
-            # Launch qwen3 retry (waits for cleanup ~0.8s) AND llama3
-            # load concurrently.  If cleanup wait holds the lock, llama3
-            # would be blocked until qwen3 cleanup finishes.
-            start = time.time()
-            qwen_task = asyncio.create_task(manager.ensure_loaded("qwen3"))
-            llama_task = asyncio.create_task(manager.ensure_loaded("llama3:8b"))
+            # Launch qwen3 retry (waits for cleanup) AND llama3 load
+            # concurrently.  Track completion order.
+            async def load_and_track(name):
+                lm = await manager.ensure_loaded(name)
+                results.append(lm.name)
+                return lm
 
-            # llama3 should finish fast even while qwen3 waits for cleanup
-            llama_lm = await llama_task
-            llama_elapsed = time.time() - start
+            qwen_task = asyncio.create_task(load_and_track("qwen3"))
+            llama_task = asyncio.create_task(load_and_track("llama3:8b"))
 
-            qwen_lm = await qwen_task
-            qwen_elapsed = time.time() - start
+            await asyncio.gather(qwen_task, llama_task)
 
-            assert llama_lm.name == "llama3:8b"
-            assert qwen_lm.name == "qwen3:latest"
-            # llama3 should not have waited for qwen3's ~0.8s cleanup
-            assert llama_elapsed < qwen_elapsed * 0.7, (
-                f"llama3 took {llama_elapsed:.3f}s, qwen3 took {qwen_elapsed:.3f}s — "
-                "looks like llama3 was blocked waiting for qwen3's cleanup"
-            )
+            # llama3 should finish before qwen3 (which waits for cleanup).
+            # If the lock were held during cleanup, qwen3 would block
+            # llama3 and finish first.
+            assert results == ["llama3:8b", "qwen3:latest"]
 
 
 class TestTryLmThenVlmFallback:
