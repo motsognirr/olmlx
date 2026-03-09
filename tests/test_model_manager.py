@@ -807,8 +807,9 @@ class TestModelLoadTimeout:
             # Await the cleanup task — it should fail but still clear the entry
             cleanup_task = manager._pending_cleanups.get("qwen3:latest")
             assert cleanup_task is not None
-            # The task raises RuntimeError from gc.collect, but the pop
-            # should have happened in finally before gc.collect ran.
+            # The task raises RuntimeError from gc.collect (which runs
+            # first in the outer try), but the inner finally still pops
+            # the entry regardless.
             with pytest.raises(RuntimeError, match="gc failure"):
                 await cleanup_task
 

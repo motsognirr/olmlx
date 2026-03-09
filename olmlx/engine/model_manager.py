@@ -128,6 +128,7 @@ class ModelManager:
         # The underlying threads can't be interrupted (Python limitation)
         # so use a bounded timeout to avoid blocking shutdown indefinitely.
         if self._pending_load_tasks:
+            drained = True
             try:
                 await asyncio.wait_for(
                     asyncio.gather(
@@ -136,14 +137,17 @@ class ModelManager:
                     timeout=5.0,
                 )
             except asyncio.TimeoutError:
+                drained = False
                 logger.warning(
                     "Timed out waiting for %d orphaned load thread(s) to finish; "
                     "they will be abandoned on process exit",
                     len(self._pending_load_tasks),
                 )
-            # Flush GPU memory for any threads that did finish during the drain.
-            gc.collect()
-            mx.clear_cache()
+            # Only flush when all threads finished — if the drain timed out,
+            # threads are still allocating and mx.clear_cache() is unsafe.
+            if drained:
+                gc.collect()
+                mx.clear_cache()
         self._pending_load_tasks.clear()
         self._loaded.clear()
 
@@ -210,9 +214,12 @@ class ModelManager:
                     del self._loaded[oldest_name]
 
                 # Flush Metal allocator cache so that buffers from evicted models
-                # don't inflate the mem_before measurement below.
-                gc.collect()
-                mx.clear_cache()
+                # don't inflate the mem_before measurement below.  Skip when
+                # any deferred cleanup is pending — a different model's
+                # background thread may still be allocating Metal memory.
+                if not self._pending_cleanups:
+                    gc.collect()
+                    mx.clear_cache()
 
                 hf_path = self.registry.resolve(name)
                 if hf_path is None:
