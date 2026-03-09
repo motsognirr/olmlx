@@ -112,6 +112,13 @@ class ModelManager:
                 await self._expiry_task
             except asyncio.CancelledError:
                 pass
+        for task in self._pending_cleanups.values():
+            task.cancel()
+        if self._pending_cleanups:
+            await asyncio.gather(
+                *self._pending_cleanups.values(), return_exceptions=True
+            )
+        self._pending_cleanups.clear()
         self._loaded.clear()
 
     def _resolve_keep_alive(self, keep_alive: str | None) -> float | None:
@@ -125,6 +132,19 @@ class ModelManager:
     ) -> LoadedModel:
         """Ensure a model is loaded and return it."""
         normalized = self.registry.normalize_name(name)
+
+        # If a previous load timed out and the background thread is still
+        # running, wait for its deferred cleanup to finish BEFORE acquiring
+        # the lock — the cleanup may take minutes (waiting for a background
+        # download thread), and holding the lock would block all model ops.
+        cleanup = self._pending_cleanups.get(normalized)
+        if cleanup is not None:
+            logger.info(
+                "Waiting for deferred cleanup of '%s' before retry",
+                normalized,
+            )
+            await cleanup
+
         async with self._lock:
             if normalized in self._loaded:
                 lm = self._loaded[normalized]
@@ -135,18 +155,6 @@ class ModelManager:
                 else:
                     lm.expires_at = None
                 return lm
-
-            # If a previous load timed out and the background thread is
-            # still running, wait for its deferred cleanup to finish before
-            # starting a new load — otherwise two threads race to load the
-            # same weights, doubling peak GPU memory.
-            cleanup = self._pending_cleanups.get(normalized)
-            if cleanup is not None:
-                logger.info(
-                    "Waiting for deferred cleanup of '%s' before retry",
-                    normalized,
-                )
-                await cleanup
 
             # Evict LRU if at capacity (skip models with active inference)
             while len(self._loaded) >= settings.max_loaded_models:

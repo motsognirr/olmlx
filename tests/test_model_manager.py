@@ -155,6 +155,19 @@ class TestModelManager:
         assert mock_manager._loaded == {}
 
     @pytest.mark.asyncio
+    async def test_stop_cancels_pending_cleanups(self, mock_manager):
+        """stop() cancels and clears pending cleanup tasks."""
+
+        async def dummy():
+            await asyncio.sleep(100)
+
+        task = asyncio.create_task(dummy())
+        mock_manager._pending_cleanups["test:latest"] = task
+        await mock_manager.stop()
+        assert mock_manager._pending_cleanups == {}
+        assert task.cancelled()
+
+    @pytest.mark.asyncio
     async def test_stop_cancels_expiry_task(self, mock_manager):
         # Create a dummy task
         async def dummy():
@@ -677,6 +690,73 @@ class TestModelLoadTimeout:
 
             # Cleanup should be complete
             assert "qwen3:latest" not in manager._pending_cleanups
+
+    @pytest.mark.asyncio
+    async def test_cleanup_wait_does_not_block_other_models(
+        self, registry, mock_store, monkeypatch
+    ):
+        """Retrying a timed-out model while another model loads concurrently.
+
+        The cleanup wait for qwen3 must not hold the lock and block a
+        concurrent ensure_loaded for llama3:8b.
+        """
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", 0.1
+        )
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 2)
+        manager = ModelManager(registry, mock_store)
+
+        call_count = 0
+
+        def slow_then_fast(hf_path):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                time.sleep(0.8)  # First call: triggers timeout, cleanup takes 0.8s
+            return (MagicMock(), MagicMock(), False, TemplateCaps())
+
+        total_ram = 64 * self.GB
+        mem_before = 1 * self.GB
+        mem_after = int(total_ram * 0.50)
+
+        with (
+            patch.object(manager, "_load_model", side_effect=slow_then_fast),
+            patch(
+                "olmlx.engine.model_manager._get_metal_memory_bytes",
+                side_effect=[mem_before, mem_before, mem_after, mem_before, mem_after],
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+            patch("olmlx.engine.model_manager.gc.collect"),
+            patch("olmlx.engine.model_manager.mx.clear_cache"),
+        ):
+            # Timeout on qwen3 — orphaned thread runs for ~0.8s
+            with pytest.raises(TimeoutError):
+                await manager.ensure_loaded("qwen3")
+
+            monkeypatch.setattr(
+                "olmlx.engine.model_manager.settings.model_load_timeout", None
+            )
+
+            # Launch qwen3 retry (waits for cleanup ~0.8s) AND llama3
+            # load concurrently.  If cleanup wait holds the lock, llama3
+            # would be blocked until qwen3 cleanup finishes.
+            start = time.time()
+            qwen_task = asyncio.create_task(manager.ensure_loaded("qwen3"))
+            llama_task = asyncio.create_task(manager.ensure_loaded("llama3:8b"))
+
+            # llama3 should finish fast even while qwen3 waits for cleanup
+            llama_lm = await llama_task
+            llama_elapsed = time.time() - start
+
+            qwen_lm = await qwen_task
+
+            assert llama_lm.name == "llama3:8b"
+            assert qwen_lm.name == "qwen3:latest"
+            # llama3 should not have waited for qwen3's ~0.8s cleanup
+            assert llama_elapsed < 0.5
 
 
 class TestTryLmThenVlmFallback:
