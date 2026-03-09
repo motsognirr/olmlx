@@ -12,13 +12,12 @@ def _atomic_write_json(data: dict, path: Path) -> None:
     fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w") as f:
+            fd = -1  # ownership transferred to the file object
             json.dump(data, f, indent=2)
-        # mkstemp creates files with 0o600; restore umask-respecting permissions
-        umask = os.umask(0)
-        os.umask(umask)
-        os.chmod(tmp_path, 0o666 & ~umask)
         os.replace(tmp_path, path)
     except BaseException:
+        if fd != -1:
+            os.close(fd)
         try:
             os.unlink(tmp_path)
         except OSError:
