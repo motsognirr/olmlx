@@ -587,6 +587,86 @@ class TestCacheStatsInCacheInfoChunk:
         assert "cache_read_tokens" not in done_chunk
 
 
+class TestTokenizeForCacheEmptyBos:
+    def test_empty_bos_token_still_adds_special(self):
+        """When bos_token is empty string, add_special_tokens should be True."""
+        from olmlx.engine.inference import _tokenize_for_cache
+
+        tokenizer = MagicMock()
+        tokenizer.bos_token = ""
+        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+        result = _tokenize_for_cache(tokenizer, "hello")
+        tokenizer.encode.assert_called_once_with("hello", add_special_tokens=True)
+        assert result == [1, 2, 3]
+
+
+class TestCacheExactMatchTrimAlignment:
+    @pytest.mark.asyncio
+    async def test_exact_match_trims_to_suffix_start(self, mock_manager):
+        """When prompt is exact prefix of cached tokens, trim aligns with suffix_start."""
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="same prompt")
+        lm.tokenizer.bos_token = None
+
+        # Previously cached: 3 prompt tokens + 2 generated
+        existing_cache = [MagicMock()]
+        lm.prompt_cache_state = CachedPromptState(
+            tokens=[10, 20, 30, 100, 101],
+            cache=existing_cache,
+        )
+
+        # New prompt: exact same 3 tokens (prefix_len == len(prompt_tokens))
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30])
+
+        tokens = _make_stream_tokens("out", prompt_tokens=1)
+        mock_stream = _make_mock_stream(tokens)
+
+        mock_trim = MagicMock()
+
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ) as mock_async_stream,
+            patch(
+                "olmlx.engine.inference.trim_prompt_cache",
+                mock_trim,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.default_keep_alive = "5m"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "same"}],
+                stream=True,
+            )
+            chunks = []
+            async for chunk in gen:
+                chunks.append(chunk)
+
+        # suffix_start = min(3, 3-1) = 2
+        # Trim should leave 2 entries (not 3), so trim_amount = 5 - 2 = 3
+        mock_trim.assert_called_once_with(existing_cache, 3)
+
+        # Only the last token should be sent (suffix_tokens = [30])
+        call_args = mock_async_stream.call_args
+        prompt_arg = call_args[1].get("prompt") or call_args[0][2]
+        assert prompt_arg == [30]
+
+        # Cache stats: cache_read should be suffix_start (2), not prefix_len (3)
+        cache_info = chunks[0]
+        assert cache_info.get("cache_info") is True
+        assert cache_info["cache_read_tokens"] == 2
+        assert cache_info["cache_creation_tokens"] == 1
+
+
 class TestConfigPromptCacheSetting:
     def test_default_enabled(self, monkeypatch):
         monkeypatch.delenv("OLMLX_PROMPT_CACHE", raising=False)

@@ -49,7 +49,7 @@ def _safe_sync():
 def _tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
     """Tokenize prompt text matching stream_generate's tokenization logic."""
     bos = getattr(tokenizer, "bos_token", None)
-    add_special = bos is None or not prompt_text.startswith(bos)
+    add_special = not bos or not prompt_text.startswith(bos)
     return tokenizer.encode(prompt_text, add_special_tokens=add_special)
 
 
@@ -329,16 +329,17 @@ async def _stream_completion(
         )
 
         if prefix_len > 0:
-            # Trim cache to common prefix (remove generated + divergent tokens)
-            trim_amount = len(cached.tokens) - prefix_len
+            # Ensure at least 1 token for stream_generate
+            suffix_start = min(prefix_len, len(prompt_tokens) - 1)
+
+            # Trim cache to suffix_start so it aligns with where we resume
+            trim_amount = len(cached.tokens) - suffix_start
             if trim_amount > 0:
                 trim_prompt_cache(cached.cache, trim_amount)
 
-            # Ensure at least 1 token for stream_generate
-            suffix_start = min(prefix_len, len(prompt_tokens) - 1)
             suffix_tokens = prompt_tokens[suffix_start:]
 
-            cache_read_tokens = prefix_len
+            cache_read_tokens = suffix_start
             cache_creation_tokens = len(suffix_tokens)
             logger.info(
                 "Prompt cache hit: %d prefix tokens reused, %d new tokens to process (was %d total)",
