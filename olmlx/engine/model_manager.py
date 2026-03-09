@@ -126,13 +126,24 @@ class ModelManager:
         self._pending_cleanups.clear()
         # Drain orphaned load tasks so their exceptions are retrieved.
         # The underlying threads can't be interrupted (Python limitation)
-        # but cancelling the asyncio tasks prevents warnings at shutdown.
-        for task in self._pending_load_tasks.values():
-            task.cancel()
+        # so use a bounded timeout to avoid blocking shutdown indefinitely.
         if self._pending_load_tasks:
-            await asyncio.gather(
-                *self._pending_load_tasks.values(), return_exceptions=True
-            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *self._pending_load_tasks.values(), return_exceptions=True
+                    ),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timed out waiting for %d orphaned load thread(s) to finish; "
+                    "they will be abandoned on process exit",
+                    len(self._pending_load_tasks),
+                )
+            # Flush GPU memory for any threads that did finish during the drain.
+            gc.collect()
+            mx.clear_cache()
         self._pending_load_tasks.clear()
         self._loaded.clear()
 

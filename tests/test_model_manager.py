@@ -762,7 +762,9 @@ class TestModelLoadTimeout:
             # llama3 should finish before qwen3 (which waits for cleanup).
             # If the lock were held during cleanup, qwen3 would block
             # llama3 and finish first.
-            assert results == ["llama3:8b", "qwen3:latest"]
+            assert results.index("llama3:8b") < results.index("qwen3:latest"), (
+                f"Expected llama3:8b to complete before qwen3:latest, got: {results}"
+            )
 
     @pytest.mark.asyncio
     async def test_stale_cleanup_entry_on_gc_failure(
