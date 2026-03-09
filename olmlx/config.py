@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     default_keep_alive: str = "5m"
     max_loaded_models: int = 1
     memory_limit_fraction: Annotated[float, Field(gt=0, le=1.0)] = 0.75
+    model_load_timeout: Annotated[float, Field(gt=0)] | None = None
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
 
 

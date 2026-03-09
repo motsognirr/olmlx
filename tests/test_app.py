@@ -1,10 +1,12 @@
 """Tests for olmlx.app."""
 
+import socket
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from olmlx.app import _make_error_response, create_app
+from olmlx.engine.model_manager import ModelLoadTimeoutError
 
 
 class TestMakeErrorResponse:
@@ -227,6 +229,86 @@ class TestErrorHandlers:
         assert resp.status_code == 500
         data = resp.json()
         assert "TypeError" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_handler_ollama(self, app_client):
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = ModelLoadTimeoutError("loading timed out after 60s")
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "hi",
+                    "stream": False,
+                },
+            )
+        assert resp.status_code == 504
+        data = resp.json()
+        assert data["error"] == "loading timed out after 60s"
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_handler_anthropic(self, app_client):
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = ModelLoadTimeoutError("loading timed out after 60s")
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+            )
+        assert resp.status_code == 504
+        data = resp.json()
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "api_error"
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_handler_openai(self, app_client):
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = ModelLoadTimeoutError("loading timed out after 60s")
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        assert resp.status_code == 504
+        data = resp.json()
+        assert data["error"]["code"] == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_socket_timeout_not_caught_as_504(self, app_client):
+        """socket.timeout (a TimeoutError subclass) should NOT hit the 504 handler."""
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = socket.timeout("connection timed out")
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "hi",
+                    "stream": False,
+                },
+            )
+        # Should be 500 (general handler), not 504 (model load timeout)
+        assert resp.status_code == 500
 
     @pytest.mark.asyncio
     async def test_memory_error_handler_ollama(self, app_client):
