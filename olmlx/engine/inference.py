@@ -329,6 +329,11 @@ async def _stream_completion(
             # Shield was interrupted — do synchronous thread join as fallback
             if stream._thread is not None and stream._thread.is_alive():
                 stream._thread.join(timeout=30)
+                if stream._thread.is_alive():
+                    logger.error(
+                        "Fallback thread join timed out after 30s — "
+                        "thread still alive, potential GPU resource leak"
+                    )
         finally:
             # Sync default stream after drain to ensure cleanup is complete
             # before releasing the lock.

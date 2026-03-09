@@ -1,5 +1,7 @@
 """Tests for olmlx.utils.streaming."""
 
+import logging
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -245,3 +247,111 @@ class TestCancellableStream:
         with pytest.raises(RuntimeError, match="boom"):
             async for _ in stream:
                 pass
+
+
+def _blocking_generator(block_event: threading.Event):
+    """A generator factory that blocks until block_event is set."""
+
+    def gen(cancel_event):
+        # Yield one token then block
+        yield type(
+            "Resp",
+            (),
+            {
+                "text": "tok0",
+                "token": 0,
+                "prompt_tokens": 5,
+                "generation_tokens": 1,
+                "prompt_tps": 100.0,
+                "generation_tps": 50.0,
+                "finish_reason": None,
+            },
+        )()
+        # Simulate GPU deadlock — block until explicitly released
+        block_event.wait()
+
+    return gen
+
+
+class TestDrainAndJoinTimeout:
+    @pytest.mark.asyncio
+    async def test_drain_and_join_returns_within_timeout_on_stuck_thread(self):
+        """drain_and_join with a stuck thread should return within the timeout, not hang."""
+        block_event = threading.Event()
+        stream = CancellableStream(_blocking_generator(block_event))
+        stream.start()
+
+        # Consume the one token
+        async for _ in stream:
+            break
+
+        start = time.monotonic()
+        await stream.drain_and_join(timeout=0.5)
+        elapsed = time.monotonic() - start
+
+        # Should return within timeout + some slack, not hang forever
+        assert elapsed < 2.0
+
+        # Clean up: unblock the thread so it can exit
+        block_event.set()
+        stream._thread.join(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_drain_and_join_logs_error_on_timeout(self, caplog):
+        """drain_and_join should log an error when the thread won't exit."""
+        block_event = threading.Event()
+        stream = CancellableStream(_blocking_generator(block_event))
+        stream.start()
+
+        # Consume the one token
+        async for _ in stream:
+            break
+
+        with caplog.at_level(logging.ERROR, logger="olmlx.utils.streaming"):
+            await stream.drain_and_join(timeout=0.5)
+
+        assert any("GPU resource leak" in record.message for record in caplog.records)
+
+        # Clean up
+        block_event.set()
+        stream._thread.join(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_drain_and_join_respects_timeout_value(self):
+        """drain_and_join should respect different timeout values."""
+        block_event = threading.Event()
+        stream = CancellableStream(_blocking_generator(block_event))
+        stream.start()
+
+        async for _ in stream:
+            break
+
+        start = time.monotonic()
+        await stream.drain_and_join(timeout=0.3)
+        elapsed = time.monotonic() - start
+
+        # Should be close to the timeout, not 60s default or infinite
+        assert elapsed < 1.5
+        assert elapsed >= 0.2  # Should wait at least near the timeout
+
+        block_event.set()
+        stream._thread.join(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_drain_and_join_normal_completion_unaffected_by_timeout(self):
+        """Normal completion should still work quickly with timeout parameter."""
+        stream = CancellableStream(
+            lambda cancel_event: _fake_generator(3, delay=0.001),
+        )
+        stream.start()
+
+        async for _ in stream:
+            pass
+
+        start = time.monotonic()
+        await stream.drain_and_join(timeout=30.0)
+        elapsed = time.monotonic() - start
+
+        # Normal completion should be fast, well under the timeout
+        assert elapsed < 5.0
+        assert not stream._thread.is_alive()

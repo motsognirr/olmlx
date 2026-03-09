@@ -1,6 +1,7 @@
 """Tests for olmlx.engine.inference (non-GPU parts)."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -738,3 +739,65 @@ class TestInferenceLocked:
                 pass
             # Called at least twice: entry sync + exit sync
             assert mock_mx.synchronize.call_count >= 2
+
+
+class TestStreamCompletionFallbackJoinLogging:
+    @pytest.mark.asyncio
+    async def test_fallback_join_logs_error_when_thread_alive(
+        self, mock_manager, caplog
+    ):
+        """When shield is interrupted and fallback join times out, should log error."""
+        mock_mx = MagicMock()
+
+        # Create a mock stream that simulates a stuck thread
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_thread = MagicMock()
+        mock_thread.is_alive.return_value = True
+        mock_thread.join = MagicMock()  # join returns but thread still "alive"
+        mock_stream._thread = mock_thread
+
+        token_iter = iter(
+            [
+                StreamToken(
+                    text="a",
+                    token=1,
+                    prompt_tokens=5,
+                    generation_tokens=1,
+                    prompt_tps=100.0,
+                    generation_tps=50.0,
+                ),
+            ]
+        )
+
+        async def anext_impl():
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        # Make drain_and_join raise CancelledError to trigger fallback path
+        async def drain_raises():
+            raise asyncio.CancelledError()
+
+        mock_stream.drain_and_join = drain_raises
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ):
+                with caplog.at_level(logging.ERROR, logger="olmlx.engine.inference"):
+                    gen = await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=True,
+                    )
+                    chunks = []
+                    async for chunk in gen:
+                        chunks.append(chunk)
+
+        assert any("thread still alive" in record.message for record in caplog.records)

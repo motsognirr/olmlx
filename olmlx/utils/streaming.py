@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import threading
+import time
 import traceback
 from collections.abc import Generator
 from dataclasses import dataclass
@@ -138,23 +139,39 @@ class CancellableStream:
             except Exception:
                 pass
 
-    async def drain_and_join(self):
+    async def drain_and_join(self, timeout: float = 60.0):
         """Drain remaining items from the queue and wait for the thread to finish.
 
         IMPORTANT: This must wait for the thread to truly finish before returning,
         otherwise Metal operations from the dying thread can overlap with a new
         inference, causing '[_MTLCommandBuffer addCompletedHandler:] failed assertion'.
+
+        Args:
+            timeout: Maximum total seconds to wait across drain loop and thread join.
+                     If exceeded, logs an error and returns (potential GPU resource leak).
         """
         self._cancel_event.set()
+        deadline = time.monotonic() + timeout
+
         # If the stream already finished (sentinel posted), skip queue draining.
         # This avoids the 10s timeout when the sentinel was already consumed
         # by the async for loop (causing StopAsyncIteration).
         if not self._stream_done.is_set() and self._queue is not None:
             # Drain the queue until we see the sentinel.
-            # Keep waiting as long as the background thread is alive.
+            # Keep waiting as long as the background thread is alive and time remains.
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "drain_and_join: timeout (%.1fs) exceeded during queue drain, "
+                        "thread still alive=%s",
+                        timeout,
+                        self._thread is not None and self._thread.is_alive(),
+                    )
+                    break
                 try:
-                    item = await asyncio.wait_for(self._queue.get(), timeout=10.0)
+                    wait_time = min(10.0, remaining)
+                    item = await asyncio.wait_for(self._queue.get(), timeout=wait_time)
                     if item is _SENTINEL:
                         break
                 except asyncio.TimeoutError:
@@ -165,9 +182,19 @@ class CancellableStream:
                         "drain_and_join: thread still alive, continuing to wait"
                     )
                     continue
+
         if self._thread is not None:
-            # Wait for the thread to fully exit — no timeout
-            await asyncio.to_thread(self._thread.join)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.to_thread(self._thread.join, remaining)
+            if self._thread.is_alive():
+                logger.error(
+                    "drain_and_join: thread still alive after %.1fs timeout — "
+                    "potential GPU resource leak. The background inference thread "
+                    "could not be stopped, which may cause Metal errors on the "
+                    "next inference.",
+                    timeout,
+                )
 
     def __aiter__(self):
         return self
