@@ -307,6 +307,10 @@ class TestModelStore:
                 events.append(event)
 
         assert any(e["status"] == "success" for e in events)
+        # Marker renamed so is_downloaded() isn't permanently poisoned
+        local_dir = mock_store.local_path("Qwen/Qwen3-8B-MLX")
+        assert not (local_dir / ".downloading").exists()
+        assert (local_dir / ".downloading.failed").exists()
 
     @pytest.mark.asyncio
     async def test_pull_unknown_model(self, mock_store, registry):
@@ -359,7 +363,7 @@ class TestEnsureDownloaded:
         assert not mock_store.is_downloaded("Qwen/Qwen3-8B-MLX")
 
     def test_succeeds_when_marker_unlink_raises_oserror(self, mock_store):
-        """If marker.unlink() raises OSError, ensure_downloaded still succeeds."""
+        """If marker.unlink() raises OSError, marker is renamed and download succeeds."""
         from unittest.mock import patch
 
         original_unlink = Path.unlink
@@ -375,4 +379,33 @@ class TestEnsureDownloaded:
         ):
             result = mock_store.ensure_downloaded("Qwen/Qwen3-8B-MLX")
 
-        assert result == mock_store.local_path("Qwen/Qwen3-8B-MLX")
+        local_dir = mock_store.local_path("Qwen/Qwen3-8B-MLX")
+        assert result == local_dir
+        # Marker renamed so is_downloaded() isn't permanently poisoned
+        assert not (local_dir / ".downloading").exists()
+        assert (local_dir / ".downloading.failed").exists()
+
+    def test_concurrent_calls_serialize(self, mock_store):
+        """Concurrent ensure_downloaded for same model only downloads once."""
+        import concurrent.futures
+        from unittest.mock import patch
+
+        call_count = 0
+
+        def counting_download(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            # Simulate download creating config.json
+            local_dir = mock_store.local_path("Qwen/Qwen3-8B-MLX")
+            (local_dir / "config.json").write_text("{}")
+
+        with patch("huggingface_hub.snapshot_download", side_effect=counting_download):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [
+                    pool.submit(mock_store.ensure_downloaded, "Qwen/Qwen3-8B-MLX")
+                    for _ in range(4)
+                ]
+                results = [f.result() for f in futures]
+
+        assert call_count == 1
+        assert all(r == mock_store.local_path("Qwen/Qwen3-8B-MLX") for r in results)

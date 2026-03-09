@@ -245,9 +245,9 @@ class ModelManager:
                     self._loaded.pop(normalized, None)
                     del lm
                 # When _load_model fails, model/tokenizer are still None —
-                # del just unbinds the names.  gc.collect + clear_cache below
-                # are what actually flush partial Metal allocations.
-                del model, tokenizer
+                # only bother deleting if they hold actual GPU resources.
+                if model is not None:
+                    del model, tokenizer
                 gc.collect()
                 mx.clear_cache()
                 raise
