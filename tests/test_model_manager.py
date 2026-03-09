@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -397,6 +398,68 @@ class TestLoadModel:
 
         mock_dl.assert_called_once()
         assert mock_dl.call_args[1]["repo_id"] == "test/path"
+
+    def test_load_keeps_partial_dir_on_download_failure(self, registry, mock_store):
+        """If snapshot_download fails in _load_model, partial dir is kept for resume."""
+        manager = self._make_manager(registry, mock_store)
+
+        with patch(
+            "huggingface_hub.snapshot_download",
+            side_effect=Exception("download failed"),
+        ):
+            with pytest.raises(Exception, match="download failed"):
+                manager._load_model("test/path")
+
+        # Dir kept for resume, marker stays so is_downloaded() returns False
+        local_dir = mock_store.local_path("test/path")
+        assert local_dir.exists()
+        assert (local_dir / ".downloading").exists()
+        assert not mock_store.is_downloaded("test/path")
+
+    def test_load_removes_downloading_marker_on_success(self, registry, mock_store):
+        """After successful download in _load_model, .downloading marker is gone."""
+        manager = self._make_manager(registry, mock_store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
+
+        with patch.object(manager, "_detect_model_kind", return_value="text"):
+            with patch("huggingface_hub.snapshot_download"):
+                with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                    manager._load_model("test/path")
+
+        local_dir = mock_store.local_path("test/path")
+        assert not (local_dir / ".downloading").exists()
+
+    def test_load_succeeds_when_marker_unlink_raises_oserror(
+        self, registry, mock_store
+    ):
+        """If marker.unlink() raises a non-ENOENT OSError, _load_model still succeeds."""
+        manager = self._make_manager(registry, mock_store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
+
+        original_unlink = Path.unlink
+
+        def unlink_that_fails_on_downloading(self_path, **kwargs):
+            if self_path.name == ".downloading":
+                raise OSError("permission denied")
+            return original_unlink(self_path, **kwargs)
+
+        with patch.object(manager, "_detect_model_kind", return_value="text"):
+            with patch("huggingface_hub.snapshot_download"):
+                with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                    with patch.object(Path, "unlink", unlink_that_fails_on_downloading):
+                        model, tok, is_vlm, caps = manager._load_model("test/path")
+
+        assert model is mock_model
 
 
 class TestTryLmThenVlmFallback:
@@ -887,3 +950,95 @@ class TestMemoryCheck:
         match = re.search(r"requires ~(\d+) MB", msg)
         assert match is not None
         assert int(match.group(1)) >= 0
+
+    @pytest.mark.asyncio
+    async def test_cleanup_on_unexpected_exception_after_load(
+        self, registry, mock_store
+    ):
+        """If _get_metal_memory_bytes raises after load, GPU cleanup must still run."""
+        manager = ModelManager(registry, mock_store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(mock_model, mock_tokenizer, False, TemplateCaps()),
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_metal_memory_bytes",
+                side_effect=[1 * self.GB, OSError("Metal query failed")],
+            ),
+            patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
+            patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+        ):
+            with pytest.raises(OSError, match="Metal query failed"):
+                await manager.ensure_loaded("qwen3")
+
+        # Cleanup must have been called: once pre-load flush + once post-failure
+        assert mock_gc.call_count == 2
+        assert mock_clear.call_count == 2
+        # Model must NOT be in _loaded
+        assert "qwen3:latest" not in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_cleanup_on_system_memory_query_failure(self, registry, mock_store):
+        """If _get_system_memory_bytes raises, GPU cleanup must still run."""
+        manager = ModelManager(registry, mock_store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(mock_model, mock_tokenizer, False, TemplateCaps()),
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_metal_memory_bytes",
+                side_effect=[1 * self.GB, 2 * self.GB],
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_system_memory_bytes",
+                side_effect=OSError("sysconf failed"),
+            ),
+            patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
+            patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+        ):
+            with pytest.raises(OSError, match="sysconf failed"):
+                await manager.ensure_loaded("qwen3")
+
+        assert mock_gc.call_count == 2
+        assert mock_clear.call_count == 2
+        assert "qwen3:latest" not in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_cleanup_when_load_model_itself_fails(self, registry, mock_store):
+        """If _load_model raises (e.g. partial GPU alloc then OOM), GPU cache must be flushed."""
+        manager = ModelManager(registry, mock_store)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                side_effect=RuntimeError("Metal OOM during mlx_lm.load"),
+            ),
+            patch(
+                "olmlx.engine.model_manager._get_metal_memory_bytes",
+                return_value=1 * self.GB,
+            ),
+            patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
+            patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+        ):
+            with pytest.raises(RuntimeError, match="Metal OOM"):
+                await manager.ensure_loaded("qwen3")
+
+        # Pre-load flush + post-failure flush = 2 calls each
+        assert mock_gc.call_count == 2
+        assert mock_clear.call_count == 2
+        assert "qwen3:latest" not in manager._loaded

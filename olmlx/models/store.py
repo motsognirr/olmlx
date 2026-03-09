@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,6 +71,8 @@ class ModelStore:
     def __init__(self, registry: ModelRegistry):
         self.registry = registry
         self.models_dir = settings.models_dir
+        self._download_locks: dict[str, threading.Lock] = {}
+        self._locks_lock = threading.Lock()
 
     def local_path(self, hf_path: str) -> Path:
         """Return the local directory for a HF repo ID."""
@@ -77,7 +80,10 @@ class ModelStore:
 
     def is_downloaded(self, hf_path: str) -> bool:
         """Check if a model is already downloaded locally."""
-        return (self.local_path(hf_path) / "config.json").exists()
+        local = self.local_path(hf_path)
+        return (local / "config.json").exists() and not (
+            local / ".downloading"
+        ).exists()
 
     def _resolve_model_dir(self, name: str) -> Path | None:
         """Resolve a model name to its local directory, trying HF-path-based naming first."""
@@ -94,6 +100,58 @@ class ModelStore:
                 return d
         return None
 
+    def _download_lock(self, hf_path: str) -> threading.Lock:
+        """Return a per-path lock, creating one if needed."""
+        with self._locks_lock:
+            if hf_path not in self._download_locks:
+                self._download_locks[hf_path] = threading.Lock()
+            return self._download_locks[hf_path]
+
+    def ensure_downloaded(self, hf_path: str) -> Path:
+        """Download a model if not already present. Returns the local directory.
+
+        Uses a .downloading marker to track incomplete downloads.
+        Partial directories are kept on failure so snapshot_download can resume.
+        Thread-safe: concurrent calls for the same hf_path are serialized.
+        """
+        local_dir = self.local_path(hf_path)
+        if self.is_downloaded(hf_path):
+            return local_dir
+
+        with self._download_lock(hf_path):
+            # Re-check after acquiring lock — another thread may have
+            # completed the download while we waited.
+            if self.is_downloaded(hf_path):
+                return local_dir
+
+            from huggingface_hub import snapshot_download
+
+            local_dir.mkdir(parents=True, exist_ok=True)
+            marker = local_dir / ".downloading"
+            # Let touch() propagate on failure — without the marker we can't
+            # safely track download state, so failing fast is correct.
+            marker.touch()
+            # Don't rmtree on failure: partial dir lets snapshot_download
+            # resume on retry.  The .downloading marker keeps is_downloaded()
+            # safe either way.
+            snapshot_download(repo_id=hf_path, local_dir=str(local_dir))
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                # Rename so is_downloaded() isn't permanently poisoned —
+                # without this, every future call would re-enter the download
+                # path and hit snapshot_download (a network round-trip).
+                try:
+                    marker.rename(marker.with_name(".downloading.failed"))
+                except OSError:
+                    pass
+                logger.error(
+                    "Failed to remove .downloading marker %s; renamed to .downloading.failed"
+                    " if possible — model may need manual cleanup",
+                    marker,
+                )
+            return local_dir
+
     async def pull(self, name: str) -> AsyncGenerator[dict, None]:
         """Pull a model from HuggingFace, yielding progress dicts."""
         hf_path = self.registry.resolve(name)
@@ -102,8 +160,6 @@ class ModelStore:
                 hf_path = name
             else:
                 raise ValueError(f"Model '{name}' not found in config")
-
-        local_dir = self.local_path(hf_path)
 
         # Skip download if already present
         if self.is_downloaded(hf_path):
@@ -115,19 +171,10 @@ class ModelStore:
                 self.registry.add_mapping(name, hf_path)
             return
 
-        local_dir.mkdir(parents=True, exist_ok=True)
-
         yield {"status": "pulling manifest"}
-
-        from huggingface_hub import snapshot_download
-
         yield {"status": f"downloading {hf_path}"}
 
-        await asyncio.to_thread(
-            snapshot_download,
-            repo_id=hf_path,
-            local_dir=str(local_dir),
-        )
+        local_dir = await asyncio.to_thread(self.ensure_downloaded, hf_path)
 
         yield {"status": "verifying"}
 
