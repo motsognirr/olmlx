@@ -323,6 +323,9 @@ async def _stream_completion(
         # We MUST wait for the Metal thread to finish before releasing
         # _inference_lock, otherwise the next inference will hit concurrent
         # Metal command buffer access.
+        # Worst case: drain_and_join runs up to 60s under shield, then if
+        # CancelledError fires, the fallback join adds up to 30s — total
+        # 90s holding _inference_lock.
         try:
             await asyncio.shield(stream.drain_and_join())
         except (asyncio.CancelledError, Exception):

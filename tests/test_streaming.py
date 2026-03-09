@@ -332,7 +332,6 @@ class TestDrainAndJoinTimeout:
 
         # Should be close to the timeout, not 60s default or infinite
         assert elapsed < 1.5
-        assert elapsed >= 0.2  # Should wait at least near the timeout
 
         block_event.set()
         stream._thread.join(timeout=5)

@@ -162,12 +162,10 @@ class CancellableStream:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    logger.warning(
-                        "drain_and_join: timeout (%.1fs) exceeded during queue drain, "
-                        "thread still alive=%s",
-                        timeout,
-                        self._thread is not None and self._thread.is_alive(),
-                    )
+                    if self._thread is not None and not self._thread.is_alive():
+                        logger.debug(
+                            "drain_and_join: drain timed out but thread already exited"
+                        )
                     break
                 try:
                     wait_time = min(10.0, remaining)
@@ -186,7 +184,9 @@ class CancellableStream:
         if self._thread is not None:
             remaining = deadline - time.monotonic()
             if remaining > 0:
-                await asyncio.to_thread(self._thread.join, remaining)
+                # Shield the join so external CancelledError can't skip it —
+                # the whole point of drain_and_join is guaranteed cleanup.
+                await asyncio.shield(asyncio.to_thread(self._thread.join, remaining))
             if self._thread.is_alive():
                 logger.error(
                     "drain_and_join: thread still alive after %.1fs timeout — "
