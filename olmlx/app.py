@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from olmlx.config import settings
-from olmlx.engine.model_manager import ModelManager
+from olmlx.engine.model_manager import ModelLoadTimeoutError, ModelManager
 from olmlx.engine.registry import ModelRegistry
 from olmlx.models.store import ModelStore
 from olmlx.routers import (
@@ -123,8 +123,8 @@ def create_app() -> FastAPI:
             "model_too_large",
         )
 
-    @app.exception_handler(TimeoutError)
-    async def timeout_error_handler(request: Request, exc: TimeoutError):
+    @app.exception_handler(ModelLoadTimeoutError)
+    async def timeout_error_handler(request: Request, exc: ModelLoadTimeoutError):
         msg = str(exc)
         logger.error("TimeoutError on %s: %s", request.url.path, msg)
         return _make_error_response(

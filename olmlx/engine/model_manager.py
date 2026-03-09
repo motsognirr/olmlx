@@ -35,6 +35,10 @@ _FALLBACK_EXCEPTIONS = (
 )
 
 
+class ModelLoadTimeoutError(TimeoutError):
+    """Raised when model loading exceeds OLMLX_MODEL_LOAD_TIMEOUT."""
+
+
 @dataclass
 class LoadedModel:
     name: str
@@ -214,12 +218,7 @@ class ModelManager:
                             # cleanup for when it finishes to prevent Metal
                             # memory leaks from orphaned model weights.
                             self._schedule_deferred_cleanup(load_task, normalized)
-                            # Re-raise as builtin TimeoutError (not
-                            # asyncio.TimeoutError) so the FastAPI exception
-                            # handler fires.  On Python <=3.10 these are
-                            # distinct types; on 3.11+ they are aliases but the
-                            # explicit re-raise adds a descriptive message.
-                            raise TimeoutError(
+                            raise ModelLoadTimeoutError(
                                 f"Loading model '{normalized}' timed out after {timeout}s. "
                                 f"Increase OLMLX_MODEL_LOAD_TIMEOUT or unset it to disable."
                             )
@@ -325,15 +324,20 @@ class ModelManager:
             try:
                 await load_task
             except asyncio.CancelledError:
-                # Re-raise so the task enters cancelled state.  Don't flush
-                # Metal cache — the background thread is still running.
-                # stop() clears _pending_cleanups separately.
+                # Cancel load_task to prevent "exception never retrieved"
+                # warnings.  The background thread keeps running (Python
+                # can't interrupt native threads) but the task is marked
+                # done so asyncio won't complain at shutdown.
+                load_task.cancel()
                 raise
             except BaseException:
                 pass
+            finally:
+                # Always clear the entry so a retry isn't bricked if
+                # gc.collect() or mx.clear_cache() raises below.
+                self._pending_cleanups.pop(model_name, None)
             gc.collect()
             mx.clear_cache()
-            self._pending_cleanups.pop(model_name, None)
             logger.info(
                 "Deferred GPU cleanup after timeout of '%s' completed", model_name
             )
