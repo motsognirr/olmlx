@@ -232,7 +232,7 @@ class CancellableStream:
 def async_mlx_stream(
     model: Any,
     tokenizer: Any,
-    prompt: str,
+    prompt: str | list[int],
     max_tokens: int = 512,
     is_vlm: bool = False,
     images: list[str] | None = None,

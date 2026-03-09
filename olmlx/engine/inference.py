@@ -8,8 +8,21 @@ from typing import Any
 
 import mlx.core as mx
 
-from olmlx.engine.model_manager import LoadedModel, ModelManager, parse_keep_alive
+from olmlx.engine.model_manager import (
+    CachedPromptState,
+    LoadedModel,
+    ModelManager,
+    parse_keep_alive,
+)
 from olmlx.config import settings
+
+try:
+    from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+    from mlx_lm.utils import common_prefix_len as _find_common_prefix
+except ImportError:  # pragma: no cover
+    make_prompt_cache = None  # type: ignore[assignment]
+    trim_prompt_cache = None  # type: ignore[assignment]
+    _find_common_prefix = None  # type: ignore[assignment]
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils.streaming import async_mlx_stream
 from olmlx.utils.timing import Timer, TimingStats
@@ -30,6 +43,13 @@ def _safe_sync():
         mx.synchronize()
     except Exception:
         logger.debug("mx.synchronize() failed", exc_info=True)
+
+
+def _tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
+    """Tokenize prompt text matching stream_generate's tokenization logic."""
+    bos = getattr(tokenizer, "bos_token", None)
+    add_special = bos is None or not prompt_text.startswith(bos)
+    return tokenizer.encode(prompt_text, add_special_tokens=add_special)
 
 
 @contextlib.asynccontextmanager
@@ -277,11 +297,15 @@ async def generate_completion(
 
 async def _stream_completion(
     lm: LoadedModel,
-    prompt: str,
+    prompt: str | list[int],
     max_tokens: int,
     gen_kwargs: dict,
     stats: TimingStats,
     images: list[str] | None = None,
+    *,
+    full_prompt_tokens: list[int] | None = None,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
@@ -297,6 +321,8 @@ async def _stream_completion(
         images=images,
         **gen_kwargs,
     )
+    generation_complete = False
+    generated_tokens: list[int] = []
     try:
         with _inference_ref(lm), Timer() as total_timer:
             with Timer() as eval_timer:
@@ -304,6 +330,8 @@ async def _stream_completion(
                     yield {"text": token.text, "done": False}
                     stats.eval_count = token.generation_tokens
                     stats.prompt_eval_count = token.prompt_tokens
+                    if token.token is not None:
+                        generated_tokens.append(token.token)
 
             stats.eval_duration = eval_timer.duration_ns
             prompt_tps = getattr(token, "prompt_tps", 0) or 0
@@ -318,8 +346,27 @@ async def _stream_completion(
             gen_tps,
             total_timer.duration_ns / 1e9,
         )
-        yield {"text": "", "done": True, "stats": stats}
+        generation_complete = True
+
+        # Store cache state after successful generation
+        prompt_cache = gen_kwargs.get("prompt_cache")
+        if prompt_cache is not None and full_prompt_tokens is not None:
+            lm.prompt_cache_state = CachedPromptState(
+                tokens=list(full_prompt_tokens) + generated_tokens,
+                cache=prompt_cache,
+            )
+
+        yield {
+            "text": "",
+            "done": True,
+            "stats": stats,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+        }
     finally:
+        # Invalidate cache on incomplete generation to avoid inconsistent state
+        if not generation_complete and full_prompt_tokens is not None:
+            lm.prompt_cache_state = None
         # We MUST wait for the Metal thread to finish before releasing
         # _inference_lock, otherwise the next inference will hit concurrent
         # Metal command buffer access.
@@ -470,8 +517,73 @@ async def generate_chat(
     gen_kwargs = _build_generate_kwargs(options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
+    # Prompt caching: text models only, streaming only, when enabled
+    full_prompt_tokens: list[int] | None = None
+    cache_read_tokens = 0
+    cache_creation_tokens = 0
+
+    if (
+        settings.prompt_cache
+        and not lm.is_vlm
+        and stream
+        and make_prompt_cache is not None
+    ):
+        prompt_tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
+        cached = lm.prompt_cache_state
+
+        prefix_len = (
+            _find_common_prefix(prompt_tokens, cached.tokens)
+            if cached is not None
+            else 0
+        )
+
+        if prefix_len > 0:
+            # Trim cache to common prefix (remove generated + divergent tokens)
+            trim_amount = len(cached.tokens) - prefix_len
+            if trim_amount > 0:
+                trim_prompt_cache(cached.cache, trim_amount)
+
+            # Ensure at least 1 token for stream_generate
+            suffix_start = min(prefix_len, len(prompt_tokens) - 1)
+            suffix_tokens = prompt_tokens[suffix_start:]
+
+            cache_read_tokens = suffix_start
+            cache_creation_tokens = len(suffix_tokens)
+            logger.info(
+                "Prompt cache hit: %d prefix tokens reused, %d new tokens to process (was %d total)",
+                suffix_start,
+                len(suffix_tokens),
+                len(prompt_tokens),
+            )
+            gen_kwargs["prompt_cache"] = cached.cache
+            prompt = suffix_tokens
+        else:
+            # No usable prefix — free old cache and create fresh
+            lm.prompt_cache_state = None
+            new_cache = make_prompt_cache(lm.model)
+            gen_kwargs["prompt_cache"] = new_cache
+            cache_creation_tokens = len(prompt_tokens)
+            logger.info(
+                "Prompt cache %s: creating fresh cache for %d tokens",
+                "miss" if cached is not None else "init",
+                len(prompt_tokens),
+            )
+            prompt = prompt_tokens
+
+        full_prompt_tokens = prompt_tokens
+
     if stream:
-        return _stream_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        return _stream_completion(
+            lm,
+            prompt,
+            mt,
+            gen_kwargs,
+            stats,
+            images,
+            full_prompt_tokens=full_prompt_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
     else:
         return await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
 

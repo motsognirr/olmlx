@@ -222,6 +222,9 @@ async def _stream_buffered_with_tools(result, tool_names):
     full_text = ""
     output_tokens = 0
 
+    cache_read_tokens = 0
+    cache_creation_tokens = 0
+
     async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
         if chunk is _PING_SENTINEL:
             yield _sse("ping", {"type": "ping"})
@@ -230,6 +233,8 @@ async def _stream_buffered_with_tools(result, tool_names):
             stats = chunk.get("stats")
             if stats:
                 output_tokens = stats.eval_count
+            cache_read_tokens = chunk.get("cache_read_tokens", 0)
+            cache_creation_tokens = chunk.get("cache_creation_tokens", 0)
             break
         full_text += chunk.get("text", "")
 
@@ -303,6 +308,8 @@ async def _stream_buffered_with_tools(result, tool_names):
     yield {
         "stop_reason": "tool_use" if tool_uses else "end_turn",
         "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
     }
 
 
@@ -310,6 +317,8 @@ async def _stream_thinking_state_machine(result):
     """Stream incrementally with thinking state machine. Yields a final dict with metadata."""
     block_idx = 0
     output_tokens = 0
+    cache_read_tokens = 0
+    cache_creation_tokens = 0
     buffer = ""
     state = "init"  # "init", "thinking", "text"
     text_block_started = False
@@ -322,6 +331,8 @@ async def _stream_thinking_state_machine(result):
             stats = chunk.get("stats")
             if stats:
                 output_tokens = stats.eval_count
+            cache_read_tokens = chunk.get("cache_read_tokens", 0)
+            cache_creation_tokens = chunk.get("cache_creation_tokens", 0)
             break
 
         token_text = chunk.get("text", "")
@@ -473,7 +484,12 @@ async def _stream_thinking_state_machine(result):
             "content_block_stop", {"type": "content_block_stop", "index": block_idx}
         )
 
-    yield {"stop_reason": "end_turn", "output_tokens": output_tokens}
+    yield {
+        "stop_reason": "end_turn",
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
+    }
 
 
 @router.post("/v1/messages/count_tokens")
@@ -581,7 +597,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                             "stop_reason": meta.get("stop_reason", "end_turn"),
                             "stop_sequence": None,
                         },
-                        "usage": {"output_tokens": meta.get("output_tokens", 0)},
+                        "usage": {
+                            "output_tokens": meta.get("output_tokens", 0),
+                            "cache_read_input_tokens": meta.get("cache_read_tokens", 0),
+                            "cache_creation_input_tokens": meta.get(
+                                "cache_creation_tokens", 0
+                            ),
+                        },
                     },
                 )
                 yield _sse("message_stop", {"type": "message_stop"})
