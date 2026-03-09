@@ -103,9 +103,7 @@ class ModelStore:
 
     def _pull_lock(self, hf_path: str) -> asyncio.Lock:
         """Return a per-path async lock, creating one if needed."""
-        if hf_path not in self._pull_locks:
-            self._pull_locks[hf_path] = asyncio.Lock()
-        return self._pull_locks[hf_path]
+        return self._pull_locks.setdefault(hf_path, asyncio.Lock())
 
     def _download_lock(self, hf_path: str) -> threading.Lock:
         """Return a per-path lock, creating one if needed."""
@@ -168,8 +166,17 @@ class ModelStore:
             else:
                 raise ValueError(f"Model '{name}' not found in config")
 
+        # Fast path: skip lock if already downloaded
+        if self.is_downloaded(hf_path):
+            yield {"status": "pulling manifest"}
+            yield {"status": "already downloaded"}
+            yield {"status": "success"}
+            if "/" not in name:
+                self.registry.add_mapping(name, hf_path)
+            return
+
         async with self._pull_lock(hf_path):
-            # Check after acquiring lock — another coroutine may have
+            # Re-check after acquiring lock — another coroutine may have
             # completed the download while we waited.
             if self.is_downloaded(hf_path):
                 yield {"status": "pulling manifest"}
