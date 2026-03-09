@@ -137,6 +137,10 @@ class ModelStore:
                 local_dir=str(local_dir),
             )
         except BaseException:
+            # Note: on CancelledError the download thread may still be
+            # running (asyncio.to_thread doesn't support cancellation).
+            # rmtree could race with snapshot_download, but the
+            # .downloading marker keeps is_downloaded() correct either way.
             try:
                 shutil.rmtree(local_dir)
             except OSError:

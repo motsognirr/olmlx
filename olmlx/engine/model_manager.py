@@ -380,7 +380,9 @@ class ModelManager:
                 marker.touch()
                 try:
                     snapshot_download(repo_id=hf_path, local_dir=str(local_dir))
-                except BaseException:
+                except Exception:
+                    # This runs in a thread (via asyncio.to_thread in
+                    # ensure_loaded), so CancelledError cannot reach here.
                     try:
                         shutil.rmtree(local_dir)
                     except OSError:
