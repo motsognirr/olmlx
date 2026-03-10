@@ -588,15 +588,20 @@ class TestCacheStatsInCacheInfoChunk:
 
 
 class TestTokenizeForCacheEmptyBos:
-    def test_empty_bos_token_still_adds_special(self):
-        """When bos_token is empty string, add_special_tokens should be True."""
+    def test_empty_bos_matches_stream_generate(self):
+        """When bos_token is empty string, match stream_generate: add_special_tokens=False.
+
+        stream_generate uses `bos_token is None`, not `not bos_token`, so empty
+        string falls through to `not prompt.startswith("")` which is always False.
+        We must match exactly to avoid token sequence divergence and cache misses.
+        """
         from olmlx.engine.inference import _tokenize_for_cache
 
         tokenizer = MagicMock()
         tokenizer.bos_token = ""
         tokenizer.encode = MagicMock(return_value=[1, 2, 3])
         result = _tokenize_for_cache(tokenizer, "hello")
-        tokenizer.encode.assert_called_once_with("hello", add_special_tokens=True)
+        tokenizer.encode.assert_called_once_with("hello", add_special_tokens=False)
         assert result == [1, 2, 3]
 
 
@@ -660,10 +665,12 @@ class TestCacheExactMatchTrimAlignment:
         prompt_arg = call_args[1].get("prompt") or call_args[0][2]
         assert prompt_arg == [30]
 
-        # Cache stats: cache_read should be suffix_start (2), not prefix_len (3)
+        # Cache stats: cache_read should be prefix_len (3) — what was actually
+        # matched. suffix_start (2) is an implementation detail of stream_generate
+        # needing ≥1 token; the re-processed token was still in the cache.
         cache_info = chunks[0]
         assert cache_info.get("cache_info") is True
-        assert cache_info["cache_read_tokens"] == 2
+        assert cache_info["cache_read_tokens"] == 3
         assert cache_info["cache_creation_tokens"] == 1
 
 
@@ -714,6 +721,136 @@ class TestLockReleasedOnCacheInfoDisconnect:
         acquired = await asyncio.wait_for(_inference_lock.acquire(), timeout=1.0)
         assert acquired
         _inference_lock.release()
+
+
+class TestNoneTokenWarning:
+    @pytest.mark.asyncio
+    async def test_none_token_logged_not_silently_dropped(self, mock_manager, caplog):
+        """When token.token is None, a debug warning is logged."""
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30])
+
+        # Create tokens where one has token=None
+        tokens_with_none = [
+            StreamToken(
+                text="Hello",
+                token=100,
+                prompt_tokens=3,
+                generation_tokens=1,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            ),
+            StreamToken(
+                text=" world",
+                token=None,  # EOS or missing token
+                prompt_tokens=3,
+                generation_tokens=2,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            ),
+        ]
+        mock_stream = _make_mock_stream(tokens_with_none)
+
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache",
+                mock_make_cache,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            caplog.at_level(logging.DEBUG, logger="olmlx.engine.inference"),
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.default_keep_alive = "5m"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+            async for chunk in gen:
+                pass
+
+        # Should log a warning about the missing/None token ID
+        assert any(
+            "skipping token" in r.message.lower() or "token id" in r.message.lower()
+            for r in caplog.records
+        ), (
+            f"Expected warning about None token ID, got: {[r.message for r in caplog.records]}"
+        )
+
+
+class TestSingleTokenPromptCacheEdgeCase:
+    @pytest.mark.asyncio
+    async def test_single_token_prompt_treated_as_miss(self, mock_manager):
+        """Single-token prompt with cache hit should not wastefully trim entire cache."""
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="a")
+        lm.tokenizer.bos_token = None
+
+        # Previously cached: starts with same token
+        existing_cache = [MagicMock()]
+        lm.prompt_cache_state = CachedPromptState(
+            tokens=[10, 100, 101],  # [prompt_token, gen1, gen2]
+            cache=existing_cache,
+        )
+
+        # New prompt: single token that matches
+        lm.tokenizer.encode = MagicMock(return_value=[10])
+
+        tokens = _make_stream_tokens("out", prompt_tokens=1)
+        mock_stream = _make_mock_stream(tokens)
+
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        mock_trim = MagicMock()
+
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache",
+                mock_make_cache,
+            ),
+            patch(
+                "olmlx.engine.inference.trim_prompt_cache",
+                mock_trim,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.default_keep_alive = "5m"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "a"}],
+                stream=True,
+            )
+            chunks = []
+            async for chunk in gen:
+                chunks.append(chunk)
+
+        # Should create fresh cache rather than wastefully trimming entire existing cache
+        mock_make_cache.assert_called_once()
+        # Should NOT have trimmed (fresh cache instead)
+        mock_trim.assert_not_called()
 
 
 class TestConfigPromptCacheSetting:
