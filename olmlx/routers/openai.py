@@ -43,6 +43,8 @@ async def _stream_openai_sse(
     """
     try:
         async for chunk in result:
+            if chunk.get("cache_info"):
+                continue
             if chunk.get("done"):
                 data = {
                     "id": response_id,

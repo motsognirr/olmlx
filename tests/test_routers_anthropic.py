@@ -1008,3 +1008,81 @@ class TestCountTokens:
         assert resp.status_code == 200
         assert resp.json()["input_tokens"] == 7
         inner_tokenizer.apply_chat_template.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_batch_encoding_return_type(self, app_client, mock_loaded_model):
+        """apply_chat_template may return BatchEncoding (UserDict subclass)."""
+        from collections import UserDict
+
+        # BatchEncoding extends UserDict, not dict — simulate it
+        batch_encoding = UserDict({"input_ids": [1, 2, 3, 4, 5, 6, 7, 8]})
+        mock_loaded_model.tokenizer.apply_chat_template.return_value = batch_encoding
+        resp = await app_client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["input_tokens"] == 8
+
+
+class TestPingBeforeCacheInfo:
+    @pytest.mark.asyncio
+    async def test_ping_before_cache_info_preserves_stats(self, app_client):
+        """When a keepalive ping arrives before cache_info, cache stats must still appear in message_start."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                # Simulate: ping fires during lock wait, then cache_info, then tokens
+                yield {
+                    "cache_info": True,
+                    "cache_read_tokens": 42,
+                    "cache_creation_tokens": 8,
+                }
+                yield {"text": "Hello", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats(eval_count=1)}
+
+            return gen()
+
+        async def pings_then_passthrough(aiter, interval=5.0):
+            yield _PING_SENTINEL  # Ping fires before any real data
+            async for item in aiter:
+                yield item
+
+        with (
+            patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream),
+            patch(
+                "olmlx.routers.anthropic._with_keepalive_pings",
+                side_effect=pings_then_passthrough,
+            ),
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        text = resp.text
+
+        # Parse message_start event to extract usage
+        for line in text.split("\n"):
+            if line.startswith("data:") and "message_start" in line:
+                data = json.loads(line[5:])
+                usage = data["message"]["usage"]
+                assert usage["cache_read_input_tokens"] == 42, (
+                    f"Expected cache_read=42, got {usage}"
+                )
+                assert usage["cache_creation_input_tokens"] == 8, (
+                    f"Expected cache_creation=8, got {usage}"
+                )
+                break
+        else:
+            pytest.fail("message_start event not found in SSE output")

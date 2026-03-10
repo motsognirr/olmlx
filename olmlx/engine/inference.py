@@ -3,13 +3,27 @@ import contextlib
 import json
 import logging
 import time
+import collections.abc
 from collections.abc import AsyncGenerator
 from typing import Any
 
 import mlx.core as mx
 
-from olmlx.engine.model_manager import LoadedModel, ModelManager, parse_keep_alive
+from olmlx.engine.model_manager import (
+    CachedPromptState,
+    LoadedModel,
+    ModelManager,
+    parse_keep_alive,
+)
 from olmlx.config import settings
+
+try:
+    from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+    from mlx_lm.utils import common_prefix_len as _find_common_prefix
+except ImportError:  # pragma: no cover
+    make_prompt_cache = None  # type: ignore[assignment]
+    trim_prompt_cache = None  # type: ignore[assignment]
+    _find_common_prefix = None  # type: ignore[assignment]
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils.streaming import async_mlx_stream
 from olmlx.utils.timing import Timer, TimingStats
@@ -30,6 +44,13 @@ def _safe_sync():
         mx.synchronize()
     except Exception:
         logger.debug("mx.synchronize() failed", exc_info=True)
+
+
+def _tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
+    """Tokenize prompt text matching stream_generate's tokenization logic."""
+    bos = getattr(tokenizer, "bos_token", None)
+    add_special = not bos or not prompt_text.startswith(bos)
+    return tokenizer.encode(prompt_text, add_special_tokens=add_special)
 
 
 @contextlib.asynccontextmanager
@@ -228,8 +249,9 @@ def count_chat_tokens(
     """
     result = _apply_chat_template(tokenizer, messages, tools, caps, tokenize=True)
 
-    # Handle varied return types from apply_chat_template
-    if isinstance(result, dict):
+    # Handle varied return types from apply_chat_template.
+    # BatchEncoding (transformers) extends UserDict, not dict, so use Mapping.
+    if isinstance(result, collections.abc.Mapping):
         tokens = result.get("input_ids")
         if tokens is None:
             raise TypeError(
@@ -277,33 +299,121 @@ async def generate_completion(
 
 async def _stream_completion(
     lm: LoadedModel,
-    prompt: str,
+    prompt: str | list[int],
     max_tokens: int,
     gen_kwargs: dict,
     stats: TimingStats,
     images: list[str] | None = None,
+    *,
+    use_prompt_cache: bool = False,
+    prompt_tokens: list[int] | None = None,
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
     await _inference_lock.acquire()
     # Sync default stream before starting — same purpose as _inference_locked entry.
     _safe_sync()
-    stream = async_mlx_stream(
-        lm.model,
-        lm.tokenizer,
-        prompt,
-        max_tokens=max_tokens,
-        is_vlm=lm.is_vlm,
-        images=images,
-        **gen_kwargs,
-    )
+
+    # Everything after lock acquisition must be in try/finally so the lock is
+    # always released — even if the generator is closed at a yield point
+    # (e.g. client disconnect during cache_info yield).
+    stream = None
+    generation_complete = False
+    generated_tokens: list[int] = []
+    cache_read_tokens = 0
+    cache_creation_tokens = 0
+    full_prompt_tokens: list[int] | None = None
     try:
+        # Cache setup — must happen after lock to prevent concurrent cache corruption
+        if (
+            use_prompt_cache
+            and prompt_tokens is not None
+            and make_prompt_cache is not None
+        ):
+            cached = lm.prompt_cache_state
+            logger.debug(
+                "Cache lookup: cached=%s, new prompt=%d tokens",
+                (
+                    f"{len(cached.tokens)} tokens (first 5: {cached.tokens[:5]})"
+                    if cached
+                    else "none"
+                ),
+                len(prompt_tokens),
+            )
+
+            prefix_len = (
+                _find_common_prefix(prompt_tokens, cached.tokens)
+                if cached is not None
+                else 0
+            )
+            logger.debug(
+                "Common prefix length: %d / %d prompt tokens",
+                prefix_len,
+                len(prompt_tokens),
+            )
+
+            # Set before mutation so finally guard can clean up on error
+            full_prompt_tokens = prompt_tokens
+
+            if prefix_len > 0:
+                # Ensure at least 1 token for stream_generate
+                suffix_start = min(prefix_len, len(prompt_tokens) - 1)
+
+                # Trim cache to suffix_start so it aligns with where we resume
+                trim_amount = len(cached.tokens) - suffix_start
+                if trim_amount > 0:
+                    trim_prompt_cache(cached.cache, trim_amount)
+
+                suffix_tokens = prompt_tokens[suffix_start:]
+
+                cache_read_tokens = suffix_start
+                cache_creation_tokens = len(suffix_tokens)
+                logger.info(
+                    "Prompt cache hit: %d prefix tokens reused, %d new tokens to process (was %d total)",
+                    prefix_len,
+                    len(suffix_tokens),
+                    len(prompt_tokens),
+                )
+                gen_kwargs["prompt_cache"] = cached.cache
+                prompt = suffix_tokens
+            else:
+                # No usable prefix — free old cache and create fresh
+                lm.prompt_cache_state = None
+                new_cache = make_prompt_cache(lm.model)
+                gen_kwargs["prompt_cache"] = new_cache
+                cache_creation_tokens = len(prompt_tokens)
+                logger.info(
+                    "Prompt cache %s: creating fresh cache for %d tokens",
+                    "miss" if cached is not None else "init",
+                    len(prompt_tokens),
+                )
+                prompt = prompt_tokens
+
+            # Yield cache stats as first chunk so routers can use them
+            yield {
+                "cache_info": True,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_creation_tokens": cache_creation_tokens,
+            }
+
+        stream = async_mlx_stream(
+            lm.model,
+            lm.tokenizer,
+            prompt,
+            max_tokens=max_tokens,
+            is_vlm=lm.is_vlm,
+            images=images,
+            **gen_kwargs,
+        )
+
         with _inference_ref(lm), Timer() as total_timer:
             with Timer() as eval_timer:
                 async for token in stream:
                     yield {"text": token.text, "done": False}
                     stats.eval_count = token.generation_tokens
                     stats.prompt_eval_count = token.prompt_tokens
+                    if token.token is not None:
+                        generated_tokens.append(token.token)
 
             stats.eval_duration = eval_timer.duration_ns
             prompt_tps = getattr(token, "prompt_tps", 0) or 0
@@ -318,34 +428,57 @@ async def _stream_completion(
             gen_tps,
             total_timer.duration_ns / 1e9,
         )
-        yield {"text": "", "done": True, "stats": stats}
+        generation_complete = True
+
+        # Store cache state after successful generation
+        prompt_cache = gen_kwargs.get("prompt_cache")
+        if prompt_cache is not None and full_prompt_tokens is not None:
+            stored_tokens = list(full_prompt_tokens) + generated_tokens
+            lm.prompt_cache_state = CachedPromptState(
+                tokens=stored_tokens,
+                cache=prompt_cache,
+            )
+            logger.debug(
+                "Cache stored: %d tokens (%d prompt + %d generated)",
+                len(stored_tokens),
+                len(full_prompt_tokens),
+                len(generated_tokens),
+            )
+
+        yield {
+            "text": "",
+            "done": True,
+            "stats": stats,
+        }
     finally:
+        # Invalidate cache on incomplete generation to avoid inconsistent state
+        if not generation_complete and full_prompt_tokens is not None:
+            logger.debug("Cache invalidated: generation did not complete")
+            lm.prompt_cache_state = None
         # We MUST wait for the Metal thread to finish before releasing
         # _inference_lock, otherwise the next inference will hit concurrent
         # Metal command buffer access.
-        # Worst case: drain_and_join runs up to 60s under shield, then if
-        # CancelledError fires, the fallback join adds up to 10s — total
-        # 70s holding _inference_lock.
-        try:
-            await asyncio.shield(stream.drain_and_join())
-        except (asyncio.CancelledError, Exception):
-            # Shield was interrupted — async fallback join (avoids blocking
-            # the event loop, unlike a synchronous thread.join).
-            if stream._thread is not None and stream._thread.is_alive():
-                try:
-                    await asyncio.to_thread(stream._thread.join, 10)
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if stream._thread is not None and stream._thread.is_alive():
-                logger.error(
-                    "Fallback thread join timed out after 10s — "
-                    "thread still alive, potential GPU resource leak"
-                )
-        finally:
-            # Sync default stream after drain to ensure cleanup is complete
-            # before releasing the lock.
-            _safe_sync()
-            _inference_lock.release()
+        # stream may be None if generator was closed during cache setup.
+        if stream is not None:
+            try:
+                await asyncio.shield(stream.drain_and_join())
+            except (asyncio.CancelledError, Exception):
+                # Shield was interrupted — async fallback join (avoids blocking
+                # the event loop, unlike a synchronous thread.join).
+                if stream._thread is not None and stream._thread.is_alive():
+                    try:
+                        await asyncio.to_thread(stream._thread.join, 10)
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if stream._thread is not None and stream._thread.is_alive():
+                    logger.error(
+                        "Fallback thread join timed out after 10s — "
+                        "thread still alive, potential GPU resource leak"
+                    )
+        # Sync default stream after drain to ensure cleanup is complete
+        # before releasing the lock.
+        _safe_sync()
+        _inference_lock.release()
 
 
 async def _full_completion(
@@ -470,8 +603,42 @@ async def generate_chat(
     gen_kwargs = _build_generate_kwargs(options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
+    # Prompt caching: text models only, streaming only, when enabled
+    use_prompt_cache = (
+        settings.prompt_cache
+        and not lm.is_vlm
+        and stream
+        and make_prompt_cache is not None
+    )
+    prompt_tokens = None
+    if use_prompt_cache:
+        prompt_tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
+        cached_state = lm.prompt_cache_state
+        logger.debug(
+            "Prompt cache enabled: %d prompt tokens, existing cache=%s",
+            len(prompt_tokens),
+            f"{len(cached_state.tokens)} tokens" if cached_state else "none",
+        )
+    else:
+        logger.debug(
+            "Prompt cache disabled: setting=%s vlm=%s stream=%s make_prompt_cache=%s",
+            settings.prompt_cache,
+            lm.is_vlm,
+            stream,
+            make_prompt_cache is not None,
+        )
+
     if stream:
-        return _stream_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        return _stream_completion(
+            lm,
+            prompt,
+            mt,
+            gen_kwargs,
+            stats,
+            images,
+            use_prompt_cache=use_prompt_cache,
+            prompt_tokens=prompt_tokens,
+        )
     else:
         return await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
 

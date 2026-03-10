@@ -34,6 +34,8 @@ async def chat(req: ChatRequest, request: Request):
             try:
                 full_text = ""
                 async for chunk in result:
+                    if chunk.get("cache_info"):
+                        continue
                     now = datetime.now(timezone.utc).isoformat()
                     if chunk.get("done"):
                         stats = chunk.get("stats")

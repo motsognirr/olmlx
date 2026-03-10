@@ -226,6 +226,9 @@ async def _stream_buffered_with_tools(result, tool_names):
         if chunk is _PING_SENTINEL:
             yield _sse("ping", {"type": "ping"})
             continue
+        if isinstance(chunk, dict) and chunk.get("cache_info"):
+            yield chunk  # Forward to stream_sse for message_start
+            continue
         if chunk.get("done"):
             stats = chunk.get("stats")
             if stats:
@@ -317,6 +320,9 @@ async def _stream_thinking_state_machine(result):
     async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
         if chunk is _PING_SENTINEL:
             yield _sse("ping", {"type": "ping"})
+            continue
+        if isinstance(chunk, dict) and chunk.get("cache_info"):
+            yield chunk  # Forward to stream_sse for message_start
             continue
         if chunk.get("done"):
             stats = chunk.get("stats")
@@ -473,7 +479,10 @@ async def _stream_thinking_state_machine(result):
             "content_block_stop", {"type": "content_block_stop", "index": block_idx}
         )
 
-    yield {"stop_reason": "end_turn", "output_tokens": output_tokens}
+    yield {
+        "stop_reason": "end_turn",
+        "output_tokens": output_tokens,
+    }
 
 
 @router.post("/v1/messages/count_tokens")
@@ -538,6 +547,35 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
 
         async def stream_sse():
             try:
+                path = (
+                    _stream_buffered_with_tools(result, tool_names)
+                    if has_tools
+                    else _stream_thinking_state_machine(result)
+                )
+
+                # Consume cache_info if present (forwarded by helpers),
+                # then emit message_start with accurate cache stats.
+                # Keepalive pings may arrive before cache_info (during lock
+                # wait), so skip them here and replay after message_start.
+                cache_read = 0
+                cache_creation = 0
+                first_event = None
+                pending_pings: list[str] = []
+                async for event in path:
+                    if isinstance(event, dict) and event.get("cache_info"):
+                        cache_read = event.get("cache_read_tokens", 0)
+                        cache_creation = event.get("cache_creation_tokens", 0)
+                        logger.debug(
+                            "Cache stats for message_start: read=%d creation=%d",
+                            cache_read,
+                            cache_creation,
+                        )
+                    elif isinstance(event, str) and event.startswith("event: ping"):
+                        pending_pings.append(event)
+                    else:
+                        first_event = event
+                        break
+
                 yield _sse(
                     "message_start",
                     {
@@ -553,20 +591,24 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                             "usage": {
                                 "input_tokens": 0,
                                 "output_tokens": 0,
-                                "cache_creation_input_tokens": 0,
-                                "cache_read_input_tokens": 0,
+                                "cache_creation_input_tokens": cache_creation,
+                                "cache_read_input_tokens": cache_read,
                             },
                         },
                     },
                 )
 
-                path = (
-                    _stream_buffered_with_tools(result, tool_names)
-                    if has_tools
-                    else _stream_thinking_state_machine(result)
-                )
+                # Replay any pings that arrived before message_start
+                for ping in pending_pings:
+                    yield ping
 
                 meta = {}
+                if first_event is not None:
+                    if isinstance(first_event, dict):
+                        meta = first_event
+                    else:
+                        yield first_event
+
                 async for event in path:
                     if isinstance(event, dict):
                         meta = event
@@ -581,7 +623,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                             "stop_reason": meta.get("stop_reason", "end_turn"),
                             "stop_sequence": None,
                         },
-                        "usage": {"output_tokens": meta.get("output_tokens", 0)},
+                        "usage": {
+                            "output_tokens": meta.get("output_tokens", 0),
+                        },
                     },
                 )
                 yield _sse("message_stop", {"type": "message_stop"})

@@ -40,6 +40,14 @@ class ModelLoadTimeoutError(TimeoutError):
 
 
 @dataclass
+class CachedPromptState:
+    """KV cache state from a previous generation, for prompt cache reuse."""
+
+    tokens: list[int]  # Full sequence: prompt + generated tokens
+    cache: list[Any]  # Per-layer KV cache objects (mutated in-place by generate_step)
+
+
+@dataclass
 class LoadedModel:
     name: str
     hf_path: str
@@ -51,6 +59,7 @@ class LoadedModel:
     expires_at: float | None = None
     size_bytes: int = 0
     active_refs: int = 0
+    prompt_cache_state: CachedPromptState | None = None
 
     @property
     def text_tokenizer(self) -> Any:
