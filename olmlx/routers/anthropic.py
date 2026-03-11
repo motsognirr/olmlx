@@ -29,8 +29,10 @@ def _resolve_anthropic_model(model: str) -> str:
     if not settings.anthropic_models:
         return model
     model_lower = model.lower()
-    for family, local_model in settings.anthropic_models.items():
-        if family.lower() in model_lower:
+    for family, local_model in sorted(
+        settings.anthropic_models.items(), key=lambda x: len(x[0]), reverse=True
+    ):
+        if family.lower() in model_lower and local_model:
             logger.info(
                 "Resolved Anthropic model %s → %s (family: %s)",
                 model,

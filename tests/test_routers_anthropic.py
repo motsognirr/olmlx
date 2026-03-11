@@ -1267,6 +1267,21 @@ class TestResolveAnthropicModel:
             mock_settings.anthropic_models = {"haiku": "qwen3:latest"}
             assert _resolve_anthropic_model("qwen3:latest") == "qwen3:latest"
 
+    def test_longer_key_matches_first(self):
+        """More-specific (longer) keys should take priority over shorter ones."""
+        with patch("olmlx.routers.anthropic.settings") as mock_settings:
+            mock_settings.anthropic_models = {
+                "son": "short-match",
+                "sonnet": "long-match",
+            }
+            assert _resolve_anthropic_model("claude-sonnet-4-6") == "long-match"
+
+    def test_empty_value_skipped(self):
+        """Empty-string values should be skipped, falling through to next match or passthrough."""
+        with patch("olmlx.routers.anthropic.settings") as mock_settings:
+            mock_settings.anthropic_models = {"sonnet": ""}
+            assert _resolve_anthropic_model("claude-sonnet-4-6") == "claude-sonnet-4-6"
+
 
 class TestAnthropicModelResolution:
     """Integration tests: resolver applied in endpoints, response echoes original model."""
