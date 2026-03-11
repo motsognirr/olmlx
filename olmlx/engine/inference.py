@@ -84,13 +84,14 @@ def _safe_sync():
 # free Metal memory before hitting the hard model-load rejection limit.
 _MEMORY_PRESSURE_THRESHOLD = 0.9
 
+_TOTAL_PHYSICAL_MEMORY = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+
 
 def _is_memory_pressure_high() -> bool:
     """Check if Metal memory is approaching the safety limit."""
     try:
         mem = mx.get_active_memory() + mx.get_cache_memory()
-        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        limit = int(total * settings.memory_limit_fraction)
+        limit = int(_TOTAL_PHYSICAL_MEMORY * settings.memory_limit_fraction)
         return mem > int(limit * _MEMORY_PRESSURE_THRESHOLD)
     except Exception:
         return False
@@ -549,6 +550,7 @@ async def _stream_completion(
                     max_cache_tokens,
                 )
                 lm.prompt_cache_state = None
+                gen_kwargs.pop("prompt_cache", None)
                 gc.collect()
                 mx.clear_cache()
             else:

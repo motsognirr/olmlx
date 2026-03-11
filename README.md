@@ -191,6 +191,7 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_MODEL_LOAD_TIMEOUT` | `None` | Timeout in seconds for model loading (no timeout by default) |
 | `OLMLX_LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) |
 | `OLMLX_PROMPT_CACHE` | `true` | Enable KV cache reuse across requests for faster inference |
+| `OLMLX_PROMPT_CACHE_MAX_TOKENS` | `32768` | Invalidate the KV cache after a conversation exceeds this many tokens. Set to `None` to disable the limit |
 | `OLMLX_CORS_ORIGINS` | `http://localhost:*`, `http://127.0.0.1:*` | Allowed CORS origins |
 
 ## How It Works
