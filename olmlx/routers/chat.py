@@ -75,6 +75,8 @@ async def chat(req: ChatRequest, request: Request):
                 yield (
                     json.dumps(
                         {
+                            "model": req.model,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
                             "error": "An internal server error occurred during streaming.",
                             "done": True,
                             "done_reason": "error",

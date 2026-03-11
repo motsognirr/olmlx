@@ -680,6 +680,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                     },
                 )
             finally:
+                await path.aclose()
                 await result.aclose()
 
         return StreamingResponse(stream_sse(), media_type="text/event-stream")

@@ -107,3 +107,5 @@ class TestChatRouter:
         assert "internal server error" in last_line["error"]
         assert last_line["done"] is True
         assert last_line["done_reason"] == "error"
+        assert last_line["model"] == "qwen3"
+        assert "created_at" in last_line
