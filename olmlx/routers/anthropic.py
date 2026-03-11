@@ -21,18 +21,33 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def _build_anthropic_model_map() -> list[tuple[str, str]]:
+    """Pre-sort anthropic_models by key length descending, filtering invalid entries."""
+    return sorted(
+        [
+            (family.lower(), local_model)
+            for family, local_model in settings.anthropic_models.items()
+            if family.strip() and local_model
+        ],
+        key=lambda x: len(x[0]),
+        reverse=True,
+    )
+
+
+_anthropic_model_map = _build_anthropic_model_map()
+
+
 def _resolve_anthropic_model(model: str) -> str:
     """Resolve Claude model names to local models via config mapping.
 
-    Matches family keywords (e.g. "haiku", "sonnet") against the model name.
+    Matches family keywords against whole segments (split on - and :) in the
+    model name. Longer keys take priority.
     """
-    if not settings.anthropic_models:
+    if not _anthropic_model_map:
         return model
-    model_lower = model.lower()
-    for family, local_model in sorted(
-        settings.anthropic_models.items(), key=lambda x: len(x[0]), reverse=True
-    ):
-        if family.lower() in model_lower and local_model:
+    segments = model.lower().replace(":", "-").split("-")
+    for family, local_model in _anthropic_model_map:
+        if family in segments:
             logger.info(
                 "Resolved Anthropic model %s → %s (family: %s)",
                 model,
