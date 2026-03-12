@@ -22,22 +22,17 @@ logger = logging.getLogger(__name__)
 
 
 def _build_anthropic_model_map() -> list[tuple[str, str]]:
-    """Pre-sort anthropic_models by key length descending, filtering invalid entries."""
-    entries = []
-    for family, local_model in settings.anthropic_models.items():
-        key = family.strip().lower()
-        value = local_model.strip()
-        if not key or not value:
-            continue
-        if "-" in key or ":" in key:
-            logger.warning(
-                "Skipping anthropic_models key %r: keys must be single segments "
-                "(no dashes or colons)",
-                family,
-            )
-            continue
-        entries.append((key, value))
-    return sorted(entries, key=lambda x: len(x[0]), reverse=True)
+    """Pre-sort anthropic_models by key length descending, filtering invalid entries.
+
+    Keys with dashes/colons are rejected by the Settings validator; this only
+    filters empty/whitespace entries that slip through.
+    """
+    entries = [
+        (family.strip().lower(), local_model.strip())
+        for family, local_model in settings.anthropic_models.items()
+        if family.strip() and local_model.strip()
+    ]
+    return sorted(entries, key=lambda x: (-len(x[0]), x[0]))
 
 
 _anthropic_model_map = _build_anthropic_model_map()

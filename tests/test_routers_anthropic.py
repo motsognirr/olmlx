@@ -1271,6 +1271,19 @@ class TestResolveAnthropicModel:
         with patch(MAP_PATCH, [("sonnet", "long-match"), ("son", "short-match")]):
             assert _resolve_anthropic_model("claude-sonnet-4-6") == "long-match"
 
+    def test_equal_length_keys_sorted_alphabetically(self):
+        """Equal-length keys use alphabetical order for deterministic tie-breaking."""
+        from olmlx.routers.anthropic import _build_anthropic_model_map
+
+        with patch("olmlx.routers.anthropic.settings") as mock_settings:
+            mock_settings.anthropic_models = {
+                "llama": "llama-model",
+                "haiku": "haiku-model",
+            }
+            result = _build_anthropic_model_map()
+            # Both 5 chars — alphabetical: haiku before llama
+            assert result == [("haiku", "haiku-model"), ("llama", "llama-model")]
+
     def test_empty_value_skipped(self):
         """_build_anthropic_model_map filters out empty values at build time."""
         from olmlx.routers.anthropic import _build_anthropic_model_map
@@ -1304,14 +1317,6 @@ class TestResolveAnthropicModel:
 
         with patch("olmlx.routers.anthropic.settings") as mock_settings:
             mock_settings.anthropic_models = {"sonnet": "   "}
-            assert _build_anthropic_model_map() == []
-
-    def test_multi_segment_key_excluded(self):
-        """Keys containing - or : can never match a single segment; exclude them."""
-        from olmlx.routers.anthropic import _build_anthropic_model_map
-
-        with patch("olmlx.routers.anthropic.settings") as mock_settings:
-            mock_settings.anthropic_models = {"claude-sonnet": "qwen3:latest"}
             assert _build_anthropic_model_map() == []
 
 

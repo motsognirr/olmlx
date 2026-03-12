@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -21,6 +21,17 @@ class Settings(BaseSettings):
     prompt_cache_max_tokens: Annotated[int, Field(gt=0)] | None = 32768
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
     anthropic_models: dict[str, str] = {}
+
+    @field_validator("anthropic_models")
+    @classmethod
+    def validate_anthropic_model_keys(cls, v: dict[str, str]) -> dict[str, str]:
+        for key in v:
+            if "-" in key or ":" in key:
+                raise ValueError(
+                    f"anthropic_models key {key!r} must be a single segment "
+                    "(no dashes or colons)"
+                )
+        return v
 
 
 settings = Settings()

@@ -66,3 +66,19 @@ class TestSettings:
             "haiku": "qwen3:latest",
             "sonnet": "qwen3-8b:latest",
         }
+
+    def test_anthropic_models_rejects_dash_in_key(self, monkeypatch):
+        monkeypatch.setenv(
+            "OLMLX_ANTHROPIC_MODELS",
+            '{"claude-sonnet": "qwen3:latest"}',
+        )
+        with pytest.raises(ValidationError, match="single segment"):
+            Settings()
+
+    def test_anthropic_models_rejects_colon_in_key(self, monkeypatch):
+        monkeypatch.setenv(
+            "OLMLX_ANTHROPIC_MODELS",
+            '{"sonnet:latest": "qwen3:latest"}',
+        )
+        with pytest.raises(ValidationError, match="single segment"):
+            Settings()
