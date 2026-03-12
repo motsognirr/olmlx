@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     prompt_cache: bool = True
     prompt_cache_max_tokens: Annotated[int, Field(gt=0)] | None = 32768
+    prompt_cache_max_slots: Annotated[int, Field(gt=0)] = 4
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
     anthropic_models: dict[str, str] = {}
 

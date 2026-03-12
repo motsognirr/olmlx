@@ -20,6 +20,7 @@ async def chat(req: ChatRequest, request: Request):
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
     tools = [t.model_dump() for t in req.tools] if req.tools else None
     max_tokens = options.pop("num_predict", 512)
+    cache_id = request.headers.get("x-cache-id", "")
 
     if req.stream:
         result = await generate_chat(
@@ -31,6 +32,7 @@ async def chat(req: ChatRequest, request: Request):
             stream=True,
             keep_alive=req.keep_alive,
             max_tokens=max_tokens,
+            cache_id=cache_id,
         )
 
         async def stream_response():
@@ -98,6 +100,7 @@ async def chat(req: ChatRequest, request: Request):
             stream=False,
             keep_alive=req.keep_alive,
             max_tokens=max_tokens,
+            cache_id=cache_id,
         )
         now = datetime.now(timezone.utc).isoformat()
         stats = result.get("stats")

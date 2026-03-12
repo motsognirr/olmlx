@@ -170,11 +170,11 @@ class TestCacheCreatedOnFirstRequest:
         # Cache should have been created
         mock_make_cache.assert_called_once_with(lm.model)
         # After successful generation, cache state should be stored
-        assert lm.prompt_cache_state is not None
-        assert isinstance(lm.prompt_cache_state, CachedPromptState)
+        assert lm.prompt_cache_store.get("") is not None
+        assert isinstance(lm.prompt_cache_store.get(""), CachedPromptState)
         # Stored tokens should include prompt tokens + generated tokens
-        assert lm.prompt_cache_state.tokens[:5] == [10, 20, 30, 40, 50]
-        assert len(lm.prompt_cache_state.tokens) == 7  # 5 prompt + 2 generated
+        assert lm.prompt_cache_store.get("").tokens[:5] == [10, 20, 30, 40, 50]
+        assert len(lm.prompt_cache_store.get("").tokens) == 7  # 5 prompt + 2 generated
 
 
 class TestCacheReusedOnPrefixMatch:
@@ -190,9 +190,12 @@ class TestCacheReusedOnPrefixMatch:
 
         # Previously cached: 5 prompt tokens + 2 generated tokens
         existing_cache = [MagicMock()]
-        lm.prompt_cache_state = CachedPromptState(
-            tokens=[10, 20, 30, 40, 50, 100, 101],  # prompt + generated
-            cache=existing_cache,
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50, 100, 101],  # prompt + generated
+                cache=existing_cache,
+            ),
         )
 
         # New prompt: shares first 5 tokens, adds 3 more
@@ -254,9 +257,12 @@ class TestCacheMissCreatesFresh:
 
         # Previously cached: completely different tokens
         old_cache = [MagicMock()]
-        lm.prompt_cache_state = CachedPromptState(
-            tokens=[99, 98, 97],
-            cache=old_cache,
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[99, 98, 97],
+                cache=old_cache,
+            ),
         )
 
         # New prompt: no common prefix
@@ -295,8 +301,8 @@ class TestCacheMissCreatesFresh:
 
         # Should create fresh cache, not reuse old one
         mock_make_cache.assert_called_once_with(lm.model)
-        assert lm.prompt_cache_state is not None
-        assert lm.prompt_cache_state.cache is new_cache
+        assert lm.prompt_cache_store.get("") is not None
+        assert lm.prompt_cache_store.get("").cache is new_cache
 
 
 class TestCacheInvalidatedOnCancel:
@@ -366,7 +372,7 @@ class TestCacheInvalidatedOnCancel:
                 pass
 
         # Cache should be invalidated after cancellation
-        assert lm.prompt_cache_state is None
+        assert lm.prompt_cache_store.get("") is None
 
 
 class TestCacheClearedOnModelUnload:
@@ -375,9 +381,12 @@ class TestCacheClearedOnModelUnload:
         from olmlx.engine.model_manager import CachedPromptState
 
         lm = mock_manager._loaded["qwen3:latest"]
-        lm.prompt_cache_state = CachedPromptState(
-            tokens=[1, 2, 3],
-            cache=[MagicMock()],
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[1, 2, 3],
+                cache=[MagicMock()],
+            ),
         )
 
         mock_manager.unload("qwen3")
@@ -422,7 +431,7 @@ class TestCacheDisabledViaConfig:
         prompt_arg = call_args[1].get("prompt") or call_args[0][2]
         assert isinstance(prompt_arg, str)
         # No cache state should be set
-        assert lm.prompt_cache_state is None
+        assert lm.prompt_cache_store.get("") is None
         # No prompt_cache kwarg
         assert "prompt_cache" not in call_args[1]
 
@@ -485,7 +494,7 @@ class TestVlmUsesCache:
         call_args = mock_make_cache.call_args
         assert call_args is not None, "make_prompt_cache was not called"
         assert call_args[0][0] is lm.model.language_model
-        assert lm.prompt_cache_state is not None
+        assert lm.prompt_cache_store.get("") is not None
 
     @pytest.mark.asyncio
     async def test_vlm_passes_input_ids_not_token_list(self, mock_manager):
@@ -556,9 +565,12 @@ class TestCacheTokenCountLogging:
         lm.tokenizer.bos_token = None
 
         # Cached: 5 prompt + 2 generated = 7 tokens
-        lm.prompt_cache_state = CachedPromptState(
-            tokens=[10, 20, 30, 40, 50, 100, 101],
-            cache=[MagicMock()],
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50, 100, 101],
+                cache=[MagicMock()],
+            ),
         )
 
         # New prompt: shares 5 token prefix, adds 3 new
@@ -614,9 +626,12 @@ class TestCacheStatsInCacheInfoChunk:
         lm.tokenizer.bos_token = None
 
         # Cached: 5 prompt + 2 generated
-        lm.prompt_cache_state = CachedPromptState(
-            tokens=[10, 20, 30, 40, 50, 100, 101],
-            cache=[MagicMock()],
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50, 100, 101],
+                cache=[MagicMock()],
+            ),
         )
 
         # New prompt: shares 5 prefix, adds 3 new
@@ -696,9 +711,12 @@ class TestCacheExactMatchTrimAlignment:
 
         # Previously cached: 3 prompt tokens + 2 generated
         existing_cache = [MagicMock()]
-        lm.prompt_cache_state = CachedPromptState(
-            tokens=[10, 20, 30, 100, 101],
-            cache=existing_cache,
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 100, 101],
+                cache=existing_cache,
+            ),
         )
 
         # New prompt: exact same 3 tokens (prefix_len == len(prompt_tokens))
@@ -886,9 +904,12 @@ class TestSingleTokenPromptCacheEdgeCase:
 
         # Previously cached: starts with same token
         existing_cache = [MagicMock()]
-        lm.prompt_cache_state = CachedPromptState(
-            tokens=[10, 100, 101],  # [prompt_token, gen1, gen2]
-            cache=existing_cache,
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 100, 101],  # [prompt_token, gen1, gen2]
+                cache=existing_cache,
+            ),
         )
 
         # New prompt: single token that matches
@@ -986,9 +1007,9 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
                 pass
 
         # 5 prompt + 2 generated = 7 > limit of 6 → cache should be trimmed, not invalidated
-        assert lm.prompt_cache_state is not None
-        assert isinstance(lm.prompt_cache_state, CachedPromptState)
-        assert len(lm.prompt_cache_state.tokens) == 6
+        assert lm.prompt_cache_store.get("") is not None
+        assert isinstance(lm.prompt_cache_store.get(""), CachedPromptState)
+        assert len(lm.prompt_cache_store.get("").tokens) == 6
         # trim_prompt_cache called with trim_amount = 7 - 6 = 1
         mock_trim.assert_called_once_with(mock_cache_obj, 1)
 
@@ -1042,7 +1063,7 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
                 pass
 
         # Stored tokens should be first 4 of [10, 20, 30, 40, 50, 100, 101]
-        assert lm.prompt_cache_state.tokens == [10, 20, 30, 40]
+        assert lm.prompt_cache_store.get("").tokens == [10, 20, 30, 40]
         # trim_amount = 7 - 4 = 3
         mock_trim.assert_called_once_with(mock_cache_obj, 3)
 
@@ -1095,8 +1116,8 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
                 pass
 
         # After first request: cache trimmed to 5 tokens [10, 20, 30, 40, 50]
-        assert lm.prompt_cache_state is not None
-        assert lm.prompt_cache_state.tokens == [10, 20, 30, 40, 50]
+        assert lm.prompt_cache_store.get("") is not None
+        assert lm.prompt_cache_store.get("").tokens == [10, 20, 30, 40, 50]
 
         # Second request: longer prompt that shares the trimmed prefix
         # [10, 20, 30, 40, 50, 60, 70] — first 5 tokens match the trimmed cache
@@ -1222,10 +1243,10 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
         assert mock_trim.call_args_list[0] == call(mock_cache_obj, 2)
         # extra = max_cache_tokens(4) - len(prompt)(3) = 1
         assert mock_trim.call_args_list[1] == call(mock_cache_obj, 1)
-        assert lm.prompt_cache_state is not None
-        assert isinstance(lm.prompt_cache_state, CachedPromptState)
+        assert lm.prompt_cache_store.get("") is not None
+        assert isinstance(lm.prompt_cache_store.get(""), CachedPromptState)
         # Only prompt tokens stored — KV depth matches len(stored_tokens)
-        assert lm.prompt_cache_state.tokens == [10, 20, 30]
+        assert lm.prompt_cache_store.get("").tokens == [10, 20, 30]
 
     @pytest.mark.asyncio
     async def test_trim_none_id_limit_smaller_than_prompt(self, mock_manager):
@@ -1299,9 +1320,9 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
         # extra = 3 - 5 = -2 → no second trim needed
         # stored_tokens = [10, 20, 30, 40, 50][:3] = [10, 20, 30]
         mock_trim.assert_called_once_with(mock_cache_obj, 5)
-        assert lm.prompt_cache_state is not None
-        assert isinstance(lm.prompt_cache_state, CachedPromptState)
-        assert lm.prompt_cache_state.tokens == [10, 20, 30]
+        assert lm.prompt_cache_store.get("") is not None
+        assert isinstance(lm.prompt_cache_store.get(""), CachedPromptState)
+        assert lm.prompt_cache_store.get("").tokens == [10, 20, 30]
 
     @pytest.mark.asyncio
     async def test_cache_invalidated_on_trim_exception(self, mock_manager):
@@ -1355,7 +1376,7 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
         # Response should complete with a final done chunk
         assert chunks[-1]["done"] is True
         # Cache should be invalidated, not left in corrupted state
-        assert lm.prompt_cache_state is None
+        assert lm.prompt_cache_store.get("") is None
 
 
 class TestCacheStoredWhenWithinTokenLimit:
@@ -1402,9 +1423,9 @@ class TestCacheStoredWhenWithinTokenLimit:
                 pass
 
         # 7 tokens <= 20 limit → cache should be stored
-        assert lm.prompt_cache_state is not None
-        assert isinstance(lm.prompt_cache_state, CachedPromptState)
-        assert len(lm.prompt_cache_state.tokens) == 7
+        assert lm.prompt_cache_store.get("") is not None
+        assert isinstance(lm.prompt_cache_store.get(""), CachedPromptState)
+        assert len(lm.prompt_cache_store.get("").tokens) == 7
 
 
 class TestCacheStoredWhenLimitDisabled:
@@ -1451,9 +1472,9 @@ class TestCacheStoredWhenLimitDisabled:
                 pass
 
         # No limit → cache stored regardless
-        assert lm.prompt_cache_state is not None
-        assert isinstance(lm.prompt_cache_state, CachedPromptState)
-        assert len(lm.prompt_cache_state.tokens) == 102
+        assert lm.prompt_cache_store.get("") is not None
+        assert isinstance(lm.prompt_cache_store.get(""), CachedPromptState)
+        assert len(lm.prompt_cache_store.get("").tokens) == 102
 
 
 class TestCacheSkippedOnMemoryPressure:
@@ -1470,8 +1491,8 @@ class TestCacheSkippedOnMemoryPressure:
         # Set up existing cache that should be invalidated
         from olmlx.engine.model_manager import CachedPromptState
 
-        lm.prompt_cache_state = CachedPromptState(
-            tokens=[10, 20, 30], cache=[MagicMock()]
+        lm.prompt_cache_store.set(
+            "", CachedPromptState(tokens=[10, 20, 30], cache=[MagicMock()])
         )
 
         tokens = _make_stream_tokens("Hello", prompt_tokens=3)
@@ -1513,7 +1534,7 @@ class TestCacheSkippedOnMemoryPressure:
         # No cache_info chunk should be emitted
         assert not any(c.get("cache_info") for c in chunks)
         # Cache should be invalidated
-        assert lm.prompt_cache_state is None
+        assert lm.prompt_cache_store.get("") is None
 
 
 class TestCacheRebuiltAfterPressureResolves:
@@ -1529,8 +1550,8 @@ class TestCacheRebuiltAfterPressureResolves:
 
         from olmlx.engine.model_manager import CachedPromptState
 
-        lm.prompt_cache_state = CachedPromptState(
-            tokens=[10, 20, 30], cache=[MagicMock()]
+        lm.prompt_cache_store.set(
+            "", CachedPromptState(tokens=[10, 20, 30], cache=[MagicMock()])
         )
 
         tokens = _make_stream_tokens("Hello", prompt_tokens=3)
@@ -1578,7 +1599,7 @@ class TestCacheRebuiltAfterPressureResolves:
         # Cache info chunk should be emitted
         assert any(c.get("cache_info") for c in chunks)
         # Cache should be stored after generation
-        assert lm.prompt_cache_state is not None
+        assert lm.prompt_cache_store.get("") is not None
 
 
 class TestConfigPromptCacheSetting:
@@ -1618,3 +1639,240 @@ class TestConfigPromptCacheMaxTokensSetting:
 
         s = Settings(prompt_cache_max_tokens=None)
         assert s.prompt_cache_max_tokens is None
+
+
+class TestConfigPromptCacheMaxSlotsSetting:
+    def test_default_is_4(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_PROMPT_CACHE_MAX_SLOTS", raising=False)
+        from olmlx.config import Settings
+
+        s = Settings()
+        assert s.prompt_cache_max_slots == 4
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_PROMPT_CACHE_MAX_SLOTS", "8")
+        from olmlx.config import Settings
+
+        s = Settings()
+        assert s.prompt_cache_max_slots == 8
+
+
+class TestMultiCacheBehavior:
+    @pytest.mark.asyncio
+    async def test_different_cache_ids_get_separate_caches(self, mock_manager):
+        """Two requests with different cache_id values get independent caches."""
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50])
+
+        tokens = _make_stream_tokens("Hello", " world", prompt_tokens=5)
+        mock_stream = _make_mock_stream(tokens)
+
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        mock_mx = MagicMock()
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache",
+                mock_make_cache,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+                cache_id="agent-a",
+            )
+            async for _ in gen:
+                pass
+
+        # Agent-a should have a cache
+        assert lm.prompt_cache_store.get("agent-a") is not None
+        # Default and agent-b should not
+        assert lm.prompt_cache_store.get("") is None
+        assert lm.prompt_cache_store.get("agent-b") is None
+
+    @pytest.mark.asyncio
+    async def test_cache_id_reuse_hits_correct_cache(self, mock_manager):
+        """Second request with same cache_id reuses the stored cache."""
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50])
+
+        # Pre-populate cache for agent-a
+        existing_cache = [MagicMock()]
+        lm.prompt_cache_store.set(
+            "agent-a",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50, 100, 101],
+                cache=existing_cache,
+            ),
+        )
+
+        tokens = _make_stream_tokens("Hello", prompt_tokens=5)
+        mock_stream = _make_mock_stream(tokens)
+
+        mock_trim = MagicMock()
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache",
+                MagicMock(return_value=[MagicMock()]),
+            ),
+            patch(
+                "olmlx.engine.inference.trim_prompt_cache",
+                mock_trim,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+                cache_id="agent-a",
+            )
+            chunks = []
+            async for chunk in gen:
+                chunks.append(chunk)
+
+        # Should have found cache hit — trim_prompt_cache called to align
+        mock_trim.assert_called()
+        # Cache info should show cache read
+        cache_info = [c for c in chunks if c.get("cache_info")]
+        assert cache_info
+        assert cache_info[0]["cache_read_tokens"] > 0
+
+    @pytest.mark.asyncio
+    async def test_cache_id_miss_does_not_affect_other_caches(self, mock_manager):
+        """A miss on one cache_id doesn't invalidate caches for other IDs."""
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50])
+
+        # Pre-populate cache for agent-a
+        agent_a_state = CachedPromptState(
+            tokens=[10, 20, 30, 40, 50], cache=[MagicMock()]
+        )
+        lm.prompt_cache_store.set("agent-a", agent_a_state)
+
+        tokens = _make_stream_tokens("Hello", " world", prompt_tokens=5)
+        mock_stream = _make_mock_stream(tokens)
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        mock_mx = MagicMock()
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache",
+                mock_make_cache,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+                cache_id="agent-b",
+            )
+            async for _ in gen:
+                pass
+
+        # agent-b should now have a cache
+        assert lm.prompt_cache_store.get("agent-b") is not None
+        # agent-a's cache should be untouched
+        assert lm.prompt_cache_store.get("agent-a") is agent_a_state
+
+    @pytest.mark.asyncio
+    async def test_memory_pressure_clears_all_caches(self, mock_manager):
+        """Memory pressure clears all cache slots, not just the active one."""
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30])
+
+        # Pre-populate caches for multiple agents
+        lm.prompt_cache_store.set(
+            "agent-a", CachedPromptState(tokens=[10, 20], cache=[MagicMock()])
+        )
+        lm.prompt_cache_store.set(
+            "agent-b", CachedPromptState(tokens=[10, 20], cache=[MagicMock()])
+        )
+
+        tokens = _make_stream_tokens("Hello", prompt_tokens=3)
+        mock_stream = _make_mock_stream(tokens)
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        mock_mx = MagicMock()
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache",
+                mock_make_cache,
+            ),
+            patch(
+                "olmlx.engine.inference._is_memory_pressure_high",
+                side_effect=[True, False],
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+                cache_id="agent-a",
+            )
+            async for _ in gen:
+                pass
+
+        # Both caches cleared, but agent-a gets a new one from this request
+        assert lm.prompt_cache_store.get("agent-a") is not None
+        assert lm.prompt_cache_store.get("agent-b") is None

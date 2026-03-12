@@ -235,3 +235,48 @@ class TestOpenAIRouter:
         assert error_line["error"]["type"] == "server_error"
         assert "internal server error" in error_line["error"]["message"]
         assert any("[DONE]" in line for line in lines)
+
+
+class TestXCacheIDHeader:
+    @pytest.mark.asyncio
+    async def test_header_passed_to_generate_chat(self, app_client):
+        stats = TimingStats(prompt_eval_count=10, eval_count=5)
+        mock_result = {"text": "response", "done": True, "stats": stats}
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={"X-Cache-ID": "agent-beta"},
+            )
+
+        assert resp.status_code == 200
+        mock_gen.assert_called_once()
+        assert mock_gen.call_args.kwargs.get("cache_id") == "agent-beta"
+
+    @pytest.mark.asyncio
+    async def test_no_header_uses_default_cache_id(self, app_client):
+        stats = TimingStats(prompt_eval_count=10, eval_count=5)
+        mock_result = {"text": "response", "done": True, "stats": stats}
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+
+        assert resp.status_code == 200
+        mock_gen.assert_called_once()
+        assert mock_gen.call_args.kwargs.get("cache_id") == ""

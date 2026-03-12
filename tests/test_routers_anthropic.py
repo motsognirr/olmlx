@@ -1416,3 +1416,50 @@ class TestAnthropicModelResolution:
 
         assert resp.status_code == 200
         mock_ensure.assert_called_with("qwen3-8b:latest")
+
+
+class TestXCacheIDHeader:
+    @pytest.mark.asyncio
+    async def test_header_passed_to_generate_chat(self, app_client):
+        stats = TimingStats(prompt_eval_count=10, eval_count=5)
+        mock_result = {"text": "response", "done": True, "stats": stats}
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+                headers={"X-Cache-ID": "agent-alpha"},
+            )
+
+        assert resp.status_code == 200
+        mock_gen.assert_called_once()
+        assert mock_gen.call_args.kwargs.get("cache_id") == "agent-alpha"
+
+    @pytest.mark.asyncio
+    async def test_no_header_uses_default_cache_id(self, app_client):
+        stats = TimingStats(prompt_eval_count=10, eval_count=5)
+        mock_result = {"text": "response", "done": True, "stats": stats}
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+            )
+
+        assert resp.status_code == 200
+        mock_gen.assert_called_once()
+        assert mock_gen.call_args.kwargs.get("cache_id") == ""

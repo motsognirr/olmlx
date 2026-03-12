@@ -60,7 +60,7 @@ async def test_cache_created_on_first_request(integration_ctx):
 
     # Verify cache state stored on manager
     lm = integration_ctx.manager._loaded["qwen3:latest"]
-    assert lm.prompt_cache_state is not None
+    assert lm.prompt_cache_store.get("") is not None
 
 
 async def test_cache_hit_on_second_request(integration_ctx):
@@ -92,7 +92,7 @@ async def test_cache_miss_on_different_prompt(integration_ctx):
 
     # Invalidate the cache to force a true miss
     lm = integration_ctx.manager._loaded["qwen3:latest"]
-    lm.prompt_cache_state = None
+    lm.prompt_cache_store.clear()
 
     # Entirely different prompt
     msgs2 = [

@@ -614,6 +614,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     msg_id = _make_msg_id()
     logger.debug("Converted %d messages, %d tools", len(messages), len(tools or []))
 
+    cache_id = request.headers.get("x-cache-id", "")
+
     if req.stream:
         result = await generate_chat(
             manager,
@@ -623,6 +625,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             tools=tools,
             stream=True,
             max_tokens=req.max_tokens,
+            cache_id=cache_id,
         )
 
         async def stream_sse():
@@ -739,6 +742,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             tools=tools,
             stream=False,
             max_tokens=req.max_tokens,
+            cache_id=cache_id,
         )
         text = result.get("text", "")
         stats = result.get("stats")
