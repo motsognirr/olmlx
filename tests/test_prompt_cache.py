@@ -1047,14 +1047,14 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
         mock_trim.assert_called_once_with(mock_cache_obj, 3)
 
     @pytest.mark.asyncio
-    async def test_trimmed_cache_reusable_on_next_request(self, mock_manager):
-        """After trimming, the same prompt reuses the trimmed cache (not a fresh one)."""
+    async def test_trimmed_cache_reusable_as_prefix(self, mock_manager):
+        """After trimming, a longer prompt sharing the trimmed prefix reuses the cache."""
         from olmlx.engine.inference import generate_chat
 
         lm = mock_manager._loaded["qwen3:latest"]
         lm.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
         lm.tokenizer.bos_token = None
-        # Same 5 prompt tokens for both requests (same content → same tokens)
+        # First request: 5 prompt tokens
         lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50])
 
         mock_cache_obj = [MagicMock()]
@@ -1098,8 +1098,10 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
         assert lm.prompt_cache_state is not None
         assert lm.prompt_cache_state.tokens == [10, 20, 30, 40, 50]
 
-        # Second request: same prompt content → same tokens → cache hit
-        tokens2 = _make_stream_tokens("Again", prompt_tokens=5)
+        # Second request: longer prompt that shares the trimmed prefix
+        # [10, 20, 30, 40, 50, 60, 70] — first 5 tokens match the trimmed cache
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50, 60, 70])
+        tokens2 = _make_stream_tokens("Again", prompt_tokens=7)
         mock_stream2 = _make_mock_stream(tokens2)
         mock_make_cache.reset_mock()
         mock_trim.reset_mock()
@@ -1121,18 +1123,18 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
             patch("olmlx.engine.inference.settings") as mock_settings,
         ):
             mock_settings.prompt_cache = True
-            mock_settings.prompt_cache_max_tokens = 5
+            mock_settings.prompt_cache_max_tokens = 20
             mock_settings.default_keep_alive = "5m"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
-                [{"role": "user", "content": "hi"}],
+                [{"role": "user", "content": "hi there"}],
                 stream=True,
             )
             async for chunk in gen:
                 pass
 
-        # Should NOT have created a fresh cache — reused trimmed one
+        # Should NOT have created a fresh cache — reused trimmed prefix
         mock_make_cache.assert_not_called()
 
     @pytest.mark.asyncio

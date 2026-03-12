@@ -555,7 +555,6 @@ async def _stream_completion(
             max_cache_tokens = settings.prompt_cache_max_tokens
             if max_cache_tokens is not None and actual_total > max_cache_tokens:
                 trim_amount = actual_total - max_cache_tokens
-                original_len = len(stored_tokens)
                 try:
                     trim_prompt_cache(prompt_cache, trim_amount)
                     if stats.eval_count != len(generated_tokens):
@@ -573,7 +572,7 @@ async def _stream_completion(
                     )
                     logger.info(
                         "Cache trimmed: %d → %d tokens (limit %d)",
-                        original_len,
+                        actual_total,
                         len(stored_tokens),
                         max_cache_tokens,
                     )
