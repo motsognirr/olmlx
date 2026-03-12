@@ -1215,6 +1215,10 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
         mock_trim.assert_called_once_with(mock_cache_obj, 2)
         assert lm.prompt_cache_state is not None
         assert isinstance(lm.prompt_cache_state, CachedPromptState)
+        # Retained KV depth = 4: 3 prompt + 1 gen step (step 1 = token 100).
+        # None-ID tokens make generated_tokens unreliable for slicing,
+        # so only prompt tokens should be stored.
+        assert lm.prompt_cache_state.tokens == [10, 20, 30]
 
     @pytest.mark.asyncio
     async def test_cache_invalidated_on_trim_exception(self, mock_manager):

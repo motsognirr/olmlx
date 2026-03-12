@@ -560,7 +560,12 @@ async def _stream_completion(
                     trim_prompt_cache(prompt_cache, trim_amount)
                     # trim_prompt_cache only adjusts offsets, not Metal buffers
                     mx.clear_cache()
-                    stored_tokens = stored_tokens[:max_cache_tokens]
+                    if stats.eval_count != len(generated_tokens):
+                        # None-ID tokens present: can't map generated_tokens
+                        # to KV cache positions, so only store prompt tokens.
+                        stored_tokens = list(full_prompt_tokens)
+                    else:
+                        stored_tokens = stored_tokens[:max_cache_tokens]
                     lm.prompt_cache_state = CachedPromptState(
                         tokens=stored_tokens, cache=prompt_cache
                     )
