@@ -548,18 +548,43 @@ async def _stream_completion(
         prompt_cache = gen_kwargs.get("prompt_cache")
         if prompt_cache is not None and full_prompt_tokens is not None:
             stored_tokens = list(full_prompt_tokens) + generated_tokens
+            # The KV cache has an entry for every generation step, including
+            # steps where the token ID was None (skipped in generated_tokens).
+            # Use stats.eval_count for the real generation depth.
+            actual_total = len(full_prompt_tokens) + stats.eval_count
             max_cache_tokens = settings.prompt_cache_max_tokens
-            if max_cache_tokens is not None and len(stored_tokens) > max_cache_tokens:
-                logger.info(
-                    "Cache invalidated: %d tokens exceeds limit of %d",
-                    len(stored_tokens),
-                    max_cache_tokens,
-                )
-                lm.prompt_cache_state = None
-                gen_kwargs.pop("prompt_cache", None)
-                prompt_cache = None
-                gc.collect()
-                mx.clear_cache()
+            if max_cache_tokens is not None and actual_total > max_cache_tokens:
+                trim_amount = actual_total - max_cache_tokens
+                try:
+                    trim_prompt_cache(prompt_cache, trim_amount)
+                    if stats.eval_count != len(generated_tokens):
+                        # None-ID tokens present: can't map generated_tokens
+                        # to KV cache positions. Trim KV cache down to prompt
+                        # boundary so depth == len(stored_tokens).
+                        extra = max_cache_tokens - len(full_prompt_tokens)
+                        if extra > 0:
+                            trim_prompt_cache(prompt_cache, extra)
+                        stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
+                    else:
+                        stored_tokens = stored_tokens[:max_cache_tokens]
+                    lm.prompt_cache_state = CachedPromptState(
+                        tokens=stored_tokens, cache=prompt_cache
+                    )
+                    logger.info(
+                        "Cache trimmed: %d → %d tokens (limit %d)",
+                        actual_total,
+                        len(stored_tokens),
+                        max_cache_tokens,
+                    )
+                except Exception:
+                    lm.prompt_cache_state = None
+                    prompt_cache = None
+                    gc.collect()
+                    mx.clear_cache()
+                    logger.warning(
+                        "Cache trim failed; invalidating cache",
+                        exc_info=True,
+                    )
             else:
                 lm.prompt_cache_state = CachedPromptState(
                     tokens=stored_tokens,
