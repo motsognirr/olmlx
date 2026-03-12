@@ -109,3 +109,50 @@ class TestChatRouter:
         assert last_line["done_reason"] == "error"
         assert last_line["model"] == "qwen3"
         assert "created_at" in last_line
+
+
+class TestXCacheIDHeader:
+    @pytest.mark.asyncio
+    async def test_header_passed_to_generate_chat(self, app_client):
+        stats = TimingStats()
+        mock_result = {"text": "response", "done": True, "stats": stats}
+
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                },
+                headers={"X-Cache-ID": "agent-gamma"},
+            )
+
+        assert resp.status_code == 200
+        mock_gen.assert_called_once()
+        assert mock_gen.call_args.kwargs.get("cache_id") == "agent-gamma"
+
+    @pytest.mark.asyncio
+    async def test_no_header_uses_default_cache_id(self, app_client):
+        stats = TimingStats()
+        mock_result = {"text": "response", "done": True, "stats": stats}
+
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                },
+            )
+
+        assert resp.status_code == 200
+        mock_gen.assert_called_once()
+        assert mock_gen.call_args.kwargs.get("cache_id") == ""

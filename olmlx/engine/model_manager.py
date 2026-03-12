@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +48,49 @@ class CachedPromptState:
     cache: list[Any]  # Per-layer KV cache objects (mutated in-place by generate_step)
 
 
+class PromptCacheStore:
+    """LRU store for per-agent KV caches."""
+
+    def __init__(self, max_slots: int) -> None:
+        self._max_slots = max_slots
+        self._entries: OrderedDict[str, CachedPromptState] = OrderedDict()
+
+    def get(self, cache_id: str) -> CachedPromptState | None:
+        """Get a cache entry, promoting it to MRU. Returns None if missing."""
+        state = self._entries.get(cache_id)
+        if state is not None:
+            self._entries.move_to_end(cache_id)
+        return state
+
+    def set(self, cache_id: str, state: CachedPromptState) -> CachedPromptState | None:
+        """Set a cache entry, evicting LRU if at capacity.
+
+        Returns the displaced CachedPromptState when its GPU resources need
+        cleanup (different .cache object), or None when no cleanup is needed.
+        """
+        if cache_id in self._entries:
+            self._entries.move_to_end(cache_id)
+            old = self._entries[cache_id]
+            self._entries[cache_id] = state
+            return old if old.cache is not state.cache else None
+        evicted: CachedPromptState | None = None
+        if len(self._entries) >= self._max_slots:
+            _, evicted = self._entries.popitem(last=False)
+        self._entries[cache_id] = state
+        return evicted
+
+    def remove(self, cache_id: str) -> None:
+        """Remove a specific cache entry."""
+        self._entries.pop(cache_id, None)
+
+    def clear(self) -> None:
+        """Remove all cache entries."""
+        self._entries.clear()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
 @dataclass
 class LoadedModel:
     name: str
@@ -59,7 +103,11 @@ class LoadedModel:
     expires_at: float | None = None
     size_bytes: int = 0
     active_refs: int = 0
-    prompt_cache_state: CachedPromptState | None = None
+    prompt_cache_store: PromptCacheStore = field(
+        default_factory=lambda: PromptCacheStore(
+            max_slots=settings.prompt_cache_max_slots
+        )
+    )
 
     @property
     def text_tokenizer(self) -> Any:

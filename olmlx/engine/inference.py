@@ -379,6 +379,7 @@ async def _stream_completion(
     *,
     use_prompt_cache: bool = False,
     prompt_tokens: list[int] | None = None,
+    cache_id: str = "",
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
@@ -407,7 +408,7 @@ async def _stream_completion(
             logger.warning(
                 "Memory pressure high, invalidating prompt cache to prevent OOM"
             )
-            lm.prompt_cache_state = None
+            lm.prompt_cache_store.clear()
             gc.collect()
             mx.clear_cache()
             memory_too_high = _is_memory_pressure_high()
@@ -419,7 +420,7 @@ async def _stream_completion(
             and prompt_tokens is not None
             and make_prompt_cache is not None
         ):
-            cached = lm.prompt_cache_state
+            cached = lm.prompt_cache_store.get(cache_id)
             logger.debug(
                 "Cache lookup: cached=%s, new prompt=%d tokens",
                 (
@@ -482,7 +483,7 @@ async def _stream_completion(
                     prompt = suffix_tokens
             else:
                 # No usable prefix — free old cache and create fresh
-                lm.prompt_cache_state = None
+                lm.prompt_cache_store.remove(cache_id)
                 cache_model = _get_model_for_cache(lm.model, lm.is_vlm)
                 new_cache = make_prompt_cache(cache_model)
                 gen_kwargs["prompt_cache"] = new_cache
@@ -567,9 +568,15 @@ async def _stream_completion(
                         stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
                     else:
                         stored_tokens = stored_tokens[:max_cache_tokens]
-                    lm.prompt_cache_state = CachedPromptState(
-                        tokens=stored_tokens, cache=prompt_cache
+                    evicted = lm.prompt_cache_store.set(
+                        cache_id,
+                        CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
                     )
+                    if evicted is not None:
+                        del evicted
+                        if _is_memory_pressure_high():
+                            gc.collect()
+                            mx.clear_cache()
                     logger.info(
                         "Cache trimmed: %d → %d tokens (limit %d)",
                         actual_total,
@@ -577,7 +584,7 @@ async def _stream_completion(
                         max_cache_tokens,
                     )
                 except Exception:
-                    lm.prompt_cache_state = None
+                    lm.prompt_cache_store.remove(cache_id)
                     prompt_cache = None
                     gc.collect()
                     mx.clear_cache()
@@ -586,10 +593,18 @@ async def _stream_completion(
                         exc_info=True,
                     )
             else:
-                lm.prompt_cache_state = CachedPromptState(
-                    tokens=stored_tokens,
-                    cache=prompt_cache,
+                evicted = lm.prompt_cache_store.set(
+                    cache_id,
+                    CachedPromptState(
+                        tokens=stored_tokens,
+                        cache=prompt_cache,
+                    ),
                 )
+                if evicted is not None:
+                    del evicted
+                    if _is_memory_pressure_high():
+                        gc.collect()
+                        mx.clear_cache()
                 logger.debug(
                     "Cache stored: %d tokens (%d prompt + %d generated)",
                     len(stored_tokens),
@@ -606,7 +621,7 @@ async def _stream_completion(
         # Invalidate cache on incomplete generation to avoid inconsistent state
         if not generation_complete and full_prompt_tokens is not None:
             logger.debug("Cache invalidated: generation did not complete")
-            lm.prompt_cache_state = None
+            lm.prompt_cache_store.remove(cache_id)
         # We MUST wait for the Metal thread to finish before releasing
         # _inference_lock, otherwise the next inference will hit concurrent
         # Metal command buffer access.
@@ -730,6 +745,7 @@ async def generate_chat(
     stream: bool = True,
     keep_alive: str | None = None,
     max_tokens: int = 512,
+    cache_id: str = "",
 ) -> AsyncGenerator[dict, None] | dict:
     """Generate a chat completion."""
     stats = TimingStats()
@@ -762,7 +778,7 @@ async def generate_chat(
     prompt_tokens = None
     if use_prompt_cache:
         prompt_tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
-        cached_state = lm.prompt_cache_state
+        cached_state = lm.prompt_cache_store.get(cache_id)
         logger.debug(
             "Prompt cache enabled: %d prompt tokens, existing cache=%s",
             len(prompt_tokens),
@@ -786,6 +802,7 @@ async def generate_chat(
             images,
             use_prompt_cache=use_prompt_cache,
             prompt_tokens=prompt_tokens,
+            cache_id=cache_id,
         )
     else:
         return await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
