@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
+from functools import partial
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -578,16 +579,23 @@ async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request
     messages = _convert_messages(req)
     tools = _convert_tools(req)
 
+    enable_thinking: bool | None = None
+    if req.thinking is not None:
+        enable_thinking = req.thinking.type == "enabled"
+
     lm.active_refs += 1
     try:
         loop = asyncio.get_running_loop()
         token_count = await loop.run_in_executor(
             None,
-            count_chat_tokens,
-            lm.text_tokenizer,
-            messages,
-            tools,
-            lm.template_caps,
+            partial(
+                count_chat_tokens,
+                lm.text_tokenizer,
+                messages,
+                tools,
+                lm.template_caps,
+                enable_thinking=enable_thinking,
+            ),
         )
     finally:
         lm.active_refs -= 1
@@ -616,6 +624,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
 
     cache_id = request.headers.get("x-cache-id", "")[:256]
 
+    enable_thinking: bool | None = None
+    if req.thinking is not None:
+        enable_thinking = req.thinking.type == "enabled"
+
     if req.stream:
         result = await generate_chat(
             manager,
@@ -626,6 +638,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             stream=True,
             max_tokens=req.max_tokens,
             cache_id=cache_id,
+            enable_thinking=enable_thinking,
         )
 
         async def stream_sse():
@@ -743,6 +756,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             stream=False,
             max_tokens=req.max_tokens,
             cache_id=cache_id,
+            enable_thinking=enable_thinking,
         )
         text = result.get("text", "")
         stats = result.get("stats")

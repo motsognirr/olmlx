@@ -22,6 +22,7 @@ from olmlx.schemas.anthropic import (
     AnthropicContentBlock,
     AnthropicMessage,
     AnthropicMessagesRequest,
+    AnthropicThinkingParam,
     AnthropicTool,
     AnthropicToolInputSchema,
 )
@@ -1463,3 +1464,195 @@ class TestXCacheIDHeader:
         assert resp.status_code == 200
         mock_gen.assert_called_once()
         assert mock_gen.call_args.kwargs.get("cache_id") == ""
+
+
+class TestThinkingParamSchema:
+    def test_thinking_enabled(self):
+        req = AnthropicMessagesRequest(
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
+            thinking=AnthropicThinkingParam(type="enabled", budget_tokens=10000),
+        )
+        assert req.thinking is not None
+        assert req.thinking.type == "enabled"
+        assert req.thinking.budget_tokens == 10000
+
+    def test_thinking_disabled(self):
+        req = AnthropicMessagesRequest(
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
+            thinking=AnthropicThinkingParam(type="disabled"),
+        )
+        assert req.thinking is not None
+        assert req.thinking.type == "disabled"
+        assert req.thinking.budget_tokens is None
+
+    def test_thinking_missing(self):
+        req = AnthropicMessagesRequest(
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
+        )
+        assert req.thinking is None
+
+    def test_thinking_from_dict(self):
+        """Schema parses thinking from raw dict (as JSON would arrive)."""
+        req = AnthropicMessagesRequest(
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
+            thinking={"type": "enabled", "budget_tokens": 5000},
+        )
+        assert req.thinking.type == "enabled"
+        assert req.thinking.budget_tokens == 5000
+
+
+class TestThinkingParamRouter:
+    @pytest.mark.asyncio
+    async def test_thinking_enabled_passes_to_generate(self, app_client):
+        stats = TimingStats(prompt_eval_count=10, eval_count=20)
+        mock_result = {"text": "Hello!", "done": True, "stats": stats}
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "thinking": {"type": "enabled", "budget_tokens": 10000},
+                },
+            )
+
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs.get("enable_thinking") is True
+
+    @pytest.mark.asyncio
+    async def test_thinking_disabled_passes_to_generate(self, app_client):
+        stats = TimingStats(prompt_eval_count=10, eval_count=20)
+        mock_result = {"text": "Hello!", "done": True, "stats": stats}
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "thinking": {"type": "disabled"},
+                },
+            )
+
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs.get("enable_thinking") is False
+
+    @pytest.mark.asyncio
+    async def test_no_thinking_passes_none(self, app_client):
+        stats = TimingStats(prompt_eval_count=10, eval_count=20)
+        mock_result = {"text": "Hello!", "done": True, "stats": stats}
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+            )
+
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs.get("enable_thinking") is None
+
+    @pytest.mark.asyncio
+    async def test_thinking_enabled_with_tools(self, app_client):
+        """Thinking enabled + tools should pass enable_thinking=True (not hardcoded off)."""
+        stats = TimingStats(prompt_eval_count=10, eval_count=20)
+        mock_result = {
+            "text": "<think>reasoning</think>I'll search.",
+            "done": True,
+            "stats": stats,
+        }
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "search for test"}],
+                    "max_tokens": 100,
+                    "thinking": {"type": "enabled", "budget_tokens": 10000},
+                    "tools": [
+                        {
+                            "name": "search",
+                            "description": "Search",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"q": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs.get("enable_thinking") is True
+
+    @pytest.mark.asyncio
+    async def test_streaming_thinking_enabled(self, app_client):
+        """Streaming: thinking parameter is forwarded to generate_chat."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "Hello", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats(eval_count=1)}
+
+            return gen()
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", side_effect=mock_stream
+        ) as mock_gen:
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                    "thinking": {"type": "enabled", "budget_tokens": 8000},
+                },
+            )
+
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs.get("enable_thinking") is True
+
+    @pytest.mark.asyncio
+    async def test_count_tokens_passes_thinking(self, app_client, mock_loaded_model):
+        """count_tokens endpoint passes enable_thinking to count_chat_tokens."""
+        mock_loaded_model.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+
+        with patch(
+            "olmlx.routers.anthropic.count_chat_tokens", return_value=3
+        ) as mock_count:
+            resp = await app_client.post(
+                "/v1/messages/count_tokens",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "thinking": {"type": "enabled", "budget_tokens": 5000},
+                },
+            )
+
+        assert resp.status_code == 200
+        assert mock_count.call_args.kwargs.get("enable_thinking") is True

@@ -36,6 +36,11 @@ class AnthropicMessage(BaseModel):
     content: str | list[AnthropicContentBlock]
 
 
+class AnthropicThinkingParam(BaseModel):
+    type: str  # "enabled" or "disabled"
+    budget_tokens: int | None = None
+
+
 class AnthropicMessagesRequest(BaseModel):
     model: str
     messages: list[AnthropicMessage]
@@ -48,6 +53,7 @@ class AnthropicMessagesRequest(BaseModel):
     system: str | list[AnthropicContentBlock] | None = None
     tools: list[AnthropicTool] | None = None
     tool_choice: dict | None = None
+    thinking: AnthropicThinkingParam | None = None
     metadata: dict | None = None
 
     model_config = {"extra": "allow"}

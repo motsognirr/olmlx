@@ -218,6 +218,7 @@ def _apply_chat_template(
     caps: TemplateCaps | None = None,
     *,
     tokenize: bool = False,
+    enable_thinking: bool | None = None,
 ) -> Any:
     """Core chat template application.
 
@@ -231,13 +232,21 @@ def _apply_chat_template(
 
     if tools and caps.supports_tools:
         kwargs["tools"] = tools
-        if caps.supports_enable_thinking:
-            kwargs["enable_thinking"] = False
     elif tools and not caps.supports_tools:
         logger.info(
             "Template lacks tool support, injecting tool descriptions into system message"
         )
         messages = _inject_tools_into_system(messages, tools)
+
+    if caps.supports_enable_thinking:
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
+        elif tools:
+            kwargs["enable_thinking"] = (
+                False  # backward compat for non-Anthropic callers
+            )
+        else:
+            kwargs["enable_thinking"] = True
 
     try:
         return tokenizer.apply_chat_template(messages, **kwargs)
@@ -265,9 +274,18 @@ def _apply_chat_template_text(
     messages: list[dict],
     tools: list[dict] | None = None,
     caps: TemplateCaps | None = None,
+    *,
+    enable_thinking: bool | None = None,
 ) -> str:
     """Apply chat template for text-only models (mlx-lm), returning prompt text."""
-    return _apply_chat_template(tokenizer, messages, tools, caps, tokenize=False)
+    return _apply_chat_template(
+        tokenizer,
+        messages,
+        tools,
+        caps,
+        tokenize=False,
+        enable_thinking=enable_thinking,
+    )
 
 
 def _apply_chat_template_vlm(
@@ -312,6 +330,8 @@ def count_chat_tokens(
     messages: list[dict],
     tools: list[dict] | None = None,
     caps: TemplateCaps | None = None,
+    *,
+    enable_thinking: bool | None = None,
 ) -> int:
     """Count input tokens by applying the chat template with tokenize=True.
 
@@ -319,7 +339,9 @@ def count_chat_tokens(
     add_generation_prompt=True so the count includes the assistant-turn
     opener tokens, matching what the model actually receives at inference.
     """
-    result = _apply_chat_template(tokenizer, messages, tools, caps, tokenize=True)
+    result = _apply_chat_template(
+        tokenizer, messages, tools, caps, tokenize=True, enable_thinking=enable_thinking
+    )
 
     # Handle varied return types from apply_chat_template.
     # BatchEncoding (transformers) extends UserDict, not dict, so use Mapping.
@@ -746,6 +768,7 @@ async def generate_chat(
     keep_alive: str | None = None,
     max_tokens: int = 512,
     cache_id: str = "",
+    enable_thinking: bool | None = None,
 ) -> AsyncGenerator[dict, None] | dict:
     """Generate a chat completion."""
     stats = TimingStats()
@@ -762,7 +785,11 @@ async def generate_chat(
         # Use text template path when tools are needed, even for VLM-loaded models,
         # because _apply_chat_template_vlm doesn't support tool definitions.
         prompt = _apply_chat_template_text(
-            lm.text_tokenizer, messages, tools, caps=lm.template_caps
+            lm.text_tokenizer,
+            messages,
+            tools,
+            caps=lm.template_caps,
+            enable_thinking=enable_thinking,
         )
         if tools:
             logger.info("Chat prompt with %d tools", len(tools))
