@@ -565,7 +565,7 @@ async def _stream_completion(
                         extra = max_cache_tokens - len(full_prompt_tokens)
                         if extra > 0:
                             trim_prompt_cache(prompt_cache, extra)
-                        stored_tokens = list(full_prompt_tokens)
+                        stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
                     else:
                         stored_tokens = stored_tokens[:max_cache_tokens]
                     lm.prompt_cache_state = CachedPromptState(
@@ -573,7 +573,10 @@ async def _stream_completion(
                     )
                 except Exception:
                     lm.prompt_cache_state = None
-                    raise
+                    logger.warning(
+                        "Cache trim failed; invalidating cache",
+                        exc_info=True,
+                    )
                 logger.info(
                     "Cache trimmed: %d → %d tokens (limit %d)",
                     original_len,

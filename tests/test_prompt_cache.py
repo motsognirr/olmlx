@@ -1227,7 +1227,7 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
 
     @pytest.mark.asyncio
     async def test_cache_invalidated_on_trim_exception(self, mock_manager):
-        """If trim_prompt_cache raises, cache is invalidated to prevent corruption."""
+        """If trim_prompt_cache raises, cache is invalidated but response completes."""
         from olmlx.engine.inference import generate_chat
 
         lm = mock_manager._loaded["qwen3:latest"]
@@ -1262,16 +1262,20 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
             mock_settings.prompt_cache = True
             mock_settings.prompt_cache_max_tokens = 6
             mock_settings.default_keep_alive = "5m"
-            with pytest.raises(RuntimeError, match="trim failed"):
-                gen = await generate_chat(
-                    mock_manager,
-                    "qwen3",
-                    [{"role": "user", "content": "hi"}],
-                    stream=True,
-                )
-                async for chunk in gen:
-                    pass
+            # Trim failure is post-generation bookkeeping — should not kill
+            # the response. Generation completes, final done chunk emitted.
+            chunks = []
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+            async for chunk in gen:
+                chunks.append(chunk)
 
+        # Response should complete with a final done chunk
+        assert chunks[-1]["done"] is True
         # Cache should be invalidated, not left in corrupted state
         assert lm.prompt_cache_state is None
 
