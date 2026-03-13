@@ -258,10 +258,7 @@ def _apply_chat_template(
                 exc,
             )
             del kwargs["tools"]
-            if kwargs.pop("enable_thinking", None) is not None:
-                logger.warning(
-                    "enable_thinking preference dropped during template fallback"
-                )
+            # Keep enable_thinking — it's independent of the tools kwarg failure
             messages = _inject_tools_into_system(messages, tools)
             try:
                 return tokenizer.apply_chat_template(messages, **kwargs)

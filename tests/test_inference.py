@@ -220,6 +220,35 @@ class TestApplyChatTemplateText:
         assert result == "fallback prompt"
         assert call_count[0] == 2
 
+    def test_fallback_preserves_enable_thinking(self):
+        """When tools kwarg fails and falls back to injection, enable_thinking is preserved."""
+        tokenizer = MagicMock()
+        call_count = [0]
+        retry_kwargs = {}
+
+        def side_effect(messages, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1 and "tools" in kwargs:
+                raise TypeError("tools not supported")
+            retry_kwargs.update(kwargs)
+            return "fallback prompt"
+
+        tokenizer.apply_chat_template = side_effect
+        messages = [{"role": "user", "content": "hi"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "f", "description": "d", "parameters": {}},
+            }
+        ]
+        caps = TemplateCaps(supports_tools=True, supports_enable_thinking=True)
+        result = _apply_chat_template_text(
+            tokenizer, messages, tools, caps, enable_thinking=False
+        )
+        assert result == "fallback prompt"
+        assert retry_kwargs.get("enable_thinking") is False
+        assert "tools" not in retry_kwargs
+
     def test_enable_thinking_true(self):
         """Explicit enable_thinking=True → passed through to template."""
         tokenizer = MagicMock()
