@@ -75,6 +75,30 @@ class TestSettings:
         with pytest.raises(ValidationError, match="single segment"):
             Settings()
 
+    def test_port_rejects_zero(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_PORT", "0")
+        with pytest.raises(ValidationError):
+            Settings()
+
+    def test_port_rejects_negative(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_PORT", "-1")
+        with pytest.raises(ValidationError):
+            Settings()
+
+    def test_port_rejects_above_65535(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_PORT", "65536")
+        with pytest.raises(ValidationError):
+            Settings()
+
+    def test_port_accepts_boundary_values(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_PORT", "1")
+        s = Settings()
+        assert s.port == 1
+
+        monkeypatch.setenv("OLMLX_PORT", "65535")
+        s = Settings()
+        assert s.port == 65535
+
     def test_anthropic_models_rejects_colon_in_key(self, monkeypatch):
         monkeypatch.setenv(
             "OLMLX_ANTHROPIC_MODELS",
