@@ -96,6 +96,7 @@ def _make_mock_stream(tokens):
     """Create a mock CancellableStream that yields the given StreamTokens."""
     mock_stream = MagicMock(spec=CancellableStream)
     mock_stream.drain_and_join = AsyncMock()
+    mock_stream._thread = None  # No thread — normal completion path
     token_iter = iter(tokens)
 
     async def anext_impl():
@@ -319,6 +320,7 @@ class TestCacheInvalidatedOnCancel:
         # Create a stream that will be interrupted
         mock_stream = MagicMock(spec=CancellableStream)
         mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None  # No thread — normal completion path
 
         call_count = 0
 

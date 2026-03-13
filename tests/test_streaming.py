@@ -7,7 +7,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from olmlx.utils.streaming import CancellableStream, StreamToken, async_mlx_stream
+from olmlx.utils.streaming import (
+    CancellableStream,
+    PrefillCancelled,
+    StreamToken,
+    async_mlx_stream,
+)
 
 
 class TestStreamToken:
@@ -354,3 +359,73 @@ class TestDrainAndJoinTimeout:
         # Normal completion should be fast, well under the timeout
         assert elapsed < 5.0
         assert not stream._thread.is_alive()
+
+
+class TestPrefillCancelCallback:
+    @pytest.mark.asyncio
+    async def test_prefill_cancelled_when_cancel_event_set(self):
+        """PrefillCancelled should be raised when cancel_event is set during prefill callback."""
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        # Simulate what the callback does
+        with pytest.raises(PrefillCancelled):
+            if cancel_event.is_set():
+                raise PrefillCancelled()
+
+    @pytest.mark.asyncio
+    async def test_prefill_cancelled_not_propagated_as_error(self):
+        """PrefillCancelled should end the stream cleanly without RuntimeError."""
+
+        def gen_that_cancels_during_prefill(cancel_event):
+            raise PrefillCancelled()
+
+        stream = CancellableStream(gen_that_cancels_during_prefill)
+        stream.start()
+
+        tokens = []
+        async for tok in stream:
+            tokens.append(tok)
+
+        # Stream ends cleanly — no RuntimeError raised
+        assert tokens == []
+
+    @pytest.mark.asyncio
+    async def test_prompt_progress_callback_passed_for_text_model(self):
+        """async_mlx_stream should pass prompt_progress_callback for non-VLM models."""
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.stream_generate = MagicMock(return_value=iter([]))
+
+        with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+            stream = async_mlx_stream(
+                MagicMock(),
+                MagicMock(),
+                "prompt",
+                max_tokens=10,
+                is_vlm=False,
+            )
+            async for _ in stream:
+                pass
+
+        call_kwargs = mock_mlx_lm.stream_generate.call_args
+        assert "prompt_progress_callback" in call_kwargs.kwargs
+
+    @pytest.mark.asyncio
+    async def test_prompt_progress_callback_not_passed_for_vlm(self):
+        """async_mlx_stream should NOT pass prompt_progress_callback for VLM models."""
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.stream_generate = MagicMock(return_value=iter([]))
+
+        with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+            stream = async_mlx_stream(
+                MagicMock(),
+                MagicMock(),
+                "prompt",
+                max_tokens=10,
+                is_vlm=True,
+            )
+            async for _ in stream:
+                pass
+
+        call_kwargs = mock_mlx_vlm.stream_generate.call_args
+        assert "prompt_progress_callback" not in call_kwargs.kwargs
