@@ -421,6 +421,54 @@ class TestAnthropicSchemas:
         assert resp.role == "assistant"
         assert resp.stop_reason == "end_turn"
 
+    def test_messages_request_temperature_valid_boundary(self):
+        req = AnthropicMessagesRequest(
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
+            temperature=1.0,
+        )
+        assert req.temperature == 1.0
+
+    def test_messages_request_temperature_rejects_above_one(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            AnthropicMessagesRequest(
+                model="test",
+                messages=[AnthropicMessage(role="user", content="hi")],
+                temperature=1.1,
+            )
+
+    def test_messages_request_temperature_rejects_negative(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            AnthropicMessagesRequest(
+                model="test",
+                messages=[AnthropicMessage(role="user", content="hi")],
+                temperature=-0.1,
+            )
+
+    def test_messages_request_top_p_rejects_above_one(self):
+        with pytest.raises(ValidationError, match="top_p"):
+            AnthropicMessagesRequest(
+                model="test",
+                messages=[AnthropicMessage(role="user", content="hi")],
+                top_p=1.1,
+            )
+
+    def test_messages_request_top_k_rejects_zero(self):
+        with pytest.raises(ValidationError, match="top_k"):
+            AnthropicMessagesRequest(
+                model="test",
+                messages=[AnthropicMessage(role="user", content="hi")],
+                top_k=0,
+            )
+
+    def test_messages_request_max_tokens_rejects_zero(self):
+        with pytest.raises(ValidationError, match="max_tokens"):
+            AnthropicMessagesRequest(
+                model="test",
+                messages=[AnthropicMessage(role="user", content="hi")],
+                max_tokens=0,
+            )
+
     def test_usage(self):
         u = AnthropicUsage()
         assert u.input_tokens == 0
