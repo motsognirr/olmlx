@@ -1,5 +1,8 @@
 """Tests for all schema models."""
 
+import pytest
+from pydantic import ValidationError
+
 from olmlx.schemas.anthropic import (
     AnthropicContentBlock,
     AnthropicMessage,
@@ -251,6 +254,90 @@ class TestOpenAISchemas:
             max_completion_tokens=1024,
         )
         assert req.max_completion_tokens == 1024
+
+    def test_chat_request_temperature_valid_boundary(self):
+        req = OpenAIChatRequest(
+            model="test",
+            messages=[OpenAIChatMessage(role="user", content="hi")],
+            temperature=2.0,
+        )
+        assert req.temperature == 2.0
+
+    def test_chat_request_temperature_rejects_negative(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                temperature=-0.1,
+            )
+
+    def test_chat_request_temperature_rejects_above_max(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                temperature=2.1,
+            )
+
+    def test_chat_request_top_p_rejects_above_one(self):
+        with pytest.raises(ValidationError, match="top_p"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                top_p=1.1,
+            )
+
+    def test_chat_request_max_tokens_rejects_zero(self):
+        with pytest.raises(ValidationError, match="max_tokens"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                max_tokens=0,
+            )
+
+    def test_chat_request_max_completion_tokens_rejects_zero(self):
+        with pytest.raises(ValidationError, match="max_completion_tokens"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                max_completion_tokens=0,
+            )
+
+    def test_chat_request_n_rejects_greater_than_one(self):
+        with pytest.raises(ValidationError, match="n"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                n=2,
+            )
+
+    def test_chat_request_presence_penalty_rejects_out_of_range(self):
+        with pytest.raises(ValidationError, match="presence_penalty"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                presence_penalty=2.1,
+            )
+
+    def test_chat_request_frequency_penalty_rejects_out_of_range(self):
+        with pytest.raises(ValidationError, match="frequency_penalty"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                frequency_penalty=-2.1,
+            )
+
+    def test_completion_request_temperature_rejects_negative(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            OpenAICompletionRequest(model="test", prompt="hi", temperature=-1)
+
+    def test_completion_request_n_rejects_greater_than_one(self):
+        with pytest.raises(ValidationError, match="n"):
+            OpenAICompletionRequest(model="test", prompt="hi", n=2)
+
+    def test_completion_request_max_tokens_rejects_zero(self):
+        with pytest.raises(ValidationError, match="max_tokens"):
+            OpenAICompletionRequest(model="test", prompt="hi", max_tokens=0)
 
 
 class TestAnthropicSchemas:
