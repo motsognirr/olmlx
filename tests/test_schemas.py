@@ -62,6 +62,50 @@ class TestCommonSchemas:
         opts = ModelOptions(custom_param=42)
         assert opts.custom_param == 42
 
+    def test_model_options_temperature_rejects_negative(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            ModelOptions(temperature=-0.1)
+
+    def test_model_options_temperature_allows_high_values(self):
+        opts = ModelOptions(temperature=100.0)
+        assert opts.temperature == 100.0
+
+    def test_model_options_top_p_rejects_above_one(self):
+        with pytest.raises(ValidationError, match="top_p"):
+            ModelOptions(top_p=1.1)
+
+    def test_model_options_top_p_rejects_negative(self):
+        with pytest.raises(ValidationError, match="top_p"):
+            ModelOptions(top_p=-0.1)
+
+    def test_model_options_top_k_rejects_zero(self):
+        with pytest.raises(ValidationError, match="top_k"):
+            ModelOptions(top_k=0)
+
+    def test_model_options_min_p_rejects_above_one(self):
+        with pytest.raises(ValidationError, match="min_p"):
+            ModelOptions(min_p=1.1)
+
+    def test_model_options_repeat_last_n_allows_negative_one(self):
+        opts = ModelOptions(repeat_last_n=-1)
+        assert opts.repeat_last_n == -1
+
+    def test_model_options_repeat_last_n_rejects_below_negative_one(self):
+        with pytest.raises(ValidationError, match="repeat_last_n"):
+            ModelOptions(repeat_last_n=-2)
+
+    def test_model_options_num_predict_allows_negative_one(self):
+        opts = ModelOptions(num_predict=-1)
+        assert opts.num_predict == -1
+
+    def test_model_options_num_predict_rejects_below_negative_one(self):
+        with pytest.raises(ValidationError, match="num_predict"):
+            ModelOptions(num_predict=-2)
+
+    def test_model_options_num_ctx_rejects_zero(self):
+        with pytest.raises(ValidationError, match="num_ctx"):
+            ModelOptions(num_ctx=0)
+
 
 class TestGenerateSchemas:
     def test_generate_request_defaults(self):
