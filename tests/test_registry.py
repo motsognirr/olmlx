@@ -89,6 +89,63 @@ class TestModelRegistry:
         registry.add_mapping("qwen3", "Qwen/Qwen3-8B-MLX")
         # Should not raise, mapping already exists
 
+    def test_validate_model_name_rejects_empty(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="empty"):
+            validate_model_name("")
+
+    def test_validate_model_name_rejects_whitespace_only(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="empty"):
+            validate_model_name("   ")
+
+    def test_validate_model_name_rejects_path_traversal(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="path traversal"):
+            validate_model_name("../etc/passwd")
+
+    def test_validate_model_name_rejects_embedded_path_traversal(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="path traversal"):
+            validate_model_name("model/../secret")
+
+    def test_validate_model_name_rejects_too_long(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="256"):
+            validate_model_name("a" * 257)
+
+    def test_validate_model_name_accepts_ollama_style(self):
+        from olmlx.engine.registry import validate_model_name
+
+        validate_model_name("qwen3:8b")  # should not raise
+
+    def test_validate_model_name_accepts_hf_style(self):
+        from olmlx.engine.registry import validate_model_name
+
+        validate_model_name("Qwen/Qwen3-8B")  # should not raise
+
+    def test_validate_model_name_accepts_256_chars(self):
+        from olmlx.engine.registry import validate_model_name
+
+        validate_model_name("a" * 256)  # should not raise
+
+    def test_resolve_rejects_empty_name(self, registry):
+        with pytest.raises(ValueError, match="empty"):
+            registry.resolve("")
+
+    def test_resolve_rejects_path_traversal(self, registry):
+        with pytest.raises(ValueError, match="path traversal"):
+            registry.resolve("../etc/passwd")
+
+    def test_add_mapping_rejects_empty_name(self, registry):
+        with pytest.raises(ValueError, match="empty"):
+            registry.add_mapping("", "org/model")
+
     def test_list_models_combines_aliases(self, registry, tmp_path):
         registry._aliases_path = tmp_path / "aliases.json"
         registry._aliases["custom:latest"] = "custom/path"

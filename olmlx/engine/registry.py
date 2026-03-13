@@ -26,6 +26,16 @@ def _atomic_write_json(data: dict, path: Path) -> None:
         raise
 
 
+def validate_model_name(name: str) -> None:
+    """Validate a model name. Raises ValueError for invalid names."""
+    if not name or not name.strip():
+        raise ValueError("Model name must not be empty")
+    if ".." in name:
+        raise ValueError(f"Model name {name!r} contains path traversal sequence '..'")
+    if len(name) > 256:
+        raise ValueError(f"Model name must be at most 256 characters, got {len(name)}")
+
+
 class ModelRegistry:
     """Resolves Ollama model names to HuggingFace paths via config file."""
 
@@ -56,6 +66,7 @@ class ModelRegistry:
         Returns the HF path or None if not found.
         Direct HF paths (containing '/') are passed through.
         """
+        validate_model_name(name)
         if "/" in name:
             return name
         normalized = self.normalize_name(name)
@@ -85,6 +96,7 @@ class ModelRegistry:
 
     def add_mapping(self, name: str, hf_path: str):
         """Add a name → HF path mapping and persist to models.json."""
+        validate_model_name(name)
         normalized = self.normalize_name(name)
         if self._mappings.get(normalized) == hf_path:
             return  # already exists
