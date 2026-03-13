@@ -435,47 +435,16 @@ class TestParseModelOutput:
         assert len(tools) == 0
         assert "<tool_call>" in visible
 
-    def test_tool_name_filtering(self):
-        text = '<tool_call>{"name": "unknown_func", "arguments": {}}</tool_call>'
-        thinking, visible, tools = parse_model_output(
-            text,
-            has_tools=True,
-            tool_names={"search", "get_weather"},
-        )
-        # Unknown tool names are filtered out; original text is restored
-        assert len(tools) == 0
-        assert "unknown_func" in visible
-
-    def test_tool_name_filtering_keeps_valid(self):
+    def test_unknown_tool_names_not_filtered(self):
+        """Unknown tool names should be returned as-is, not filtered out."""
         text = (
             '<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>'
-            '<tool_call>{"name": "unknown", "arguments": {}}</tool_call>'
+            '<tool_call>{"name": "TodoWrite", "arguments": {"todos": []}}</tool_call>'
         )
-        thinking, visible, tools = parse_model_output(
-            text,
-            has_tools=True,
-            tool_names={"search", "get_weather"},
-        )
-        assert len(tools) == 1
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 2
         assert tools[0]["name"] == "search"
-        # Dropped call's raw text is preserved in visible_text
-        assert "unknown" in visible
-
-    def test_tool_name_filtering_mistral_shared_span(self):
-        """Mistral calls share one span — block is stripped if any call is kept.
-
-        For formats where all calls share one span (Mistral/DeepSeek), the
-        entire block is removed when at least one call passes the filter.
-        The dropped call's raw text is unavoidably lost.
-        """
-        text = '[TOOL_CALLS] [{"name": "search", "arguments": {}}, {"name": "bad_tool", "arguments": {}}]'
-        _, visible, tools = parse_model_output(
-            text, has_tools=True, tool_names={"search"}
-        )
-        assert len(tools) == 1
-        assert tools[0]["name"] == "search"
-        # Shared span is stripped because at least one call was kept
-        assert visible == ""
+        assert tools[1]["name"] == "TodoWrite"
 
     def test_qwen_format_priority(self):
         """Qwen format should be tried first and win."""

@@ -263,15 +263,12 @@ def _try_bare_json(text: str) -> tuple[list[dict], str]:
 def parse_model_output(
     text: str,
     has_tools: bool,
-    tool_names: set[str] | None = None,
 ) -> tuple[str, str, list[dict]]:
     """Parse raw model output into (thinking_text, visible_text, tool_use_blocks).
 
     Args:
         text: Raw model output text.
         has_tools: Whether tools were provided in the request.
-        tool_names: Set of valid tool names. If provided, parsed tool calls
-            with unknown names are dropped and a warning is logged.
     """
     thinking = ""
 
@@ -297,41 +294,7 @@ def parse_model_output(
             if tool_uses:
                 break
 
-        # Filter out tool calls with unknown names
-        if tool_uses and tool_names:
-            kept = []
-            dropped = []
-            for tu in tool_uses:
-                if tu["name"] in tool_names:
-                    kept.append(tu)
-                else:
-                    dropped.append(tu)
-                    logger.warning(
-                        "Dropping parsed tool call '%s' — not in provided tool set: %s",
-                        tu["name"],
-                        tool_names,
-                    )
-            if dropped:
-                logger.warning(
-                    "Filtered %d of %d parsed tool call(s) with unknown names",
-                    len(dropped),
-                    len(tool_uses),
-                )
-            tool_uses = kept
-
-            # For shared-span formats (Mistral/DeepSeek), a dropped call's
-            # raw text is unavoidably lost when a sibling call is kept (the
-            # whole block is stripped).
-            kept_span_set = {tu.get("_span") for tu in kept if "_span" in tu}
-            for tu in dropped:
-                if tu.get("_span") in kept_span_set:
-                    logger.warning(
-                        "Raw text for dropped call '%s' is lost — shares a span "
-                        "with a kept call (Mistral/DeepSeek shared-block format)",
-                        tu["name"],
-                    )
-
-        # Strip matched spans from text for kept tool calls.
+        # Strip matched spans from text for tool calls.
         # For formats where multiple calls share one span (Mistral/DeepSeek),
         # the span is stripped if any call was kept — the dropped call's raw
         # text is unavoidably lost since it's embedded in the same block.

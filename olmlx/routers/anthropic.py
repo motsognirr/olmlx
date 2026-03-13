@@ -302,7 +302,7 @@ def _emit_content_block(
     return events
 
 
-async def _stream_buffered_with_tools(result, tool_names):
+async def _stream_buffered_with_tools(result):
     """Buffer full output, parse tools, yield SSE strings. Yields a final dict with metadata."""
     full_text = ""
     output_tokens = 0
@@ -328,7 +328,6 @@ async def _stream_buffered_with_tools(result, tool_names):
     thinking, visible_text, tool_uses = parse_model_output(
         full_text,
         True,
-        tool_names=tool_names,
     )
 
     if tool_uses:
@@ -624,7 +623,6 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     options = _build_options(req)
     tools = _convert_tools(req)
     has_tools = bool(tools)
-    tool_names = {t["function"]["name"] for t in tools} if tools else None
     msg_id = _make_msg_id()
     logger.debug("Converted %d messages, %d tools", len(messages), len(tools or []))
 
@@ -656,7 +654,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             path = None
             try:
                 path = (
-                    _stream_buffered_with_tools(result, tool_names)
+                    _stream_buffered_with_tools(result)
                     if has_tools
                     else _stream_thinking_state_machine(result)
                 )
@@ -777,7 +775,6 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         thinking, visible_text, tool_uses = parse_model_output(
             text,
             has_tools,
-            tool_names=tool_names,
         )
 
         content_blocks = []
