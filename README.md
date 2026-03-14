@@ -37,6 +37,7 @@ The server starts on `http://localhost:11434` — the same default port as Ollam
 ```bash
 olmlx                      # Start the server (default)
 olmlx serve                # Start the server (explicit)
+olmlx chat <model>         # Interactive terminal chat with MCP tool support
 olmlx models list          # List locally downloaded models
 olmlx models pull <name>   # Download a model
 olmlx models show <name>   # Show model details
@@ -46,6 +47,56 @@ olmlx service install      # Install as launchd service
 olmlx service status       # Check service status
 olmlx service uninstall    # Remove the service
 ```
+
+## Terminal Chat
+
+`olmlx chat` provides an interactive terminal chat that runs inference directly in-process — no server needed. It supports MCP tool servers for agent-style workflows where the model can call external tools.
+
+```bash
+# Basic chat
+olmlx chat qwen3:8b
+
+# With a system prompt
+olmlx chat qwen3:8b --system "You are a helpful coding assistant"
+
+# With MCP tools (reads ~/.olmlx/mcp.json by default)
+olmlx chat qwen3:8b --mcp-config path/to/mcp.json
+
+# Disable thinking or MCP
+olmlx chat qwen3:8b --no-thinking --no-mcp
+```
+
+### Slash commands
+
+| Command | Description |
+|---|---|
+| `/exit` | Quit the chat |
+| `/clear` | Clear conversation history |
+| `/tools` | Show available MCP tools |
+| `/system <prompt>` | Set or show the system prompt |
+| `/model <name>` | Switch to a different model |
+
+Multiline input is supported with a trailing `\`.
+
+### MCP tool servers
+
+Configure MCP servers in `~/.olmlx/mcp.json` using the same format as Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "remote": {
+      "url": "http://localhost:8080/sse"
+    }
+  }
+}
+```
+
+Entries with `command` use stdio transport; entries with `url` use SSE transport. When tools are available, the model can call them and the results are automatically fed back for the model to continue — a full agent loop.
 
 ## Auto-start on Login (macOS)
 
