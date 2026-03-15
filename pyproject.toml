@@ -28,6 +28,12 @@ build-backend = "hatchling.build"
 [tool.uv]
 package = true
 
+[tool.coverage.run]
+source = ["olmlx"]
+
+[tool.coverage.report]
+show_missing = true
+
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
