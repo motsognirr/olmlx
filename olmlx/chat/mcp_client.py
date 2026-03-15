@@ -1,5 +1,6 @@
 """MCP client manager for connecting to external tool servers."""
 
+import asyncio
 import logging
 from typing import Any
 
@@ -126,7 +127,7 @@ class MCPClientManager:
         """Return tools in OpenAI function-calling format for generate_chat()."""
         return self._tools
 
-    async def call_tool(self, name: str, arguments: dict) -> str:
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 30.0) -> str:
         """Route a tool call to the correct server and return the result text."""
         server_name = self._tool_to_server.get(name)
         if server_name is None:
@@ -139,7 +140,9 @@ class MCPClientManager:
             )
 
         session = server["session"]
-        result = await session.call_tool(name, arguments)
+        result = await asyncio.wait_for(
+            session.call_tool(name, arguments), timeout=timeout
+        )
 
         parts = []
         for content in result.content:

@@ -1,6 +1,7 @@
 """Chat session with agent loop for tool use."""
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -83,7 +84,7 @@ class ChatSession:
         }
 
         for turn in range(self.config.max_turns):
-            chunks: list[str] = []
+            accumulated = ""
             repetition_stopped = False
             async for chunk in await generate_chat(
                 self.manager,
@@ -95,7 +96,7 @@ class ChatSession:
                 keep_alive="-1",
                 max_tokens=self.config.max_tokens,
                 cache_id="chat",
-                enable_thinking=self.config.thinking or None,
+                enable_thinking=self.config.thinking,
             ):
                 if chunk.get("cache_info"):
                     continue
@@ -103,16 +104,16 @@ class ChatSession:
                     break
                 text = chunk.get("text", "")
                 if text:
-                    chunks.append(text)
+                    accumulated += text
                     yield {"type": "token", "text": text}
-                    if _detect_repetition(chunks):
+                    if _detect_repetition(accumulated):
                         logger.warning(
                             "Repetitive output detected, stopping generation"
                         )
                         repetition_stopped = True
                         break
 
-            full_text = "".join(chunks)
+            full_text = accumulated
 
             thinking, visible_text, tool_uses = parse_model_output(
                 full_text, has_tools=(mcp_tools is not None)
@@ -133,7 +134,7 @@ class ChatSession:
                         "type": "function",
                         "function": {
                             "name": tu["name"],
-                            "arguments": tu["input"],
+                            "arguments": json.dumps(tu["input"]),
                         },
                     }
                     for tu in tool_uses
@@ -212,14 +213,13 @@ class ChatSession:
 
 
 def _detect_repetition(
-    chunks: list[str], min_phrase_len: int = 20, min_repeats: int = 4
+    text: str, min_phrase_len: int = 20, min_repeats: int = 4
 ) -> bool:
     """Detect if the accumulated text contains a repeating phrase.
 
     Checks if any substring of length >= min_phrase_len repeats
     min_repeats or more times consecutively in the recent text.
     """
-    text = "".join(chunks)
     if len(text) < min_phrase_len * min_repeats:
         return False
 
