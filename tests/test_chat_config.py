@@ -53,11 +53,7 @@ class TestLoadMcpConfig:
         assert result["filesystem"]["transport"] == "stdio"
 
     def test_loads_sse_server(self, tmp_path):
-        config = {
-            "mcpServers": {
-                "remote": {"url": "http://localhost:8080/sse"}
-            }
-        }
+        config = {"mcpServers": {"remote": {"url": "http://localhost:8080/sse"}}}
         config_path = tmp_path / "mcp.json"
         config_path.write_text(json.dumps(config))
         result = load_mcp_config(config_path)

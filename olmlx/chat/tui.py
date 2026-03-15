@@ -30,7 +30,9 @@ class ChatTUI:
             lines.append("Tools: none (use --mcp-config or ~/.olmlx/mcp.json)")
         lines.append("")
         lines.append("Commands: /exit, /clear, /tools, /system <prompt>, /model <name>")
-        self.console.print(Panel("\n".join(lines), title="olmlx chat", border_style="blue"))
+        self.console.print(
+            Panel("\n".join(lines), title="olmlx chat", border_style="blue")
+        )
 
     def get_user_input(self) -> str | None:
         """Prompt for user input. Returns None on exit (Ctrl+D/Ctrl+C)."""
@@ -98,7 +100,9 @@ class ChatTUI:
 
     def display_error(self, message: str) -> None:
         """Show red error panel."""
-        self.console.print(Panel(f"[red]{message}[/red]", title="error", border_style="red"))
+        self.console.print(
+            Panel(f"[red]{message}[/red]", title="error", border_style="red")
+        )
 
     def display_tools(self, tools: list[dict]) -> None:
         """Show available tools."""
@@ -111,7 +115,9 @@ class ChatTUI:
             name = func.get("name", "?")
             desc = func.get("description", "")
             lines.append(f"[bold]{name}[/bold]: {desc}")
-        self.console.print(Panel("\n".join(lines), title="available tools", border_style="blue"))
+        self.console.print(
+            Panel("\n".join(lines), title="available tools", border_style="blue")
+        )
 
 
 class StreamContext:

@@ -14,9 +14,7 @@ class TestMCPToolConversion:
             "description": "Read a file from disk",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File path"}
-                },
+                "properties": {"path": {"type": "string", "description": "File path"}},
                 "required": ["path"],
             },
         }

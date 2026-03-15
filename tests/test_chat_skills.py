@@ -6,7 +6,9 @@ from olmlx.chat.skills import SkillManager, _parse_skill_file, load_skills_from_
 class TestParseSkillFile:
     def test_valid_file(self, tmp_path):
         p = tmp_path / "review.md"
-        p.write_text("---\nname: code-review\ndescription: Review code quality\n---\n\nCheck for bugs.")
+        p.write_text(
+            "---\nname: code-review\ndescription: Review code quality\n---\n\nCheck for bugs."
+        )
         skill = _parse_skill_file(p)
         assert skill is not None
         assert skill.name == "code-review"
@@ -91,34 +93,46 @@ class TestSkillManager:
         return mgr
 
     def test_load_and_list(self, tmp_path):
-        mgr = self._make_manager(tmp_path, {
-            "a.md": "---\nname: alpha\ndescription: Alpha skill\n---\n\nAlpha.",
-            "b.md": "---\nname: beta\ndescription: Beta skill\n---\n\nBeta.",
-        })
+        mgr = self._make_manager(
+            tmp_path,
+            {
+                "a.md": "---\nname: alpha\ndescription: Alpha skill\n---\n\nAlpha.",
+                "b.md": "---\nname: beta\ndescription: Beta skill\n---\n\nBeta.",
+            },
+        )
         skills = mgr.list_skills()
         assert len(skills) == 2
         names = {s.name for s in skills}
         assert names == {"alpha", "beta"}
 
     def test_get_by_name(self, tmp_path):
-        mgr = self._make_manager(tmp_path, {
-            "a.md": "---\nname: alpha\n---\n\nAlpha content.",
-        })
+        mgr = self._make_manager(
+            tmp_path,
+            {
+                "a.md": "---\nname: alpha\n---\n\nAlpha content.",
+            },
+        )
         skill = mgr.get_skill("alpha")
         assert skill is not None
         assert skill.content == "Alpha content."
 
     def test_get_unknown_returns_none(self, tmp_path):
-        mgr = self._make_manager(tmp_path, {
-            "a.md": "---\nname: alpha\n---\n\nAlpha.",
-        })
+        mgr = self._make_manager(
+            tmp_path,
+            {
+                "a.md": "---\nname: alpha\n---\n\nAlpha.",
+            },
+        )
         assert mgr.get_skill("nonexistent") is None
 
     def test_index_text_contains_all_names(self, tmp_path):
-        mgr = self._make_manager(tmp_path, {
-            "a.md": "---\nname: alpha\ndescription: The alpha skill\n---\n\nA.",
-            "b.md": "---\nname: beta\ndescription: The beta skill\n---\n\nB.",
-        })
+        mgr = self._make_manager(
+            tmp_path,
+            {
+                "a.md": "---\nname: alpha\ndescription: The alpha skill\n---\n\nA.",
+                "b.md": "---\nname: beta\ndescription: The beta skill\n---\n\nB.",
+            },
+        )
         index = mgr.get_skill_index_text()
         assert "alpha" in index
         assert "beta" in index
@@ -130,10 +144,13 @@ class TestSkillManager:
         assert mgr.get_skill_index_text() == ""
 
     def test_tool_definition_has_enum(self, tmp_path):
-        mgr = self._make_manager(tmp_path, {
-            "a.md": "---\nname: alpha\n---\n\nA.",
-            "b.md": "---\nname: beta\n---\n\nB.",
-        })
+        mgr = self._make_manager(
+            tmp_path,
+            {
+                "a.md": "---\nname: alpha\n---\n\nA.",
+                "b.md": "---\nname: beta\n---\n\nB.",
+            },
+        )
         tool_def = mgr.get_tool_definition()
         assert tool_def["type"] == "function"
         assert tool_def["function"]["name"] == "use_skill"
@@ -146,15 +163,21 @@ class TestSkillManager:
         assert mgr.get_tool_definition() is None
 
     def test_handle_use_skill_returns_content(self, tmp_path):
-        mgr = self._make_manager(tmp_path, {
-            "a.md": "---\nname: alpha\n---\n\nAlpha instructions here.",
-        })
+        mgr = self._make_manager(
+            tmp_path,
+            {
+                "a.md": "---\nname: alpha\n---\n\nAlpha instructions here.",
+            },
+        )
         result = mgr.handle_use_skill({"name": "alpha"})
         assert "Alpha instructions here." in result
 
     def test_handle_use_skill_not_found(self, tmp_path):
-        mgr = self._make_manager(tmp_path, {
-            "a.md": "---\nname: alpha\n---\n\nA.",
-        })
+        mgr = self._make_manager(
+            tmp_path,
+            {
+                "a.md": "---\nname: alpha\n---\n\nA.",
+            },
+        )
         result = mgr.handle_use_skill({"name": "nonexistent"})
         assert "not found" in result.lower()

@@ -338,7 +338,9 @@ def cmd_chat(args):
                         f"[dim]Loaded {len(skills.list_skills())} skill(s)[/dim]"
                     )
 
-            session = ChatSession(config=config, manager=manager, mcp=mcp, skills=skills)
+            session = ChatSession(
+                config=config, manager=manager, mcp=mcp, skills=skills
+            )
             tools = mcp.get_tools_for_chat() if mcp else []
             tui.display_welcome(model_name, tools)
 
@@ -497,11 +499,15 @@ def build_parser() -> argparse.ArgumentParser:
     chat_p.add_argument("--max-tokens", type=int, default=4096)
     chat_p.add_argument("--max-turns", type=int, default=25)
     chat_p.add_argument(
-        "--repeat-penalty", type=float, default=1.1,
+        "--repeat-penalty",
+        type=float,
+        default=1.1,
         help="Repetition penalty (1.0 = disabled, default: 1.1)",
     )
     chat_p.add_argument(
-        "--repeat-last-n", type=int, default=64,
+        "--repeat-last-n",
+        type=int,
+        default=64,
         help="Context window for repetition penalty (default: 64)",
     )
     chat_p.add_argument(
