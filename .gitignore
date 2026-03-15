@@ -10,5 +10,7 @@ models.json
 aliases.json
 *.mlx
 .coverage
+coverage.xml
+htmlcov/
 .pytest_cache/
 .claude/scheduled_tasks.lock
