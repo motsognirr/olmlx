@@ -23,6 +23,8 @@ class ChatConfig:
     )
     skills_enabled: bool = True
     skills_dir: Path = field(default_factory=lambda: Path.home() / ".olmlx" / "skills")
+    builtin_tools_enabled: bool = True
+    plans_dir: Path = field(default_factory=lambda: Path.home() / ".olmlx" / "plans")
 
 
 def load_mcp_config(path: Path) -> dict:
