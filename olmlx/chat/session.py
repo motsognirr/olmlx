@@ -84,6 +84,7 @@ class ChatSession:
 
         for turn in range(self.config.max_turns):
             chunks: list[str] = []
+            repetition_stopped = False
             async for chunk in await generate_chat(
                 self.manager,
                 self.config.model_name,
@@ -94,7 +95,7 @@ class ChatSession:
                 keep_alive="-1",
                 max_tokens=self.config.max_tokens,
                 cache_id="chat",
-                enable_thinking=self.config.thinking if self.config.thinking else None,
+                enable_thinking=self.config.thinking or None,
             ):
                 if chunk.get("cache_info"):
                     continue
@@ -105,7 +106,10 @@ class ChatSession:
                     chunks.append(text)
                     yield {"type": "token", "text": text}
                     if _detect_repetition(chunks):
-                        logger.warning("Repetitive output detected, stopping generation")
+                        logger.warning(
+                            "Repetitive output detected, stopping generation"
+                        )
+                        repetition_stopped = True
                         break
 
             full_text = "".join(chunks)
@@ -118,7 +122,10 @@ class ChatSession:
                 yield {"type": "thinking", "text": thinking}
 
             # Build assistant message
-            assistant_msg: dict[str, Any] = {"role": "assistant", "content": visible_text}
+            assistant_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": visible_text,
+            }
             if tool_uses:
                 assistant_msg["tool_calls"] = [
                     {
@@ -133,7 +140,7 @@ class ChatSession:
                 ]
             self.messages.append(assistant_msg)
 
-            if not tool_uses:
+            if not tool_uses or repetition_stopped:
                 break
 
             # Execute tool calls concurrently
@@ -145,19 +152,51 @@ class ChatSession:
                 try:
                     if tool_name == "use_skill" and self.skills:
                         result = self.skills.handle_use_skill(tool_input)
-                    else:
+                    elif self.mcp is not None:
                         result = await self.mcp.call_tool(tool_name, tool_input)
+                    else:
+                        raise ValueError(f"No handler for tool: {tool_name!r}")
                     return {
-                        "call_event": {"type": "tool_call", "name": tool_name, "arguments": tool_input, "id": tool_id},
-                        "result_event": {"type": "tool_result", "name": tool_name, "result": result, "id": tool_id},
-                        "message": {"role": "tool", "tool_call_id": tool_id, "name": tool_name, "content": result},
+                        "call_event": {
+                            "type": "tool_call",
+                            "name": tool_name,
+                            "arguments": tool_input,
+                            "id": tool_id,
+                        },
+                        "result_event": {
+                            "type": "tool_result",
+                            "name": tool_name,
+                            "result": result,
+                            "id": tool_id,
+                        },
+                        "message": {
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "name": tool_name,
+                            "content": result,
+                        },
                     }
                 except Exception as exc:
                     error_msg = f"Error calling {tool_name}: {exc}"
                     return {
-                        "call_event": {"type": "tool_call", "name": tool_name, "arguments": tool_input, "id": tool_id},
-                        "result_event": {"type": "tool_error", "name": tool_name, "error": str(exc), "id": tool_id},
-                        "message": {"role": "tool", "tool_call_id": tool_id, "name": tool_name, "content": error_msg},
+                        "call_event": {
+                            "type": "tool_call",
+                            "name": tool_name,
+                            "arguments": tool_input,
+                            "id": tool_id,
+                        },
+                        "result_event": {
+                            "type": "tool_error",
+                            "name": tool_name,
+                            "error": str(exc),
+                            "id": tool_id,
+                        },
+                        "message": {
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "name": tool_name,
+                            "content": error_msg,
+                        },
                     }
 
             results = await asyncio.gather(*(_exec_tool(tu) for tu in tool_uses))

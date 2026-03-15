@@ -22,10 +22,13 @@ class MCPClientManager:
             "function": {
                 "name": mcp_tool["name"],
                 "description": mcp_tool.get("description", ""),
-                "parameters": mcp_tool.get("inputSchema", {
-                    "type": "object",
-                    "properties": {},
-                }),
+                "parameters": mcp_tool.get(
+                    "inputSchema",
+                    {
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
             },
         }
 
@@ -38,9 +41,7 @@ class MCPClientManager:
                 elif server_cfg["transport"] == "sse":
                     await self._connect_sse(name, server_cfg)
             except Exception as exc:
-                logger.warning(
-                    "Failed to connect to MCP server %r: %s", name, exc
-                )
+                logger.warning("Failed to connect to MCP server %r: %s", name, exc)
 
     async def _connect_stdio(self, name: str, cfg: dict) -> None:
         """Connect to a stdio MCP server."""
@@ -79,30 +80,47 @@ class MCPClientManager:
             await transport_cm.__aexit__(None, None, None)
             raise
 
+        try:
+            await self._discover_tools(name, session)
+        except BaseException:
+            await session_cm.__aexit__(None, None, None)
+            await transport_cm.__aexit__(None, None, None)
+            raise
         self._servers[name] = {
             "session": session,
             "session_cm": session_cm,
             "transport_cm": transport_cm,
         }
-        await self._discover_tools(name, session)
 
     async def _discover_tools(self, server_name: str, session: Any) -> None:
         """Discover tools from an MCP session and register them."""
         result = await session.list_tools()
         for tool in result.tools:
-            converted = self._convert_tool({
-                "name": tool.name,
-                "description": tool.description or "",
-                "inputSchema": getattr(tool, "inputSchema", {
-                    "type": "object",
-                    "properties": {},
-                }),
-            })
+            converted = self._convert_tool(
+                {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "inputSchema": getattr(
+                        tool,
+                        "inputSchema",
+                        {
+                            "type": "object",
+                            "properties": {},
+                        },
+                    ),
+                }
+            )
+            if tool.name in self._tool_to_server:
+                logger.warning(
+                    "Tool %r from server %r conflicts with existing tool from %r; skipping",
+                    tool.name,
+                    server_name,
+                    self._tool_to_server[tool.name],
+                )
+                continue
             self._tools.append(converted)
             self._tool_to_server[tool.name] = server_name
-            logger.info(
-                "Discovered tool %r from server %r", tool.name, server_name
-            )
+            logger.info("Discovered tool %r from server %r", tool.name, server_name)
 
     def get_tools_for_chat(self) -> list[dict]:
         """Return tools in OpenAI function-calling format for generate_chat()."""
@@ -140,10 +158,8 @@ class MCPClientManager:
                 if cm is not None:
                     try:
                         await cm.__aexit__(None, None, None)
-                    except Exception as exc:
-                        logger.debug(
-                            "Error closing %s for %r: %s", key, name, exc
-                        )
+                    except BaseException as exc:
+                        logger.debug("Error closing %s for %r: %s", key, name, exc)
         self._servers.clear()
         self._tool_to_server.clear()
         self._tools.clear()
