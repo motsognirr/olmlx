@@ -1,5 +1,8 @@
-from pydantic import BaseModel, Field
 from typing import Any
+
+from pydantic import BaseModel, Field
+
+from olmlx.schemas.common import ModelName
 
 
 class AnthropicToolInputSchema(BaseModel):
@@ -44,7 +47,7 @@ class AnthropicThinkingParam(BaseModel):
 
 
 class AnthropicMessagesRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName
     messages: list[AnthropicMessage]
     max_tokens: int = Field(4096, ge=1)
     stream: bool = False

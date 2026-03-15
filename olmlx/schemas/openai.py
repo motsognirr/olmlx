@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field
 
+from olmlx.schemas.common import ModelName
+
 
 # --- Chat Completions ---
 
@@ -13,7 +15,7 @@ class OpenAIChatMessage(BaseModel):
 
 
 class OpenAIChatRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName
     messages: list[OpenAIChatMessage]
     temperature: float | None = Field(None, ge=0, le=2)
     top_p: float | None = Field(None, ge=0, le=1)
@@ -55,7 +57,7 @@ class OpenAIChatResponse(BaseModel):
 
 
 class OpenAICompletionRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName
     prompt: str | list[str]
     temperature: float | None = Field(None, ge=0, le=2)
     top_p: float | None = Field(None, ge=0, le=1)
@@ -102,7 +104,7 @@ class OpenAIModelList(BaseModel):
 
 
 class OpenAIEmbeddingRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName
     input: str | list[str]
     encoding_format: str = "float"
 

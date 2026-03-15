@@ -145,11 +145,9 @@ class ModelRegistry:
         """Remove a model alias or mapping."""
         validate_model_name(name)
         normalized = self.normalize_name(name)
-        removed_alias = self._aliases.pop(normalized, None)
-        if removed_alias is not None:
+        if self._aliases.pop(normalized, None) is not None:
             self._save_aliases()
-        removed_mapping = self._mappings.pop(normalized, None)
-        if removed_mapping is not None:
+        if self._mappings.pop(normalized, None) is not None:
             self._save_mappings()
 
     def _save_aliases(self):

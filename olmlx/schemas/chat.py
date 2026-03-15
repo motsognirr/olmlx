@@ -1,6 +1,6 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from olmlx.schemas.common import ModelOptions
+from olmlx.schemas.common import ModelName, ModelOptions
 
 
 class ToolCallFunction(BaseModel):
@@ -25,7 +25,7 @@ class Tool(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName
     messages: list[Message]
     tools: list[Tool] | None = None
     format: str | None = None

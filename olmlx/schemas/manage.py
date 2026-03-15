@@ -1,17 +1,19 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+from olmlx.schemas.common import ModelName
 
 
 class CopyRequest(BaseModel):
-    source: str = Field(..., min_length=1, max_length=256)
-    destination: str = Field(..., min_length=1, max_length=256)
+    source: ModelName
+    destination: ModelName
 
 
 class DeleteRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName
 
 
 class CreateRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName
     modelfile: str | None = None
     stream: bool = True
     path: str | None = None
@@ -19,13 +21,13 @@ class CreateRequest(BaseModel):
 
 
 class WarmupRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName
     keep_alive: str | None = None
 
 
 class AbortRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName
 
 
 class UnloadRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName

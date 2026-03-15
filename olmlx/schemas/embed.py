@@ -1,8 +1,10 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+from olmlx.schemas.common import ModelName
 
 
 class EmbedRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName
     input: str | list[str]
     truncate: bool = True
     options: dict | None = None
@@ -18,7 +20,7 @@ class EmbedResponse(BaseModel):
 
 
 class EmbeddingsRequest(BaseModel):
-    model: str = Field(..., min_length=1, max_length=256)
+    model: ModelName
     prompt: str
     options: dict | None = None
     keep_alive: str | None = None
