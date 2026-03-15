@@ -303,6 +303,7 @@ def cmd_chat(args):
         repeat_penalty=args.repeat_penalty,
         repeat_last_n=args.repeat_last_n,
         skills_enabled=not args.no_skills,
+        builtin_tools_enabled=not args.no_builtin_tools,
     )
     if args.mcp_config:
         chat_kwargs["mcp_config_path"] = Path(args.mcp_config)
@@ -311,6 +312,7 @@ def cmd_chat(args):
     config = ChatConfig(**chat_kwargs)
 
     async def _run_chat():
+        from olmlx.chat.builtin_tools import BuiltinToolManager
         from olmlx.chat.skills import SkillManager
 
         store = _create_store()
@@ -319,6 +321,7 @@ def cmd_chat(args):
         tui = ChatTUI()
         mcp = None
         skills = None
+        builtin = None
 
         try:
             tui.console.print(f"[dim]Loading {model_name}...[/dim]")
@@ -338,10 +341,15 @@ def cmd_chat(args):
                         f"[dim]Loaded {len(skills.list_skills())} skill(s)[/dim]"
                     )
 
+            if config.builtin_tools_enabled:
+                builtin = BuiltinToolManager(config)
+
             session = ChatSession(
-                config=config, manager=manager, mcp=mcp, skills=skills
+                config=config, manager=manager, mcp=mcp, skills=skills, builtin=builtin,
             )
             tools = mcp.get_tools_for_chat() if mcp else []
+            if builtin:
+                tools = tools + builtin.get_tool_definitions()
             tui.display_welcome(model_name, tools)
 
             while True:
@@ -533,6 +541,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat_p.add_argument(
         "--no-skills", action="store_true", default=False, help="Disable skills"
+    )
+    chat_p.add_argument(
+        "--no-builtin-tools", action="store_true", default=False, help="Disable built-in tools"
     )
     chat_p.add_argument(
         "--skills-dir", help="Skills directory (default: ~/.olmlx/skills)"
