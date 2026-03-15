@@ -1,4 +1,12 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _validate_n_is_one(v: int) -> int:
+    if v != 1:
+        raise ValueError(
+            "only n=1 is supported; this server returns a single completion"
+        )
+    return v
 
 
 # --- Chat Completions ---
@@ -17,7 +25,14 @@ class OpenAIChatRequest(BaseModel):
     messages: list[OpenAIChatMessage]
     temperature: float | None = Field(None, ge=0, le=2)
     top_p: float | None = Field(None, ge=0, le=1)
-    n: int = Field(1, ge=1, le=1, description="Only n=1 is supported.")
+    n: int = Field(
+        1,
+        json_schema_extra={
+            "minimum": 1,
+            "maximum": 1,
+            "description": "Only n=1 is supported.",
+        },
+    )
     stream: bool = False
     stop: str | list[str] | None = None
     max_tokens: int | None = Field(None, ge=1)
@@ -27,6 +42,8 @@ class OpenAIChatRequest(BaseModel):
     tools: list[dict] | None = None
     tool_choice: str | dict | None = None
     seed: int | None = None
+
+    _validate_n = field_validator("n")(_validate_n_is_one)
 
 
 class OpenAIUsage(BaseModel):
@@ -59,13 +76,22 @@ class OpenAICompletionRequest(BaseModel):
     prompt: str | list[str]
     temperature: float | None = Field(None, ge=0, le=2)
     top_p: float | None = Field(None, ge=0, le=1)
-    n: int = Field(1, ge=1, le=1, description="Only n=1 is supported.")
+    n: int = Field(
+        1,
+        json_schema_extra={
+            "minimum": 1,
+            "maximum": 1,
+            "description": "Only n=1 is supported.",
+        },
+    )
     stream: bool = False
     stop: str | list[str] | None = None
     max_tokens: int | None = Field(None, ge=1)
     presence_penalty: float = Field(0.0, ge=-2, le=2)
     frequency_penalty: float = Field(0.0, ge=-2, le=2)
     seed: int | None = None
+
+    _validate_n = field_validator("n")(_validate_n_is_one)
 
 
 class OpenAICompletionChoice(BaseModel):

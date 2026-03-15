@@ -98,10 +98,10 @@ class ModelRegistry:
         Returns the HF path or None if not found.
         Direct HF paths (containing '/') are passed through.
         """
-        validate_model_name(name)
         if "/" in name:
             validate_hf_path(name)
             return name
+        validate_model_name(name)
         normalized = self.normalize_name(name)
         # Check aliases first, then mappings
         if normalized in self._aliases:
