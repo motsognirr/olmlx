@@ -59,6 +59,33 @@ class TestChatTUI:
         assert "No tools" in output
 
 
+class TestThinkingDisplay:
+    def test_stream_context_thinking_mode(self, capsys):
+        """StreamContext should support thinking mode that writes ANSI italic."""
+        console = Console(file=StringIO(), force_terminal=True)
+        ctx = StreamContext(console)
+        with ctx:
+            ctx.start_thinking()
+            ctx.update("thinking text")
+            ctx.end_thinking()
+            ctx.update("normal text")
+        text = ctx.get_text()
+        assert "normal text" in text
+        # Thinking text should not be in get_text() (it's separate)
+
+    def test_stream_context_get_thinking_text(self):
+        """StreamContext should track thinking text separately."""
+        console = Console(file=StringIO(), force_terminal=True)
+        ctx = StreamContext(console)
+        with ctx:
+            ctx.start_thinking()
+            ctx.update("deep thought")
+            ctx.end_thinking()
+            ctx.update("response")
+        assert ctx.get_text() == "response"
+        assert ctx.get_thinking_text() == "deep thought"
+
+
 class TestStreamContext:
     def test_accumulates_text(self):
         console = Console(file=StringIO(), force_terminal=True)

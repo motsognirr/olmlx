@@ -384,7 +384,23 @@ def cmd_chat(args):
                             current = config.system_prompt or "(none)"
                             tui.console.print(f"[dim]System prompt: {current}[/dim]")
                     elif command == "/model":
-                        if arg:
+                        model_parts = arg.split(None, 1)
+                        if model_parts and model_parts[0] == "thinking":
+                            # /model thinking [on|off]
+                            if len(model_parts) == 2 and model_parts[1] in (
+                                "on",
+                                "off",
+                            ):
+                                config.thinking = model_parts[1] == "on"
+                                tui.console.print(
+                                    f"[dim]Thinking: {'on' if config.thinking else 'off'}[/dim]"
+                                )
+                            else:
+                                thinking_str = "on" if config.thinking else "off"
+                                tui.console.print(
+                                    f"[dim]Thinking: {thinking_str}. Use: /model thinking on|off[/dim]"
+                                )
+                        elif arg:
                             tui.console.print(f"[dim]Loading {arg}...[/dim]")
                             try:
                                 await manager.ensure_loaded(arg, keep_alive="-1")
@@ -396,8 +412,9 @@ def cmd_chat(args):
                             except Exception as exc:
                                 tui.display_error(str(exc))
                         else:
+                            thinking_str = "on" if config.thinking else "off"
                             tui.console.print(
-                                f"[dim]Current model: {config.model_name}[/dim]"
+                                f"[dim]Current model: {config.model_name} | thinking: {thinking_str}[/dim]"
                             )
                     else:
                         tui.display_error(f"Unknown command: {command}")
@@ -408,16 +425,20 @@ def cmd_chat(args):
                 stream_ctx = tui.stream_response()
                 with stream_ctx:
                     async for event in session.send_message(user_input):
-                        if event["type"] == "token":
+                        if event["type"] == "thinking_start":
+                            stream_ctx.start_thinking()
+                        elif event["type"] == "thinking_end":
+                            stream_ctx.end_thinking()
+                        elif event["type"] == "thinking_token":
+                            stream_ctx.update(event["text"])
+                        elif event["type"] == "token":
                             stream_ctx.update(event["text"])
                         else:
                             pending_events.append(event)
 
                 # Display collected events
                 for event in pending_events:
-                    if event["type"] == "thinking":
-                        tui.display_thinking(event["text"])
-                    elif event["type"] == "tool_call":
+                    if event["type"] == "tool_call":
                         tui.display_tool_call(event["name"], event["arguments"])
                     elif event["type"] == "tool_result":
                         tui.display_tool_result(event["name"], event["result"])

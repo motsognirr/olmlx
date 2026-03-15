@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from olmlx.chat.config import ChatConfig
 from olmlx.chat.session import ChatSession
 from olmlx.chat.skills import SkillManager
+from olmlx.engine.template_caps import TemplateCaps
 
 
 def _make_session(
@@ -16,6 +17,7 @@ def _make_session(
     thinking=True,
     max_turns=25,
     system_prompt=None,
+    template_has_thinking=False,
 ):
     config = ChatConfig(
         model_name=model_name,
@@ -24,7 +26,157 @@ def _make_session(
         system_prompt=system_prompt,
     )
     manager = MagicMock()
+    # Set up ensure_loaded to return a mock LoadedModel with template_caps
+    loaded_model = MagicMock()
+    loaded_model.template_caps = TemplateCaps(
+        supports_enable_thinking=template_has_thinking,
+        has_thinking_tags=template_has_thinking,
+    )
+    manager.ensure_loaded = AsyncMock(return_value=loaded_model)
     return ChatSession(config=config, manager=manager, mcp=mcp, skills=skills)
+
+
+class TestExtractThinkingContent:
+    """Tests for _extract_thinking_content helper."""
+
+    def test_closed_think_block(self):
+        from olmlx.chat.session import _extract_thinking_content
+
+        assert _extract_thinking_content("<think>hello</think>world") == "hello"
+
+    def test_unclosed_think_block(self):
+        from olmlx.chat.session import _extract_thinking_content
+
+        assert _extract_thinking_content("<think>partial") == "partial"
+
+    def test_no_think_block(self):
+        from olmlx.chat.session import _extract_thinking_content
+
+        assert _extract_thinking_content("just text") == ""
+
+    def test_empty_think_block(self):
+        from olmlx.chat.session import _extract_thinking_content
+
+        assert _extract_thinking_content("<think></think>rest") == ""
+
+    def test_multiple_think_blocks(self):
+        from olmlx.chat.session import _extract_thinking_content
+
+        text = "<think>first</think>middle<think>second</think>end"
+        assert _extract_thinking_content(text) == "firstsecond"
+
+    def test_implicit_thinking_with_close_tag_only(self):
+        """Handle template-injected <think> — output has </think> but no <think>."""
+        from olmlx.chat.session import _extract_thinking_content
+
+        text = "Thinking content here</think>The answer"
+        assert _extract_thinking_content(text) == "Thinking content here"
+
+    def test_implicit_thinking_strip(self):
+        """_strip_thinking should handle </think> without <think>."""
+        from olmlx.chat.session import _strip_thinking
+
+        text = "Thinking content here</think>The answer"
+        assert _strip_thinking(text) == "The answer"
+
+
+class TestImplicitThinkingStreaming:
+    """Test streaming when model template injects <think> (no <think> in output)."""
+
+    @pytest.mark.asyncio
+    async def test_implicit_thinking_streamed_correctly(self):
+        """When model output has no <think> but has </think>, thinking should be detected."""
+        session = _make_session(thinking=True, template_has_thinking=True)
+
+        async def fake_stream(*args, **kwargs):
+            # Model output without <think> prefix (template-injected)
+            yield {"text": "Let me think about this", "done": False}
+            yield {"text": "</think>", "done": False}
+            yield {"text": "The answer is 42", "done": False}
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch("olmlx.chat.session.generate_chat", return_value=fake_stream()):
+            events = []
+            async for event in session.send_message("Q"):
+                events.append(event)
+
+        # Should have thinking events
+        types = [e["type"] for e in events]
+        assert "thinking_start" in types
+        assert "thinking_token" in types
+        assert "thinking_end" in types
+
+        think_text = "".join(e["text"] for e in events if e["type"] == "thinking_token")
+        assert "Let me think about this" in think_text
+
+        token_text = "".join(e["text"] for e in events if e["type"] == "token")
+        assert "The answer is 42" in token_text
+        assert "</think>" not in token_text
+
+    @pytest.mark.asyncio
+    async def test_implicit_thinking_no_close_tag_yet(self):
+        """During streaming, before </think> arrives, content should be treated as thinking."""
+        session = _make_session(thinking=True, template_has_thinking=True)
+
+        async def fake_stream(*args, **kwargs):
+            yield {"text": "Still thinking...", "done": False}
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch("olmlx.chat.session.generate_chat", return_value=fake_stream()):
+            events = []
+            async for event in session.send_message("Q"):
+                events.append(event)
+
+        # With thinking enabled and no tags, assume it's thinking
+        think_text = "".join(e["text"] for e in events if e["type"] == "thinking_token")
+        assert "Still thinking..." in think_text
+
+    @pytest.mark.asyncio
+    async def test_thinking_disabled_strips_implicit_thinking(self):
+        """When thinking=False, implicit thinking should be stripped from output."""
+        session = _make_session(thinking=False, template_has_thinking=True)
+
+        async def fake_stream(*args, **kwargs):
+            yield {"text": "I am thinking</think>The answer", "done": False}
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch("olmlx.chat.session.generate_chat", return_value=fake_stream()):
+            events = []
+            async for event in session.send_message("Q"):
+                events.append(event)
+
+        # No thinking events
+        types = [e["type"] for e in events]
+        assert "thinking_start" not in types
+        assert "thinking_token" not in types
+
+        # Only the response should be shown
+        token_text = "".join(e["text"] for e in events if e["type"] == "token")
+        assert "The answer" in token_text
+        assert "</think>" not in token_text
+
+    @pytest.mark.asyncio
+    async def test_no_thinking_output_not_duplicated(self):
+        """If model skips thinking (no tags), content shown once, not duplicated."""
+        session = _make_session(thinking=True, template_has_thinking=True)
+
+        async def fake_stream(*args, **kwargs):
+            yield {"text": "Plain answer with no thinking", "done": False}
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch("olmlx.chat.session.generate_chat", return_value=fake_stream()):
+            events = []
+            async for event in session.send_message("Q"):
+                events.append(event)
+
+        # Content was streamed as thinking (implicit assumption).
+        # It must NOT also appear as a token event (would duplicate on screen).
+        think_text = "".join(e["text"] for e in events if e["type"] == "thinking_token")
+        token_text = "".join(e["text"] for e in events if e["type"] == "token")
+        assert "Plain answer with no thinking" in think_text
+        assert token_text == ""
+        # thinking_end must be emitted to close italic display
+        assert "thinking_end" in [e["type"] for e in events]
 
 
 class TestChatSessionInit:
@@ -71,7 +223,7 @@ class TestAgentLoop:
 
     @pytest.mark.asyncio
     async def test_thinking_extracted(self):
-        """Model output with <think> tags should emit thinking event."""
+        """Model output with <think> tags should emit streaming thinking events."""
         session = _make_session()
 
         async def fake_stream(*args, **kwargs):
@@ -83,9 +235,9 @@ class TestAgentLoop:
             async for event in session.send_message("What is the answer?"):
                 events.append(event)
 
-        thinking_events = [e for e in events if e["type"] == "thinking"]
-        assert len(thinking_events) == 1
-        assert "Let me think" in thinking_events[0]["text"]
+        # Should have thinking_token events with the thinking content
+        think_text = "".join(e["text"] for e in events if e["type"] == "thinking_token")
+        assert "Let me think" in think_text
 
         # Token events should NOT contain raw <think> tags
         token_events = [e for e in events if e["type"] == "token"]
@@ -99,7 +251,7 @@ class TestAgentLoop:
 
     @pytest.mark.asyncio
     async def test_thinking_streamed_incrementally(self):
-        """Thinking tokens streamed across multiple chunks should be suppressed."""
+        """Thinking tokens streamed across multiple chunks should appear as thinking_token events."""
         session = _make_session()
 
         async def fake_stream(*args, **kwargs):
@@ -115,8 +267,12 @@ class TestAgentLoop:
             async for event in session.send_message("Q"):
                 events.append(event)
 
-        token_events = [e for e in events if e["type"] == "token"]
-        token_text = "".join(e["text"] for e in token_events)
+        # Thinking content should be in thinking_token events
+        think_text = "".join(e["text"] for e in events if e["type"] == "thinking_token")
+        assert "Let me think" in think_text
+
+        # Regular tokens should have the response
+        token_text = "".join(e["text"] for e in events if e["type"] == "token")
         assert "<think>" not in token_text
         assert "The answer" in token_text
 
@@ -338,6 +494,109 @@ class TestClearHistory:
         session = _make_session(model_name="qwen3:8b")
         session.clear_history()
         session.manager.invalidate_prompt_cache.assert_called_with("qwen3:8b", "chat")
+
+
+class TestStreamingThinking:
+    """Thinking tokens should be streamed as thinking_token events, not suppressed."""
+
+    @pytest.mark.asyncio
+    async def test_thinking_streamed_as_thinking_tokens(self):
+        """Think block content should yield thinking_start/thinking_token/thinking_end events."""
+        session = _make_session()
+
+        async def fake_stream(*args, **kwargs):
+            yield {"text": "<think>", "done": False}
+            yield {"text": "Let me ", "done": False}
+            yield {"text": "think", "done": False}
+            yield {"text": "</think>", "done": False}
+            yield {"text": "The answer", "done": False}
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch("olmlx.chat.session.generate_chat", return_value=fake_stream()):
+            events = []
+            async for event in session.send_message("Q"):
+                events.append(event)
+
+        # Should have thinking_start, thinking_token(s), thinking_end
+        types = [e["type"] for e in events]
+        assert "thinking_start" in types
+        assert "thinking_token" in types
+        assert "thinking_end" in types
+
+        # thinking_token content should contain the thinking text
+        think_text = "".join(e["text"] for e in events if e["type"] == "thinking_token")
+        assert "Let me think" in think_text
+
+        # Regular tokens should contain the response
+        token_text = "".join(e["text"] for e in events if e["type"] == "token")
+        assert "The answer" in token_text
+
+        # No old-style "thinking" event
+        assert "thinking" not in types
+
+    @pytest.mark.asyncio
+    async def test_no_thinking_events_without_think_tags(self):
+        """Without <think> tags, no thinking events should be emitted."""
+        session = _make_session()
+
+        async def fake_stream(*args, **kwargs):
+            yield {"text": "Just a response", "done": False}
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch("olmlx.chat.session.generate_chat", return_value=fake_stream()):
+            events = []
+            async for event in session.send_message("Q"):
+                events.append(event)
+
+        types = [e["type"] for e in events]
+        assert "thinking_start" not in types
+        assert "thinking_token" not in types
+        assert "thinking_end" not in types
+
+    @pytest.mark.asyncio
+    async def test_unclosed_think_block_still_emits(self):
+        """If generation ends mid-<think> (e.g. max_tokens), thinking content is still shown."""
+        session = _make_session()
+
+        async def fake_stream(*args, **kwargs):
+            yield {"text": "<think>Partial thinking content", "done": False}
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch("olmlx.chat.session.generate_chat", return_value=fake_stream()):
+            events = []
+            async for event in session.send_message("Q"):
+                events.append(event)
+
+        # Should still emit thinking events for the unclosed block
+        think_text = "".join(e["text"] for e in events if e["type"] == "thinking_token")
+        assert "Partial thinking content" in think_text
+
+        # Should have thinking_end to close the italic display
+        types = [e["type"] for e in events]
+        assert "thinking_end" in types
+
+    @pytest.mark.asyncio
+    async def test_all_in_one_chunk_thinking(self):
+        """Thinking and response in a single chunk."""
+        session = _make_session()
+
+        async def fake_stream(*args, **kwargs):
+            yield {
+                "text": "<think>Let me think</think>The answer is 42",
+                "done": False,
+            }
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch("olmlx.chat.session.generate_chat", return_value=fake_stream()):
+            events = []
+            async for event in session.send_message("Q"):
+                events.append(event)
+
+        think_text = "".join(e["text"] for e in events if e["type"] == "thinking_token")
+        assert "Let me think" in think_text
+
+        token_text = "".join(e["text"] for e in events if e["type"] == "token")
+        assert "The answer is 42" in token_text
 
 
 class TestRepetitionOptions:
