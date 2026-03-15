@@ -1,8 +1,8 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class EmbedRequest(BaseModel):
-    model: str
+    model: str = Field(..., min_length=1, max_length=256)
     input: str | list[str]
     truncate: bool = True
     options: dict | None = None
@@ -18,7 +18,7 @@ class EmbedResponse(BaseModel):
 
 
 class EmbeddingsRequest(BaseModel):
-    model: str
+    model: str = Field(..., min_length=1, max_length=256)
     prompt: str
     options: dict | None = None
     keep_alive: str | None = None

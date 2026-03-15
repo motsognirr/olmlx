@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ModelOptions(BaseModel):
@@ -7,14 +7,14 @@ class ModelOptions(BaseModel):
 
     num_keep: int | None = None
     seed: int | None = None
-    num_predict: int | None = None
-    top_k: int | None = None
-    top_p: float | None = None
-    min_p: float | None = None
+    num_predict: int | None = Field(None, ge=-2)  # -1=infinite, -2=fill context
+    top_k: int | None = Field(None, ge=0)
+    top_p: float | None = Field(None, ge=0, le=1)
+    min_p: float | None = Field(None, ge=0, le=1)
     tfs_z: float | None = None
     typical_p: float | None = None
-    repeat_last_n: int | None = None
-    temperature: float | None = None
+    repeat_last_n: int | None = Field(None, ge=-1)
+    temperature: float | None = Field(None, ge=0)  # no upper bound (Ollama compat)
     repeat_penalty: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
@@ -24,7 +24,7 @@ class ModelOptions(BaseModel):
     penalize_newline: bool | None = None
     stop: list[str] | None = None
     numa: bool | None = None
-    num_ctx: int | None = None
+    num_ctx: int | None = Field(None, ge=1)
     num_batch: int | None = None
     num_gpu: int | None = None
     main_gpu: int | None = None

@@ -1,5 +1,8 @@
 """Tests for all schema models."""
 
+import pytest
+from pydantic import ValidationError
+
 from olmlx.schemas.anthropic import (
     AnthropicContentBlock,
     AnthropicMessage,
@@ -58,6 +61,58 @@ class TestCommonSchemas:
     def test_model_options_extra_allowed(self):
         opts = ModelOptions(custom_param=42)
         assert opts.custom_param == 42
+
+    def test_model_options_temperature_rejects_negative(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            ModelOptions(temperature=-0.1)
+
+    def test_model_options_temperature_allows_high_values(self):
+        opts = ModelOptions(temperature=100.0)
+        assert opts.temperature == 100.0
+
+    def test_model_options_top_p_rejects_above_one(self):
+        with pytest.raises(ValidationError, match="top_p"):
+            ModelOptions(top_p=1.1)
+
+    def test_model_options_top_p_rejects_negative(self):
+        with pytest.raises(ValidationError, match="top_p"):
+            ModelOptions(top_p=-0.1)
+
+    def test_model_options_top_k_allows_zero(self):
+        opts = ModelOptions(top_k=0)
+        assert opts.top_k == 0
+
+    def test_model_options_top_k_rejects_negative(self):
+        with pytest.raises(ValidationError, match="top_k"):
+            ModelOptions(top_k=-1)
+
+    def test_model_options_min_p_rejects_above_one(self):
+        with pytest.raises(ValidationError, match="min_p"):
+            ModelOptions(min_p=1.1)
+
+    def test_model_options_repeat_last_n_allows_negative_one(self):
+        opts = ModelOptions(repeat_last_n=-1)
+        assert opts.repeat_last_n == -1
+
+    def test_model_options_repeat_last_n_rejects_below_negative_one(self):
+        with pytest.raises(ValidationError, match="repeat_last_n"):
+            ModelOptions(repeat_last_n=-2)
+
+    def test_model_options_num_predict_allows_negative_one(self):
+        opts = ModelOptions(num_predict=-1)
+        assert opts.num_predict == -1
+
+    def test_model_options_num_predict_allows_negative_two(self):
+        opts = ModelOptions(num_predict=-2)
+        assert opts.num_predict == -2
+
+    def test_model_options_num_predict_rejects_below_negative_two(self):
+        with pytest.raises(ValidationError, match="num_predict"):
+            ModelOptions(num_predict=-3)
+
+    def test_model_options_num_ctx_rejects_zero(self):
+        with pytest.raises(ValidationError, match="num_ctx"):
+            ModelOptions(num_ctx=0)
 
 
 class TestGenerateSchemas:
@@ -252,6 +307,90 @@ class TestOpenAISchemas:
         )
         assert req.max_completion_tokens == 1024
 
+    def test_chat_request_temperature_valid_boundary(self):
+        req = OpenAIChatRequest(
+            model="test",
+            messages=[OpenAIChatMessage(role="user", content="hi")],
+            temperature=2.0,
+        )
+        assert req.temperature == 2.0
+
+    def test_chat_request_temperature_rejects_negative(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                temperature=-0.1,
+            )
+
+    def test_chat_request_temperature_rejects_above_max(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                temperature=2.1,
+            )
+
+    def test_chat_request_top_p_rejects_above_one(self):
+        with pytest.raises(ValidationError, match="top_p"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                top_p=1.1,
+            )
+
+    def test_chat_request_max_tokens_rejects_zero(self):
+        with pytest.raises(ValidationError, match="max_tokens"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                max_tokens=0,
+            )
+
+    def test_chat_request_max_completion_tokens_rejects_zero(self):
+        with pytest.raises(ValidationError, match="max_completion_tokens"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                max_completion_tokens=0,
+            )
+
+    def test_chat_request_n_rejects_greater_than_one(self):
+        with pytest.raises(ValidationError, match="less than or equal to 1"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                n=2,
+            )
+
+    def test_chat_request_presence_penalty_rejects_out_of_range(self):
+        with pytest.raises(ValidationError, match="presence_penalty"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                presence_penalty=2.1,
+            )
+
+    def test_chat_request_frequency_penalty_rejects_out_of_range(self):
+        with pytest.raises(ValidationError, match="frequency_penalty"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                frequency_penalty=-2.1,
+            )
+
+    def test_completion_request_temperature_rejects_negative(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            OpenAICompletionRequest(model="test", prompt="hi", temperature=-1)
+
+    def test_completion_request_n_rejects_greater_than_one(self):
+        with pytest.raises(ValidationError, match="less than or equal to 1"):
+            OpenAICompletionRequest(model="test", prompt="hi", n=2)
+
+    def test_completion_request_max_tokens_rejects_zero(self):
+        with pytest.raises(ValidationError, match="max_tokens"):
+            OpenAICompletionRequest(model="test", prompt="hi", max_tokens=0)
+
 
 class TestAnthropicSchemas:
     def test_tool_input_schema(self):
@@ -333,6 +472,54 @@ class TestAnthropicSchemas:
         assert resp.type == "message"
         assert resp.role == "assistant"
         assert resp.stop_reason == "end_turn"
+
+    def test_messages_request_temperature_valid_boundary(self):
+        req = AnthropicMessagesRequest(
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
+            temperature=1.0,
+        )
+        assert req.temperature == 1.0
+
+    def test_messages_request_temperature_rejects_above_one(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            AnthropicMessagesRequest(
+                model="test",
+                messages=[AnthropicMessage(role="user", content="hi")],
+                temperature=1.1,
+            )
+
+    def test_messages_request_temperature_rejects_negative(self):
+        with pytest.raises(ValidationError, match="temperature"):
+            AnthropicMessagesRequest(
+                model="test",
+                messages=[AnthropicMessage(role="user", content="hi")],
+                temperature=-0.1,
+            )
+
+    def test_messages_request_top_p_rejects_above_one(self):
+        with pytest.raises(ValidationError, match="top_p"):
+            AnthropicMessagesRequest(
+                model="test",
+                messages=[AnthropicMessage(role="user", content="hi")],
+                top_p=1.1,
+            )
+
+    def test_messages_request_top_k_rejects_zero(self):
+        with pytest.raises(ValidationError, match="top_k"):
+            AnthropicMessagesRequest(
+                model="test",
+                messages=[AnthropicMessage(role="user", content="hi")],
+                top_k=0,
+            )
+
+    def test_messages_request_max_tokens_rejects_zero(self):
+        with pytest.raises(ValidationError, match="max_tokens"):
+            AnthropicMessagesRequest(
+                model="test",
+                messages=[AnthropicMessage(role="user", content="hi")],
+                max_tokens=0,
+            )
 
     def test_usage(self):
         u = AnthropicUsage()

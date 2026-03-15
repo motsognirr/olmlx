@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     model_config = {"env_prefix": "OLMLX_", "env_file": ".env"}
 
     host: str = "0.0.0.0"
-    port: int = 11434
+    port: Annotated[int, Field(ge=1, le=65535)] = 11434
     models_dir: Path = Path.home() / ".olmlx" / "models"
     models_config: Path = Path.home() / ".olmlx" / "models.json"
     default_keep_alive: str = "5m"

@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # --- Chat Completions ---
@@ -13,17 +13,17 @@ class OpenAIChatMessage(BaseModel):
 
 
 class OpenAIChatRequest(BaseModel):
-    model: str
+    model: str = Field(..., min_length=1, max_length=256)
     messages: list[OpenAIChatMessage]
-    temperature: float | None = None
-    top_p: float | None = None
-    n: int = 1
+    temperature: float | None = Field(None, ge=0, le=2)
+    top_p: float | None = Field(None, ge=0, le=1)
+    n: int = Field(1, ge=1, le=1, description="Only n=1 is supported.")
     stream: bool = False
     stop: str | list[str] | None = None
-    max_tokens: int | None = None
-    max_completion_tokens: int | None = None
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
+    max_tokens: int | None = Field(None, ge=1)
+    max_completion_tokens: int | None = Field(None, ge=1)
+    presence_penalty: float = Field(0.0, ge=-2, le=2)
+    frequency_penalty: float = Field(0.0, ge=-2, le=2)
     tools: list[dict] | None = None
     tool_choice: str | dict | None = None
     seed: int | None = None
@@ -55,16 +55,16 @@ class OpenAIChatResponse(BaseModel):
 
 
 class OpenAICompletionRequest(BaseModel):
-    model: str
+    model: str = Field(..., min_length=1, max_length=256)
     prompt: str | list[str]
-    temperature: float | None = None
-    top_p: float | None = None
-    n: int = 1
+    temperature: float | None = Field(None, ge=0, le=2)
+    top_p: float | None = Field(None, ge=0, le=1)
+    n: int = Field(1, ge=1, le=1, description="Only n=1 is supported.")
     stream: bool = False
     stop: str | list[str] | None = None
-    max_tokens: int | None = None
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
+    max_tokens: int | None = Field(None, ge=1)
+    presence_penalty: float = Field(0.0, ge=-2, le=2)
+    frequency_penalty: float = Field(0.0, ge=-2, le=2)
     seed: int | None = None
 
 
@@ -102,7 +102,7 @@ class OpenAIModelList(BaseModel):
 
 
 class OpenAIEmbeddingRequest(BaseModel):
-    model: str
+    model: str = Field(..., min_length=1, max_length=256)
     input: str | list[str]
     encoding_format: str = "float"
 

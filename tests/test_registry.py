@@ -89,6 +89,128 @@ class TestModelRegistry:
         registry.add_mapping("qwen3", "Qwen/Qwen3-8B-MLX")
         # Should not raise, mapping already exists
 
+    def test_validate_model_name_rejects_empty(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="empty"):
+            validate_model_name("")
+
+    def test_validate_model_name_rejects_whitespace_only(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="empty"):
+            validate_model_name("   ")
+
+    def test_validate_model_name_rejects_path_traversal(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="path traversal"):
+            validate_model_name("../etc/passwd")
+
+    def test_validate_model_name_rejects_embedded_path_traversal(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="path traversal"):
+            validate_model_name("model/../secret")
+
+    def test_validate_model_name_rejects_too_long(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="256"):
+            validate_model_name("a" * 257)
+
+    def test_validate_model_name_accepts_ollama_style(self):
+        from olmlx.engine.registry import validate_model_name
+
+        validate_model_name("qwen3:8b")  # should not raise
+
+    def test_validate_model_name_accepts_hf_style(self):
+        from olmlx.engine.registry import validate_model_name
+
+        validate_model_name("Qwen/Qwen3-8B")  # should not raise
+
+    def test_validate_model_name_accepts_256_chars(self):
+        from olmlx.engine.registry import validate_model_name
+
+        validate_model_name("a" * 256)  # should not raise
+
+    def test_resolve_rejects_empty_name(self, registry):
+        with pytest.raises(ValueError, match="empty"):
+            registry.resolve("")
+
+    def test_resolve_rejects_path_traversal(self, registry):
+        with pytest.raises(ValueError, match="path traversal"):
+            registry.resolve("../etc/passwd")
+
+    def test_add_mapping_rejects_empty_name(self, registry):
+        with pytest.raises(ValueError, match="empty"):
+            registry.add_mapping("", "org/model")
+
+    def test_validate_model_name_rejects_absolute_path(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="path traversal"):
+            validate_model_name("/etc/passwd")
+
+    def test_resolve_rejects_absolute_path(self, registry):
+        with pytest.raises(ValueError, match="path traversal"):
+            registry.resolve("/etc/passwd")
+
+    def test_add_alias_rejects_empty_alias(self, registry):
+        with pytest.raises(ValueError, match="empty"):
+            registry.add_alias("", "qwen3:latest")
+
+    def test_add_mapping_rejects_empty_hf_path(self, registry):
+        with pytest.raises(ValueError, match="HuggingFace path must not be empty"):
+            registry.add_mapping("my-model", "")
+
+    def test_add_mapping_rejects_long_hf_path(self, registry):
+        with pytest.raises(ValueError, match="512"):
+            registry.add_mapping("my-model", "org/" + "a" * 510)
+
+    def test_add_mapping_rejects_hf_path_no_slash(self, registry):
+        with pytest.raises(ValueError, match="owner/repo"):
+            registry.add_mapping("my-model", "localmodel")
+
+    def test_remove_rejects_empty_name(self, registry):
+        with pytest.raises(ValueError, match="empty"):
+            registry.remove("")
+
+    def test_add_mapping_rejects_hf_path_extra_slashes(self, registry):
+        with pytest.raises(ValueError, match="owner/repo"):
+            registry.add_mapping("my-model", "org/model/extra")
+
+    def test_resolve_rejects_hf_path_extra_slashes(self, registry):
+        with pytest.raises(ValueError, match="owner/repo"):
+            registry.resolve("org/model/extra")
+
+    def test_add_mapping_rejects_hf_path_traversal(self, registry):
+        with pytest.raises(ValueError, match="HuggingFace path.*path traversal"):
+            registry.add_mapping("my-model", "../evil/path")
+
+    def test_validate_model_name_rejects_null_bytes(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="null bytes"):
+            validate_model_name("legit\x00evil")
+
+    def test_validate_hf_path_rejects_null_bytes(self):
+        from olmlx.engine.registry import validate_hf_path
+
+        with pytest.raises(ValueError, match="null bytes"):
+            validate_hf_path("org/model\x00evil")
+
+    def test_validate_model_name_rejects_bare_dotdot(self):
+        from olmlx.engine.registry import validate_model_name
+
+        with pytest.raises(ValueError, match="path traversal"):
+            validate_model_name("..")
+
+    def test_validate_model_name_allows_double_dots_in_name(self):
+        from olmlx.engine.registry import validate_model_name
+
+        validate_model_name("gpt2..medium")  # should not raise
+
     def test_list_models_combines_aliases(self, registry, tmp_path):
         registry._aliases_path = tmp_path / "aliases.json"
         registry._aliases["custom:latest"] = "custom/path"

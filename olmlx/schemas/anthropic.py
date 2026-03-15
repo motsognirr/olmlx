@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any
 
 
@@ -44,13 +44,13 @@ class AnthropicThinkingParam(BaseModel):
 
 
 class AnthropicMessagesRequest(BaseModel):
-    model: str
+    model: str = Field(..., min_length=1, max_length=256)
     messages: list[AnthropicMessage]
-    max_tokens: int = 4096
+    max_tokens: int = Field(4096, ge=1)
     stream: bool = False
-    temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
+    temperature: float | None = Field(None, ge=0, le=1)
+    top_p: float | None = Field(None, ge=0, le=1)
+    top_k: int | None = Field(None, ge=1)  # Anthropic spec: top_k >= 1
     stop_sequences: list[str] | None = None
     system: str | list[AnthropicContentBlock] | None = None
     tools: list[AnthropicTool] | None = None
