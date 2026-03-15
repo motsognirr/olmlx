@@ -8,8 +8,14 @@ Ollama-compatible API server using Apple MLX for local inference on Apple Silico
 olmlx/
 ├── app.py              # FastAPI app factory, middleware, router registration
 ├── config.py           # Settings (pydantic-settings, OLMLX_ env prefix)
-├── cli.py              # CLI with subcommands (serve, service, models, config)
+├── cli.py              # CLI with subcommands (serve, chat, service, models, config)
 ├── __main__.py         # Entry point (delegates to cli.py)
+├── chat/
+│   ├── __init__.py     # Package exports
+│   ├── config.py       # ChatConfig dataclass, load_mcp_config()
+│   ├── mcp_client.py   # MCPClientManager: connect/discover/call MCP servers
+│   ├── session.py      # ChatSession: agent loop, message history, tool execution
+│   └── tui.py          # ChatTUI: Rich-based terminal UI with streaming markdown
 ├── engine/
 │   ├── inference.py    # generate_chat, generate_completion, generate_embeddings
 │   ├── model_manager.py # Model loading/unloading, keep-alive, LRU eviction
@@ -58,6 +64,7 @@ olmlx/
 - **Auto-registration**: Direct HF paths (e.g. `Qwen/Qwen3-8B`) are auto-registered in `models.json` on first load or pull.
 - **Prompt caching**: KV cache reuse across requests when prompts share a common prefix. Works with both mlx-lm (text) and mlx-vlm (vision) models. Controlled via `OLMLX_PROMPT_CACHE` setting.
 - **Model load timeout**: Configurable via `OLMLX_MODEL_LOAD_TIMEOUT` with dedicated `ModelLoadTimeoutError` (HTTP 504).
+- **Terminal chat** (`chat/`): `olmlx chat` runs inference directly in-process via `ModelManager`/`generate_chat()` — no HTTP server needed. Connects to external MCP servers (stdio/SSE) for tool use with a full agent loop (model → tool calls → MCP execution → results fed back → continue). Uses `parse_model_output()` from `engine/tool_parser.py` for thinking/tool extraction. MCP config uses Claude Desktop format (`~/.olmlx/mcp.json`).
 
 ## Development
 

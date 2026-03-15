@@ -37,6 +37,7 @@ The server starts on `http://localhost:11434` — the same default port as Ollam
 ```bash
 olmlx                      # Start the server (default)
 olmlx serve                # Start the server (explicit)
+olmlx chat <model>         # Interactive terminal chat with MCP tool support
 olmlx models list          # List locally downloaded models
 olmlx models pull <name>   # Download a model
 olmlx models show <name>   # Show model details
@@ -46,6 +47,102 @@ olmlx service install      # Install as launchd service
 olmlx service status       # Check service status
 olmlx service uninstall    # Remove the service
 ```
+
+## Terminal Chat
+
+`olmlx chat` provides an interactive terminal chat that runs inference directly in-process — no server needed. It supports MCP tool servers for agent-style workflows where the model can call external tools.
+
+```bash
+# Basic chat
+olmlx chat qwen3:8b
+
+# With a system prompt
+olmlx chat qwen3:8b --system "You are a helpful coding assistant"
+
+# With MCP tools (reads ~/.olmlx/mcp.json by default)
+olmlx chat qwen3:8b --mcp-config path/to/mcp.json
+
+# Disable thinking or MCP
+olmlx chat qwen3:8b --no-thinking --no-mcp
+```
+
+### Slash commands
+
+| Command | Description |
+|---|---|
+| `/exit` | Quit the chat |
+| `/clear` | Clear conversation history |
+| `/tools` | Show available MCP tools |
+| `/skills` | Show loaded skills |
+| `/system <prompt>` | Set or show the system prompt |
+| `/model <name>` | Switch to a different model |
+
+Multiline input is supported with a trailing `\`.
+
+### MCP tool servers
+
+Configure MCP servers in `~/.olmlx/mcp.json` using the same format as Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "remote": {
+      "url": "http://localhost:8080/sse"
+    }
+  }
+}
+```
+
+Entries with `command` use stdio transport; entries with `url` use SSE transport. When tools are available, the model can call them and the results are automatically fed back for the model to continue — a full agent loop.
+
+### Skills
+
+Skills are markdown files that provide specialized instructions the model can load on demand. Instead of stuffing everything into the system prompt, skill descriptions are listed briefly and the model uses a `use_skill` tool to load the full content only when relevant.
+
+```bash
+# Create the skills directory and copy the examples
+mkdir -p ~/.olmlx/skills
+cp examples/skills/*.md ~/.olmlx/skills/
+
+# Chat with skills enabled (default)
+olmlx chat qwen3:8b
+
+# List loaded skills in chat
+/skills
+
+# Disable skills
+olmlx chat qwen3:8b --no-skills
+
+# Use a custom skills directory
+olmlx chat qwen3:8b --skills-dir /path/to/skills
+```
+
+Skill files use a simple frontmatter format:
+
+```markdown
+---
+name: code-review
+description: Structured code review focusing on correctness, clarity, and maintainability
+---
+
+When reviewing code, follow this structured approach...
+```
+
+The `name` field is required; `description` is optional but recommended — it's shown in the system prompt so the model knows when to use each skill.
+
+**Included example skills** (in `examples/skills/`):
+
+| Skill | Description |
+|---|---|
+| `code-review` | Structured review: correctness, clarity, maintainability, security |
+| `explain` | Explain code or concepts, adapting depth to the question |
+| `commit-message` | Write clear conventional commit messages from diffs |
+| `debug` | Systematic debugging: reproduce, isolate, fix, verify |
+| `refactor` | Safe refactoring — improve structure without changing behavior |
 
 ## Auto-start on Login (macOS)
 

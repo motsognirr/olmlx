@@ -468,6 +468,13 @@ class ModelManager:
     def get_loaded(self) -> list[LoadedModel]:
         return list(self._loaded.values())
 
+    def invalidate_prompt_cache(self, model_name: str, cache_id: str) -> None:
+        """Remove a prompt cache entry for the given model and cache_id."""
+        normalized = self.registry.normalize_name(model_name)
+        lm = self._loaded.get(normalized)
+        if lm is not None:
+            lm.prompt_cache_store.remove(cache_id)
+
     def unload(self, name: str) -> bool:
         """Unload a model. Returns True if unloaded, False if not loaded.
 

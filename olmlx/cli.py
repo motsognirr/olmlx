@@ -39,10 +39,7 @@ def cmd_serve(_args):
     import uvicorn
 
     ensure_config()
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    _configure_logging()
     uvicorn.run(
         "olmlx.app:create_app",
         factory=True,
@@ -272,6 +269,180 @@ def cmd_models_delete(args):
         sys.exit(1)
 
 
+def _configure_logging():
+    """Configure logging from settings."""
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+
+def cmd_chat(args):
+    """Start an interactive chat session."""
+    from olmlx.chat.config import ChatConfig, load_mcp_config
+    from olmlx.chat.mcp_client import MCPClientManager
+    from olmlx.chat.session import ChatSession
+    from olmlx.chat.tui import ChatTUI
+    from olmlx.engine.model_manager import ModelManager
+
+    ensure_config()
+    _configure_logging()
+
+    model_name = args.model_name
+    if model_name is None:
+        print("Error: model name required. Usage: olmlx chat <model>", file=sys.stderr)
+        sys.exit(1)
+
+    chat_kwargs = dict(
+        model_name=model_name,
+        system_prompt=args.system,
+        max_tokens=args.max_tokens,
+        max_turns=args.max_turns,
+        thinking=not args.no_thinking,
+        mcp_enabled=not args.no_mcp,
+        repeat_penalty=args.repeat_penalty,
+        repeat_last_n=args.repeat_last_n,
+        skills_enabled=not args.no_skills,
+    )
+    if args.mcp_config:
+        chat_kwargs["mcp_config_path"] = Path(args.mcp_config)
+    if args.skills_dir:
+        chat_kwargs["skills_dir"] = Path(args.skills_dir)
+    config = ChatConfig(**chat_kwargs)
+
+    async def _run_chat():
+        from olmlx.chat.skills import SkillManager
+
+        store = _create_store()
+        manager = ModelManager(store.registry, store)
+
+        tui = ChatTUI()
+        mcp = None
+        skills = None
+
+        try:
+            tui.console.print(f"[dim]Loading {model_name}...[/dim]")
+            await manager.ensure_loaded(model_name, keep_alive="-1")
+
+            if config.mcp_enabled:
+                mcp_cfg = load_mcp_config(config.mcp_config_path)
+                if mcp_cfg:
+                    mcp = MCPClientManager()
+                    await mcp.connect_all(mcp_cfg)
+
+            if config.skills_enabled:
+                skills = SkillManager(config.skills_dir)
+                skills.load()
+                if skills.list_skills():
+                    tui.console.print(
+                        f"[dim]Loaded {len(skills.list_skills())} skill(s)[/dim]"
+                    )
+
+            session = ChatSession(
+                config=config, manager=manager, mcp=mcp, skills=skills
+            )
+            tools = mcp.get_tools_for_chat() if mcp else []
+            tui.display_welcome(model_name, tools)
+
+            while True:
+                user_input = tui.get_user_input()
+                if user_input is None:
+                    break
+
+                user_input = user_input.strip()
+                if not user_input:
+                    continue
+
+                if user_input.startswith("/"):
+                    cmd_parts = user_input.split(None, 1)
+                    command = cmd_parts[0].lower()
+                    arg = cmd_parts[1] if len(cmd_parts) > 1 else ""
+
+                    if command in ("/exit", "/quit"):
+                        break
+                    elif command == "/clear":
+                        session.clear_history()
+                        tui.console.print("[dim]History cleared[/dim]")
+                    elif command == "/tools":
+                        tui.display_tools(tools)
+                    elif command == "/skills":
+                        if skills and skills.list_skills():
+                            tui.console.print("[bold]Skills:[/bold]")
+                            for s in skills.list_skills():
+                                desc = f" — {s.description}" if s.description else ""
+                                tui.console.print(f"  [cyan]{s.name}[/cyan]{desc}")
+                        else:
+                            tui.console.print("[dim]No skills loaded[/dim]")
+                    elif command == "/system":
+                        if arg:
+                            config.system_prompt = arg
+                            session.clear_history()
+                            tui.console.print(
+                                "[dim]System prompt set. History cleared.[/dim]"
+                            )
+                        else:
+                            current = config.system_prompt or "(none)"
+                            tui.console.print(f"[dim]System prompt: {current}[/dim]")
+                    elif command == "/model":
+                        if arg:
+                            tui.console.print(f"[dim]Loading {arg}...[/dim]")
+                            try:
+                                await manager.ensure_loaded(arg, keep_alive="-1")
+                                config.model_name = arg
+                                session.clear_history()
+                                tui.console.print(
+                                    f"[dim]Switched to {arg}. History cleared.[/dim]"
+                                )
+                            except Exception as exc:
+                                tui.display_error(str(exc))
+                        else:
+                            tui.console.print(
+                                f"[dim]Current model: {config.model_name}[/dim]"
+                            )
+                    else:
+                        tui.display_error(f"Unknown command: {command}")
+                    continue
+
+                # Collect events while streaming tokens
+                pending_events = []
+                stream_ctx = tui.stream_response()
+                with stream_ctx:
+                    async for event in session.send_message(user_input):
+                        if event["type"] == "token":
+                            stream_ctx.update(event["text"])
+                        else:
+                            pending_events.append(event)
+
+                # Display collected events
+                for event in pending_events:
+                    if event["type"] == "thinking":
+                        tui.display_thinking(event["text"])
+                    elif event["type"] == "tool_call":
+                        tui.display_tool_call(event["name"], event["arguments"])
+                    elif event["type"] == "tool_result":
+                        tui.display_tool_result(event["name"], event["result"])
+                    elif event["type"] == "tool_error":
+                        tui.display_tool_error(event["name"], event["error"])
+                    elif event["type"] == "max_turns_exceeded":
+                        tui.display_error("Max tool turns reached")
+
+        except MemoryError as exc:
+            tui.display_error(str(exc))
+            sys.exit(1)
+        except ValueError as exc:
+            tui.display_error(str(exc))
+            sys.exit(1)
+        finally:
+            if mcp is not None:
+                await mcp.disconnect_all()
+            await manager.stop()
+
+    try:
+        asyncio.run(_run_chat())
+    except KeyboardInterrupt:
+        print("\nBye!", file=sys.stderr)
+
+
 def cmd_config_show(_args):
     """Show current configuration."""
     print(f"Host:                   {settings.host}")
@@ -313,6 +484,39 @@ def build_parser() -> argparse.ArgumentParser:
     del_p.add_argument("model_name", help="Model name or HF path")
     del_p.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
 
+    chat_p = sub.add_parser("chat", help="Interactive chat")
+    chat_p.add_argument("model_name", nargs="?", help="Model name or HF path")
+    chat_p.add_argument("--system", "-s", help="System prompt")
+    chat_p.add_argument(
+        "--mcp-config", help="MCP config path (default: ~/.olmlx/mcp.json)"
+    )
+    chat_p.add_argument(
+        "--no-mcp", action="store_true", default=False, help="Disable MCP"
+    )
+    chat_p.add_argument(
+        "--no-thinking", action="store_true", default=False, help="Disable thinking"
+    )
+    chat_p.add_argument("--max-tokens", type=int, default=4096)
+    chat_p.add_argument("--max-turns", type=int, default=25)
+    chat_p.add_argument(
+        "--repeat-penalty",
+        type=float,
+        default=1.1,
+        help="Repetition penalty (1.0 = disabled, default: 1.1)",
+    )
+    chat_p.add_argument(
+        "--repeat-last-n",
+        type=int,
+        default=64,
+        help="Context window for repetition penalty (default: 64)",
+    )
+    chat_p.add_argument(
+        "--no-skills", action="store_true", default=False, help="Disable skills"
+    )
+    chat_p.add_argument(
+        "--skills-dir", help="Skills directory (default: ~/.olmlx/skills)"
+    )
+
     cfg = sub.add_parser("config", help="Show configuration")
     cfg_sub = cfg.add_subparsers(dest="config_command")
     cfg_sub.add_parser("show", help="Show current configuration")
@@ -335,6 +539,8 @@ def cli_main():
             cmd_service_status(args)
         else:
             parser.parse_args(["service", "--help"])
+    elif args.command == "chat":
+        cmd_chat(args)
     elif args.command == "models":
         if args.models_command == "list":
             cmd_models_list(args)
