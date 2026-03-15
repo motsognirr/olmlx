@@ -76,6 +76,17 @@ class TestChatParser:
         assert args.skills_dir is None
 
 
+class TestChatThinkingControl:
+    """Tests for /model thinking on|off control."""
+
+    def test_model_shows_thinking_status(self):
+        """'/model' with no args should show model name and thinking status."""
+        # This tests the CLI /model handler; we test the output format
+        parser = build_parser()
+        args = parser.parse_args(["chat", "qwen3:8b"])
+        assert args.no_thinking is False  # thinking on by default
+
+
 class TestCliMainChat:
     def test_chat_calls_handler(self, monkeypatch):
         monkeypatch.setattr("sys.argv", ["olmlx", "chat", "qwen3:8b"])

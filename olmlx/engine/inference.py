@@ -891,12 +891,33 @@ async def generate_chat(
     images = _extract_images(messages)
 
     if lm.is_vlm and not tools:
-        if enable_thinking is not None:
-            logger.warning(
-                "enable_thinking=%s ignored for VLM model (not supported by mlx-vlm template)",
-                enable_thinking,
+        # VLM template doesn't support enable_thinking. When the user
+        # explicitly sets it, there are no images, and the text template
+        # supports it, fall back to the text template path so thinking
+        # can be controlled. Images require the VLM template.
+        # Note: the text template prompt is tokenized by lm.tokenizer
+        # (VLM processor) during generation. This works for Qwen models
+        # where text and VLM tokenizers share the same vocabulary.
+        if (
+            enable_thinking is not None
+            and not images
+            and lm.template_caps
+            and lm.template_caps.supports_enable_thinking
+        ):
+            prompt = _apply_chat_template_text(
+                lm.text_tokenizer,
+                messages,
+                tools,
+                caps=lm.template_caps,
+                enable_thinking=enable_thinking,
             )
-        prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages, images)
+        else:
+            if enable_thinking is not None:
+                logger.warning(
+                    "enable_thinking=%s ignored for VLM model (not supported by mlx-vlm template)",
+                    enable_thinking,
+                )
+            prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages, images)
     else:
         # Use text template path when tools are needed, even for VLM-loaded models,
         # because _apply_chat_template_vlm doesn't support tool definitions.

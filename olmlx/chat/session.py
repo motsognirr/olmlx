@@ -60,8 +60,10 @@ class ChatSession:
         """Send a user message and run the agent loop.
 
         Yields event dicts:
-        - {"type": "token", "text": str} — streaming token
-        - {"type": "thinking", "text": str} — thinking block
+        - {"type": "token", "text": str} — streaming response token
+        - {"type": "thinking_start"} — thinking block begins
+        - {"type": "thinking_token", "text": str} — streaming thinking token
+        - {"type": "thinking_end"} — thinking block ends
         - {"type": "tool_call", "name": str, "arguments": dict, "id": str}
         - {"type": "tool_result", "name": str, "result": str, "id": str}
         - {"type": "tool_error", "name": str, "error": str, "id": str}
@@ -84,11 +86,40 @@ class ChatSession:
             "repeat_last_n": self.config.repeat_last_n,
         }
 
+        # Check template caps for implicit thinking detection.
+        # generate_chat() calls ensure_loaded too; the model stays cached.
+        # Only has_thinking_tags implies implicit thinking (template injects
+        # <think>); supports_enable_thinking alone means explicit tags.
+        try:
+            lm = await self.manager.ensure_loaded(self.config.model_name)
+            template_has_thinking = lm.template_caps.has_thinking_tags
+        except Exception:
+            logger.debug(
+                "Could not detect template caps, assuming no implicit thinking",
+                exc_info=True,
+            )
+            template_has_thinking = False
+
+        # Implicit thinking: model injects <think> into the template prompt,
+        # so generated text starts with thinking content (no <think> prefix).
+        assume_implicit_thinking = self.config.thinking and template_has_thinking
+
         for turn in range(self.config.max_turns):
             accumulated = ""
-            visible_len = 0
+            think_emitted = 0
+            visible_emitted = 0
+            in_thinking = False
             token_count = 0
             repetition_stopped = False
+
+            # Incremental tag tracking — positions only move forward.
+            # Only assume implicit thinking on the first turn; subsequent
+            # tool-call follow-up turns may not produce thinking at all.
+            implicit_mode = assume_implicit_thinking and turn == 0
+            open_pos = -1  # position of <think>, -1 = not found
+            close_pos = -1  # position of </think>, -1 = not found
+            scan_pos = 0  # how far we've scanned for tags
+
             async for chunk in await generate_chat(
                 self.manager,
                 self.config.model_name,
@@ -109,12 +140,81 @@ class ChatSession:
                 if text:
                     accumulated += text
                     token_count += 1
-                    # Suppress <think>...</think> from streaming output
-                    visible = _strip_thinking(accumulated)
-                    if len(visible) > visible_len:
-                        delta = visible[visible_len:]
-                        visible_len = len(visible)
-                        yield {"type": "token", "text": delta}
+
+                    # Scan only new text for tag boundaries (with overlap
+                    # for partial tags that span chunk boundaries).
+                    new_scan = max(0, scan_pos - len(_THINK_CLOSE) + 1)
+                    scan_pos = len(accumulated)
+
+                    if open_pos == -1:
+                        pos = accumulated.find(_THINK_OPEN, new_scan)
+                        if pos != -1:
+                            open_pos = pos
+                            implicit_mode = False  # explicit tag found
+
+                    # Always scan for </think> — needed for both thinking
+                    # display and thinking-disabled stripping.
+                    if close_pos == -1:
+                        search_from = max(
+                            (open_pos + len(_THINK_OPEN)) if open_pos >= 0 else 0,
+                            new_scan,
+                        )
+                        pos = accumulated.find(_THINK_CLOSE, search_from)
+                        if pos != -1:
+                            close_pos = pos
+
+                    # Derive thinking content and visible text from positions
+                    has_thinking = open_pos >= 0 or implicit_mode
+                    # Also detect implicit thinking when disabled (model still
+                    # produced thinking despite the flag — strip it from output).
+                    implicit_strip = (
+                        not self.config.thinking
+                        and template_has_thinking
+                        and open_pos == -1
+                        and close_pos >= 0
+                    )
+                    if has_thinking:
+                        # Content starts after <think> tag, or at 0 for implicit
+                        cs = (open_pos + len(_THINK_OPEN)) if open_pos >= 0 else 0
+                        if close_pos >= 0:
+                            think_content = accumulated[cs:close_pos]
+                            visible = accumulated[close_pos + len(_THINK_CLOSE) :]
+                        else:
+                            think_content = accumulated[cs:]
+                            visible = ""
+                    elif implicit_strip:
+                        # Model produced thinking despite being disabled;
+                        # strip everything before </think> from visible.
+                        think_content = ""
+                        visible = accumulated[close_pos + len(_THINK_CLOSE) :]
+                    else:
+                        think_content = ""
+                        visible = accumulated
+
+                    # When thinking is disabled, suppress thinking events
+                    # but still strip thinking content from visible output.
+                    if not self.config.thinking:
+                        think_content = ""
+
+                    # Emit thinking delta
+                    if len(think_content) > think_emitted:
+                        if not in_thinking:
+                            yield {"type": "thinking_start"}
+                            in_thinking = True
+                        yield {
+                            "type": "thinking_token",
+                            "text": think_content[think_emitted:],
+                        }
+                        think_emitted = len(think_content)
+
+                    # Emit visible delta
+                    if len(visible) > visible_emitted:
+                        if in_thinking:
+                            yield {"type": "thinking_end"}
+                            in_thinking = False
+                        yield {"type": "token", "text": visible[visible_emitted:]}
+                        visible_emitted = len(visible)
+
                     # Throttle: only check every 10 tokens to reduce overhead
                     if token_count % 10 == 0 and _detect_repetition(accumulated):
                         logger.warning(
@@ -123,14 +223,15 @@ class ChatSession:
                         repetition_stopped = True
                         break
 
+            # Close any open thinking block (unclosed <think> or implicit)
+            if in_thinking:
+                yield {"type": "thinking_end"}
+
             full_text = accumulated
 
             thinking, visible_text, tool_uses = parse_model_output(
                 full_text, has_tools=(mcp_tools is not None)
             )
-
-            if thinking:
-                yield {"type": "thinking", "text": thinking}
 
             # Build assistant message
             assistant_msg: dict[str, Any] = {
@@ -222,7 +323,10 @@ class ChatSession:
         yield {"type": "done"}
 
 
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_CONTENT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 
 def _strip_thinking(text: str) -> str:
@@ -230,14 +334,46 @@ def _strip_thinking(text: str) -> str:
 
     Strips closed ``<think>...</think>`` blocks and truncates at any
     unclosed ``<think>`` tag so thinking content is never shown.
+    Also handles implicit thinking where the template injects ``<think>``
+    so only ``</think>`` appears in the output.
     """
     # Remove complete blocks
     result = _THINK_BLOCK_RE.sub("", text)
+    # Handle implicit thinking: </think> without matching <think>
+    if _THINK_OPEN not in result:
+        close_idx = result.find(_THINK_CLOSE)
+        if close_idx != -1:
+            return result[close_idx + len(_THINK_CLOSE) :]
     # Truncate at any unclosed <think>
-    idx = result.find("<think>")
+    idx = result.find(_THINK_OPEN)
     if idx != -1:
         result = result[:idx]
     return result
+
+
+def _extract_thinking_content(text: str) -> str:
+    """Extract content from <think> blocks, including unclosed trailing blocks.
+
+    Returns the concatenated thinking content from all closed blocks
+    plus any content after an unclosed trailing ``<think>`` tag.
+    Also handles implicit thinking where ``<think>`` is template-injected
+    and only ``</think>`` appears in the output.
+    """
+    parts = []
+    # Closed blocks
+    for m in _THINK_CONTENT_RE.finditer(text):
+        parts.append(m.group(1))
+    # Check for unclosed trailing <think> after removing closed blocks
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    idx = cleaned.find(_THINK_OPEN)
+    if idx != -1:
+        parts.append(cleaned[idx + len(_THINK_OPEN) :])
+    # Implicit thinking: no <think> tag but </think> present
+    elif not parts:
+        close_idx = cleaned.find(_THINK_CLOSE)
+        if close_idx != -1:
+            parts.append(cleaned[:close_idx])
+    return "".join(parts)
 
 
 def _detect_repetition(

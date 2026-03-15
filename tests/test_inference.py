@@ -654,10 +654,49 @@ class TestFullCompletionInner:
 
 class TestGenerateChatVlm:
     @pytest.mark.asyncio
-    async def test_vlm_enable_thinking_warns(self, mock_manager, caplog):
-        """VLM path logs warning when enable_thinking is set."""
+    async def test_vlm_enable_thinking_uses_text_template(self, mock_manager):
+        """VLM path uses text template when enable_thinking is set and supported."""
         lm = mock_manager._loaded["qwen3:latest"]
         lm.is_vlm = True
+        lm.template_caps = TemplateCaps(
+            supports_tools=True, supports_enable_thinking=True
+        )
+
+        mock_mx = MagicMock()
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch(
+                "olmlx.engine.inference._apply_chat_template_text",
+                return_value="text prompt",
+            ) as mock_text_tpl:
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                ) as mock_thread:
+                    mock_thread.return_value = "response"
+                    await generate_chat(
+                        mock_manager,
+                        "qwen3",
+                        [{"role": "user", "content": "describe"}],
+                        stream=False,
+                        enable_thinking=False,
+                    )
+
+        # Should have used text template path (not VLM template)
+        mock_text_tpl.assert_called_once()
+        call_kwargs = mock_text_tpl.call_args
+        assert call_kwargs.kwargs.get("enable_thinking") is False
+
+    @pytest.mark.asyncio
+    async def test_vlm_enable_thinking_warns_when_unsupported(
+        self, mock_manager, caplog
+    ):
+        """VLM path logs warning when enable_thinking is set but template doesn't support it."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        lm.template_caps = TemplateCaps(
+            supports_tools=False, supports_enable_thinking=False
+        )
 
         mock_mx = MagicMock()
 
