@@ -7,6 +7,7 @@ import re
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from olmlx.chat.builtin_tools import BuiltinToolManager
 from olmlx.chat.config import ChatConfig
 from olmlx.chat.mcp_client import MCPClientManager
 from olmlx.chat.skills import SkillManager
@@ -26,11 +27,13 @@ class ChatSession:
         manager: ModelManager,
         mcp: MCPClientManager | None = None,
         skills: SkillManager | None = None,
+        builtin: BuiltinToolManager | None = None,
     ):
         self.config = config
         self.manager = manager
         self.mcp = mcp
         self.skills = skills
+        self.builtin = builtin
         self.messages: list[dict] = []
 
         system_prompt = self._build_system_prompt()
@@ -73,6 +76,10 @@ class ChatSession:
         mcp_tools = None
         if self.mcp is not None:
             mcp_tools = self.mcp.get_tools_for_chat() or None
+
+        # Merge built-in tool definitions
+        if self.builtin:
+            mcp_tools = (mcp_tools or []) + self.builtin.get_tool_definitions()
 
         # Merge skill tool into the tools list
         skill_tool = self.skills.get_tool_definition() if self.skills else None
@@ -163,6 +170,8 @@ class ChatSession:
                 try:
                     if tool_name == "use_skill" and self.skills:
                         result = self.skills.handle_use_skill(tool_input)
+                    elif self.builtin and tool_name in self.builtin.tool_names:
+                        result = await self.builtin.call_tool(tool_name, tool_input)
                     elif self.mcp is not None:
                         result = await self.mcp.call_tool(tool_name, tool_input)
                     else:

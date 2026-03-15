@@ -21,6 +21,9 @@ dependencies = [
 [project.scripts]
 olmlx = "olmlx.__main__:main"
 
+[project.optional-dependencies]
+search = ["duckduckgo-search>=6.0"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
