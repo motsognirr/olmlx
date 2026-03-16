@@ -150,6 +150,8 @@ class DistributedCoordinator:
         for i, conn in enumerate(pending):
             remaining = timeout - (time.monotonic() - start)
             if remaining <= 0:
+                for s in pending[i:]:
+                    s.close()
                 raise TimeoutError(
                     f"Timed out waiting for workers to report ready "
                     f"({len(self._workers)}/{expected} ready)"
@@ -158,6 +160,8 @@ class DistributedCoordinator:
             try:
                 msg = _recv_message(conn)
                 if msg is None or msg.get("action") != "ready":
+                    for s in pending[i:]:
+                        s.close()
                     raise TimeoutError(
                         f"Worker {i + 1} sent unexpected message instead of ready: {msg}"
                     )
@@ -169,6 +173,8 @@ class DistributedCoordinator:
                     expected,
                 )
             except socket.timeout:
+                for s in pending[i:]:
+                    s.close()
                 raise TimeoutError(
                     f"Timed out waiting for workers to report ready "
                     f"({len(self._workers)}/{expected} ready)"
@@ -185,6 +191,9 @@ class DistributedCoordinator:
 
         Raises RuntimeError if any worker send fails — partial broadcasts
         leave the cluster in an unrecoverable state (all_sum deadlock).
+
+        Thread safety: callers must serialize access. In olmlx this is
+        guaranteed by _inference_lock — only one inference runs at a time.
         """
         msg = {
             "prompt_tokens": prompt_tokens,

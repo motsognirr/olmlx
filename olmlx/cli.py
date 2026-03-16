@@ -65,7 +65,8 @@ def _launch_distributed_workers():
     """Launch worker processes on remote hosts via SSH for distributed inference.
 
     Stores Popen handles in _worker_procs for cleanup on failure/shutdown.
-    Requires passwordless SSH with pre-accepted host keys.
+    Requires passwordless SSH with pre-accepted host keys — run
+    `ssh-keyscan -H <host> >> ~/.ssh/known_hosts` for each worker first.
     """
     import atexit
     import shlex
@@ -143,7 +144,7 @@ def _launch_distributed_workers():
             "-o",
             "BatchMode=yes",
             "-o",
-            "StrictHostKeyChecking=accept-new",
+            "StrictHostKeyChecking=yes",
             host,
             remote_cmd,
         ]
