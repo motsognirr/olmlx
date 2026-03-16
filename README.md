@@ -242,11 +242,11 @@ olmlx supports vision-language models (VLMs) that can process images alongside t
 ```bash
 # Chat with an image (base64-encoded in message)
 curl http://localhost:11434/api/chat -d '{
-  "model": "llava:13b",
+  "model": "llava:1.5-7b",
   "messages": [{
     "role": "user",
     "content": "What is in this image?",
-    "images": ["data:image/png;base64,iVBOR..."]
+    "images": ["iVBOR..."]
   }]
 }'
 ```
@@ -257,8 +257,7 @@ Add VLM mappings to `~/.olmlx/models.json`:
 
 ```json
 {
-  "llava:13b": "mlx-community/llava-llama-13b-hf",
-  "llava:7b": "mlx-community/llava-llama-7b-hf"
+  "llava:1.5-7b": "mlx-community/llava-1.5-7b-4bit"
 }
 ```
 
