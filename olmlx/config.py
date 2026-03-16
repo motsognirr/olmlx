@@ -40,3 +40,16 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+class ExperimentalSettings(BaseSettings):
+    model_config = {"env_prefix": "EXPERIMENTAL_"}
+
+    distributed: bool = False
+    distributed_hostfile: Path = Path("~/.olmlx/hostfile.json")
+    distributed_backend: str = "ring"
+    distributed_port: int = 32323
+    distributed_sideband_port: int = 32400
+
+
+experimental = ExperimentalSettings()

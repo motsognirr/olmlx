@@ -33,7 +33,36 @@ async def lifespan(app: FastAPI):
     registry = ModelRegistry()
     registry.load()
     store = ModelStore(registry)
-    manager = ModelManager(registry, store)
+
+    # -- Experimental: Distributed inference --
+    from olmlx.config import experimental
+
+    distributed_group = None
+    coordinator = None
+    if experimental.distributed:
+        import mlx.core as mx
+
+        from olmlx.engine.distributed import DistributedCoordinator
+        from olmlx.engine.inference import set_distributed_coordinator
+
+        distributed_group = mx.distributed.init(
+            backend=experimental.distributed_backend
+        )
+        world_size = distributed_group.size()
+        logger.info(
+            "Distributed mode: rank %d, world_size %d, backend %s",
+            distributed_group.rank(),
+            world_size,
+            experimental.distributed_backend,
+        )
+        coordinator = DistributedCoordinator(
+            world_size=world_size,
+            port=experimental.distributed_sideband_port,
+        )
+        coordinator.wait_for_workers(timeout=60.0)
+        set_distributed_coordinator(coordinator)
+
+    manager = ModelManager(registry, store, distributed_group=distributed_group)
     manager.start_expiry_checker()
 
     settings.models_dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +75,12 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    if coordinator is not None:
+        coordinator.broadcast_shutdown()
+        coordinator.close()
+        from olmlx.engine.inference import set_distributed_coordinator
+
+        set_distributed_coordinator(None)
     await manager.stop()
     logger.info("olmlx server stopped")
 

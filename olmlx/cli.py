@@ -40,6 +40,12 @@ def cmd_serve(_args):
 
     ensure_config()
     _configure_logging()
+
+    from olmlx.config import experimental
+
+    if experimental.distributed:
+        _launch_distributed_workers()
+
     uvicorn.run(
         "olmlx.app:create_app",
         factory=True,
@@ -47,6 +53,83 @@ def cmd_serve(_args):
         port=settings.port,
         log_level=settings.log_level.lower(),
     )
+
+
+_VALID_HOSTNAME_RE = __import__("re").compile(r"^[a-zA-Z0-9._-]+$")
+
+
+def _launch_distributed_workers():
+    """Launch worker processes on remote hosts via SSH for distributed inference."""
+    import shlex
+
+    from olmlx.config import experimental
+
+    hostfile_path = Path(experimental.distributed_hostfile).expanduser()
+    if not hostfile_path.exists():
+        print(
+            f"Error: distributed hostfile not found at {hostfile_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    with open(hostfile_path) as f:
+        hostfile = json.load(f)
+
+    hosts = hostfile.get("hosts", [])
+    if len(hosts) < 2:
+        print(
+            "Error: hostfile must contain at least 2 hosts for distributed inference",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    model = hostfile.get("model", "")
+    if not model:
+        print(
+            "Error: hostfile must contain a 'model' field with the HF model path",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Validate hostnames to prevent command injection
+    for host in hosts:
+        if not _VALID_HOSTNAME_RE.match(host):
+            print(
+                f"Error: invalid hostname {host!r} in hostfile",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    world_size = len(hosts)
+    coordinator_host = hosts[0]
+    print(
+        f"Distributed mode: {world_size} nodes, coordinator={coordinator_host}"
+    )
+
+    log_dir = Path.home() / ".olmlx"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Launch workers on remote hosts (rank 1..N)
+    for rank, host in enumerate(hosts[1:], start=1):
+        env = {
+            "EXPERIMENTAL_DISTRIBUTED_MODEL": model,
+            "EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST": coordinator_host,
+            "EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT": str(
+                experimental.distributed_sideband_port
+            ),
+            "MLX_RANK": str(rank),
+            "MLX_WORLD_SIZE": str(world_size),
+            "MLX_PORT": str(experimental.distributed_port),
+        }
+        env_str = " ".join(
+            f"{k}={shlex.quote(v)}" for k, v in env.items()
+        )
+        remote_cmd = f"{env_str} python -m olmlx.engine.distributed_worker"
+        cmd = ["ssh", host, remote_cmd]
+        log_file = log_dir / f"worker-{rank}.log"
+        print(f"  Launching worker rank {rank} on {host} (log: {log_file})")
+        log_fh = open(log_file, "w")
+        subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh)
 
 
 def _find_executable() -> str:
@@ -512,6 +595,8 @@ def cmd_chat(args):
 
 def cmd_config_show(_args):
     """Show current configuration."""
+    from olmlx.config import experimental
+
     print(f"Host:                   {settings.host}")
     print(f"Port:                   {settings.port}")
     print(f"Models dir:             {settings.models_dir}")
@@ -523,6 +608,13 @@ def cmd_config_show(_args):
     print(f"Prompt cache:           {settings.prompt_cache}")
     print(f"Prompt cache max tokens: {settings.prompt_cache_max_tokens}")
     print(f"CORS origins:           {settings.cors_origins}")
+    if experimental.distributed:
+        print()
+        print("Experimental distributed inference:")
+        print(f"  Hostfile:             {experimental.distributed_hostfile}")
+        print(f"  Backend:              {experimental.distributed_backend}")
+        print(f"  Port:                 {experimental.distributed_port}")
+        print(f"  Sideband port:        {experimental.distributed_sideband_port}")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -36,6 +36,28 @@ from olmlx.utils.timing import Timer, TimingStats
 
 logger = logging.getLogger(__name__)
 
+# -- Experimental: Distributed inference coordinator --
+# Only set when EXPERIMENTAL_DISTRIBUTED=true; see set_distributed_coordinator().
+_distributed_coordinator = None
+
+
+def set_distributed_coordinator(coordinator):
+    """Set the distributed coordinator for broadcasting inference to workers."""
+    global _distributed_coordinator
+    _distributed_coordinator = coordinator
+
+
+def _maybe_broadcast_distributed(
+    lm, prompt_tokens: list[int], max_tokens: int, gen_kwargs: dict
+) -> None:
+    """Broadcast inference params to distributed workers if applicable."""
+    if _distributed_coordinator is not None and lm.is_distributed:
+        _distributed_coordinator.broadcast_inference(
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            gen_kwargs=gen_kwargs,
+        )
+
 
 # Resolve generation streams at module load time to avoid repeated
 # importlib.import_module() calls in the hot path (_safe_sync).
@@ -692,6 +714,12 @@ async def _stream_completion(
                 "cache_creation_tokens": cache_creation_tokens,
             }
 
+        # Broadcast to distributed workers before starting generation
+        if isinstance(prompt, list):
+            _maybe_broadcast_distributed(lm, prompt, max_tokens, gen_kwargs)
+        elif isinstance(prompt, str) and prompt_tokens is not None:
+            _maybe_broadcast_distributed(lm, prompt_tokens, max_tokens, gen_kwargs)
+
         stream = async_mlx_stream(
             lm.model,
             lm.tokenizer,
@@ -878,6 +906,11 @@ async def _full_completion_inner(
     stats: TimingStats,
     images: list[str] | None = None,
 ) -> dict:
+    # Broadcast to distributed workers for non-streaming path
+    if _distributed_coordinator is not None:
+        tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
+        _maybe_broadcast_distributed(lm, tokens, max_tokens, gen_kwargs)
+
     def _generate_sync():
         """Run generate + synchronize in the same thread so GPU work completes
         before the thread returns to the pool."""
