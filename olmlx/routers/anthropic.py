@@ -659,14 +659,45 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                     else _stream_thinking_state_machine(result)
                 )
 
-                # Consume cache_info if present (forwarded by helpers),
-                # then emit message_start with accurate cache stats.
-                # Keepalive pings may arrive before cache_info (during lock
-                # wait), so skip them here and replay after message_start.
+                # Emit message_start as early as possible so the client
+                # receives keep-alive pings during prefill instead of
+                # buffering them until the first content token arrives.
+                #
+                # Phase 1: Look for cache_info.  Any pings that arrive
+                #          before it are buffered (this window is <1 ms).
+                # Phase 2: After cache_info (or first ping if no cache),
+                #          emit message_start and yield pings directly.
                 cache_read = 0
                 cache_creation = 0
-                first_event = None
+                message_started = False
                 pending_pings: list[str] = []
+
+                def _emit_message_start():
+                    nonlocal message_started
+                    message_started = True
+                    return _sse(
+                        "message_start",
+                        {
+                            "type": "message_start",
+                            "message": {
+                                "id": msg_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                                "model": req.model,
+                                "stop_reason": None,
+                                "stop_sequence": None,
+                                "usage": {
+                                    "input_tokens": 0,
+                                    "output_tokens": 0,
+                                    "cache_creation_input_tokens": cache_creation,
+                                    "cache_read_input_tokens": cache_read,
+                                },
+                            },
+                        },
+                    )
+
+                meta = {}
                 async for event in path:
                     if isinstance(event, dict) and event.get("cache_info"):
                         cache_read = event.get("cache_read_tokens", 0)
@@ -676,50 +707,44 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                             cache_read,
                             cache_creation,
                         )
+                        # Emit message_start immediately with cache stats
+                        if not message_started:
+                            yield _emit_message_start()
+                        else:
+                            logger.warning(
+                                "Duplicate cache_info received after message_start "
+                                "(read=%d, creation=%d) — stats dropped",
+                                cache_read,
+                                cache_creation,
+                            )
+                        # Replay any pings that arrived before cache_info
+                        for ping in pending_pings:
+                            yield ping
+                        pending_pings.clear()
                     elif isinstance(event, str) and event.startswith("event: ping"):
-                        pending_pings.append(event)
-                    else:
-                        first_event = event
-                        break
-
-                yield _sse(
-                    "message_start",
-                    {
-                        "type": "message_start",
-                        "message": {
-                            "id": msg_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [],
-                            "model": req.model,
-                            "stop_reason": None,
-                            "stop_sequence": None,
-                            "usage": {
-                                "input_tokens": 0,
-                                "output_tokens": 0,
-                                "cache_creation_input_tokens": cache_creation,
-                                "cache_read_input_tokens": cache_read,
-                            },
-                        },
-                    },
-                )
-
-                # Replay any pings that arrived before message_start
-                for ping in pending_pings:
-                    yield ping
-
-                meta = {}
-                if first_event is not None:
-                    if isinstance(first_event, dict):
-                        meta = first_event
-                    else:
-                        yield first_event
-
-                async for event in path:
-                    if isinstance(event, dict):
+                        if message_started:
+                            # After message_start: yield pings directly to client
+                            yield event
+                        else:
+                            # Before cache_info or content: buffer pings.
+                            # cache_info arrives within ms (before first 5s
+                            # ping), so this buffer is normally empty.
+                            pending_pings.append(event)
+                    elif isinstance(event, dict):
                         meta = event
                     else:
+                        if not message_started:
+                            # Content arrived before cache_info — no-cache case
+                            yield _emit_message_start()
+                            for ping in pending_pings:
+                                yield ping
+                            pending_pings.clear()
                         yield event
+
+                if not message_started:
+                    yield _emit_message_start()
+                    for ping in pending_pings:
+                        yield ping
 
                 yield _sse(
                     "message_delta",

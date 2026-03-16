@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     prompt_cache: bool = True
     prompt_cache_max_tokens: Annotated[int, Field(gt=0)] | None = 32768
     prompt_cache_max_slots: Annotated[int, Field(gt=0)] = 4
+    inference_queue_timeout: Annotated[float, Field(gt=0)] | None = 300.0
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
     anthropic_models: dict[str, str] = {}
 

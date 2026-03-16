@@ -141,7 +141,7 @@ def create_app() -> FastAPI:
     async def server_busy_error_handler(request: Request, exc: ServerBusyError):
         msg = str(exc)
         logger.warning("ServerBusyError on %s: %s", request.url.path, msg)
-        return _make_error_response(
+        response = _make_error_response(
             request.url.path,
             503,
             msg,
@@ -149,6 +149,8 @@ def create_app() -> FastAPI:
             "server_error",
             "server_busy",
         )
+        response.headers["Retry-After"] = "5"
+        return response
 
     @app.exception_handler(RuntimeError)
     async def runtime_error_handler(request: Request, exc: RuntimeError):

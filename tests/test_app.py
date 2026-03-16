@@ -371,6 +371,28 @@ class TestErrorHandlers:
         assert data["error"]["code"] == "model_too_large"
 
     @pytest.mark.asyncio
+    async def test_server_busy_has_retry_after_header(self, app_client):
+        """ServerBusyError 503 should include Retry-After header."""
+        from unittest.mock import AsyncMock
+
+        from olmlx.engine.inference import ServerBusyError
+
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = ServerBusyError("deferred cleanup")
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "hi",
+                    "stream": False,
+                },
+            )
+        assert resp.status_code == 503
+        assert resp.headers.get("retry-after") == "5"
+
+    @pytest.mark.asyncio
     async def test_general_endpoints_exist(self, app_client):
         resp = await app_client.get("/")
         assert resp.status_code == 200
