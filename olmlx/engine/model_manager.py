@@ -132,14 +132,14 @@ class PromptCacheStore:
         try:
             cache, metadata = load_prompt_cache(str(file_path), return_metadata=True)
             tokens = json.loads(metadata.get("tokens", "[]"))
-            # Remove disk file after successful load
-            file_path.unlink(missing_ok=True)
             state = CachedPromptState(tokens=tokens, cache=cache)
             # Store in memory via set() to respect max_slots capacity.
             # Delete the evicted entry to release GPU buffers promptly.
             evicted = self.set(cache_id, state)
             if evicted is not None:
                 del evicted
+            # Remove disk file only after set() succeeded
+            file_path.unlink(missing_ok=True)
             logger.info(
                 "Restored cache '%s' from disk (%d tokens)",
                 cache_id,
@@ -211,8 +211,10 @@ class PromptCacheStore:
         return evicted
 
     def remove(self, cache_id: str) -> None:
-        """Remove a specific cache entry."""
+        """Remove a specific cache entry from memory and disk."""
         self._entries.pop(cache_id, None)
+        if self._disk_enabled:
+            self._disk_file_path(cache_id).unlink(missing_ok=True)
 
     def evict_all_to_disk(self) -> None:
         """Save all in-memory entries to disk, then clear memory.

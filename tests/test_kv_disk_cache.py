@@ -215,6 +215,21 @@ class TestPromptCacheStoreDiskCleanup:
         # New file should remain
         assert new_file.exists()
 
+    def test_remove_also_deletes_disk_file(self, tmp_path):
+        """remove() should delete the disk file to prevent stale restoration."""
+        store = PromptCacheStore(
+            max_slots=2,
+            disk_path=tmp_path,
+            model_name="test-model",
+        )
+        # Create a fake disk file as if "a" was evicted to disk
+        disk_file = store._disk_file_path("a")
+        disk_file.parent.mkdir(parents=True, exist_ok=True)
+        disk_file.write_bytes(b"fake cache")
+
+        store.remove("a")
+        assert not disk_file.exists()
+
     def test_disk_cleanup_noop_under_limit(self, tmp_path):
         """No cleanup needed when under the limit."""
         store = PromptCacheStore(
