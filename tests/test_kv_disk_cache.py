@@ -3,9 +3,7 @@
 import os
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 from olmlx.engine.model_manager import CachedPromptState, PromptCacheStore
 
@@ -26,9 +24,7 @@ class TestPromptCacheStoreDiskEviction:
             model_name="test-model",
         )
         state_a = _make_state(1)
-        with patch(
-            "olmlx.engine.model_manager.save_prompt_cache"
-        ) as mock_save:
+        with patch("olmlx.engine.model_manager.save_prompt_cache") as mock_save:
             store.set("a", state_a)
             store.set("b", _make_state(2))  # evicts "a"
             mock_save.assert_called_once()
@@ -45,9 +41,7 @@ class TestPromptCacheStoreDiskEviction:
             model_name="test-model",
         )
         state_a = CachedPromptState(tokens=[10, 20, 30], cache=["kv"])
-        with patch(
-            "olmlx.engine.model_manager.save_prompt_cache"
-        ) as mock_save:
+        with patch("olmlx.engine.model_manager.save_prompt_cache") as mock_save:
             store.set("a", state_a)
             store.set("b", _make_state(2))  # evicts "a"
             metadata = mock_save.call_args[0][2]
@@ -57,9 +51,7 @@ class TestPromptCacheStoreDiskEviction:
         """Without disk_path, eviction behaves as before (no save)."""
         store = PromptCacheStore(max_slots=1)
         store.set("a", _make_state(1))
-        with patch(
-            "olmlx.engine.model_manager.save_prompt_cache"
-        ) as mock_save:
+        with patch("olmlx.engine.model_manager.save_prompt_cache") as mock_save:
             store.set("b", _make_state(2))  # evicts "a"
             mock_save.assert_not_called()
 
@@ -78,7 +70,7 @@ class TestPromptCacheStoreDiskEviction:
             side_effect=OSError("disk full"),
         ):
             with caplog.at_level(logging.WARNING):
-                evicted = store.set("b", _make_state(2))
+                store.set("b", _make_state(2))
                 # Should still evict from memory
                 assert store.get("a") is None
                 assert "disk full" in caplog.text
@@ -274,9 +266,7 @@ class TestPromptCacheStoreEvictAllToDisk:
         store.set("b", _make_state(2))
         assert len(store) == 2
 
-        with patch(
-            "olmlx.engine.model_manager.save_prompt_cache"
-        ) as mock_save:
+        with patch("olmlx.engine.model_manager.save_prompt_cache") as mock_save:
             store.evict_all_to_disk()
             assert len(store) == 0
             assert mock_save.call_count == 2
@@ -297,9 +287,7 @@ class TestPromptCacheStoreEvictAllToDisk:
         )
         store.set("a", _make_state(1))
 
-        with patch(
-            "olmlx.engine.model_manager.save_prompt_cache"
-        ):
+        with patch("olmlx.engine.model_manager.save_prompt_cache"):
             store.evict_all_to_disk()
 
         # Simulate file exists on disk for restoration
