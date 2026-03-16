@@ -39,7 +39,13 @@ def _load_json_file(path: Path) -> dict:
         return {}
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
+        if not isinstance(data, dict):
+            logger.warning(
+                "Expected JSON object in %s, got %s", path, type(data).__name__
+            )
+            return {}
+        return data
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Failed to load JSON from %s: %s", path, exc)
         return {}

@@ -220,6 +220,7 @@ class StreamContext:
             self._thinking_chunks.append(token)
         else:
             self._chunks.append(token)
+        self._started = True  # re-arm so finish() emits trailing newline
         sys.stdout.write(token)
         sys.stdout.flush()
 
