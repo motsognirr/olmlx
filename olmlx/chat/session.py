@@ -304,42 +304,6 @@ class ChatSession:
                     }
                 )
 
-            # Prompt for confirmation on confirm tools
-            approved = []
-            for tu in confirm:
-                yield {
-                    "type": "tool_confirmation_needed",
-                    "name": tu["name"],
-                    "arguments": tu["input"],
-                    "id": tu["id"],
-                }
-                if await self.tool_safety.check_and_confirm(tu["name"], tu["input"]):
-                    approved.append(tu)
-                    yield {
-                        "type": "tool_approved",
-                        "name": tu["name"],
-                        "id": tu["id"],
-                    }
-                else:
-                    yield {
-                        "type": "tool_denied",
-                        "name": tu["name"],
-                        "arguments": tu["input"],
-                        "id": tu["id"],
-                        "reason": "user",
-                    }
-                    self.messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tu["id"],
-                            "name": tu["name"],
-                            "content": f"Tool '{tu['name']}' was not approved",
-                        }
-                    )
-
-            # Execute allowed + approved tools concurrently
-            to_execute = allow + approved
-
             async def _exec_tool(tu: dict) -> dict:
                 """Execute a single tool call and return the event + message."""
                 tool_name = tu["name"]
@@ -397,12 +361,49 @@ class ChatSession:
                         },
                     }
 
-            if to_execute:
-                results = await asyncio.gather(*(_exec_tool(tu) for tu in to_execute))
-                for r in results:
-                    yield r["call_event"]
-                    yield r["result_event"]
-                    self.messages.append(r["message"])
+            # Launch allow tools immediately (don't wait for confirm prompts)
+            allow_tasks = [asyncio.create_task(_exec_tool(tu)) for tu in allow]
+
+            # Prompt for confirmation on confirm tools
+            approved = []
+            for tu in confirm:
+                yield {
+                    "type": "tool_confirmation_needed",
+                    "name": tu["name"],
+                    "arguments": tu["input"],
+                    "id": tu["id"],
+                }
+                if await self.tool_safety.check_and_confirm(tu["name"], tu["input"]):
+                    approved.append(tu)
+                    yield {
+                        "type": "tool_approved",
+                        "name": tu["name"],
+                        "id": tu["id"],
+                    }
+                else:
+                    yield {
+                        "type": "tool_denied",
+                        "name": tu["name"],
+                        "arguments": tu["input"],
+                        "id": tu["id"],
+                        "reason": "user",
+                    }
+                    self.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tu["id"],
+                            "name": tu["name"],
+                            "content": f"Tool '{tu['name']}' was not approved",
+                        }
+                    )
+
+            # Await allow results + execute approved tools concurrently
+            approved_tasks = [asyncio.create_task(_exec_tool(tu)) for tu in approved]
+            all_results = await asyncio.gather(*allow_tasks, *approved_tasks)
+            for r in all_results:
+                yield r["call_event"]
+                yield r["result_event"]
+                self.messages.append(r["message"])
         else:
             # max_turns reached
             yield {"type": "max_turns_exceeded"}

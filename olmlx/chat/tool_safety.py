@@ -1,6 +1,6 @@
 """Tool safety policy for gating tool execution."""
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -21,20 +21,20 @@ class ToolSafetyConfig:
 class ToolSafetyPolicy:
     """Classifies tools by safety policy and gates execution."""
 
-    _BUILTIN_SAFE = {"use_skill"}
+    _BUILTIN_SAFE: frozenset[str] = frozenset({"use_skill"})
 
     def __init__(
         self,
         config: ToolSafetyConfig,
-        decider: Callable[[str, dict[str, Any]], Any] | None = None,
+        decider: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None,
     ):
         self.config = config
-        self.decider = decider  # async (name, args) -> bool
+        self.decider = decider
 
     @property
     def builtin_safe_tools(self) -> frozenset[str]:
         """Tools that are safe by default (no side effects)."""
-        return frozenset(self._BUILTIN_SAFE)
+        return self._BUILTIN_SAFE
 
     def get_policy(self, tool_name: str) -> ToolPolicy:
         if tool_name in self.config.tool_policies:
