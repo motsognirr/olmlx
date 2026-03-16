@@ -111,14 +111,14 @@ class ChatTUI:
         except (EOFError, KeyboardInterrupt):
             return False
 
-    def display_tool_denied(self, name: str) -> None:
+    def display_tool_denied(self, name: str, reason: str = "policy") -> None:
         """Show that a tool call was blocked."""
+        if reason == "user":
+            msg = f"{name} — denied by user"
+        else:
+            msg = f"{name} — blocked by safety policy"
         self.console.print(
-            Panel(
-                f"[dim]{name} — blocked by safety policy[/dim]",
-                title="tool denied",
-                border_style="dim",
-            )
+            Panel(f"[dim]{msg}[/dim]", title="tool denied", border_style="dim")
         )
 
     def display_safety_policy(self, policy: "ToolSafetyPolicy") -> None:

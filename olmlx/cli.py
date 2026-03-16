@@ -477,7 +477,9 @@ def cmd_chat(args):
                     elif event["type"] == "tool_error":
                         tui.display_tool_error(event["name"], event["error"])
                     elif event["type"] == "tool_denied":
-                        tui.display_tool_denied(event["name"])
+                        tui.display_tool_denied(
+                            event["name"], event.get("reason", "policy")
+                        )
                     elif event["type"] in ("tool_confirmation_needed", "tool_approved"):
                         pass  # handled inline by decider callback
                     elif event["type"] == "max_turns_exceeded":

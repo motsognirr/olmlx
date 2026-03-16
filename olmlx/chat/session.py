@@ -293,6 +293,7 @@ class ChatSession:
                     "name": tu["name"],
                     "arguments": tu["input"],
                     "id": tu["id"],
+                    "reason": "policy",
                 }
                 self.messages.append(
                     {
@@ -305,7 +306,6 @@ class ChatSession:
 
             # Prompt for confirmation on confirm tools
             approved = []
-            decider = self.tool_safety.decider if self.tool_safety else None
             for tu in confirm:
                 yield {
                     "type": "tool_confirmation_needed",
@@ -313,7 +313,7 @@ class ChatSession:
                     "arguments": tu["input"],
                     "id": tu["id"],
                 }
-                if decider and await decider(tu["name"], tu["input"]):
+                if await self.tool_safety.check_and_confirm(tu["name"], tu["input"]):
                     approved.append(tu)
                     yield {
                         "type": "tool_approved",
@@ -326,13 +326,14 @@ class ChatSession:
                         "name": tu["name"],
                         "arguments": tu["input"],
                         "id": tu["id"],
+                        "reason": "user",
                     }
                     self.messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tu["id"],
                             "name": tu["name"],
-                            "content": f"Tool '{tu['name']}' denied by user",
+                            "content": f"Tool '{tu['name']}' was not approved",
                         }
                     )
 

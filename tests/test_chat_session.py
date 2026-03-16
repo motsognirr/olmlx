@@ -1039,7 +1039,7 @@ class TestToolSafetyIntegration:
         assert len(denied) == 1
 
         tool_msgs = [m for m in session.messages if m["role"] == "tool"]
-        assert any("denied by user" in m["content"] for m in tool_msgs)
+        assert any("was not approved" in m["content"] for m in tool_msgs)
 
     @pytest.mark.asyncio
     async def test_allow_tools_skip_decider(self):
