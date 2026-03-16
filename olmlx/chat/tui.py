@@ -1,11 +1,17 @@
 """Rich-based terminal UI for chat."""
 
+from __future__ import annotations
+
 import json
 import logging
 import sys
+from typing import TYPE_CHECKING
 
 from rich.console import Console
 from rich.panel import Panel
+
+if TYPE_CHECKING:
+    from olmlx.chat.tool_safety import ToolSafetyPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +35,7 @@ class ChatTUI:
             lines.append("Tools: none (use --mcp-config or ~/.olmlx/mcp.json)")
         lines.append("")
         lines.append(
-            "Commands: /exit, /clear, /tools, /system <prompt>, "
+            "Commands: /exit, /clear, /tools, /safety, /system <prompt>, "
             "/model <name>, /model thinking on|off"
         )
         self.console.print(
@@ -96,6 +102,38 @@ class ChatTUI:
             Panel(f"[red]{message}[/red]", title="error", border_style="red")
         )
 
+    def confirm_tool_call(self, name: str, arguments: dict) -> bool:
+        """Prompt user to approve a tool call. Returns True if approved."""
+        self.display_tool_call(name, arguments)
+        try:
+            answer = self.console.input("[yellow]Allow? [y/N] [/yellow]")
+            return answer.strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+    def display_tool_denied(self, name: str, reason: str = "policy") -> None:
+        """Show that a tool call was blocked."""
+        if reason == "user":
+            msg = f"{name} — denied by user"
+        else:
+            msg = f"{name} — blocked by safety policy"
+        self.console.print(
+            Panel(f"[dim]{msg}[/dim]", title="tool denied", border_style="dim")
+        )
+
+    def display_safety_policy(self, policy: "ToolSafetyPolicy") -> None:
+        """Show current tool safety policy."""
+        lines = [f"Default policy: {policy.config.default_policy.value}"]
+        if policy.config.tool_policies:
+            for name, pol in sorted(policy.config.tool_policies.items()):
+                lines.append(f"  {name}: {pol.value}")
+        else:
+            lines.append("  (no per-tool overrides)")
+        lines.append("Local tools (skills, builtins): always allowed")
+        self.console.print(
+            Panel("\n".join(lines), title="tool safety", border_style="blue")
+        )
+
     def display_tools(self, tools: list[dict]) -> None:
         """Show available tools."""
         if not tools:
@@ -140,11 +178,19 @@ class StreamContext:
         return self
 
     def __exit__(self, *args):
+        self.finish()
+
+    @property
+    def is_active(self) -> bool:
+        """Whether the stream context is currently started."""
+        return self._started
+
+    def finish(self) -> None:
+        """End streaming output. Idempotent — safe to call multiple times."""
         if self._started:
             if self._in_thinking:
                 self._write_ansi(self._ITALIC_OFF)
                 self._in_thinking = False
-            # End the streaming line
             sys.stdout.write("\n")
             sys.stdout.flush()
             self._started = False
@@ -173,6 +219,11 @@ class StreamContext:
             self._thinking_chunks.append(token)
         else:
             self._chunks.append(token)
+        # Re-arm _started: when confirm_decider calls finish() mid-stream
+        # (ending the first model turn), the second turn's tokens still
+        # arrive through update(). Re-arming ensures __exit__ → finish()
+        # emits the trailing newline for the second turn's output.
+        self._started = True
         sys.stdout.write(token)
         sys.stdout.flush()
 

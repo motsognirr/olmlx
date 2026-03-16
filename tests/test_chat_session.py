@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from olmlx.chat.config import ChatConfig
 from olmlx.chat.session import ChatSession
 from olmlx.chat.skills import SkillManager
+from olmlx.chat.tool_safety import ToolPolicy, ToolSafetyConfig, ToolSafetyPolicy
 from olmlx.engine.template_caps import TemplateCaps
 
 
@@ -13,6 +14,7 @@ def _make_session(
     *,
     mcp=None,
     skills=None,
+    tool_safety=None,
     model_name="test:latest",
     thinking=True,
     max_turns=25,
@@ -33,7 +35,9 @@ def _make_session(
         has_thinking_tags=template_has_thinking,
     )
     manager.ensure_loaded = AsyncMock(return_value=loaded_model)
-    return ChatSession(config=config, manager=manager, mcp=mcp, skills=skills)
+    return ChatSession(
+        config=config, manager=manager, mcp=mcp, skills=skills, tool_safety=tool_safety
+    )
 
 
 class TestExtractThinkingContent:
@@ -835,3 +839,244 @@ class TestSkillIntegration:
         system_msgs = [m for m in session.messages if m["role"] == "system"]
         assert len(system_msgs) == 1
         assert "code-review" in system_msgs[0]["content"]
+
+
+class TestToolSafetyIntegration:
+    """Tests for tool safety policy integration in the agent loop."""
+
+    def _mcp_with_tools(self):
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delete_file",
+                    "description": "Delete a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            },
+        ]
+        mcp.call_tool = AsyncMock(return_value="tool result")
+        return mcp
+
+    @pytest.mark.asyncio
+    async def test_no_safety_policy_allows_all(self):
+        """Backward compat: no policy = all tools execute."""
+        mcp = self._mcp_with_tools()
+        session = _make_session(mcp=mcp, tool_safety=None)
+        call_count = 0
+
+        async def fake_generate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield {
+                    "text": '<tool_call>{"name": "write_file", "arguments": {"path": "/tmp/x"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": MagicMock()}
+            else:
+                yield {"text": "Done", "done": False}
+                yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            events = []
+            async for event in session.send_message("Write a file"):
+                events.append(event)
+
+        mcp.call_tool.assert_awaited_once()
+        result_events = [e for e in events if e["type"] == "tool_result"]
+        assert len(result_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_denied_tool_yields_tool_denied_event(self):
+        """Denied tools emit tool_denied event and feed error to model."""
+        mcp = self._mcp_with_tools()
+        config = ToolSafetyConfig(tool_policies={"delete_file": ToolPolicy.DENY})
+        policy = ToolSafetyPolicy(config)
+        session = _make_session(mcp=mcp, tool_safety=policy)
+        call_count = 0
+
+        async def fake_generate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield {
+                    "text": '<tool_call>{"name": "delete_file", "arguments": {"path": "/tmp/x"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": MagicMock()}
+            else:
+                yield {"text": "I cannot delete that file.", "done": False}
+                yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            events = []
+            async for event in session.send_message("Delete /tmp/x"):
+                events.append(event)
+
+        # Should have tool_denied event
+        denied = [e for e in events if e["type"] == "tool_denied"]
+        assert len(denied) == 1
+        assert denied[0]["name"] == "delete_file"
+
+        # MCP should NOT have been called for delete_file
+        mcp.call_tool.assert_not_awaited()
+
+        # Error fed back to model in messages
+        tool_msgs = [m for m in session.messages if m["role"] == "tool"]
+        assert any("blocked by safety policy" in m["content"] for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_confirmed_tool_executes_on_approval(self):
+        """Decider returns True -> tool runs."""
+        mcp = self._mcp_with_tools()
+
+        async def approve(name, args):
+            return True
+
+        config = ToolSafetyConfig(
+            default_policy=ToolPolicy.CONFIRM,
+            tool_policies={"read_file": ToolPolicy.ALLOW},
+        )
+        policy = ToolSafetyPolicy(config, decider=approve)
+        session = _make_session(mcp=mcp, tool_safety=policy)
+        call_count = 0
+
+        async def fake_generate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield {
+                    "text": '<tool_call>{"name": "write_file", "arguments": {"path": "/tmp/x"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": MagicMock()}
+            else:
+                yield {"text": "Done", "done": False}
+                yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            events = []
+            async for event in session.send_message("Write /tmp/x"):
+                events.append(event)
+
+        # Tool should have been called
+        mcp.call_tool.assert_awaited_once()
+        approved = [e for e in events if e["type"] == "tool_approved"]
+        assert len(approved) == 1
+
+    @pytest.mark.asyncio
+    async def test_confirmed_tool_blocked_by_user(self):
+        """Decider returns False -> tool doesn't run."""
+        mcp = self._mcp_with_tools()
+
+        async def deny(name, args):
+            return False
+
+        config = ToolSafetyConfig(default_policy=ToolPolicy.CONFIRM)
+        policy = ToolSafetyPolicy(config, decider=deny)
+        session = _make_session(mcp=mcp, tool_safety=policy)
+        call_count = 0
+
+        async def fake_generate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield {
+                    "text": '<tool_call>{"name": "write_file", "arguments": {"path": "/tmp/x"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": MagicMock()}
+            else:
+                yield {"text": "Cannot write.", "done": False}
+                yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            events = []
+            async for event in session.send_message("Write /tmp/x"):
+                events.append(event)
+
+        mcp.call_tool.assert_not_awaited()
+        denied = [e for e in events if e["type"] == "tool_denied"]
+        assert len(denied) == 1
+
+        tool_msgs = [m for m in session.messages if m["role"] == "tool"]
+        assert any("was not approved" in m["content"] for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_allow_tools_skip_decider(self):
+        """Safe tools execute without calling decider."""
+        mcp = self._mcp_with_tools()
+        decider_called = False
+
+        async def decider(name, args):
+            nonlocal decider_called
+            decider_called = True
+            return False
+
+        config = ToolSafetyConfig(tool_policies={"read_file": ToolPolicy.ALLOW})
+        policy = ToolSafetyPolicy(config, decider=decider)
+        session = _make_session(mcp=mcp, tool_safety=policy)
+        call_count = 0
+
+        async def fake_generate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield {
+                    "text": '<tool_call>{"name": "read_file", "arguments": {"path": "/tmp/x"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": MagicMock()}
+            else:
+                yield {"text": "File contents", "done": False}
+                yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            events = []
+            async for event in session.send_message("Read /tmp/x"):
+                events.append(event)
+
+        mcp.call_tool.assert_awaited_once()
+        assert not decider_called

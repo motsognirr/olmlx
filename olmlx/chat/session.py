@@ -11,6 +11,7 @@ from olmlx.chat.builtin_tools import BuiltinToolManager
 from olmlx.chat.config import ChatConfig
 from olmlx.chat.mcp_client import MCPClientManager
 from olmlx.chat.skills import SkillManager
+from olmlx.chat.tool_safety import ToolSafetyPolicy
 from olmlx.engine.inference import generate_chat
 from olmlx.engine.model_manager import ModelManager
 from olmlx.engine.tool_parser import parse_model_output
@@ -28,12 +29,14 @@ class ChatSession:
         mcp: MCPClientManager | None = None,
         skills: SkillManager | None = None,
         builtin: BuiltinToolManager | None = None,
+        tool_safety: ToolSafetyPolicy | None = None,
     ):
         self.config = config
         self.manager = manager
         self.mcp = mcp
         self.skills = skills
         self.builtin = builtin
+        self.tool_safety = tool_safety
         self.messages: list[dict] = []
 
         system_prompt = self._build_system_prompt()
@@ -276,7 +279,30 @@ class ChatSession:
             if not tool_uses or repetition_stopped:
                 break
 
-            # Execute tool calls concurrently
+            # Classify tools by safety policy.
+            # Local tools (skills, builtins) bypass the safety policy
+            # because they run in-process and were already trusted by
+            # the user when configured. Note: tool names come from model
+            # output (not MCP directly), so a prompt injection could
+            # cause the model to emit a local tool name — but local
+            # tools are no more dangerous than the model calling them
+            # without the safety layer.
+            local_tools = []
+            remote_tools = []
+            for tu in tool_uses:
+                if tu["name"] == "use_skill" and self.skills:
+                    local_tools.append(tu)
+                elif self.builtin and tu["name"] in self.builtin.tool_names:
+                    local_tools.append(tu)
+                else:
+                    remote_tools.append(tu)
+
+            if self.tool_safety:
+                allow, confirm, deny = self.tool_safety.classify_batch(remote_tools)
+                allow = local_tools + allow
+            else:
+                allow, confirm, deny = local_tools + remote_tools, [], []
+
             async def _exec_tool(tu: dict) -> dict:
                 """Execute a single tool call and return the event + message."""
                 tool_name = tu["name"]
@@ -334,11 +360,78 @@ class ChatSession:
                         },
                     }
 
-            results = await asyncio.gather(*(_exec_tool(tu) for tu in tool_uses))
-            for r in results:
-                yield r["call_event"]
-                yield r["result_event"]
-                self.messages.append(r["message"])
+            # Collect results by tool_call_id for call-order output.
+            # Events are yielded immediately (deny/confirm prompts),
+            # but messages are buffered and appended in call order.
+            results_by_id: dict[str, dict] = {}
+
+            # Handle denied tools
+            for tu in deny:
+                yield {
+                    "type": "tool_denied",
+                    "name": tu["name"],
+                    "arguments": tu["input"],
+                    "id": tu["id"],
+                    "reason": "policy",
+                }
+                results_by_id[tu["id"]] = {
+                    "message": {
+                        "role": "tool",
+                        "tool_call_id": tu["id"],
+                        "name": tu["name"],
+                        "content": f"Tool '{tu['name']}' is blocked by safety policy",
+                    },
+                }
+
+            # Prompt for confirmation on confirm tools
+            approved = []
+            for tu in confirm:
+                yield {
+                    "type": "tool_confirmation_needed",
+                    "name": tu["name"],
+                    "arguments": tu["input"],
+                    "id": tu["id"],
+                }
+                if await self.tool_safety.check_and_confirm(tu["name"], tu["input"]):
+                    approved.append(tu)
+                    yield {
+                        "type": "tool_approved",
+                        "name": tu["name"],
+                        "id": tu["id"],
+                    }
+                else:
+                    yield {
+                        "type": "tool_denied",
+                        "name": tu["name"],
+                        "arguments": tu["input"],
+                        "id": tu["id"],
+                        "reason": "user",
+                    }
+                    results_by_id[tu["id"]] = {
+                        "message": {
+                            "role": "tool",
+                            "tool_call_id": tu["id"],
+                            "name": tu["name"],
+                            "content": f"Tool '{tu['name']}' was not approved",
+                        },
+                    }
+
+            # Execute allowed + approved tools concurrently
+            to_execute = allow + approved
+            if to_execute:
+                exec_results = await asyncio.gather(
+                    *(_exec_tool(tu) for tu in to_execute)
+                )
+                for r in exec_results:
+                    yield r["call_event"]
+                    yield r["result_event"]
+                    results_by_id[r["message"]["tool_call_id"]] = r
+
+            # Append messages in original call order
+            for tu in tool_uses:
+                r = results_by_id.get(tu["id"])
+                if r:
+                    self.messages.append(r["message"])
         else:
             # max_turns reached
             yield {"type": "max_turns_exceeded"}
