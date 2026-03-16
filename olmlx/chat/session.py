@@ -360,6 +360,11 @@ class ChatSession:
                         },
                     }
 
+            # Collect results by tool_call_id for call-order output.
+            # Events are yielded immediately (deny/confirm prompts),
+            # but messages are buffered and appended in call order.
+            results_by_id: dict[str, dict] = {}
+
             # Handle denied tools
             for tu in deny:
                 yield {
@@ -369,14 +374,14 @@ class ChatSession:
                     "id": tu["id"],
                     "reason": "policy",
                 }
-                self.messages.append(
-                    {
+                results_by_id[tu["id"]] = {
+                    "message": {
                         "role": "tool",
                         "tool_call_id": tu["id"],
                         "name": tu["name"],
                         "content": f"Tool '{tu['name']}' is blocked by safety policy",
-                    }
-                )
+                    },
+                }
 
             # Prompt for confirmation on confirm tools
             approved = []
@@ -402,22 +407,30 @@ class ChatSession:
                         "id": tu["id"],
                         "reason": "user",
                     }
-                    self.messages.append(
-                        {
+                    results_by_id[tu["id"]] = {
+                        "message": {
                             "role": "tool",
                             "tool_call_id": tu["id"],
                             "name": tu["name"],
                             "content": f"Tool '{tu['name']}' was not approved",
-                        }
-                    )
+                        },
+                    }
 
             # Execute allowed + approved tools concurrently
             to_execute = allow + approved
             if to_execute:
-                results = await asyncio.gather(*(_exec_tool(tu) for tu in to_execute))
-                for r in results:
+                exec_results = await asyncio.gather(
+                    *(_exec_tool(tu) for tu in to_execute)
+                )
+                for r in exec_results:
                     yield r["call_event"]
                     yield r["result_event"]
+                    results_by_id[r["message"]["tool_call_id"]] = r
+
+            # Append messages in original call order
+            for tu in tool_uses:
+                r = results_by_id.get(tu["id"])
+                if r:
                     self.messages.append(r["message"])
         else:
             # max_turns reached
