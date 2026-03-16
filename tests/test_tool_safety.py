@@ -24,11 +24,11 @@ class TestToolPolicy:
         policy = ToolSafetyPolicy(config)
         assert policy.get_policy("delete_file") == ToolPolicy.DENY
 
-    def test_use_skill_default_allow(self):
-        """use_skill is safe by default even with defaultPolicy=confirm."""
+    def test_use_skill_follows_default_policy(self):
+        """use_skill is not special to the policy — handled by session instead."""
         config = ToolSafetyConfig(default_policy=ToolPolicy.CONFIRM)
         policy = ToolSafetyPolicy(config)
-        assert policy.get_policy("use_skill") == ToolPolicy.ALLOW
+        assert policy.get_policy("use_skill") == ToolPolicy.CONFIRM
 
     def test_config_override_default(self):
         """Explicit per-tool config overrides default policy."""
@@ -40,9 +40,12 @@ class TestToolPolicy:
         assert policy.get_policy("write_file") == ToolPolicy.CONFIRM
         assert policy.get_policy("other_tool") == ToolPolicy.ALLOW
 
-    def test_config_override_builtin_safe(self):
-        """Explicit config can override builtin safe tools."""
-        config = ToolSafetyConfig(tool_policies={"use_skill": ToolPolicy.DENY})
+    def test_config_override_per_tool(self):
+        """Per-tool config overrides default for any tool."""
+        config = ToolSafetyConfig(
+            default_policy=ToolPolicy.CONFIRM,
+            tool_policies={"use_skill": ToolPolicy.DENY},
+        )
         policy = ToolSafetyPolicy(config)
         assert policy.get_policy("use_skill") == ToolPolicy.DENY
 
@@ -62,10 +65,9 @@ class TestClassifyBatch:
             {"name": "read_file", "input": {}, "id": "1"},
             {"name": "write_file", "input": {}, "id": "2"},
             {"name": "delete_file", "input": {}, "id": "3"},
-            {"name": "use_skill", "input": {}, "id": "4"},
         ]
         allow, confirm, deny = policy.classify_batch(tool_uses)
-        assert [tu["name"] for tu in allow] == ["read_file", "use_skill"]
+        assert [tu["name"] for tu in allow] == ["read_file"]
         assert [tu["name"] for tu in confirm] == ["write_file"]
         assert [tu["name"] for tu in deny] == ["delete_file"]
 

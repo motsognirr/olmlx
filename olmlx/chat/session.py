@@ -280,13 +280,32 @@ class ChatSession:
                 break
 
             # Classify tools by safety policy
+            # Separate local tools (skills, builtins) from MCP tools.
+            # Local tools are always allowed — they're handled in-process
+            # and their names aren't attacker-controlled via MCP.
+            local_tools = []
+            remote_tools = []
+            for tu in tool_uses:
+                if tu["name"] == "use_skill" and self.skills:
+                    local_tools.append(tu)
+                elif self.builtin and tu["name"] in self.builtin.tool_names:
+                    local_tools.append(tu)
+                else:
+                    remote_tools.append(tu)
+
             if self.tool_safety:
-                allow, confirm, deny = self.tool_safety.classify_batch(tool_uses)
+                allow, confirm, deny = self.tool_safety.classify_batch(remote_tools)
+                allow = local_tools + allow
             else:
-                allow, confirm, deny = tool_uses, [], []
+                allow, confirm, deny = local_tools + remote_tools, [], []
 
             async def _exec_tool(tu: dict) -> dict:
-                """Execute a single tool call and return the event + message."""
+                """Execute a single tool call and return the event + message.
+
+                This function catches all exceptions internally so that
+                TaskGroup never sees an unhandled exception from tool
+                execution.
+                """
                 tool_name = tu["name"]
                 tool_input = tu["input"]
                 tool_id = tu["id"]
@@ -365,8 +384,10 @@ class ChatSession:
                     },
                 }
 
-            # Launch allow tools concurrently with confirm prompts
-            # TaskGroup cancels all tasks on any failure
+            # Launch allow tools concurrently with confirm prompts.
+            # This is safe because allow tools are explicitly marked safe
+            # by the user in config (or are local tools like use_skill).
+            # TaskGroup cancels all tasks on any failure.
             allow_tasks: dict[str, asyncio.Task] = {}
             async with asyncio.TaskGroup() as tg:
                 for tu in allow:

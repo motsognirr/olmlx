@@ -129,8 +129,7 @@ class ChatTUI:
                 lines.append(f"  {name}: {pol.value}")
         else:
             lines.append("  (no per-tool overrides)")
-        builtins = ", ".join(sorted(policy.builtin_safe_tools))
-        lines.append(f"Built-in safe: {builtins}")
+        lines.append("Local tools (skills, builtins): always allowed")
         self.console.print(
             Panel("\n".join(lines), title="tool safety", border_style="blue")
         )
@@ -220,7 +219,11 @@ class StreamContext:
             self._thinking_chunks.append(token)
         else:
             self._chunks.append(token)
-        self._started = True  # re-arm so finish() emits trailing newline
+        # Re-arm _started: when confirm_decider calls finish() mid-stream
+        # (ending the first model turn), the second turn's tokens still
+        # arrive through update(). Re-arming ensures __exit__ → finish()
+        # emits the trailing newline for the second turn's output.
+        self._started = True
         sys.stdout.write(token)
         sys.stdout.flush()
 

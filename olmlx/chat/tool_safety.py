@@ -19,9 +19,13 @@ class ToolSafetyConfig:
 
 
 class ToolSafetyPolicy:
-    """Classifies tools by safety policy and gates execution."""
+    """Classifies tools by safety policy and gates execution.
 
-    _BUILTIN_SAFE: frozenset[str] = frozenset({"use_skill"})
+    Policy is determined solely from user config (``ToolSafetyConfig``).
+    Tool source awareness (e.g. which tools are local vs MCP) belongs
+    in the caller — see ``ChatSession`` which separates local tools
+    before calling ``classify_batch``.
+    """
 
     def __init__(
         self,
@@ -31,16 +35,9 @@ class ToolSafetyPolicy:
         self.config = config
         self.decider = decider
 
-    @property
-    def builtin_safe_tools(self) -> frozenset[str]:
-        """Tools that are safe by default (no side effects)."""
-        return self._BUILTIN_SAFE
-
     def get_policy(self, tool_name: str) -> ToolPolicy:
         if tool_name in self.config.tool_policies:
             return self.config.tool_policies[tool_name]
-        if tool_name in self._BUILTIN_SAFE:
-            return ToolPolicy.ALLOW
         return self.config.default_policy
 
     def classify_batch(
@@ -59,6 +56,12 @@ class ToolSafetyPolicy:
         return allow, confirm, deny
 
     async def check_and_confirm(self, name: str, arguments: dict) -> bool:
+        """Check policy and prompt for confirmation if needed.
+
+        Intended for CONFIRM-classified tools but safe to call for any
+        policy — ALLOW returns True, DENY returns False without calling
+        the decider.
+        """
         policy = self.get_policy(name)
         if policy == ToolPolicy.ALLOW:
             return True
