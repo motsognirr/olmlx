@@ -16,6 +16,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_MAX_MESSAGE_BYTES = 64 * 1024 * 1024  # 64 MiB hard cap
+
 
 @dataclass
 class InferenceRequest:
@@ -66,6 +68,8 @@ def _recv_message(sock: socket.socket) -> dict | None:
     if header is None:
         return None
     (length,) = struct.unpack("!I", header)
+    if length > _MAX_MESSAGE_BYTES:
+        raise ValueError(f"Sideband message too large: {length} bytes")
     payload = _recv_exact(sock, length)
     if payload is None:
         return None
@@ -177,15 +181,31 @@ class DistributedCoordinator:
         max_tokens: int,
         gen_kwargs: dict[str, Any],
     ) -> None:
-        """Send inference parameters to all connected workers."""
+        """Send inference parameters to all connected workers.
+
+        Raises RuntimeError if any worker send fails — partial broadcasts
+        leave the cluster in an unrecoverable state (all_sum deadlock).
+        """
         msg = {
             "prompt_tokens": prompt_tokens,
             "max_tokens": max_tokens,
             "gen_kwargs": gen_kwargs,
             "action": "generate",
         }
-        for worker in self._workers:
-            _send_message(worker, msg)
+        for i, worker in enumerate(self._workers):
+            try:
+                _send_message(worker, msg)
+            except Exception:
+                logger.error(
+                    "Failed to broadcast to worker %d/%d — cluster is degraded",
+                    i + 1,
+                    len(self._workers),
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    f"Distributed broadcast failed: worker {i + 1}/{len(self._workers)} unreachable. "
+                    f"The cluster cannot recover — restart all nodes."
+                )
 
     def broadcast_shutdown(self) -> None:
         """Tell all workers to exit."""

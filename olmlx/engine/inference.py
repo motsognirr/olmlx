@@ -715,7 +715,7 @@ async def _stream_completion(
             }
 
         # Broadcast to distributed workers before starting generation
-        if _distributed_coordinator is not None:
+        if _distributed_coordinator is not None and lm.is_distributed:
             if isinstance(prompt, list):
                 _maybe_broadcast_distributed(lm, prompt, max_tokens, gen_kwargs)
             else:
@@ -912,14 +912,15 @@ async def _full_completion_inner(
     stats: TimingStats,
     images: list[str] | None = None,
 ) -> dict:
-    # Broadcast to distributed workers for non-streaming path
-    if _distributed_coordinator is not None:
-        tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
-        _maybe_broadcast_distributed(lm, tokens, max_tokens, gen_kwargs)
-
     def _generate_sync():
         """Run generate + synchronize in the same thread so GPU work completes
         before the thread returns to the pool."""
+        # Broadcast inside the thread so rank 0 and workers enter MLX
+        # computation at the same time (avoids all_sum timeout).
+        if _distributed_coordinator is not None and lm.is_distributed:
+            tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
+            _maybe_broadcast_distributed(lm, tokens, max_tokens, gen_kwargs)
+
         if lm.is_vlm:
             import mlx_vlm
 

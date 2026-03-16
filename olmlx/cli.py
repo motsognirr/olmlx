@@ -58,8 +58,16 @@ def cmd_serve(_args):
 _VALID_HOSTNAME_RE = __import__("re").compile(r"^[a-zA-Z0-9._-]+$")
 
 
+_worker_procs: list[subprocess.Popen] = []
+
+
 def _launch_distributed_workers():
-    """Launch worker processes on remote hosts via SSH for distributed inference."""
+    """Launch worker processes on remote hosts via SSH for distributed inference.
+
+    Stores Popen handles in _worker_procs for cleanup on failure/shutdown.
+    Requires passwordless SSH with pre-accepted host keys.
+    """
+    import atexit
     import shlex
 
     from olmlx.config import experimental
@@ -107,6 +115,15 @@ def _launch_distributed_workers():
     log_dir = Path.home() / ".olmlx"
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    def _cleanup_workers():
+        for proc in _worker_procs:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    atexit.register(_cleanup_workers)
+
     # Launch workers on remote hosts (rank 1..N)
     for rank, host in enumerate(hosts[1:], start=1):
         env = {
@@ -121,12 +138,21 @@ def _launch_distributed_workers():
         }
         env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
         remote_cmd = f"{env_str} python -m olmlx.engine.distributed_worker"
-        cmd = ["ssh", host, remote_cmd]
+        cmd = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            host,
+            remote_cmd,
+        ]
         log_file = log_dir / f"worker-{rank}.log"
         print(f"  Launching worker rank {rank} on {host} (log: {log_file})")
         log_fh = open(log_file, "w")
-        subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh)
+        proc = subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh)
         log_fh.close()
+        _worker_procs.append(proc)
 
 
 def _find_executable() -> str:

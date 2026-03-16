@@ -74,6 +74,10 @@ def worker_main() -> None:
     logger.info("Model sharded, ready signal sent, entering inference loop")
 
     # Main loop: wait for broadcast → run stream_generate → repeat
+    # Note: if rank 0 fails mid-inference (OOM, device error), workers will
+    # hang on all_sum indefinitely. This is an inherent MLX limitation —
+    # there is no timeout on collective operations. The worker must be
+    # killed externally (the atexit handler in cli.py handles this).
     try:
         while True:
             req = worker.wait_for_inference()
