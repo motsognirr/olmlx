@@ -2,7 +2,8 @@
 
 import json
 
-from olmlx.chat.config import ChatConfig, load_mcp_config
+from olmlx.chat.config import ChatConfig, load_mcp_config, load_tool_safety_config
+from olmlx.chat.tool_safety import ToolPolicy
 
 
 class TestChatConfig:
@@ -117,3 +118,58 @@ class TestLoadMcpConfig:
         config_path.write_text(json.dumps(config))
         result = load_mcp_config(config_path)
         assert result["server"]["env"] == {"API_KEY": "secret"}
+
+
+class TestLoadToolSafetyConfig:
+    def test_load_tool_safety_config(self, tmp_path):
+        """Parses toolSafety section from mcp.json."""
+        config = {
+            "mcpServers": {},
+            "toolSafety": {
+                "defaultPolicy": "allow",
+                "tools": {
+                    "write_file": "confirm",
+                    "delete_file": "deny",
+                },
+            },
+        }
+        config_path = tmp_path / "mcp.json"
+        config_path.write_text(json.dumps(config))
+        result = load_tool_safety_config(config_path)
+        assert result.default_policy == ToolPolicy.ALLOW
+        assert result.tool_policies["write_file"] == ToolPolicy.CONFIRM
+        assert result.tool_policies["delete_file"] == ToolPolicy.DENY
+
+    def test_load_tool_safety_missing(self, tmp_path):
+        """Returns default config when toolSafety absent."""
+        config = {"mcpServers": {}}
+        config_path = tmp_path / "mcp.json"
+        config_path.write_text(json.dumps(config))
+        result = load_tool_safety_config(config_path)
+        assert result.default_policy == ToolPolicy.CONFIRM
+        assert result.tool_policies == {}
+
+    def test_load_tool_safety_missing_file(self, tmp_path):
+        """Returns default config when file doesn't exist."""
+        result = load_tool_safety_config(tmp_path / "nonexistent.json")
+        assert result.default_policy == ToolPolicy.CONFIRM
+
+    def test_load_tool_safety_invalid_policy(self, tmp_path):
+        """Ignores invalid policy values."""
+        config = {
+            "toolSafety": {
+                "defaultPolicy": "invalid",
+                "tools": {
+                    "read_file": "allow",
+                    "write_file": "bad_value",
+                },
+            },
+        }
+        config_path = tmp_path / "mcp.json"
+        config_path.write_text(json.dumps(config))
+        result = load_tool_safety_config(config_path)
+        # Invalid default falls back to confirm
+        assert result.default_policy == ToolPolicy.CONFIRM
+        # Valid tool policy kept, invalid skipped
+        assert result.tool_policies["read_file"] == ToolPolicy.ALLOW
+        assert "write_file" not in result.tool_policies

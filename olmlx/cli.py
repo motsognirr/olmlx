@@ -279,9 +279,10 @@ def _configure_logging():
 
 def cmd_chat(args):
     """Start an interactive chat session."""
-    from olmlx.chat.config import ChatConfig, load_mcp_config
+    from olmlx.chat.config import ChatConfig, load_mcp_config, load_tool_safety_config
     from olmlx.chat.mcp_client import MCPClientManager
     from olmlx.chat.session import ChatSession
+    from olmlx.chat.tool_safety import ToolSafetyPolicy
     from olmlx.chat.tui import ChatTUI
     from olmlx.engine.model_manager import ModelManager
 
@@ -344,12 +345,25 @@ def cmd_chat(args):
             if config.builtin_tools_enabled:
                 builtin = BuiltinToolManager(config)
 
+            # Load tool safety policy
+            safety_config = load_tool_safety_config(config.mcp_config_path)
+            active_stream_ctx = None
+
+            async def confirm_decider(name: str, args: dict) -> bool:
+                nonlocal active_stream_ctx
+                if active_stream_ctx and active_stream_ctx.is_active:
+                    active_stream_ctx.finish()
+                return tui.confirm_tool_call(name, args)
+
+            policy = ToolSafetyPolicy(safety_config, decider=confirm_decider)
+
             session = ChatSession(
                 config=config,
                 manager=manager,
                 mcp=mcp,
                 skills=skills,
                 builtin=builtin,
+                tool_safety=policy,
             )
             tools = mcp.get_tools_for_chat() if mcp else []
             if builtin:
@@ -385,6 +399,8 @@ def cmd_chat(args):
                                 tui.console.print(f"  [cyan]{s.name}[/cyan]{desc}")
                         else:
                             tui.console.print("[dim]No skills loaded[/dim]")
+                    elif command == "/safety":
+                        tui.display_safety_policy(policy)
                     elif command == "/system":
                         if arg:
                             config.system_prompt = arg
@@ -435,6 +451,7 @@ def cmd_chat(args):
                 # Collect events while streaming tokens
                 pending_events = []
                 stream_ctx = tui.stream_response()
+                active_stream_ctx = stream_ctx
                 with stream_ctx:
                     async for event in session.send_message(user_input):
                         if event["type"] == "thinking_start":
@@ -448,6 +465,8 @@ def cmd_chat(args):
                         else:
                             pending_events.append(event)
 
+                active_stream_ctx = None
+
                 # Display collected events
                 for event in pending_events:
                     if event["type"] == "tool_call":
@@ -456,6 +475,10 @@ def cmd_chat(args):
                         tui.display_tool_result(event["name"], event["result"])
                     elif event["type"] == "tool_error":
                         tui.display_tool_error(event["name"], event["error"])
+                    elif event["type"] == "tool_denied":
+                        tui.display_tool_denied(event["name"])
+                    elif event["type"] in ("tool_confirmation_needed", "tool_approved"):
+                        pass  # handled inline by decider callback
                     elif event["type"] == "max_turns_exceeded":
                         tui.display_error("Max tool turns reached")
 
