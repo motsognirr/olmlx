@@ -233,6 +233,37 @@ response = client.chat(
 print(response["message"]["content"])
 ```
 
+## Vision-Language Models
+
+olmlx supports vision-language models (VLMs) that can process images alongside text. VLMs are automatically detected and loaded using mlx-vlm.
+
+### Using a VLM
+
+```bash
+# Chat with an image (base64-encoded in message)
+curl http://localhost:11434/api/chat -d '{
+  "model": "llava:13b",
+  "messages": [{
+    "role": "user",
+    "content": "What is in this image?",
+    "images": ["data:image/png;base64,iVBOR..."]
+  }]
+}'
+```
+
+### VLM Model Configuration
+
+Add VLM mappings to `~/.olmlx/models.json`:
+
+```json
+{
+  "llava:13b": "mlx-community/llava-llama-13b-hf",
+  "llava:7b": "mlx-community/llava-llama-7b-hf"
+}
+```
+
+VLMs are automatically detected by inspecting `config.json` for vision-related keys (`vision_config`, `vision_tower`, etc.) and loaded via mlx-vlm instead of mlx-lm.
+
 ## API Endpoints
 
 ### Ollama API
