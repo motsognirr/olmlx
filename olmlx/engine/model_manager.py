@@ -135,8 +135,11 @@ class PromptCacheStore:
             # Remove disk file after successful load
             file_path.unlink(missing_ok=True)
             state = CachedPromptState(tokens=tokens, cache=cache)
-            # Store in memory via set() to respect max_slots capacity
-            self.set(cache_id, state)
+            # Store in memory via set() to respect max_slots capacity.
+            # Delete the evicted entry to release GPU buffers promptly.
+            evicted = self.set(cache_id, state)
+            if evicted is not None:
+                del evicted
             logger.info(
                 "Restored cache '%s' from disk (%d tokens)",
                 cache_id,

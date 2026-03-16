@@ -146,10 +146,14 @@ class TestPromptCacheStoreDiskLoad:
         store.set("a", _make_state(1))
         assert len(store) == 1
 
-        # Simulate "b" on disk
-        with patch(
-            "olmlx.engine.model_manager.load_prompt_cache",
-            return_value=(["kv_b"], {"tokens": "[2]"}),
+        # Simulate "b" on disk — mock both load and save since loading "b"
+        # evicts "a" which triggers save_prompt_cache for "a"
+        with (
+            patch(
+                "olmlx.engine.model_manager.load_prompt_cache",
+                return_value=(["kv_b"], {"tokens": "[2]"}),
+            ),
+            patch("olmlx.engine.model_manager.save_prompt_cache") as mock_save,
         ):
             disk_file = store._disk_file_path("b")
             disk_file.parent.mkdir(parents=True, exist_ok=True)
@@ -159,6 +163,8 @@ class TestPromptCacheStoreDiskLoad:
             assert result is not None
             # Must not exceed max_slots
             assert len(store) <= 1
+            # "a" should have been saved to disk when evicted
+            mock_save.assert_called_once()
 
     def test_disk_file_deleted_after_load(self, tmp_path):
         """After loading from disk, the disk file should be removed."""
