@@ -31,6 +31,11 @@ class ToolSafetyPolicy:
         self.config = config
         self.decider = decider  # async (name, args) -> bool
 
+    @property
+    def builtin_safe_tools(self) -> frozenset[str]:
+        """Tools that are safe by default (no side effects)."""
+        return frozenset(self._BUILTIN_SAFE)
+
     def get_policy(self, tool_name: str) -> ToolPolicy:
         if tool_name in self.config.tool_policies:
             return self.config.tool_policies[tool_name]

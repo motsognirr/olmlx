@@ -289,12 +289,11 @@ class ChatSession:
             for tu in deny:
                 error_msg = f"Tool '{tu['name']}' is blocked by safety policy"
                 yield {
-                    "type": "tool_call",
+                    "type": "tool_denied",
                     "name": tu["name"],
                     "arguments": tu["input"],
                     "id": tu["id"],
                 }
-                yield {"type": "tool_denied", "name": tu["name"], "id": tu["id"]}
                 self.messages.append(
                     {
                         "role": "tool",
@@ -306,6 +305,7 @@ class ChatSession:
 
             # Prompt for confirmation on confirm tools
             approved = []
+            decider = self.tool_safety.decider if self.tool_safety else None
             for tu in confirm:
                 yield {
                     "type": "tool_confirmation_needed",
@@ -313,7 +313,7 @@ class ChatSession:
                     "arguments": tu["input"],
                     "id": tu["id"],
                 }
-                if await self.tool_safety.check_and_confirm(tu["name"], tu["input"]):
+                if decider and await decider(tu["name"], tu["input"]):
                     approved.append(tu)
                     yield {
                         "type": "tool_approved",
@@ -321,7 +321,12 @@ class ChatSession:
                         "id": tu["id"],
                     }
                 else:
-                    yield {"type": "tool_denied", "name": tu["name"], "id": tu["id"]}
+                    yield {
+                        "type": "tool_denied",
+                        "name": tu["name"],
+                        "arguments": tu["input"],
+                        "id": tu["id"],
+                    }
                     self.messages.append(
                         {
                             "role": "tool",

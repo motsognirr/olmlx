@@ -129,7 +129,7 @@ class ChatTUI:
                 lines.append(f"  {name}: {pol.value}")
         else:
             lines.append("  (no per-tool overrides)")
-        builtins = ", ".join(sorted(policy._BUILTIN_SAFE))
+        builtins = ", ".join(sorted(policy.builtin_safe_tools))
         lines.append(f"Built-in safe: {builtins}")
         self.console.print(
             Panel("\n".join(lines), title="tool safety", border_style="blue")

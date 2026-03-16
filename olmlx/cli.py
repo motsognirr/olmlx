@@ -353,7 +353,7 @@ def cmd_chat(args):
                 nonlocal active_stream_ctx
                 if active_stream_ctx and active_stream_ctx.is_active:
                     active_stream_ctx.finish()
-                return tui.confirm_tool_call(name, args)
+                return await asyncio.to_thread(tui.confirm_tool_call, name, args)
 
             policy = ToolSafetyPolicy(safety_config, decider=confirm_decider)
 
@@ -452,20 +452,21 @@ def cmd_chat(args):
                 pending_events = []
                 stream_ctx = tui.stream_response()
                 active_stream_ctx = stream_ctx
-                with stream_ctx:
-                    async for event in session.send_message(user_input):
-                        if event["type"] == "thinking_start":
-                            stream_ctx.start_thinking()
-                        elif event["type"] == "thinking_end":
-                            stream_ctx.end_thinking()
-                        elif event["type"] == "thinking_token":
-                            stream_ctx.update(event["text"])
-                        elif event["type"] == "token":
-                            stream_ctx.update(event["text"])
-                        else:
-                            pending_events.append(event)
-
-                active_stream_ctx = None
+                try:
+                    with stream_ctx:
+                        async for event in session.send_message(user_input):
+                            if event["type"] == "thinking_start":
+                                stream_ctx.start_thinking()
+                            elif event["type"] == "thinking_end":
+                                stream_ctx.end_thinking()
+                            elif event["type"] == "thinking_token":
+                                stream_ctx.update(event["text"])
+                            elif event["type"] == "token":
+                                stream_ctx.update(event["text"])
+                            else:
+                                pending_events.append(event)
+                finally:
+                    active_stream_ctx = None
 
                 # Display collected events
                 for event in pending_events:
