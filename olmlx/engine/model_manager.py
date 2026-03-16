@@ -473,10 +473,14 @@ class ModelManager:
                     if timeout is not None:
                         load_task = asyncio.create_task(coro)
                         try:
-                            model, tokenizer, is_vlm, caps, is_distributed = (
-                                await asyncio.wait_for(
-                                    asyncio.shield(load_task), timeout=timeout
-                                )
+                            (
+                                model,
+                                tokenizer,
+                                is_vlm,
+                                caps,
+                                is_distributed,
+                            ) = await asyncio.wait_for(
+                                asyncio.shield(load_task), timeout=timeout
                             )
                         except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
                             # The background thread continues running — Python

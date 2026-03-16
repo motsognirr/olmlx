@@ -719,7 +719,11 @@ async def _stream_completion(
             if isinstance(prompt, list):
                 _maybe_broadcast_distributed(lm, prompt, max_tokens, gen_kwargs)
             else:
-                tokens = prompt_tokens if prompt_tokens is not None else _tokenize_for_cache(lm.text_tokenizer, prompt)
+                tokens = (
+                    prompt_tokens
+                    if prompt_tokens is not None
+                    else _tokenize_for_cache(lm.text_tokenizer, prompt)
+                )
                 _maybe_broadcast_distributed(lm, tokens, max_tokens, gen_kwargs)
 
         stream = async_mlx_stream(

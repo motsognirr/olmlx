@@ -1,12 +1,10 @@
 """Tests for experimental distributed inference."""
 
-import json
 import socket
-import struct
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -275,7 +273,6 @@ class TestCoordinatorWorkerIntegration:
         from olmlx.engine.distributed import (
             DistributedCoordinator,
             DistributedWorker,
-            InferenceRequest,
         )
 
         coordinator = DistributedCoordinator(world_size=2, port=0)
@@ -383,7 +380,6 @@ class TestInferenceDistributedBroadcast:
 
     def test_set_distributed_coordinator(self):
         from olmlx.engine.inference import (
-            _distributed_coordinator,
             set_distributed_coordinator,
         )
 
@@ -479,7 +475,6 @@ class TestInferenceBroadcast:
     def test_broadcast_called_before_streaming(self):
         """When coordinator is set and model is distributed, broadcast should happen."""
         from olmlx.engine.inference import (
-            _distributed_coordinator,
             set_distributed_coordinator,
         )
 
@@ -492,9 +487,7 @@ class TestInferenceBroadcast:
             lm = MagicMock()
             lm.is_distributed = True
 
-            _maybe_broadcast_distributed(
-                lm, [1, 2, 3], 100, {"temp": 0.7}
-            )
+            _maybe_broadcast_distributed(lm, [1, 2, 3], 100, {"temp": 0.7})
 
             mock_coordinator.broadcast_inference.assert_called_once_with(
                 prompt_tokens=[1, 2, 3],

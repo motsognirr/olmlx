@@ -155,7 +155,7 @@ class DistributedCoordinator:
                 msg = _recv_message(conn)
                 if msg is None or msg.get("action") != "ready":
                     raise TimeoutError(
-                        f"Worker {i+1} sent unexpected message instead of ready: {msg}"
+                        f"Worker {i + 1} sent unexpected message instead of ready: {msg}"
                     )
                 self._workers.append(conn)
                 conn.settimeout(None)

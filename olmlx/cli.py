@@ -102,9 +102,7 @@ def _launch_distributed_workers():
 
     world_size = len(hosts)
     coordinator_host = hosts[0]
-    print(
-        f"Distributed mode: {world_size} nodes, coordinator={coordinator_host}"
-    )
+    print(f"Distributed mode: {world_size} nodes, coordinator={coordinator_host}")
 
     log_dir = Path.home() / ".olmlx"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -121,9 +119,7 @@ def _launch_distributed_workers():
             "MLX_WORLD_SIZE": str(world_size),
             "MLX_PORT": str(experimental.distributed_port),
         }
-        env_str = " ".join(
-            f"{k}={shlex.quote(v)}" for k, v in env.items()
-        )
+        env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
         remote_cmd = f"{env_str} python -m olmlx.engine.distributed_worker"
         cmd = ["ssh", host, remote_cmd]
         log_file = log_dir / f"worker-{rank}.log"
