@@ -108,6 +108,12 @@ class CancellableStream:
                     gen.close()
                 except Exception:
                     pass
+                gen = None
+
+            # Release the factory closure which captures model, tokenizer,
+            # and prompt — these can be large and should not be pinned by
+            # the stream object after the thread exits.
+            self._gen_factory = None
 
             # Sync both the generation stream and the default stream.
             # mlx_lm and mlx_vlm run GPU work on their own module-level
@@ -230,6 +236,50 @@ class CancellableStream:
         return item
 
 
+def _make_prefill_progress(
+    cancel_event: threading.Event,
+    memory_limit: int = 0,
+    mx_module: Any = None,
+) -> Callable[[float], bool]:
+    """Create a prefill progress callback that checks cancellation and memory.
+
+    Args:
+        cancel_event: Threading event to signal cancellation.
+        memory_limit: Metal memory limit in bytes. 0 disables memory checking.
+        mx_module: The mlx.core module (injectable for testing).
+
+    Returns:
+        Callback that returns False to abort prefill.
+    """
+    # Resolve mx once at creation time, not per-callback invocation
+    if mx_module is None and memory_limit > 0:
+        import mlx.core as mx_module
+    last_check_progress = 0.0
+
+    def _prefill_progress(progress: float) -> bool:
+        nonlocal last_check_progress
+        if cancel_event.is_set():
+            return False
+        # Check memory periodically (every ~5% progress)
+        if memory_limit > 0 and progress - last_check_progress >= 0.05:
+            last_check_progress = progress
+            try:
+                current = mx_module.get_active_memory() + mx_module.get_cache_memory()
+                if current > memory_limit:
+                    logger.warning(
+                        "Aborting prefill at %.0f%%: Metal memory %.1f GB exceeds limit %.1f GB",
+                        progress * 100,
+                        current / 1024**3,
+                        memory_limit / 1024**3,
+                    )
+                    return False
+            except Exception:
+                pass
+        return True
+
+    return _prefill_progress
+
+
 def async_mlx_stream(
     model: Any,
     tokenizer: Any,
@@ -237,6 +287,7 @@ def async_mlx_stream(
     max_tokens: int = 512,
     is_vlm: bool = False,
     images: list[str] | None = None,
+    memory_limit: int = 0,
     **kwargs: Any,
 ) -> CancellableStream:
     """Bridge sync mlx_lm/mlx_vlm stream_generate into an async iterable.
@@ -278,11 +329,9 @@ def async_mlx_stream(
             gen_kwargs.pop("prompt_progress_callback", None)  # we control this below
 
             if use_prefill_callback:
-
-                def _prefill_progress(progress: float) -> bool:
-                    return not cancel_event.is_set()
-
-                gen_kwargs["prompt_progress_callback"] = _prefill_progress
+                gen_kwargs["prompt_progress_callback"] = _make_prefill_progress(
+                    cancel_event, memory_limit=memory_limit
+                )
 
             return mlx_lm.stream_generate(model, tokenizer, **gen_kwargs)
 
