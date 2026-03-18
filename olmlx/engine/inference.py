@@ -752,6 +752,7 @@ async def _stream_completion(
                 if current_metal + kv_bytes > memory_limit:
                     # Drop cached KV tensors so eviction + gc can reclaim them
                     had_cache = gen_kwargs.pop("prompt_cache", None) is not None
+                    gen_kwargs.pop("input_ids", None)  # VLMs: force re-tokenize from string prompt
                     lm.prompt_cache_store.evict_all_to_disk()
                     gc.collect()
                     mx.clear_cache()
@@ -766,9 +767,6 @@ async def _stream_completion(
                         )
                         if full_prompt_tokens is not None and not lm.is_vlm:
                             prompt = full_prompt_tokens
-                        # VLMs: popping input_ids is sufficient — mlx_vlm will
-                        # re-tokenize the original string prompt including images.
-                        gen_kwargs.pop("input_ids", None)
                     # Sync Metal to ensure freed buffers are reclaimed before re-reading
                     _safe_sync()
                     current_metal = _get_metal_memory()
