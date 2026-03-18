@@ -1,6 +1,6 @@
 """Distributed inference sideband coordination.
 
-Only imported when EXPERIMENTAL_DISTRIBUTED=true. Uses simple TCP sockets
+Only imported when OLMLX_EXPERIMENTAL_DISTRIBUTED=true. Uses simple TCP sockets
 with length-prefixed JSON messages for coordinator↔worker communication.
 """
 
@@ -94,9 +94,14 @@ class DistributedCoordinator:
     """Rank 0 sideband server that broadcasts inference params to workers."""
 
     def __init__(
-        self, world_size: int, port: int = 32400, bind: str = "0.0.0.0"
+        self,
+        world_size: int,
+        port: int = 32400,
+        bind: str = "0.0.0.0",
+        secret: str | None = None,
     ) -> None:
         self._world_size = world_size
+        self._secret = secret
         self._workers: list[socket.socket] = []
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -169,9 +174,18 @@ class DistributedCoordinator:
                 if msg is None or msg.get("action") != "ready":
                     for s in pending[i:]:
                         s.close()
-                    raise TimeoutError(
+                    raise RuntimeError(
                         f"Worker {i + 1} sent unexpected message instead of ready: {msg}"
                     )
+                # Validate shared secret if configured
+                if self._secret is not None:
+                    if msg.get("secret") != self._secret:
+                        for s in pending[i:]:
+                            s.close()
+                        raise RuntimeError(
+                            f"Worker {i + 1} provided invalid secret — "
+                            f"rejecting connection"
+                        )
                 self._workers.append(conn)
                 conn.settimeout(None)
                 logger.info(
@@ -186,7 +200,9 @@ class DistributedCoordinator:
                     f"Timed out waiting for workers to report ready "
                     f"({len(self._workers)}/{expected} ready)"
                 )
-        self._server.settimeout(None)
+        # Issue 12: Close server socket — no more connections expected
+        self._server.close()
+        logger.info("All workers connected, server socket closed")
 
     def broadcast_inference(
         self,
@@ -233,8 +249,16 @@ class DistributedCoordinator:
                         _send_message(self._workers[j], shutdown_msg)
                     except Exception:
                         pass
+                # Clean up all worker sockets — cluster is unrecoverable
+                num_workers = len(self._workers)
+                for w in self._workers:
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+                self._workers.clear()
                 raise RuntimeError(
-                    f"Distributed broadcast failed: worker {i + 1}/{len(self._workers)} unreachable. "
+                    f"Distributed broadcast failed: worker {i + 1}/{num_workers} unreachable. "
                     f"The cluster cannot recover — restart all nodes."
                 )
 
@@ -276,9 +300,12 @@ class DistributedWorker:
         self._sock.settimeout(None)
         logger.info("Connected to coordinator at %s:%d", coordinator_host, port)
 
-    def send_ready(self) -> None:
+    def send_ready(self, secret: str | None = None) -> None:
         """Signal to coordinator that this worker has loaded and sharded its model."""
-        _send_message(self._sock, {"action": "ready"})
+        msg: dict[str, Any] = {"action": "ready"}
+        if secret is not None:
+            msg["secret"] = secret
+        _send_message(self._sock, msg)
 
     def wait_for_inference(self) -> InferenceRequest | None:
         """Block until next broadcast. Returns None on shutdown."""

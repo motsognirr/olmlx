@@ -9,9 +9,12 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from olmlx.config import settings
+
+logger = logging.getLogger(__name__)
 
 PLIST_LABEL = "com.dpalmqvist.olmlx"
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{PLIST_LABEL}.plist"
@@ -59,6 +62,16 @@ _VALID_HOSTNAME_RE = __import__("re").compile(r"^[a-zA-Z0-9._-]+$")
 
 
 _worker_procs: list[subprocess.Popen] = []
+_atexit_registered = False
+
+
+def _cleanup_workers():
+    """Terminate all distributed worker processes."""
+    for proc in _worker_procs:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
 
 
 def _launch_distributed_workers():
@@ -116,24 +129,22 @@ def _launch_distributed_workers():
     log_dir = Path.home() / ".olmlx"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    def _cleanup_workers():
-        for proc in _worker_procs:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+    global _atexit_registered
 
-    atexit.register(_cleanup_workers)
+    if not _atexit_registered:
+        atexit.register(_cleanup_workers)
+        _atexit_registered = True
 
     # Launch workers on remote hosts (rank 1..N)
     for rank, host in enumerate(hosts[1:], start=1):
         env = {
-            "EXPERIMENTAL_DISTRIBUTED_MODEL": model,
-            "EXPERIMENTAL_DISTRIBUTED_BACKEND": experimental.distributed_backend,
-            "EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST": coordinator_host,
-            "EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT": str(
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_MODEL": model,
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND": experimental.distributed_backend,
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST": coordinator_host,
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT": str(
                 experimental.distributed_sideband_port
             ),
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET": experimental.distributed_secret,
             "MLX_RANK": str(rank),
             "MLX_WORLD_SIZE": str(world_size),
             "MLX_PORT": str(experimental.distributed_port),
@@ -152,9 +163,21 @@ def _launch_distributed_workers():
         log_file = log_dir / f"worker-{rank}.log"
         print(f"  Launching worker rank {rank} on {host} (log: {log_file})")
         log_fh = open(log_file, "w")
-        proc = subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh)
+        try:
+            proc = subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh)
+        except Exception:
+            log_fh.close()
+            raise
         log_fh.close()
         _worker_procs.append(proc)
+
+    # Check for immediate SSH failures
+    time.sleep(1)
+    for proc in _worker_procs:
+        if proc.poll() is not None:
+            logger.error("Worker process exited immediately (rc=%d)", proc.returncode)
+            _cleanup_workers()
+            raise RuntimeError("Worker SSH launch failed — check worker logs")
 
 
 def _find_executable() -> str:

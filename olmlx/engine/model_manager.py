@@ -809,6 +809,15 @@ class ModelManager:
         is_distributed = False
 
         if self._distributed_group is not None:
+            if is_vlm:
+                del model, tokenizer
+                gc.collect()
+                mx.clear_cache()
+                raise ValueError(
+                    f"VLM models are not supported in distributed mode. "
+                    f"Model {hf_path} is a vision-language model which cannot "
+                    f"be sharded correctly across workers."
+                )
             if hasattr(model, "shard"):
                 model.shard(self._distributed_group)
                 is_distributed = True

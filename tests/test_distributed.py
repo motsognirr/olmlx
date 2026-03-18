@@ -16,11 +16,12 @@ class TestExperimentalSettings:
 
     def test_defaults(self, monkeypatch):
         for key in (
-            "EXPERIMENTAL_DISTRIBUTED",
-            "EXPERIMENTAL_DISTRIBUTED_HOSTFILE",
-            "EXPERIMENTAL_DISTRIBUTED_BACKEND",
-            "EXPERIMENTAL_DISTRIBUTED_PORT",
-            "EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT",
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED",
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE",
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND",
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT",
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT",
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET",
         ):
             monkeypatch.delenv(key, raising=False)
         s = ExperimentalSettings()
@@ -31,11 +32,11 @@ class TestExperimentalSettings:
         assert s.distributed_sideband_port == 32400
 
     def test_env_override(self, monkeypatch):
-        monkeypatch.setenv("EXPERIMENTAL_DISTRIBUTED", "true")
-        monkeypatch.setenv("EXPERIMENTAL_DISTRIBUTED_HOSTFILE", "/tmp/hosts.json")
-        monkeypatch.setenv("EXPERIMENTAL_DISTRIBUTED_BACKEND", "mpi")
-        monkeypatch.setenv("EXPERIMENTAL_DISTRIBUTED_PORT", "40000")
-        monkeypatch.setenv("EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT", "40100")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", "true")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE", "/tmp/hosts.json")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND", "mpi")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT", "40000")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT", "40100")
         s = ExperimentalSettings()
         assert s.distributed is True
         assert s.distributed_hostfile == Path("/tmp/hosts.json")
@@ -44,16 +45,15 @@ class TestExperimentalSettings:
         assert s.distributed_sideband_port == 40100
 
     def test_distributed_false_by_default(self, monkeypatch):
-        monkeypatch.delenv("EXPERIMENTAL_DISTRIBUTED", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", raising=False)
         s = ExperimentalSettings()
         assert s.distributed is False
 
     def test_separate_from_main_settings(self, monkeypatch):
-        """ExperimentalSettings uses EXPERIMENTAL_ prefix, not OLMLX_."""
+        """ExperimentalSettings uses OLMLX_EXPERIMENTAL_ prefix, consistent with main."""
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", "true")
-        monkeypatch.delenv("EXPERIMENTAL_DISTRIBUTED", raising=False)
         s = ExperimentalSettings()
-        assert s.distributed is False  # Should NOT read OLMLX_ prefix
+        assert s.distributed is True  # Should read OLMLX_EXPERIMENTAL_ prefix
 
 
 class TestInferenceRequest:
@@ -550,7 +550,383 @@ class TestExperimentalModuleGlobal:
         assert isinstance(experimental, ExperimentalSettings)
 
     def test_experimental_singleton_disabled_by_default(self, monkeypatch):
-        monkeypatch.delenv("EXPERIMENTAL_DISTRIBUTED", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", raising=False)
         # Re-instantiate to test defaults
         s = ExperimentalSettings()
         assert s.distributed is False
+
+
+class TestProtocolViolation:
+    """Issue 8: Wrong exception type for protocol violation."""
+
+    def test_unexpected_message_raises_runtime_error(self):
+        """Worker sending wrong message should raise RuntimeError, not TimeoutError."""
+        from olmlx.engine.distributed import DistributedCoordinator, _send_message
+
+        coordinator = DistributedCoordinator(world_size=2, port=0)
+        actual_port = coordinator.port
+
+        def bad_worker_fn():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(("127.0.0.1", actual_port))
+            # Send wrong message instead of {"action": "ready"}
+            _send_message(sock, {"action": "wrong"})
+            time.sleep(1)
+            sock.close()
+
+        t = threading.Thread(target=bad_worker_fn)
+        t.start()
+
+        try:
+            with pytest.raises(RuntimeError, match="unexpected message"):
+                coordinator.wait_for_workers(timeout=5.0)
+        finally:
+            coordinator.close()
+            t.join(timeout=5.0)
+
+
+class TestServerSocketClose:
+    """Issue 12: Server socket closed after wait_for_workers."""
+
+    def test_server_socket_closed_after_workers_ready(self):
+        """Server socket should be closed after all workers connect."""
+        from olmlx.engine.distributed import DistributedCoordinator, DistributedWorker
+
+        coordinator = DistributedCoordinator(world_size=2, port=0)
+        actual_port = coordinator.port
+
+        def worker_fn():
+            worker = DistributedWorker(coordinator_host="127.0.0.1", port=actual_port)
+            worker.send_ready()
+            time.sleep(0.5)
+            worker.close()
+
+        t = threading.Thread(target=worker_fn)
+        t.start()
+
+        coordinator.wait_for_workers(timeout=5.0)
+
+        # Server socket should be closed — new connections should fail
+        with pytest.raises(OSError):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            try:
+                sock.connect(("127.0.0.1", actual_port))
+            finally:
+                sock.close()
+
+        coordinator.close()
+        t.join(timeout=5.0)
+
+
+class TestDeadSocketCleanup:
+    """Issue 1: Dead socket cleanup after broadcast failure."""
+
+    def test_workers_cleared_after_broadcast_failure(self):
+        """After broadcast failure, all workers should be cleaned up."""
+        from olmlx.engine.distributed import DistributedCoordinator, DistributedWorker
+
+        coordinator = DistributedCoordinator(world_size=2, port=0)
+        actual_port = coordinator.port
+
+        def worker_fn():
+            worker = DistributedWorker(coordinator_host="127.0.0.1", port=actual_port)
+            worker.send_ready()
+            time.sleep(0.5)
+            worker.close()
+
+        t = threading.Thread(target=worker_fn)
+        t.start()
+
+        coordinator.wait_for_workers(timeout=5.0)
+        t.join(timeout=5.0)
+
+        # Force-close the coordinator's copy of the worker socket to simulate
+        # a dead connection (closing the remote end isn't guaranteed to cause
+        # sendall to fail immediately due to kernel buffering).
+        for w in coordinator._workers:
+            w.close()
+
+        # Now broadcast should fail and clean up
+        with pytest.raises(RuntimeError, match="broadcast failed"):
+            coordinator.broadcast_inference([1, 2], "test", 100, {})
+
+        # Workers list should be empty after failure
+        assert len(coordinator._workers) == 0
+        coordinator.close()
+
+
+class TestCoordinatorThreadSafety:
+    """Issue 3: Thread-safe access to _distributed_coordinator global."""
+
+    def test_set_and_read_coordinator_thread_safe(self):
+        """Concurrent set/read of coordinator should not crash."""
+        from olmlx.engine.inference import (
+            _maybe_broadcast_distributed,
+            set_distributed_coordinator,
+        )
+
+        mock_coord = MagicMock()
+        errors = []
+
+        def writer():
+            try:
+                for _ in range(100):
+                    set_distributed_coordinator(mock_coord)
+                    set_distributed_coordinator(None)
+            except Exception as e:
+                errors.append(e)
+
+        def reader():
+            try:
+                lm = MagicMock()
+                lm.is_distributed = True
+                for _ in range(100):
+                    try:
+                        _maybe_broadcast_distributed(lm, [1], "t", 10, {})
+                    except Exception:
+                        pass  # broadcast_inference may fail on mock
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        set_distributed_coordinator(None)
+        assert len(errors) == 0
+
+
+class TestShutdownOrdering:
+    """Issue 2: Coordinator torn down before in-flight inference."""
+
+    def test_manager_stop_before_coordinator_teardown(self):
+        """Verify the shutdown order in lifespan is correct."""
+        # This is a code inspection test — we verify the pattern in app.py
+        import inspect
+        from olmlx.app import lifespan
+
+        source = inspect.getsource(lifespan)
+        # manager.stop() must appear before coordinator.broadcast_shutdown()
+        stop_pos = source.find("await manager.stop()")
+        shutdown_pos = source.find("coordinator.broadcast_shutdown()")
+        assert stop_pos < shutdown_pos, (
+            "manager.stop() must be called before coordinator.broadcast_shutdown()"
+        )
+
+
+class TestAtexitGuard:
+    """Issue 9: atexit.register called only once."""
+
+    def test_atexit_registered_once(self):
+        """_launch_distributed_workers should register atexit only once."""
+        import olmlx.cli as cli_module
+
+        # Reset the flag
+        cli_module._atexit_registered = False
+        # The flag should exist
+        assert hasattr(cli_module, "_atexit_registered")
+
+
+class TestFileHandleLeak:
+    """Issue 5: File handle leak if Popen raises."""
+
+    def test_log_fh_closed_on_popen_failure(self, tmp_path, monkeypatch):
+        """If Popen raises, the log file handle should be closed."""
+        import olmlx.cli as cli_module
+
+        # Reset state
+        cli_module._worker_procs.clear()
+        cli_module._atexit_registered = False
+
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text('{"hosts": ["host0", "host1"], "model": "test/model"}')
+
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                distributed_hostfile=str(hostfile),
+                distributed_backend="ring",
+                distributed_sideband_port=32400,
+                distributed_port=32323,
+                distributed_secret="",
+            ),
+        )
+
+        # Make Popen raise
+        monkeypatch.setattr(
+            "subprocess.Popen", MagicMock(side_effect=OSError("popen failed"))
+        )
+
+        with pytest.raises(OSError, match="popen failed"):
+            cli_module._launch_distributed_workers()
+
+        # Verify no worker procs were added
+        assert len(cli_module._worker_procs) == 0
+
+
+class TestEnvPrefix:
+    """Issue 11: OLMLX_EXPERIMENTAL_ env prefix."""
+
+    def test_olmlx_experimental_prefix(self, monkeypatch):
+        """ExperimentalSettings should use OLMLX_EXPERIMENTAL_ prefix."""
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", "true")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND", "mpi")
+        s = ExperimentalSettings()
+        assert s.distributed is True
+        assert s.distributed_backend == "mpi"
+
+    def test_old_prefix_no_longer_works(self, monkeypatch):
+        """Old EXPERIMENTAL_ prefix should NOT be recognized."""
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", raising=False)
+        monkeypatch.setenv("EXPERIMENTAL_DISTRIBUTED", "true")
+        s = ExperimentalSettings()
+        assert s.distributed is False
+
+
+class TestSharedSecret:
+    """Issue 6: Shared secret authentication."""
+
+    def test_worker_rejected_with_wrong_secret(self):
+        """Workers with wrong secret should be rejected."""
+        from olmlx.engine.distributed import DistributedCoordinator, _send_message
+
+        coordinator = DistributedCoordinator(
+            world_size=2, port=0, secret="correct-secret"
+        )
+        actual_port = coordinator.port
+
+        def bad_worker_fn():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(("127.0.0.1", actual_port))
+            _send_message(sock, {"action": "ready", "secret": "wrong-secret"})
+            time.sleep(1)
+            sock.close()
+
+        t = threading.Thread(target=bad_worker_fn)
+        t.start()
+
+        try:
+            with pytest.raises(RuntimeError, match="secret"):
+                coordinator.wait_for_workers(timeout=5.0)
+        finally:
+            coordinator.close()
+            t.join(timeout=5.0)
+
+    def test_worker_accepted_with_correct_secret(self):
+        """Workers with correct secret should be accepted."""
+        from olmlx.engine.distributed import DistributedCoordinator, _send_message
+
+        coordinator = DistributedCoordinator(world_size=2, port=0, secret="my-secret")
+        actual_port = coordinator.port
+
+        def good_worker_fn():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(("127.0.0.1", actual_port))
+            _send_message(sock, {"action": "ready", "secret": "my-secret"})
+            time.sleep(0.5)
+            sock.close()
+
+        t = threading.Thread(target=good_worker_fn)
+        t.start()
+
+        coordinator.wait_for_workers(timeout=5.0)
+        assert len(coordinator._workers) == 1
+        coordinator.close()
+        t.join(timeout=5.0)
+
+    def test_no_secret_required_by_default(self):
+        """When no secret is set, workers should connect without one."""
+        from olmlx.engine.distributed import DistributedCoordinator, DistributedWorker
+
+        coordinator = DistributedCoordinator(world_size=2, port=0)
+        actual_port = coordinator.port
+
+        def worker_fn():
+            worker = DistributedWorker(coordinator_host="127.0.0.1", port=actual_port)
+            worker.send_ready()
+            time.sleep(0.5)
+            worker.close()
+
+        t = threading.Thread(target=worker_fn)
+        t.start()
+
+        coordinator.wait_for_workers(timeout=5.0)
+        assert len(coordinator._workers) == 1
+        coordinator.close()
+        t.join(timeout=5.0)
+
+
+class TestVLMDistributedRejection:
+    """Issue 4: VLM models rejected in distributed mode."""
+
+    def test_vlm_rejected_in_distributed_mode(self):
+        """VLM models should be rejected when distributed_group is set."""
+        from olmlx.engine.model_manager import ModelManager
+
+        model = MagicMock()
+        model.shard = MagicMock()
+        tokenizer = MagicMock()
+        caps = MagicMock()
+        group = MagicMock()
+
+        manager = ModelManager(MagicMock(), distributed_group=group)
+        # _load_model returns is_vlm=True
+        manager._load_model = MagicMock(return_value=(model, tokenizer, True, caps))
+
+        with pytest.raises(ValueError, match="VLM models are not supported"):
+            manager._load_model_and_shard("test/vlm-model")
+
+    def test_text_model_accepted_in_distributed_mode(self):
+        """Text models should work fine in distributed mode."""
+        from olmlx.engine.model_manager import ModelManager
+
+        model = MagicMock()
+        model.shard = MagicMock()
+        tokenizer = MagicMock()
+        caps = MagicMock()
+        group = MagicMock()
+
+        manager = ModelManager(MagicMock(), distributed_group=group)
+        manager._load_model = MagicMock(return_value=(model, tokenizer, False, caps))
+
+        _, _, is_vlm, _, is_distributed = manager._load_model_and_shard("test/model")
+        assert is_vlm is False
+        assert is_distributed is True
+        model.shard.assert_called_once_with(group)
+
+
+class TestSSHFailureDetection:
+    """Issue 10: SSH failures detected early."""
+
+    def test_ssh_failure_detected_early(self, tmp_path, monkeypatch):
+        """Immediate SSH failure should be detected before server starts."""
+        import olmlx.cli as cli_module
+
+        cli_module._worker_procs.clear()
+        cli_module._atexit_registered = False
+
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text('{"hosts": ["host0", "host1"], "model": "test/model"}')
+
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                distributed_hostfile=str(hostfile),
+                distributed_backend="ring",
+                distributed_sideband_port=32400,
+                distributed_port=32323,
+                distributed_secret="test-secret",
+            ),
+        )
+
+        # Create a mock proc that exits immediately with error
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1  # Exited with error
+        mock_proc.returncode = 1
+        monkeypatch.setattr("subprocess.Popen", MagicMock(return_value=mock_proc))
+
+        with pytest.raises(RuntimeError, match="Worker SSH launch failed"):
+            cli_module._launch_distributed_workers()

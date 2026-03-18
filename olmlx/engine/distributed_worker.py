@@ -5,9 +5,10 @@ loads the model, shards it, then runs stream_generate in lockstep
 with rank 0 for each inference request.
 
 Environment variables:
-    EXPERIMENTAL_DISTRIBUTED_MODEL: HF model path to load
-    EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST: rank 0 hostname
-    EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT: coordinator sideband port
+    OLMLX_EXPERIMENTAL_DISTRIBUTED_MODEL: HF model path to load
+    OLMLX_EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST: rank 0 hostname
+    OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT: coordinator sideband port
+    OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET: shared secret for authentication
 """
 
 from __future__ import annotations
@@ -30,20 +31,21 @@ def worker_main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    model_path = os.environ.get("EXPERIMENTAL_DISTRIBUTED_MODEL")
+    model_path = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_MODEL")
     if not model_path:
-        logger.error("EXPERIMENTAL_DISTRIBUTED_MODEL not set")
+        logger.error("OLMLX_EXPERIMENTAL_DISTRIBUTED_MODEL not set")
         sys.exit(1)
 
     coordinator_host = os.environ.get(
-        "EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST", "127.0.0.1"
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST", "127.0.0.1"
     )
     sideband_port = int(
-        os.environ.get("EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT", "32400")
+        os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT", "32400")
     )
+    secret = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET", "") or None
 
     # Initialize MLX distributed
-    backend = os.environ.get("EXPERIMENTAL_DISTRIBUTED_BACKEND", "ring")
+    backend = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND", "ring")
     group = mx.distributed.init(backend=backend)
     rank = group.rank()
     world_size = group.size()
@@ -71,7 +73,7 @@ def worker_main() -> None:
         sys.exit(1)
 
     model.shard(group)
-    worker.send_ready()
+    worker.send_ready(secret=secret)
     logger.info("Model sharded, ready signal sent, entering inference loop")
 
     # Main loop: wait for broadcast → run stream_generate → repeat

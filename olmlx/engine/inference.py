@@ -5,6 +5,7 @@ import importlib
 import json
 import logging
 import os
+import threading
 import time
 import collections.abc
 from collections.abc import AsyncGenerator
@@ -37,14 +38,16 @@ from olmlx.utils.timing import Timer, TimingStats
 logger = logging.getLogger(__name__)
 
 # -- Experimental: Distributed inference coordinator --
-# Only set when EXPERIMENTAL_DISTRIBUTED=true; see set_distributed_coordinator().
+# Only set when OLMLX_EXPERIMENTAL_DISTRIBUTED=true; see set_distributed_coordinator().
 _distributed_coordinator = None
+_distributed_coordinator_lock = threading.Lock()
 
 
 def set_distributed_coordinator(coordinator):
     """Set the distributed coordinator for broadcasting inference to workers."""
     global _distributed_coordinator
-    _distributed_coordinator = coordinator
+    with _distributed_coordinator_lock:
+        _distributed_coordinator = coordinator
 
 
 def _maybe_broadcast_distributed(
@@ -55,8 +58,10 @@ def _maybe_broadcast_distributed(
     gen_kwargs: dict,
 ) -> None:
     """Broadcast inference params to distributed workers if applicable."""
-    if _distributed_coordinator is not None and lm.is_distributed:
-        _distributed_coordinator.broadcast_inference(
+    with _distributed_coordinator_lock:
+        coord = _distributed_coordinator
+    if coord is not None and lm.is_distributed:
+        coord.broadcast_inference(
             prompt_tokens=prompt_tokens,
             prompt_text=prompt_text,
             max_tokens=max_tokens,
@@ -610,6 +615,9 @@ async def _stream_completion(
     cache_read_tokens = 0
     cache_creation_tokens = 0
     full_prompt_tokens: list[int] | None = None
+    # Save original string prompt before cache setup may replace it with token IDs.
+    # prompt is always str at entry; cache setup may later reassign it to list[int].
+    original_prompt = prompt
     try:
         # Memory pressure check — invalidate cache to prevent Metal OOM
         memory_too_high = (
@@ -721,20 +729,18 @@ async def _stream_completion(
 
         # Broadcast to distributed workers before starting generation.
         # Workers need prompt_text (str) because mlx_lm.stream_generate
-        # expects a string prompt, not token IDs.
-        if _distributed_coordinator is not None and lm.is_distributed:
-            if isinstance(prompt, list):
-                broadcast_text = lm.text_tokenizer.decode(prompt)
-                _maybe_broadcast_distributed(
-                    lm, prompt, broadcast_text, max_tokens, gen_kwargs
-                )
-            else:
-                tokens = (
-                    prompt_tokens
-                    if prompt_tokens is not None
-                    else _tokenize_for_cache(lm.text_tokenizer, prompt)
-                )
-                _maybe_broadcast_distributed(lm, tokens, prompt, max_tokens, gen_kwargs)
+        # expects a string prompt, not token IDs. Always use original_prompt
+        # (the original string before cache manipulation may have replaced it
+        # with token IDs) to avoid tokenizer round-trip mismatches.
+        if lm.is_distributed:
+            tokens = (
+                prompt_tokens
+                if prompt_tokens is not None
+                else _tokenize_for_cache(lm.text_tokenizer, original_prompt)
+            )
+            _maybe_broadcast_distributed(
+                lm, tokens, original_prompt, max_tokens, gen_kwargs
+            )
 
         stream = async_mlx_stream(
             lm.model,
@@ -927,7 +933,7 @@ async def _full_completion_inner(
         before the thread returns to the pool."""
         # Broadcast inside the thread so rank 0 and workers enter MLX
         # computation at the same time (avoids all_sum timeout).
-        if _distributed_coordinator is not None and lm.is_distributed:
+        if lm.is_distributed:
             tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
             _maybe_broadcast_distributed(lm, tokens, prompt, max_tokens, gen_kwargs)
 

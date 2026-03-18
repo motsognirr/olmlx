@@ -58,6 +58,7 @@ async def lifespan(app: FastAPI):
         coordinator = DistributedCoordinator(
             world_size=world_size,
             port=experimental.distributed_sideband_port,
+            secret=experimental.distributed_secret or None,
         )
         import asyncio
 
@@ -80,14 +81,14 @@ async def lifespan(app: FastAPI):
     logger.info("olmlx server started on %s:%d", settings.host, settings.port)
     yield
 
-    # Shutdown
+    # Shutdown — drain in-flight requests before tearing down coordinator
+    await manager.stop()
     if coordinator is not None:
         coordinator.broadcast_shutdown()
         coordinator.close()
         from olmlx.engine.inference import set_distributed_coordinator
 
         set_distributed_coordinator(None)
-    await manager.stop()
     logger.info("olmlx server stopped")
 
 
