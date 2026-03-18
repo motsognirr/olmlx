@@ -110,7 +110,12 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
     manager = request.app.state.model_manager
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
     if req.response_format and req.response_format.type == "json_object":
-        messages.append({"role": "system", "content": JSON_MODE_SYSTEM_MSG})
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = messages[0]["content"] + "\n\n" + JSON_MODE_SYSTEM_MSG
+        else:
+            messages.insert(0, {"role": "system", "content": JSON_MODE_SYSTEM_MSG})
+    elif req.response_format and req.response_format.type == "json_schema":
+        logger.warning("response_format type 'json_schema' is not enforced; output may not conform to the provided schema")
     options = _build_options(req)
     max_tokens = req.max_completion_tokens or req.max_tokens or 512
     chat_id = _make_id()

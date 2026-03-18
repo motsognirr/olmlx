@@ -1,6 +1,7 @@
 """Tests for olmlx.routers.openai."""
 
 import json
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -304,7 +305,7 @@ class TestResponseFormat:
 
         assert resp.status_code == 200
         messages = mock_gen.call_args[0][2]
-        assert messages[-1] == {"role": "system", "content": JSON_MODE_SYSTEM_MSG}
+        assert messages[0] == {"role": "system", "content": JSON_MODE_SYSTEM_MSG}
 
     @pytest.mark.asyncio
     async def test_json_mode_streaming(self, app_client):
@@ -330,7 +331,57 @@ class TestResponseFormat:
 
         assert resp.status_code == 200
         messages = mock_gen.call_args[0][2]
-        assert messages[-1] == {"role": "system", "content": JSON_MODE_SYSTEM_MSG}
+        assert messages[0] == {"role": "system", "content": JSON_MODE_SYSTEM_MSG}
+
+    @pytest.mark.asyncio
+    async def test_json_mode_merges_existing_system_message(self, app_client):
+        mock_result = {"text": '{"a": 1}', "done": True, "stats": TimingStats()}
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [
+                        {"role": "system", "content": "You are helpful."},
+                        {"role": "user", "content": "give me json"},
+                    ],
+                    "response_format": {"type": "json_object"},
+                },
+            )
+
+        assert resp.status_code == 200
+        messages = mock_gen.call_args[0][2]
+        assert messages[0]["role"] == "system"
+        assert "You are helpful." in messages[0]["content"]
+        assert JSON_MODE_SYSTEM_MSG in messages[0]["content"]
+        assert len([m for m in messages if m["role"] == "system"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_json_schema_logs_warning(self, app_client, caplog):
+        mock_result = {"text": '{"a": 1}', "done": True, "stats": TimingStats()}
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            with caplog.at_level(logging.WARNING, logger="olmlx.routers.openai"):
+                resp = await app_client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "qwen3",
+                        "messages": [{"role": "user", "content": "give me json"}],
+                        "response_format": {"type": "json_schema", "json_schema": {"name": "test", "schema": {"type": "object"}}},
+                    },
+                )
+
+        assert resp.status_code == 200
+        assert "json_schema" in caplog.text
+        messages = mock_gen.call_args[0][2]
+        assert not any(m.get("content") == JSON_MODE_SYSTEM_MSG for m in messages)
 
     @pytest.mark.asyncio
     async def test_response_format_text_no_injection(self, app_client):
