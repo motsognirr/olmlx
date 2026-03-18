@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from olmlx.schemas.common import ModelName
 
@@ -19,6 +19,12 @@ class OpenAIChatMessage(BaseModel):
 class ResponseFormat(BaseModel):
     type: Literal["text", "json_object", "json_schema"] = "text"
     json_schema: dict | None = None
+
+    @model_validator(mode="after")
+    def _json_schema_required(self) -> "ResponseFormat":
+        if self.type == "json_schema" and self.json_schema is None:
+            raise ValueError("json_schema is required when type is 'json_schema'")
+        return self
 
 
 class OpenAIChatRequest(BaseModel):
