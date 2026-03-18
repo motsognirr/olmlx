@@ -191,7 +191,9 @@ def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
     num_layers = args.num_hidden_layers
     num_heads = args.num_attention_heads
     num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
-    head_dim = getattr(args, "head_dim", args.hidden_size // num_heads)
+    head_dim = (
+        args.head_dim if hasattr(args, "head_dim") else args.hidden_size // num_heads
+    )
     bytes_per_element = 2  # float16/bfloat16
     return num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
 
@@ -758,9 +760,10 @@ async def _stream_completion(
                     if had_cache and cache_read_tokens > 0:
                         estimate_tokens = cache_read_tokens + num_prefill_tokens
                         kv_bytes = _estimate_kv_cache_bytes(lm.model, estimate_tokens)
-                        if full_prompt_tokens is not None:
+                        if full_prompt_tokens is not None and not lm.is_vlm:
                             prompt = full_prompt_tokens
-                        # VLMs use input_ids (which still holds suffix only)
+                        # VLMs: popping input_ids is sufficient — mlx_vlm will
+                        # re-tokenize the original string prompt including images.
                         gen_kwargs.pop("input_ids", None)
                     # Sync Metal to ensure freed buffers are reclaimed before re-reading
                     _safe_sync()

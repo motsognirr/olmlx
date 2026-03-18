@@ -1335,7 +1335,7 @@ class TestEstimateKvCacheBytes:
         model = self._make_model()
         assert _estimate_kv_cache_bytes(model, 0) == 0
 
-    def test_no_gqa_fallback(self):
+    def test_gqa_fallback_to_mha(self):
         """When num_key_value_heads is missing, fall back to num_attention_heads."""
         model = MagicMock()
         model.args = MagicMock(spec=[])
