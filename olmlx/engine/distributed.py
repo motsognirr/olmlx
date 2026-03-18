@@ -91,7 +91,12 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
 
 
 class DistributedCoordinator:
-    """Rank 0 sideband server that broadcasts inference params to workers."""
+    """Rank 0 sideband server that broadcasts inference params to workers.
+
+    Security: the shared secret is sent in plaintext over TCP. This provides
+    authentication against accidental connections, not confidentiality.
+    Deploy on a trusted network or use SSH tunnels for encryption.
+    """
 
     def __init__(
         self,

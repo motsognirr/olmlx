@@ -732,14 +732,21 @@ async def _stream_completion(
         # expects a string prompt, not token IDs. Always use original_prompt
         # (the original string before cache manipulation may have replaced it
         # with token IDs) to avoid tokenizer round-trip mismatches.
+        # Strip prompt_cache and input_ids — these are local MLX objects
+        # that cannot be serialized to JSON for the sideband protocol.
         if lm.is_distributed:
             tokens = (
                 prompt_tokens
                 if prompt_tokens is not None
                 else _tokenize_for_cache(lm.text_tokenizer, original_prompt)
             )
+            broadcast_kwargs = {
+                k: v
+                for k, v in gen_kwargs.items()
+                if k not in ("prompt_cache", "input_ids")
+            }
             _maybe_broadcast_distributed(
-                lm, tokens, original_prompt, max_tokens, gen_kwargs
+                lm, tokens, original_prompt, max_tokens, broadcast_kwargs
             )
 
         stream = async_mlx_stream(
@@ -1060,9 +1067,15 @@ async def generate_chat(
     gen_kwargs = _build_generate_kwargs(options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
-    # Prompt caching: streaming only, when enabled
+    # Prompt caching: streaming only, when enabled.
+    # Disabled in distributed mode because rank 0 processes only suffix tokens
+    # on cache hits while workers process the full prompt, causing all_sum
+    # call count mismatch and deadlock.
     use_prompt_cache = (
-        settings.prompt_cache and stream and make_prompt_cache is not None
+        settings.prompt_cache
+        and stream
+        and make_prompt_cache is not None
+        and not lm.is_distributed
     )
     prompt_tokens = None
     if use_prompt_cache:

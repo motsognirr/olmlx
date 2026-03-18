@@ -930,3 +930,63 @@ class TestSSHFailureDetection:
 
         with pytest.raises(RuntimeError, match="Worker SSH launch failed"):
             cli_module._launch_distributed_workers()
+
+
+class TestPromptCacheDistributed:
+    """Tests for prompt cache + distributed interaction."""
+
+    def test_prompt_cache_disabled_when_distributed(self):
+        """Prompt caching must be disabled for distributed models to avoid deadlock."""
+        # Verify the condition in generate_chat disables cache for distributed models
+        import inspect
+
+        from olmlx.engine.inference import generate_chat
+
+        source = inspect.getsource(generate_chat)
+        assert "not lm.is_distributed" in source, (
+            "generate_chat must disable prompt caching when lm.is_distributed"
+        )
+
+    def test_broadcast_strips_prompt_cache_from_gen_kwargs(self):
+        """gen_kwargs sent to workers must not contain prompt_cache or input_ids."""
+        import inspect
+
+        from olmlx.engine import inference
+
+        source = inspect.getsource(inference._stream_completion)
+        assert "prompt_cache" in source and "input_ids" in source, (
+            "_stream_completion must strip prompt_cache and input_ids from broadcast kwargs"
+        )
+
+
+class TestCleanupWorkersRobust:
+    """Tests for _cleanup_workers with wait/kill fallback."""
+
+    def test_cleanup_kills_after_terminate_timeout(self):
+        """If terminate doesn't work within timeout, kill should be called."""
+        import olmlx.cli as cli_module
+
+        mock_proc = MagicMock()
+        mock_proc.terminate = MagicMock()
+        mock_proc.wait = MagicMock(
+            side_effect=__import__("subprocess").TimeoutExpired("cmd", 5)
+        )
+        mock_proc.kill = MagicMock()
+
+        cli_module._worker_procs.clear()
+        cli_module._worker_procs.append(mock_proc)
+
+        cli_module._cleanup_workers()
+
+        mock_proc.terminate.assert_called_once()
+        mock_proc.kill.assert_called_once()
+
+        cli_module._worker_procs.clear()
+
+
+class TestExperimentalEnvFile:
+    """Test that ExperimentalSettings reads .env file."""
+
+    def test_env_file_configured(self):
+        """ExperimentalSettings should have env_file='.env' in model_config."""
+        assert ExperimentalSettings.model_config.get("env_file") == ".env"

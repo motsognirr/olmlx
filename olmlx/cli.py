@@ -70,6 +70,9 @@ def _cleanup_workers():
     for proc in _worker_procs:
         try:
             proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
         except Exception:
             pass
 
@@ -171,8 +174,8 @@ def _launch_distributed_workers():
         log_fh.close()
         _worker_procs.append(proc)
 
-    # Check for immediate SSH failures
-    time.sleep(1)
+    # Check for immediate SSH failures (auth errors, bad host, etc.)
+    time.sleep(0.2)
     for proc in _worker_procs:
         if proc.poll() is not None:
             logger.error("Worker process exited immediately (rc=%d)", proc.returncode)

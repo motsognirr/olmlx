@@ -43,7 +43,7 @@ settings = Settings()
 
 
 class ExperimentalSettings(BaseSettings):
-    model_config = {"env_prefix": "OLMLX_EXPERIMENTAL_"}
+    model_config = {"env_prefix": "OLMLX_EXPERIMENTAL_", "env_file": ".env"}
 
     distributed: bool = False
     distributed_hostfile: Path = Path("~/.olmlx/hostfile.json")
