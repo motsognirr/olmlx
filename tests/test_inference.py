@@ -1302,16 +1302,19 @@ class TestEstimateKvCacheBytes:
         num_attention_heads=32,
         num_key_value_heads=8,
         hidden_size=4096,
+        head_dim=None,
     ):
-        args = MagicMock()
+        args = MagicMock(spec=[])
         args.num_hidden_layers = num_hidden_layers
         args.num_attention_heads = num_attention_heads
         args.num_key_value_heads = num_key_value_heads
         args.hidden_size = hidden_size
+        if head_dim is not None:
+            args.head_dim = head_dim
         return args
 
     def _make_model(self, **kwargs):
-        model = MagicMock()
+        model = MagicMock(spec=[])
         model.args = self._make_model_args(**kwargs)
         return model
 
@@ -1358,6 +1361,19 @@ class TestEstimateKvCacheBytes:
         # expected = 28 * 2 * 4 * 128 * 22000 * 2 = 1_261_568_000 (~1.2 GB)
         result = _estimate_kv_cache_bytes(model, 22000)
         assert result == 1_261_568_000
+
+    def test_explicit_head_dim(self):
+        """When model.args.head_dim exists, use it instead of hidden_size // num_heads."""
+        model = self._make_model(
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            hidden_size=4096,
+            head_dim=256,
+        )
+        # expected = 32 * 2 * 8 * 256 * 100 * 2 = 26_214_400
+        result = _estimate_kv_cache_bytes(model, 100)
+        assert result == 26_214_400
 
 
 class TestKvCachePreflightCheck:

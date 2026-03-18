@@ -308,6 +308,8 @@ def async_mlx_stream(
                 "prompt_progress_callback"
                 in inspect.signature(mlx_lm.stream_generate).parameters
             )
+    # VLMs excluded: mlx_vlm.stream_generate doesn't support prompt_progress_callback.
+    # VLMs still get the pre-flight check in inference.py before streaming starts.
     use_prefill_callback = not is_vlm and _has_prefill_callback
 
     def gen_factory(cancel_event: threading.Event):

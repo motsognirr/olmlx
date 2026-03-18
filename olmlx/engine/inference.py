@@ -191,7 +191,7 @@ def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
     num_layers = args.num_hidden_layers
     num_heads = args.num_attention_heads
     num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
-    head_dim = args.hidden_size // num_heads
+    head_dim = getattr(args, "head_dim", args.hidden_size // num_heads)
     bytes_per_element = 2  # float16/bfloat16
     return num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
 
@@ -607,6 +607,7 @@ async def _stream_completion(
     cache_read_tokens = 0
     cache_creation_tokens = 0
     full_prompt_tokens: list[int] | None = None
+    cache_setup_done = False
     try:
         # Memory pressure check — invalidate cache to prevent Metal OOM
         memory_too_high = (
@@ -709,24 +710,30 @@ async def _stream_completion(
                 else:
                     prompt = prompt_tokens
 
+            cache_setup_done = True
+
             # Release the cached reference — on cache miss the old
             # CachedPromptState was removed from the store but this local
             # variable still pins its KV cache tensors in GPU memory.
             del cached
 
-            # Yield cache stats as first chunk so routers can use them
-            yield {
-                "cache_info": True,
-                "cache_read_tokens": cache_read_tokens,
-                "cache_creation_tokens": cache_creation_tokens,
-            }
-
         # Pre-flight KV cache memory check — estimate how much GPU memory
         # the KV cache will need and reject if it would exceed the limit.
         # This prevents uncatchable Metal OOM crashes during prefill.
-        num_prefill_tokens = cache_creation_tokens if cache_creation_tokens > 0 else (
-            len(prompt) if isinstance(prompt, list) else 0
-        )
+        # MUST run before yielding cache_info, because that yield starts
+        # the HTTP response — after which we can't return a clean 503.
+        if cache_creation_tokens > 0:
+            num_prefill_tokens = cache_creation_tokens
+        elif isinstance(prompt, list):
+            num_prefill_tokens = len(prompt)
+        elif isinstance(prompt, str):
+            # VLM or non-cached path — tokenize to get a count
+            try:
+                num_prefill_tokens = len(lm.text_tokenizer.encode(prompt))
+            except Exception:
+                num_prefill_tokens = 0
+        else:
+            num_prefill_tokens = 0
         memory_limit = 0
         if _TOTAL_PHYSICAL_MEMORY > 0 and num_prefill_tokens > 0:
             try:
@@ -750,6 +757,15 @@ async def _stream_completion(
                 raise
             except Exception:
                 logger.debug("KV cache pre-flight check skipped", exc_info=True)
+
+        # Yield cache stats after the pre-flight check so routers can
+        # use them.  This starts the HTTP response — no 503 after this.
+        if cache_setup_done:
+            yield {
+                "cache_info": True,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_creation_tokens": cache_creation_tokens,
+            }
 
         stream = async_mlx_stream(
             lm.model,
