@@ -9,6 +9,7 @@ import pytest
 import olmlx.engine.inference as _inf_mod
 from olmlx.engine.inference import (
     _build_generate_kwargs,
+    _estimate_kv_cache_bytes,
     _extract_images,
     _inference_lock,
     _inference_locked,
@@ -1290,3 +1291,287 @@ class TestAwaitDeferredCleanup:
             with contextlib.suppress(asyncio.CancelledError):
                 await _inf_mod._deferred_cleanup_task
             _inf_mod._deferred_cleanup_task = None
+
+
+class TestEstimateKvCacheBytes:
+    """Tests for _estimate_kv_cache_bytes()."""
+
+    def _make_model_args(
+        self,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        hidden_size=4096,
+        head_dim=None,
+    ):
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = num_hidden_layers
+        args.num_attention_heads = num_attention_heads
+        args.num_key_value_heads = num_key_value_heads
+        args.hidden_size = hidden_size
+        if head_dim is not None:
+            args.head_dim = head_dim
+        return args
+
+    def _make_model(self, **kwargs):
+        model = MagicMock(spec=[])
+        model.args = self._make_model_args(**kwargs)
+        return model
+
+    def test_basic_estimate(self):
+        """KV cache bytes = layers * 2 * kv_heads * head_dim * tokens * 2."""
+        model = self._make_model(
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            hidden_size=4096,
+        )
+        # head_dim = 4096 / 32 = 128
+        # expected = 32 * 2 * 8 * 128 * 1000 * 2 = 131_072_000
+        result = _estimate_kv_cache_bytes(model, 1000)
+        assert result == 131_072_000
+
+    def test_zero_tokens(self):
+        model = self._make_model()
+        assert _estimate_kv_cache_bytes(model, 0) == 0
+
+    def test_gqa_fallback_to_mha(self):
+        """When num_key_value_heads is missing, fall back to num_attention_heads."""
+        model = MagicMock()
+        model.args = MagicMock(spec=[])
+        model.args.num_hidden_layers = 32
+        model.args.num_attention_heads = 32
+        model.args.hidden_size = 4096
+        # Delete num_key_value_heads so hasattr returns False
+        del model.args.num_key_value_heads
+        # head_dim = 128, kv_heads = 32 (fallback)
+        # expected = 32 * 2 * 32 * 128 * 100 * 2 = 52_428_800
+        result = _estimate_kv_cache_bytes(model, 100)
+        assert result == 52_428_800
+
+    def test_large_prompt(self):
+        """Test with a 22k token prompt (the crash scenario)."""
+        model = self._make_model(
+            num_hidden_layers=28,
+            num_attention_heads=28,
+            num_key_value_heads=4,
+            hidden_size=3584,
+        )
+        # head_dim = 3584 / 28 = 128
+        # expected = 28 * 2 * 4 * 128 * 22000 * 2 = 1_261_568_000 (~1.2 GB)
+        result = _estimate_kv_cache_bytes(model, 22000)
+        assert result == 1_261_568_000
+
+    def test_explicit_head_dim(self):
+        """When model.args.head_dim exists, use it instead of hidden_size // num_heads."""
+        model = self._make_model(
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            hidden_size=4096,
+            head_dim=256,
+        )
+        # expected = 32 * 2 * 8 * 256 * 100 * 2 = 26_214_400
+        result = _estimate_kv_cache_bytes(model, 100)
+        assert result == 26_214_400
+
+
+class TestKvCachePreflightCheck:
+    """Tests for the pre-flight KV cache memory check in _stream_completion."""
+
+    @pytest.fixture
+    def mock_lm(self):
+        lm = MagicMock()
+        lm.is_vlm = False
+        lm.model = MagicMock()
+        lm.model.args = MagicMock()
+        lm.model.args.num_hidden_layers = 32
+        lm.model.args.num_attention_heads = 32
+        lm.model.args.num_key_value_heads = 8
+        lm.model.args.hidden_size = 4096
+        lm.tokenizer = MagicMock()
+        lm.text_tokenizer = MagicMock()
+        lm.prompt_cache_store = MagicMock()
+        lm.prompt_cache_store.get.return_value = None
+        lm.prompt_cache_store.evict_all_to_disk = MagicMock()
+        lm.active_refs = 0
+        return lm
+
+    @pytest.mark.asyncio
+    async def test_rejects_when_kv_cache_exceeds_memory(self, mock_lm):
+        """_stream_completion should raise MemoryError when estimated KV cache
+        would push Metal memory over the limit."""
+        stats = TimingStats()
+
+        # Simulate: current memory is 10GB, limit is 12GB, KV cache needs 3GB
+        # 10GB + 3GB > 12GB → should reject
+        total_mem = 24 * 1024**3  # 24GB system
+        current_metal = 10 * 1024**3  # 10GB used
+        kv_estimate = 3 * 1024**3  # 3GB KV cache
+
+        # Pre-acquire the real lock so the finally block can release it
+        await _inference_lock.acquire()
+        try:
+            with (
+                patch.object(_inf_mod, "_TOTAL_PHYSICAL_MEMORY", total_mem),
+                patch("olmlx.engine.inference.settings") as mock_settings,
+                patch("olmlx.engine.inference.mx") as mock_mx,
+                patch(
+                    "olmlx.engine.inference._estimate_kv_cache_bytes",
+                    return_value=kv_estimate,
+                ),
+                patch("olmlx.engine.inference._safe_sync"),
+                patch(
+                    "olmlx.engine.inference._await_deferred_cleanup",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "olmlx.engine.inference._acquire_inference_lock",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                mock_settings.memory_limit_fraction = 0.5  # 12GB limit
+                mock_settings.prompt_cache = False
+                mock_mx.get_active_memory.return_value = current_metal
+                mock_mx.get_cache_memory.return_value = 0
+
+                gen = _inf_mod._stream_completion(
+                    mock_lm, list(range(22000)), 512, {}, stats
+                )
+                with pytest.raises(MemoryError, match="prompt too long"):
+                    async for _ in gen:
+                        pass
+        finally:
+            # Ensure lock is released even if test fails
+            if _inference_lock.locked():
+                _inference_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_allows_when_kv_cache_fits(self, mock_lm):
+        """Should proceed normally when KV cache fits in memory."""
+        stats = TimingStats()
+
+        total_mem = 24 * 1024**3
+        current_metal = 5 * 1024**3  # 5GB used
+        kv_estimate = 1 * 1024**3  # 1GB KV cache — fits within 12GB limit
+
+        # Create a proper async iterable mock with one token
+        final_token = StreamToken(
+            text="hi",
+            token=1,
+            prompt_tokens=100,
+            generation_tokens=1,
+            prompt_tps=100.0,
+            generation_tps=50.0,
+        )
+        mock_stream = AsyncMock()
+        mock_stream.__aiter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__anext__ = AsyncMock(side_effect=[final_token, StopAsyncIteration])
+        mock_stream._thread = None
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream.cancel = MagicMock()
+
+        # Pre-acquire the real lock so the finally block can release it
+        await _inference_lock.acquire()
+        try:
+            with (
+                patch.object(_inf_mod, "_TOTAL_PHYSICAL_MEMORY", total_mem),
+                patch("olmlx.engine.inference.settings") as mock_settings,
+                patch("olmlx.engine.inference.mx") as mock_mx,
+                patch(
+                    "olmlx.engine.inference._estimate_kv_cache_bytes",
+                    return_value=kv_estimate,
+                ),
+                patch("olmlx.engine.inference._safe_sync"),
+                patch(
+                    "olmlx.engine.inference._await_deferred_cleanup",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "olmlx.engine.inference._acquire_inference_lock",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "olmlx.engine.inference.async_mlx_stream", return_value=mock_stream
+                ),
+                patch("olmlx.engine.inference.parse_keep_alive", return_value=300),
+            ):
+                mock_settings.memory_limit_fraction = 0.5  # 12GB limit
+                mock_settings.prompt_cache = False
+                mock_settings.default_keep_alive = "5m"
+                mock_mx.get_active_memory.return_value = current_metal
+                mock_mx.get_cache_memory.return_value = 0
+
+                gen = _inf_mod._stream_completion(
+                    mock_lm, list(range(100)), 512, {}, stats
+                )
+                # Should not raise — just exhaust the generator
+                chunks = []
+                async for chunk in gen:
+                    chunks.append(chunk)
+                # Generator completed without MemoryError
+        finally:
+            if _inference_lock.locked():
+                _inference_lock.release()
+
+
+class TestPrefillMemoryCallback:
+    """Tests for memory checking during prefill."""
+
+    def test_prefill_callback_returns_false_on_memory_exceeded(self):
+        """The prefill progress callback should return False when memory exceeds limit."""
+        from olmlx.utils.streaming import _make_prefill_progress
+
+        cancel_event = MagicMock()
+        cancel_event.is_set.return_value = False
+
+        # memory_limit = 12GB, current memory at 13GB → over limit
+        mock_mx = MagicMock()
+        mock_mx.get_active_memory.return_value = 10 * 1024**3
+        mock_mx.get_cache_memory.return_value = 3 * 1024**3
+
+        callback = _make_prefill_progress(
+            cancel_event, memory_limit=12 * 1024**3, mx_module=mock_mx
+        )
+        # At 50% progress, should check memory and return False
+        result = callback(0.5)
+        assert result is False
+
+    def test_prefill_callback_returns_true_when_memory_ok(self):
+        """The prefill progress callback should return True when memory is fine."""
+        from olmlx.utils.streaming import _make_prefill_progress
+
+        cancel_event = MagicMock()
+        cancel_event.is_set.return_value = False
+
+        mock_mx = MagicMock()
+        mock_mx.get_active_memory.return_value = 5 * 1024**3
+        mock_mx.get_cache_memory.return_value = 1 * 1024**3
+
+        callback = _make_prefill_progress(
+            cancel_event, memory_limit=12 * 1024**3, mx_module=mock_mx
+        )
+        result = callback(0.5)
+        assert result is True
+
+    def test_prefill_callback_respects_cancel_event(self):
+        """Cancel event should still take priority."""
+        from olmlx.utils.streaming import _make_prefill_progress
+
+        cancel_event = MagicMock()
+        cancel_event.is_set.return_value = True
+
+        callback = _make_prefill_progress(cancel_event, memory_limit=12 * 1024**3)
+        result = callback(0.5)
+        assert result is False
+
+    def test_prefill_callback_no_limit(self):
+        """With no memory limit, should only check cancel event."""
+        from olmlx.utils.streaming import _make_prefill_progress
+
+        cancel_event = MagicMock()
+        cancel_event.is_set.return_value = False
+
+        callback = _make_prefill_progress(cancel_event, memory_limit=0)
+        result = callback(0.5)
+        assert result is True

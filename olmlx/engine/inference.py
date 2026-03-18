@@ -212,14 +212,42 @@ except (OSError, ValueError):
     _TOTAL_PHYSICAL_MEMORY = 0
 
 
+def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
+    """Estimate KV cache memory for a given number of tokens.
+
+    Formula: num_layers * 2 (K+V) * num_kv_heads * head_dim * num_tokens * bytes_per_element
+    """
+    if num_tokens <= 0:
+        return 0
+    args = model.args
+    num_layers = args.num_hidden_layers
+    num_heads = args.num_attention_heads
+    num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
+    head_dim = (
+        args.head_dim if hasattr(args, "head_dim") else args.hidden_size // num_heads
+    )
+    bytes_per_element = 2  # float16/bfloat16
+    return num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
+
+
+def _get_metal_memory() -> int:
+    """Return total Metal memory in use (active + cached)."""
+    return mx.get_active_memory() + mx.get_cache_memory()
+
+
+def _get_memory_limit() -> int:
+    """Return the configured Metal memory limit in bytes."""
+    return int(_TOTAL_PHYSICAL_MEMORY * settings.memory_limit_fraction)
+
+
 def _is_memory_pressure_high() -> bool:
     """Check if Metal memory is approaching the safety limit."""
     if _TOTAL_PHYSICAL_MEMORY == 0:
         return False
     try:
-        mem = mx.get_active_memory() + mx.get_cache_memory()
-        limit = int(_TOTAL_PHYSICAL_MEMORY * settings.memory_limit_fraction)
-        return mem > int(limit * _MEMORY_PRESSURE_THRESHOLD)
+        return _get_metal_memory() > int(
+            _get_memory_limit() * _MEMORY_PRESSURE_THRESHOLD
+        )
     except Exception:
         return False
 
@@ -618,6 +646,7 @@ async def _stream_completion(
     # Save original string prompt before cache setup may replace it with token IDs.
     # prompt is always str at entry; cache setup may later reassign it to list[int].
     original_prompt = prompt
+    cache_setup_done = False
     try:
         # Memory pressure check — invalidate cache to prevent Metal OOM
         memory_too_high = (
@@ -720,7 +749,85 @@ async def _stream_completion(
                 else:
                     prompt = prompt_tokens
 
-            # Yield cache stats as first chunk so routers can use them
+            cache_setup_done = True
+
+            # Release the cached reference — on cache miss the old
+            # CachedPromptState was removed from the store but this local
+            # variable still pins its KV cache tensors in GPU memory.
+            del cached
+
+        # Pre-flight KV cache memory check — estimate how much GPU memory
+        # the KV cache will need and reject if it would exceed the limit.
+        # This prevents uncatchable Metal OOM crashes during prefill.
+        # MUST run before yielding cache_info, because that yield starts
+        # the HTTP response — after which we can't return a clean 503.
+        if cache_creation_tokens > 0:
+            num_prefill_tokens = cache_creation_tokens
+        elif isinstance(prompt, list):
+            num_prefill_tokens = len(prompt)
+        elif isinstance(prompt, str) and not lm.is_vlm:
+            # Non-cached text path — tokenize to get a count.
+            # VLMs excluded: text_tokenizer.encode() misses image patch
+            # tokens, giving a systematic undercount.
+            try:
+                num_prefill_tokens = len(lm.text_tokenizer.encode(prompt))
+            except Exception:
+                num_prefill_tokens = 0
+        else:
+            num_prefill_tokens = 0
+        # Compute memory_limit before try so the streaming callback always
+        # has the correct limit, even when the pre-flight estimate throws.
+        memory_limit = _get_memory_limit() if _TOTAL_PHYSICAL_MEMORY > 0 else 0
+        if _TOTAL_PHYSICAL_MEMORY > 0 and num_prefill_tokens > 0:
+            try:
+                kv_bytes = _estimate_kv_cache_bytes(
+                    lm.model, num_prefill_tokens + max_tokens
+                )
+                current_metal = _get_metal_memory()
+                if current_metal + kv_bytes > memory_limit:
+                    # Drop cached KV tensors so eviction + gc can reclaim them
+                    had_cache = gen_kwargs.pop("prompt_cache", None) is not None
+                    gen_kwargs.pop(
+                        "input_ids", None
+                    )  # VLMs: force re-tokenize from string prompt
+                    lm.prompt_cache_store.evict_all_to_disk()
+                    gc.collect()
+                    mx.clear_cache()
+                    # After evicting the prompt cache, mlx_lm will prefill
+                    # the full prompt from scratch — re-estimate for all tokens
+                    # and restore prompt from suffix_tokens to the full sequence.
+                    estimate_tokens = num_prefill_tokens
+                    if had_cache and cache_read_tokens > 0:
+                        estimate_tokens = cache_read_tokens + num_prefill_tokens
+                        kv_bytes = _estimate_kv_cache_bytes(
+                            lm.model, estimate_tokens + max_tokens
+                        )
+                        if full_prompt_tokens is not None and not lm.is_vlm:
+                            prompt = full_prompt_tokens
+                    # Sync Metal to ensure freed buffers are reclaimed before re-reading
+                    _safe_sync()
+                    current_metal = _get_metal_memory()
+                    if current_metal + kv_bytes > memory_limit:
+                        available_gb = max(
+                            0.0, (memory_limit - current_metal) / 1024**3
+                        )
+                        raise MemoryError(
+                            f"KV cache for {estimate_tokens} tokens estimated at "
+                            f"{kv_bytes / 1024**3:.1f} GB, but only "
+                            f"{available_gb:.1f} GB available "
+                            f"— prompt too long, reduce context or use a smaller model"
+                        )
+            except MemoryError:
+                raise
+            except Exception:
+                logger.warning(
+                    "KV cache pre-flight check skipped — OOM protection inactive",
+                    exc_info=True,
+                )
+
+        # Yield cache stats after the pre-flight check so routers can
+        # use them.  This starts the HTTP response — no 503 after this.
+        if cache_setup_done:
             yield {
                 "cache_info": True,
                 "cache_read_tokens": cache_read_tokens,
@@ -756,6 +863,7 @@ async def _stream_completion(
             max_tokens=max_tokens,
             is_vlm=lm.is_vlm,
             images=images,
+            memory_limit=memory_limit,
             **gen_kwargs,
         )
 
@@ -862,6 +970,12 @@ async def _stream_completion(
             "stats": stats,
         }
     finally:
+        # Release GPU-backed references from gen_kwargs so they can be
+        # garbage-collected.  prompt_cache is either stored in the cache
+        # store (successful path) or should be freed; input_ids is a
+        # temporary MLX array only needed during stream setup.
+        gen_kwargs.pop("prompt_cache", None)
+        gen_kwargs.pop("input_ids", None)
         # Invalidate cache on incomplete generation to avoid inconsistent state
         if not generation_complete and full_prompt_tokens is not None:
             logger.debug("Cache invalidated: generation did not complete")
