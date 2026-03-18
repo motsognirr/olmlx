@@ -745,7 +745,9 @@ async def _stream_completion(
         memory_limit = _get_memory_limit() if _TOTAL_PHYSICAL_MEMORY > 0 else 0
         if _TOTAL_PHYSICAL_MEMORY > 0 and num_prefill_tokens > 0:
             try:
-                kv_bytes = _estimate_kv_cache_bytes(lm.model, num_prefill_tokens)
+                kv_bytes = _estimate_kv_cache_bytes(
+                    lm.model, num_prefill_tokens + max_tokens
+                )
                 current_metal = _get_metal_memory()
                 if current_metal + kv_bytes > memory_limit:
                     # Drop cached KV tensors so eviction + gc can reclaim them
@@ -759,7 +761,9 @@ async def _stream_completion(
                     estimate_tokens = num_prefill_tokens
                     if had_cache and cache_read_tokens > 0:
                         estimate_tokens = cache_read_tokens + num_prefill_tokens
-                        kv_bytes = _estimate_kv_cache_bytes(lm.model, estimate_tokens)
+                        kv_bytes = _estimate_kv_cache_bytes(
+                            lm.model, estimate_tokens + max_tokens
+                        )
                         if full_prompt_tokens is not None and not lm.is_vlm:
                             prompt = full_prompt_tokens
                         # VLMs: popping input_ids is sufficient — mlx_vlm will
