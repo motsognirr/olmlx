@@ -26,8 +26,8 @@ class ResponseFormat(BaseModel):
         if self.type == "json_schema":
             if self.json_schema is None:
                 raise ValueError("json_schema is required when type is 'json_schema'")
-            if "name" not in self.json_schema:
-                raise ValueError("json_schema.name is required")
+            if not self.json_schema.get("name"):
+                raise ValueError("json_schema.name is required and must be non-empty")
             if "schema" not in self.json_schema:
                 raise ValueError("json_schema.schema is required")
         return self

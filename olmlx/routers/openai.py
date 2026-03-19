@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 import uuid
 
@@ -114,7 +115,8 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         "json_schema",
     ):
         if req.response_format.type == "json_schema":
-            schema_name = (req.response_format.json_schema or {}).get("name", "")
+            raw_name = (req.response_format.json_schema or {}).get("name", "")
+            schema_name = re.sub(r"[^A-Za-z0-9_\-]", "", raw_name)[:64]
             logger.info(
                 "response_format type 'json_schema' is not enforced; "
                 "output may not conform to the provided schema",
