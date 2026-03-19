@@ -219,7 +219,17 @@ def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
     """
     if num_tokens <= 0:
         return 0
-    args = model.args
+    # mlx-lm text models: model.args
+    # mlx-vlm vision-language models: model.language_model.args
+    args = getattr(model, "args", None)
+    if args is None:
+        lang_model = getattr(model, "language_model", None)
+        if lang_model is not None:
+            args = getattr(lang_model, "args", None)
+    if args is None:
+        raise AttributeError(
+            "Model has no 'args' attribute (checked model.args and model.language_model.args)"
+        )
     num_layers = args.num_hidden_layers
     num_heads = args.num_attention_heads
     num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
