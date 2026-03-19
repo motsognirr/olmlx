@@ -511,10 +511,16 @@ class TestAgentLoop:
         # The missing one should have a fallback error message
         write_msgs = [m for m in tool_msgs if m["name"] == "write_file"]
         assert len(write_msgs) == 1
-        assert (
-            "no result" in write_msgs[0]["content"].lower()
-            or "error" in write_msgs[0]["content"].lower()
-        )
+        assert "no result" in write_msgs[0]["content"].lower()
+
+        # A tool_result event should also have been yielded for the fallback
+        fallback_events = [
+            e
+            for e in events
+            if e.get("type") == "tool_result" and e.get("name") == "write_file"
+        ]
+        assert len(fallback_events) == 1
+        assert "no result" in fallback_events[0]["result"].lower()
 
     @pytest.mark.asyncio
     async def test_no_mcp_no_tools(self):

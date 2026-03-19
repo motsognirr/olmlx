@@ -59,7 +59,7 @@ class OpenAIUsage(BaseModel):
     @classmethod
     def from_stats(cls, stats) -> "OpenAIUsage":
         """Build usage from a TimingStats (or None)."""
-        if not stats:
+        if stats is None:
             return cls()
         prompt = stats.prompt_eval_count
         completion = stats.eval_count

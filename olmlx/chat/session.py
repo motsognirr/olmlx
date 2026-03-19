@@ -435,12 +435,21 @@ class ChatSession:
                 else:
                     # Fallback: ensure every tool_call gets a result to
                     # maintain the message history contract.
+                    fallback_content = (
+                        f"Error: no result received for tool '{tu['name']}'"
+                    )
+                    yield {
+                        "type": "tool_result",
+                        "name": tu["name"],
+                        "result": fallback_content,
+                        "id": tu["id"],
+                    }
                     self.messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tu["id"],
                             "name": tu["name"],
-                            "content": f"Error: no result received for tool '{tu['name']}'",
+                            "content": fallback_content,
                         }
                     )
         else:
