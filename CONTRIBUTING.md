@@ -5,7 +5,7 @@ Thank you for your interest in contributing! This document outlines how to get s
 ## Development Setup
 
 ```bash
-git clone <repo-url> && cd olmlx
+git clone git@github.com:motsognirr/olmlx.git && cd olmlx
 uv sync --no-editable
 uv run olmlx  # start server
 uv run pytest # run tests

@@ -26,7 +26,7 @@ The background thread method that:
 
 1. Iterates the generator, yielding tokens to the queue
 2. On exit (normal or exception), executes a `finally` block that:
-   - Closes the generator (triggers `wired_limit.__exit__` which syncs the generation stream)
+   - Closes the generator (which syncs the generation stream)
    - Calls `mx.synchronize(generation_stream)` and `mx.synchronize()` to ensure all GPU work completes
    - Sets `_stream_done` event
    - Posts the sentinel to the queue
@@ -82,7 +82,7 @@ try:
     async for token in result:
         yield {...}
 finally:
-    await result.aclose()  # closes async generator, which calls stream.drain_and_join() on the inner CancellableStream
+    await result.aclose()  # wraps drain_and_join() in asyncio.shield with 10s to_thread fallback on CancelledError; without shield, client disconnect cancels drain_and_join before it can join the thread, causing the GPU race this architecture prevents
 ```
 
 The `try/finally` ensures cleanup happens even on client disconnect.
