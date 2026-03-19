@@ -56,6 +56,19 @@ class OpenAIUsage(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
 
+    @classmethod
+    def from_stats(cls, stats) -> "OpenAIUsage":
+        """Build usage from a TimingStats (or None)."""
+        if not stats:
+            return cls()
+        prompt = stats.prompt_eval_count
+        completion = stats.eval_count
+        return cls(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=prompt + completion,
+        )
+
 
 class OpenAIChoice(BaseModel):
     index: int = 0

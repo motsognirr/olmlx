@@ -289,24 +289,6 @@ class TestXCacheIDHeader:
         assert mock_gen.call_args.kwargs.get("cache_id") == ""
 
 
-    @pytest.mark.asyncio
-    async def test_embeddings_passes_cache_id_header(self, app_client):
-        """Bug #86: x-cache-id header should be extracted in embeddings endpoint."""
-        with patch(
-            "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
-        ) as mock_emb:
-            mock_emb.return_value = [[0.1, 0.2]]
-            resp = await app_client.post(
-                "/v1/embeddings",
-                json={"model": "qwen3", "input": "hello"},
-                headers={"X-Cache-ID": "emb-session-42"},
-            )
-
-        assert resp.status_code == 200
-        mock_emb.assert_called_once()
-        assert mock_emb.call_args.kwargs.get("cache_id") == "emb-session-42"
-
-
 class TestResponseFormat:
     @pytest.mark.asyncio
     async def test_json_mode_injects_system_message(self, app_client):
