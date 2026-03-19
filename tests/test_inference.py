@@ -1375,6 +1375,25 @@ class TestEstimateKvCacheBytes:
         result = _estimate_kv_cache_bytes(model, 100)
         assert result == 26_214_400
 
+    def test_vlm_fallback_to_language_model_args(self):
+        """Falls back to model.language_model.args for VLM models."""
+        model = MagicMock(spec=[])
+        model.language_model = MagicMock(spec=[])
+        model.language_model.args = self._make_model_args(
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            hidden_size=4096,
+        )
+        result = _estimate_kv_cache_bytes(model, 1000)
+        assert result == 131_072_000
+
+    def test_raises_when_no_args_found(self):
+        """Raises AttributeError when model has no discoverable args."""
+        model = MagicMock(spec=[])
+        with pytest.raises(AttributeError, match="no 'args' attribute"):
+            _estimate_kv_cache_bytes(model, 1000)
+
 
 class TestKvCachePreflightCheck:
     """Tests for the pre-flight KV cache memory check in _stream_completion."""
