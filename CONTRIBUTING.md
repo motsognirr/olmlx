@@ -5,7 +5,7 @@ Thank you for your interest in contributing! This document outlines how to get s
 ## Development Setup
 
 ```bash
-git clone <repo-url> && cd olmlx
+git clone <repo-url> && cd mlx-for-claude
 uv sync --no-editable
 uv run olmlx  # start server
 uv run pytest # run tests

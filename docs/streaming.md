@@ -81,7 +81,7 @@ try:
     async for token in stream:
         yield {...}
 finally:
-    await stream.aclose()  # calls drain_and_join()
+    await result.aclose()  # closes async generator, which calls stream.drain_and_join()
 ```
 
 The `try/finally` ensures cleanup happens even on client disconnect.

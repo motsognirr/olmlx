@@ -246,7 +246,7 @@ curl http://localhost:11434/api/chat -d '{
   "messages": [{
     "role": "user",
     "content": "What is in this image?",
-    "images": ["iVBOR..."]
+    "images": ["iVBOR..."]  # raw base64, no data:image/...;base64, prefix
   }]
 }'
 ```
