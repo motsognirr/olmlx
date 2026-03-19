@@ -1876,6 +1876,80 @@ class TestStreamCloseOnce:
         )
 
     @pytest.mark.asyncio
+    async def test_buffered_with_tools_closes_once_on_error(self, app_client):
+        """Buffered-with-tools path: result.aclose called once even on mid-stream error."""
+        tracker = None
+
+        async def mock_stream(*args, **kwargs):
+            nonlocal tracker
+
+            async def gen():
+                yield {"text": "partial", "done": False}
+                raise RuntimeError("GPU exploded")
+
+            tracker = _CloseCountingStream(gen())
+            return tracker
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "search"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                    "tools": [
+                        {
+                            "name": "search",
+                            "description": "Search",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"q": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        assert "event: error" in resp.text
+        assert tracker.close_count == 1, (
+            f"Expected result.aclose() called once on error, got {tracker.close_count}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_thinking_state_machine_closes_once_on_error(self, app_client):
+        """Thinking state machine path: result.aclose called once even on mid-stream error."""
+        tracker = None
+
+        async def mock_stream(*args, **kwargs):
+            nonlocal tracker
+
+            async def gen():
+                yield {"text": "<think>partial", "done": False}
+                raise RuntimeError("GPU exploded")
+
+            tracker = _CloseCountingStream(gen())
+            return tracker
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "think"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        assert "event: error" in resp.text
+        assert tracker.close_count == 1, (
+            f"Expected result.aclose() called once on error, got {tracker.close_count}"
+        )
+
+    @pytest.mark.asyncio
     async def test_thinking_state_machine_closes_once(self, app_client):
         """Thinking state machine path (has_tools=False): result.aclose called once."""
         tracker = None
