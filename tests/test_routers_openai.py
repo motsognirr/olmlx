@@ -72,7 +72,11 @@ class TestOpenAIRouter:
 
     @pytest.mark.asyncio
     async def test_completions_non_streaming(self, app_client):
-        mock_result = {"text": "Completed text", "done": True, "stats": TimingStats(prompt_eval_count=5, eval_count=15)}
+        mock_result = {
+            "text": "Completed text",
+            "done": True,
+            "stats": TimingStats(prompt_eval_count=5, eval_count=15),
+        }
 
         with patch(
             "olmlx.routers.openai.generate_completion", new_callable=AsyncMock

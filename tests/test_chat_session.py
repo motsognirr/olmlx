@@ -494,10 +494,13 @@ class TestAgentLoop:
             # Drop the second tool result to simulate the bug
             return [r for r in results if r["message"]["name"] != "write_file"]
 
-        with patch(
-            "olmlx.chat.session.generate_chat",
-            side_effect=lambda *a, **kw: fake_generate(),
-        ), patch("olmlx.chat.session.asyncio.gather", side_effect=patched_gather):
+        with (
+            patch(
+                "olmlx.chat.session.generate_chat",
+                side_effect=lambda *a, **kw: fake_generate(),
+            ),
+            patch("olmlx.chat.session.asyncio.gather", side_effect=patched_gather),
+        ):
             events = []
             async for event in session.send_message("Do both"):
                 events.append(event)
@@ -508,7 +511,10 @@ class TestAgentLoop:
         # The missing one should have a fallback error message
         write_msgs = [m for m in tool_msgs if m["name"] == "write_file"]
         assert len(write_msgs) == 1
-        assert "no result" in write_msgs[0]["content"].lower() or "error" in write_msgs[0]["content"].lower()
+        assert (
+            "no result" in write_msgs[0]["content"].lower()
+            or "error" in write_msgs[0]["content"].lower()
+        )
 
     @pytest.mark.asyncio
     async def test_no_mcp_no_tools(self):
