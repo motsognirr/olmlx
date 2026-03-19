@@ -2,7 +2,6 @@ import json
 import logging
 import time
 import uuid
-import warnings
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -110,19 +109,15 @@ def _build_options(req) -> dict:
 async def openai_chat(req: OpenAIChatRequest, request: Request):
     manager = request.app.state.model_manager
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
-    if req.response_format and req.response_format.type == "json_object":
-        if messages and messages[0].get("role") == "system":
-            existing = messages[0].get("content") or ""
-            sep = "\n\n" if existing else ""
-            messages[0]["content"] = existing + sep + JSON_MODE_SYSTEM_MSG
-        else:
-            messages.insert(0, {"role": "system", "content": JSON_MODE_SYSTEM_MSG})
-    elif req.response_format and req.response_format.type == "json_schema":
-        warnings.warn(
-            "response_format type 'json_schema' is not enforced; "
-            "output may not conform to the provided schema",
-            stacklevel=2,
-        )
+    if req.response_format and req.response_format.type in (
+        "json_object",
+        "json_schema",
+    ):
+        if req.response_format.type == "json_schema":
+            logger.warning(
+                "response_format type 'json_schema' is not enforced; "
+                "output may not conform to the provided schema",
+            )
         if messages and messages[0].get("role") == "system":
             existing = messages[0].get("content") or ""
             sep = "\n\n" if existing else ""
