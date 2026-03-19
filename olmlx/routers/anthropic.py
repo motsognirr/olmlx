@@ -321,8 +321,6 @@ async def _stream_buffered_with_tools(result):
             break
         full_text += chunk.get("text", "")
 
-    await result.aclose()
-
     logger.info("Raw model output (%d chars): %s", len(full_text), full_text[:1000])
 
     thinking, visible_text, tool_uses = parse_model_output(
@@ -495,8 +493,6 @@ async def _stream_thinking_state_machine(result):
                     )
                     buffer = ""
                 break
-
-    await result.aclose()
 
     # Flush remaining buffer
     if state == "thinking":

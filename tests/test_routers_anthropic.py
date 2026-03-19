@@ -1808,3 +1808,100 @@ class TestStreamSseEarlyMessageStart:
         assert any(e == "ping" for e in between), (
             f"Expected pings between message_start and content_block_start, got: {between}"
         )
+
+
+class _CloseCountingStream:
+    """Wraps an async generator to count aclose() calls."""
+
+    def __init__(self, agen):
+        self._agen = agen
+        self.close_count = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self._agen.__anext__()
+
+    async def aclose(self):
+        self.close_count += 1
+        await self._agen.aclose()
+
+
+class TestStreamCloseOnce:
+    """The raw MLX stream (result) must be closed exactly once by stream_sse's finally block."""
+
+    @pytest.mark.asyncio
+    async def test_buffered_with_tools_closes_once(self, app_client):
+        """Buffered-with-tools path (has_tools=True): result.aclose called once."""
+        tracker = None
+
+        async def mock_stream(*args, **kwargs):
+            nonlocal tracker
+
+            async def gen():
+                yield {
+                    "text": '<tool_call>{"name": "search", "arguments": {"q": "t"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": TimingStats(eval_count=5)}
+
+            tracker = _CloseCountingStream(gen())
+            return tracker
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "search"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                    "tools": [
+                        {
+                            "name": "search",
+                            "description": "Search",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"q": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        assert tracker.close_count == 1, (
+            f"Expected result.aclose() called once, got {tracker.close_count}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_thinking_state_machine_closes_once(self, app_client):
+        """Thinking state machine path (has_tools=False): result.aclose called once."""
+        tracker = None
+
+        async def mock_stream(*args, **kwargs):
+            nonlocal tracker
+
+            async def gen():
+                yield {"text": "<think>reasoning</think>answer", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            tracker = _CloseCountingStream(gen())
+            return tracker
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "think"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        assert tracker.close_count == 1, (
+            f"Expected result.aclose() called once, got {tracker.close_count}"
+        )
