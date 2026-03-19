@@ -345,17 +345,22 @@ class TestBashSubprocessCleanup:
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        await asyncio.sleep(0.1)
-        proc = await asyncio.create_subprocess_exec(
-            "pgrep",
-            "-f",
-            marker,
-            stdout=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        assert proc.returncode == 1, (
-            f"Orphan process with marker {marker} still running: {stdout.decode()}"
-        )
+        # Poll for process cleanup instead of fixed sleep
+        for _ in range(20):
+            await asyncio.sleep(0.025)
+            proc = await asyncio.create_subprocess_exec(
+                "pgrep",
+                "-f",
+                marker,
+                stdout=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            if proc.returncode == 1:
+                break
+        else:
+            pytest.fail(
+                f"Orphan process with marker {marker} still running after 500ms"
+            )
 
 
 class TestWebFetchSchemeValidation:

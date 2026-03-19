@@ -1026,14 +1026,13 @@ class TestLogFileHandleLifetime:
         for fh in cli_module._worker_log_fhs:
             assert not fh.closed, "Log file handle was closed prematurely"
 
-        # Cleanup should close them
+        # Capture references before cleanup (cleanup clears the lists)
+        handles = list(cli_module._worker_log_fhs)
         cli_module._cleanup_workers()
 
-        for fh in cli_module._worker_log_fhs:
+        assert handles, "No file handles were stored"
+        for fh in handles:
             assert fh.closed, "Log file handle was not closed during cleanup"
-
-        cli_module._worker_procs.clear()
-        cli_module._worker_log_fhs.clear()
 
 
 class TestExperimentalEnvFile:
