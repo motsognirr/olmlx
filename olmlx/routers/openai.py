@@ -120,8 +120,9 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             )
         if messages and messages[0].get("role") == "system":
             existing = messages[0].get("content") or ""
-            sep = "\n\n" if existing else ""
-            messages[0]["content"] = existing + sep + JSON_MODE_SYSTEM_MSG
+            if JSON_MODE_SYSTEM_MSG not in existing:
+                sep = "\n\n" if existing else ""
+                messages[0]["content"] = existing + sep + JSON_MODE_SYSTEM_MSG
         else:
             messages.insert(0, {"role": "system", "content": JSON_MODE_SYSTEM_MSG})
     options = _build_options(req)

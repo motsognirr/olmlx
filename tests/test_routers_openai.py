@@ -360,6 +360,31 @@ class TestResponseFormat:
         assert len([m for m in messages if m["role"] == "system"]) == 1
 
     @pytest.mark.asyncio
+    async def test_json_mode_no_double_injection(self, app_client):
+        mock_result = {"text": '{"a": 1}', "done": True, "stats": TimingStats()}
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [
+                        {"role": "system", "content": JSON_MODE_SYSTEM_MSG},
+                        {"role": "user", "content": "give me json"},
+                    ],
+                    "response_format": {"type": "json_object"},
+                },
+            )
+
+        assert resp.status_code == 200
+        messages = mock_gen.call_args[0][2]
+        assert messages[0]["content"] == JSON_MODE_SYSTEM_MSG
+        assert messages[0]["content"].count(JSON_MODE_SYSTEM_MSG) == 1
+
+    @pytest.mark.asyncio
     async def test_json_mode_null_system_content(self, app_client):
         mock_result = {"text": '{"a": 1}', "done": True, "stats": TimingStats()}
 
