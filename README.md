@@ -249,8 +249,9 @@ curl http://localhost:11434/api/chat -d '{
     "images": ["iVBOR..."]
   }]
 }'
-# Note: images should be raw base64 without a data:image/...;base64, prefix
 ```
+
+Note: images should be raw base64 without a `data:image/...;base64,` prefix.
 
 ### VLM Model Configuration
 

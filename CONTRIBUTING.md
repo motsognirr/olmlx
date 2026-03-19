@@ -41,5 +41,5 @@ See [CLAUDE.md](CLAUDE.md) for detailed project structure and key design decisio
 ## Git
 
 - Remote: `git@github.com:motsognirr/olmlx.git`
-- Author: Daniel Palmqvist <daniel.u.palmqvist@gmail.com>
 - Use conventional commit messages
+

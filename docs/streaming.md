@@ -38,8 +38,9 @@ This ordering is critical: Metal sync happens **before** the sentinel is posted,
 Must be called in `try/finally` to ensure proper cleanup:
 
 1. Sets the cancel event
-2. Drains the queue until the sentinel (or timeout)
-3. Joins the background thread
+2. Checks `_stream_done.is_set()` first — if already set, skips the drain entirely (this is the fast path when the stream ran to completion and the sentinel was consumed by the `async for` loop before `aclose()` was called)
+3. Drains the queue until the sentinel (or timeout) if `_stream_done` is not set
+4. Joins the background thread
 
 By the time the sentinel is received, Metal synchronization has already completed in `_run()`. The join ensures the thread has fully exited before the caller releases `_inference_lock`.
 
@@ -78,10 +79,10 @@ All streaming routers (`routers/chat.py`, `routers/generate.py`, `routers/openai
 
 ```python
 try:
-    async for token in stream:
+    async for token in result:
         yield {...}
 finally:
-    await result.aclose()  # closes async generator, which calls stream.drain_and_join()
+    await result.aclose()  # closes async generator, which calls stream.drain_and_join() on the inner CancellableStream
 ```
 
 The `try/finally` ensures cleanup happens even on client disconnect.
