@@ -48,6 +48,22 @@ def cmd_serve(_args):
 
     if experimental.distributed:
         _launch_distributed_workers()
+        # The ring backend's init() blocks until all ranks connect. Both the
+        # coordinator and workers must call init() within each other's retry
+        # window (~31s). Workers start ~5-10s after SSH launch. We delay
+        # the coordinator by 15s to overlap with the worker's init() window.
+        print("  Waiting 3s for workers to start...")
+        time.sleep(3)
+        import mlx.core as mx
+
+        group = mx.distributed.init(backend=experimental.distributed_backend)
+        print(
+            f"  Ring initialized: rank {group.rank()}, "
+            f"world_size {group.size()}"
+        )
+        # Store the group globally so the app lifespan can retrieve it
+        # instead of calling init() again (which returns the singleton).
+        os.environ["_OLMLX_DISTRIBUTED_INIT_DONE"] = "1"
 
     uvicorn.run(
         "olmlx.app:create_app",
@@ -89,9 +105,11 @@ def _cleanup_workers():
     _worker_log_fhs.clear()
 
 
-def _launch_distributed_workers():
+
+def _launch_distributed_workers() -> list[str]:
     """Launch worker processes on remote hosts via SSH for distributed inference.
 
+    Returns the list of hosts from the hostfile.
     Stores Popen handles in _worker_procs for cleanup on failure/shutdown.
     Requires passwordless SSH with pre-accepted host keys — run
     `ssh-keyscan -H <host> >> ~/.ssh/known_hosts` for each worker first.
@@ -144,11 +162,28 @@ def _launch_distributed_workers():
     log_dir = Path.home() / ".olmlx"
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Generate ring hostfile for MLX distributed backend
+    ring_hostfile_data = [
+        [f"{h}:{experimental.distributed_port + i}"] for i, h in enumerate(hosts)
+    ]
+    ring_hostfile_path = log_dir / "ring_hostfile.json"
+    with open(ring_hostfile_path, "w") as f:
+        json.dump(ring_hostfile_data, f)
+
+    # Set coordinator env vars for MLX ring backend
+    os.environ["MLX_RANK"] = "0"
+    os.environ["MLX_HOSTFILE"] = str(ring_hostfile_path)
+
+    ring_hostfile_json = json.dumps(ring_hostfile_data)
+
     global _atexit_registered
 
     if not _atexit_registered:
         atexit.register(_cleanup_workers)
         _atexit_registered = True
+
+    remote_python = experimental.distributed_remote_python
+    remote_working_dir = experimental.distributed_remote_working_dir
 
     # Launch workers on remote hosts (rank 1..N)
     for rank, host in enumerate(hosts[1:], start=1):
@@ -161,11 +196,22 @@ def _launch_distributed_workers():
             ),
             "OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET": experimental.distributed_secret,
             "MLX_RANK": str(rank),
-            "MLX_WORLD_SIZE": str(world_size),
-            "MLX_PORT": str(experimental.distributed_port),
         }
         env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-        remote_cmd = f"{env_str} python -m olmlx.engine.distributed_worker"
+
+        # Build remote shell script that sets up hostfile and runs worker
+        script_parts = [
+            f"HOSTFILE=$(mktemp)",
+            f"echo {shlex.quote(ring_hostfile_json)} > $HOSTFILE",
+            f"export MLX_HOSTFILE=$HOSTFILE",
+        ]
+        if remote_working_dir:
+            script_parts.append(f"cd {remote_working_dir}")
+        script_parts.append(
+            f"{env_str} {remote_python} -m olmlx.engine.distributed_worker"
+        )
+        remote_cmd = "; ".join(script_parts)
+
         cmd = [
             "ssh",
             "-o",
@@ -193,6 +239,9 @@ def _launch_distributed_workers():
             logger.error("Worker process exited immediately (rc=%d)", proc.returncode)
             _cleanup_workers()
             raise RuntimeError("Worker SSH launch failed — check worker logs")
+
+    return hosts
+
 
 
 def _find_executable() -> str:

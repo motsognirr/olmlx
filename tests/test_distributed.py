@@ -1,5 +1,6 @@
 """Tests for experimental distributed inference."""
 
+import os
 import socket
 import threading
 import time
@@ -1041,3 +1042,267 @@ class TestExperimentalEnvFile:
     def test_env_file_configured(self):
         """ExperimentalSettings should have env_file='.env' in model_config."""
         assert ExperimentalSettings.model_config.get("env_file") == ".env"
+
+
+class TestRemoteExecutionConfig:
+    """Tests for distributed remote execution settings."""
+
+    def test_defaults(self, monkeypatch):
+        for key in (
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR",
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        s = ExperimentalSettings()
+        assert s.distributed_remote_working_dir == ""
+        assert s.distributed_remote_python == "python"
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv(
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR",
+            "~/Documents/olmlx_distributed",
+        )
+        monkeypatch.setenv(
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON", "uv run python"
+        )
+        s = ExperimentalSettings()
+        assert s.distributed_remote_working_dir == "~/Documents/olmlx_distributed"
+        assert s.distributed_remote_python == "uv run python"
+
+
+class TestRingHostfileGeneration:
+    """Tests for MLX ring hostfile generation."""
+
+    def test_ring_hostfile_generated(self, tmp_path, monkeypatch):
+        """_launch_distributed_workers should generate a ring hostfile."""
+        import olmlx.cli as cli_module
+
+        cli_module._worker_procs.clear()
+        cli_module._worker_log_fhs.clear()
+        cli_module._atexit_registered = False
+
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text(
+            '{"hosts": ["10.0.1.1", "10.0.1.2"], "model": "test/model"}'
+        )
+
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                distributed_hostfile=str(hostfile),
+                distributed_backend="ring",
+                distributed_sideband_port=32400,
+                distributed_port=32323,
+                distributed_secret="",
+                distributed_remote_working_dir="",
+                distributed_remote_python="python",
+            ),
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        monkeypatch.setattr("subprocess.Popen", MagicMock(return_value=mock_proc))
+
+        cli_module._launch_distributed_workers()
+
+        # Ring hostfile should be written
+        ring_hostfile = Path.home() / ".olmlx" / "ring_hostfile.json"
+        assert ring_hostfile.exists()
+        import json
+
+        content = json.loads(ring_hostfile.read_text())
+        assert content == [["10.0.1.1:32323"], ["10.0.1.2:32324"]]
+
+        # Coordinator env vars should be set
+        assert os.environ.get("MLX_RANK") == "0"
+
+        assert os.environ.get("MLX_HOSTFILE") == str(ring_hostfile)
+
+        cli_module._cleanup_workers()
+
+        # Clean up env
+        for key in ("MLX_RANK", "MLX_HOSTFILE"):
+            os.environ.pop(key, None)
+
+    def test_ring_hostfile_port_increments(self, tmp_path, monkeypatch):
+        """Each host should get an incrementing port in the ring hostfile."""
+        import olmlx.cli as cli_module
+
+        cli_module._worker_procs.clear()
+        cli_module._worker_log_fhs.clear()
+        cli_module._atexit_registered = False
+
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text(
+            '{"hosts": ["10.0.0.1", "10.0.0.2", "10.0.0.3"], "model": "test/model"}'
+        )
+
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                distributed_hostfile=str(hostfile),
+                distributed_backend="ring",
+                distributed_sideband_port=32400,
+                distributed_port=50000,
+                distributed_secret="",
+                distributed_remote_working_dir="",
+                distributed_remote_python="python",
+            ),
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        monkeypatch.setattr("subprocess.Popen", MagicMock(return_value=mock_proc))
+
+        cli_module._launch_distributed_workers()
+
+        ring_hostfile = Path.home() / ".olmlx" / "ring_hostfile.json"
+        import json
+
+        content = json.loads(ring_hostfile.read_text())
+        assert content == [
+            ["10.0.0.1:50000"],
+            ["10.0.0.2:50001"],
+            ["10.0.0.3:50002"],
+        ]
+
+        cli_module._cleanup_workers()
+        for key in ("MLX_RANK", "MLX_HOSTFILE"):
+            os.environ.pop(key, None)
+
+
+class TestSSHCommandConstruction:
+    """Tests for SSH command with working dir and custom python."""
+
+    def test_ssh_command_includes_working_dir(self, tmp_path, monkeypatch):
+        """SSH command should cd to working dir when configured."""
+        import olmlx.cli as cli_module
+
+        cli_module._worker_procs.clear()
+        cli_module._worker_log_fhs.clear()
+        cli_module._atexit_registered = False
+
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text(
+            '{"hosts": ["10.0.1.1", "10.0.1.2"], "model": "test/model"}'
+        )
+
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                distributed_hostfile=str(hostfile),
+                distributed_backend="ring",
+                distributed_sideband_port=32400,
+                distributed_port=32323,
+                distributed_secret="",
+                distributed_remote_working_dir="~/Documents/olmlx_distributed",
+                distributed_remote_python="uv run python",
+            ),
+        )
+
+        popen_mock = MagicMock()
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        popen_mock.return_value = mock_proc
+        monkeypatch.setattr("subprocess.Popen", popen_mock)
+
+        cli_module._launch_distributed_workers()
+
+        # Check the SSH command passed to Popen
+        call_args = popen_mock.call_args[0][0]
+        remote_cmd = call_args[-1]  # Last arg is the remote command
+
+        assert "cd ~/Documents/olmlx_distributed" in remote_cmd
+        assert "uv run python -m olmlx.engine.distributed_worker" in remote_cmd
+
+        cli_module._cleanup_workers()
+        for key in ("MLX_RANK", "MLX_HOSTFILE"):
+            os.environ.pop(key, None)
+
+    def test_ssh_command_includes_hostfile(self, tmp_path, monkeypatch):
+        """SSH command should create a temp hostfile on the remote."""
+        import olmlx.cli as cli_module
+
+        cli_module._worker_procs.clear()
+        cli_module._worker_log_fhs.clear()
+        cli_module._atexit_registered = False
+
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text(
+            '{"hosts": ["10.0.1.1", "10.0.1.2"], "model": "test/model"}'
+        )
+
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                distributed_hostfile=str(hostfile),
+                distributed_backend="ring",
+                distributed_sideband_port=32400,
+                distributed_port=32323,
+                distributed_secret="",
+                distributed_remote_working_dir="",
+                distributed_remote_python="python",
+            ),
+        )
+
+        popen_mock = MagicMock()
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        popen_mock.return_value = mock_proc
+        monkeypatch.setattr("subprocess.Popen", popen_mock)
+
+        cli_module._launch_distributed_workers()
+
+        call_args = popen_mock.call_args[0][0]
+        remote_cmd = call_args[-1]
+
+        assert "MLX_HOSTFILE=" in remote_cmd
+        assert "mktemp" in remote_cmd
+
+        cli_module._cleanup_workers()
+        for key in ("MLX_RANK", "MLX_HOSTFILE"):
+            os.environ.pop(key, None)
+
+    def test_ssh_command_no_mlx_port_or_world_size(self, tmp_path, monkeypatch):
+        """SSH command should NOT include MLX_PORT or MLX_WORLD_SIZE (ring backend uses hostfile)."""
+        import olmlx.cli as cli_module
+
+        cli_module._worker_procs.clear()
+        cli_module._worker_log_fhs.clear()
+        cli_module._atexit_registered = False
+
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text(
+            '{"hosts": ["10.0.1.1", "10.0.1.2"], "model": "test/model"}'
+        )
+
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                distributed_hostfile=str(hostfile),
+                distributed_backend="ring",
+                distributed_sideband_port=32400,
+                distributed_port=32323,
+                distributed_secret="",
+                distributed_remote_working_dir="",
+                distributed_remote_python="python",
+            ),
+        )
+
+        popen_mock = MagicMock()
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        popen_mock.return_value = mock_proc
+        monkeypatch.setattr("subprocess.Popen", popen_mock)
+
+        cli_module._launch_distributed_workers()
+
+        call_args = popen_mock.call_args[0][0]
+        remote_cmd = call_args[-1]
+
+        assert "MLX_PORT=" not in remote_cmd
+        assert "MLX_WORLD_SIZE=" not in remote_cmd
+
+        cli_module._cleanup_workers()
+        for key in ("MLX_RANK", "MLX_HOSTFILE"):
+            os.environ.pop(key, None)
