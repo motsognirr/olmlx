@@ -298,10 +298,46 @@ class DistributedCoordinator:
 class DistributedWorker:
     """Non-rank-0 sideband client that receives inference params from coordinator."""
 
-    def __init__(self, coordinator_host: str, port: int, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        coordinator_host: str,
+        port: int,
+        timeout: float = 30.0,
+        connect_retry_timeout: float = 120.0,
+    ) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.settimeout(timeout)
-        self._sock.connect((coordinator_host, port))
+        # The coordinator's sideband server starts in the app lifespan, which
+        # may not be running yet when the worker reaches this point (the worker
+        # finishes ring init before the coordinator starts uvicorn). Retry the
+        # connection with exponential backoff until the sideband is available.
+        import time
+
+        deadline = time.monotonic() + connect_retry_timeout
+        delay = 1.0
+        while True:
+            try:
+                self._sock.connect((coordinator_host, port))
+                break
+            except (ConnectionRefusedError, OSError) as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ConnectionRefusedError(
+                        f"Could not connect to coordinator sideband at "
+                        f"{coordinator_host}:{port} after {connect_retry_timeout}s"
+                    ) from exc
+                logger.info(
+                    "Sideband not ready (%s), retrying in %.0fs (%.0fs remaining)",
+                    exc,
+                    delay,
+                    remaining,
+                )
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 10.0)
+                # Need a fresh socket after failed connect
+                self._sock.close()
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock.settimeout(timeout)
         self._sock.settimeout(None)
         logger.info("Connected to coordinator at %s:%d", coordinator_host, port)
 

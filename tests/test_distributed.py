@@ -316,6 +316,68 @@ class TestCoordinatorWorkerIntegration:
         assert received[0].prompt_tokens == [1, 2]
         assert received[1].prompt_tokens == [3, 4, 5]
 
+    def test_worker_retries_sideband_connection(self):
+        """Worker retries connecting to sideband if coordinator isn't ready yet."""
+        from olmlx.engine.distributed import (
+            DistributedCoordinator,
+            DistributedWorker,
+        )
+
+        # Start the worker BEFORE the coordinator's sideband server
+        # to simulate the race condition in distributed startup.
+        free_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        free_sock.bind(("127.0.0.1", 0))
+        port = free_sock.getsockname()[1]
+        free_sock.close()
+
+        connected = []
+        errors = []
+
+        def worker_fn():
+            try:
+                worker = DistributedWorker(
+                    coordinator_host="127.0.0.1",
+                    port=port,
+                    connect_retry_timeout=10.0,
+                )
+                worker.send_ready()
+                connected.append(True)
+                req = worker.wait_for_inference()
+                worker.close()
+            except Exception as e:
+                errors.append(e)
+
+        t = threading.Thread(target=worker_fn)
+        t.start()
+
+        # Delay coordinator start by 2s to force worker retries
+        time.sleep(2)
+        coordinator = DistributedCoordinator(world_size=2, port=port)
+
+        coordinator.wait_for_workers(timeout=10.0)
+        assert len(connected) == 1, f"Worker failed to connect: {errors}"
+
+        coordinator.broadcast_shutdown()
+        t.join(timeout=5.0)
+        coordinator.close()
+
+    def test_worker_sideband_retry_timeout(self):
+        """Worker gives up after connect_retry_timeout if sideband never appears."""
+        from olmlx.engine.distributed import DistributedWorker
+
+        # Use a port that nothing is listening on
+        free_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        free_sock.bind(("127.0.0.1", 0))
+        port = free_sock.getsockname()[1]
+        free_sock.close()
+
+        with pytest.raises(ConnectionRefusedError, match="after 1.0s"):
+            DistributedWorker(
+                coordinator_host="127.0.0.1",
+                port=port,
+                connect_retry_timeout=1.0,
+            )
+
 
 class TestShardDetection:
     """Tests for model shard() capability detection."""
