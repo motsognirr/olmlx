@@ -426,12 +426,10 @@ class ChatSession:
                 )
                 for tu, r in zip(to_execute, exec_results):
                     if isinstance(r, BaseException):
-                        if not isinstance(r, (Exception, asyncio.CancelledError)):
-                            raise r  # SystemExit, KeyboardInterrupt
                         if deferred_exc is None:
                             deferred_exc = r
                         name = tu["name"]
-                        error_msg = f"Error calling {name}: {r}"
+                        error_content = f"Error calling {name}: {r}"
                         yield {
                             "type": "tool_call",
                             "name": name,
@@ -449,7 +447,7 @@ class ChatSession:
                                 "role": "tool",
                                 "tool_call_id": tu["id"],
                                 "name": name,
-                                "content": error_msg,
+                                "content": error_content,
                             },
                         }
                     else:
@@ -465,12 +463,6 @@ class ChatSession:
                 else:
                     error_detail = "no result received"
                     error_content = f"Error calling {tu['name']}: {error_detail}"
-                    yield {
-                        "type": "tool_call",
-                        "name": tu["name"],
-                        "arguments": tu["input"],
-                        "id": tu["id"],
-                    }
                     yield {
                         "type": "tool_error",
                         "name": tu["name"],

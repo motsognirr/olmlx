@@ -1121,6 +1121,9 @@ class TestToolSafetyIntegration:
 
         def classify_dropping_write(tool_uses):
             allow, confirm, deny = original_classify(tool_uses)
+            assert any(tu["name"] == "write_file" for tu in allow), (
+                "write_file should be in allow before filtering"
+            )
             allow = [tu for tu in allow if tu["name"] != "write_file"]
             confirm = [tu for tu in confirm if tu["name"] != "write_file"]
             deny = [tu for tu in deny if tu["name"] != "write_file"]
@@ -1141,13 +1144,13 @@ class TestToolSafetyIntegration:
             async for event in session.send_message("Do both"):
                 events.append(event)
 
-        # write_file should get a tool_call + tool_error event pair
+        # write_file was never dispatched, so only a tool_error (no tool_call)
         call_events = [
             e
             for e in events
             if e.get("type") == "tool_call" and e.get("name") == "write_file"
         ]
-        assert len(call_events) == 1
+        assert len(call_events) == 0
         error_events = [
             e
             for e in events
