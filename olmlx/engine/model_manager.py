@@ -812,11 +812,12 @@ class ModelManager:
                 )
             if hasattr(model, "shard"):
                 model.shard(self._distributed_group)
-                # Force-evaluate sharded weights incrementally to avoid a
-                # single massive Metal command buffer that exceeds the GPU
-                # timeout (~10s).  Without this, the first operation after
-                # shard() would evaluate ALL lazy weight slices at once.
-                self._eval_sharded_weights(model)
+                # Materialize all lazy weight slices BEFORE any forward pass.
+                # model.shard() creates lazy array slices; if they're first
+                # evaluated during inference (with all_sum), the combined Metal
+                # command buffer can exceed the ~10s GPU timeout for large
+                # models (32B+).  Evaluating here is purely local (no all_sum).
+                mx.eval(model.parameters())
                 is_distributed = True
                 logger.info("Model %s sharded for distributed inference", hf_path)
             else:
@@ -832,20 +833,6 @@ class ModelManager:
                 )
 
         return model, tokenizer, is_vlm, caps, is_distributed
-
-    @staticmethod
-    def _eval_sharded_weights(model) -> None:
-        """Evaluate sharded model weights one module at a time.
-
-        After model.shard(), weights are lazy slices.  Evaluating them
-        all at once in a single Metal command buffer can exceed the GPU
-        timeout (~10s) for large models.  This method evaluates each
-        module's parameters individually to keep command buffers small.
-        """
-        for _name, module in model.named_modules():
-            params = [v for v in vars(module).values() if isinstance(v, mx.array)]
-            if params:
-                mx.eval(*params)
 
     async def _expire_stale(self):
         """Unload models whose keep-alive has expired (active_refs == 0)."""

@@ -73,6 +73,11 @@ def worker_main() -> None:
         sys.exit(1)
 
     model.shard(group)
+    # Materialize all lazy weight slices before entering inference.
+    # model.shard() creates lazy array slices; if they're first evaluated
+    # during a forward pass (with all_sum), the combined Metal command
+    # buffer can exceed the ~10s GPU timeout for large models (32B+).
+    mx.eval(model.parameters())
     worker.send_ready(secret=secret)
     logger.info("Model sharded, ready signal sent, entering inference loop")
 
