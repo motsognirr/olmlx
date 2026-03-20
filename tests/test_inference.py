@@ -8,6 +8,7 @@ import pytest
 
 import olmlx.engine.inference as _inf_mod
 from olmlx.engine.inference import (
+    _apply_seed,
     _build_generate_kwargs,
     _estimate_kv_cache_bytes,
     _extract_images,
@@ -88,8 +89,8 @@ class TestBuildGenerateKwargs:
             assert key not in result
         # max_tokens still direct
         assert result["max_tokens"] == 100
-        # seed still present for caller to handle
-        assert result["seed"] == 42
+        # seed NOT in kwargs — handled by _apply_seed before generation
+        assert "seed" not in result
 
     def test_stop_dropped_for_text_model(self):
         """stop is no longer accepted by mlx-lm generate_step."""
@@ -124,6 +125,52 @@ class TestBuildGenerateKwargs:
         result = _build_generate_kwargs({"num_predict": 100})
         assert "sampler" not in result
         assert result["max_tokens"] == 100
+
+    def test_make_sampler_none_raises(self, monkeypatch):
+        """When make_sampler is None (mlx-lm not installed), should raise RuntimeError."""
+        monkeypatch.setattr(_inf_mod, "make_sampler", None)
+        with pytest.raises(RuntimeError, match="mlx-lm is not installed"):
+            _build_generate_kwargs({"temperature": 0.7})
+
+    def test_make_logits_processors_none_raises(self, monkeypatch):
+        """When make_logits_processors is None (mlx-lm not installed), should raise RuntimeError."""
+        monkeypatch.setattr(_inf_mod, "make_logits_processors", None)
+        with pytest.raises(RuntimeError, match="mlx-lm is not installed"):
+            _build_generate_kwargs({"repeat_penalty": 1.1})
+
+    def test_seed_not_in_text_model_kwargs(self):
+        """Text model: seed should NOT be in kwargs (handled by _apply_seed)."""
+        result = _build_generate_kwargs({"seed": 42})
+        assert "seed" not in result
+
+    def test_vlm_seed_in_kwargs(self):
+        """VLM: seed should be in kwargs (mlx-vlm accepts it directly)."""
+        result = _build_generate_kwargs({"seed": 42}, is_vlm=True)
+        assert result["seed"] == 42
+
+    def test_stop_warns_text_model(self, caplog):
+        """Text model: stop sequences should log a warning."""
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
+            result = _build_generate_kwargs({"stop": [".", "\n"]})
+        assert "stop" not in result
+        assert any("stop sequences not supported" in r.message for r in caplog.records)
+
+
+class TestApplySeed:
+    def test_apply_seed_does_not_pop(self):
+        """_apply_seed should use get, not pop — seed key must remain in dict."""
+        kwargs = {"seed": 42, "max_tokens": 100}
+        with patch("olmlx.engine.inference.mx") as mock_mx:
+            _apply_seed(kwargs)
+        assert "seed" in kwargs
+        mock_mx.random.seed.assert_called_once_with(42)
+
+    def test_apply_seed_no_seed(self):
+        """_apply_seed with no seed key should be a no-op."""
+        kwargs = {"max_tokens": 100}
+        with patch("olmlx.engine.inference.mx") as mock_mx:
+            _apply_seed(kwargs)
+        mock_mx.random.seed.assert_not_called()
 
 
 class TestExtractImages:

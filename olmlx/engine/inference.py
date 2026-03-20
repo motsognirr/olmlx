@@ -383,6 +383,8 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
             if ollama_key in options:
                 sampler_args[sampler_key] = options[ollama_key]
         if sampler_args:
+            if make_sampler is None:
+                raise RuntimeError("mlx-lm is not installed; cannot build sampler")
             kwargs["sampler"] = make_sampler(**sampler_args)
 
         # Collect penalty params
@@ -392,24 +394,27 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
         if "repeat_last_n" in options:
             penalty_args["repetition_context_size"] = options["repeat_last_n"]
         if penalty_args:
+            if make_logits_processors is None:
+                raise RuntimeError(
+                    "mlx-lm is not installed; cannot build logits processors"
+                )
             kwargs["logits_processors"] = make_logits_processors(**penalty_args)
 
         if "num_predict" in options:
             kwargs["max_tokens"] = options["num_predict"]
-        # seed: not accepted by mlx-lm generate_step; callers must pop it
-        # and call _apply_seed() in the inference thread before generation.
-        if "seed" in options:
-            kwargs["seed"] = options["seed"]
+
+        if "stop" in options:
+            logger.warning("stop sequences not supported by mlx-lm >= 0.30.7; ignored")
 
     return kwargs
 
 
 def _apply_seed(kwargs: dict) -> None:
-    """Pop ``seed`` from *kwargs* and set the MLX RNG state.
+    """Read ``seed`` from *kwargs* and set the MLX RNG state.
 
     Must be called from the inference thread, not the event loop.
     """
-    seed = kwargs.pop("seed", None)
+    seed = kwargs.get("seed", None)
     if seed is not None:
         mx.random.seed(seed)
 
