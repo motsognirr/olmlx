@@ -1094,7 +1094,7 @@ class TestToolSafetyIntegration:
 
     @pytest.mark.asyncio
     async def test_missing_tool_result_gets_error_fallback(self):
-        """Tool missing from all classify_batch buckets gets an error fallback."""
+        """Defensive guard: tool dropped from all classify_batch buckets gets error fallback."""
         mcp = self._mcp_with_tools()
         config = ToolSafetyConfig(default_policy=ToolPolicy.ALLOW)
         policy = ToolSafetyPolicy(config)
