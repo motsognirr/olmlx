@@ -14,13 +14,11 @@ def get_metal_memory() -> int:
 
 
 def get_system_memory_bytes() -> int:
-    """Return total system memory in bytes."""
-    return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-
-
-def get_memory_limit(fraction: float) -> int:
-    """Return the Metal memory limit in bytes for the given fraction of system RAM."""
-    return int(get_system_memory_bytes() * fraction)
+    """Return total system memory in bytes, or 0 on failure."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (OSError, ValueError):
+        return 0
 
 
 # Fraction of memory_limit_fraction at which we shed the prompt cache to
@@ -36,10 +34,10 @@ def is_memory_pressure_high(
     Returns True when Metal memory exceeds ``fraction * threshold`` of system RAM.
     Returns False when system memory cannot be determined or on any error.
     """
-    total = get_system_memory_bytes()
-    if total == 0:
-        return False
     try:
+        total = get_system_memory_bytes()
+        if total == 0:
+            return False
         limit = int(total * fraction)
         return get_metal_memory() > int(limit * threshold)
     except Exception:

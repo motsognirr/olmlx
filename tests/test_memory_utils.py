@@ -23,13 +23,11 @@ class TestGetSystemMemoryBytes:
             assert memory_mod.get_system_memory_bytes() == 4096 * 1000
 
 
-class TestGetMemoryLimit:
-    def test_returns_fraction_of_system_memory(self):
-        with patch.object(
-            memory_mod, "get_system_memory_bytes", return_value=32 * 1024**3
-        ):
-            result = memory_mod.get_memory_limit(0.75)
-            assert result == int(32 * 1024**3 * 0.75)
+    def test_returns_zero_on_os_error(self):
+        with patch.object(memory_mod, "os") as mock_os:
+            mock_os.sysconf.side_effect = OSError("unsupported")
+            assert memory_mod.get_system_memory_bytes() == 0
+
 
 
 class TestIsMemoryPressureHigh:
