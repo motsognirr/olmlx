@@ -1,8 +1,13 @@
-from typing import Literal
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
 from olmlx.schemas.common import ModelName
+
+if TYPE_CHECKING:
+    from olmlx.utils.timing import TimingStats
 
 
 # --- Chat Completions ---
@@ -57,7 +62,7 @@ class OpenAIUsage(BaseModel):
     total_tokens: int = 0
 
     @classmethod
-    def from_stats(cls, stats) -> "OpenAIUsage":
+    def from_stats(cls, stats: TimingStats | None) -> OpenAIUsage:
         """Build usage from a TimingStats (or None)."""
         if stats is None:
             return cls()

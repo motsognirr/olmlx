@@ -423,7 +423,7 @@ class ChatSession:
                     *(self._exec_tool(tu) for tu in to_execute)
                 )
                 for r in exec_results:
-                    if r is None:
+                    if r is None:  # defensive: _exec_tool always returns a dict, but guard for safety
                         continue
                     yield r["call_event"]
                     yield r["result_event"]
