@@ -73,7 +73,6 @@ def cmd_serve(_args):
         global _cli_distributed_group, _cli_distributed_coordinator
         _cli_distributed_group = group
         _cli_distributed_coordinator = coordinator
-        os.environ["_OLMLX_DISTRIBUTED_INIT_DONE"] = "1"
 
     uvicorn.run(
         "olmlx.app:create_app",

@@ -14,9 +14,22 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import mlx.core as mx
+
 logger = logging.getLogger(__name__)
 
 _MAX_MESSAGE_BYTES = 64 * 1024 * 1024  # 64 MiB hard cap
+
+
+def distributed_barrier() -> None:
+    """Lightweight all_sum barrier to synchronize distributed ranks.
+
+    Must be called by ALL ranks at the same point.  Ensures ranks are
+    synchronized before compute-heavy forward passes begin, preventing
+    Metal GPU timeouts from one rank hitting all_sum before the other.
+    """
+    result = mx.distributed.all_sum(mx.array([1.0]))
+    mx.eval(result)  # MLX eval — force synchronous barrier completion
 
 
 @dataclass
@@ -311,8 +324,6 @@ class DistributedWorker:
         # may not be running yet when the worker reaches this point (the worker
         # finishes ring init before the coordinator starts uvicorn). Retry the
         # connection with exponential backoff until the sideband is available.
-        import time
-
         deadline = time.monotonic() + connect_retry_timeout
         delay = 1.0
         while True:

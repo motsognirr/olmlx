@@ -44,24 +44,17 @@ async def lifespan(app: FastAPI):
 
         # The CLI starts the ring backend and sideband server before uvicorn
         # (to avoid the slow transformers import blocking the sideband).
-        # Retrieve the pre-created state.
+        # Retrieve the pre-created state from cmd_serve().
         from olmlx.cli import _cli_distributed_coordinator, _cli_distributed_group
 
         distributed_group = _cli_distributed_group
         coordinator = _cli_distributed_coordinator
 
         if distributed_group is None or coordinator is None:
-            import mlx.core as mx
-
-            from olmlx.engine.distributed import DistributedCoordinator
-
-            distributed_group = mx.distributed.init(
-                backend=experimental.distributed_backend
-            )
-            coordinator = DistributedCoordinator(
-                world_size=distributed_group.size(),
-                port=experimental.distributed_sideband_port,
-                secret=experimental.distributed_secret or None,
+            raise RuntimeError(
+                "Distributed mode requires starting via 'olmlx serve'. "
+                "The ring backend and sideband server must be initialized "
+                "before the app starts."
             )
 
         world_size = distributed_group.size()

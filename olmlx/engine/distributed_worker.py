@@ -97,8 +97,9 @@ def worker_main() -> None:
             # The coordinator broadcasts via sideband then hits the same
             # barrier.  This prevents Metal GPU timeouts from one rank
             # starting all_sum ops before the other is ready.
-            barrier = mx.distributed.all_sum(mx.array([1.0]))
-            mx.eval(barrier)  # MLX eval - force barrier computation
+            from olmlx.engine.distributed import distributed_barrier
+
+            distributed_barrier()
 
             # Run stream_generate in lockstep with rank 0.
             # The sharded model's all_sum ops synchronize with other ranks.
