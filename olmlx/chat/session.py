@@ -62,6 +62,63 @@ class ChatSession:
             self.messages.append({"role": "system", "content": system_prompt})
         self.manager.invalidate_prompt_cache(self.config.model_name, "chat")
 
+    async def _exec_tool(self, tu: dict) -> dict:
+        """Execute a single tool call and return the event + message."""
+        tool_name = tu["name"]
+        tool_input = tu["input"]
+        tool_id = tu["id"]
+        try:
+            if tool_name == "use_skill" and self.skills:
+                result = self.skills.handle_use_skill(tool_input)
+            elif self.builtin and tool_name in self.builtin.tool_names:
+                result = await self.builtin.call_tool(tool_name, tool_input)
+            elif self.mcp is not None:
+                result = await self.mcp.call_tool(tool_name, tool_input)
+            else:
+                raise ValueError(f"No handler for tool: {tool_name!r}")
+            return {
+                "call_event": {
+                    "type": "tool_call",
+                    "name": tool_name,
+                    "arguments": tool_input,
+                    "id": tool_id,
+                },
+                "result_event": {
+                    "type": "tool_result",
+                    "name": tool_name,
+                    "result": result,
+                    "id": tool_id,
+                },
+                "message": {
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "name": tool_name,
+                    "content": result,
+                },
+            }
+        except Exception as exc:
+            error_msg = f"Error calling {tool_name}: {exc}"
+            return {
+                "call_event": {
+                    "type": "tool_call",
+                    "name": tool_name,
+                    "arguments": tool_input,
+                    "id": tool_id,
+                },
+                "result_event": {
+                    "type": "tool_error",
+                    "name": tool_name,
+                    "error": str(exc),
+                    "id": tool_id,
+                },
+                "message": {
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "name": tool_name,
+                    "content": error_msg,
+                },
+            }
+
     async def send_message(self, user_text: str) -> AsyncGenerator[dict, None]:
         """Send a user message and run the agent loop.
 
@@ -303,63 +360,6 @@ class ChatSession:
             else:
                 allow, confirm, deny = local_tools + remote_tools, [], []
 
-            async def _exec_tool(tu: dict) -> dict:
-                """Execute a single tool call and return the event + message."""
-                tool_name = tu["name"]
-                tool_input = tu["input"]
-                tool_id = tu["id"]
-                try:
-                    if tool_name == "use_skill" and self.skills:
-                        result = self.skills.handle_use_skill(tool_input)
-                    elif self.builtin and tool_name in self.builtin.tool_names:
-                        result = await self.builtin.call_tool(tool_name, tool_input)
-                    elif self.mcp is not None:
-                        result = await self.mcp.call_tool(tool_name, tool_input)
-                    else:
-                        raise ValueError(f"No handler for tool: {tool_name!r}")
-                    return {
-                        "call_event": {
-                            "type": "tool_call",
-                            "name": tool_name,
-                            "arguments": tool_input,
-                            "id": tool_id,
-                        },
-                        "result_event": {
-                            "type": "tool_result",
-                            "name": tool_name,
-                            "result": result,
-                            "id": tool_id,
-                        },
-                        "message": {
-                            "role": "tool",
-                            "tool_call_id": tool_id,
-                            "name": tool_name,
-                            "content": result,
-                        },
-                    }
-                except Exception as exc:
-                    error_msg = f"Error calling {tool_name}: {exc}"
-                    return {
-                        "call_event": {
-                            "type": "tool_call",
-                            "name": tool_name,
-                            "arguments": tool_input,
-                            "id": tool_id,
-                        },
-                        "result_event": {
-                            "type": "tool_error",
-                            "name": tool_name,
-                            "error": str(exc),
-                            "id": tool_id,
-                        },
-                        "message": {
-                            "role": "tool",
-                            "tool_call_id": tool_id,
-                            "name": tool_name,
-                            "content": error_msg,
-                        },
-                    }
-
             # Collect results by tool_call_id for call-order output.
             # Events are yielded immediately (deny/confirm prompts),
             # but messages are buffered and appended in call order.
@@ -420,9 +420,11 @@ class ChatSession:
             to_execute = allow + approved
             if to_execute:
                 exec_results = await asyncio.gather(
-                    *(_exec_tool(tu) for tu in to_execute)
+                    *(self._exec_tool(tu) for tu in to_execute)
                 )
                 for r in exec_results:
+                    if r is None:
+                        continue
                     yield r["call_event"]
                     yield r["result_event"]
                     results_by_id[r["message"]["tool_call_id"]] = r
@@ -438,6 +440,12 @@ class ChatSession:
                     fallback_content = (
                         f"Error: no result received for tool '{tu['name']}'"
                     )
+                    yield {
+                        "type": "tool_call",
+                        "name": tu["name"],
+                        "arguments": tu.get("input", {}),
+                        "id": tu["id"],
+                    }
                     yield {
                         "type": "tool_result",
                         "name": tu["name"],

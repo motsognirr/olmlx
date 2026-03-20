@@ -1,7 +1,5 @@
 """Tests for olmlx.chat.session."""
 
-import asyncio
-
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -485,21 +483,21 @@ class TestAgentLoop:
                 yield {"text": "Done", "done": False}
                 yield {"text": "", "done": True, "stats": MagicMock()}
 
-        # Monkey-patch _exec_tool inside send_message to simulate one tool
-        # disappearing from results (e.g. gather race or bug in safety classify)
-        original_gather = asyncio.gather
+        # Patch _exec_tool to drop the write_file result, simulating a missing
+        # result (e.g. gather race or bug in safety classify).
+        original_exec = ChatSession._exec_tool
 
-        async def patched_gather(*coros):
-            results = await original_gather(*coros)
-            # Drop the second tool result to simulate the bug
-            return [r for r in results if r["message"]["name"] != "write_file"]
+        async def patched_exec(tu):
+            if tu["name"] == "write_file":
+                return None  # simulate missing result
+            return await original_exec(session, tu)
 
         with (
             patch(
                 "olmlx.chat.session.generate_chat",
                 side_effect=lambda *a, **kw: fake_generate(),
             ),
-            patch("olmlx.chat.session.asyncio.gather", side_effect=patched_gather),
+            patch.object(session, "_exec_tool", side_effect=patched_exec),
         ):
             events = []
             async for event in session.send_message("Do both"):
@@ -513,14 +511,21 @@ class TestAgentLoop:
         assert len(write_msgs) == 1
         assert "no result" in write_msgs[0]["content"].lower()
 
-        # A tool_result event should also have been yielded for the fallback
-        fallback_events = [
+        # A paired tool_call + tool_result event should be yielded for the fallback
+        fallback_call_events = [
+            e
+            for e in events
+            if e.get("type") == "tool_call" and e.get("name") == "write_file"
+        ]
+        assert len(fallback_call_events) == 1
+
+        fallback_result_events = [
             e
             for e in events
             if e.get("type") == "tool_result" and e.get("name") == "write_file"
         ]
-        assert len(fallback_events) == 1
-        assert "no result" in fallback_events[0]["result"].lower()
+        assert len(fallback_result_events) == 1
+        assert "no result" in fallback_result_events[0]["result"].lower()
 
     @pytest.mark.asyncio
     async def test_no_mcp_no_tools(self):
