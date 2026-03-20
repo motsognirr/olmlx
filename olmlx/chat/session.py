@@ -418,17 +418,42 @@ class ChatSession:
 
             # Execute allowed + approved tools concurrently
             to_execute = allow + approved
+            deferred_exc = None
             if to_execute:
                 exec_results = await asyncio.gather(
-                    *(self._exec_tool(tu) for tu in to_execute)
+                    *(self._exec_tool(tu) for tu in to_execute),
+                    return_exceptions=True,
                 )
-                for r in exec_results:
-                    # Defensive: _exec_tool always returns a dict, but guard for safety
-                    if r is None:
-                        continue
-                    yield r["call_event"]
-                    yield r["result_event"]
-                    results_by_id[r["message"]["tool_call_id"]] = r
+                for tu, r in zip(to_execute, exec_results):
+                    if isinstance(r, BaseException):
+                        if deferred_exc is None:
+                            deferred_exc = r
+                        name = tu["name"]
+                        error_content = f"Error calling {name}: {r}"
+                        yield {
+                            "type": "tool_call",
+                            "name": name,
+                            "arguments": tu["input"],
+                            "id": tu["id"],
+                        }
+                        yield {
+                            "type": "tool_error",
+                            "name": name,
+                            "error": str(r),
+                            "id": tu["id"],
+                        }
+                        results_by_id[tu["id"]] = {
+                            "message": {
+                                "role": "tool",
+                                "tool_call_id": tu["id"],
+                                "name": name,
+                                "content": error_content,
+                            },
+                        }
+                    else:
+                        yield r["call_event"]
+                        yield r["result_event"]
+                        results_by_id[r["message"]["tool_call_id"]] = r
 
             # Append messages in original call order
             for tu in tool_uses:
@@ -436,21 +461,12 @@ class ChatSession:
                 if r:
                     self.messages.append(r["message"])
                 else:
-                    # Fallback: ensure every tool_call gets a result to
-                    # maintain the message history contract.
-                    fallback_content = (
-                        f"Error: no result received for tool '{tu['name']}'"
-                    )
+                    error_detail = "no result received"
+                    error_content = f"Error calling {tu['name']}: {error_detail}"
                     yield {
-                        "type": "tool_call",
+                        "type": "tool_error",
                         "name": tu["name"],
-                        "arguments": tu.get("input", {}),
-                        "id": tu["id"],
-                    }
-                    yield {
-                        "type": "tool_result",
-                        "name": tu["name"],
-                        "result": fallback_content,
+                        "error": error_detail,
                         "id": tu["id"],
                     }
                     self.messages.append(
@@ -458,9 +474,12 @@ class ChatSession:
                             "role": "tool",
                             "tool_call_id": tu["id"],
                             "name": tu["name"],
-                            "content": fallback_content,
+                            "content": error_content,
                         }
                     )
+
+            if deferred_exc is not None:
+                raise deferred_exc
         else:
             # max_turns reached
             yield {"type": "max_turns_exceeded"}
