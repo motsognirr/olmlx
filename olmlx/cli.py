@@ -162,7 +162,7 @@ def _pre_shard_and_distribute(
 
             cfg = json.loads((model_dir / "config.json").read_text())
             layer_counts = _compute_layer_counts(cfg["num_hidden_layers"], world_size)
-        except Exception as e:
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
             logger.warning("Failed to read config.json for layer_counts: %s", e)
             return False
 

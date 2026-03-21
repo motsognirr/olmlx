@@ -246,6 +246,11 @@ def pre_shard_pipeline_for_rank(
 
     config["num_hidden_layers"] = end_idx - start_idx
     if "layer_types" in config:
+        if len(config["layer_types"]) != total_layers:
+            raise ValueError(
+                f"config.json layer_types length ({len(config['layer_types'])}) "
+                f"does not match num_hidden_layers ({total_layers})"
+            )
         config["layer_types"] = config["layer_types"][start_idx:end_idx]
     (output_dir / "config.json").write_text(json.dumps(config, indent=2))
 
