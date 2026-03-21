@@ -162,7 +162,11 @@ def _load_safetensors_weights(
         # No index file — try single-file layout
         return dict(mx.load(str(model_dir / "model.safetensors")))
 
-    weight_map = index["weight_map"]
+    weight_map = index.get("weight_map")
+    if weight_map is None:
+        raise ValueError(
+            f"model.safetensors.index.json in {model_dir} has no 'weight_map' key"
+        )
 
     # For multi-file models, only load shard files containing needed keys
     if start_idx is not None and end_idx is not None:

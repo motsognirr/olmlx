@@ -157,10 +157,14 @@ def _pre_shard_and_distribute(
     # Resolve default layer_counts for pipeline so marker comparison works
     # when the hostfile omits an explicit "layers" key.
     if strategy == "pipeline" and layer_counts is None:
-        from olmlx.engine.pipeline import _compute_layer_counts
+        try:
+            from olmlx.engine.pipeline import _compute_layer_counts
 
-        config = json.loads((model_dir / "config.json").read_text())
-        layer_counts = _compute_layer_counts(config["num_hidden_layers"], world_size)
+            cfg = json.loads((model_dir / "config.json").read_text())
+            layer_counts = _compute_layer_counts(cfg["num_hidden_layers"], world_size)
+        except Exception as e:
+            logger.warning("Failed to read config.json for layer_counts: %s", e)
+            return False
 
     # Check if valid shards already exist
     all_valid = True

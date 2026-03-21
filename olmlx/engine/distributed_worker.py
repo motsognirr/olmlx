@@ -142,9 +142,9 @@ def worker_main() -> None:
                     "falling back to full model download",
                     e,
                 )
-                pre_shard_dir = None
+                pre_sharded = False
 
-        if not pre_shard_dir:
+        if not pre_sharded:
             logger.info("Loading model %s (pipeline strategy)", model_path)
             model, tokenizer = mlx_lm.load(model_path)
 
