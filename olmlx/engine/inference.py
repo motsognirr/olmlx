@@ -390,8 +390,8 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
             kwargs["sampler"] = make_sampler(**sampler_args)
         elif sampler_args:
             logger.warning(
-                "top_k/top_p/min_p without temperature ignored; make_sampler "
-                "defaults to greedy (temp=0.0) which makes them irrelevant"
+                "top_k/top_p/min_p provided without temperature; no sampler "
+                "will be built and these params will have no effect"
             )
 
         # Collect penalty params — only build processors when repeat_penalty
