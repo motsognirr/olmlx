@@ -403,18 +403,38 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
         if "num_predict" in options:
             kwargs["max_tokens"] = options["num_predict"]
 
+        # Forward seed so _apply_seed can consume it before generation
+        if "seed" in options:
+            kwargs["seed"] = options["seed"]
+
         if "stop" in options:
-            logger.warning("stop sequences not supported by mlx-lm >= 0.30.7; ignored")
+            raise ValueError(
+                "stop sequences are not supported by mlx-lm >= 0.30.7; "
+                "remove the 'stop' parameter from your request"
+            )
+
+        for penalty_key in ("frequency_penalty", "presence_penalty"):
+            if penalty_key in options and options[penalty_key]:
+                logger.warning(
+                    "%s not supported by mlx-lm >= 0.30.7; ignored", penalty_key
+                )
 
     return kwargs
 
 
-def _apply_seed(kwargs: dict) -> None:
+def _apply_seed(kwargs: dict, *, consume: bool = False) -> None:
     """Read ``seed`` from *kwargs* and set the MLX RNG state.
 
     Must be called from the inference thread, not the event loop.
+
+    Args:
+        kwargs: Generate kwargs dict (may contain ``seed``).
+        consume: If True, pop the key so it is not forwarded to the
+                 underlying generate call (required for mlx-lm which
+                 does not accept a ``seed`` kwarg).  If False, the key
+                 is left in place (VLMs forward it to mlx-vlm).
     """
-    seed = kwargs.get("seed", None)
+    seed = kwargs.pop("seed", None) if consume else kwargs.get("seed", None)
     if seed is not None:
         mx.random.seed(seed)
 
@@ -1094,7 +1114,7 @@ async def _full_completion_inner(
     def _generate_sync():
         """Run generate + synchronize in the same thread so GPU work completes
         before the thread returns to the pool."""
-        _apply_seed(gen_kwargs)
+        _apply_seed(gen_kwargs, consume=not lm.is_vlm)
 
         # Broadcast inside the thread so rank 0 and workers enter MLX
         # computation at the same time (avoids all_sum timeout).
