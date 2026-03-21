@@ -89,25 +89,28 @@ class TestBuildGenerateKwargs:
             assert key not in result
         # max_tokens still direct
         assert result["max_tokens"] == 100
-        # seed NOT in kwargs — handled by _apply_seed before generation
-        assert "seed" not in result
+        # seed in kwargs for _apply_seed to consume before generation
+        assert result["seed"] == 42
 
-    def test_stop_dropped_for_text_model(self):
-        """stop is no longer accepted by mlx-lm generate_step."""
-        result = _build_generate_kwargs({"stop": [".", "\n"]})
-        assert "stop" not in result
+    def test_stop_raises_for_text_model_basic(self):
+        """stop is no longer accepted by mlx-lm — should raise ValueError."""
+        with pytest.raises(ValueError, match="stop sequences"):
+            _build_generate_kwargs({"stop": [".", "\n"]})
 
     def test_stop_vlm_ignored(self):
         result = _build_generate_kwargs({"stop": [".", "\n"]}, is_vlm=True)
         assert "stop" not in result
 
-    def test_frequency_presence_penalty_dropped(self):
-        """frequency_penalty/presence_penalty not supported by make_logits_processors."""
-        result = _build_generate_kwargs(
-            {"frequency_penalty": 0.5, "presence_penalty": 0.3}
-        )
+    def test_frequency_presence_penalty_dropped_with_warning(self, caplog):
+        """frequency_penalty/presence_penalty dropped with warning."""
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
+            result = _build_generate_kwargs(
+                {"frequency_penalty": 0.5, "presence_penalty": 0.3}
+            )
         assert "frequency_penalty" not in result
         assert "presence_penalty" not in result
+        assert any("frequency_penalty" in r.message for r in caplog.records)
+        assert any("presence_penalty" in r.message for r in caplog.records)
 
     def test_zero_penalty_not_passed(self):
         result = _build_generate_kwargs(
@@ -138,30 +141,43 @@ class TestBuildGenerateKwargs:
         with pytest.raises(RuntimeError, match="mlx-lm is not installed"):
             _build_generate_kwargs({"repeat_penalty": 1.1})
 
-    def test_seed_not_in_text_model_kwargs(self):
-        """Text model: seed should NOT be in kwargs (handled by _apply_seed)."""
+    def test_seed_in_text_kwargs_for_apply_seed(self):
+        """Text model: seed must be in kwargs so _apply_seed can read it."""
         result = _build_generate_kwargs({"seed": 42})
-        assert "seed" not in result
+        assert result["seed"] == 42
 
     def test_vlm_seed_in_kwargs(self):
         """VLM: seed should be in kwargs (mlx-vlm accepts it directly)."""
         result = _build_generate_kwargs({"seed": 42}, is_vlm=True)
         assert result["seed"] == 42
 
-    def test_stop_warns_text_model(self, caplog):
-        """Text model: stop sequences should log a warning."""
+    def test_stop_raises_text_model(self):
+        """Text model: stop sequences should raise ValueError."""
+        with pytest.raises(ValueError, match="stop sequences"):
+            _build_generate_kwargs({"stop": [".", "\n"]})
+
+    def test_frequency_presence_penalty_warns(self, caplog):
+        """Text model: frequency/presence penalty should log a warning when dropped."""
         with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
-            result = _build_generate_kwargs({"stop": [".", "\n"]})
-        assert "stop" not in result
-        assert any("stop sequences not supported" in r.message for r in caplog.records)
+            _build_generate_kwargs({"frequency_penalty": 0.5, "presence_penalty": 0.3})
+        assert any("frequency_penalty" in r.message for r in caplog.records)
+        assert any("presence_penalty" in r.message for r in caplog.records)
 
 
 class TestApplySeed:
-    def test_apply_seed_does_not_pop(self):
-        """_apply_seed should use get, not pop — seed key must remain in dict."""
+    def test_apply_seed_consume_pops(self):
+        """_apply_seed(consume=True) should pop seed — text models must not forward it."""
         kwargs = {"seed": 42, "max_tokens": 100}
         with patch("olmlx.engine.inference.mx") as mock_mx:
-            _apply_seed(kwargs)
+            _apply_seed(kwargs, consume=True)
+        assert "seed" not in kwargs
+        mock_mx.random.seed.assert_called_once_with(42)
+
+    def test_apply_seed_no_consume_keeps(self):
+        """_apply_seed(consume=False) should keep seed — VLMs forward it to mlx-vlm."""
+        kwargs = {"seed": 42, "max_tokens": 100}
+        with patch("olmlx.engine.inference.mx") as mock_mx:
+            _apply_seed(kwargs, consume=False)
         assert "seed" in kwargs
         mock_mx.random.seed.assert_called_once_with(42)
 

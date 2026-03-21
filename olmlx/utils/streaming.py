@@ -325,7 +325,7 @@ def async_mlx_stream(
     def gen_factory(cancel_event: threading.Event):
         from olmlx.engine.inference import _apply_seed
 
-        _apply_seed(kwargs)
+        _apply_seed(kwargs, consume=not is_vlm)
 
         if is_vlm:
             import mlx_vlm
