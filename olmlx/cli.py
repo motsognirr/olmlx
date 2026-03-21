@@ -177,7 +177,9 @@ def _pre_shard_and_distribute(hosts, model, world_size, experimental) -> bool:
             return False
 
     # SCP shards to each worker
-    worker_shard_dir = experimental.distributed_worker_shard_dir
+    # Replace ~ with $HOME so the path survives shell quoting (shlex.quote
+    # wraps in single quotes which suppress tilde expansion).
+    worker_shard_dir = experimental.distributed_worker_shard_dir.replace("~", "$HOME", 1)
     for rank, host in enumerate(hosts[1:], start=1):
         shard_dir = shard_base / f"rank{rank}"
         remote_dir = f"{worker_shard_dir}/{safe_name}/rank{rank}"
@@ -306,7 +308,10 @@ def _launch_distributed_workers() -> list[str]:
         from olmlx.models.store import _safe_dir_name
 
         safe_name = _safe_dir_name(model)
-        worker_shard_dir = experimental.distributed_worker_shard_dir
+        # Replace ~ with $HOME so the path survives shell quoting on the remote
+        worker_shard_dir = experimental.distributed_worker_shard_dir.replace(
+            "~", "$HOME", 1
+        )
 
     # Launch workers on remote hosts (rank 1..N)
     for rank, host in enumerate(hosts[1:], start=1):

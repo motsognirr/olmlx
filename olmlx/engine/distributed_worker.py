@@ -33,10 +33,12 @@ def _load_pre_sharded(shard_dir_str, group):
     import mlx.core as mx
     import mlx_lm
 
-    shard_dir = Path(shard_dir_str)
+    shard_dir = Path(os.path.expandvars(shard_dir_str)).expanduser()
     logger.info("Loading pre-sharded weights from %s", shard_dir)
 
     model, tokenizer = mlx_lm.load(str(shard_dir))
+    if not hasattr(model, "shard"):
+        raise RuntimeError(f"Model in {shard_dir} does not support shard()")
     model.shard(group)
 
     # Overwrite double-split weights with correct pre-sharded values
@@ -97,8 +99,12 @@ def worker_main() -> None:
 
     pre_shard_dir = os.environ.get(PRE_SHARDED_DIR_ENV)
     if pre_shard_dir:
-        model, tokenizer = _load_pre_sharded(pre_shard_dir, group)
-    else:
+        try:
+            model, tokenizer = _load_pre_sharded(pre_shard_dir, group)
+        except Exception as e:
+            logger.warning("Pre-sharded load failed (%s), falling back to HF download", e)
+            pre_shard_dir = None
+    if not pre_shard_dir:
         logger.info("Loading model %s", model_path)
         model, tokenizer = mlx_lm.load(model_path)
 

@@ -116,7 +116,12 @@ def pre_shard_all_workers(
     output_base: Path,
     progress_cb=None,
 ) -> dict[int, Path]:
-    """Pre-shard for all worker ranks (1..N-1). Returns {rank: shard_dir}."""
+    """Pre-shard for all worker ranks (1..N-1). Returns {rank: shard_dir}.
+
+    Note: each rank loads the full model from disk independently. Loading once
+    and re-sharding in memory would be faster, but MLX model deep-copy behavior
+    is unverified and sequential processing keeps peak Metal memory at ~1/N.
+    """
     result = {}
     for rank in range(1, world_size):
         shard_dir = output_base / f"rank{rank}"
