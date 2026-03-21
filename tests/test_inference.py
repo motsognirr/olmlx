@@ -92,10 +92,12 @@ class TestBuildGenerateKwargs:
         # seed in kwargs for _apply_seed to consume before generation
         assert result["seed"] == 42
 
-    def test_stop_raises_for_text_model_basic(self):
-        """stop is no longer accepted by mlx-lm — should raise ValueError."""
-        with pytest.raises(ValueError, match="stop sequences"):
-            _build_generate_kwargs({"stop": [".", "\n"]})
+    def test_stop_warns_and_ignored_for_text_model(self, caplog):
+        """stop is silently ignored with a warning (not rejected) for text models."""
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
+            result = _build_generate_kwargs({"stop": [".", "\n"]})
+        assert "stop" not in result
+        assert any("stop" in r.message for r in caplog.records)
 
     def test_stop_vlm_ignored(self):
         result = _build_generate_kwargs({"stop": [".", "\n"]}, is_vlm=True)
@@ -112,12 +114,16 @@ class TestBuildGenerateKwargs:
         assert any("frequency_penalty" in r.message for r in caplog.records)
         assert any("presence_penalty" in r.message for r in caplog.records)
 
-    def test_zero_penalty_not_passed(self):
-        result = _build_generate_kwargs(
-            {"frequency_penalty": 0.0, "presence_penalty": 0.0}
-        )
+    def test_zero_penalty_warns(self, caplog):
+        """Even 0.0 values should warn when explicitly set."""
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
+            result = _build_generate_kwargs(
+                {"frequency_penalty": 0.0, "presence_penalty": 0.0}
+            )
         assert "frequency_penalty" not in result
         assert "presence_penalty" not in result
+        assert any("frequency_penalty" in r.message for r in caplog.records)
+        assert any("presence_penalty" in r.message for r in caplog.records)
 
     def test_unknown_options_ignored(self):
         result = _build_generate_kwargs({"unknown_key": 99})
@@ -150,18 +156,6 @@ class TestBuildGenerateKwargs:
         """VLM: seed should be in kwargs (mlx-vlm accepts it directly)."""
         result = _build_generate_kwargs({"seed": 42}, is_vlm=True)
         assert result["seed"] == 42
-
-    def test_stop_raises_text_model(self):
-        """Text model: stop sequences should raise ValueError."""
-        with pytest.raises(ValueError, match="stop sequences"):
-            _build_generate_kwargs({"stop": [".", "\n"]})
-
-    def test_frequency_presence_penalty_warns(self, caplog):
-        """Text model: frequency/presence penalty should log a warning when dropped."""
-        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
-            _build_generate_kwargs({"frequency_penalty": 0.5, "presence_penalty": 0.3})
-        assert any("frequency_penalty" in r.message for r in caplog.records)
-        assert any("presence_penalty" in r.message for r in caplog.records)
 
 
 class TestApplySeed:
