@@ -20,7 +20,7 @@ _WEIGHT_PATTERNS = {
     re.compile(r"^model.*\.safetensors\.index\.json$"),
     re.compile(r"^pytorch_model.*\.bin$"),
     re.compile(r"^pytorch_model.*\.bin\.index\.json$"),
-    re.compile(r"^\..*$"),  # hidden files (markers, etc.)
+    re.compile(r"^\.pre_sharded$"),  # pre-shard marker file
 }
 
 
@@ -120,12 +120,15 @@ def pre_shard_all_workers(
 
     Note: each rank loads the full model from disk independently. Loading once
     and re-sharding in memory would be faster, but MLX model deep-copy behavior
-    is unverified and sequential processing keeps peak Metal memory at ~1/N.
+    is unverified and sequential processing avoids accumulating multiple ranks'
+    materialized weights.
     """
     result = {}
     for rank in range(1, world_size):
         shard_dir = output_base / f"rank{rank}"
-        pre_shard_for_rank(model_dir, rank=rank, world_size=world_size, output_dir=shard_dir)
+        pre_shard_for_rank(
+            model_dir, rank=rank, world_size=world_size, output_dir=shard_dir
+        )
         result[rank] = shard_dir
         if progress_cb:
             progress_cb(rank, world_size)

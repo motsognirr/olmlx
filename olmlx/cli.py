@@ -95,7 +95,6 @@ _cli_distributed_coordinator = None
 _VALID_HOSTNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
-
 _worker_procs: list[subprocess.Popen] = []
 _worker_log_fhs: list = []
 _atexit_registered = False
@@ -129,8 +128,6 @@ def _pre_shard_and_distribute(hosts, model, world_size, experimental) -> bool:
 
     Returns True on success, False on failure (caller should fall back).
     """
-    import shlex
-
     from olmlx.engine.pre_shard import (
         pre_shard_all_workers,
         read_shard_marker,
@@ -177,25 +174,30 @@ def _pre_shard_and_distribute(hosts, model, world_size, experimental) -> bool:
             return False
 
     # SCP shards to each worker
-    # Replace ~ with $HOME so the path survives shell quoting (shlex.quote
-    # wraps in single quotes which suppress tilde expansion).
-    worker_shard_dir = experimental.distributed_worker_shard_dir.replace("~", "$HOME", 1)
+    # Keep ~ as-is: SSH mkdir uses double quotes (which allow tilde expansion),
+    # SCP expands ~ on the remote side natively, and the worker calls expanduser().
+    worker_shard_dir = experimental.distributed_worker_shard_dir
     for rank, host in enumerate(hosts[1:], start=1):
         shard_dir = shard_base / f"rank{rank}"
         remote_dir = f"{worker_shard_dir}/{safe_name}/rank{rank}"
 
-        # Create remote directory
-        mkdir_cmd = ["ssh", "-o", "BatchMode=yes", host, f"mkdir -p {shlex.quote(remote_dir)}"]
+        # Create remote directory (double quotes allow tilde expansion)
+        mkdir_cmd = ["ssh", "-o", "BatchMode=yes", host, f'mkdir -p "{remote_dir}"']
         try:
             subprocess.run(mkdir_cmd, check=True, capture_output=True, timeout=30)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             logger.warning("Failed to create remote dir on %s: %s", host, e)
             return False
 
-        # SCP with compression — quote remote path for spaces
+        # SCP with compression — SCP handles ~ expansion on the remote side
         scp_cmd = [
-            "scp", "-C", "-o", "BatchMode=yes",
-            "-r", f"{shard_dir}/.", f"{host}:{shlex.quote(remote_dir)}/",
+            "scp",
+            "-C",
+            "-o",
+            "BatchMode=yes",
+            "-r",
+            f"{shard_dir}/.",
+            f"{host}:{remote_dir}/",
         ]
         print(f"  Transferring shard to {host} rank {rank}...")
         try:
@@ -298,9 +300,7 @@ def _launch_distributed_workers() -> list[str]:
     # Pre-shard and distribute weights to workers if enabled
     pre_sharded = False
     if experimental.distributed_pre_shard:
-        pre_sharded = _pre_shard_and_distribute(
-            hosts, model, world_size, experimental
-        )
+        pre_sharded = _pre_shard_and_distribute(hosts, model, world_size, experimental)
 
     # Pre-compute safe model name for env var paths (used when pre-sharded)
     if pre_sharded:
@@ -308,10 +308,8 @@ def _launch_distributed_workers() -> list[str]:
         from olmlx.models.store import _safe_dir_name
 
         safe_name = _safe_dir_name(model)
-        # Replace ~ with $HOME so the path survives shell quoting on the remote
-        worker_shard_dir = experimental.distributed_worker_shard_dir.replace(
-            "~", "$HOME", 1
-        )
+        # Keep ~ as-is: the worker calls expanduser() on the received path
+        worker_shard_dir = experimental.distributed_worker_shard_dir
 
     # Launch workers on remote hosts (rank 1..N)
     for rank, host in enumerate(hosts[1:], start=1):
@@ -326,9 +324,7 @@ def _launch_distributed_workers() -> list[str]:
             "MLX_RANK": str(rank),
         }
         if pre_sharded:
-            env[PRE_SHARDED_DIR_ENV] = (
-                f"{worker_shard_dir}/{safe_name}/rank{rank}"
-            )
+            env[PRE_SHARDED_DIR_ENV] = f"{worker_shard_dir}/{safe_name}/rank{rank}"
         env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
 
         # Build remote shell script that sets up hostfile and runs worker

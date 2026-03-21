@@ -33,7 +33,7 @@ def _load_pre_sharded(shard_dir_str, group):
     import mlx.core as mx
     import mlx_lm
 
-    shard_dir = Path(os.path.expandvars(shard_dir_str)).expanduser()
+    shard_dir = Path(shard_dir_str).expanduser()
     logger.info("Loading pre-sharded weights from %s", shard_dir)
 
     model, tokenizer = mlx_lm.load(str(shard_dir))
@@ -102,7 +102,9 @@ def worker_main() -> None:
         try:
             model, tokenizer = _load_pre_sharded(pre_shard_dir, group)
         except Exception as e:
-            logger.warning("Pre-sharded load failed (%s), falling back to HF download", e)
+            logger.warning(
+                "Pre-sharded load failed (%s), falling back to HF download", e
+            )
             pre_shard_dir = None
     if not pre_shard_dir:
         logger.info("Loading model %s", model_path)
