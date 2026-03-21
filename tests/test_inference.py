@@ -157,6 +157,22 @@ class TestBuildGenerateKwargs:
         result = _build_generate_kwargs({"seed": 42}, is_vlm=True)
         assert result["seed"] == 42
 
+    def test_repeat_last_n_without_penalty_warns(self, caplog):
+        """repeat_last_n alone is a no-op — should warn and not build processors."""
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
+            result = _build_generate_kwargs({"repeat_last_n": 64})
+        assert "logits_processors" not in result
+        assert any("repeat_last_n" in r.message for r in caplog.records)
+
+    def test_sampling_without_temperature_no_sampler(self):
+        """top_k/top_p/min_p without temperature should not build a sampler.
+
+        make_sampler defaults temp=0.0 (greedy), which makes other sampling
+        params irrelevant — a silent regression from old behavior.
+        """
+        result = _build_generate_kwargs({"top_k": 40})
+        assert "sampler" not in result
+
 
 class TestApplySeed:
     def test_apply_seed_consume_pops(self):

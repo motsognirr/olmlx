@@ -382,23 +382,33 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
         for ollama_key, sampler_key in sampling_map.items():
             if ollama_key in options:
                 sampler_args[sampler_key] = options[ollama_key]
-        if sampler_args:
+        # Only build sampler when temperature is explicitly set — make_sampler
+        # defaults temp=0.0 (greedy), which makes top_k/top_p/min_p irrelevant.
+        if sampler_args and "temp" in sampler_args:
             if make_sampler is None:
                 raise RuntimeError("mlx-lm is not installed; cannot build sampler")
             kwargs["sampler"] = make_sampler(**sampler_args)
+        elif sampler_args:
+            logger.warning(
+                "top_k/top_p/min_p without temperature ignored; make_sampler "
+                "defaults to greedy (temp=0.0) which makes them irrelevant"
+            )
 
-        # Collect penalty params
-        penalty_args = {}
+        # Collect penalty params — only build processors when repeat_penalty
+        # is present; repeat_last_n alone is a no-op (no penalty to apply).
         if "repeat_penalty" in options:
-            penalty_args["repetition_penalty"] = options["repeat_penalty"]
-        if "repeat_last_n" in options:
-            penalty_args["repetition_context_size"] = options["repeat_last_n"]
-        if penalty_args:
+            penalty_args = {"repetition_penalty": options["repeat_penalty"]}
+            if "repeat_last_n" in options:
+                penalty_args["repetition_context_size"] = options["repeat_last_n"]
             if make_logits_processors is None:
                 raise RuntimeError(
                     "mlx-lm is not installed; cannot build logits processors"
                 )
             kwargs["logits_processors"] = make_logits_processors(**penalty_args)
+        elif "repeat_last_n" in options:
+            logger.warning(
+                "repeat_last_n without repeat_penalty has no effect; ignored"
+            )
 
         if "num_predict" in options:
             kwargs["max_tokens"] = options["num_predict"]
