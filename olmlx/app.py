@@ -40,25 +40,29 @@ async def lifespan(app: FastAPI):
     distributed_group = None
     coordinator = None
     if experimental.distributed:
-        import mlx.core as mx
-
-        from olmlx.engine.distributed import DistributedCoordinator
         from olmlx.engine.inference import set_distributed_coordinator
 
-        distributed_group = mx.distributed.init(
-            backend=experimental.distributed_backend
-        )
+        # The CLI starts the ring backend and sideband server before uvicorn
+        # (to avoid the slow transformers import blocking the sideband).
+        # Retrieve the pre-created state from cmd_serve().
+        from olmlx.cli import _cli_distributed_coordinator, _cli_distributed_group
+
+        distributed_group = _cli_distributed_group
+        coordinator = _cli_distributed_coordinator
+
+        if distributed_group is None or coordinator is None:
+            raise RuntimeError(
+                "Distributed mode requires starting via 'olmlx serve'. "
+                "The ring backend and sideband server must be initialized "
+                "before the app starts."
+            )
+
         world_size = distributed_group.size()
         logger.info(
             "Distributed mode: rank %d, world_size %d, backend %s",
             distributed_group.rank(),
             world_size,
             experimental.distributed_backend,
-        )
-        coordinator = DistributedCoordinator(
-            world_size=world_size,
-            port=experimental.distributed_sideband_port,
-            secret=experimental.distributed_secret or None,
         )
         import asyncio
 

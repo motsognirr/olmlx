@@ -14,9 +14,22 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import mlx.core as mx
+
 logger = logging.getLogger(__name__)
 
 _MAX_MESSAGE_BYTES = 64 * 1024 * 1024  # 64 MiB hard cap
+
+
+def distributed_barrier() -> None:
+    """Lightweight all_sum barrier to synchronize distributed ranks.
+
+    Must be called by ALL ranks at the same point.  Ensures ranks are
+    synchronized before compute-heavy forward passes begin, preventing
+    Metal GPU timeouts from one rank hitting all_sum before the other.
+    """
+    result = mx.distributed.all_sum(mx.array([1.0]))
+    mx.eval(result)  # MLX eval — force synchronous barrier completion
 
 
 @dataclass
@@ -298,10 +311,45 @@ class DistributedCoordinator:
 class DistributedWorker:
     """Non-rank-0 sideband client that receives inference params from coordinator."""
 
-    def __init__(self, coordinator_host: str, port: int, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        coordinator_host: str,
+        port: int,
+        timeout: float = 30.0,
+        connect_retry_timeout: float = 120.0,
+    ) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.settimeout(timeout)
-        self._sock.connect((coordinator_host, port))
+        # The coordinator's sideband server starts in the app lifespan, which
+        # may not be running yet when the worker reaches this point (the worker
+        # finishes ring init before the coordinator starts uvicorn). Retry the
+        # connection with exponential backoff until the sideband is available.
+        deadline = time.monotonic() + connect_retry_timeout
+        delay = 1.0
+        while True:
+            try:
+                self._sock.connect((coordinator_host, port))
+                break
+            except (ConnectionRefusedError, OSError) as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._sock.close()
+                    raise ConnectionRefusedError(
+                        f"Could not connect to coordinator sideband at "
+                        f"{coordinator_host}:{port} after {connect_retry_timeout}s"
+                    ) from exc
+                logger.info(
+                    "Sideband not ready (%s), retrying in %.0fs (%.0fs remaining)",
+                    exc,
+                    delay,
+                    remaining,
+                )
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 10.0)
+                # Need a fresh socket after failed connect
+                self._sock.close()
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock.settimeout(timeout)
         self._sock.settimeout(None)
         logger.info("Connected to coordinator at %s:%d", coordinator_host, port)
 

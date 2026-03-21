@@ -812,6 +812,12 @@ class ModelManager:
                 )
             if hasattr(model, "shard"):
                 model.shard(self._distributed_group)
+                # Materialize all lazy weight slices BEFORE any forward pass.
+                # model.shard() creates lazy array slices; if they're first
+                # evaluated during inference (with all_sum), the combined Metal
+                # command buffer can exceed the ~10s GPU timeout for large
+                # models (32B+).  Evaluating here is purely local (no all_sum).
+                mx.eval(model.parameters())
                 is_distributed = True
                 logger.info("Model %s sharded for distributed inference", hf_path)
             else:

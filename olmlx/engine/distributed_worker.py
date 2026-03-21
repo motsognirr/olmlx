@@ -24,7 +24,7 @@ def worker_main() -> None:
     """Main loop for distributed worker nodes."""
     import mlx.core as mx
 
-    from olmlx.engine.distributed import DistributedWorker
+    from olmlx.engine.distributed import DistributedWorker, distributed_barrier
 
     logging.basicConfig(
         level=logging.INFO,
@@ -73,6 +73,11 @@ def worker_main() -> None:
         sys.exit(1)
 
     model.shard(group)
+    # Materialize all lazy weight slices before entering inference.
+    # model.shard() creates lazy array slices; if they're first evaluated
+    # during a forward pass (with all_sum), the combined Metal command
+    # buffer can exceed the ~10s GPU timeout for large models (32B+).
+    mx.eval(model.parameters())
     worker.send_ready(secret=secret)
     logger.info("Model sharded, ready signal sent, entering inference loop")
 
@@ -87,6 +92,12 @@ def worker_main() -> None:
             if req is None:
                 logger.info("Received shutdown, exiting")
                 break
+
+            # Barrier: synchronize with coordinator before heavy compute.
+            # The coordinator broadcasts via sideband then hits the same
+            # barrier.  This prevents Metal GPU timeouts from one rank
+            # starting all_sum ops before the other is ready.
+            distributed_barrier()
 
             # Run stream_generate in lockstep with rank 0.
             # The sharded model's all_sum ops synchronize with other ranks.

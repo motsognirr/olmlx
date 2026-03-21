@@ -67,6 +67,9 @@ def _maybe_broadcast_distributed(
             max_tokens=max_tokens,
             gen_kwargs=gen_kwargs,
         )
+        from olmlx.engine.distributed import distributed_barrier
+
+        distributed_barrier()
 
 
 # Resolve generation streams at module load time to avoid repeated

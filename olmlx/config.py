@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    model_config = {"env_prefix": "OLMLX_", "env_file": ".env"}
+    model_config = {"env_prefix": "OLMLX_", "env_file": ".env", "extra": "ignore"}
 
     host: str = "0.0.0.0"
     port: Annotated[int, Field(ge=1, le=65535)] = 11434
@@ -43,7 +43,11 @@ settings = Settings()
 
 
 class ExperimentalSettings(BaseSettings):
-    model_config = {"env_prefix": "OLMLX_EXPERIMENTAL_", "env_file": ".env"}
+    model_config = {
+        "env_prefix": "OLMLX_EXPERIMENTAL_",
+        "env_file": ".env",
+        "extra": "ignore",
+    }
 
     distributed: bool = False
     distributed_hostfile: Path = Path("~/.olmlx/hostfile.json")
@@ -51,6 +55,8 @@ class ExperimentalSettings(BaseSettings):
     distributed_port: int = 32323
     distributed_sideband_port: int = 32400
     distributed_secret: str = ""
+    distributed_remote_working_dir: str = ""
+    distributed_remote_python: str = "python"
 
 
 experimental = ExperimentalSettings()

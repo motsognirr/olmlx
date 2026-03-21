@@ -323,6 +323,87 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_PROMPT_CACHE_MAX_TOKENS` | `32768` | Invalidate the KV cache after a conversation exceeds this many tokens. Use a very large value to effectively disable |
 | `OLMLX_CORS_ORIGINS` | `http://localhost:*`, `http://127.0.0.1:*` | Allowed CORS origins |
 
+### Distributed inference settings (experimental)
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLMLX_EXPERIMENTAL_DISTRIBUTED` | `false` | Enable distributed inference |
+| `OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE` | `~/.olmlx/hostfile.json` | Path to hostfile with hosts and model |
+| `OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND` | `ring` | MLX distributed backend |
+| `OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT` | `32323` | Base port for ring backend (increments per rank) |
+| `OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT` | `32400` | TCP port for coordinator↔worker sideband |
+| `OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET` | *(empty)* | Shared secret for worker authentication |
+| `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR` | *(empty)* | Working directory on remote workers |
+| `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON` | `python` | Python command on remote workers |
+
+## Distributed Inference (Experimental)
+
+Run models across multiple Apple Silicon machines connected via network (Thunderbolt recommended for best performance). This lets you run models that don't fit on a single machine — e.g. a 72B model split across two 64GB Mac Minis.
+
+### Setup
+
+1. **Both machines** need olmlx installed and the same model downloaded:
+   ```bash
+   cd ~/Documents/olmlx_distributed
+   git clone <repo-url> . && uv sync --no-editable
+   ```
+
+2. **Passwordless SSH** from the coordinator to all workers:
+   ```bash
+   ssh-copy-id user@worker-ip
+   ssh-keyscan -H worker-ip >> ~/.ssh/known_hosts
+   ```
+
+3. **Create a hostfile** on the coordinator at `~/.olmlx/hostfile.json`:
+   ```json
+   {
+     "hosts": ["10.0.1.1", "10.0.1.2"],
+     "model": "mlx-community/Qwen2.5-32B-Instruct-4bit"
+   }
+   ```
+   The first host is the coordinator (rank 0). All hosts must be reachable via SSH.
+
+4. **Configure** the coordinator with a `.env` file or environment variables:
+   ```bash
+   OLMLX_EXPERIMENTAL_DISTRIBUTED=true
+   OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE=~/.olmlx/hostfile.json
+   OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND=ring
+   OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT=32323
+   OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT=32400
+   OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR=~/Documents/olmlx_distributed
+   OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON=.venv/bin/python
+   OLMLX_HOST=0.0.0.0
+   ```
+
+5. **Start the server** on the coordinator only — workers are launched automatically via SSH:
+   ```bash
+   .venv/bin/python -m olmlx serve
+   ```
+
+6. **Send requests** using the model from the hostfile:
+   ```bash
+   curl http://coordinator-ip:11434/api/chat -d '{
+     "model": "mlx-community/Qwen2.5-32B-Instruct-4bit",
+     "messages": [{"role": "user", "content": "Hello!"}],
+     "stream": false
+   }'
+   ```
+
+### How it works
+
+- The coordinator generates an MLX ring hostfile from the hosts list and launches workers on remote machines via SSH
+- MLX's ring distributed backend (`mx.distributed.init`) connects all ranks
+- A sideband TCP channel (separate from the ring) broadcasts inference parameters to workers
+- On each request, the coordinator broadcasts prompt/params, both ranks run `stream_generate` in lockstep, and `all_sum` operations synchronize partial results
+- Only the coordinator returns results; worker output is discarded
+
+### Limitations
+
+- The requested model must match the model in the hostfile (workers pre-load it at startup)
+- VLM (vision) models are not supported in distributed mode
+- If the coordinator crashes mid-inference, workers hang indefinitely (MLX has no timeout on collective operations) — the atexit handler kills worker processes
+- Distributed adds per-token latency from network synchronization — it's slower than single-machine for models that fit in memory, but enables models that otherwise wouldn't run at all
+
 ## How It Works
 
 Instead of GGUF models and llama.cpp, this server uses [mlx-lm](https://github.com/ml-explore/mlx-examples/tree/main/llms/mlx_lm) to run inference directly on Apple Silicon's GPU via the Metal framework. Models are downloaded from HuggingFace Hub in MLX safetensor format.

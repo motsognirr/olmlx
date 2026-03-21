@@ -17,6 +17,8 @@ olmlx/
 │   ├── session.py      # ChatSession: agent loop, message history, tool execution
 │   └── tui.py          # ChatTUI: Rich-based terminal UI with streaming markdown
 ├── engine/
+│   ├── distributed.py  # DistributedCoordinator/Worker sideband protocol (TCP)
+│   ├── distributed_worker.py # Worker entry point for non-rank-0 nodes (launched via SSH)
 │   ├── inference.py    # generate_chat, generate_completion, generate_embeddings
 │   ├── model_manager.py # Model loading/unloading, keep-alive, LRU eviction
 │   ├── registry.py    # Ollama name → HuggingFace repo mapping via models.json
@@ -65,6 +67,13 @@ olmlx/
 - **Prompt caching**: KV cache reuse across requests when prompts share a common prefix. Works with both mlx-lm (text) and mlx-vlm (vision) models. Controlled via `OLMLX_PROMPT_CACHE` setting.
 - **Model load timeout**: Configurable via `OLMLX_MODEL_LOAD_TIMEOUT` with dedicated `ModelLoadTimeoutError` (HTTP 504).
 - **Terminal chat** (`chat/`): `olmlx chat` runs inference directly in-process via `ModelManager`/`generate_chat()` — no HTTP server needed. Connects to external MCP servers (stdio/SSE) for tool use with a full agent loop (model → tool calls → MCP execution → results fed back → continue). Uses `parse_model_output()` from `engine/tool_parser.py` for thinking/tool extraction. MCP config uses Claude Desktop format (`~/.olmlx/mcp.json`).
+- **Distributed inference** (experimental): Splits models across multiple Apple Silicon machines using MLX's ring distributed backend. Startup sequence: CLI generates ring hostfile → launches workers via SSH → ring init (`mx.distributed.init`) → starts sideband server (TCP, port 32400) → starts uvicorn. Key constraints:
+  - Sideband server starts in CLI before uvicorn (not in app lifespan) because `import transformers` can take minutes.
+  - Worker sideband connection retries with exponential backoff (up to 120s) to handle startup race conditions.
+  - After `model.shard()`, must materialize weights with `mx.eval(model.parameters())` on both coordinator and worker before any forward pass — otherwise the combined lazy weight materialization + all_sum Metal command buffer exceeds the ~10s GPU timeout for 32B+ models.
+  - Coordinator broadcasts inference params via sideband before `stream_generate`; a lightweight `all_sum` barrier synchronizes ranks before heavy compute.
+  - Worker and coordinator must load the same model (all_sum requires matching tensor shapes).
+  - Config: `OLMLX_EXPERIMENTAL_DISTRIBUTED=true`, hostfile at `~/.olmlx/hostfile.json` with `{"hosts": ["ip1", "ip2"], "model": "hf-path"}`.
 
 ## Development
 
