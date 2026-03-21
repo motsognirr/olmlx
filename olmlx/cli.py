@@ -196,7 +196,7 @@ def _pre_shard_and_distribute(hosts, model, world_size, experimental) -> bool:
             logger.warning("Failed to create remote dir on %s: %s", host, e)
             return False
 
-        # SCP with compression
+        # SCP with compression — no shlex.quote: SCP args aren't shell-processed
         scp_cmd = [
             "scp",
             "-C",
@@ -204,7 +204,7 @@ def _pre_shard_and_distribute(hosts, model, world_size, experimental) -> bool:
             "BatchMode=yes",
             "-r",
             f"{shard_dir}/.",
-            f"{host}:{shlex.quote(remote_dir)}/",
+            f"{host}:{remote_dir}/",
         ]
         print(f"  Transferring shard to {host} rank {rank}...")
         try:
