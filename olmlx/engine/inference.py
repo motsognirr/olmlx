@@ -408,13 +408,10 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
             kwargs["seed"] = options["seed"]
 
         if "stop" in options:
-            raise ValueError(
-                "stop sequences are not supported by mlx-lm >= 0.30.7; "
-                "remove the 'stop' parameter from your request"
-            )
+            logger.warning("stop sequences not supported by mlx-lm >= 0.30.7; ignored")
 
         for penalty_key in ("frequency_penalty", "presence_penalty"):
-            if penalty_key in options and options[penalty_key]:
+            if penalty_key in options:
                 logger.warning(
                     "%s not supported by mlx-lm >= 0.30.7; ignored", penalty_key
                 )
