@@ -280,6 +280,13 @@ def _launch_distributed_workers() -> list[str]:
                 file=sys.stderr,
             )
             sys.exit(1)
+        if len(hostfile_layers) != len(hosts):
+            print(
+                f"Error: hostfile 'layers' has {len(hostfile_layers)} entries "
+                f"but there are {len(hosts)} hosts (must match)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Validate hostnames to prevent command injection
     for host in hosts:

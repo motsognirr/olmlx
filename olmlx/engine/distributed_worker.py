@@ -128,7 +128,12 @@ def worker_main() -> None:
 
         from olmlx.engine.pipeline import apply_pipeline
 
-        apply_pipeline(model, group, layer_counts=layer_counts)
+        try:
+            apply_pipeline(model, group, layer_counts=layer_counts)
+        except ValueError as e:
+            logger.error("Pipeline setup failed: %s", e)
+            worker.close()
+            sys.exit(1)
         mx.eval(model.parameters())  # materialize owned weights on GPU
     else:
         pre_shard_dir = os.environ.get(PRE_SHARDED_DIR_ENV)
