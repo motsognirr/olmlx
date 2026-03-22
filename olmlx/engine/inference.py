@@ -23,16 +23,22 @@ from olmlx.utils import memory as memory_utils
 
 try:
     from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
-    from mlx_lm.sample_utils import make_logits_processors, make_sampler
     from mlx_lm.utils import common_prefix_len as _find_common_prefix
 except ImportError:  # pragma: no cover
     make_prompt_cache = None  # type: ignore[assignment]
     trim_prompt_cache = None  # type: ignore[assignment]
-    make_sampler = None  # type: ignore[assignment]
-    make_logits_processors = None  # type: ignore[assignment]
     _find_common_prefix = None  # type: ignore[assignment]
     logging.getLogger(__name__).warning(
         "mlx-lm prompt cache imports unavailable — prompt caching disabled"
+    )
+
+try:
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
+except ImportError:  # pragma: no cover
+    make_sampler = None  # type: ignore[assignment]
+    make_logits_processors = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning(
+        "mlx-lm sample_utils unavailable (mlx-lm < 0.30.7?) — sampler/logits_processors disabled"
     )
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils.streaming import async_mlx_stream
@@ -429,7 +435,7 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
     return kwargs
 
 
-def _apply_seed(kwargs: dict, *, consume: bool = False) -> None:
+def _apply_seed(kwargs: dict, *, consume: bool = True) -> None:
     """Read ``seed`` from *kwargs* and set the MLX RNG state.
 
     Must be called from the inference thread, not the event loop.
