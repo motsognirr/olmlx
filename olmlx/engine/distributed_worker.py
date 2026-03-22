@@ -105,7 +105,7 @@ def worker_main() -> None:
     from olmlx.config import PRE_SHARDED_DIR_ENV
 
     if strategy == "pipeline":
-        # Pipeline mode: load full model, apply pipeline partitioning
+        # Pipeline mode: load model, apply pipeline partitioning
         layer_counts_str = os.environ.get(
             "OLMLX_EXPERIMENTAL_DISTRIBUTED_LAYER_COUNTS", ""
         )
@@ -123,13 +123,35 @@ def worker_main() -> None:
             )
             worker.close()
             sys.exit(1)
-        logger.info("Loading model %s (pipeline strategy)", model_path)
-        model, tokenizer = mlx_lm.load(model_path)
 
         from olmlx.engine.pipeline import apply_pipeline
 
+        pre_shard_dir = os.environ.get(PRE_SHARDED_DIR_ENV)
+        pre_sharded = False
+        if pre_shard_dir:
+            try:
+                from pathlib import Path
+
+                shard_path = Path(pre_shard_dir).expanduser()
+                logger.info("Loading pre-sharded pipeline weights from %s", shard_path)
+                model, tokenizer = mlx_lm.load(str(shard_path))
+                pre_sharded = True
+            except Exception as e:
+                logger.warning(
+                    "Pre-sharded pipeline load failed (%s), "
+                    "falling back to full model download",
+                    e,
+                )
+                pre_sharded = False
+
+        if not pre_sharded:
+            logger.info("Loading model %s (pipeline strategy)", model_path)
+            model, tokenizer = mlx_lm.load(model_path)
+
         try:
-            apply_pipeline(model, group, layer_counts=layer_counts)
+            apply_pipeline(
+                model, group, layer_counts=layer_counts, pre_sharded=pre_sharded
+            )
         except ValueError as e:
             logger.error("Pipeline setup failed: %s", e)
             worker.close()

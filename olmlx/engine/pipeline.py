@@ -87,6 +87,7 @@ def apply_pipeline(
     model: Any,
     group: Any,
     layer_counts: list[int] | None = None,
+    pre_sharded: bool = False,
 ) -> None:
     """Apply pipeline parallelism to a model loaded by mlx_lm.load().
 
@@ -98,6 +99,9 @@ def apply_pipeline(
         group: MLX distributed group.
         layer_counts: Number of layers per rank. If None, splits evenly.
             Must sum to total layer count. Length must equal world_size.
+        pre_sharded: If True, the model already contains only owned layers
+            (renumbered 0-based). Skips validation against total layer count,
+            skips nullification, and uses start_idx=0.
     """
     inner = _validate_inner_model(model)
     if hasattr(inner, "pipeline_rank"):
@@ -106,38 +110,63 @@ def apply_pipeline(
         )
     rank = group.rank()
     world_size = group.size()
-    total_layers = len(inner.layers)
 
-    if layer_counts is None:
-        layer_counts = _compute_layer_counts(total_layers, world_size)
+    if pre_sharded:
+        # Model already has only owned layers, renumbered 0-based
+        owned_count = len(inner.layers)
 
-    if len(layer_counts) != world_size:
-        raise ValueError(
-            f"layer_counts must have {world_size} entries (one per rank), "
-            f"got {len(layer_counts)}"
-        )
-    if sum(layer_counts) != total_layers:
-        raise ValueError(
-            f"layer_counts must sum to {total_layers} (total layers), "
-            f"got {sum(layer_counts)}"
-        )
+        if layer_counts is None:
+            raise ValueError("layer_counts is required when pre_sharded=True")
+        if len(layer_counts) != world_size:
+            raise ValueError(
+                f"layer_counts must have {world_size} entries (one per rank), "
+                f"got {len(layer_counts)}"
+            )
+        expected = layer_counts[rank]
+        if owned_count != expected:
+            raise ValueError(
+                f"Pre-sharded model has {owned_count} layers but "
+                f"layer_counts[{rank}]={expected}; shard may be stale or incorrect"
+            )
 
-    start_idx, end_idx = _compute_layer_range(rank, layer_counts)
+        inner.pipeline_rank = rank
+        inner.pipeline_size = world_size
+        inner.start_idx = 0
+        inner.end_idx = owned_count
+        inner.num_layers = owned_count
+    else:
+        total_layers = len(inner.layers)
 
-    # Set pipeline state on inner model
-    inner.pipeline_rank = rank
-    inner.pipeline_size = world_size
-    inner.start_idx = start_idx
-    inner.end_idx = end_idx
-    inner.num_layers = end_idx - start_idx
+        if layer_counts is None:
+            layer_counts = _compute_layer_counts(total_layers, world_size)
 
-    # Nullify non-owned layers and truncate.
-    # Note: embed_tokens, norm, and lm_head (on outer model) remain on all ranks.
-    # norm is needed because all_gather broadcasts the final hidden state to all
-    # ranks, each of which must independently produce valid output for the compute
-    # graph. This matches the DeepSeek V3.2 reference implementation.
-    inner.layers = inner.layers[:end_idx]
-    inner.layers[:start_idx] = [None] * start_idx
+        if len(layer_counts) != world_size:
+            raise ValueError(
+                f"layer_counts must have {world_size} entries (one per rank), "
+                f"got {len(layer_counts)}"
+            )
+        if sum(layer_counts) != total_layers:
+            raise ValueError(
+                f"layer_counts must sum to {total_layers} (total layers), "
+                f"got {sum(layer_counts)}"
+            )
+
+        start_idx, end_idx = _compute_layer_range(rank, layer_counts)
+
+        # Set pipeline state on inner model
+        inner.pipeline_rank = rank
+        inner.pipeline_size = world_size
+        inner.start_idx = start_idx
+        inner.end_idx = end_idx
+        inner.num_layers = end_idx - start_idx
+
+        # Nullify non-owned layers and truncate.
+        # Note: embed_tokens, norm, and lm_head (on outer model) remain on all ranks.
+        # norm is needed because all_gather broadcasts the final hidden state to all
+        # ranks, each of which must independently produce valid output for the compute
+        # graph. This matches the DeepSeek V3.2 reference implementation.
+        inner.layers = inner.layers[:end_idx]
+        inner.layers[:start_idx] = [None] * start_idx
 
     # Replace inner model's __call__ with pipeline-aware version
     if _is_gpt_oss(inner):
@@ -152,12 +181,13 @@ def apply_pipeline(
     _patch_outer_layers(model, inner)
 
     logger.info(
-        "Pipeline parallelism applied: rank %d/%d, layers %d-%d (of %d total)",
+        "Pipeline parallelism applied: rank %d/%d, layers %d-%d (%d owned%s)",
         rank,
         world_size,
-        start_idx,
-        end_idx - 1,
-        total_layers,
+        inner.start_idx,
+        inner.end_idx - 1,
+        inner.num_layers,
+        ", pre-sharded" if pre_sharded else "",
     )
 
 
