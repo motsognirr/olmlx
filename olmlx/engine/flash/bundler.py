@@ -1,0 +1,293 @@
+"""Repack model FFN weights into bundled format for flash inference.
+
+Each neuron's gate_proj column, up_proj column, and down_proj row are stored
+contiguously in a .flashweights file, enabling efficient sequential reads
+(row-column bundling from the LLM in a Flash paper).
+
+Supports both regular (float16) and quantized (4-bit/8-bit) models.
+Quantized weights are dequantized to float16 during bundling.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+
+import mlx.core as mx
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+HEADER_MAGIC = 0x464C5348  # "FLSH"
+HEADER_VERSION = 1
+HEADER_SIZE = 64  # bytes
+
+# Dtype string → byte size
+_DTYPE_BYTES = {
+    "float16": 2,
+    "float32": 4,
+    "bfloat16": 2,
+}
+
+# Header format: magic(4) version(4) num_neurons(4) hidden_size(4)
+# dtype_len(4) dtype(16) padding(28) = 64 bytes
+_HEADER_STRUCT = struct.Struct("<IIII4s16s28s")
+
+
+def _encode_header(num_neurons: int, hidden_size: int, dtype: str) -> bytes:
+    dtype_bytes = dtype.encode("ascii")
+    return _HEADER_STRUCT.pack(
+        HEADER_MAGIC,
+        HEADER_VERSION,
+        num_neurons,
+        hidden_size,
+        struct.pack("<I", len(dtype_bytes)),
+        dtype_bytes.ljust(16, b"\x00"),
+        b"\x00" * 28,
+    )
+
+
+def parse_header(data: bytes) -> dict:
+    magic, version, num_neurons, hidden_size, dtype_len_bytes, dtype_raw, _ = (
+        _HEADER_STRUCT.unpack(data[:HEADER_SIZE])
+    )
+    dtype_len = struct.unpack("<I", dtype_len_bytes)[0]
+    dtype = dtype_raw[:dtype_len].decode("ascii")
+    return {
+        "magic": magic,
+        "version": version,
+        "num_neurons": num_neurons,
+        "hidden_size": hidden_size,
+        "dtype": dtype,
+    }
+
+
+@dataclass
+class BundledLayerLayout:
+    """Describes the on-disk layout of one FFN layer's bundled weights."""
+
+    layer_idx: int
+    num_neurons: int
+    hidden_size: int
+    neuron_byte_size: int
+    file_path: Path
+    offsets: np.ndarray  # uint64 byte offsets for each neuron
+    dtype: str
+
+
+def _dequantize_weight(
+    weight: np.ndarray,
+    scales: np.ndarray,
+    biases: np.ndarray | None,
+    group_size: int,
+    bits: int,
+) -> np.ndarray:
+    """Dequantize a weight tensor to float16 using MLX."""
+    w_mx = mx.array(weight)
+    s_mx = mx.array(scales)
+    b_mx = mx.array(biases) if biases is not None else None
+    result = mx.dequantize(w_mx, s_mx, b_mx, group_size, bits)
+    result = result.astype(mx.float16)
+    mx.eval(result)
+    return np.array(result)
+
+
+def _find_ffn_weights(
+    model_dir: Path,
+) -> tuple[dict[int, dict[str, np.ndarray]], dict | None]:
+    """Load all FFN weights from safetensors, grouped by layer index.
+
+    Returns (layers_dict, quantization_config_or_none).
+    Quantized models have .weight/.scales/.biases per projection;
+    regular models have just .weight.
+    """
+    from safetensors.numpy import load_file
+
+    layers: dict[int, dict[str, np.ndarray]] = {}
+
+    # Check for quantization config
+    config_path = model_dir / "config.json"
+    quant_config = None
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+        quant_config = config.get("quantization")
+
+    pattern = re.compile(
+        r"model\.layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)"
+    )
+
+    for sf_path in sorted(model_dir.glob("*.safetensors")):
+        if sf_path.name.startswith("flash_"):
+            continue
+        tensors = load_file(str(sf_path))
+        for name, arr in tensors.items():
+            m = pattern.match(name)
+            if m:
+                layer_idx = int(m.group(1))
+                proj_name = m.group(2)
+                component = m.group(3)  # weight, scales, or biases
+                key = f"{proj_name}.{component}"
+                if layer_idx not in layers:
+                    layers[layer_idx] = {}
+                layers[layer_idx][key] = arr
+
+    return layers, quant_config
+
+
+def _get_dense_weights(
+    layer_weights: dict[str, np.ndarray],
+    quant_config: dict | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """Extract dense float16 weight matrices from layer weights.
+
+    Handles both quantized and regular formats.
+
+    Returns (gate_w, up_w, down_w, intermediate_size, hidden_size).
+    """
+    is_quantized = "gate_proj.scales" in layer_weights
+
+    if is_quantized:
+        if quant_config is None:
+            raise ValueError(
+                "Quantized weights found but no quantization config in config.json"
+            )
+        group_size = quant_config["group_size"]
+        bits = quant_config["bits"]
+
+        gate_w = _dequantize_weight(
+            layer_weights["gate_proj.weight"],
+            layer_weights["gate_proj.scales"],
+            layer_weights.get("gate_proj.biases"),
+            group_size,
+            bits,
+        )
+        up_w = _dequantize_weight(
+            layer_weights["up_proj.weight"],
+            layer_weights["up_proj.scales"],
+            layer_weights.get("up_proj.biases"),
+            group_size,
+            bits,
+        )
+        down_w = _dequantize_weight(
+            layer_weights["down_proj.weight"],
+            layer_weights["down_proj.scales"],
+            layer_weights.get("down_proj.biases"),
+            group_size,
+            bits,
+        )
+    else:
+        gate_w = layer_weights["gate_proj.weight"]
+        up_w = layer_weights["up_proj.weight"]
+        down_w = layer_weights["down_proj.weight"]
+
+    inter, hidden = gate_w.shape
+    return gate_w, up_w, down_w, inter, hidden
+
+
+def bundle_ffn_weights(
+    model_dir: Path,
+    output_dir: Path,
+    dtype: str = "float16",
+) -> dict[int, BundledLayerLayout]:
+    """Repack safetensors FFN weights into bundled .flashweights format.
+
+    For each FFN layer, creates a file where neuron i's data is stored
+    contiguously as: [gate_proj row i | up_proj row i | down_proj col i].
+
+    Quantized weights are dequantized to float16 during bundling.
+
+    Args:
+        model_dir: Directory containing model safetensors files.
+        output_dir: Directory to write .flashweights files.
+        dtype: Target dtype string (e.g. "float16").
+
+    Returns:
+        Dict mapping layer index to BundledLayerLayout.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    layers, quant_config = _find_ffn_weights(model_dir)
+    if not layers:
+        raise ValueError(f"No FFN weights found in {model_dir}")
+
+    if quant_config:
+        logger.info(
+            "Quantized model detected (bits=%d, group_size=%d) — dequantizing to %s",
+            quant_config["bits"],
+            quant_config["group_size"],
+            dtype,
+        )
+
+    layouts: dict[int, BundledLayerLayout] = {}
+    hidden_size = None
+    intermediate_size = None
+
+    for layer_idx in sorted(layers.keys()):
+        gate_w, up_w, down_w, inter, hidden = _get_dense_weights(
+            layers[layer_idx], quant_config
+        )
+        if hidden_size is None:
+            hidden_size = hidden
+            intermediate_size = inter
+
+        dtype_bytes = _DTYPE_BYTES[dtype]
+        neuron_byte_size = hidden * dtype_bytes * 3
+
+        # Build offset table
+        offset_table_size = inter * 8
+        data_start = HEADER_SIZE + offset_table_size
+        offsets = np.array(
+            [data_start + i * neuron_byte_size for i in range(inter)],
+            dtype=np.uint64,
+        )
+
+        file_path = output_dir / f"layer_{layer_idx:02d}.flashweights"
+        with open(file_path, "wb") as f:
+            f.write(_encode_header(inter, hidden, dtype))
+            f.write(offsets.tobytes())
+            for neuron_idx in range(inter):
+                gate_row = gate_w[neuron_idx].astype(np.float16)
+                up_row = up_w[neuron_idx].astype(np.float16)
+                down_col = down_w[:, neuron_idx].astype(np.float16)
+                f.write(gate_row.tobytes())
+                f.write(up_row.tobytes())
+                f.write(down_col.tobytes())
+
+        layouts[layer_idx] = BundledLayerLayout(
+            layer_idx=layer_idx,
+            num_neurons=inter,
+            hidden_size=hidden,
+            neuron_byte_size=neuron_byte_size,
+            file_path=file_path,
+            offsets=offsets,
+            dtype=dtype,
+        )
+
+        logger.info("Bundled layer %d: %d neurons", layer_idx, inter)
+
+        # Free memory for this layer's dense weights
+        del gate_w, up_w, down_w
+        layers[layer_idx] = {}  # Release source tensors
+
+    config = {
+        "num_layers": len(layouts),
+        "hidden_size": hidden_size,
+        "intermediate_size": intermediate_size,
+        "dtype": dtype,
+        "quantized_source": quant_config is not None,
+        "layers": {
+            str(idx): {
+                "file": layout.file_path.name,
+                "num_neurons": layout.num_neurons,
+                "neuron_byte_size": layout.neuron_byte_size,
+            }
+            for idx, layout in layouts.items()
+        },
+    }
+    (output_dir / "flash_layout.json").write_text(json.dumps(config, indent=2))
+
+    return layouts

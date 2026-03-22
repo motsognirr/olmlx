@@ -937,6 +937,91 @@ def cmd_config_show(_args):
         print(f"  Sideband port:        {experimental.distributed_sideband_port}")
 
 
+def cmd_flash_prepare(args):
+    """Prepare a model for flash inference."""
+    _configure_logging()
+
+    from olmlx.engine.flash.prepare import prepare_model_for_flash
+
+    store = _create_store()
+    hf_path = store.registry.resolve(args.model) or args.model
+    local_dir = store.ensure_downloaded(hf_path)
+    model_path = str(local_dir)
+
+    def progress(desc, frac):
+        bar_len = 30
+        filled = int(bar_len * frac)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        print(f"\r  {desc:<40s} [{bar}] {frac:5.1%}", end="", flush=True)
+        if frac >= 1.0:
+            print()
+
+    print(f"Preparing {args.model} for flash inference...")
+    print(f"  Model path: {model_path}")
+    print(f"  Predictor rank: {args.rank}")
+    print(f"  Calibration samples: {args.samples}")
+    print(f"  Activation threshold: {args.threshold}")
+    print(f"  Training epochs: {args.epochs}")
+    print()
+
+    output_dir = prepare_model_for_flash(
+        model_path=model_path,
+        rank=args.rank,
+        num_samples=args.samples,
+        activation_threshold=args.threshold,
+        epochs=args.epochs,
+        progress_callback=progress,
+    )
+
+    print("\nFlash preparation complete!")
+    print(f"  Output: {output_dir}")
+    print("\nTo use flash inference:")
+    print("  OLMLX_EXPERIMENTAL_FLASH=true olmlx serve")
+
+
+def cmd_flash_info(args):
+    """Show flash preparation info for a model."""
+    store = _create_store()
+    hf_path = store.registry.resolve(args.model) or args.model
+    local_dir = store.local_path(hf_path)
+    flash_dir = local_dir / "flash"
+
+    if not flash_dir.exists():
+        print(f"Model '{args.model}' has not been prepared for flash inference.")
+        print(f"  Expected: {flash_dir}")
+        print(f"\nRun: olmlx flash prepare {args.model}")
+        return
+
+    config_path = flash_dir / "flash_config.json"
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+        print(f"Flash info for '{args.model}':")
+        print("  Status:             prepared")
+        print(f"  Flash directory:    {flash_dir}")
+        print(f"  Hidden size:        {config.get('hidden_size')}")
+        print(f"  Intermediate size:  {config.get('intermediate_size')}")
+        print(f"  Num layers:         {config.get('num_layers')}")
+        print(f"  Predictor rank:     {config.get('predictor_rank')}")
+        print(f"  Calibration samples:{config.get('num_calibration_samples')}")
+        print(f"  Prepared at:        {config.get('prepared_at')}")
+
+        # Count .flashweights files
+        fw_files = list(flash_dir.glob("*.flashweights"))
+        print(f"  Weight files:       {len(fw_files)}")
+
+        # Check predictors
+        pred_dir = flash_dir / "predictors"
+        if pred_dir.exists():
+            pred_files = list(pred_dir.glob("*.npz"))
+            print(f"  Predictor files:    {len(pred_files)}")
+
+        # Total size
+        total_bytes = sum(f.stat().st_size for f in flash_dir.rglob("*") if f.is_file())
+        print(f"  Total size:         {total_bytes / (1024**2):.1f} MB")
+    else:
+        print(f"Flash directory exists but no config found: {flash_dir}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="olmlx",
@@ -1002,6 +1087,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--skills-dir", help="Skills directory (default: ~/.olmlx/skills)"
     )
 
+    # Flash inference
+    flash = sub.add_parser("flash", help="Flash inference (LLM in a Flash)")
+    flash_sub = flash.add_subparsers(dest="flash_command")
+
+    prepare_p = flash_sub.add_parser(
+        "prepare", help="Prepare a model for flash inference"
+    )
+    prepare_p.add_argument("model", help="Model name or HF path")
+    prepare_p.add_argument(
+        "--rank", type=int, default=128, help="Predictor rank (default: 128)"
+    )
+    prepare_p.add_argument(
+        "--samples",
+        type=int,
+        default=256,
+        help="Number of calibration samples (default: 256)",
+    )
+    prepare_p.add_argument(
+        "--threshold",
+        type=float,
+        default=0.01,
+        help="Activation threshold (default: 0.01)",
+    )
+    prepare_p.add_argument(
+        "--epochs",
+        type=int,
+        default=5,
+        help="Predictor training epochs (default: 5)",
+    )
+
+    info_p = flash_sub.add_parser(
+        "info", help="Show flash preparation info for a model"
+    )
+    info_p.add_argument("model", help="Model name or HF path")
+
     cfg = sub.add_parser("config", help="Show configuration")
     cfg_sub = cfg.add_subparsers(dest="config_command")
     cfg_sub.add_parser("show", help="Show current configuration")
@@ -1037,6 +1157,13 @@ def cli_main():
             cmd_models_delete(args)
         else:
             parser.parse_args(["models", "--help"])
+    elif args.command == "flash":
+        if args.flash_command == "prepare":
+            cmd_flash_prepare(args)
+        elif args.flash_command == "info":
+            cmd_flash_info(args)
+        else:
+            parser.parse_args(["flash", "--help"])
     elif args.command == "config":
         if args.config_command == "show":
             cmd_config_show(args)

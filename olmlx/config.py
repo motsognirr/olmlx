@@ -62,6 +62,16 @@ class ExperimentalSettings(BaseSettings):
     distributed_shard_dir: Path = Path("~/.olmlx/shards")
     distributed_worker_shard_dir: str = "~/.olmlx/shards"
 
+    # Flash inference (LLM in a Flash)
+    flash: bool = False
+    flash_sparsity_threshold: Annotated[float, Field(gt=0, le=1.0)] = 0.5
+    flash_min_active_neurons: Annotated[int, Field(gt=0)] = 128
+    flash_max_active_neurons: Annotated[int, Field(gt=0)] | None = None
+    flash_window_size: Annotated[int, Field(gt=0)] = 5
+    flash_io_threads: Annotated[int, Field(gt=0)] = 32
+    flash_cache_budget_neurons: Annotated[int, Field(ge=0)] = 1024
+    flash_predictor_rank: Annotated[int, Field(gt=0)] = 128
+
 
 experimental = ExperimentalSettings()
 

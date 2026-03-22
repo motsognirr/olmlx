@@ -247,6 +247,7 @@ class LoadedModel:
     tokenizer: Any  # tokenizer (mlx-lm) or processor (mlx-vlm)
     is_vlm: bool = False
     is_distributed: bool = False
+    is_flash: bool = False
     template_caps: TemplateCaps = field(default_factory=TemplateCaps)
     loaded_at: float = field(default_factory=time.time)
     expires_at: float | None = None
@@ -546,6 +547,17 @@ class ModelManager:
                         caps.has_thinking_tags,
                     )
 
+                    # Detect if flash mode was used
+                    is_flash = False
+                    try:
+                        from olmlx.engine.flash.flash_model import (
+                            FlashModelWrapper,
+                        )
+
+                        is_flash = isinstance(model, FlashModelWrapper)
+                    except ImportError:
+                        pass
+
                     lm = LoadedModel(
                         name=normalized,
                         hf_path=hf_path,
@@ -553,6 +565,7 @@ class ModelManager:
                         tokenizer=tokenizer,
                         is_vlm=is_vlm,
                         is_distributed=is_distributed,
+                        is_flash=is_flash,
                         template_caps=caps,
                         expires_at=expires,
                     )
@@ -730,6 +743,9 @@ class ModelManager:
 
         # No vision keys — check mlx-lm
         try:
+            from olmlx import ensure_mlx_lm
+
+            ensure_mlx_lm()
             from mlx_lm.utils import MODEL_REMAPPING as LM_REMAP
 
             mapped = LM_REMAP.get(model_type, model_type)
@@ -757,6 +773,9 @@ class ModelManager:
     ) -> tuple[Any, Any, bool, TemplateCaps]:
         """Try loading with mlx-lm first, fall back to mlx-vlm on failure."""
         try:
+            from olmlx import ensure_mlx_lm
+
+            ensure_mlx_lm()
             import mlx_lm
 
             model, tokenizer = mlx_lm.load(load_path)
@@ -771,6 +790,75 @@ class ModelManager:
             caps = detect_caps(tok)
             return model, processor, True, caps
 
+    def _flash_dir(self, hf_path: str) -> Path | None:
+        """Return the flash-prepared directory for a model, if it exists."""
+        if self.store is None:
+            return None
+        flash_path = self.store.local_path(hf_path) / "flash"
+        if flash_path.exists() and (flash_path / "flash_layout.json").exists():
+            return flash_path
+        return None
+
+    def _is_flash_enabled(self) -> bool:
+        from olmlx.config import experimental
+
+        return experimental.flash
+
+    def _load_flash_model(
+        self, hf_path: str, load_path: str, flash_dir: Path
+    ) -> tuple[Any, Any, bool, TemplateCaps]:
+        """Load a model in flash mode (LLM in a Flash).
+
+        1. Load model normally via mlx-lm
+        2. Create FlashWeightStore, PredictorBank, WindowManager
+        3. Wrap model with FlashModelWrapper (replaces FFN layers)
+        """
+        from olmlx.config import experimental
+        from olmlx.engine.flash.flash_model import FlashConfig, FlashModelWrapper
+        from olmlx.engine.flash.predictor import PredictorBank
+        from olmlx.engine.flash.weight_store import FlashWeightStore
+
+        from olmlx import ensure_mlx_lm
+
+        ensure_mlx_lm()
+        import mlx_lm
+
+        logger.info("Loading model %s in flash mode from %s", hf_path, flash_dir)
+
+        # Load the full model first (we'll free FFN weights after wrapping)
+        model, tokenizer = mlx_lm.load(load_path)
+        caps = detect_caps(tokenizer)
+
+        # Load predictor bank
+        predictor_path = flash_dir / "predictors"
+        predictor_bank = PredictorBank.load(predictor_path)
+
+        # Read flash layout for dimensions
+        layout_config = json.loads((flash_dir / "flash_layout.json").read_text())
+
+        flash_config = FlashConfig(
+            hidden_size=layout_config["hidden_size"],
+            intermediate_size=layout_config["intermediate_size"],
+            num_layers=layout_config["num_layers"],
+            sparsity_threshold=experimental.flash_sparsity_threshold,
+            min_active_neurons=experimental.flash_min_active_neurons,
+            max_active_neurons=experimental.flash_max_active_neurons,
+            window_size=experimental.flash_window_size,
+            io_threads=experimental.flash_io_threads,
+            cache_budget_neurons=experimental.flash_cache_budget_neurons,
+        )
+
+        weight_store = FlashWeightStore(
+            flash_dir,
+            num_io_threads=flash_config.io_threads,
+            cache_budget_neurons=flash_config.cache_budget_neurons,
+        )
+
+        # Wrap model — this replaces FFN layers and frees original weights
+        wrapped = FlashModelWrapper(model, predictor_bank, weight_store, flash_config)
+
+        return wrapped, tokenizer, False, caps
+
     def _load_model(self, hf_path: str) -> tuple[Any, Any, bool, TemplateCaps]:
         """Load a model, using config.json inspection to choose the right library."""
         # Ensure model is downloaded to the store
@@ -778,6 +866,12 @@ class ModelManager:
         if self.store is not None:
             local_dir = self.store.ensure_downloaded(hf_path)
             load_path = str(local_dir)
+
+        # Check for flash-prepared model
+        if self._is_flash_enabled():
+            flash_dir = self._flash_dir(hf_path)
+            if flash_dir is not None:
+                return self._load_flash_model(hf_path, load_path, flash_dir)
 
         kind = self._detect_model_kind(hf_path)
         logger.info("Detected model kind for %s: %s", hf_path, kind)

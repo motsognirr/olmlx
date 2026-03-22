@@ -44,6 +44,19 @@ from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils.streaming import async_mlx_stream
 from olmlx.utils.timing import Timer, TimingStats
 
+try:
+    from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+except ImportError:  # pragma: no cover
+    make_prompt_cache = None  # type: ignore[assignment]
+    trim_prompt_cache = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning(
+        "mlx-lm prompt cache imports unavailable — prompt caching disabled"
+    )
+
+# Lazy-loaded to avoid importing mlx_lm.utils at module level, which
+# triggers a slow transformers v5 import (scans 1929 files on startup).
+_find_common_prefix = None
+
 logger = logging.getLogger(__name__)
 
 # -- Experimental: Distributed inference coordinator --
@@ -81,20 +94,25 @@ def _maybe_broadcast_distributed(
         distributed_barrier()
 
 
-# Resolve generation streams at module load time to avoid repeated
-# importlib.import_module() calls in the hot path (_safe_sync).
+# Resolved lazily on first use to avoid importing mlx_lm.generate at
+# module load time (which triggers the slow transformers v5 import).
+_generation_streams: list[Any] | None = None
+
+
 def _resolve_generation_streams() -> list[Any]:
     streams = []
     for mod_name in ("mlx_lm.generate", "mlx_vlm.generate"):
         try:
+            if "mlx_lm" in mod_name:
+                from olmlx import ensure_mlx_lm
+
+                ensure_mlx_lm()
             mod = importlib.import_module(mod_name)
             streams.append(mod.generation_stream)
         except (ImportError, AttributeError):
             pass
     return streams
 
-
-_generation_streams = _resolve_generation_streams()
 
 # Metal does not support concurrent command buffer submission across any
 # models — they all share the same Metal device and command queue.  A per-model
@@ -119,6 +137,10 @@ def _safe_sync():
         mx.synchronize()
     except Exception:
         logger.debug("mx.synchronize() failed", exc_info=True)
+
+    global _generation_streams
+    if _generation_streams is None:
+        _generation_streams = _resolve_generation_streams()
 
     for stream in _generation_streams:
         try:
@@ -748,6 +770,13 @@ async def _stream_completion(
                 len(prompt_tokens),
             )
 
+            global _find_common_prefix
+            if _find_common_prefix is None:
+                from olmlx import ensure_mlx_lm
+
+                ensure_mlx_lm()
+                from mlx_lm.utils import common_prefix_len as _find_common_prefix
+
             prefix_len = (
                 _find_common_prefix(prompt_tokens, cached.tokens)
                 if cached is not None
@@ -1149,6 +1178,9 @@ async def _full_completion_inner(
             )
             from mlx_vlm.generate import generation_stream
         else:
+            from olmlx import ensure_mlx_lm
+
+            ensure_mlx_lm()
             import mlx_lm
 
             result = mlx_lm.generate(
@@ -1158,7 +1190,9 @@ async def _full_completion_inner(
                 max_tokens=max_tokens,
                 **gen_kwargs,
             )
-            from mlx_lm.generate import generation_stream
+            from mlx_lm.generate import (
+                generation_stream,
+            )  # ensure_mlx_lm already called above
         # Sync the generation_stream specifically — mlx_lm/mlx_vlm run GPU
         # work on this module-level stream, not the default stream.  Without
         # this, generate() may return before GPU work is actually done.

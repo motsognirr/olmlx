@@ -100,6 +100,9 @@ def worker_main() -> None:
     strategy = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_STRATEGY", "tensor")
 
     # Load and shard the model
+    from olmlx import ensure_mlx_lm
+
+    ensure_mlx_lm()
     import mlx_lm
 
     from olmlx.config import PRE_SHARDED_DIR_ENV
