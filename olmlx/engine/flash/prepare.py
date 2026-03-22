@@ -260,9 +260,6 @@ def prepare_model_for_flash(
     Returns:
         Path to the flash directory.
     """
-    from olmlx import ensure_mlx_lm
-
-    ensure_mlx_lm()
     import mlx_lm
 
     if progress_callback:

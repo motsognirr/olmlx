@@ -312,9 +312,6 @@ def async_mlx_stream(
         if _has_prefill_callback is None:
             import inspect
 
-            from olmlx import ensure_mlx_lm
-
-            ensure_mlx_lm()
             import mlx_lm
 
             _has_prefill_callback = (
@@ -342,9 +339,6 @@ def async_mlx_stream(
                 **kwargs,
             )
         else:
-            from olmlx import ensure_mlx_lm
-
-            ensure_mlx_lm()
             import mlx_lm
 
             gen_kwargs = dict(prompt=prompt, max_tokens=max_tokens, **kwargs)

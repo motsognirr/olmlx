@@ -743,9 +743,6 @@ class ModelManager:
 
         # No vision keys — check mlx-lm
         try:
-            from olmlx import ensure_mlx_lm
-
-            ensure_mlx_lm()
             from mlx_lm.utils import MODEL_REMAPPING as LM_REMAP
 
             mapped = LM_REMAP.get(model_type, model_type)
@@ -773,9 +770,6 @@ class ModelManager:
     ) -> tuple[Any, Any, bool, TemplateCaps]:
         """Try loading with mlx-lm first, fall back to mlx-vlm on failure."""
         try:
-            from olmlx import ensure_mlx_lm
-
-            ensure_mlx_lm()
             import mlx_lm
 
             model, tokenizer = mlx_lm.load(load_path)
@@ -818,9 +812,6 @@ class ModelManager:
         from olmlx.engine.flash.predictor import PredictorBank
         from olmlx.engine.flash.weight_store import FlashWeightStore
 
-        from olmlx import ensure_mlx_lm
-
-        ensure_mlx_lm()
         import mlx_lm
 
         logger.info("Loading model %s in flash mode from %s", hf_path, flash_dir)
