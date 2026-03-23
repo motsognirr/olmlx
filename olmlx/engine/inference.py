@@ -1243,8 +1243,10 @@ async def _full_completion_inner(
         else:
             import mlx_lm
 
-            # Use stream_generate to capture token counts (generate() discards them)
+            # Use stream_generate to capture token counts (generate() discards them).
+            # Accumulate text segments since each yield is incremental.
             result = None
+            text_parts = []
             for response in mlx_lm.stream_generate(
                 lm.model,
                 lm.tokenizer,
@@ -1252,7 +1254,11 @@ async def _full_completion_inner(
                 max_tokens=max_tokens,
                 **gen_kwargs,
             ):
+                text_parts.append(response.text)
                 result = response
+            # Store full text on the result for downstream extraction
+            if result is not None:
+                result = (result, "".join(text_parts))
             from mlx_lm.generate import generation_stream
 
         # Sync the generation_stream specifically — mlx_lm/mlx_vlm run GPU
@@ -1267,6 +1273,12 @@ async def _full_completion_inner(
 
     stats.eval_duration = eval_timer.duration_ns
     stats.total_duration = total_timer.duration_ns
+
+    # Unpack (GenerationResult, full_text) tuple from stream_generate path
+    full_text = None
+    if isinstance(result, tuple):
+        gen_result, full_text = result
+        result = gen_result
 
     # Extract token counts from GenerationResult (stream_generate) or string
     if hasattr(result, "prompt_tokens"):
@@ -1287,8 +1299,10 @@ async def _full_completion_inner(
         total_secs,
     )
 
-    # Extract text from GenerationResult or string
-    if hasattr(result, "text"):
+    # Extract text: prefer accumulated full_text, fall back to result
+    if full_text is not None:
+        text = full_text
+    elif hasattr(result, "text"):
         text = result.text
     elif isinstance(result, str):
         text = result
