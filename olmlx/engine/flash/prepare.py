@@ -1,8 +1,8 @@
 """Preparation pipeline for flash inference.
 
 Prepares a model for LLM-in-a-Flash inference by:
-1. Loading the model fully
-2. Recording FFN activation patterns (calibration)
+1. Streaming calibration data through the model one layer at a time
+2. Recording FFN activation patterns
 3. Training per-layer sparsity predictors
 4. Bundling FFN weights with row-column bundling
 """
@@ -19,10 +19,24 @@ from typing import Callable
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx.utils import tree_map
+
+import mlx_lm
+
 from olmlx.engine.flash.bundler import bundle_ffn_weights
 from olmlx.engine.flash.predictor import PredictorBank
 
 logger = logging.getLogger(__name__)
+
+
+def _nullify_module_params(module: nn.Module) -> None:
+    """Replace all parameter arrays with tiny placeholders to free VRAM."""
+    placeholder = mx.zeros((1,))
+    new_params = tree_map(
+        lambda x: placeholder if isinstance(x, mx.array) else x,
+        module.parameters(),
+    )
+    module.update(new_params)
 
 
 def _get_calibration_data(num_samples: int = 256) -> list[str]:
@@ -110,7 +124,6 @@ def _record_activations(
         i: ([], []) for i in range(num_layers)
     }
 
-    # Save original MLPs and replace with recording wrappers.
     # Instance __call__ patching doesn't work (Python resolves __call__
     # on the type, not instance), so we replace layer.mlp entirely.
     original_mlps = {}
@@ -119,35 +132,10 @@ def _record_activations(
             continue
         original_mlps[i] = layer.mlp
 
-    class _RecordingMLP(nn.Module):
-        """Wrapper that records activation patterns during forward pass."""
-
-        def __init__(self, layer_idx: int, original: nn.Module):
-            super().__init__()
-            self._layer_idx = layer_idx
-            self._original = original
-
-        def __call__(self, x):
-            result = self._original(x)
-
-            flat_input = x.reshape(-1, x.shape[-1])
-            orig = self._original
-            if hasattr(orig, "gate_proj") and hasattr(orig, "up_proj"):
-                gate_out = orig.gate_proj(flat_input)
-                up_out = orig.up_proj(flat_input)
-                intermediate = mx.sigmoid(gate_out) * gate_out * up_out
-                mean_act = mx.abs(intermediate).mean(axis=0)
-                target = (mean_act > activation_threshold).astype(mx.float32)
-                mean_input = flat_input.mean(axis=0)
-
-                mx.eval(mean_input, target)
-                recordings[self._layer_idx][0].append(mean_input)
-                recordings[self._layer_idx][1].append(target)
-
-            return result
-
     for i in original_mlps:
-        layers[i].mlp = _RecordingMLP(i, original_mlps[i])
+        layers[i].mlp = _RecordingMLP(
+            original_mlps[i], recordings[i], activation_threshold
+        )
 
     try:
         total = len(calibration_texts)
@@ -170,6 +158,141 @@ def _record_activations(
             layers[i].mlp = mlp
 
     return recordings
+
+
+class _RecordingMLP(nn.Module):
+    """Wrapper that records FFN activation patterns during forward pass.
+
+    Computes gate/up projections once and reuses them for both the actual
+    MLP output and the recording targets, avoiding redundant matmuls.
+    """
+
+    def __init__(
+        self,
+        original: nn.Module,
+        recordings: tuple[list[mx.array], list[mx.array]],
+        activation_threshold: float,
+    ):
+        super().__init__()
+        self._original = original
+        self._recordings = recordings
+        self._threshold = activation_threshold
+
+    def __call__(self, x):
+        orig = self._original
+        if not (hasattr(orig, "gate_proj") and hasattr(orig, "up_proj")):
+            return orig(x)
+
+        # Compute gate/up once, reuse for both MLP output and recording
+        gate_out = orig.gate_proj(x)
+        up_out = orig.up_proj(x)
+        activated = nn.silu(gate_out) * up_out
+        result = orig.down_proj(activated)
+
+        # Record activation pattern from the same gate/up values
+        flat_input = x.reshape(-1, x.shape[-1])
+        flat_gate = gate_out.reshape(-1, gate_out.shape[-1])
+        flat_up = up_out.reshape(-1, up_out.shape[-1])
+        intermediate = mx.sigmoid(flat_gate) * flat_gate * flat_up
+        mean_act = mx.abs(intermediate).mean(axis=0)
+        target = (mean_act > self._threshold).astype(mx.float32)
+        mean_input = flat_input.mean(axis=0)
+
+        mx.eval(mean_input, target)
+        self._recordings[0].append(mean_input)
+        self._recordings[1].append(target)
+
+        return result
+
+
+def _stream_record_activations(
+    model_path: str,
+    calibration_texts: list[str],
+    activation_threshold: float = 0.01,
+    progress_callback: Callable[[str, float], None] | None = None,
+) -> tuple[dict[int, tuple[list[mx.array], list[mx.array]]], int, int, int]:
+    """Stream calibration through model one layer at a time.
+
+    Loads only one layer's weights into VRAM at a time, enabling preparation
+    of models larger than available RAM.
+
+    Returns:
+        (recordings, hidden_size, intermediate_size, num_layers)
+    """
+    from mlx_lm.models.base import create_attention_mask
+
+    if progress_callback:
+        progress_callback("Loading model skeleton", 0.0)
+
+    model, tokenizer = mlx_lm.load(model_path, lazy=True)
+
+    # Access inner model (mlx-lm wraps: Model.model = LlamaModel/Qwen3Model/etc.)
+    inner = model.model if hasattr(model, "model") else model
+    layers = inner.layers
+    num_layers = len(layers)
+
+    layer0_mlp = layers[0].mlp
+    if hasattr(layer0_mlp, "gate_proj") and hasattr(layer0_mlp, "up_proj"):
+        # Lazy arrays still have shape metadata
+        intermediate_size = layer0_mlp.gate_proj.weight.shape[0]
+        hidden_size = layer0_mlp.gate_proj.weight.shape[1]
+    else:
+        raise ValueError("First layer has no gate_proj/up_proj — cannot determine dimensions")
+
+    if progress_callback:
+        progress_callback("Computing embeddings", 0.02)
+
+    mx.eval(inner.embed_tokens.parameters())
+
+    hidden_states: list[mx.array] = []
+    for text in calibration_texts:
+        tokens = tokenizer.encode(text)
+        if len(tokens) > 512:
+            tokens = tokens[:512]
+        input_ids = mx.array([tokens])
+        h = inner.embed_tokens(input_ids)
+        mx.eval(h)
+        hidden_states.append(h)
+
+    _nullify_module_params(inner.embed_tokens)
+    gc.collect()
+    mx.clear_cache()
+
+    if progress_callback:
+        progress_callback("Streaming layers", 0.05)
+
+    recordings: dict[int, tuple[list[mx.array], list[mx.array]]] = {}
+
+    for layer_idx in range(num_layers):
+        layer = layers[layer_idx]
+        mx.eval(layer.parameters())
+
+        original_mlp = layer.mlp
+        recording_data: tuple[list[mx.array], list[mx.array]] = ([], [])
+
+        if hasattr(original_mlp, "gate_proj") and hasattr(original_mlp, "up_proj"):
+            layer.mlp = _RecordingMLP(
+                original_mlp, recording_data, activation_threshold
+            )
+
+        for i in range(len(hidden_states)):
+            mask = create_attention_mask(hidden_states[i], cache=None)
+            hidden_states[i] = layer(hidden_states[i], mask=mask, cache=None)
+            mx.eval(hidden_states[i])
+        recordings[layer_idx] = recording_data
+
+        layer.mlp = original_mlp
+        _nullify_module_params(layer)
+        gc.collect()
+        mx.clear_cache()
+
+        if progress_callback:
+            frac = 0.05 + ((layer_idx + 1) / num_layers) * 0.95
+            progress_callback(
+                f"Processed layer {layer_idx + 1}/{num_layers}", frac
+            )
+
+    return recordings, hidden_size, intermediate_size, num_layers
 
 
 def _train_predictors(
@@ -240,13 +363,14 @@ def prepare_model_for_flash(
 ) -> Path:
     """Full preparation pipeline for flash inference.
 
+    Streams calibration data through the model one layer at a time,
+    so the full model never needs to fit in RAM.
+
     Steps:
-    1. Load model fully (requires enough RAM)
-    2. Run calibration to record activations
-    3. Train per-layer predictors
-    4. Bundle FFN weights with row-column bundling
-    5. Save predictor bank
-    6. Write flash_config.json
+    1. Stream calibration data layer-by-layer (one layer in RAM at a time)
+    2. Train per-layer sparsity predictors
+    3. Bundle FFN weights with row-column bundling
+    4. Save predictor bank + config
 
     Args:
         model_path: HF model path or local directory.
@@ -260,57 +384,24 @@ def prepare_model_for_flash(
     Returns:
         Path to the flash directory.
     """
-    import mlx_lm
-
-    if progress_callback:
-        progress_callback("Loading model", 0.0)
-
-    model, tokenizer = mlx_lm.load(model_path)
-
-    # Determine dimensions from model config
-    config_path = Path(model_path) / "config.json"
-    if config_path.exists():
-        config = json.loads(config_path.read_text())
-        hidden_size = config.get("hidden_size") or config.get("d_model")
-        intermediate_size = config.get("intermediate_size")
-        num_layers = config.get("num_hidden_layers") or config.get("num_layers")
-    else:
-        # Infer from model structure
-        layer0 = model.layers[0]
-        hidden_size = layer0.mlp.gate_proj.weight.shape[1]
-        intermediate_size = layer0.mlp.gate_proj.weight.shape[0]
-        num_layers = len(model.layers)
-
-    if None in (hidden_size, intermediate_size, num_layers):
-        raise ValueError(
-            f"Cannot determine model dimensions from {config_path}. "
-            f"Got hidden_size={hidden_size}, intermediate_size={intermediate_size}, "
-            f"num_layers={num_layers}."
-        )
-
     if output_dir is None:
         output_dir = Path(model_path) / "flash"
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if progress_callback:
-        progress_callback("Loading model", 0.1)
-
     # Step 1: Generate calibration data
     calibration_texts = _get_calibration_data(num_samples)
 
-    # Step 2: Record activations
-    if progress_callback:
-        progress_callback("Recording activations", 0.1)
-
-    recordings = _record_activations(
-        model,
-        tokenizer,
-        calibration_texts,
-        activation_threshold=activation_threshold,
-        progress_callback=lambda desc, frac: (
-            progress_callback(desc, 0.1 + frac * 0.3) if progress_callback else None
-        ),
+    # Step 2: Stream-record activations (one layer at a time)
+    recordings, hidden_size, intermediate_size, num_layers = (
+        _stream_record_activations(
+            model_path,
+            calibration_texts,
+            activation_threshold=activation_threshold,
+            progress_callback=lambda desc, frac: (
+                progress_callback(desc, frac * 0.4) if progress_callback else None
+            ),
+        )
     )
 
     # Step 3: Train predictors
@@ -327,11 +418,6 @@ def prepare_model_for_flash(
             progress_callback(desc, 0.4 + frac * 0.2) if progress_callback else None
         ),
     )
-
-    # Free model to reclaim RAM before bundling
-    del model
-    gc.collect()
-    mx.clear_cache()
 
     # Step 4: Bundle FFN weights
     if progress_callback:
