@@ -248,6 +248,8 @@ class LoadedModel:
     is_vlm: bool = False
     is_distributed: bool = False
     is_flash: bool = False
+    is_flash_moe: bool = False
+    weight_store: Any = None
     template_caps: TemplateCaps = field(default_factory=TemplateCaps)
     loaded_at: float = field(default_factory=time.time)
     expires_at: float | None = None
@@ -549,12 +551,24 @@ class ModelManager:
 
                     # Detect if flash mode was used
                     is_flash = False
+                    is_flash_moe = False
+                    _weight_store = None
                     try:
                         from olmlx.engine.flash.flash_model import (
                             FlashModelWrapper,
                         )
 
                         is_flash = isinstance(model, FlashModelWrapper)
+                    except ImportError:
+                        pass
+                    try:
+                        from olmlx.engine.flash.flash_moe_model import (
+                            FlashMoeModelWrapper,
+                        )
+
+                        if isinstance(model, FlashMoeModelWrapper):
+                            is_flash_moe = True
+                            _weight_store = getattr(model, "_weight_store", None)
                     except ImportError:
                         pass
 
@@ -566,6 +580,8 @@ class ModelManager:
                         is_vlm=is_vlm,
                         is_distributed=is_distributed,
                         is_flash=is_flash,
+                        is_flash_moe=is_flash_moe,
+                        weight_store=_weight_store,
                         template_caps=caps,
                         expires_at=expires,
                     )
@@ -675,7 +691,9 @@ class ModelManager:
             raise RuntimeError(
                 f"Model '{normalized}' has {lm.active_refs} active request(s)"
             )
-        self._loaded.pop(normalized)
+        lm = self._loaded.pop(normalized)
+        if lm.weight_store is not None:
+            lm.weight_store.close()
         return True
 
     # Config keys that indicate a vision-language model
@@ -850,6 +868,74 @@ class ModelManager:
 
         return wrapped, tokenizer, False, caps
 
+    def _flash_moe_dir(self, hf_path: str) -> Path | None:
+        """Return the flash-MoE directory for a model, if it exists."""
+        if self.store is None:
+            return None
+        flash_moe_path = self.store.local_path(hf_path) / "flash_moe"
+        if (
+            flash_moe_path.exists()
+            and (flash_moe_path / "flash_moe_layout.json").exists()
+        ):
+            return flash_moe_path
+        return None
+
+    def _is_flash_moe_enabled(self) -> bool:
+        from olmlx.config import experimental
+
+        return experimental.flash_moe
+
+    def _load_flash_moe_model(
+        self, hf_path: str, load_path: str, flash_moe_dir: Path
+    ) -> tuple[Any, Any, bool, TemplateCaps]:
+        """Load a model in Flash-MoE mode.
+
+        1. Load model with lazy=True to avoid materializing expert weights
+        2. Create FlashMoeWeightStore
+        3. Wrap model with FlashMoeModelWrapper (replaces SwitchGLU)
+        4. Eval only non-expert params
+        """
+        from olmlx.config import experimental
+        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+        import mlx_lm
+
+        logger.info(
+            "Loading model %s in Flash-MoE mode from %s", hf_path, flash_moe_dir
+        )
+
+        # Lazy load — weights remain unmaterialized until eval
+        model, tokenizer = mlx_lm.load(load_path, lazy=True)
+        caps = detect_caps(tokenizer)
+
+        # Read flash_moe_config for architecture info
+        moe_config = json.loads((flash_moe_dir / "flash_moe_config.json").read_text())
+
+        store = FlashMoeWeightStore(
+            flash_moe_dir,
+            num_io_threads=experimental.flash_moe_io_threads,
+            cache_budget_experts=experimental.flash_moe_cache_budget_experts,
+        )
+
+        try:
+            wrapped = FlashMoeModelWrapper(
+                model,
+                store,
+                moe_layer_indices=moe_config["moe_layer_indices"],
+                hidden_size=moe_config["hidden_size"],
+                intermediate_size=moe_config["intermediate_size"],
+                num_experts=moe_config["num_experts"],
+                num_experts_per_tok=moe_config["num_experts_per_tok"],
+            )
+            # Materialize only non-expert weights
+            mx.eval(wrapped.parameters())
+        except Exception:
+            store.close()
+            raise
+
+        return wrapped, tokenizer, False, caps
+
     def _load_model(self, hf_path: str) -> tuple[Any, Any, bool, TemplateCaps]:
         """Load a model, using config.json inspection to choose the right library."""
         # Ensure model is downloaded to the store
@@ -857,6 +943,12 @@ class ModelManager:
         if self.store is not None:
             local_dir = self.store.ensure_downloaded(hf_path)
             load_path = str(local_dir)
+
+        # Check for flash-MoE-prepared model
+        if self._is_flash_moe_enabled():
+            flash_moe_dir = self._flash_moe_dir(hf_path)
+            if flash_moe_dir is not None:
+                return self._load_flash_moe_model(hf_path, load_path, flash_moe_dir)
 
         # Check for flash-prepared model
         if self._is_flash_enabled():

@@ -937,24 +937,55 @@ def cmd_config_show(_args):
         print(f"  Sideband port:        {experimental.distributed_sideband_port}")
 
 
-def cmd_flash_prepare(args):
-    """Prepare a model for flash inference."""
-    _configure_logging()
+def _flash_progress(desc, frac):
+    bar_len = 30
+    filled = int(bar_len * frac)
+    bar = "█" * filled + "░" * (bar_len - filled)
+    print(f"\r  {desc:<40s} [{bar}] {frac:5.1%}", end="", flush=True)
+    if frac >= 1.0:
+        print()
 
-    from olmlx.engine.flash.prepare import prepare_model_for_flash
+
+def cmd_flash_prepare(args):
+    """Prepare a model for flash inference (auto-detects MoE vs dense)."""
+    _configure_logging()
 
     store = _create_store()
     hf_path = store.registry.resolve(args.model) or args.model
     local_dir = store.ensure_downloaded(hf_path)
     model_path = str(local_dir)
 
-    def progress(desc, frac):
-        bar_len = 30
-        filled = int(bar_len * frac)
-        bar = "█" * filled + "░" * (bar_len - filled)
-        print(f"\r  {desc:<40s} [{bar}] {frac:5.1%}", end="", flush=True)
-        if frac >= 1.0:
-            print()
+    # Auto-detect MoE model
+    from olmlx.engine.flash.moe_prepare import is_moe_model
+
+    if is_moe_model(model_path):
+        _cmd_flash_moe_prepare(args, model_path)
+    else:
+        _cmd_flash_dense_prepare(args, model_path)
+
+
+def _cmd_flash_moe_prepare(args, model_path):
+    """Prepare an MoE model for Flash-MoE inference."""
+    from olmlx.engine.flash.moe_prepare import prepare_moe_for_flash
+
+    print("Detected MoE model — using Flash-MoE preparation (no model loading needed)")
+    print(f"  Model path: {model_path}")
+    print()
+
+    output_dir = prepare_moe_for_flash(
+        model_path=model_path,
+        progress_callback=_flash_progress,
+    )
+
+    print("\nFlash-MoE preparation complete!")
+    print(f"  Output: {output_dir}")
+    print("\nTo use Flash-MoE inference:")
+    print("  OLMLX_EXPERIMENTAL_FLASH_MOE=true olmlx serve")
+
+
+def _cmd_flash_dense_prepare(args, model_path):
+    """Prepare a dense model for flash inference."""
+    from olmlx.engine.flash.prepare import prepare_model_for_flash
 
     print(f"Preparing {args.model} for flash inference...")
     print(f"  Model path: {model_path}")
@@ -970,7 +1001,7 @@ def cmd_flash_prepare(args):
         num_samples=args.samples,
         activation_threshold=args.threshold,
         epochs=args.epochs,
-        progress_callback=progress,
+        progress_callback=_flash_progress,
     )
 
     print("\nFlash preparation complete!")
@@ -984,42 +1015,78 @@ def cmd_flash_info(args):
     store = _create_store()
     hf_path = store.registry.resolve(args.model) or args.model
     local_dir = store.local_path(hf_path)
+
+    # Check for Flash-MoE first
+    flash_moe_dir = local_dir / "flash_moe"
     flash_dir = local_dir / "flash"
 
-    if not flash_dir.exists():
+    if flash_moe_dir.exists() and (flash_moe_dir / "flash_moe_config.json").exists():
+        _show_flash_moe_info(args.model, flash_moe_dir)
+    elif flash_dir.exists():
+        _show_flash_dense_info(args.model, flash_dir)
+    else:
         print(f"Model '{args.model}' has not been prepared for flash inference.")
-        print(f"  Expected: {flash_dir}")
         print(f"\nRun: olmlx flash prepare {args.model}")
+
+
+def _show_flash_moe_info(model_name, flash_moe_dir):
+    config_path = flash_moe_dir / "flash_moe_config.json"
+    config = json.loads(config_path.read_text())
+    print(f"Flash-MoE info for '{model_name}':")
+    print("  Status:             prepared")
+    print("  Type:               MoE (expert offloading)")
+    print(f"  Flash directory:    {flash_moe_dir}")
+    print(f"  Hidden size:        {config.get('hidden_size')}")
+    print(f"  Intermediate size:  {config.get('intermediate_size')}")
+    print(f"  Num experts:        {config.get('num_experts')}")
+    print(f"  Experts per token:  {config.get('num_experts_per_tok')}")
+    print(f"  MoE layers:         {config.get('num_moe_layers')}")
+    print(f"  Prepared at:        {config.get('prepared_at')}")
+
+    fe_files = list(flash_moe_dir.glob("*.flashexperts"))
+    print(f"  Expert files:       {len(fe_files)}")
+
+    total_bytes = sum(f.stat().st_size for f in flash_moe_dir.rglob("*") if f.is_file())
+    if total_bytes > 1024**3:
+        print(f"  Total size:         {total_bytes / (1024**3):.1f} GB")
+    else:
+        print(f"  Total size:         {total_bytes / (1024**2):.1f} MB")
+
+    print("\nTo use Flash-MoE inference:")
+    print("  OLMLX_EXPERIMENTAL_FLASH_MOE=true olmlx serve")
+
+
+def _show_flash_dense_info(model_name, flash_dir):
+    config_path = flash_dir / "flash_config.json"
+    if not config_path.exists():
+        print(f"Flash directory exists but no config found: {flash_dir}")
         return
 
-    config_path = flash_dir / "flash_config.json"
-    if config_path.exists():
-        config = json.loads(config_path.read_text())
-        print(f"Flash info for '{args.model}':")
-        print("  Status:             prepared")
-        print(f"  Flash directory:    {flash_dir}")
-        print(f"  Hidden size:        {config.get('hidden_size')}")
-        print(f"  Intermediate size:  {config.get('intermediate_size')}")
-        print(f"  Num layers:         {config.get('num_layers')}")
-        print(f"  Predictor rank:     {config.get('predictor_rank')}")
-        print(f"  Calibration samples:{config.get('num_calibration_samples')}")
-        print(f"  Prepared at:        {config.get('prepared_at')}")
+    config = json.loads(config_path.read_text())
+    print(f"Flash info for '{model_name}':")
+    print("  Status:             prepared")
+    print("  Type:               Dense (neuron offloading)")
+    print(f"  Flash directory:    {flash_dir}")
+    print(f"  Hidden size:        {config.get('hidden_size')}")
+    print(f"  Intermediate size:  {config.get('intermediate_size')}")
+    print(f"  Num layers:         {config.get('num_layers')}")
+    print(f"  Predictor rank:     {config.get('predictor_rank')}")
+    print(f"  Calibration samples:{config.get('num_calibration_samples')}")
+    print(f"  Prepared at:        {config.get('prepared_at')}")
 
-        # Count .flashweights files
-        fw_files = list(flash_dir.glob("*.flashweights"))
-        print(f"  Weight files:       {len(fw_files)}")
+    fw_files = list(flash_dir.glob("*.flashweights"))
+    print(f"  Weight files:       {len(fw_files)}")
 
-        # Check predictors
-        pred_dir = flash_dir / "predictors"
-        if pred_dir.exists():
-            pred_files = list(pred_dir.glob("*.npz"))
-            print(f"  Predictor files:    {len(pred_files)}")
+    pred_dir = flash_dir / "predictors"
+    if pred_dir.exists():
+        pred_files = list(pred_dir.glob("*.npz"))
+        print(f"  Predictor files:    {len(pred_files)}")
 
-        # Total size
-        total_bytes = sum(f.stat().st_size for f in flash_dir.rglob("*") if f.is_file())
-        print(f"  Total size:         {total_bytes / (1024**2):.1f} MB")
-    else:
-        print(f"Flash directory exists but no config found: {flash_dir}")
+    total_bytes = sum(f.stat().st_size for f in flash_dir.rglob("*") if f.is_file())
+    print(f"  Total size:         {total_bytes / (1024**2):.1f} MB")
+
+    print("\nTo use flash inference:")
+    print("  OLMLX_EXPERIMENTAL_FLASH=true olmlx serve")
 
 
 def build_parser() -> argparse.ArgumentParser:

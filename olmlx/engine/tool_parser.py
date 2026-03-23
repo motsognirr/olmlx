@@ -25,6 +25,19 @@ def _make_tool_use_id() -> str:
 # --- Regex patterns ---
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+# gpt-oss channel format:
+# <|start|>assistant<|channel|>analysis<|message|>thinking<|end|>
+# <|start|>assistant<|channel|>final<|message|>visible<|return|>  (or end-of-string — mlx-lm strips EOS)
+# <|start|>assistant to=functions.NAME<|channel|>commentary json<|message|>{"args"}<|call|>
+_GPT_OSS_CHANNEL_RE = re.compile(
+    r"(?:<\|start\|>[^<]*)?<\|channel\|>\s*(\w+)[^<]*<\|message\|>(.*?)(?:<\|(?:end|call|return)\|>|$)",
+    re.DOTALL,
+)
+_GPT_OSS_TOOL_NAME_RE = re.compile(
+    r"(?:<\|start\|>)?[^<]*to=functions\.(\w+)[^<]*<\|channel\|>",
+)
+_GPT_OSS_DETECT = "<|channel|>"
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _FUNC_TAG_RE = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
 _PARAM_TAG_RE = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
@@ -260,6 +273,57 @@ def _try_bare_json(text: str) -> tuple[list[dict], str]:
     return tool_uses, text
 
 
+def _parse_gpt_oss_channels(
+    text: str, has_tools: bool
+) -> tuple[str, str, list[dict]] | None:
+    """Parse gpt-oss channel-formatted output.
+
+    Returns (thinking, visible_text, tool_uses) or None if not gpt-oss format.
+    """
+    if _GPT_OSS_DETECT not in text:
+        return None
+
+    thinking_parts = []
+    visible_parts = []
+    tool_uses = []
+
+    for match in _GPT_OSS_CHANNEL_RE.finditer(text):
+        channel = match.group(1).strip()
+        content = match.group(2).strip()
+
+        if channel == "analysis":
+            thinking_parts.append(content)
+        elif channel == "final":
+            visible_parts.append(content)
+        elif channel == "commentary" and has_tools and content:
+            # Extract tool name from within the matched block
+            name_match = _GPT_OSS_TOOL_NAME_RE.search(match.group(0))
+            tool_name = name_match.group(1) if name_match else "unknown"
+            try:
+                args = json.loads(content)
+            except (json.JSONDecodeError, ValueError):
+                args = {}
+            tool_uses.append(
+                {
+                    "type": "tool_use",
+                    "id": _make_tool_use_id(),
+                    "name": tool_name,
+                    "input": args,
+                }
+            )
+
+    thinking = "\n".join(thinking_parts)
+    visible = " ".join(visible_parts) if visible_parts else ""
+
+    # Fallback: if the model put everything in analysis and nothing in final,
+    # promote analysis content to visible text (otherwise user sees nothing)
+    if not visible and not tool_uses and thinking:
+        visible = thinking
+        thinking = ""
+
+    return thinking, visible, tool_uses
+
+
 def parse_model_output(
     text: str,
     has_tools: bool,
@@ -270,6 +334,11 @@ def parse_model_output(
         text: Raw model output text.
         has_tools: Whether tools were provided in the request.
     """
+    # Try gpt-oss channel format first
+    gpt_oss_result = _parse_gpt_oss_channels(text, has_tools)
+    if gpt_oss_result is not None:
+        return gpt_oss_result
+
     thinking = ""
 
     # Extract thinking blocks

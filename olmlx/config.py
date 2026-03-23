@@ -72,6 +72,11 @@ class ExperimentalSettings(BaseSettings):
     flash_cache_budget_neurons: Annotated[int, Field(ge=0)] = 1024
     flash_predictor_rank: Annotated[int, Field(gt=0)] = 128  # prepare-time only
 
+    # Flash MoE (SSD-based expert offloading for MoE models)
+    flash_moe: bool = False
+    flash_moe_cache_budget_experts: Annotated[int, Field(ge=0)] = 48  # per layer
+    flash_moe_io_threads: Annotated[int, Field(gt=0)] = 32
+
 
 experimental = ExperimentalSettings()
 

@@ -12,6 +12,7 @@ class TemplateCaps:
     supports_tools: bool = False
     supports_enable_thinking: bool = False
     has_thinking_tags: bool = False
+    has_channel_format: bool = False
 
 
 def _find_template_variables(tpl: str) -> set[str] | None:
@@ -55,8 +56,11 @@ def detect_caps(tokenizer: Any) -> TemplateCaps:
     # has_thinking_tags checks for literal output, not a variable — keep string check
     has_thinking_tags = "<think>" in tpl or "thinking" in tpl.lower()
 
+    has_channel_format = "<|channel|>" in tpl
+
     return TemplateCaps(
         supports_tools=supports_tools,
         supports_enable_thinking=supports_enable_thinking,
         has_thinking_tags=has_thinking_tags,
+        has_channel_format=has_channel_format,
     )
