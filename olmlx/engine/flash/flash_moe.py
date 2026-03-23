@@ -108,6 +108,8 @@ class FlashMoE(nn.Module):
                 rhs_indices=remap,
                 **qmm_kwargs,
             )
+            if loaded.gate_bias is not None:
+                gate_out = gate_out + loaded.gate_bias[remap][..., None, :]
             up_out = mx.gather_qmm(
                 x_expanded,
                 loaded.up_weight,
@@ -116,6 +118,8 @@ class FlashMoE(nn.Module):
                 rhs_indices=remap,
                 **qmm_kwargs,
             )
+            if loaded.up_bias is not None:
+                up_out = up_out + loaded.up_bias[remap][..., None, :]
             activated = self._apply_activation(up_out, gate_out)
             expert_out = mx.gather_qmm(
                 activated,
@@ -125,6 +129,8 @@ class FlashMoE(nn.Module):
                 rhs_indices=remap,
                 **qmm_kwargs,
             )
+            if loaded.down_bias is not None:
+                expert_out = expert_out + loaded.down_bias[remap][..., None, :]
         else:
             gate_out = mx.gather_mm(
                 x_expanded,
@@ -132,14 +138,14 @@ class FlashMoE(nn.Module):
                 rhs_indices=remap,
             )
             if loaded.gate_bias is not None:
-                gate_out = gate_out + loaded.gate_bias[remap].unsqueeze(-2)
+                gate_out = gate_out + loaded.gate_bias[remap][..., None, :]
             up_out = mx.gather_mm(
                 x_expanded,
                 loaded.up_weight.swapaxes(-1, -2),
                 rhs_indices=remap,
             )
             if loaded.up_bias is not None:
-                up_out = up_out + loaded.up_bias[remap].unsqueeze(-2)
+                up_out = up_out + loaded.up_bias[remap][..., None, :]
             activated = self._apply_activation(up_out, gate_out)
             expert_out = mx.gather_mm(
                 activated,
@@ -147,7 +153,7 @@ class FlashMoE(nn.Module):
                 rhs_indices=remap,
             )
             if loaded.down_bias is not None:
-                expert_out = expert_out + loaded.down_bias[remap].unsqueeze(-2)
+                expert_out = expert_out + loaded.down_bias[remap][..., None, :]
 
         # expert_out shape: (B, L, K, 1, H) — squeeze the extra dim
         expert_out = expert_out.squeeze(-2)
