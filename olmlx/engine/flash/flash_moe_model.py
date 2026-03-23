@@ -72,7 +72,7 @@ class _FlashMoEGptOss(nn.Module):
         part_inds = mx.argpartition(g, kth=-k, axis=-1)
         inds = part_inds[..., -k:]
         scores = mx.take_along_axis(g, inds, axis=-1)
-        scores = mx.softmax(scores, axis=-1)
+        scores = mx.softmax(scores, axis=-1, precise=True)
         y = self._flash_moe(x, inds, scores)
         return y.astype(x.dtype)
 
