@@ -1343,6 +1343,8 @@ async def _full_completion_inner(
     # Extract text: prefer accumulated full_text, fall back to result
     if full_text is not None:
         text = full_text
+    elif result is None:
+        text = ""
     elif hasattr(result, "text"):
         text = result.text
     elif isinstance(result, str):
