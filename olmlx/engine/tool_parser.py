@@ -28,10 +28,10 @@ _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 # gpt-oss channel format:
 # <|start|>assistant<|channel|>analysis<|message|>thinking<|end|>
-# <|start|>assistant<|channel|>final<|message|>visible<|end|>
+# <|start|>assistant<|channel|>final<|message|>visible<|return|>  (or end-of-string — mlx-lm strips EOS)
 # <|start|>assistant to=functions.NAME<|channel|>commentary json<|message|>{"args"}<|call|>
 _GPT_OSS_CHANNEL_RE = re.compile(
-    r"(?:<\|start\|>[^<]*)?<\|channel\|>\s*(\w+)[^<]*<\|message\|>(.*?)<\|(?:end|call|return)\|>",
+    r"(?:<\|start\|>[^<]*)?<\|channel\|>\s*(\w+)[^<]*<\|message\|>(.*?)(?:<\|(?:end|call|return)\|>|$)",
     re.DOTALL,
 )
 _GPT_OSS_TOOL_NAME_RE = re.compile(
