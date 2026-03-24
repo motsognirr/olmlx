@@ -39,6 +39,10 @@ class SpeculativeFlashDecoder:
     def _draft_generate(self, prompt: mx.array, n: int) -> tuple[list[int], mx.array]:
         """Generate n candidate tokens with the draft model.
 
+        Uses KV cache when the draft model supports it (``cache`` kwarg)
+        so each step processes only the new token — O(lambda) instead of
+        O(lambda^2) token-steps.
+
         Args:
             prompt: (1, seq_len) input token IDs.
             n: Number of tokens to generate.
@@ -50,20 +54,48 @@ class SpeculativeFlashDecoder:
         tokens: list[int] = []
         all_logits: list[mx.array] = []
 
-        for _ in range(n):
-            # Build current input from prompt + accumulated tokens
-            if tokens:
-                current = mx.concatenate([prompt, mx.array([tokens])], axis=1)
-            else:
-                current = prompt
-            logits = self._draft(current)  # (1, seq, vocab)
-            next_logits = logits[:, -1, :]  # (1, vocab)
+        # Try to create a KV cache for the draft model
+        cache = None
+        try:
+            from mlx_lm.models.cache import make_prompt_cache
+
+            cache = make_prompt_cache(self._draft)
+        except (ImportError, TypeError, AttributeError):
+            pass
+
+        if cache is not None:
+            # Prefill: process the full prompt through cache
+            logits = self._draft(prompt, cache=cache)
+            next_logits = logits[:, -1, :]
             mx.eval(next_logits)
             next_token = int(mx.argmax(next_logits, axis=-1).item())
             tokens.append(next_token)
             all_logits.append(next_logits.squeeze(0))
 
-        return tokens, mx.stack(all_logits)  # (n, vocab)
+            # Decode: each step only processes the new token
+            for _ in range(n - 1):
+                inp = mx.array([[next_token]])
+                logits = self._draft(inp, cache=cache)
+                next_logits = logits[:, -1, :]
+                mx.eval(next_logits)
+                next_token = int(mx.argmax(next_logits, axis=-1).item())
+                tokens.append(next_token)
+                all_logits.append(next_logits.squeeze(0))
+        else:
+            # Fallback: no KV cache, rebuild full sequence each step
+            for _ in range(n):
+                if tokens:
+                    current = mx.concatenate([prompt, mx.array([tokens])], axis=1)
+                else:
+                    current = prompt
+                logits = self._draft(current)
+                next_logits = logits[:, -1, :]
+                mx.eval(next_logits)
+                next_token = int(mx.argmax(next_logits, axis=-1).item())
+                tokens.append(next_token)
+                all_logits.append(next_logits.squeeze(0))
+
+        return tokens, mx.stack(all_logits)
 
     def _verify(
         self,
@@ -128,7 +160,9 @@ class SpeculativeFlashDecoder:
         # Extract target logits at the verification positions
         # Position -(lambda+1) through -1 correspond to verifying each draft token + bonus
         seq_len = prompt.shape[1]
-        target_logits = target_out[0, seq_len - 1 :, :]  # (lambda+1, vocab)
+        target_logits = target_out[
+            0, seq_len - 1 : seq_len + self._lambda, :
+        ]  # (lambda+1, vocab)
 
         # 3. Verify
         accepted = self._verify(draft_tokens, draft_logits, target_logits)

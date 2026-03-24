@@ -863,6 +863,7 @@ class ModelManager:
             num_io_threads=flash_config.io_threads,
             cache_budget_neurons=flash_config.cache_budget_neurons,
             bypass_cache=experimental.flash_bypass_os_cache,
+            use_preallocated_buffer=experimental.flash_preallocated_buffer,
         )
 
         # Wrap model — this replaces FFN layers and frees original weights

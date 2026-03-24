@@ -150,11 +150,12 @@ class PreallocatedNeuronBuffer:
             for idx in neuron_indices:
                 if idx in self._access_order:
                     self._access_order.move_to_end(idx)
+            # Copy numpy data while lock is held to avoid races with concurrent inserts
+            gate_data = self._gate[slots].T.copy()
+            up_data = self._up[slots].T.copy()
+            down_data = self._down[slots].copy()
 
-        gate_cols = mx.array(self._gate[slots].T)
-        up_cols = mx.array(self._up[slots].T)
-        down_rows = mx.array(self._down[slots])
-        return gate_cols, up_cols, down_rows
+        return mx.array(gate_data), mx.array(up_data), mx.array(down_data)
 
     def get_cached_indices(
         self, neuron_indices: list[int]
@@ -196,12 +197,9 @@ class FlashWeightStore:
         self._fds: dict[int, int] = {}
         try:
             for layer_idx, layout in self._layouts.items():
-                flags = os.O_RDONLY
-                if bypass_cache and sys.platform == "linux":
-                    flags |= getattr(os, "O_DIRECT", 0)
-                fd = os.open(str(layout.file_path), flags)
+                fd = os.open(str(layout.file_path), os.O_RDONLY)
                 if bypass_cache and sys.platform == "darwin":
-                    # F_NOCACHE = 48 on macOS
+                    # F_NOCACHE = 48 on macOS — no alignment requirements
                     fcntl.fcntl(fd, 48, 1)
                 self._fds[layer_idx] = fd
         except Exception:

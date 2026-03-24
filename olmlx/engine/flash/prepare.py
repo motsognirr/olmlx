@@ -430,20 +430,18 @@ def _train_predictors(
         pred = bank.predictors[layer_idx]
         optimizer = Adam(learning_rate=lr)
 
-        # Compute class weights for balanced loss
+        # Compute inverse-frequency class weights for balanced loss.
+        # pos_weight = num_neg / num_pos makes total positive and negative
+        # loss contributions equal regardless of class imbalance.
         if balanced_loss:
             eps_w = 1e-7
             num_pos = float(mx.sum(targets).item()) + eps_w
             num_neg = float(mx.sum(1 - targets).item()) + eps_w
-            num_total = num_pos + num_neg
-            pos_weight_val = num_neg / num_total
-            neg_weight_val = num_pos / num_total
+            pos_w = num_neg / num_pos
+            neg_w = 1.0
         else:
-            pos_weight_val = 1.0
-            neg_weight_val = 1.0
-
-        pos_w = pos_weight_val
-        neg_w = neg_weight_val
+            pos_w = 1.0
+            neg_w = 1.0
 
         def loss_fn(model, x, y):
             scores = model(x)
