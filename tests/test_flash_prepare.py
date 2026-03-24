@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -75,8 +76,10 @@ class FakeInnerModel(nn.Module):
         self.norm = nn.RMSNorm(HIDDEN)
 
     def __call__(self, inputs, cache=None):
+        from olmlx.engine.flash.prepare import _create_causal_mask
+
         h = self.embed_tokens(inputs)
-        mask = "causal" if h.shape[1] > 1 else None
+        mask = _create_causal_mask(h)
         if cache is None:
             cache = [None] * len(self.layers)
         for layer, c in zip(self.layers, cache):
@@ -140,6 +143,13 @@ class TestNullifyModuleParams:
         assert mlp.down_proj.weight.size == 1
 
 
+def _patch_mlx_lm(model, tokenizer):
+    """Create a patch context that makes the deferred ``import mlx_lm`` return a mock."""
+    mock = MagicMock()
+    mock.load.return_value = (model, tokenizer)
+    return patch.dict(sys.modules, {"mlx_lm": mock}), mock
+
+
 class TestStreamRecordActivations:
     def _make_fake_model_and_tokenizer(self):
         model = FakeModel()
@@ -147,17 +157,16 @@ class TestStreamRecordActivations:
         tokenizer = FakeTokenizer()
         return model, tokenizer
 
-    @patch("olmlx.engine.flash.prepare.mlx_lm")
-    def test_produces_recordings_for_each_layer(self, mock_mlx_lm):
+    def test_produces_recordings_for_each_layer(self):
         from olmlx.engine.flash.prepare import _stream_record_activations
 
         model, tokenizer = self._make_fake_model_and_tokenizer()
-        mock_mlx_lm.load.return_value = (model, tokenizer)
-
-        texts = ["Hello world", "Test input"]
-        recordings, hidden_size, intermediate_size, num_layers = (
-            _stream_record_activations("fake_path", texts)
-        )
+        ctx, _ = _patch_mlx_lm(model, tokenizer)
+        with ctx:
+            texts = ["Hello world", "Test input"]
+            recordings, hidden_size, intermediate_size, num_layers = (
+                _stream_record_activations("fake_path", texts)
+            )
 
         assert len(recordings) == NUM_LAYERS
         for i in range(NUM_LAYERS):
@@ -173,36 +182,45 @@ class TestStreamRecordActivations:
         assert intermediate_size == INTER
         assert num_layers == NUM_LAYERS
 
-    @patch("olmlx.engine.flash.prepare.mlx_lm")
-    def test_frees_layer_params_after_processing(self, mock_mlx_lm):
+    def test_frees_layer_params_after_processing(self):
         """After streaming, all layer params should be nullified."""
         from olmlx.engine.flash.prepare import _stream_record_activations
 
         model, tokenizer = self._make_fake_model_and_tokenizer()
-        mock_mlx_lm.load.return_value = (model, tokenizer)
-
-        _stream_record_activations("fake_path", ["Hello"])
+        ctx, _ = _patch_mlx_lm(model, tokenizer)
+        with ctx:
+            _stream_record_activations("fake_path", ["Hello"])
 
         # All layer weights should be tiny placeholders now
         for layer in model.model.layers:
             assert layer.mlp.gate_proj.weight.size == 1
             assert layer.self_attn.q_proj.weight.size == 1
 
-    @patch("olmlx.engine.flash.prepare.mlx_lm")
-    def test_calls_progress_callback(self, mock_mlx_lm):
+    def test_calls_progress_callback(self):
         from olmlx.engine.flash.prepare import _stream_record_activations
 
         model, tokenizer = self._make_fake_model_and_tokenizer()
-        mock_mlx_lm.load.return_value = (model, tokenizer)
-
+        ctx, _ = _patch_mlx_lm(model, tokenizer)
         calls = []
-        _stream_record_activations(
-            "fake_path", ["Hello"], progress_callback=lambda d, f: calls.append((d, f))
-        )
+        with ctx:
+            _stream_record_activations(
+                "fake_path", ["Hello"], progress_callback=lambda d, f: calls.append((d, f))
+            )
 
         assert len(calls) > 0
         # Last call should be at fraction 1.0
         assert calls[-1][1] == pytest.approx(1.0)
+
+    def test_load_called_with_lazy(self):
+        """Streaming path must request lazy loading."""
+        from olmlx.engine.flash.prepare import _stream_record_activations
+
+        model, tokenizer = self._make_fake_model_and_tokenizer()
+        ctx, mock_mlx_lm = _patch_mlx_lm(model, tokenizer)
+        with ctx:
+            _stream_record_activations("fake_path", ["Hello"])
+
+        mock_mlx_lm.load.assert_called_once_with("fake_path", lazy=True)
 
 
 class TestStreamingEquivalence:
@@ -237,8 +255,8 @@ class TestStreamingEquivalence:
         )
 
         # Streaming recordings (mock mlx_lm.load to return model_b)
-        with patch("olmlx.engine.flash.prepare.mlx_lm") as mock_mlx_lm:
-            mock_mlx_lm.load.return_value = (model_b, tokenizer)
+        ctx, _ = _patch_mlx_lm(model_b, tokenizer)
+        with ctx:
             stream_recordings, _, _, _ = _stream_record_activations(
                 "fake_path", texts, activation_threshold=0.01
             )
@@ -263,22 +281,22 @@ class TestPrepareModelEndToEnd:
     """End-to-end test of prepare_model_for_flash with streaming."""
 
     @patch("olmlx.engine.flash.prepare.bundle_ffn_weights")
-    @patch("olmlx.engine.flash.prepare.mlx_lm")
-    def test_produces_output_files(self, mock_mlx_lm, mock_bundle, tmp_path):
+    def test_produces_output_files(self, mock_bundle, tmp_path):
         from olmlx.engine.flash.prepare import prepare_model_for_flash
 
         model = FakeModel()
         mx.eval(model.parameters())
-        mock_mlx_lm.load.return_value = (model, FakeTokenizer())
+        ctx, mock_mlx_lm = _patch_mlx_lm(model, FakeTokenizer())
 
-        output_dir = tmp_path / "flash"
-        result = prepare_model_for_flash(
-            model_path=str(tmp_path),
-            output_dir=output_dir,
-            rank=8,
-            num_samples=4,
-            epochs=1,
-        )
+        with ctx:
+            output_dir = tmp_path / "flash"
+            result = prepare_model_for_flash(
+                model_path=str(tmp_path),
+                output_dir=output_dir,
+                rank=8,
+                num_samples=4,
+                epochs=1,
+            )
 
         assert result == output_dir
         assert (output_dir / "flash_config.json").exists()
@@ -301,8 +319,7 @@ class TestPrepareModelEndToEnd:
 
 
 class TestStreamingEdgeCases:
-    @patch("olmlx.engine.flash.prepare.mlx_lm")
-    def test_layer_without_mlp_is_skipped(self, mock_mlx_lm):
+    def test_layer_without_mlp_is_skipped(self):
         """Layers without gate_proj/up_proj should produce empty recordings."""
         from olmlx.engine.flash.prepare import _stream_record_activations
 
@@ -316,9 +333,9 @@ class TestStreamingEdgeCases:
 
         model.model.layers[1].mlp = PassthroughMLP()
 
-        mock_mlx_lm.load.return_value = (model, FakeTokenizer())
-
-        recordings, _, _, _ = _stream_record_activations("fake_path", ["Hello"])
+        ctx, _ = _patch_mlx_lm(model, FakeTokenizer())
+        with ctx:
+            recordings, _, _, _ = _stream_record_activations("fake_path", ["Hello"])
 
         # Layer 0 should have recordings
         assert len(recordings[0][0]) == 1

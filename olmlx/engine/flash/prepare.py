@@ -21,12 +21,29 @@ import mlx.nn as nn
 
 from mlx.utils import tree_map
 
-import mlx_lm
-
 from olmlx.engine.flash.bundler import bundle_ffn_weights
 from olmlx.engine.flash.predictor import PredictorBank
 
 logger = logging.getLogger(__name__)
+
+
+def _encode_tokens(tokenizer, text: str) -> list[int]:
+    """Encode text to token ids, handling both fast and slow tokenizers."""
+    result = tokenizer.encode(text)
+    tokens = result["input_ids"] if isinstance(result, dict) else result
+    if len(tokens) > 512:
+        tokens = tokens[:512]
+    return tokens
+
+
+def _create_causal_mask(h: mx.array) -> mx.array | None:
+    """Create a causal attention mask for hidden states of shape (B, L, D)."""
+    L = h.shape[1]
+    if L <= 1:
+        return None
+    indices = mx.arange(L)
+    mask = indices[:, None] < indices[None, :]
+    return mask * -1e9
 
 
 def _nullify_module_params(module: nn.Module) -> None:
@@ -143,10 +160,7 @@ def _record_activations(
             if progress_callback:
                 progress_callback("Recording activations", (idx + 1) / total)
 
-            tokens = tokenizer.encode(text)
-            if len(tokens) > 512:
-                tokens = tokens[:512]
-
+            tokens = _encode_tokens(tokenizer, text)
             input_ids = mx.array([tokens])
 
             try:
@@ -163,8 +177,9 @@ def _record_activations(
 class _RecordingMLP(nn.Module):
     """Wrapper that records FFN activation patterns during forward pass.
 
-    Computes gate/up projections once and reuses them for both the actual
-    MLP output and the recording targets, avoiding redundant matmuls.
+    Delegates to the original MLP for the forward result (preserving any
+    custom gating or normalization), then separately computes gate/up
+    projections for activation recording.
     """
 
     def __init__(
@@ -183,18 +198,16 @@ class _RecordingMLP(nn.Module):
         if not (hasattr(orig, "gate_proj") and hasattr(orig, "up_proj")):
             return orig(x)
 
-        # Compute gate/up once, reuse for both MLP output and recording
+        # Use original forward for correct result (handles GeGLU, bias, norms, etc.)
+        result = orig(x)
+
+        # Record activation pattern using gate/up projections
+        flat_input = x.reshape(-1, x.shape[-1])
         gate_out = orig.gate_proj(x)
         up_out = orig.up_proj(x)
         activated = nn.silu(gate_out) * up_out
-        result = orig.down_proj(activated)
-
-        # Record activation pattern from the same gate/up values
-        flat_input = x.reshape(-1, x.shape[-1])
-        flat_gate = gate_out.reshape(-1, gate_out.shape[-1])
-        flat_up = up_out.reshape(-1, up_out.shape[-1])
-        intermediate = mx.sigmoid(flat_gate) * flat_gate * flat_up
-        mean_act = mx.abs(intermediate).mean(axis=0)
+        flat_activated = activated.reshape(-1, activated.shape[-1])
+        mean_act = mx.abs(flat_activated).mean(axis=0)
         target = (mean_act > self._threshold).astype(mx.float32)
         mean_input = flat_input.mean(axis=0)
 
@@ -216,10 +229,14 @@ def _stream_record_activations(
     Loads only one layer's weights into VRAM at a time, enabling preparation
     of models larger than available RAM.
 
+    Note: All num_samples hidden states are materialized before the layer loop.
+    For a 70B model (hidden_size=8192) with 256 samples x 512 tokens x fp16,
+    this is ~2 GB. Memory scales linearly with num_samples.
+
     Returns:
         (recordings, hidden_size, intermediate_size, num_layers)
     """
-    from mlx_lm.models.base import create_attention_mask
+    import mlx_lm  # deferred — triggers slow import transformers
 
     if progress_callback:
         progress_callback("Loading model skeleton", 0.0)
@@ -231,13 +248,17 @@ def _stream_record_activations(
     layers = inner.layers
     num_layers = len(layers)
 
-    layer0_mlp = layers[0].mlp
-    if hasattr(layer0_mlp, "gate_proj") and hasattr(layer0_mlp, "up_proj"):
-        # Lazy arrays still have shape metadata
-        intermediate_size = layer0_mlp.gate_proj.weight.shape[0]
-        hidden_size = layer0_mlp.gate_proj.weight.shape[1]
-    else:
-        raise ValueError("First layer has no gate_proj/up_proj — cannot determine dimensions")
+    # Find dimensions from first layer with gate_proj/up_proj (some MoE models
+    # have dense layers at the start that lack these projections)
+    hidden_size = intermediate_size = None
+    for layer in layers:
+        mlp = layer.mlp if hasattr(layer, "mlp") else None
+        if mlp and hasattr(mlp, "gate_proj") and hasattr(mlp, "up_proj"):
+            intermediate_size = mlp.gate_proj.weight.shape[0]
+            hidden_size = mlp.gate_proj.weight.shape[1]
+            break
+    if hidden_size is None:
+        raise ValueError("No layer has gate_proj/up_proj — cannot determine dimensions")
 
     if progress_callback:
         progress_callback("Computing embeddings", 0.02)
@@ -246,9 +267,7 @@ def _stream_record_activations(
 
     hidden_states: list[mx.array] = []
     for text in calibration_texts:
-        tokens = tokenizer.encode(text)
-        if len(tokens) > 512:
-            tokens = tokens[:512]
+        tokens = _encode_tokens(tokenizer, text)
         input_ids = mx.array([tokens])
         h = inner.embed_tokens(input_ids)
         mx.eval(h)
@@ -262,6 +281,9 @@ def _stream_record_activations(
         progress_callback("Streaming layers", 0.05)
 
     recordings: dict[int, tuple[list[mx.array], list[mx.array]]] = {}
+    # Samples that fail at layer N are skipped for all subsequent layers
+    # (their hidden state would be stale from layer N-1)
+    skip_samples: set[int] = set()
 
     for layer_idx in range(num_layers):
         layer = layers[layer_idx]
@@ -276,9 +298,15 @@ def _stream_record_activations(
             )
 
         for i in range(len(hidden_states)):
-            mask = create_attention_mask(hidden_states[i], cache=None)
-            hidden_states[i] = layer(hidden_states[i], mask=mask, cache=None)
-            mx.eval(hidden_states[i])
+            if i in skip_samples:
+                continue
+            mask = _create_causal_mask(hidden_states[i])
+            try:
+                hidden_states[i] = layer(hidden_states[i], mask=mask, cache=None)
+                mx.eval(hidden_states[i])
+            except (ValueError, RuntimeError):
+                logger.debug("Skipping sample %d at layer %d", i, layer_idx)
+                skip_samples.add(i)
         recordings[layer_idx] = recording_data
 
         layer.mlp = original_mlp
