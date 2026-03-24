@@ -85,6 +85,8 @@ def prepare_moe_for_flash(
     moe_freq = (
         text_config.get("moe_layer_freq") or text_config.get("decoder_sparse_step") or 1
     )
+    if moe_freq == 0:
+        raise ValueError("moe_layer_freq / decoder_sparse_step is 0 — invalid config")
     num_experts_per_tok = text_config.get("num_experts_per_tok", 8)
 
     if progress_callback:

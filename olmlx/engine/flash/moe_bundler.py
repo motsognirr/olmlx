@@ -203,6 +203,8 @@ def _detect_moe_layers(config: dict) -> list[int]:
     first_dense = config.get("first_k_dense_replace", 0)
     # Qwen3-MoE uses decoder_sparse_step instead of moe_layer_freq
     freq = config.get("moe_layer_freq") or config.get("decoder_sparse_step") or 1
+    if freq == 0:
+        raise ValueError("moe_layer_freq / decoder_sparse_step is 0 — invalid config")
     # Qwen3-MoE: mlp_only_layers lists dense-MLP layer indices to exclude
     mlp_only = set(config.get("mlp_only_layers") or [])
 

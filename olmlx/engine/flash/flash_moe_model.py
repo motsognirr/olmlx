@@ -100,10 +100,10 @@ class _FlashMoEQwen3Next(nn.Module):
         self.shared_expert_gate = original_moe.shared_expert_gate
 
     def __call__(self, x):
-        gates = self.gate(x)
+        scores = mx.softmax(self.gate(x).astype(mx.float32), axis=-1)
         k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        scores = mx.take_along_axis(gates, inds, axis=-1)
+        inds = mx.argpartition(scores, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(scores, inds, axis=-1)
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
 

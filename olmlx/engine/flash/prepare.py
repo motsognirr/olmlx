@@ -165,8 +165,8 @@ def _record_activations(
 
             try:
                 model(input_ids)
-            except (ValueError, RuntimeError):
-                logger.debug("Skipping sample %d (model error)", idx)
+            except (ValueError, RuntimeError, TypeError) as exc:
+                logger.debug("Skipping sample %d (model error): %s", idx, exc)
     finally:
         for i, mlp in original_mlps.items():
             layers[i].mlp = mlp
@@ -198,14 +198,24 @@ class _RecordingMLP(nn.Module):
         if not (hasattr(orig, "gate_proj") and hasattr(orig, "up_proj")):
             return orig(x)
 
-        # Use original forward for correct result (handles GeGLU, bias, norms, etc.)
-        result = orig(x)
+        # Intercept down_proj to capture the activated tensor without
+        # recomputing gate_proj and up_proj (which orig's forward already does).
+        captured = {}
+        real_down_proj = orig.down_proj
 
-        # Record activation pattern using gate/up projections
+        def intercepting_down_proj(activated):
+            captured["activated"] = activated
+            return real_down_proj(activated)
+
+        orig.down_proj = intercepting_down_proj
+        try:
+            result = orig(x)
+        finally:
+            orig.down_proj = real_down_proj
+
+        # Record activation pattern from intercepted tensor
         flat_input = x.reshape(-1, x.shape[-1])
-        gate_out = orig.gate_proj(x)
-        up_out = orig.up_proj(x)
-        activated = nn.silu(gate_out) * up_out
+        activated = captured["activated"]
         flat_activated = activated.reshape(-1, activated.shape[-1])
         mean_act = mx.abs(flat_activated).mean(axis=0)
         target = (mean_act > self._threshold).astype(mx.float32)
@@ -309,10 +319,11 @@ def _stream_record_activations(
                 continue
             mask = _create_causal_mask(hidden_states[i])
             try:
-                hidden_states[i] = layer(hidden_states[i], mask=mask, cache=None)
+                out = layer(hidden_states[i], mask=mask, cache=None)
+                hidden_states[i] = out[0] if isinstance(out, (tuple, list)) else out
                 mx.eval(hidden_states[i])
-            except (ValueError, RuntimeError):
-                logger.debug("Skipping sample %d at layer %d", i, layer_idx)
+            except (ValueError, RuntimeError, TypeError) as exc:
+                logger.debug("Skipping sample %d at layer %d: %s", i, layer_idx, exc)
                 hidden_states[i] = None  # free stale tensor
         recordings[layer_idx] = recording_data
 
