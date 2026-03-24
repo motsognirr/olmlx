@@ -263,17 +263,27 @@ def _stream_record_activations(
     if progress_callback:
         progress_callback("Computing embeddings", 0.02)
 
-    mx.eval(inner.embed_tokens.parameters())
+    embed = (
+        getattr(inner, "embed_tokens", None)
+        or getattr(inner, "wte", None)
+        or getattr(inner, "tok_embeddings", None)
+    )
+    if embed is None:
+        raise ValueError(
+            "Cannot find embedding layer (tried embed_tokens, wte, tok_embeddings)"
+        )
+
+    mx.eval(embed.parameters())
 
     hidden_states: list[mx.array] = []
     for text in calibration_texts:
         tokens = _encode_tokens(tokenizer, text)
         input_ids = mx.array([tokens])
-        h = inner.embed_tokens(input_ids)
+        h = embed(input_ids)
         mx.eval(h)
         hidden_states.append(h)
 
-    _nullify_module_params(inner.embed_tokens)
+    _nullify_module_params(embed)
     gc.collect()
     mx.clear_cache()
 
@@ -316,9 +326,7 @@ def _stream_record_activations(
 
         if progress_callback:
             frac = 0.05 + ((layer_idx + 1) / num_layers) * 0.95
-            progress_callback(
-                f"Processed layer {layer_idx + 1}/{num_layers}", frac
-            )
+            progress_callback(f"Processed layer {layer_idx + 1}/{num_layers}", frac)
 
     return recordings, hidden_size, intermediate_size, num_layers
 
@@ -421,15 +429,13 @@ def prepare_model_for_flash(
     calibration_texts = _get_calibration_data(num_samples)
 
     # Step 2: Stream-record activations (one layer at a time)
-    recordings, hidden_size, intermediate_size, num_layers = (
-        _stream_record_activations(
-            model_path,
-            calibration_texts,
-            activation_threshold=activation_threshold,
-            progress_callback=lambda desc, frac: (
-                progress_callback(desc, frac * 0.4) if progress_callback else None
-            ),
-        )
+    recordings, hidden_size, intermediate_size, num_layers = _stream_record_activations(
+        model_path,
+        calibration_texts,
+        activation_threshold=activation_threshold,
+        progress_callback=lambda desc, frac: (
+            progress_callback(desc, frac * 0.4) if progress_callback else None
+        ),
     )
 
     # Step 3: Train predictors
