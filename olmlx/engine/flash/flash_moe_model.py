@@ -96,6 +96,12 @@ class _FlashMoEQwen3Next(nn.Module):
         self.top_k = original_moe.top_k
         self.norm_topk_prob = original_moe.norm_topk_prob
         self._flash_moe = flash_moe
+        if not hasattr(original_moe, "shared_expert"):
+            raise ValueError(
+                f"Qwen3-Next MoE detection matched on shared_expert_gate but "
+                f"{type(original_moe).__name__} has no 'shared_expert' attribute. "
+                "Unexpected architecture — disable Flash-MoE or file a bug."
+            )
         self.shared_expert = original_moe.shared_expert
         self.shared_expert_gate = original_moe.shared_expert_gate
 
@@ -106,7 +112,8 @@ class _FlashMoEQwen3Next(nn.Module):
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
-            scores = scores / scores.sum(axis=-1, keepdims=True)
+            denom = scores.sum(axis=-1, keepdims=True)
+            scores = scores / mx.maximum(denom, mx.array(1e-9, dtype=denom.dtype))
 
         y = self._flash_moe(x, inds, scores)
         y = y.astype(x.dtype)
@@ -207,13 +214,29 @@ def _replace_moe_layers(
         if getattr(moe_module, "shared_expert_gate", None) is not None and isinstance(
             getattr(moe_module, "gate", None), nn.Linear
         ):
-            # Qwen3-Next style: plain nn.Linear gate + shared_expert + shared_expert_gate
+            # Qwen3-Next style (mlx_lm Qwen3NextSparseMoeBlock):
+            # plain nn.Linear gate + shared_expert + shared_expert_gate
+            logger.debug(
+                "Layer %d: detected Qwen3-Next MoE (%s)",
+                layer_idx,
+                type(moe_module).__name__,
+            )
             replacement = _FlashMoEQwen3Next(moe_module, flash_moe)
         elif hasattr(moe_module, "gate"):
             # DeepSeek-V3 / Kimi-K2.5 style: gate returns (inds, scores)
+            logger.debug(
+                "Layer %d: detected DeepSeek-style MoE (%s)",
+                layer_idx,
+                type(moe_module).__name__,
+            )
             replacement = _FlashMoEDeepSeek(moe_module, flash_moe)
         else:
             # gpt-oss style (has router + experts)
+            logger.debug(
+                "Layer %d: detected gpt-oss MoE (%s)",
+                layer_idx,
+                type(moe_module).__name__,
+            )
             replacement = _FlashMoEGptOss(moe_module, flash_moe)
 
         # Delete original SwitchGLU weights before replacing

@@ -399,6 +399,22 @@ class TestFlashMoeQwen3Next:
             assert hasattr(mlp, "shared_expert")
             assert hasattr(mlp, "shared_expert_gate")
 
+    def test_frees_switch_mlp_weights(self, model_and_store):
+        """Original SwitchGLU weights should be deleted after wrapping."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+
+        moe_layer_indices = [1, 2]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        for i in [1, 2]:
+            mlp = wrapped.layers[i].mlp
+            assert not hasattr(mlp, "switch_mlp")
+            assert not hasattr(mlp, "experts")
+
     def test_qwen3_next_forward_pass(self, model_and_store):
         """Forward pass through Qwen3-Next Flash-MoE wrapper produces valid output."""
         model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
@@ -418,4 +434,28 @@ class TestFlashMoeQwen3Next:
         assert result.shape == (1, 4, hidden)
         # Numerical correctness: no NaN/Inf and experts actually contribute
         assert mx.all(mx.isfinite(result)).item(), "Output contains NaN or Inf"
+        assert not mx.array_equal(result, x), "Output unchanged — experts had no effect"
+
+    def test_qwen3_next_norm_topk_prob(self, model_and_store):
+        """Forward pass with norm_topk_prob=True should produce finite output."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+
+        moe_layer_indices = [1, 2]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        # Enable norm_topk_prob on the wrapped layer
+        wrapped.layers[1].mlp.norm_topk_prob = True
+
+        mx.random.seed(42)
+        x = mx.random.normal((1, 4, hidden))
+        result = wrapped.layers[1].mlp(x)
+        mx.eval(result)
+        assert result.shape == (1, 4, hidden)
+        assert mx.all(mx.isfinite(result)).item(), (
+            "Output contains NaN or Inf with norm_topk_prob=True"
+        )
         assert not mx.array_equal(result, x), "Output unchanged — experts had no effect"
