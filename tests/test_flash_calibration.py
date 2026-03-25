@@ -68,6 +68,21 @@ class TestC4Calibration:
         assert len(result) == 50
         assert all(isinstance(t, str) for t in result)
 
+    def test_network_error_falls_back_to_synthetic(self):
+        """Network errors during C4 streaming fall back to synthetic data."""
+
+        def raise_connection_error(*args, **kwargs):
+            raise ConnectionError("Network unreachable")
+
+        mock_datasets = MagicMock()
+        mock_datasets.load_dataset = raise_connection_error
+
+        with patch.dict("sys.modules", {"datasets": mock_datasets}):
+            result = _get_c4_calibration_data(100)
+
+        assert len(result) > 0
+        assert all(isinstance(t, str) for t in result)
+
     def test_long_docs_truncated(self):
         """Documents longer than 2048 chars are truncated."""
         fake_data = [{"text": "a" * 5000}]

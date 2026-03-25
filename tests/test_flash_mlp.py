@@ -181,6 +181,21 @@ class TestDynamicWindowManager:
         # Layer 1 should have all its neurons (under budget)
         assert w1 == {0, 1}
 
+    def test_warns_when_single_token_exceeds_budget(self, caplog):
+        """Log warning when a single token's neurons exceed the budget."""
+        import logging
+
+        wm = WindowManager(
+            num_layers=1,
+            window_size=10,
+            memory_budget_fraction=0.2,
+            intermediate_size=10,
+        )
+        # Budget = 2 neurons, but one token activates 5
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.flash.flash_mlp"):
+            wm.update(0, mx.array([0, 1, 2, 3, 4]))
+        assert "exceeds budget" in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # FlashMLP tests

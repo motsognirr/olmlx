@@ -36,12 +36,22 @@ class SpeculativeFlashDecoder:
         self._alpha = 0.5  # initial acceptance rate estimate
         self._alpha_ema = acceptance_rate_ema
 
+        # Persistent KV cache for the draft model — survives across generate_step calls
+        self._draft_cache: list | None = None
+        try:
+            from mlx_lm.models.cache import make_prompt_cache
+
+            self._draft_cache = make_prompt_cache(self._draft)
+        except (ImportError, TypeError, AttributeError):
+            pass
+
     def _draft_generate(self, prompt: mx.array, n: int) -> tuple[list[int], mx.array]:
         """Generate n candidate tokens with the draft model.
 
-        Uses KV cache when the draft model supports it (``cache`` kwarg)
-        so each step processes only the new token — O(lambda) instead of
-        O(lambda^2) token-steps.
+        Uses the persistent KV cache (created in __init__) so each step
+        processes only the new token — O(n) instead of O(n^2) token-steps.
+        The cache persists across generate_step calls so the prompt is not
+        re-prefilled each step.
 
         Args:
             prompt: (1, seq_len) input token IDs.
@@ -54,18 +64,9 @@ class SpeculativeFlashDecoder:
         tokens: list[int] = []
         all_logits: list[mx.array] = []
 
-        # Try to create a KV cache for the draft model
-        cache = None
-        try:
-            from mlx_lm.models.cache import make_prompt_cache
-
-            cache = make_prompt_cache(self._draft)
-        except (ImportError, TypeError, AttributeError):
-            pass
-
-        if cache is not None:
-            # Prefill: process the full prompt through cache
-            logits = self._draft(prompt, cache=cache)
+        if self._draft_cache is not None:
+            # Prefill prompt (cache accumulates across calls)
+            logits = self._draft(prompt, cache=self._draft_cache)
             next_logits = logits[:, -1, :]
             mx.eval(next_logits)
             next_token = int(mx.argmax(next_logits, axis=-1).item())
@@ -75,7 +76,7 @@ class SpeculativeFlashDecoder:
             # Decode: each step only processes the new token
             for _ in range(n - 1):
                 inp = mx.array([[next_token]])
-                logits = self._draft(inp, cache=cache)
+                logits = self._draft(inp, cache=self._draft_cache)
                 next_logits = logits[:, -1, :]
                 mx.eval(next_logits)
                 next_token = int(mx.argmax(next_logits, axis=-1).item())
@@ -165,9 +166,18 @@ class SpeculativeFlashDecoder:
         # 3. Verify
         accepted = self._verify(draft_tokens, target_logits)
 
-        # 4. Update acceptance rate
-        # How many of the lambda draft tokens were accepted
-        # (subtract 1 for the bonus token if all were accepted)
+        # 4. Trim draft cache to match accepted length (discard rejected tokens)
+        if self._draft_cache is not None and len(accepted) < self._lambda + 1:
+            # Some tokens were rejected — trim cache to the accepted position
+            num_rejected = self._lambda - len(accepted) + 1
+            try:
+                from mlx_lm.models.cache import trim_prompt_cache
+
+                trim_prompt_cache(self._draft_cache, num_rejected)
+            except (ImportError, TypeError, AttributeError):
+                pass
+
+        # 5. Update acceptance rate
         num_accepted_draft = (
             min(len(accepted) - 1, self._lambda) if len(accepted) > 0 else 0
         )
@@ -175,6 +185,17 @@ class SpeculativeFlashDecoder:
         self._alpha = self._alpha_ema * self._alpha + (1 - self._alpha_ema) * acceptance
 
         return accepted, self._lambda
+
+    def reset(self) -> None:
+        """Reset state for a new conversation (clears draft KV cache)."""
+        self._alpha = 0.5
+        if self._draft_cache is not None:
+            try:
+                from mlx_lm.models.cache import make_prompt_cache
+
+                self._draft_cache = make_prompt_cache(self._draft)
+            except (ImportError, TypeError, AttributeError):
+                self._draft_cache = None
 
     @property
     def effective_window_size(self) -> int:

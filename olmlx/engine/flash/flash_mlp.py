@@ -6,6 +6,7 @@ that loads only predicted-active neuron weights from SSD.
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 
 import mlx.core as mx
@@ -13,6 +14,8 @@ import mlx.nn as nn
 
 from olmlx.engine.flash.predictor import SparsityPredictor
 from olmlx.engine.flash.weight_store import FlashWeightStore
+
+logger = logging.getLogger(__name__)
 
 
 class WindowManager:
@@ -97,6 +100,14 @@ class WindowManager:
                 window |= indices_set
             self._cached_window[layer_idx] = window
             self._dirty[layer_idx] = False
+        if len(window) > self._budget_neurons:
+            logger.warning(
+                "Layer %d: window has %d neurons but budget is %d "
+                "(single token exceeds budget)",
+                layer_idx,
+                len(window),
+                self._budget_neurons,
+            )
 
     def reset(self) -> None:
         """Clear all window state (new conversation)."""

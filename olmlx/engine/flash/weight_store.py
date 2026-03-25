@@ -23,6 +23,9 @@ from olmlx.engine.flash.bundler import (
 
 _NP_DTYPE = {"float16": np.float16, "float32": np.float32, "bfloat16": np.float16}
 
+# macOS fcntl command to bypass OS page cache for accurate flash benchmarks
+_F_NOCACHE = 48
+
 
 class NeuronCache:
     """Thread-safe per-layer LRU cache for loaded neuron weight chunks."""
@@ -98,7 +101,7 @@ class PreallocatedNeuronBuffer:
         self._num_used = 0
         # OrderedDict for O(1) LRU: neuron_idx -> None, oldest first
         self._access_order: OrderedDict[int, None] = OrderedDict()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     @property
     def num_used(self) -> int:
@@ -200,8 +203,7 @@ class FlashWeightStore:
             for layer_idx, layout in self._layouts.items():
                 fd = os.open(str(layout.file_path), os.O_RDONLY)
                 if bypass_cache and sys.platform == "darwin":
-                    # F_NOCACHE = 48 on macOS — no alignment requirements
-                    fcntl.fcntl(fd, 48, 1)
+                    fcntl.fcntl(fd, _F_NOCACHE, 1)
                 self._fds[layer_idx] = fd
         except Exception:
             self.close()
@@ -304,7 +306,7 @@ class FlashWeightStore:
     ) -> tuple[mx.array, mx.array, mx.array]:
         """Load neurons using the preallocated buffer path.
 
-        Holds the buffer lock across insert + read to prevent concurrent
+        Holds the buffer's RLock across insert + read to prevent concurrent
         requests from evicting neurons between insertion and get_matrices.
         """
         buf = self._buffers[layer_idx]
@@ -320,34 +322,12 @@ class FlashWeightStore:
             for idx, future in futures.items():
                 loaded[idx] = future.result()
 
-        # Insert and read under one lock acquisition to prevent eviction races
+        # Insert and read under one lock acquisition to prevent eviction races.
+        # RLock allows insert() and get_matrices() to re-enter safely.
         with buf._lock:
             for idx, (gate, up, down) in loaded.items():
-                if idx not in buf._neuron_to_slot:
-                    # Re-check: another thread may have inserted it
-                    if buf._num_used < buf._max:
-                        slot = buf._num_used
-                        buf._num_used += 1
-                    else:
-                        evict_idx, _ = buf._access_order.popitem(last=False)
-                        slot = buf._neuron_to_slot.pop(evict_idx)
-                    buf._gate[slot] = gate
-                    buf._up[slot] = up
-                    buf._down[slot] = down
-                    buf._neuron_to_slot[idx] = slot
-                    buf._access_order[idx] = None
-                else:
-                    buf._access_order.move_to_end(idx)
-
-            slots = [buf._neuron_to_slot[idx] for idx in neuron_indices]
-            for idx in neuron_indices:
-                if idx in buf._access_order:
-                    buf._access_order.move_to_end(idx)
-            gate_data = buf._gate[slots].T.copy()
-            up_data = buf._up[slots].T.copy()
-            down_data = buf._down[slots].copy()
-
-        return mx.array(gate_data), mx.array(up_data), mx.array(down_data)
+                buf.insert(idx, gate, up, down)
+            return buf.get_matrices(neuron_indices)
 
     def _load_neurons_cache(
         self, layer_idx: int, neuron_indices: list[int]
