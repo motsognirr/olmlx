@@ -280,8 +280,9 @@ class _MockQwen3NextSparseMoeBlock(nn.Module):
         gates = mx.softmax(gates, axis=-1, precise=True)
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        _scores = mx.take_along_axis(gates, inds, axis=-1)
-        y = x  # simplified
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        # Simplified expert routing: scale input by mean routing score
+        y = x * scores.mean(axis=-1, keepdims=True)
         shared_y = self.shared_expert(x)
         shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
         return y + shared_y

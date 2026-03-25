@@ -204,7 +204,9 @@ def _replace_moe_layers(
         )
 
         # Detect router style and create appropriate replacement
-        if getattr(moe_module, "shared_expert_gate", None) is not None:
+        if getattr(moe_module, "shared_expert_gate", None) is not None and isinstance(
+            getattr(moe_module, "gate", None), nn.Linear
+        ):
             # Qwen3-Next style: plain nn.Linear gate + shared_expert + shared_expert_gate
             replacement = _FlashMoEQwen3Next(moe_module, flash_moe)
         elif hasattr(moe_module, "gate"):
