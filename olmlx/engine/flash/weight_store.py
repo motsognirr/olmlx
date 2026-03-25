@@ -306,11 +306,14 @@ class FlashWeightStore:
     ) -> tuple[mx.array, mx.array, mx.array]:
         """Load neurons using the preallocated buffer path.
 
-        Holds the buffer's RLock across insert + read to prevent concurrent
-        requests from evicting neurons between insertion and get_matrices.
+        Determines cached/missing under the lock to prevent TOCTOU races,
+        then releases for I/O, then re-acquires for insert + read.
         """
         buf = self._buffers[layer_idx]
-        _, missing = buf.get_cached_indices(neuron_indices)
+
+        # Determine missing under lock to prevent concurrent eviction
+        with buf._lock:
+            _, missing = buf.get_cached_indices(neuron_indices)
 
         # Fetch missing neurons via parallel I/O (outside lock)
         loaded: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -322,7 +325,7 @@ class FlashWeightStore:
             for idx, future in futures.items():
                 loaded[idx] = future.result()
 
-        # Insert and read under one lock acquisition to prevent eviction races.
+        # Insert and read under one lock acquisition.
         # RLock allows insert() and get_matrices() to re-enter safely.
         with buf._lock:
             for idx, (gate, up, down) in loaded.items():

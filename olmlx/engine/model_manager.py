@@ -869,6 +869,12 @@ class ModelManager:
         # Wrap model — this replaces FFN layers and frees original weights
         wrapped = FlashModelWrapper(model, predictor_bank, weight_store, flash_config)
 
+        if experimental.flash_speculative:
+            logger.warning(
+                "flash_speculative is enabled but speculative decoding is not yet "
+                "integrated into the inference pipeline — setting has no effect"
+            )
+
         return wrapped, tokenizer, False, caps
 
     def _flash_moe_dir(self, hf_path: str) -> Path | None:
