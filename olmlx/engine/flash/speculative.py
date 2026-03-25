@@ -25,13 +25,11 @@ class SpeculativeFlashDecoder:
         self,
         draft_model: nn.Module,
         target_model: nn.Module,
-        vocab_size: int,
         num_speculative_tokens: int = 4,
         acceptance_rate_ema: float = 0.9,
     ):
         self._draft = draft_model
         self._target = target_model
-        self._vocab_size = vocab_size
         self._lambda = num_speculative_tokens
         self._alpha = 0.5  # initial acceptance rate estimate
         self._alpha_ema = acceptance_rate_ema
@@ -151,6 +149,8 @@ class SpeculativeFlashDecoder:
         draft_tokens, draft_logits = self._draft_generate(prompt, self._lambda)
 
         # 2. Target model verifies all candidates + 1 in one pass
+        # TODO: use a KV cache for the target model so only the new lambda
+        # tokens are processed incrementally, not the full prompt each step.
         draft_ids = mx.array([draft_tokens])
         combined = mx.concatenate([prompt, draft_ids], axis=1)
         target_out = self._target(combined)  # (1, seq+lambda, vocab)

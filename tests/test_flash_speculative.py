@@ -46,7 +46,6 @@ class TestSpeculativeFlashDecoder:
         return SpeculativeFlashDecoder(
             draft_model=draft,
             target_model=target,
-            vocab_size=vocab_size,
             num_speculative_tokens=4,
         )
 
@@ -58,7 +57,7 @@ class TestSpeculativeFlashDecoder:
         prompt = mx.array([[1, 2, 3]])
         draft_tokens, draft_logits = decoder._draft_generate(prompt, n=4)
         assert len(draft_tokens) == 4
-        assert all(0 <= t < decoder._vocab_size for t in draft_tokens)
+        assert all(0 <= t < 32 for t in draft_tokens)
 
     def test_verify_greedy_all_match(self):
         """When draft and target produce same greedy tokens, all are accepted."""
@@ -73,7 +72,6 @@ class TestSpeculativeFlashDecoder:
         decoder = SpeculativeFlashDecoder(
             draft_model=draft,
             target_model=target,
-            vocab_size=vocab_size,
             num_speculative_tokens=3,
         )
 
@@ -108,7 +106,6 @@ class TestSpeculativeFlashDecoder:
         decoder._lambda = 3
         decoder._alpha = 0.5
         decoder._alpha_ema = 0.9
-        decoder._vocab_size = vocab_size
 
         draft_tokens = [0, 0, 0]  # draft always picks 0
 

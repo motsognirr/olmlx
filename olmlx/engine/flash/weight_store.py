@@ -330,6 +330,12 @@ class FlashWeightStore:
         with buf._lock:
             for idx, (gate, up, down) in loaded.items():
                 buf.insert(idx, gate, up, down)
+            # Re-check: concurrent eviction may have removed neurons
+            # we assumed were cached during the I/O phase
+            _, still_missing = buf.get_cached_indices(neuron_indices)
+            for idx in still_missing:
+                gate, up, down = self._read_neuron_raw(layer_idx, idx)
+                buf.insert(idx, gate, up, down)
             return buf.get_matrices(neuron_indices)
 
     def _load_neurons_cache(

@@ -93,7 +93,6 @@ class WindowManager:
         window = self.get_window(layer_idx)
         while len(window) > self._budget_neurons and len(self._history[layer_idx]) > 1:
             self._history[layer_idx].popleft()
-            self._dirty[layer_idx] = True
             # Recompute union directly instead of going through get_window
             window = set()
             for indices_set in self._history[layer_idx]:
