@@ -201,10 +201,20 @@ def _detect_moe_layers(config: dict) -> list[int]:
     """Return list of layer indices that are MoE layers based on config."""
     num_layers = config.get("num_hidden_layers") or config.get("num_layers", 0)
     first_dense = config.get("first_k_dense_replace", 0)
-    freq = config.get("moe_layer_freq") or 1
+    # Qwen3-MoE uses decoder_sparse_step instead of moe_layer_freq
+    freq_raw = config.get("moe_layer_freq")
+    if freq_raw is None:
+        freq_raw = config.get("decoder_sparse_step")
+    if freq_raw == 0:
+        raise ValueError("moe_layer_freq / decoder_sparse_step is 0 — invalid config")
+    freq = freq_raw or 1
+    # Qwen3-MoE: mlp_only_layers lists dense-MLP layer indices to exclude
+    mlp_only = set(config.get("mlp_only_layers") or [])
 
     moe_layers = []
     for i in range(num_layers):
+        if i in mlp_only:
+            continue
         if i >= first_dense and (i - first_dense) % freq == 0:
             moe_layers.append(i)
     return moe_layers
@@ -320,12 +330,13 @@ def bundle_moe_experts(
         )
     num_experts = (
         config.get("n_routed_experts")
-        or config.get("num_local_experts")  # gpt-oss uses this
+        or config.get("num_local_experts")
+        or config.get("num_experts")
     )
     if num_experts is None:
         raise ValueError(
-            f"config.json at {model_dir} is missing both "
-            "'n_routed_experts' and 'num_local_experts'"
+            f"config.json at {model_dir} is missing "
+            "'n_routed_experts', 'num_local_experts', and 'num_experts'"
         )
 
     # Check for safetensors index (sharded models)

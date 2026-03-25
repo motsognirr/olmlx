@@ -26,8 +26,9 @@ def is_moe_model(model_path: str | Path) -> bool:
     if "text_config" in config:
         config = config["text_config"]
     return (
-        config.get("n_routed_experts") is not None
-        or config.get("num_local_experts") is not None
+        (config.get("n_routed_experts") or 0) > 1
+        or (config.get("num_local_experts") or 0) > 1
+        or (config.get("num_experts") or 0) > 1
     )
 
 
@@ -74,12 +75,19 @@ def prepare_moe_for_flash(
             f"config.json at {model_dir} is missing both "
             "'moe_intermediate_size' and 'intermediate_size'"
         )
-    num_experts = text_config.get("n_routed_experts") or text_config.get(
-        "num_local_experts"
+    num_experts = (
+        text_config.get("n_routed_experts")
+        or text_config.get("num_local_experts")
+        or text_config.get("num_experts")
     )
     num_layers = text_config.get("num_hidden_layers") or text_config.get("num_layers")
     first_dense = text_config.get("first_k_dense_replace", 0)
-    moe_freq = text_config.get("moe_layer_freq", 1)
+    moe_freq_raw = text_config.get("moe_layer_freq")
+    if moe_freq_raw is None:
+        moe_freq_raw = text_config.get("decoder_sparse_step")
+    if moe_freq_raw == 0:
+        raise ValueError("moe_layer_freq / decoder_sparse_step is 0 — invalid config")
+    moe_freq = moe_freq_raw or 1
     num_experts_per_tok = text_config.get("num_experts_per_tok", 8)
 
     if progress_callback:

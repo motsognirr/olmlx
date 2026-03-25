@@ -1,8 +1,8 @@
 """Preparation pipeline for flash inference.
 
 Prepares a model for LLM-in-a-Flash inference by:
-1. Loading the model fully
-2. Recording FFN activation patterns (calibration)
+1. Streaming calibration data through the model one layer at a time
+2. Recording FFN activation patterns
 3. Training per-layer sparsity predictors
 4. Bundling FFN weights with row-column bundling
 """
@@ -19,10 +19,40 @@ from typing import Callable
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx.utils import tree_map
+
 from olmlx.engine.flash.bundler import bundle_ffn_weights
 from olmlx.engine.flash.predictor import PredictorBank
 
 logger = logging.getLogger(__name__)
+
+
+def _encode_tokens(tokenizer, text: str) -> list[int]:
+    """Encode text to token ids, handling both fast and slow tokenizers."""
+    result = tokenizer.encode(text)
+    tokens = result["input_ids"] if isinstance(result, dict) else result
+    if len(tokens) > 512:
+        tokens = tokens[:512]
+    return tokens
+
+
+def _create_causal_mask(h: mx.array) -> mx.array | None:
+    """Create a causal attention mask for hidden states of shape (B, L, D)."""
+    L = h.shape[1]
+    if L <= 1:
+        return None
+    indices = mx.arange(L)
+    mask = indices[:, None] < indices[None, :]
+    return mask * -1e9
+
+
+def _nullify_module_params(module: nn.Module) -> None:
+    """Replace all parameter arrays with tiny placeholders to free VRAM."""
+    new_params = tree_map(
+        lambda x: mx.zeros((1,)) if isinstance(x, mx.array) else x,
+        module.parameters(),
+    )
+    module.update(new_params)
 
 
 def _get_calibration_data(num_samples: int = 256) -> list[str]:
@@ -110,7 +140,6 @@ def _record_activations(
         i: ([], []) for i in range(num_layers)
     }
 
-    # Save original MLPs and replace with recording wrappers.
     # Instance __call__ patching doesn't work (Python resolves __call__
     # on the type, not instance), so we replace layer.mlp entirely.
     original_mlps = {}
@@ -119,35 +148,10 @@ def _record_activations(
             continue
         original_mlps[i] = layer.mlp
 
-    class _RecordingMLP(nn.Module):
-        """Wrapper that records activation patterns during forward pass."""
-
-        def __init__(self, layer_idx: int, original: nn.Module):
-            super().__init__()
-            self._layer_idx = layer_idx
-            self._original = original
-
-        def __call__(self, x):
-            result = self._original(x)
-
-            flat_input = x.reshape(-1, x.shape[-1])
-            orig = self._original
-            if hasattr(orig, "gate_proj") and hasattr(orig, "up_proj"):
-                gate_out = orig.gate_proj(flat_input)
-                up_out = orig.up_proj(flat_input)
-                intermediate = mx.sigmoid(gate_out) * gate_out * up_out
-                mean_act = mx.abs(intermediate).mean(axis=0)
-                target = (mean_act > activation_threshold).astype(mx.float32)
-                mean_input = flat_input.mean(axis=0)
-
-                mx.eval(mean_input, target)
-                recordings[self._layer_idx][0].append(mean_input)
-                recordings[self._layer_idx][1].append(target)
-
-            return result
-
     for i in original_mlps:
-        layers[i].mlp = _RecordingMLP(i, original_mlps[i])
+        layers[i].mlp = _RecordingMLP(
+            original_mlps[i], recordings[i], activation_threshold
+        )
 
     try:
         total = len(calibration_texts)
@@ -155,21 +159,193 @@ def _record_activations(
             if progress_callback:
                 progress_callback("Recording activations", (idx + 1) / total)
 
-            tokens = tokenizer.encode(text)
-            if len(tokens) > 512:
-                tokens = tokens[:512]
-
+            tokens = _encode_tokens(tokenizer, text)
             input_ids = mx.array([tokens])
 
             try:
                 model(input_ids)
-            except (ValueError, RuntimeError):
-                logger.debug("Skipping sample %d (model error)", idx)
+            except (ValueError, RuntimeError, TypeError) as exc:
+                logger.debug("Skipping sample %d (model error): %s", idx, exc)
     finally:
         for i, mlp in original_mlps.items():
             layers[i].mlp = mlp
 
     return recordings
+
+
+class _RecordingMLP(nn.Module):
+    """Wrapper that records FFN activation patterns during forward pass.
+
+    Delegates to the original MLP for the forward result (preserving any
+    custom gating or normalization), then separately computes gate/up
+    projections for activation recording.
+    """
+
+    def __init__(
+        self,
+        original: nn.Module,
+        recordings: tuple[list[mx.array], list[mx.array]],
+        activation_threshold: float,
+    ):
+        super().__init__()
+        self._original = original
+        self._recordings = recordings
+        self._threshold = activation_threshold
+
+    def __call__(self, x):
+        orig = self._original
+        if not (hasattr(orig, "gate_proj") and hasattr(orig, "up_proj")):
+            return orig(x)
+
+        # Intercept down_proj to capture the activated tensor without
+        # recomputing gate_proj and up_proj (which orig's forward already does).
+        captured = {}
+        real_down_proj = orig.down_proj
+
+        def intercepting_down_proj(activated):
+            captured["activated"] = activated
+            return real_down_proj(activated)
+
+        orig.down_proj = intercepting_down_proj
+        try:
+            result = orig(x)
+        finally:
+            orig.down_proj = real_down_proj
+
+        # Record activation pattern from intercepted tensor
+        if "activated" not in captured:
+            return result
+        flat_input = x.reshape(-1, x.shape[-1])
+        activated = captured["activated"]
+        flat_activated = activated.reshape(-1, activated.shape[-1])
+        mean_act = mx.abs(flat_activated).mean(axis=0)
+        target = (mean_act > self._threshold).astype(mx.float32)
+        mean_input = flat_input.mean(axis=0)
+
+        mx.eval(mean_input, target)
+        self._recordings[0].append(mean_input)
+        self._recordings[1].append(target)
+
+        return result
+
+
+def _stream_record_activations(
+    model_path: str,
+    calibration_texts: list[str],
+    activation_threshold: float = 0.01,
+    progress_callback: Callable[[str, float], None] | None = None,
+) -> tuple[dict[int, tuple[list[mx.array], list[mx.array]]], int, int, int]:
+    """Stream calibration through model one layer at a time.
+
+    Loads only one layer's weights into VRAM at a time, enabling preparation
+    of models larger than available RAM.
+
+    Note: All num_samples hidden states are materialized before the layer loop.
+    For a 70B model (hidden_size=8192) with 256 samples x 512 tokens x fp16,
+    this is ~2 GB. Memory scales linearly with num_samples.
+
+    Returns:
+        (recordings, hidden_size, intermediate_size, num_layers)
+    """
+    import mlx_lm  # deferred — triggers slow import transformers
+
+    if progress_callback:
+        progress_callback("Loading model skeleton", 0.0)
+
+    model, tokenizer = mlx_lm.load(model_path, lazy=True)
+
+    # Access inner model (mlx-lm wraps: Model.model = LlamaModel/Qwen3Model/etc.)
+    inner = model.model if hasattr(model, "model") else model
+    layers = inner.layers
+    num_layers = len(layers)
+
+    # Find dimensions from first layer with gate_proj/up_proj (some MoE models
+    # have dense layers at the start that lack these projections)
+    hidden_size = intermediate_size = None
+    for layer in layers:
+        mlp = layer.mlp if hasattr(layer, "mlp") else None
+        if mlp and hasattr(mlp, "gate_proj") and hasattr(mlp, "up_proj"):
+            intermediate_size = mlp.gate_proj.weight.shape[0]
+            hidden_size = mlp.gate_proj.weight.shape[1]
+            break
+    if hidden_size is None:
+        raise ValueError("No layer has gate_proj/up_proj — cannot determine dimensions")
+
+    if progress_callback:
+        progress_callback("Computing embeddings", 0.02)
+
+    embed = (
+        getattr(inner, "embed_tokens", None)
+        or getattr(inner, "wte", None)
+        or getattr(inner, "tok_embeddings", None)
+    )
+    if embed is None:
+        raise ValueError(
+            "Cannot find embedding layer (tried embed_tokens, wte, tok_embeddings)"
+        )
+
+    mx.eval(embed.parameters())
+
+    hidden_states: list[mx.array] = []
+    for text in calibration_texts:
+        tokens = _encode_tokens(tokenizer, text)
+        input_ids = mx.array([tokens])
+        h = embed(input_ids)
+        mx.eval(h)
+        hidden_states.append(h)
+
+    _nullify_module_params(embed)
+    # Free LM head and final norm — not needed for layer-by-layer streaming
+    for attr in ("lm_head", "norm", "output"):
+        submod = getattr(inner, attr, None) or getattr(model, attr, None)
+        if submod is not None and isinstance(submod, nn.Module):
+            _nullify_module_params(submod)
+    gc.collect()
+    mx.clear_cache()
+
+    if progress_callback:
+        progress_callback("Streaming layers", 0.05)
+
+    recordings: dict[int, tuple[list[mx.array], list[mx.array]]] = {}
+
+    for layer_idx in range(num_layers):
+        layer = layers[layer_idx]
+        mx.eval(layer.parameters())
+
+        original_mlp = layer.mlp
+        recording_data: tuple[list[mx.array], list[mx.array]] = ([], [])
+
+        if hasattr(original_mlp, "gate_proj") and hasattr(original_mlp, "up_proj"):
+            layer.mlp = _RecordingMLP(
+                original_mlp, recording_data, activation_threshold
+            )
+
+        for i in range(len(hidden_states)):
+            if hidden_states[i] is None:
+                continue
+            mask = _create_causal_mask(hidden_states[i])
+            try:
+                out = layer(hidden_states[i], mask=mask, cache=None)
+                hidden_states[i] = out[0] if isinstance(out, (tuple, list)) else out
+                mx.eval(hidden_states[i])
+            except (ValueError, RuntimeError, TypeError) as exc:
+                logger.debug("Skipping sample %d at layer %d: %s", i, layer_idx, exc)
+                hidden_states[i] = None  # free stale tensor
+        recordings[layer_idx] = recording_data
+
+        if not recording_data[0]:
+            logger.warning("No activations recorded for layer %d", layer_idx)
+
+        layer.mlp = original_mlp
+        _nullify_module_params(layer)
+        gc.collect()
+        mx.clear_cache()
+
+        if progress_callback:
+            frac = 0.05 + ((layer_idx + 1) / num_layers) * 0.95
+            progress_callback(f"Processed layer {layer_idx + 1}/{num_layers}", frac)
+
+    return recordings, hidden_size, intermediate_size, num_layers
 
 
 def _train_predictors(
@@ -240,13 +416,14 @@ def prepare_model_for_flash(
 ) -> Path:
     """Full preparation pipeline for flash inference.
 
+    Streams calibration data through the model one layer at a time,
+    so the full model never needs to fit in RAM.
+
     Steps:
-    1. Load model fully (requires enough RAM)
-    2. Run calibration to record activations
-    3. Train per-layer predictors
-    4. Bundle FFN weights with row-column bundling
-    5. Save predictor bank
-    6. Write flash_config.json
+    1. Stream calibration data layer-by-layer (one layer in RAM at a time)
+    2. Train per-layer sparsity predictors
+    3. Bundle FFN weights with row-column bundling
+    4. Save predictor bank + config
 
     Args:
         model_path: HF model path or local directory.
@@ -260,56 +437,21 @@ def prepare_model_for_flash(
     Returns:
         Path to the flash directory.
     """
-    import mlx_lm
-
-    if progress_callback:
-        progress_callback("Loading model", 0.0)
-
-    model, tokenizer = mlx_lm.load(model_path)
-
-    # Determine dimensions from model config
-    config_path = Path(model_path) / "config.json"
-    if config_path.exists():
-        config = json.loads(config_path.read_text())
-        hidden_size = config.get("hidden_size") or config.get("d_model")
-        intermediate_size = config.get("intermediate_size")
-        num_layers = config.get("num_hidden_layers") or config.get("num_layers")
-    else:
-        # Infer from model structure
-        layer0 = model.layers[0]
-        hidden_size = layer0.mlp.gate_proj.weight.shape[1]
-        intermediate_size = layer0.mlp.gate_proj.weight.shape[0]
-        num_layers = len(model.layers)
-
-    if None in (hidden_size, intermediate_size, num_layers):
-        raise ValueError(
-            f"Cannot determine model dimensions from {config_path}. "
-            f"Got hidden_size={hidden_size}, intermediate_size={intermediate_size}, "
-            f"num_layers={num_layers}."
-        )
-
     if output_dir is None:
         output_dir = Path(model_path) / "flash"
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if progress_callback:
-        progress_callback("Loading model", 0.1)
-
     # Step 1: Generate calibration data
     calibration_texts = _get_calibration_data(num_samples)
 
-    # Step 2: Record activations
-    if progress_callback:
-        progress_callback("Recording activations", 0.1)
-
-    recordings = _record_activations(
-        model,
-        tokenizer,
+    # Step 2: Stream-record activations (one layer at a time)
+    recordings, hidden_size, intermediate_size, num_layers = _stream_record_activations(
+        model_path,
         calibration_texts,
         activation_threshold=activation_threshold,
         progress_callback=lambda desc, frac: (
-            progress_callback(desc, 0.1 + frac * 0.3) if progress_callback else None
+            progress_callback(desc, frac * 0.4) if progress_callback else None
         ),
     )
 
@@ -327,11 +469,6 @@ def prepare_model_for_flash(
             progress_callback(desc, 0.4 + frac * 0.2) if progress_callback else None
         ),
     )
-
-    # Free model to reclaim RAM before bundling
-    del model
-    gc.collect()
-    mx.clear_cache()
 
     # Step 4: Bundle FFN weights
     if progress_callback:

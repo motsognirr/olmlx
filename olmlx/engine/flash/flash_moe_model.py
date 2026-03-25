@@ -77,6 +77,45 @@ class _FlashMoEGptOss(nn.Module):
         return y.astype(x.dtype)
 
 
+class _FlashMoEQwen3Next(nn.Module):
+    """Replacement MoE layer for Qwen3-Next style models.
+
+    Gate is a plain nn.Linear (returns logits, not (inds, scores)).
+    Keeps gate, shared_expert, and shared_expert_gate in RAM.
+    """
+
+    def __init__(self, original_moe, flash_moe: FlashMoE):
+        super().__init__()
+        if getattr(original_moe, "sharding_group", None) is not None:
+            raise NotImplementedError(
+                "Flash-MoE does not support distributed tensor parallelism. "
+                "Each rank loads all needed experts, so all_sum would produce "
+                "incorrect results. Disable distributed or Flash-MoE."
+            )
+        self.gate = original_moe.gate
+        self.top_k = original_moe.top_k
+        self.norm_topk_prob = original_moe.norm_topk_prob
+        self._flash_moe = flash_moe
+        self.shared_expert = original_moe.shared_expert
+        self.shared_expert_gate = original_moe.shared_expert_gate
+
+    def __call__(self, x):
+        scores = mx.softmax(self.gate(x).astype(mx.float32), axis=-1)
+        k = self.top_k
+        inds = mx.argpartition(scores, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(scores, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+
+        y = self._flash_moe(x, inds, scores)
+        y = y.astype(x.dtype)
+
+        shared_y = self.shared_expert(x)
+        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+
+        return y + shared_y
+
+
 class FlashMoeModelWrapper(nn.Module):
     """Wraps an mlx-lm model for Flash-MoE inference.
 
@@ -163,9 +202,15 @@ def _replace_moe_layers(
             activation=activation,
         )
 
-        # Detect router style and create appropriate replacement
-        if hasattr(moe_module, "gate"):
-            # DeepSeek-V3 / Kimi-K2.5 style
+        # Detect router style and create appropriate replacement.
+        # Qwen3-Next: gate is a plain nn.Linear (returns logits); we apply softmax.
+        # DeepSeek-V3: gate is a custom module returning (inds, scores) directly.
+        gate = getattr(moe_module, "gate", None)
+        if isinstance(gate, nn.Linear) and hasattr(moe_module, "shared_expert_gate"):
+            # Qwen3-Next style: plain nn.Linear gate + shared_expert + shared_expert_gate
+            replacement = _FlashMoEQwen3Next(moe_module, flash_moe)
+        elif gate is not None:
+            # DeepSeek-V3 / Kimi-K2.5 style: gate returns (inds, scores)
             replacement = _FlashMoEDeepSeek(moe_module, flash_moe)
         else:
             # gpt-oss style (has router + experts)

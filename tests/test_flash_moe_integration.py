@@ -59,6 +59,14 @@ class TestIsMoeModel:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert is_moe_model(tmp_path) is True
 
+    def test_qwen3_moe_detected(self, tmp_path):
+        """Qwen3-MoE uses 'num_experts' instead of 'n_routed_experts'."""
+        from olmlx.engine.flash.moe_prepare import is_moe_model
+
+        config = {"model_type": "qwen3_moe", "num_experts": 160, "hidden_size": 6144}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert is_moe_model(tmp_path) is True
+
     def test_missing_config(self, tmp_path):
         from olmlx.engine.flash.moe_prepare import is_moe_model
 

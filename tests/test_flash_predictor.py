@@ -97,9 +97,16 @@ class TestPredictorBank:
         num_layers = 2
         bank = PredictorBank(num_layers, hidden, inter, rank)
 
+        # Ensure predictors have distinct weights (random init can collide)
+        bank.predictors[0].down.weight = mx.random.normal(
+            bank.predictors[0].down.weight.shape, key=mx.random.key(0)
+        )
+        bank.predictors[1].down.weight = mx.random.normal(
+            bank.predictors[1].down.weight.shape, key=mx.random.key(1)
+        )
+
         x = mx.random.normal((1, hidden))
         s0 = bank.predictors[0](x)
         s1 = bank.predictors[1](x)
         mx.eval(s0, s1)
-        # Extremely unlikely to be identical given random init
         assert not mx.array_equal(s0, s1)
