@@ -77,15 +77,21 @@ def _get_c4_calibration_data(num_samples: int = 10000) -> list[str]:
 
     try:
         ds = load_dataset("allenai/c4", "en", split="train", streaming=True)
+        ds_iter = iter(ds)
         texts: list[str] = []
-        for example in ds:
-            text = example.get("text", "")
-            if len(text) < 100:
-                continue
-            texts.append(text[:2048])
-            if len(texts) >= num_samples:
-                break
-    except (ConnectionError, OSError) as exc:
+        try:
+            for example in ds_iter:
+                text = example.get("text", "")
+                if len(text) < 100:
+                    continue
+                texts.append(text[:2048])
+                if len(texts) >= num_samples:
+                    break
+        finally:
+            # Close the streaming iterator to release HTTP connections
+            if hasattr(ds_iter, "close"):
+                ds_iter.close()
+    except Exception as exc:
         actual = min(num_samples, 256)
         logger.warning(
             "Failed to stream C4 dataset (%s: %s); "

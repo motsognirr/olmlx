@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import sys
@@ -21,7 +20,10 @@ from olmlx.engine.flash.bundler import (
     parse_header,
 )
 
-_NP_DTYPE = {"float16": np.float16, "float32": np.float32, "bfloat16": np.float16}
+_NP_DTYPE = {"float16": np.float16, "float32": np.float32, "bfloat16": np.uint16}
+
+# MLX dtype for reinterpreting uint16 storage back to bfloat16
+_MX_DTYPE = {"float16": mx.float16, "float32": mx.float32, "bfloat16": mx.bfloat16}
 
 # macOS fcntl command to bypass OS page cache for accurate flash benchmarks
 _F_NOCACHE = 48
@@ -91,17 +93,30 @@ class PreallocatedNeuronBuffer:
     per-call allocation (no mx.stack).
     """
 
-    def __init__(self, max_neurons: int, hidden_size: int, dtype=np.float16):
+    def __init__(
+        self,
+        max_neurons: int,
+        hidden_size: int,
+        dtype=np.float16,
+        mx_dtype: mx.Dtype | None = None,
+    ):
         self._max = max_neurons
         self._hidden = hidden_size
         self._gate = np.zeros((max_neurons, hidden_size), dtype=dtype)
         self._up = np.zeros((max_neurons, hidden_size), dtype=dtype)
         self._down = np.zeros((max_neurons, hidden_size), dtype=dtype)
+        # mx dtype for reinterpretation (e.g. uint16 storage → bfloat16)
+        self._mx_dtype = mx_dtype
         self._neuron_to_slot: dict[int, int] = {}
         self._num_used = 0
         # OrderedDict for O(1) LRU: neuron_idx -> None, oldest first
         self._access_order: OrderedDict[int, None] = OrderedDict()
         self._lock = threading.RLock()
+
+    @property
+    def lock(self) -> threading.RLock:
+        """Expose lock for callers that need atomic check-fetch-insert-read."""
+        return self._lock
 
     @property
     def num_used(self) -> int:
@@ -158,7 +173,15 @@ class PreallocatedNeuronBuffer:
             up_data = self._up[slots].T.copy()
             down_data = self._down[slots].copy()
 
-        return mx.array(gate_data), mx.array(up_data), mx.array(down_data)
+        gate = mx.array(gate_data)
+        up = mx.array(up_data)
+        down = mx.array(down_data)
+        # Reinterpret uint16 storage as bfloat16 (or other non-native numpy dtype)
+        if self._mx_dtype is not None:
+            gate = gate.view(self._mx_dtype)
+            up = up.view(self._mx_dtype)
+            down = down.view(self._mx_dtype)
+        return gate, up, down
 
     def get_cached_indices(
         self, neuron_indices: list[int]
@@ -191,10 +214,15 @@ class FlashWeightStore:
 
         if use_preallocated_buffer:
             for layer_idx, layout in self._layouts.items():
+                np_dtype = _NP_DTYPE[layout.dtype]
+                # Pass mx_dtype for reinterpretation when numpy can't represent
+                # the model dtype natively (e.g. bfloat16 stored as uint16)
+                needs_reinterpret = np_dtype != np.float16 and np_dtype != np.float32
                 self._buffers[layer_idx] = PreallocatedNeuronBuffer(
                     max_neurons=cache_budget_neurons,
                     hidden_size=layout.hidden_size,
-                    dtype=_NP_DTYPE[layout.dtype],
+                    dtype=np_dtype,
+                    mx_dtype=_MX_DTYPE[layout.dtype] if needs_reinterpret else None,
                 )
         else:
             self._cache = NeuronCache(max_neurons_per_layer=cache_budget_neurons)
@@ -203,6 +231,8 @@ class FlashWeightStore:
             for layer_idx, layout in self._layouts.items():
                 fd = os.open(str(layout.file_path), os.O_RDONLY)
                 if bypass_cache and sys.platform == "darwin":
+                    import fcntl
+
                     fcntl.fcntl(fd, _F_NOCACHE, 1)
                 self._fds[layer_idx] = fd
         except Exception:
@@ -283,7 +313,14 @@ class FlashWeightStore:
     ) -> tuple[mx.array, mx.array, mx.array]:
         """Read a single neuron's bundled weights from SSD as mx arrays."""
         gate, up, down = self._read_neuron_raw(layer_idx, neuron_idx)
-        return mx.array(gate), mx.array(up), mx.array(down)
+        mx_gate, mx_up, mx_down = mx.array(gate), mx.array(up), mx.array(down)
+        # Reinterpret uint16 storage as bfloat16 when needed
+        target_dtype = _MX_DTYPE.get(self._layouts[layer_idx].dtype)
+        if target_dtype is not None and mx_gate.dtype != target_dtype:
+            mx_gate = mx_gate.view(target_dtype)
+            mx_up = mx_up.view(target_dtype)
+            mx_down = mx_down.view(target_dtype)
+        return mx_gate, mx_up, mx_down
 
     def load_neurons(
         self,
@@ -312,7 +349,7 @@ class FlashWeightStore:
         buf = self._buffers[layer_idx]
 
         # Determine missing under lock to prevent concurrent eviction
-        with buf._lock:
+        with buf.lock:
             _, missing = buf.get_cached_indices(neuron_indices)
 
         # Fetch missing neurons via parallel I/O (outside lock)
@@ -326,7 +363,7 @@ class FlashWeightStore:
                 loaded[idx] = future.result()
 
         # Insert under lock, then check for eviction races
-        with buf._lock:
+        with buf.lock:
             for idx, (gate, up, down) in loaded.items():
                 buf.insert(idx, gate, up, down)
             _, still_missing = buf.get_cached_indices(neuron_indices)
@@ -336,12 +373,12 @@ class FlashWeightStore:
             extra = {
                 idx: self._read_neuron_raw(layer_idx, idx) for idx in still_missing
             }
-            with buf._lock:
+            with buf.lock:
                 for idx, (gate, up, down) in extra.items():
                     buf.insert(idx, gate, up, down)
                 return buf.get_matrices(neuron_indices)
 
-        with buf._lock:
+        with buf.lock:
             return buf.get_matrices(neuron_indices)
 
     def _load_neurons_cache(
