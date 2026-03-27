@@ -23,7 +23,9 @@ olmlx/
 │   ├── model_manager.py # Model loading/unloading, keep-alive, LRU eviction
 │   ├── registry.py    # Ollama name → HuggingFace repo mapping via models.json
 │   ├── template_caps.py # Chat template capability detection (tools, thinking)
-│   └── tool_parser.py  # Multi-format tool call parsing (Qwen, Mistral, Llama, DeepSeek, bare JSON)
+│   ├── tool_parser.py  # Multi-format tool call parsing (Qwen, Mistral, Llama, DeepSeek, bare JSON)
+│   ├── turboquant.py   # TurboQuant_mse: rotation, Lloyd-Max codebooks, bit-packed quantize/dequantize
+│   └── turboquant_cache.py # TurboQuantKVCache: drop-in KVCache replacement with TurboQuant compression
 ├── models/
 │   ├── manifest.py     # Model manifest/metadata
 │   └── store.py        # Local model storage
@@ -65,6 +67,7 @@ olmlx/
 - **Stream cleanup**: All streaming routers use `try/finally` with `await result.aclose()` to ensure GPU resources are released on client disconnect.
 - **Auto-registration**: Direct HF paths (e.g. `Qwen/Qwen3-8B`) are auto-registered in `models.json` on first load or pull.
 - **Prompt caching**: KV cache reuse across requests when prompts share a common prefix. Works with both mlx-lm (text) and mlx-vlm (vision) models. Controlled via `OLMLX_PROMPT_CACHE` setting.
+- **TurboQuant KV cache quantization** (experimental): Compresses KV cache using TurboQuant_mse (arxiv 2504.19874). Algorithm: random rotation → Lloyd-Max scalar quantization per coordinate → bit-packed storage → inverse rotation on fetch. Supports 2-bit (~7.5x compression) and 4-bit (~3.9x compression). `TurboQuantKVCache` is a drop-in replacement for mlx-lm's `KVCache` — dequantizes on each `update_and_fetch` call (O(n) per step, same as attention). Per-layer rotation matrices via QR decomposition. Codebooks are standard Gaussian Lloyd-Max centroids scaled by 1/√(head_dim). Indices bit-packed: 2 per byte (4-bit) or 4 per byte (2-bit). Head dim detected from `model.args.head_dim` or K projection weight shape. Incompatible with disk cache offload (guarded in `_save_to_disk`). Config: `OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:4` (or `:2`), validated at startup.
 - **Model load timeout**: Configurable via `OLMLX_MODEL_LOAD_TIMEOUT` with dedicated `ModelLoadTimeoutError` (HTTP 504).
 - **Terminal chat** (`chat/`): `olmlx chat` runs inference directly in-process via `ModelManager`/`generate_chat()` — no HTTP server needed. Connects to external MCP servers (stdio/SSE) for tool use with a full agent loop (model → tool calls → MCP execution → results fed back → continue). Uses `parse_model_output()` from `engine/tool_parser.py` for thinking/tool extraction. MCP config uses Claude Desktop format (`~/.olmlx/mcp.json`).
 - **Distributed inference** (experimental): Splits models across multiple Apple Silicon machines using MLX's ring distributed backend. Startup sequence: CLI generates ring hostfile → launches workers via SSH → ring init (`mx.distributed.init`) → starts sideband server (TCP, port 32400) → starts uvicorn. Key constraints:
