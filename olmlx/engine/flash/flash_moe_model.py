@@ -135,6 +135,8 @@ class _FlashMoEMiniMax(nn.Module):
         self.num_experts_per_tok = original_moe.num_experts_per_tok
         self.e_score_correction_bias = original_moe.e_score_correction_bias
         self._flash_moe = flash_moe
+        if hasattr(original_moe, "shared_experts"):
+            self.shared_experts = original_moe.shared_experts
 
     def __call__(self, x):
         gates = self.gate(x.astype(mx.float32))
@@ -149,7 +151,10 @@ class _FlashMoEMiniMax(nn.Module):
         scores = scores.astype(x.dtype)
 
         y = self._flash_moe(x, inds, scores)
-        return y.astype(x.dtype)
+        y = y.astype(x.dtype)
+        if hasattr(self, "shared_experts"):
+            y = y + self.shared_experts(x)
+        return y
 
 
 class FlashMoeModelWrapper(nn.Module):
@@ -259,7 +264,9 @@ def _replace_moe_layers(
             # Qwen3-Next style: linear gate + shared_expert + shared_expert_gate
             replacement = _FlashMoEQwen3Next(moe_module, flash_moe)
         elif hasattr(moe_module, "e_score_correction_bias") and gate is not None:
-            # MiniMax style: sigmoid gate + correction bias
+            # MiniMax style: sigmoid gate + correction bias.
+            # DeepSeek V3 also has e_score_correction_bias but on its MoEGate
+            # submodule (moe_module.gate), not the MoE block itself.
             replacement = _FlashMoEMiniMax(moe_module, flash_moe)
         elif gate is not None:
             # DeepSeek-V3 / Kimi-K2.5 style: gate returns (inds, scores)

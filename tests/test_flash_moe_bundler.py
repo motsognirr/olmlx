@@ -544,9 +544,7 @@ class TestBundleMiniMaxMoeExperts:
         from olmlx.engine.flash.moe_bundler import bundle_moe_experts
 
         original = load_file(str(model_dir / "model.safetensors"))
-        gate_w = original[
-            "model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight"
-        ]
+        gate_w = original["model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight"]
 
         layouts = bundle_moe_experts(model_dir, output_dir)
         layout = layouts[0]

@@ -180,9 +180,7 @@ def _detect_expert_prefix(
     _EXPERT_CONTAINERS = ("switch_mlp", "experts")
 
     candidates = [
-        f"{mod}.{cont}"
-        for mod in _MOE_MODULES
-        for cont in _EXPERT_CONTAINERS
+        f"{mod}.{cont}" for mod in _MOE_MODULES for cont in _EXPERT_CONTAINERS
     ]
 
     for prefix in candidates:
