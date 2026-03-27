@@ -213,7 +213,7 @@ def _find_moe_module(layer: nn.Module) -> tuple[str, nn.Module]:
     Returns (attr_name, module) — the attribute may be 'mlp' (DeepSeek,
     Qwen3-Next, gpt-oss) or 'block_sparse_moe' (MiniMax).
     """
-    for attr in ("block_sparse_moe", "mlp"):
+    for attr in ("mlp", "block_sparse_moe"):
         mod = getattr(layer, attr, None)
         if mod is not None:
             return attr, mod
@@ -259,17 +259,20 @@ def _replace_moe_layers(
         )
 
         # Detect router style and create appropriate replacement.
+        # Structural checks use gate type: nn.Linear (or QuantizedLinear)
+        # returns logits; custom gate modules return (inds, scores) directly.
         gate = getattr(moe_module, "gate", None)
-        if hasattr(moe_module, "shared_expert_gate") and gate is not None:
+        gate_is_linear = isinstance(gate, (nn.Linear,)) or (
+            hasattr(nn, "QuantizedLinear") and isinstance(gate, nn.QuantizedLinear)
+        )
+        if hasattr(moe_module, "shared_expert_gate") and gate_is_linear:
             # Qwen3-Next style: linear gate + shared_expert + shared_expert_gate
             replacement = _FlashMoEQwen3Next(moe_module, flash_moe)
-        elif hasattr(moe_module, "e_score_correction_bias") and gate is not None:
-            # MiniMax style: sigmoid gate + correction bias.
-            # DeepSeek V3 also has e_score_correction_bias but on its MoEGate
-            # submodule (moe_module.gate), not the MoE block itself.
+        elif gate_is_linear and hasattr(moe_module, "e_score_correction_bias"):
+            # MiniMax style: linear gate with sigmoid scoring + correction bias
             replacement = _FlashMoEMiniMax(moe_module, flash_moe)
         elif gate is not None:
-            # DeepSeek-V3 / Kimi-K2.5 style: gate returns (inds, scores)
+            # DeepSeek-V3 / Kimi-K2.5 style: custom gate returns (inds, scores)
             replacement = _FlashMoEDeepSeek(moe_module, flash_moe)
         else:
             # gpt-oss style (has router + experts)
