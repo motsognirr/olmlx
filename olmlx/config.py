@@ -80,6 +80,9 @@ class ExperimentalSettings(BaseSettings):
     flash_speculative_draft_model: str | None = None
     flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
+    # TurboQuant KV cache quantization (e.g. "turboquant:4", "turboquant:2")
+    kv_cache_quant: str | None = None
+
     # Flash MoE (SSD-based expert offloading for MoE models)
     flash_moe: bool = False
     flash_moe_cache_budget_experts: Annotated[int, Field(ge=0)] = 48  # per layer

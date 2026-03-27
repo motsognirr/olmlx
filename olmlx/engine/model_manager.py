@@ -47,6 +47,13 @@ _FALLBACK_EXCEPTIONS = (
 )
 
 
+def _is_serializable_cache(cache: list) -> bool:
+    """Check if a cache list can be serialized with mlx-lm's save_prompt_cache."""
+    from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+    return not any(isinstance(c, TurboQuantKVCache) for c in cache)
+
+
 class ModelLoadTimeoutError(TimeoutError):
     """Raised when model loading exceeds OLMLX_MODEL_LOAD_TIMEOUT."""
 
@@ -102,6 +109,13 @@ class PromptCacheStore:
     def _save_to_disk(self, cache_id: str, state: CachedPromptState) -> None:
         """Save a cache entry to disk."""
         if not self._disk_enabled:
+            return
+        # TurboQuant caches use a custom format incompatible with safetensors
+        if state.cache and not _is_serializable_cache(state.cache):
+            logger.debug(
+                "Skipping disk save for '%s': cache uses non-serializable format (TurboQuant)",
+                cache_id,
+            )
             return
         try:
             disk_dir = self._disk_dir()
