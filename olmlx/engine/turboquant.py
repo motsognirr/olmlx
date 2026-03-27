@@ -116,7 +116,8 @@ def turboquant_quantize(
         bits: Quantization bit-width (2 or 4).
 
     Returns:
-        (packed_indices, norms): bit-packed indices as uint8, norms as float16.
+        (packed_indices, norms): bit-packed indices as uint8, norms as float32
+            (float32 to avoid overflow for vectors with L2-norm > 65504).
     """
     head_dim = x.shape[-1]
     codebook = get_codebook(bits, head_dim)
@@ -139,7 +140,6 @@ def turboquant_quantize(
         better = d < best_dist
         best_idx = mx.where(better, mx.array(ci, dtype=mx.uint8), best_idx)
         best_dist = mx.minimum(best_dist, d)
-    mx.eval(best_idx)
 
     return pack_indices(best_idx, bits), norms
 
