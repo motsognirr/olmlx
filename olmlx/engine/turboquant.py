@@ -139,8 +139,9 @@ def turboquant_quantize(
         better = d < best_dist
         best_idx = mx.where(better, mx.array(ci, dtype=mx.uint8), best_idx)
         best_dist = mx.minimum(best_dist, d)
+    mx.eval(best_idx)
 
-    return pack_indices(best_idx, bits), norms.astype(mx.float16)
+    return pack_indices(best_idx, bits), norms
 
 
 def turboquant_dequantize(
@@ -148,6 +149,7 @@ def turboquant_dequantize(
     norms: mx.array,
     rotation: TurboQuantRotation,
     bits: int,
+    dtype: mx.Dtype | None = None,
 ) -> mx.array:
     """Dequantize TurboQuant_mse encoded vectors.
 
@@ -171,4 +173,5 @@ def turboquant_dequantize(
     x_hat = y_hat @ rotation.matrix
 
     # Rescale by original norms
-    return x_hat * norms.astype(x_hat.dtype)
+    result = x_hat * norms.astype(x_hat.dtype)
+    return result.astype(dtype) if dtype is not None else result

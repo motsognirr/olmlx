@@ -52,6 +52,7 @@ class TurboQuantKVCache(_BaseCache):
     ) -> tuple[mx.array, mx.array]:
         """Quantize new K/V, append to store, dequantize all and return."""
         B, n_heads, num_steps, head_dim = keys.shape
+        input_dtype = keys.dtype
         prev = self.offset
 
         # Quantize incoming tokens (returns bit-packed indices)
@@ -76,19 +77,19 @@ class TurboQuantKVCache(_BaseCache):
                     [self._key_indices, mx.zeros(idx_shape, dtype=mx.uint8)], axis=2
                 )
                 self._key_norms = mx.concatenate(
-                    [self._key_norms, mx.zeros(nrm_shape, dtype=mx.float16)], axis=2
+                    [self._key_norms, mx.zeros(nrm_shape, dtype=mx.float32)], axis=2
                 )
                 self._value_indices = mx.concatenate(
                     [self._value_indices, mx.zeros(idx_shape, dtype=mx.uint8)], axis=2
                 )
                 self._value_norms = mx.concatenate(
-                    [self._value_norms, mx.zeros(nrm_shape, dtype=mx.float16)], axis=2
+                    [self._value_norms, mx.zeros(nrm_shape, dtype=mx.float32)], axis=2
                 )
             else:
                 self._key_indices = mx.zeros(idx_shape, dtype=mx.uint8)
-                self._key_norms = mx.zeros(nrm_shape, dtype=mx.float16)
+                self._key_norms = mx.zeros(nrm_shape, dtype=mx.float32)
                 self._value_indices = mx.zeros(idx_shape, dtype=mx.uint8)
-                self._value_norms = mx.zeros(nrm_shape, dtype=mx.float16)
+                self._value_norms = mx.zeros(nrm_shape, dtype=mx.float32)
 
         # Store quantized data
         self.offset += num_steps
@@ -97,18 +98,20 @@ class TurboQuantKVCache(_BaseCache):
         self._value_indices[..., prev : self.offset, :] = v_idx
         self._value_norms[..., prev : self.offset, :] = v_nrm
 
-        # Dequantize full cache and return
+        # Dequantize full cache and return in the original dtype
         k_out = turboquant_dequantize(
             self._key_indices[..., : self.offset, :],
             self._key_norms[..., : self.offset, :],
             self.rotation_key,
             self.bits,
+            dtype=input_dtype,
         )
         v_out = turboquant_dequantize(
             self._value_indices[..., : self.offset, :],
             self._value_norms[..., : self.offset, :],
             self.rotation_value,
             self.bits,
+            dtype=input_dtype,
         )
         return k_out, v_out
 
@@ -121,7 +124,8 @@ class TurboQuantKVCache(_BaseCache):
         return n
 
     def make_mask(self, *args, **kwargs):
-        return create_attention_mask(*args, offset=self.offset, **kwargs)
+        kwargs["offset"] = self.offset
+        return create_attention_mask(*args, **kwargs)
 
     def empty(self):
         return self._key_indices is None or self.offset == 0
@@ -165,6 +169,13 @@ def make_turboquant_cache(model: Any, bits: int) -> list[TurboQuantKVCache]:
     """Create a list of TurboQuantKVCache objects, one per model layer."""
     num_layers = len(model.layers)
     head_dim = _detect_head_dim(model)
+
+    packing_factor = 8 // bits
+    if head_dim % packing_factor != 0:
+        raise ValueError(
+            f"TurboQuant {bits}-bit requires head_dim divisible by {packing_factor}, "
+            f"got head_dim={head_dim}"
+        )
 
     caches = []
     for i in range(num_layers):
