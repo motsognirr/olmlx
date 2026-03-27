@@ -1,7 +1,7 @@
 """TurboQuant KV cache: drop-in replacement for mlx-lm's KVCache.
 
-Stores quantized key/value vectors using TurboQuant_mse and dequantizes
-on fetch, providing transparent memory compression.
+Stores bit-packed quantized key/value vectors using TurboQuant_mse and
+dequantizes on fetch, providing transparent memory compression.
 """
 
 from __future__ import annotations
@@ -25,8 +25,9 @@ logger = logging.getLogger(__name__)
 class TurboQuantKVCache(_BaseCache):
     """KV cache with TurboQuant compression.
 
-    Quantizes K/V vectors on store and dequantizes on fetch.
-    Implements the same interface as mlx-lm's KVCache.
+    Stores only bit-packed indices and float16 norms. Dequantizes the
+    full cache on each ``update_and_fetch`` call — this is O(n) per step,
+    matching the cost of attention itself.
     """
 
     step = 256
@@ -40,42 +41,30 @@ class TurboQuantKVCache(_BaseCache):
         self.bits = bits
         self.rotation_key = rotation_key
         self.rotation_value = rotation_value
-        # Quantized storage (compact)
         self._key_indices: mx.array | None = None
         self._key_norms: mx.array | None = None
         self._value_indices: mx.array | None = None
         self._value_norms: mx.array | None = None
-        # Dequantized cache (avoids O(n^2) re-dequantization)
-        self._keys_deq: mx.array | None = None
-        self._values_deq: mx.array | None = None
         self.offset = 0
 
     def update_and_fetch(
         self, keys: mx.array, values: mx.array
     ) -> tuple[mx.array, mx.array]:
-        """Quantize new K/V, append to store, return dequantized cache.
-
-        Only the new tokens are dequantized each call — the previously
-        dequantized prefix is reused, making per-step cost O(new_tokens)
-        instead of O(total_tokens).
-        """
+        """Quantize new K/V, append to store, dequantize all and return."""
         B, n_heads, num_steps, head_dim = keys.shape
         prev = self.offset
 
-        # Quantize incoming tokens
+        # Quantize incoming tokens (returns bit-packed indices)
         k_idx, k_nrm = turboquant_quantize(keys, self.rotation_key, self.bits)
         v_idx, v_nrm = turboquant_quantize(values, self.rotation_value, self.bits)
 
-        # Dequantize only the new tokens
-        k_new_deq = turboquant_dequantize(k_idx, k_nrm, self.rotation_key, self.bits)
-        v_new_deq = turboquant_dequantize(v_idx, v_nrm, self.rotation_value, self.bits)
+        packed_dim = k_idx.shape[-1]  # head_dim // (8 // bits)
 
-        # Allocate or expand quantized buffers
+        # Allocate or expand buffers
         if self._key_indices is None or (prev + num_steps) > self._key_indices.shape[2]:
             new_steps = (self.step + num_steps - 1) // self.step * self.step
-            idx_shape = (B, n_heads, new_steps, head_dim)
+            idx_shape = (B, n_heads, new_steps, packed_dim)
             nrm_shape = (B, n_heads, new_steps, 1)
-            deq_shape = (B, n_heads, new_steps, head_dim)
 
             if self._key_indices is not None:
                 if prev % self.step != 0:
@@ -83,8 +72,6 @@ class TurboQuantKVCache(_BaseCache):
                     self._key_norms = self._key_norms[..., :prev, :]
                     self._value_indices = self._value_indices[..., :prev, :]
                     self._value_norms = self._value_norms[..., :prev, :]
-                    self._keys_deq = self._keys_deq[..., :prev, :]
-                    self._values_deq = self._values_deq[..., :prev, :]
                 self._key_indices = mx.concatenate(
                     [self._key_indices, mx.zeros(idx_shape, dtype=mx.uint8)], axis=2
                 )
@@ -97,33 +84,33 @@ class TurboQuantKVCache(_BaseCache):
                 self._value_norms = mx.concatenate(
                     [self._value_norms, mx.zeros(nrm_shape, dtype=mx.float16)], axis=2
                 )
-                self._keys_deq = mx.concatenate(
-                    [self._keys_deq, mx.zeros(deq_shape, dtype=keys.dtype)], axis=2
-                )
-                self._values_deq = mx.concatenate(
-                    [self._values_deq, mx.zeros(deq_shape, dtype=values.dtype)], axis=2
-                )
             else:
                 self._key_indices = mx.zeros(idx_shape, dtype=mx.uint8)
                 self._key_norms = mx.zeros(nrm_shape, dtype=mx.float16)
                 self._value_indices = mx.zeros(idx_shape, dtype=mx.uint8)
                 self._value_norms = mx.zeros(nrm_shape, dtype=mx.float16)
-                self._keys_deq = mx.zeros(deq_shape, dtype=keys.dtype)
-                self._values_deq = mx.zeros(deq_shape, dtype=values.dtype)
 
-        # Store quantized data and dequantized cache
+        # Store quantized data
         self.offset += num_steps
         self._key_indices[..., prev : self.offset, :] = k_idx
         self._key_norms[..., prev : self.offset, :] = k_nrm
         self._value_indices[..., prev : self.offset, :] = v_idx
         self._value_norms[..., prev : self.offset, :] = v_nrm
-        self._keys_deq[..., prev : self.offset, :] = k_new_deq
-        self._values_deq[..., prev : self.offset, :] = v_new_deq
 
-        return (
-            self._keys_deq[..., : self.offset, :],
-            self._values_deq[..., : self.offset, :],
+        # Dequantize full cache and return
+        k_out = turboquant_dequantize(
+            self._key_indices[..., : self.offset, :],
+            self._key_norms[..., : self.offset, :],
+            self.rotation_key,
+            self.bits,
         )
+        v_out = turboquant_dequantize(
+            self._value_indices[..., : self.offset, :],
+            self._value_norms[..., : self.offset, :],
+            self.rotation_value,
+            self.bits,
+        )
+        return k_out, v_out
 
     def is_trimmable(self):
         return True
@@ -165,7 +152,13 @@ def _detect_head_dim(model: Any) -> int:
         pass
 
     # Last resort: hidden_size // num_attention_heads
-    return model.args.hidden_size // model.args.num_attention_heads
+    try:
+        return model.args.hidden_size // model.args.num_attention_heads
+    except AttributeError as e:
+        raise RuntimeError(
+            f"TurboQuant: cannot detect head_dim for this model architecture. "
+            f"Missing attribute: {e}"
+        ) from e
 
 
 def make_turboquant_cache(model: Any, bits: int) -> list[TurboQuantKVCache]:

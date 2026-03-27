@@ -64,6 +64,53 @@ class TurboQuantRotation:
         self.matrix: mx.array = mx.array(q)
 
 
+def pack_indices(indices: mx.array, bits: int) -> mx.array:
+    """Pack quantized indices into bytes.
+
+    4-bit: 2 indices per byte (low/high nibble).
+    2-bit: 4 indices per byte.
+    """
+    if bits == 4:
+        # Pack pairs: low nibble = even indices, high nibble = odd indices
+        low = indices[..., 0::2] & 0xF
+        high = (indices[..., 1::2] & 0xF) << 4
+        return (low | high).astype(mx.uint8)
+    elif bits == 2:
+        # Pack quads: bits 0-1 = idx[0], bits 2-3 = idx[1], etc.
+        i0 = indices[..., 0::4] & 0x3
+        i1 = (indices[..., 1::4] & 0x3) << 2
+        i2 = (indices[..., 2::4] & 0x3) << 4
+        i3 = (indices[..., 3::4] & 0x3) << 6
+        return (i0 | i1 | i2 | i3).astype(mx.uint8)
+    raise ValueError(f"Unsupported bits={bits}")
+
+
+def unpack_indices(packed: mx.array, bits: int, head_dim: int) -> mx.array:
+    """Unpack bit-packed indices back to one-per-element uint8."""
+    if bits == 4:
+        low = packed & 0xF
+        high = (packed >> 4) & 0xF
+        # Interleave: [low0, high0, low1, high1, ...]
+        shape = packed.shape[:-1] + (head_dim,)
+        result = mx.zeros(shape, dtype=mx.uint8)
+        result[..., 0::2] = low
+        result[..., 1::2] = high
+        return result
+    elif bits == 2:
+        i0 = packed & 0x3
+        i1 = (packed >> 2) & 0x3
+        i2 = (packed >> 4) & 0x3
+        i3 = (packed >> 6) & 0x3
+        shape = packed.shape[:-1] + (head_dim,)
+        result = mx.zeros(shape, dtype=mx.uint8)
+        result[..., 0::4] = i0
+        result[..., 1::4] = i1
+        result[..., 2::4] = i2
+        result[..., 3::4] = i3
+        return result
+    raise ValueError(f"Unsupported bits={bits}")
+
+
 def turboquant_quantize(
     x: mx.array,
     rotation: TurboQuantRotation,
@@ -77,8 +124,7 @@ def turboquant_quantize(
         bits: Quantization bit-width (2 or 4).
 
     Returns:
-        (indices, norms): indices as uint8 (B, n_heads, seq_len, head_dim),
-                          norms as float16 (B, n_heads, seq_len, 1).
+        (packed_indices, norms): bit-packed indices as uint8, norms as float16.
     """
     head_dim = x.shape[-1]
     codebook = get_codebook(bits, head_dim)
@@ -91,17 +137,22 @@ def turboquant_quantize(
     # Rotate: y = x_norm @ Πᵀ  (equivalent to Π @ x_norm per vector)
     y = x_norm @ rotation.matrix.T
 
-    # Scalar quantize: find nearest centroid per coordinate
-    # codebook shape: (n_centroids,) → broadcast against y
-    # distances shape: (..., head_dim, n_centroids)
-    distances = mx.abs(mx.expand_dims(y, -1) - codebook)
-    indices = mx.argmin(distances, axis=-1).astype(mx.uint8)
+    # Scalar quantize: find nearest centroid per coordinate.
+    # Iterate over centroids to avoid materializing the full distances tensor
+    # which would be (B, heads, seq, head_dim, n_centroids) — OOM on long prefills.
+    best_idx = mx.zeros(y.shape, dtype=mx.uint8)
+    best_dist = mx.full(y.shape, float("inf"))
+    for ci in range(len(codebook)):
+        d = mx.abs(y - codebook[ci])
+        better = d < best_dist
+        best_idx = mx.where(better, mx.array(ci, dtype=mx.uint8), best_idx)
+        best_dist = mx.minimum(best_dist, d)
 
-    return indices, norms.astype(mx.float16)
+    return pack_indices(best_idx, bits), norms.astype(mx.float16)
 
 
 def turboquant_dequantize(
-    indices: mx.array,
+    packed_indices: mx.array,
     norms: mx.array,
     rotation: TurboQuantRotation,
     bits: int,
@@ -109,7 +160,7 @@ def turboquant_dequantize(
     """Dequantize TurboQuant_mse encoded vectors.
 
     Args:
-        indices: Quantized indices of shape (B, n_heads, seq_len, head_dim).
+        packed_indices: Bit-packed quantized indices.
         norms: Vector norms of shape (B, n_heads, seq_len, 1).
         rotation: Rotation matrix used during quantization.
         bits: Quantization bit-width (2 or 4).
@@ -117,10 +168,11 @@ def turboquant_dequantize(
     Returns:
         Reconstructed tensor of shape (B, n_heads, seq_len, head_dim).
     """
-    head_dim = indices.shape[-1]
+    head_dim = rotation.matrix.shape[0]
     codebook = get_codebook(bits, head_dim)
 
-    # Lookup centroids
+    # Unpack indices and lookup centroids
+    indices = unpack_indices(packed_indices, bits, head_dim)
     y_hat = codebook[indices.astype(mx.uint32)]
 
     # Inverse rotate: x_hat = y_hat @ Π

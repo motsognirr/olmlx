@@ -93,6 +93,28 @@ class TestQuantizeDequantize:
         x = np.random.randn(*shape).astype(np.float32)
         return mx.array(x)
 
+    def test_pack_unpack_4bit(self):
+        """4-bit pack/unpack should roundtrip perfectly."""
+        from olmlx.engine.turboquant import pack_indices, unpack_indices
+
+        indices = mx.array([0, 15, 3, 12, 7, 8, 1, 14], dtype=mx.uint8).reshape(
+            1, 1, 1, 8
+        )
+        packed = pack_indices(indices, bits=4)
+        assert packed.shape == (1, 1, 1, 4)
+        unpacked = unpack_indices(packed, bits=4, head_dim=8)
+        np.testing.assert_array_equal(np.array(unpacked), np.array(indices))
+
+    def test_pack_unpack_2bit(self):
+        """2-bit pack/unpack should roundtrip perfectly."""
+        from olmlx.engine.turboquant import pack_indices, unpack_indices
+
+        indices = mx.array([0, 3, 1, 2, 3, 0, 2, 1], dtype=mx.uint8).reshape(1, 1, 1, 8)
+        packed = pack_indices(indices, bits=2)
+        assert packed.shape == (1, 1, 1, 2)
+        unpacked = unpack_indices(packed, bits=2, head_dim=8)
+        np.testing.assert_array_equal(np.array(unpacked), np.array(indices))
+
     def test_roundtrip_mse_4bit(self):
         """4-bit roundtrip should have low MSE."""
         from olmlx.engine.turboquant import (
@@ -143,12 +165,27 @@ class TestQuantizeDequantize:
         x = self._random_vectors((1, 4, 32, 64))
 
         indices, norms = turboquant_quantize(x, rot, bits=4)
-        assert indices.shape == (1, 4, 32, 64)
+        # 4-bit: 2 indices per byte → head_dim // 2
+        assert indices.shape == (1, 4, 32, 32)
         assert indices.dtype == mx.uint8
         assert norms.shape == (1, 4, 32, 1)
 
         x_hat = turboquant_dequantize(indices, norms, rot, bits=4)
         assert x_hat.shape == x.shape
+
+    def test_output_shapes_2bit(self):
+        from olmlx.engine.turboquant import (
+            TurboQuantRotation,
+            turboquant_quantize,
+        )
+
+        rot = TurboQuantRotation(head_dim=64, seed=0)
+        x = self._random_vectors((1, 4, 32, 64))
+
+        indices, norms = turboquant_quantize(x, rot, bits=2)
+        # 2-bit: 4 indices per byte → head_dim // 4
+        assert indices.shape == (1, 4, 32, 16)
+        assert indices.dtype == mx.uint8
 
     def test_batch_dimensions(self):
         """Should handle batch>1 and multiple heads."""
@@ -316,35 +353,6 @@ class TestTurboQuantKVCache:
         mask = cache.make_mask(N=1, return_array=True, window_size=None)
         # For N=1, mask should be None (single token attention)
         assert mask is None
-
-    def test_prefix_stability(self):
-        """Dequantized prefix should be identical across consecutive fetches.
-
-        This verifies the O(n) incremental dequantization — the prefix
-        portion of the returned tensors must not change when new tokens
-        are appended.
-        """
-        cache = self._make_cache(bits=4, head_dim=64)
-
-        # Prefill 16 tokens
-        k1 = mx.random.normal((1, 4, 16, 64))
-        v1 = mx.random.normal((1, 4, 16, 64))
-        k_out1, v_out1 = cache.update_and_fetch(k1, v1)
-
-        # Append 1 token
-        k2 = mx.random.normal((1, 4, 1, 64))
-        v2 = mx.random.normal((1, 4, 1, 64))
-        k_out2, v_out2 = cache.update_and_fetch(k2, v2)
-
-        # First 16 tokens of second fetch should match first fetch exactly
-        np.testing.assert_array_equal(
-            np.array(k_out2[..., :16, :]),
-            np.array(k_out1),
-        )
-        np.testing.assert_array_equal(
-            np.array(v_out2[..., :16, :]),
-            np.array(v_out1),
-        )
 
     def test_fetch_after_trim_returns_correct_length(self):
         """After trim, next fetch should return trimmed + new tokens."""

@@ -925,7 +925,7 @@ async def _stream_completion(
                 # No usable prefix — free old cache and create fresh
                 lm.prompt_cache_store.remove(cache_id)
                 kv_quant = experimental.kv_cache_quant
-                if kv_quant and kv_quant.startswith("turboquant:"):
+                if kv_quant is not None:
                     bits = int(kv_quant.split(":")[1])
                     new_cache = _make_turboquant_prompt_cache(
                         lm.model, bits, is_vlm=lm.is_vlm
