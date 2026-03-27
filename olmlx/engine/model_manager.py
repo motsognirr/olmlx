@@ -901,7 +901,25 @@ class ModelManager:
                 "Loading draft model %s for speculative decoding",
                 experimental.flash_speculative_draft_model,
             )
-            draft_model, _ = mlx_lm.load(experimental.flash_speculative_draft_model)
+            draft_model, draft_tokenizer = mlx_lm.load(
+                experimental.flash_speculative_draft_model
+            )
+
+            # Verify vocabulary compatibility — a mismatch causes silent token ID errors
+            target_vocab = getattr(getattr(wrapped, "args", None), "vocab_size", None)
+            draft_vocab = getattr(
+                getattr(draft_model, "args", None), "vocab_size", None
+            )
+            if (
+                target_vocab is not None
+                and draft_vocab is not None
+                and target_vocab != draft_vocab
+            ):
+                raise ValueError(
+                    f"Draft model vocab_size ({draft_vocab}) does not match "
+                    f"target model vocab_size ({target_vocab}). "
+                    f"Speculative decoding requires matching vocabularies."
+                )
 
             decoder = SpeculativeFlashDecoder(
                 draft_model=draft_model,

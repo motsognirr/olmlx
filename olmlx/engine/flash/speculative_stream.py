@@ -86,7 +86,9 @@ def speculative_stream_generate(
             generated.append(token)
             gen_elapsed = time.perf_counter() - t0
 
-            # Decode full sequence and diff to get new text
+            # Decode full sequence and diff to get new text.
+            # O(n) per token; a suffix-based approach could improve this for
+            # very long sequences, but BPE boundary handling is subtle.
             if tokenizer is not None:
                 full_text = tokenizer.decode(generated)
                 new_text = full_text[prev_text_len:]

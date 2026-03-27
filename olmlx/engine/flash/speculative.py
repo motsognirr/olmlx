@@ -29,6 +29,9 @@ class SpeculativeFlashDecoder:
     Supports two modes:
     - Stateless: ``generate_step(prompt)`` — no cross-step caching (backward compat)
     - Cached: ``prefill(prompt)`` then ``step()`` — persistent KV caches for O(λ) verification
+
+    Not thread-safe: one decoder instance must serve one request at a time.
+    The inference pipeline serializes requests via ``_inference_lock``.
     """
 
     def __init__(
