@@ -90,24 +90,16 @@ def unpack_indices(packed: mx.array, bits: int, head_dim: int) -> mx.array:
     if bits == 4:
         low = packed & 0xF
         high = (packed >> 4) & 0xF
-        # Interleave: [low0, high0, low1, high1, ...]
-        shape = packed.shape[:-1] + (head_dim,)
-        result = mx.zeros(shape, dtype=mx.uint8)
-        result[..., 0::2] = low
-        result[..., 1::2] = high
-        return result
+        # Interleave via stack + reshape: [low0, high0, low1, high1, ...]
+        parts = mx.stack([low, high], axis=-1)  # (..., packed_dim, 2)
+        return parts.reshape(packed.shape[:-1] + (head_dim,)).astype(mx.uint8)
     elif bits == 2:
         i0 = packed & 0x3
         i1 = (packed >> 2) & 0x3
         i2 = (packed >> 4) & 0x3
         i3 = (packed >> 6) & 0x3
-        shape = packed.shape[:-1] + (head_dim,)
-        result = mx.zeros(shape, dtype=mx.uint8)
-        result[..., 0::4] = i0
-        result[..., 1::4] = i1
-        result[..., 2::4] = i2
-        result[..., 3::4] = i3
-        return result
+        parts = mx.stack([i0, i1, i2, i3], axis=-1)  # (..., packed_dim, 4)
+        return parts.reshape(packed.shape[:-1] + (head_dim,)).astype(mx.uint8)
     raise ValueError(f"Unsupported bits={bits}")
 
 

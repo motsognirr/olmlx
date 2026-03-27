@@ -124,7 +124,7 @@ class TurboQuantKVCache(_BaseCache):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
     def empty(self):
-        return self._key_indices is None
+        return self._key_indices is None or self.offset == 0
 
 
 def _detect_head_dim(model: Any) -> int:
