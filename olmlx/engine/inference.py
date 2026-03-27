@@ -18,7 +18,7 @@ from olmlx.engine.model_manager import (
     ModelManager,
     parse_keep_alive,
 )
-from olmlx.config import settings
+from olmlx.config import experimental, settings
 from olmlx.utils import memory as memory_utils
 
 try:
@@ -700,6 +700,14 @@ def _get_model_for_cache(model: Any, is_vlm: bool) -> Any:
     return model
 
 
+def _make_turboquant_prompt_cache(model: Any, bits: int, is_vlm: bool = False) -> list:
+    """Create a TurboQuant-compressed prompt cache for the model."""
+    from olmlx.engine.turboquant_cache import make_turboquant_cache
+
+    cache_model = _get_model_for_cache(model, is_vlm)
+    return make_turboquant_cache(cache_model, bits=bits)
+
+
 def _extract_images(messages: list[dict]) -> list[str] | None:
     """Extract image URLs/paths from message content."""
     images = []
@@ -916,8 +924,15 @@ async def _stream_completion(
             else:
                 # No usable prefix — free old cache and create fresh
                 lm.prompt_cache_store.remove(cache_id)
-                cache_model = _get_model_for_cache(lm.model, lm.is_vlm)
-                new_cache = make_prompt_cache(cache_model)
+                kv_quant = experimental.kv_cache_quant
+                if kv_quant is not None:
+                    bits = int(kv_quant.split(":")[1])
+                    new_cache = _make_turboquant_prompt_cache(
+                        lm.model, bits, is_vlm=lm.is_vlm
+                    )
+                else:
+                    cache_model = _get_model_for_cache(lm.model, lm.is_vlm)
+                    new_cache = make_prompt_cache(cache_model)
                 gen_kwargs["prompt_cache"] = new_cache
                 cache_creation_tokens = len(prompt_tokens)
                 logger.info(

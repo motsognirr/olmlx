@@ -80,6 +80,29 @@ class ExperimentalSettings(BaseSettings):
     flash_speculative_draft_model: str | None = None
     flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
+    # TurboQuant KV cache quantization (e.g. "turboquant:4", "turboquant:2")
+    kv_cache_quant: str | None = None
+
+    @field_validator("kv_cache_quant")
+    @classmethod
+    def validate_kv_cache_quant(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        _VALID_METHODS = {"turboquant"}
+        _VALID_BITS = {"2", "4"}
+        parts = v.split(":", 1)
+        if (
+            len(parts) != 2
+            or parts[0] not in _VALID_METHODS
+            or parts[1] not in _VALID_BITS
+        ):
+            raise ValueError(
+                f"Invalid kv_cache_quant={v!r}. "
+                f"Expected '<method>:<bits>' where method is one of {_VALID_METHODS} "
+                f"and bits is one of {_VALID_BITS}."
+            )
+        return v
+
     # Flash MoE (SSD-based expert offloading for MoE models)
     flash_moe: bool = False
     flash_moe_cache_budget_experts: Annotated[int, Field(ge=0)] = 48  # per layer
