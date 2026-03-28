@@ -87,6 +87,7 @@ class PromptCacheStore:
         self._disk_path = disk_path
         self._model_name = model_name.replace("/", "--")
         self._disk_max_bytes = disk_max_bytes
+        self._evict_generation = 0  # bumped by async_evict_all_to_disk
 
     @property
     def _disk_enabled(self) -> bool:
@@ -315,18 +316,23 @@ class PromptCacheStore:
             self._entries.move_to_end(cache_id)
             return state
         # Memory miss — read from disk in a thread, then insert on the event loop.
+        gen_before = self._evict_generation
         loaded, disk_path = await asyncio.to_thread(self._read_from_disk, cache_id)
         if loaded is None:
+            return None
+        # If entries were bulk-evicted during the await (memory pressure),
+        # don't re-insert — the eviction was intentional.
+        if self._evict_generation != gen_before:
+            if disk_path is not None:
+                await asyncio.to_thread(disk_path.unlink, True)
             return None
         # Another coroutine may have populated this cache_id during the await;
         # if so, keep the fresher in-memory entry and discard the stale disk load.
         if cache_id in self._entries:
             self._entries.move_to_end(cache_id)
-            existing = self._entries.get(cache_id)
             if disk_path is not None:
                 await asyncio.to_thread(disk_path.unlink, True)
-            # Re-check after await — entries may have been cleared
-            return self._entries.get(cache_id) or existing
+            return self._entries.get(cache_id)
         evicted_id, evicted = self._set_in_memory(cache_id, loaded)
         # Delete disk file only after successful insertion
         if disk_path is not None:
@@ -356,6 +362,7 @@ class PromptCacheStore:
         else:
             snapshot = []
         self._entries.clear()
+        self._evict_generation += 1
         if snapshot:
             await asyncio.to_thread(self._save_entries_to_disk, snapshot)
 

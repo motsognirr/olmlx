@@ -2,13 +2,23 @@
 
 Ollama-compatible API server using Apple MLX for local inference on Apple Silicon.
 
+## Usage Context
+
+This is a **single-user, localhost-only** inference server. It is not designed for multi-tenant or public-facing deployment. Implications for code review:
+
+- **No authentication/authorization** — the server binds to localhost by default; there are no user accounts or API keys.
+- **No rate limiting** — one user, one machine. The inference lock provides natural backpressure.
+- **No TLS** — traffic stays on the loopback interface.
+- **Error messages may include internal details** (paths, model names) — acceptable for a local tool.
+- **No Cache-Control headers** — no shared proxy or browser caching concerns.
+
 ## Project Structure
 
 ```
 olmlx/
 ├── app.py              # FastAPI app factory, middleware, router registration
 ├── config.py           # Settings (pydantic-settings, OLMLX_ env prefix)
-├── cli.py              # CLI with subcommands (serve, chat, service, models, config)
+├── cli.py              # CLI with subcommands (serve, chat, service, models incl. search, config)
 ├── __main__.py         # Entry point (delegates to cli.py)
 ├── chat/
 │   ├── __init__.py     # Package exports
@@ -21,7 +31,7 @@ olmlx/
 │   ├── distributed_worker.py # Worker entry point for non-rank-0 nodes (launched via SSH)
 │   ├── inference.py    # generate_chat, generate_completion, generate_embeddings
 │   ├── model_manager.py # Model loading/unloading, keep-alive, LRU eviction
-│   ├── registry.py    # Ollama name → HuggingFace repo mapping via models.json
+│   ├── registry.py    # Ollama name → HuggingFace repo mapping via models.json, fuzzy search
 │   ├── template_caps.py # Chat template capability detection (tools, thinking)
 │   ├── tool_parser.py  # Multi-format tool call parsing (Qwen, Mistral, Llama, DeepSeek, bare JSON)
 │   ├── turboquant.py   # TurboQuant_mse: rotation, Lloyd-Max codebooks, bit-packed quantize/dequantize
@@ -51,7 +61,7 @@ olmlx/
 │   ├── pull.py         # Ollama pull schemas
 │   └── status.py       # Ollama status schemas
 └── utils/
-    ├── streaming.py    # async_mlx_stream — sync-to-async streaming bridge
+    ├── streaming.py    # async_mlx_stream, safe_ndjson_stream — streaming bridge + error wrapper
     └── timing.py       # Timer, TimingStats
 ```
 
@@ -64,9 +74,9 @@ olmlx/
 - **Model storage**: Models stored by HF repo path (e.g. `Qwen--Qwen3-8B`). `ModelManager` takes a `ModelStore` dependency for local-first config loading and auto-download.
 - **Active inference protection**: `LoadedModel.active_refs` prevents LRU eviction and expiry of models currently serving requests.
 - **Memory safety**: After loading, checks Metal memory (active + cache) against `OLMLX_MEMORY_LIMIT_FRACTION` of system RAM. Rejects oversized models with `MemoryError` (HTTP 503) to prevent uncatchable Metal OOM crashes.
-- **Stream cleanup**: All streaming routers use `try/finally` with `await result.aclose()` to ensure GPU resources are released on client disconnect.
+- **Stream cleanup**: NDJSON routers (generate, chat, manage) use `safe_ndjson_stream()` from `utils/streaming.py` — a shared async generator that wraps a source with error handling and guaranteed `aclose()`. OpenAI and Anthropic routers have their own cleanup patterns due to SSE framing differences.
 - **Auto-registration**: Direct HF paths (e.g. `Qwen/Qwen3-8B`) are auto-registered in `models.json` on first load or pull.
-- **Prompt caching**: KV cache reuse across requests when prompts share a common prefix. Works with both mlx-lm (text) and mlx-vlm (vision) models. Controlled via `OLMLX_PROMPT_CACHE` setting.
+- **Prompt caching**: KV cache reuse across requests when prompts share a common prefix. Works with both mlx-lm (text) and mlx-vlm (vision) models. Controlled via `OLMLX_PROMPT_CACHE` setting. `PromptCacheStore` async wrappers (`async_get`, `async_set`, `async_evict_all_to_disk`) offload disk I/O to `asyncio.to_thread()` to avoid blocking the event loop. All `_entries` mutations happen on the event loop; an eviction-generation counter prevents re-insertion of stale disk data after bulk eviction.
 - **TurboQuant KV cache quantization** (experimental): Compresses KV cache using TurboQuant_mse (arxiv 2504.19874). Algorithm: random rotation → Lloyd-Max scalar quantization per coordinate → bit-packed storage → inverse rotation on fetch. Supports 2-bit (~7.5x compression) and 4-bit (~3.9x compression). `TurboQuantKVCache` is a drop-in replacement for mlx-lm's `KVCache` — dequantizes on each `update_and_fetch` call (O(n) per step, same as attention). Per-layer rotation matrices via QR decomposition. Codebooks are standard Gaussian Lloyd-Max centroids scaled by 1/√(head_dim). Indices bit-packed: 2 per byte (4-bit) or 4 per byte (2-bit). Head dim detected from `model.args.head_dim` or K projection weight shape. Incompatible with disk cache offload (guarded in `_save_to_disk`). Config: `OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:4` (or `:2`), validated at startup.
 - **Model load timeout**: Configurable via `OLMLX_MODEL_LOAD_TIMEOUT` with dedicated `ModelLoadTimeoutError` (HTTP 504).
 - **Terminal chat** (`chat/`): `olmlx chat` runs inference directly in-process via `ModelManager`/`generate_chat()` — no HTTP server needed. Connects to external MCP servers (stdio/SSE) for tool use with a full agent loop (model → tool calls → MCP execution → results fed back → continue). Uses `parse_model_output()` from `engine/tool_parser.py` for thinking/tool extraction. MCP config uses Claude Desktop format (`~/.olmlx/mcp.json`).
