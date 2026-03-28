@@ -420,7 +420,7 @@ class TestAsyncDiskCache:
         with patch(
             "asyncio.to_thread",
             new_callable=AsyncMock,
-            return_value=loaded_state,
+            return_value=(loaded_state, disk_file),
         ) as mock_thread:
             result = await store.async_get("a")
             mock_thread.assert_called_once()

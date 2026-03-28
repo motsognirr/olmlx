@@ -270,28 +270,30 @@ class PromptCacheStore:
         for cache_id, state in entries:
             self._save_to_disk(cache_id, state)
 
-    def _read_from_disk(self, cache_id: str) -> CachedPromptState | None:
+    def _read_from_disk(
+        self, cache_id: str
+    ) -> tuple[CachedPromptState | None, Path | None]:
         """Read a cache entry from disk without mutating _entries.
 
-        Returns the restored state, or None.  The caller is responsible for
-        inserting it into _entries on the event loop.
+        Returns (state, file_path) so the caller can delete the file after
+        a successful insertion into _entries.  Returns (None, None) on miss
+        or failure.
         """
         if not self._disk_enabled:
-            return None
+            return None, None
         file_path = self._disk_file_path(cache_id)
         if not file_path.exists():
-            return None
+            return None, None
         try:
             cache, metadata = load_prompt_cache(str(file_path), return_metadata=True)
             tokens = json.loads(metadata.get("tokens", "[]"))
             state = CachedPromptState(tokens=tokens, cache=cache)
-            file_path.unlink(missing_ok=True)
             logger.info(
                 "Restored cache '%s' from disk (%d tokens)",
                 cache_id,
                 len(tokens),
             )
-            return state
+            return state, file_path
         except Exception:
             logger.warning(
                 "Failed to load cache '%s' from disk",
@@ -299,7 +301,7 @@ class PromptCacheStore:
                 exc_info=True,
             )
             file_path.unlink(missing_ok=True)
-            return None
+            return None, None
 
     # -- Async wrappers that offload disk I/O to threads ----------------
     #
@@ -313,13 +315,25 @@ class PromptCacheStore:
             self._entries.move_to_end(cache_id)
             return state
         # Memory miss — read from disk in a thread, then insert on the event loop.
-        # Use _set_in_memory (no disk I/O) to avoid blocking the event loop
-        # if insertion evicts another entry.
-        loaded = await asyncio.to_thread(self._read_from_disk, cache_id)
-        if loaded is not None:
-            _evicted_id, evicted = self._set_in_memory(cache_id, loaded)
-            if evicted is not None:
-                del evicted
+        loaded, disk_path = await asyncio.to_thread(self._read_from_disk, cache_id)
+        if loaded is None:
+            return None
+        # Another coroutine may have populated this cache_id during the await;
+        # if so, keep the fresher in-memory entry and discard the stale disk load.
+        if cache_id in self._entries:
+            self._entries.move_to_end(cache_id)
+            if disk_path is not None:
+                disk_path.unlink(missing_ok=True)
+            return self._entries[cache_id]
+        evicted_id, evicted = self._set_in_memory(cache_id, loaded)
+        # Delete disk file only after successful insertion
+        if disk_path is not None:
+            disk_path.unlink(missing_ok=True)
+        # Save evicted entry to disk (mirrors async_set behavior)
+        if evicted_id is not None and evicted is not None:
+            await asyncio.to_thread(self._save_to_disk, evicted_id, evicted)
+        elif evicted is not None:
+            del evicted
         return loaded
 
     async def async_set(
