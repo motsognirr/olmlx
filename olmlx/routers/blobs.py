@@ -1,11 +1,14 @@
 import hashlib
 import os
+import re
 import tempfile
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
+
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 # Maximum blob upload size: 10 GB
 MAX_BLOB_SIZE = 10 * 1024 * 1024 * 1024
@@ -21,6 +24,9 @@ async def check_blob(digest: str, request: Request):
 
 @router.post("/api/blobs/{digest}")
 async def upload_blob(digest: str, request: Request):
+    if not _DIGEST_RE.match(digest):
+        return JSONResponse({"error": "invalid digest format"}, status_code=400)
+
     store = request.app.state.model_store
 
     # Fast-path: reject via Content-Length header before reading the body

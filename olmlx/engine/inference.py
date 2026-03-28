@@ -1054,6 +1054,10 @@ async def _stream_completion(
                                 cache=working,
                             ),
                         )
+                    # Drop Python references so gc.collect() + mx.clear_cache()
+                    # can actually reclaim GPU memory.
+                    working_cache = None  # noqa: F841
+                    working = None
                     lm.prompt_cache_store.evict_all_to_disk()
                     gc.collect()
                     mx.clear_cache()

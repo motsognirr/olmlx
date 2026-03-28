@@ -34,9 +34,21 @@ class AnthropicContentBlock(BaseModel):
     model_config = {"extra": "allow"}
 
 
+_MAX_CONTENT_LENGTH = 1_000_000
+
+
 class AnthropicMessage(BaseModel):
     role: str
     content: str | list[AnthropicContentBlock]
+
+    @field_validator("content")
+    @classmethod
+    def validate_content_length(cls, v: str | list) -> str | list:
+        if isinstance(v, str) and len(v) > _MAX_CONTENT_LENGTH:
+            raise ValueError(
+                f"content length {len(v)} exceeds limit {_MAX_CONTENT_LENGTH}"
+            )
+        return v
 
 
 class AnthropicThinkingParam(BaseModel):
@@ -72,6 +84,16 @@ class AnthropicMessagesRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     tool_choice: dict | None = None
     thinking: AnthropicThinkingParam | None = None
+
+    @field_validator("system")
+    @classmethod
+    def validate_system_length(cls, v: str | list | None) -> str | list | None:
+        if isinstance(v, str) and len(v) > _MAX_CONTENT_LENGTH:
+            raise ValueError(
+                f"system length {len(v)} exceeds limit {_MAX_CONTENT_LENGTH}"
+            )
+        return v
+
     metadata: dict | None = None
 
     model_config = {"extra": "allow"}
