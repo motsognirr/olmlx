@@ -242,6 +242,12 @@ def _detect_moe_layers(config: dict) -> list[int]:
     # Nemotron-H: hybrid_override_pattern where 'E' = MoE layer
     pattern = config.get("hybrid_override_pattern")
     if pattern is not None:
+        num_layers = config.get("num_hidden_layers") or config.get("num_layers", 0)
+        if num_layers and len(pattern) != num_layers:
+            raise ValueError(
+                f"hybrid_override_pattern length ({len(pattern)}) != "
+                f"num_hidden_layers ({num_layers})"
+            )
         return [i for i, c in enumerate(pattern) if c == "E"]
 
     num_layers = config.get("num_hidden_layers") or config.get("num_layers", 0)
