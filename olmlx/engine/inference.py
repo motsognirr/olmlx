@@ -1591,7 +1591,7 @@ async def generate_chat(
         prompt_tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
         # Memory-only peek for debug logging; the authoritative lookup happens
         # inside _stream_completion under the inference lock.
-        cached_state = lm.prompt_cache_store._entries.get(cache_id)
+        cached_state = lm.prompt_cache_store.peek(cache_id)
         logger.debug(
             "Prompt cache enabled: %d prompt tokens, existing cache=%s",
             len(prompt_tokens),

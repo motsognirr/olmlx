@@ -33,7 +33,14 @@ async def safe_ndjson_stream(
                 yield formatted
     except Exception as exc:
         log.error("Error during %s: %s", log_prefix, exc, exc_info=True)
-        yield format_error(exc)
+        try:
+            yield format_error(exc)
+        except Exception:
+            log.error(
+                "format_error raised during %s error handling",
+                log_prefix,
+                exc_info=True,
+            )
     finally:
         await source.aclose()
 

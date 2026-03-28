@@ -163,7 +163,7 @@ class ModelRegistry:
         # Deduplicated candidate list: full names + base names
         candidates = list(dict.fromkeys(all_names + list(base_to_full.keys())))
         matches = difflib.get_close_matches(
-            query, candidates, n=max_results * 2, cutoff=0.4
+            query, candidates, n=max(max_results * 4, 20), cutoff=0.4
         )
         seen: set[str] = set()
         results: list[tuple[str, str]] = []

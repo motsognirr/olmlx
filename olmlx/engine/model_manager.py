@@ -191,6 +191,10 @@ class PromptCacheStore:
             path.unlink(missing_ok=True)
             logger.info("Disk cache cleanup: removed %s", path)
 
+    def peek(self, cache_id: str) -> CachedPromptState | None:
+        """Read-only check for a cache entry without LRU side effects."""
+        return self._entries.get(cache_id)
+
     def get(self, cache_id: str) -> CachedPromptState | None:
         """Get a cache entry, promoting it to MRU.
 
@@ -308,10 +312,12 @@ class PromptCacheStore:
         if state is not None:
             self._entries.move_to_end(cache_id)
             return state
-        # Memory miss — read from disk in a thread, then insert on the event loop
+        # Memory miss — read from disk in a thread, then insert on the event loop.
+        # Use _set_in_memory (no disk I/O) to avoid blocking the event loop
+        # if insertion evicts another entry.
         loaded = await asyncio.to_thread(self._read_from_disk, cache_id)
         if loaded is not None:
-            evicted = self.set(cache_id, loaded)
+            _evicted_id, evicted = self._set_in_memory(cache_id, loaded)
             if evicted is not None:
                 del evicted
         return loaded
