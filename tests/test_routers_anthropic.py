@@ -1984,46 +1984,14 @@ class TestStreamCloseOnce:
 class TestAnthropicStreamingCleanup:
     """Tests for streaming error handling and cleanup in the Anthropic router."""
 
-    @staticmethod
-    def _parse_sse_events(text: str) -> list[dict]:
-        """Parse SSE text into a list of {event, data} dicts."""
-        events = []
-        current_event = None
-        current_data = []
-        for line in text.split("\n"):
-            if line.startswith("event: "):
-                current_event = line[7:]
-            elif line.startswith("data: "):
-                current_data.append(line[6:])
-            elif line == "" and (current_event or current_data):
-                data_str = "\n".join(current_data)
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    data = data_str
-                events.append({"event": current_event, "data": data})
-                current_event = None
-                current_data = []
-        return events
-
     async def test_streaming_error_emits_error_event(self, app_client):
         """When the model stream raises mid-stream, an SSE error event is emitted."""
+        from tests.conftest import make_error_stream
+        from tests.integration.conftest import parse_sse_events
 
-        class ErrorStream:
-            def __init__(self):
-                self._yielded = False
-                self.aclose = AsyncMock()
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if not self._yielded:
-                    self._yielded = True
-                    return {"text": "partial"}
-                raise RuntimeError("GPU error mid-stream")
-
-        error_stream = ErrorStream()
+        error_stream = make_error_stream(
+            [{"text": "partial"}], error_msg="GPU error mid-stream"
+        )
 
         with patch(
             "olmlx.routers.anthropic.generate_chat",
@@ -2040,7 +2008,7 @@ class TestAnthropicStreamingCleanup:
             )
 
         assert resp.status_code == 200
-        events = self._parse_sse_events(resp.text)
+        events = parse_sse_events(resp.text)
         # Should contain an error event
         error_events = [e for e in events if e.get("event") == "error"]
         assert len(error_events) >= 1
@@ -2050,22 +2018,11 @@ class TestAnthropicStreamingCleanup:
 
     async def test_streaming_cleanup_on_error(self, app_client):
         """Verify result.aclose() is called even when the inner generator raises."""
+        from tests.conftest import make_error_stream
 
-        class ErrorStream:
-            def __init__(self):
-                self._yielded = False
-                self.aclose = AsyncMock()
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if not self._yielded:
-                    self._yielded = True
-                    return {"text": "partial"}
-                raise RuntimeError("GPU error mid-stream")
-
-        error_stream = ErrorStream()
+        error_stream = make_error_stream(
+            [{"text": "partial"}], error_msg="GPU error mid-stream"
+        )
 
         with patch(
             "olmlx.routers.anthropic.generate_chat",

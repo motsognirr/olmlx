@@ -1,7 +1,7 @@
 """Shared fixtures for olmlx tests."""
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -10,6 +10,30 @@ from olmlx.engine.model_manager import LoadedModel, ModelManager
 from olmlx.engine.registry import ModelRegistry
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.models.store import ModelStore
+
+
+def make_error_stream(chunks, error_msg="GPU error"):
+    """Create an async iterator that yields chunks then raises RuntimeError.
+
+    Each instance has a trackable ``aclose`` mock.
+    """
+
+    class ErrorStream:
+        def __init__(self):
+            self._idx = 0
+            self.aclose = AsyncMock()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._idx < len(chunks):
+                chunk = chunks[self._idx]
+                self._idx += 1
+                return chunk
+            raise RuntimeError(error_msg)
+
+    return ErrorStream()
 
 
 @pytest.fixture

@@ -79,7 +79,11 @@ async def generate(req: GenerateRequest, request: Request):
 
         return StreamingResponse(
             safe_ndjson_stream(
-                result, format_chunk, format_error, logger, "generate streaming"
+                result,
+                format_chunk,
+                format_error,
+                log=logger,
+                log_prefix="generate streaming",
             ),
             media_type="application/x-ndjson",
         )

@@ -499,7 +499,7 @@ class TestSafeNdjsonStream:
             src,
             format_chunk=lambda x: f"[{x}]",
             format_error=lambda e: f"ERR:{e}",
-            logger=logging.getLogger("test"),
+            log=logging.getLogger("test"),
         ):
             chunks.append(chunk)
 
@@ -527,7 +527,7 @@ class TestSafeNdjsonStream:
             src,
             format_chunk=lambda x: f"[{x}]",
             format_error=lambda e: f"ERR:{e}",
-            logger=logging.getLogger("test"),
+            log=logging.getLogger("test"),
         ):
             chunks.append(chunk)
 
@@ -555,7 +555,7 @@ class TestSafeNdjsonStream:
             src,
             format_chunk=lambda x: f"[{x}]",
             format_error=lambda e: f"ERR:{e}",
-            logger=logging.getLogger("test"),
+            log=logging.getLogger("test"),
         )
         # Consume one item then break
         async for chunk in stream:
@@ -586,7 +586,7 @@ class TestSafeNdjsonStream:
             src,
             format_chunk=lambda x: f"[{x}]",
             format_error=lambda e: f"ERR:{e}",
-            logger=logging.getLogger("test"),
+            log=logging.getLogger("test"),
         ):
             chunks.append(chunk)
 

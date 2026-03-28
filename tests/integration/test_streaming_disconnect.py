@@ -5,9 +5,9 @@ mid-stream.
 """
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
-
+from tests.conftest import make_error_stream
 from tests.integration.conftest import set_stream_responses
 
 
@@ -71,35 +71,7 @@ class TestStreamingDisconnect:
 
     async def test_generate_stream_aclose_called_on_error(self, integration_ctx):
         """Verify result.aclose() is called even when stream generator raises."""
-        # Patch generate_completion to return a mock async generator that errors
-        mock_result = AsyncMock()
-        mock_result.aclose = AsyncMock()
-
-        async def _error_gen():
-            yield {"text": "Hello"}
-            raise RuntimeError("GPU exploded")
-
-        mock_result.__aiter__ = _error_gen().__aiter__
-        mock_result.__anext__ = _error_gen().__anext__
-
-        # Create a proper async iterator mock
-        error_chunks = [{"text": "Hello"}]
-
-        class ErrorStream:
-            def __init__(self):
-                self._idx = 0
-                self.aclose = AsyncMock()
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if self._idx < len(error_chunks):
-                    self._idx += 1
-                    return error_chunks[0]
-                raise RuntimeError("GPU exploded")
-
-        error_stream = ErrorStream()
+        error_stream = make_error_stream([{"text": "Hello"}], error_msg="GPU exploded")
 
         with patch(
             "olmlx.routers.generate.generate_completion",
@@ -119,22 +91,7 @@ class TestStreamingDisconnect:
 
     async def test_chat_stream_aclose_called_on_error(self, integration_ctx):
         """Verify result.aclose() is called for /api/chat even on error."""
-
-        class ErrorStream:
-            def __init__(self):
-                self._yielded = False
-                self.aclose = AsyncMock()
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if not self._yielded:
-                    self._yielded = True
-                    return {"text": "Hello"}
-                raise RuntimeError("GPU exploded")
-
-        error_stream = ErrorStream()
+        error_stream = make_error_stream([{"text": "Hello"}], error_msg="GPU exploded")
 
         with patch(
             "olmlx.routers.chat.generate_chat",
@@ -153,22 +110,7 @@ class TestStreamingDisconnect:
 
     async def test_openai_stream_aclose_called_on_error(self, integration_ctx):
         """Verify result.aclose() is called for /v1/chat/completions even on error."""
-
-        class ErrorStream:
-            def __init__(self):
-                self._yielded = False
-                self.aclose = AsyncMock()
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if not self._yielded:
-                    self._yielded = True
-                    return {"text": "Hello"}
-                raise RuntimeError("GPU exploded")
-
-        error_stream = ErrorStream()
+        error_stream = make_error_stream([{"text": "Hello"}], error_msg="GPU exploded")
 
         with patch(
             "olmlx.routers.openai.generate_chat",

@@ -81,7 +81,11 @@ async def chat(req: ChatRequest, request: Request):
 
         return StreamingResponse(
             safe_ndjson_stream(
-                result, format_chunk, format_error, logger, "chat streaming"
+                result,
+                format_chunk,
+                format_error,
+                log=logger,
+                log_prefix="chat streaming",
             ),
             media_type="application/x-ndjson",
         )

@@ -203,6 +203,29 @@ class PromptCacheStore:
         # Memory miss — try disk
         return self._load_from_disk(cache_id)
 
+    def _set_in_memory(
+        self, cache_id: str, state: CachedPromptState
+    ) -> tuple[str | None, CachedPromptState | None]:
+        """Update in-memory entries.
+
+        Returns (evicted_id, evicted_or_displaced):
+        - On cache-ID collision: (None, displaced_state_or_None)
+        - On LRU eviction: (evicted_id, evicted_state)
+        - No eviction needed: (None, None)
+        """
+        if cache_id in self._entries:
+            self._entries.move_to_end(cache_id)
+            old = self._entries[cache_id]
+            self._entries[cache_id] = state
+            displaced = old if old.cache is not state.cache else None
+            return None, displaced
+        evicted: CachedPromptState | None = None
+        evicted_id: str | None = None
+        if len(self._entries) >= self._max_slots:
+            evicted_id, evicted = self._entries.popitem(last=False)
+        self._entries[cache_id] = state
+        return evicted_id, evicted
+
     def set(self, cache_id: str, state: CachedPromptState) -> CachedPromptState | None:
         """Set a cache entry, evicting LRU if at capacity.
 
@@ -210,18 +233,8 @@ class PromptCacheStore:
         cleanup (different .cache object), or None when no cleanup is needed.
         Evicted entries are saved to disk if disk offload is enabled.
         """
-        if cache_id in self._entries:
-            self._entries.move_to_end(cache_id)
-            old = self._entries[cache_id]
-            self._entries[cache_id] = state
-            return old if old.cache is not state.cache else None
-        evicted: CachedPromptState | None = None
-        evicted_id: str | None = None
-        if len(self._entries) >= self._max_slots:
-            evicted_id, evicted = self._entries.popitem(last=False)
-        self._entries[cache_id] = state
-        # Save evicted entry to disk
-        if evicted is not None and evicted_id is not None:
+        evicted_id, evicted = self._set_in_memory(cache_id, state)
+        if evicted_id is not None and evicted is not None:
             self._save_to_disk(evicted_id, evicted)
         return evicted
 
@@ -261,19 +274,8 @@ class PromptCacheStore:
         self, cache_id: str, state: CachedPromptState
     ) -> CachedPromptState | None:
         """Async version of set(). Memory ops are sync; disk save runs in a thread."""
-        # Do the in-memory operations synchronously (fast)
-        if cache_id in self._entries:
-            self._entries.move_to_end(cache_id)
-            old = self._entries[cache_id]
-            self._entries[cache_id] = state
-            return old if old.cache is not state.cache else None
-        evicted: CachedPromptState | None = None
-        evicted_id: str | None = None
-        if len(self._entries) >= self._max_slots:
-            evicted_id, evicted = self._entries.popitem(last=False)
-        self._entries[cache_id] = state
-        # Offload disk save to thread if there was an eviction
-        if evicted is not None and evicted_id is not None:
+        evicted_id, evicted = self._set_in_memory(cache_id, state)
+        if evicted_id is not None and evicted is not None:
             await asyncio.to_thread(self._save_to_disk, evicted_id, evicted)
         return evicted
 
