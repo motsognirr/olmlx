@@ -889,7 +889,7 @@ async def _stream_completion(
             logger.warning(
                 "Memory pressure high, evicting prompt caches to free GPU memory"
             )
-            lm.prompt_cache_store.evict_all_to_disk()
+            await lm.prompt_cache_store.async_evict_all_to_disk()
             gc.collect()
             mx.clear_cache()
             _safe_sync()  # Bug #120: ensure freed buffers are reclaimed
@@ -904,7 +904,7 @@ async def _stream_completion(
             and prompt_tokens is not None
             and make_prompt_cache is not None
         ):
-            cached = lm.prompt_cache_store.get(cache_id)
+            cached = await lm.prompt_cache_store.async_get(cache_id)
             logger.debug(
                 "Cache lookup: cached=%s, new prompt=%d tokens",
                 (
@@ -1047,7 +1047,7 @@ async def _stream_completion(
                     # Use full_prompt_tokens[:suffix_start] to match the trimmed
                     # KV state — working_cache was trimmed to suffix_start tokens.
                     if had_cache and full_prompt_tokens is not None:
-                        lm.prompt_cache_store.set(
+                        await lm.prompt_cache_store.async_set(
                             cache_id,
                             CachedPromptState(
                                 tokens=list(full_prompt_tokens[:suffix_start]),
@@ -1058,7 +1058,7 @@ async def _stream_completion(
                     # can actually reclaim GPU memory.
                     working_cache = None  # noqa: F841
                     working = None
-                    lm.prompt_cache_store.evict_all_to_disk()
+                    await lm.prompt_cache_store.async_evict_all_to_disk()
                     gc.collect()
                     mx.clear_cache()
                     # After evicting the prompt cache, mlx_lm will prefill
@@ -1235,7 +1235,7 @@ async def _stream_completion(
                         stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
                     else:
                         stored_tokens = stored_tokens[:max_cache_tokens]
-                    evicted = lm.prompt_cache_store.set(
+                    evicted = await lm.prompt_cache_store.async_set(
                         cache_id,
                         CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
                     )
@@ -1262,7 +1262,7 @@ async def _stream_completion(
                         exc_info=True,
                     )
             else:
-                evicted = lm.prompt_cache_store.set(
+                evicted = await lm.prompt_cache_store.async_set(
                     cache_id,
                     CachedPromptState(
                         tokens=stored_tokens,
@@ -1589,7 +1589,7 @@ async def generate_chat(
     prompt_tokens = None
     if use_prompt_cache:
         prompt_tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
-        cached_state = lm.prompt_cache_store.get(cache_id)
+        cached_state = await lm.prompt_cache_store.async_get(cache_id)
         logger.debug(
             "Prompt cache enabled: %d prompt tokens, existing cache=%s",
             len(prompt_tokens),

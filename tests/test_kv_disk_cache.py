@@ -3,7 +3,9 @@
 import os
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from olmlx.engine.model_manager import CachedPromptState, PromptCacheStore
 
@@ -384,3 +386,119 @@ class TestConfigSettings:
         assert s.prompt_cache_disk is True
         assert s.prompt_cache_disk_max_gb == 5.0
         assert s.prompt_cache_disk_path == Path("/tmp/kv")
+
+
+class TestAsyncDiskCache:
+    """Test async wrappers that offload disk I/O to threads."""
+
+    @pytest.mark.asyncio
+    async def test_async_get_memory_hit_no_thread(self):
+        """When cache is in memory, asyncio.to_thread is NOT called."""
+        store = PromptCacheStore(max_slots=2)
+        store.set("a", _make_state(1))
+
+        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
+            result = await store.async_get("a")
+            assert result is not None
+            assert result.tokens == [1]
+            mock_thread.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_get_disk_fallback_uses_thread(self, tmp_path):
+        """On memory miss with disk hit, asyncio.to_thread IS called with _load_from_disk."""
+        store = PromptCacheStore(
+            max_slots=2,
+            disk_path=tmp_path,
+            model_name="test-model",
+        )
+
+        disk_file = store._disk_file_path("a")
+        disk_file.parent.mkdir(parents=True, exist_ok=True)
+        disk_file.touch()
+
+        with patch(
+            "olmlx.engine.model_manager.load_prompt_cache",
+            return_value=(["restored_kv"], {"tokens": "[10, 20]"}),
+        ):
+            with patch(
+                "asyncio.to_thread",
+                new_callable=AsyncMock,
+                return_value=CachedPromptState(tokens=[10, 20], cache=["restored_kv"]),
+            ) as mock_thread:
+                result = await store.async_get("a")
+                mock_thread.assert_called_once()
+                # Verify _load_from_disk was the function passed to to_thread
+                assert mock_thread.call_args[0][0] == store._load_from_disk
+                assert mock_thread.call_args[0][1] == "a"
+                assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_async_set_eviction_saves_in_thread(self, tmp_path):
+        """Fill cache to capacity, async_set a new entry, verify _save_to_disk runs via asyncio.to_thread."""
+        store = PromptCacheStore(
+            max_slots=1,
+            disk_path=tmp_path,
+            model_name="test-model",
+        )
+        state_a = _make_state(1)
+        store.set("a", state_a)
+
+        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
+            await store.async_set("b", _make_state(2))
+            mock_thread.assert_called_once()
+            # Verify _save_to_disk was called with the evicted entry
+            assert mock_thread.call_args[0][0] == store._save_to_disk
+            assert mock_thread.call_args[0][1] == "a"
+            assert mock_thread.call_args[0][2] is state_a
+
+    @pytest.mark.asyncio
+    async def test_async_set_no_eviction_no_thread(self):
+        """When cache has room, no thread needed."""
+        store = PromptCacheStore(max_slots=4)
+
+        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
+            await store.async_set("a", _make_state(1))
+            mock_thread.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_evict_all_uses_thread(self, tmp_path):
+        """Verify evict_all_to_disk is offloaded to a thread."""
+        store = PromptCacheStore(
+            max_slots=4,
+            disk_path=tmp_path,
+            model_name="test-model",
+        )
+        store.set("a", _make_state(1))
+        store.set("b", _make_state(2))
+
+        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
+            await store.async_evict_all_to_disk()
+            mock_thread.assert_called_once()
+            # The function passed should be _evict_all_to_disk_sync or similar
+            assert mock_thread.call_args[0][0] == store._evict_all_to_disk_sync
+
+    def test_sync_methods_unchanged(self, tmp_path):
+        """Regression: sync get()/set() still work exactly as before."""
+        store = PromptCacheStore(
+            max_slots=2,
+            disk_path=tmp_path,
+            model_name="test-model",
+        )
+        state_a = _make_state(1)
+        state_b = _make_state(2)
+
+        # set works
+        result = store.set("a", state_a)
+        assert result is None  # no eviction
+        assert len(store) == 1
+
+        # get works
+        got = store.get("a")
+        assert got is state_a
+
+        # eviction via set works
+        store.set("b", state_b)
+        assert len(store) == 2
+
+        # get returns None for missing
+        assert store.get("missing") is None

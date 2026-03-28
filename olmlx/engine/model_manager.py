@@ -237,10 +237,49 @@ class PromptCacheStore:
         Used during memory pressure to free GPU memory while preserving
         cache state on disk for later restoration.
         """
+        self._evict_all_to_disk_sync()
+
+    def _evict_all_to_disk_sync(self) -> None:
+        """Sync implementation of evict_all_to_disk (used by async wrapper)."""
         if self._disk_enabled:
             for cache_id, state in list(self._entries.items()):
                 self._save_to_disk(cache_id, state)
         self._entries.clear()
+
+    # -- Async wrappers that offload disk I/O to threads ----------------
+
+    async def async_get(self, cache_id: str) -> CachedPromptState | None:
+        """Async version of get(). Memory lookup is sync; disk fallback runs in a thread."""
+        state = self._entries.get(cache_id)
+        if state is not None:
+            self._entries.move_to_end(cache_id)
+            return state
+        # Memory miss — offload disk load to thread
+        return await asyncio.to_thread(self._load_from_disk, cache_id)
+
+    async def async_set(
+        self, cache_id: str, state: CachedPromptState
+    ) -> CachedPromptState | None:
+        """Async version of set(). Memory ops are sync; disk save runs in a thread."""
+        # Do the in-memory operations synchronously (fast)
+        if cache_id in self._entries:
+            self._entries.move_to_end(cache_id)
+            old = self._entries[cache_id]
+            self._entries[cache_id] = state
+            return old if old.cache is not state.cache else None
+        evicted: CachedPromptState | None = None
+        evicted_id: str | None = None
+        if len(self._entries) >= self._max_slots:
+            evicted_id, evicted = self._entries.popitem(last=False)
+        self._entries[cache_id] = state
+        # Offload disk save to thread if there was an eviction
+        if evicted is not None and evicted_id is not None:
+            await asyncio.to_thread(self._save_to_disk, evicted_id, evicted)
+        return evicted
+
+    async def async_evict_all_to_disk(self) -> None:
+        """Async version of evict_all_to_disk(). Offloads disk I/O to a thread."""
+        await asyncio.to_thread(self._evict_all_to_disk_sync)
 
     def clear(self) -> None:
         """Remove all cache entries and disk cache files."""
