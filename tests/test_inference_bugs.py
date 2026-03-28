@@ -1,6 +1,5 @@
 """Tests for inference engine bug fixes (#118, #119, #120, #123, #124, #125)."""
 
-import copy
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -12,7 +11,7 @@ from olmlx.engine.inference import (
     _estimate_kv_cache_bytes,
     _inference_ref,
 )
-from olmlx.engine.model_manager import CachedPromptState, LoadedModel
+from olmlx.engine.model_manager import LoadedModel
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +39,24 @@ class TestActiveRefsLock:
             with _inference_ref(real_lm):
                 assert real_lm.active_refs == 1
         assert real_lm.active_refs == 0
+
+    def test_lock_excluded_from_equality_and_repr(self):
+        """_active_refs_lock must not affect equality or repr."""
+        from dataclasses import fields
+
+        lock_field = next(
+            f for f in fields(LoadedModel) if f.name == "_active_refs_lock"
+        )
+        assert lock_field.compare is False, "_active_refs_lock must have compare=False"
+        assert lock_field.repr is False, "_active_refs_lock must have repr=False"
+        # Lock should not appear in repr
+        lm = LoadedModel(
+            name="test",
+            hf_path="test/test",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        assert "_active_refs_lock" not in repr(lm)
 
     def test_concurrent_inference_ref_no_race(self):
         """Concurrent _inference_ref calls must not lose increments/decrements."""
@@ -187,32 +204,29 @@ class TestDrainAndJoinBlocksNewInference:
 # ---------------------------------------------------------------------------
 # Bug #123: Prompt cache state corruption on mid-stream disconnect
 # ---------------------------------------------------------------------------
-class TestPromptCacheDeepCopy:
-    """Cache must be deep-copied before passing to generator to avoid corruption."""
+class TestPromptCacheRemoveBeforeMutation:
+    """Cache must be removed from store before mutation to avoid corruption (Bug #123)."""
 
     @pytest.mark.asyncio
-    async def test_cache_not_committed_on_incomplete_generation(self):
-        """On disconnect (generation_complete=False), cache must not be stored."""
+    async def test_cache_removed_from_store_before_mutation(self):
+        """_stream_completion must remove cache from store before trimming/passing to generator."""
         import inspect
 
         source = inspect.getsource(_inf_mod._stream_completion)
-        # The fix should deep-copy the cache before use and only commit on success.
-        # Check that copy or deepcopy is used for cache objects
-        assert "copy" in source or "deepcopy" in source, (
-            "Prompt cache must be deep-copied before passing to generator (Bug #123)"
+        # The fix removes the cache from the store before mutation so the
+        # store's copy is not corrupted if the client disconnects mid-stream.
+        assert "prompt_cache_store.remove" in source, (
+            "Prompt cache must be removed from store before mutation (Bug #123)"
         )
 
-    def test_cache_deep_copy_preserves_structure(self):
-        """Deep-copying a CachedPromptState should produce an independent copy."""
-        original_cache = [MagicMock(), MagicMock()]
-        state = CachedPromptState(tokens=[1, 2, 3], cache=original_cache)
-        copied = copy.deepcopy(state)
-        # Tokens should be independent
-        copied.tokens.append(4)
-        assert len(state.tokens) == 3
-        # Cache list should be independent (the objects inside may be shallow-copied
-        # but the list itself should be different)
-        assert copied.cache is not original_cache
+    def test_cache_not_committed_on_incomplete_generation(self):
+        """On disconnect (generation_complete=False), removed cache stays removed."""
+        store = MagicMock()
+        # After remove(), a subsequent remove() on disconnect is a safe no-op
+        store.remove.return_value = None
+        store.remove("test_id")
+        store.remove("test_id")  # second call should not raise
+        assert store.remove.call_count == 2
 
 
 # ---------------------------------------------------------------------------

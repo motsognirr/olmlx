@@ -1,7 +1,6 @@
 import asyncio
 import collections.abc
 import contextlib
-import copy
 import gc
 import importlib
 import json
@@ -274,15 +273,17 @@ async def _await_deferred_cleanup():
     Uses _deferred_cleanup_lock to prevent TOCTOU races on _deferred_cleanup_task (Bug #119).
     """
     async with _get_deferred_cleanup_lock():
-        if _deferred_cleanup_task is not None and not _deferred_cleanup_task.done():
-            logger.info("Waiting for deferred GPU cleanup to complete")
-            done, _ = await asyncio.wait(
-                {_deferred_cleanup_task}, timeout=_DEFERRED_WAIT_TIMEOUT
-            )
-            if not done:
-                raise ServerBusyError(
-                    f"Server busy: deferred GPU cleanup did not complete within {_DEFERRED_WAIT_TIMEOUT}s"
-                )
+        task = _deferred_cleanup_task
+        if task is None or task.done():
+            return
+    # Wait outside the lock so _cleanup() can acquire it in its finally block
+    # to set _deferred_cleanup_task = None.  Holding the lock here would deadlock.
+    logger.info("Waiting for deferred GPU cleanup to complete")
+    done, _ = await asyncio.wait({task}, timeout=_DEFERRED_WAIT_TIMEOUT)
+    if not done:
+        raise ServerBusyError(
+            f"Server busy: deferred GPU cleanup did not complete within {_DEFERRED_WAIT_TIMEOUT}s"
+        )
 
 
 async def _schedule_deferred_inference_cleanup(stream) -> None:
@@ -931,9 +932,12 @@ async def _stream_completion(
             )
 
             if prefix_len > 0 and suffix_start > 0:
-                # Bug #123: Deep-copy the cache before trimming so the store's
-                # copy is not corrupted if the client disconnects mid-stream.
-                working_cache = copy.deepcopy(cached.cache)
+                # Bug #123: Remove cache from store before mutation so the
+                # store's copy is not corrupted if the client disconnects
+                # mid-stream.  The cache will be re-stored on successful
+                # completion; on disconnect the finally block is a no-op.
+                working_cache = cached.cache
+                lm.prompt_cache_store.remove(cache_id)
                 # Trim cache to suffix_start so it aligns with where we resume
                 trim_amount = len(cached.tokens) - suffix_start
                 if trim_amount > 0:

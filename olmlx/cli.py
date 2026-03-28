@@ -257,7 +257,7 @@ def validate_remote_python(remote_python: str) -> None:
     multi-word values like "uv run python"), so it must be validated to prevent
     command injection via SSH.
     """
-    if not re.match(r"^[a-zA-Z0-9_\s/.@-]+$", remote_python):
+    if not re.match(r"^[a-zA-Z0-9_ /.@-]+$", remote_python):
         raise ValueError(f"Invalid remote_python value: {remote_python!r}")
 
 

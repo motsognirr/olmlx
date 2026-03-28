@@ -21,7 +21,11 @@ async def upload_blob(digest: str, request: Request):
 
     # Check Content-Length header first for early rejection
     content_length = request.headers.get("content-length")
-    if content_length is not None and int(content_length) > MAX_BLOB_SIZE:
+    try:
+        cl = int(content_length) if content_length is not None else 0
+    except ValueError:
+        cl = 0
+    if cl > MAX_BLOB_SIZE:
         return JSONResponse(
             {"error": f"blob too large (limit: {MAX_BLOB_SIZE} bytes)"},
             status_code=413,

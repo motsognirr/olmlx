@@ -254,11 +254,13 @@ class TestCacheReusedOnPrefixMatch:
         prompt_arg = call_args[1].get("prompt") or call_args[0][2]
         assert prompt_arg == [60, 70, 80]
 
-        # prompt_cache should be a deep copy of the existing cache (Bug #123)
-        # It should NOT be the same object (identity check) to prevent corruption
+        # Bug #123: cache is removed from store before mutation (not deep-copied)
+        # so the generator receives the original cache object directly
         prompt_cache_arg = call_args[1].get("prompt_cache")
         assert prompt_cache_arg is not None
-        assert prompt_cache_arg is not existing_cache  # deep-copied, not same object
+        assert (
+            prompt_cache_arg is existing_cache
+        )  # same object, removed from store before use
 
 
 class TestCacheMissCreatesFresh:

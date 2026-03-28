@@ -74,6 +74,18 @@ class TestRemotePythonValidation:
         with pytest.raises(ValueError, match="Invalid remote_python"):
             validate_remote_python("")
 
+    def test_tab_rejected(self):
+        from olmlx.cli import validate_remote_python
+
+        with pytest.raises(ValueError, match="Invalid remote_python"):
+            validate_remote_python("python\t--version")
+
+    def test_newline_rejected(self):
+        from olmlx.cli import validate_remote_python
+
+        with pytest.raises(ValueError, match="Invalid remote_python"):
+            validate_remote_python("python\n--version")
+
 
 class TestBlobUploadSizeLimit:
     """Bug #122: Unbounded blob upload."""
@@ -95,6 +107,19 @@ class TestBlobUploadSizeLimit:
         digest = "sha256:" + hashlib.sha256(data).hexdigest()
         resp = await app_client.post(f"/api/blobs/{digest}", content=data)
         assert resp.status_code == 413
+
+    @pytest.mark.asyncio
+    async def test_upload_blob_malformed_content_length(self, app_client):
+        """Malformed Content-Length should not cause a 500."""
+        data = b"small blob"
+        digest = "sha256:" + hashlib.sha256(data).hexdigest()
+        resp = await app_client.post(
+            f"/api/blobs/{digest}",
+            content=data,
+            headers={"content-length": "not-a-number"},
+        )
+        # Should either succeed (falls through to body check) or 4xx, never 500
+        assert resp.status_code != 500
 
 
 class TestMessageContentMaxLength:
