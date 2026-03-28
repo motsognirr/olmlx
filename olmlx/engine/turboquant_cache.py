@@ -38,7 +38,7 @@ class TurboQuantKVCache(_BaseCache):
         rotation_key: TurboQuantRotation,
         rotation_value: TurboQuantRotation,
     ):
-        self.bits = bits
+        self._bits = bits
         self.rotation_key = rotation_key
         self.rotation_value = rotation_value
         self._key_indices: mx.array | None = None
@@ -56,8 +56,8 @@ class TurboQuantKVCache(_BaseCache):
         prev = self.offset
 
         # Quantize incoming tokens (returns bit-packed indices)
-        k_idx, k_nrm = turboquant_quantize(keys, self.rotation_key, self.bits)
-        v_idx, v_nrm = turboquant_quantize(values, self.rotation_value, self.bits)
+        k_idx, k_nrm = turboquant_quantize(keys, self.rotation_key, self._bits)
+        v_idx, v_nrm = turboquant_quantize(values, self.rotation_value, self._bits)
 
         packed_dim = k_idx.shape[-1]  # head_dim // (8 // bits)
 
@@ -103,22 +103,33 @@ class TurboQuantKVCache(_BaseCache):
             self._key_indices[..., : self.offset, :],
             self._key_norms[..., : self.offset, :],
             self.rotation_key,
-            self.bits,
+            self._bits,
             dtype=input_dtype,
         )
         v_out = turboquant_dequantize(
             self._value_indices[..., : self.offset, :],
             self._value_norms[..., : self.offset, :],
             self.rotation_value,
-            self.bits,
+            self._bits,
             dtype=input_dtype,
         )
         return k_out, v_out
 
     @property
     def state(self):
+        if self._key_indices is None:
+            return []
+        return (
+            self._key_indices[..., : self.offset, :],
+            self._key_norms[..., : self.offset, :],
+            self._value_indices[..., : self.offset, :],
+            self._value_norms[..., : self.offset, :],
+        )
+
+    @state.setter
+    def state(self, v):
         raise NotImplementedError(
-            "TurboQuantKVCache does not support serialization. "
+            "TurboQuantKVCache does not support state restoration. "
             "Disable disk cache offload when using TurboQuant."
         )
 
