@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 
 from olmlx.engine.inference import generate_completion
 from olmlx.schemas.generate import GenerateRequest
+from olmlx.utils.streaming import safe_ndjson_stream
 
 logger = logging.getLogger(__name__)
 
@@ -36,52 +37,52 @@ async def generate(req: GenerateRequest, request: Request):
             images=req.images,
         )
 
-        async def stream_response():
-            try:
-                async for chunk in result:
-                    now = datetime.now(timezone.utc).isoformat()
-                    if chunk.get("done"):
-                        stats = chunk.get("stats")
-                        final = {
-                            "model": req.model,
-                            "created_at": now,
-                            "response": "",
-                            "done": True,
-                            "done_reason": "stop",
-                        }
-                        if stats:
-                            final.update(stats.to_dict())
-                        yield json.dumps(final) + "\n"
-                    else:
-                        yield (
-                            json.dumps(
-                                {
-                                    "model": req.model,
-                                    "created_at": now,
-                                    "response": chunk.get("text", ""),
-                                    "done": False,
-                                }
-                            )
-                            + "\n"
-                        )
-            except Exception as exc:
-                logger.error("Error during generate streaming: %s", exc, exc_info=True)
-                yield (
-                    json.dumps(
-                        {
-                            "model": req.model,
-                            "created_at": datetime.now(timezone.utc).isoformat(),
-                            "error": "An internal server error occurred during streaming.",
-                            "done": True,
-                            "done_reason": "error",
-                        }
-                    )
-                    + "\n"
+        def format_chunk(chunk):
+            now = datetime.now(timezone.utc).isoformat()
+            if chunk.get("done"):
+                stats = chunk.get("stats")
+                final = {
+                    "model": req.model,
+                    "created_at": now,
+                    "response": "",
+                    "done": True,
+                    "done_reason": "stop",
+                }
+                if stats:
+                    final.update(stats.to_dict())
+                return json.dumps(final) + "\n"
+            return (
+                json.dumps(
+                    {
+                        "model": req.model,
+                        "created_at": now,
+                        "response": chunk.get("text", ""),
+                        "done": False,
+                    }
                 )
-            finally:
-                await result.aclose()
+                + "\n"
+            )
 
-        return StreamingResponse(stream_response(), media_type="application/x-ndjson")
+        def format_error(exc):
+            return (
+                json.dumps(
+                    {
+                        "model": req.model,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "error": "An internal server error occurred during streaming.",
+                        "done": True,
+                        "done_reason": "error",
+                    }
+                )
+                + "\n"
+            )
+
+        return StreamingResponse(
+            safe_ndjson_stream(
+                result, format_chunk, format_error, logger, "generate streaming"
+            ),
+            media_type="application/x-ndjson",
+        )
     else:
         result = await generate_completion(
             manager,

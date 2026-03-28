@@ -26,11 +26,14 @@ async def pull_model(req: PullRequest, request: Request):
     if req.stream:
 
         async def stream_progress():
+            pull_iter = store.pull(req.model).__aiter__()
             try:
-                async for event in store.pull(req.model):
+                async for event in pull_iter:
                     yield json.dumps(event) + "\n"
             except Exception as e:
                 yield json.dumps({"status": "error", "error": str(e)}) + "\n"
+            finally:
+                await pull_iter.aclose()
 
         return StreamingResponse(stream_progress(), media_type="application/x-ndjson")
     else:

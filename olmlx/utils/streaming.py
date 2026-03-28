@@ -10,6 +10,30 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 
+async def safe_ndjson_stream(
+    source, format_chunk, format_error, logger, log_prefix="streaming"
+):
+    """Wrap an async source with error handling and guaranteed cleanup.
+
+    Args:
+        source: Async iterator to consume (must support aclose()).
+        format_chunk: Callable(item) -> str for each yielded item.
+        format_error: Callable(Exception) -> str for error formatting.
+        logger: Logger instance.
+        log_prefix: Prefix for error log messages.
+    """
+    try:
+        async for item in source:
+            formatted = format_chunk(item)
+            if formatted is not None:
+                yield formatted
+    except Exception as exc:
+        logger.error("Error during %s: %s", log_prefix, exc, exc_info=True)
+        yield format_error(exc)
+    finally:
+        await source.aclose()
+
+
 @dataclass
 class StreamToken:
     text: str

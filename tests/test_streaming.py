@@ -472,3 +472,123 @@ class TestPrefillCancelCallback:
 
         call_kwargs = mock_mlx_vlm.stream_generate.call_args
         assert "prompt_progress_callback" not in call_kwargs.kwargs
+
+
+class TestSafeNdjsonStream:
+    """Tests for the safe_ndjson_stream helper."""
+
+    @pytest.mark.asyncio
+    async def test_normal_completion(self):
+        """Source yields 3 items, all formatted and yielded, source closed."""
+        from olmlx.utils.streaming import safe_ndjson_stream
+
+        closed = False
+
+        async def source():
+            nonlocal closed
+            try:
+                yield "a"
+                yield "b"
+                yield "c"
+            finally:
+                closed = True
+
+        src = source()
+        chunks = []
+        async for chunk in safe_ndjson_stream(
+            src,
+            format_chunk=lambda x: f"[{x}]",
+            format_error=lambda e: f"ERR:{e}",
+            logger=logging.getLogger("test"),
+        ):
+            chunks.append(chunk)
+
+        assert chunks == ["[a]", "[b]", "[c]"]
+        assert closed is True
+
+    @pytest.mark.asyncio
+    async def test_error_formats_and_closes(self):
+        """Source raises mid-stream, error is formatted and yielded, source closed."""
+        from olmlx.utils.streaming import safe_ndjson_stream
+
+        closed = False
+
+        async def source():
+            nonlocal closed
+            try:
+                yield "ok"
+                raise RuntimeError("boom")
+            finally:
+                closed = True
+
+        src = source()
+        chunks = []
+        async for chunk in safe_ndjson_stream(
+            src,
+            format_chunk=lambda x: f"[{x}]",
+            format_error=lambda e: f"ERR:{e}",
+            logger=logging.getLogger("test"),
+        ):
+            chunks.append(chunk)
+
+        assert chunks == ["[ok]", "ERR:boom"]
+        assert closed is True
+
+    @pytest.mark.asyncio
+    async def test_generator_exit_closes_source(self):
+        """Consumer breaks early (GeneratorExit), source still closed."""
+        from olmlx.utils.streaming import safe_ndjson_stream
+
+        closed = False
+
+        async def source():
+            nonlocal closed
+            try:
+                yield "a"
+                yield "b"
+                yield "c"
+            finally:
+                closed = True
+
+        src = source()
+        stream = safe_ndjson_stream(
+            src,
+            format_chunk=lambda x: f"[{x}]",
+            format_error=lambda e: f"ERR:{e}",
+            logger=logging.getLogger("test"),
+        )
+        # Consume one item then break
+        async for chunk in stream:
+            break
+
+        # Explicitly close the wrapper to trigger cleanup
+        await stream.aclose()
+        assert closed is True
+
+    @pytest.mark.asyncio
+    async def test_empty_source(self):
+        """Source yields nothing, still closes properly."""
+        from olmlx.utils.streaming import safe_ndjson_stream
+
+        closed = False
+
+        async def source():
+            nonlocal closed
+            try:
+                return
+                yield  # make it a generator
+            finally:
+                closed = True
+
+        src = source()
+        chunks = []
+        async for chunk in safe_ndjson_stream(
+            src,
+            format_chunk=lambda x: f"[{x}]",
+            format_error=lambda e: f"ERR:{e}",
+            logger=logging.getLogger("test"),
+        ):
+            chunks.append(chunk)
+
+        assert chunks == []
+        assert closed is True

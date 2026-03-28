@@ -249,3 +249,54 @@ class TestManageRouter:
                 },
             )
         assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_pull_streaming_calls_aclose_on_iterator(self, app_client):
+        """Verify the pull iterator's aclose() is explicitly called via finally block."""
+        from unittest.mock import patch
+
+        original_aclose_called = False
+
+        async def mock_pull(name):
+            nonlocal original_aclose_called
+            try:
+                yield {"status": "pulling manifest"}
+                yield {"status": "success"}
+            finally:
+                original_aclose_called = True
+
+        # We wrap mock_pull to track aclose calls on the actual iterator
+        aclose_explicitly_called = False
+
+        class TrackingAsyncGen:
+            def __init__(self, gen):
+                self._gen = gen
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return await self._gen.__anext__()
+
+            async def aclose(self):
+                nonlocal aclose_explicitly_called
+                aclose_explicitly_called = True
+                await self._gen.aclose()
+
+        def tracked_pull(name):
+            return TrackingAsyncGen(mock_pull(name))
+
+        with patch.object(
+            app_client._transport.app.state.model_store,
+            "pull",
+            side_effect=tracked_pull,
+        ):
+            resp = await app_client.post(
+                "/api/pull",
+                json={
+                    "model": "qwen3",
+                    "stream": True,
+                },
+            )
+        assert resp.status_code == 200
+        assert aclose_explicitly_called is True

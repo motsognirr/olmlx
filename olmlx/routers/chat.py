@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 
 from olmlx.engine.inference import generate_chat
 from olmlx.schemas.chat import ChatRequest, Message
+from olmlx.utils.streaming import safe_ndjson_stream
 
 logger = logging.getLogger(__name__)
 
@@ -35,61 +36,55 @@ async def chat(req: ChatRequest, request: Request):
             cache_id=cache_id,
         )
 
-        async def stream_response():
-            try:
-                full_text = ""
-                async for chunk in result:
-                    if chunk.get("cache_info"):
-                        continue
-                    now = datetime.now(timezone.utc).isoformat()
-                    if chunk.get("done"):
-                        stats = chunk.get("stats")
-                        final = {
-                            "model": req.model,
-                            "created_at": now,
-                            "message": Message(
-                                role="assistant", content=""
-                            ).model_dump(),
-                            "done": True,
-                            "done_reason": "stop",
-                        }
-                        if stats:
-                            final.update(stats.to_dict())
-                        yield json.dumps(final) + "\n"
-                    else:
-                        text = chunk.get("text", "")
-                        full_text += text
-                        yield (
-                            json.dumps(
-                                {
-                                    "model": req.model,
-                                    "created_at": now,
-                                    "message": Message(
-                                        role="assistant", content=text
-                                    ).model_dump(),
-                                    "done": False,
-                                }
-                            )
-                            + "\n"
-                        )
-            except Exception as exc:
-                logger.error("Error during chat streaming: %s", exc, exc_info=True)
-                yield (
-                    json.dumps(
-                        {
-                            "model": req.model,
-                            "created_at": datetime.now(timezone.utc).isoformat(),
-                            "error": "An internal server error occurred during streaming.",
-                            "done": True,
-                            "done_reason": "error",
-                        }
-                    )
-                    + "\n"
+        def format_chunk(chunk):
+            if chunk.get("cache_info"):
+                return None
+            now = datetime.now(timezone.utc).isoformat()
+            if chunk.get("done"):
+                stats = chunk.get("stats")
+                final = {
+                    "model": req.model,
+                    "created_at": now,
+                    "message": Message(role="assistant", content="").model_dump(),
+                    "done": True,
+                    "done_reason": "stop",
+                }
+                if stats:
+                    final.update(stats.to_dict())
+                return json.dumps(final) + "\n"
+            text = chunk.get("text", "")
+            return (
+                json.dumps(
+                    {
+                        "model": req.model,
+                        "created_at": now,
+                        "message": Message(role="assistant", content=text).model_dump(),
+                        "done": False,
+                    }
                 )
-            finally:
-                await result.aclose()
+                + "\n"
+            )
 
-        return StreamingResponse(stream_response(), media_type="application/x-ndjson")
+        def format_error(exc):
+            return (
+                json.dumps(
+                    {
+                        "model": req.model,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "error": "An internal server error occurred during streaming.",
+                        "done": True,
+                        "done_reason": "error",
+                    }
+                )
+                + "\n"
+            )
+
+        return StreamingResponse(
+            safe_ndjson_stream(
+                result, format_chunk, format_error, logger, "chat streaming"
+            ),
+            media_type="application/x-ndjson",
+        )
     else:
         result = await generate_chat(
             manager,
