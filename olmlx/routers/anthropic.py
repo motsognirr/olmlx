@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from olmlx.config import settings
-from olmlx.engine.inference import count_chat_tokens, generate_chat
+from olmlx.engine.inference import _inference_ref, count_chat_tokens, generate_chat
 from olmlx.engine.tool_parser import _make_tool_use_id, parse_model_output
 from olmlx.schemas.anthropic import (
     AnthropicContentBlock,
@@ -583,8 +583,6 @@ async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request
     enable_thinking: bool | None = None
     if req.thinking is not None:
         enable_thinking = _THINKING_TYPE_MAP.get(req.thinking.type)
-
-    from olmlx.engine.inference import _inference_ref
 
     with _inference_ref(lm):
         loop = asyncio.get_running_loop()

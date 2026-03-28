@@ -40,9 +40,14 @@ async def upload_blob(digest: str, request: Request):
     blobs_dir.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=blobs_dir)
     try:
+        try:
+            tmp_file = os.fdopen(tmp_fd, "wb")
+        except Exception:
+            os.close(tmp_fd)
+            raise
         hasher = hashlib.sha256()
         received = 0
-        with os.fdopen(tmp_fd, "wb") as tmp:
+        with tmp_file as tmp:
             async for chunk in request.stream():
                 received += len(chunk)
                 if received > MAX_BLOB_SIZE:

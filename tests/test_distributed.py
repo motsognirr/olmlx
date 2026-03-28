@@ -1306,8 +1306,8 @@ class TestSidebandSocketTimeout:
             conn.close()
             server_sock.close()
 
-    def test_coordinator_sets_timeout_on_accepted_connections(self):
-        """Coordinator should set socket timeout on accepted worker connections."""
+    def test_coordinator_resets_timeout_after_handshake(self):
+        """After handshake, worker sockets should be blocking (no timeout) for inference loop."""
         from olmlx.engine.distributed import DistributedCoordinator, DistributedWorker
 
         coordinator = DistributedCoordinator(world_size=2, port=0)
@@ -1325,11 +1325,11 @@ class TestSidebandSocketTimeout:
 
         coordinator.wait_for_workers(timeout=5.0)
 
-        # After wait_for_workers, worker sockets should have a timeout set
+        # After wait_for_workers, worker sockets should be blocking (timeout=None)
+        # so idle workers don't crash with socket.timeout
         for ws in coordinator._workers:
-            timeout = ws.gettimeout()
-            assert timeout is not None and timeout > 0, (
-                f"Worker socket should have a timeout set, got {timeout}"
+            assert ws.gettimeout() is None, (
+                f"Worker socket should be blocking after handshake, got timeout={ws.gettimeout()}"
             )
 
         coordinator.broadcast_shutdown()

@@ -210,7 +210,7 @@ class DistributedCoordinator:
                             f"rejecting connection"
                         )
                 self._workers.append(conn)
-                conn.settimeout(30.0)
+                conn.settimeout(None)  # blocking recv for inference loop
                 logger.info(
                     "Worker %d/%d ready",
                     len(self._workers),
