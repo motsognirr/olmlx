@@ -255,7 +255,8 @@ def validate_remote_python(remote_python: str) -> None:
 
     The remote_python config value is intentionally not shell-quoted (to allow
     multi-word values like "uv run python"), so it must be validated to prevent
-    command injection via SSH.
+    command injection via SSH.  Note: remote_working_dir does not need a similar
+    allowlist because it is passed through shlex.quote() before interpolation.
     """
     if not re.fullmatch(r"[a-zA-Z0-9_ /.@-]+", remote_python):
         raise ValueError(f"Invalid remote_python value: {remote_python!r}")

@@ -1034,10 +1034,20 @@ async def _stream_completion(
                 current_metal = memory_utils.get_metal_memory()
                 if current_metal + kv_bytes > memory_limit:
                     # Drop cached KV tensors so eviction + gc can reclaim them
-                    had_cache = gen_kwargs.pop("prompt_cache", None) is not None
+                    working = gen_kwargs.pop("prompt_cache", None)
+                    had_cache = working is not None
                     gen_kwargs.pop(
                         "input_ids", None
                     )  # VLMs: force re-tokenize from string prompt
+                    # Bug #123 removes cache from store before mutation.
+                    # Re-add it temporarily so evict_all_to_disk() can persist it.
+                    if had_cache and full_prompt_tokens is not None:
+                        lm.prompt_cache_store.set(
+                            cache_id,
+                            CachedPromptState(
+                                tokens=list(full_prompt_tokens), cache=working
+                            ),
+                        )
                     lm.prompt_cache_store.evict_all_to_disk()
                     gc.collect()
                     mx.clear_cache()
