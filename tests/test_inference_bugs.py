@@ -209,14 +209,18 @@ class TestPromptCacheRemoveBeforeMutation:
             "Prompt cache must be removed from store before mutation (Bug #123)"
         )
 
-    def test_cache_not_committed_on_incomplete_generation(self):
-        """On disconnect (generation_complete=False), removed cache stays removed."""
-        store = MagicMock()
-        # After remove(), a subsequent remove() on disconnect is a safe no-op
-        store.remove.return_value = None
-        store.remove("test_id")
-        store.remove("test_id")  # second call should not raise
-        assert store.remove.call_count == 2
+    def test_finally_block_removes_cache_on_incomplete_generation(self):
+        """The finally block in _stream_completion must call remove on incomplete generation."""
+        import inspect
+
+        source = inspect.getsource(_inf_mod._stream_completion)
+        # The finally block should invalidate cache when generation_complete is False
+        assert "not generation_complete" in source, (
+            "_stream_completion must check generation_complete in finally block"
+        )
+        assert "prompt_cache_store.remove" in source, (
+            "_stream_completion must remove cache on incomplete generation"
+        )
 
 
 # ---------------------------------------------------------------------------

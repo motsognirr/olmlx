@@ -282,6 +282,9 @@ async def _await_deferred_cleanup():
             return
     # Wait outside the lock so _cleanup() can acquire it in its finally block
     # to set _deferred_cleanup_task = None.  Holding the lock here would deadlock.
+    # Race safety: a concurrent _schedule_deferred_inference_cleanup cannot replace
+    # _deferred_cleanup_task while we wait because _inference_lock is held by the
+    # existing cleanup — no new inference (and thus no new cleanup) can be scheduled.
     logger.info("Waiting for deferred GPU cleanup to complete")
     done, _ = await asyncio.wait({task}, timeout=_DEFERRED_WAIT_TIMEOUT)
     if not done:
@@ -1041,11 +1044,14 @@ async def _stream_completion(
                     )  # VLMs: force re-tokenize from string prompt
                     # Bug #123 removes cache from store before mutation.
                     # Re-add it temporarily so evict_all_to_disk() can persist it.
+                    # Use full_prompt_tokens[:suffix_start] to match the trimmed
+                    # KV state — working_cache was trimmed to suffix_start tokens.
                     if had_cache and full_prompt_tokens is not None:
                         lm.prompt_cache_store.set(
                             cache_id,
                             CachedPromptState(
-                                tokens=list(full_prompt_tokens), cache=working
+                                tokens=list(full_prompt_tokens[:suffix_start]),
+                                cache=working,
                             ),
                         )
                     lm.prompt_cache_store.evict_all_to_disk()
