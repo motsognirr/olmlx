@@ -461,6 +461,53 @@ class TestMakeTurboQuantCache:
         cache = make_turboquant_cache(model, bits=4)
         assert cache[0].rotation_key.matrix.shape == (128, 128)
 
+    def test_hybrid_model_preserves_non_kv_caches(self):
+        """Hybrid models (e.g. Nemotron-H) have SSM layers needing ArraysCache."""
+        from unittest.mock import MagicMock
+
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from olmlx.engine.turboquant_cache import (
+            TurboQuantKVCache,
+            make_turboquant_cache,
+        )
+
+        model = MagicMock()
+        model.layers = [MagicMock() for _ in range(4)]
+        model.args.head_dim = 64
+        # Simulate Nemotron-H: SSM, attention, SSM, attention
+        model.make_cache.return_value = [
+            ArraysCache(size=2),
+            KVCache(),
+            ArraysCache(size=2),
+            KVCache(),
+        ]
+
+        cache = make_turboquant_cache(model, bits=4)
+        assert len(cache) == 4
+        assert isinstance(cache[0], ArraysCache)
+        assert isinstance(cache[1], TurboQuantKVCache)
+        assert isinstance(cache[2], ArraysCache)
+        assert isinstance(cache[3], TurboQuantKVCache)
+
+    def test_model_without_make_cache_all_turboquant(self):
+        """Models without make_cache() get TurboQuantKVCache for all layers."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.turboquant_cache import (
+            TurboQuantKVCache,
+            make_turboquant_cache,
+        )
+
+        model = MagicMock(spec=[])  # no make_cache attribute
+        model.layers = [MagicMock() for _ in range(3)]
+        model.args = MagicMock()
+        model.args.head_dim = 64
+
+        cache = make_turboquant_cache(model, bits=4)
+        assert len(cache) == 3
+        assert all(isinstance(c, TurboQuantKVCache) for c in cache)
+
 
 # ---------------------------------------------------------------------------
 # Config tests

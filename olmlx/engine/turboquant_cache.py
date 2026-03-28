@@ -11,7 +11,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from mlx_lm.models.cache import _BaseCache, create_attention_mask
+from mlx_lm.models.cache import KVCache, _BaseCache, create_attention_mask
 
 from olmlx.engine.turboquant import (
     TurboQuantRotation,
@@ -177,8 +177,13 @@ def _detect_head_dim(model: Any) -> int:
         ) from e
 
 
-def make_turboquant_cache(model: Any, bits: int) -> list[TurboQuantKVCache]:
-    """Create a list of TurboQuantKVCache objects, one per model layer."""
+def make_turboquant_cache(model: Any, bits: int) -> list:
+    """Create a cache list with TurboQuantKVCache for attention layers.
+
+    For hybrid models (e.g. Nemotron-H with SSM + attention layers), only
+    attention-layer caches (KVCache) are replaced with TurboQuantKVCache.
+    Non-attention caches (e.g. ArraysCache for SSM/Mamba layers) are preserved.
+    """
     num_layers = len(model.layers)
     head_dim = _detect_head_dim(model)
 
@@ -189,16 +194,31 @@ def make_turboquant_cache(model: Any, bits: int) -> list[TurboQuantKVCache]:
             f"got head_dim={head_dim}"
         )
 
+    # Get default cache layout from model if available (hybrid models
+    # return different cache types per layer, e.g. ArraysCache for SSM)
+    if hasattr(model, "make_cache"):
+        default_caches = model.make_cache()
+        if not isinstance(default_caches, list) or len(default_caches) != num_layers:
+            default_caches = [None] * num_layers
+    else:
+        default_caches = [None] * num_layers
+
     caches = []
-    for i in range(num_layers):
-        rot_k = TurboQuantRotation(head_dim=head_dim, seed=i * 2)
-        rot_v = TurboQuantRotation(head_dim=head_dim, seed=i * 2 + 1)
-        caches.append(
-            TurboQuantKVCache(bits=bits, rotation_key=rot_k, rotation_value=rot_v)
-        )
+    tq_count = 0
+    for i, default in enumerate(default_caches):
+        if default is None or isinstance(default, KVCache):
+            rot_k = TurboQuantRotation(head_dim=head_dim, seed=i * 2)
+            rot_v = TurboQuantRotation(head_dim=head_dim, seed=i * 2 + 1)
+            caches.append(
+                TurboQuantKVCache(bits=bits, rotation_key=rot_k, rotation_value=rot_v)
+            )
+            tq_count += 1
+        else:
+            caches.append(default)
 
     logger.info(
-        "Created TurboQuant KV cache: %d layers, %d-bit, head_dim=%d",
+        "Created TurboQuant KV cache: %d/%d layers quantized, %d-bit, head_dim=%d",
+        tq_count,
         num_layers,
         bits,
         head_dim,
