@@ -167,27 +167,54 @@ def _try_load_tensor(
         raise
 
 
-def _detect_expert_prefix(
+@dataclass
+class _ExpertFormat:
+    """Describes the detected weight naming convention for a model's MoE experts."""
+
+    layer_prefix: str  # e.g. "model.layers" or "backbone.layers"
+    expert_prefix: str  # e.g. "mlp.switch_mlp" or "mixer.switch_mlp"
+    projections: tuple[
+        str, ...
+    ]  # e.g. ("gate_proj", "up_proj", "down_proj") or ("fc1", "fc2")
+
+    def full_prefix(self, layer_idx: int) -> str:
+        return f"{self.layer_prefix}.{layer_idx}.{self.expert_prefix}"
+
+
+def _detect_expert_format(
     model_dir: Path, sample_layer: int, index: dict | None
-) -> str:
-    """Detect the full MoE weight prefix for expert projections.
+) -> _ExpertFormat:
+    """Detect the full MoE weight naming convention.
 
-    Returns the prefix from ``model.layers.{i}.`` up to and including the
-    expert container, e.g. ``mlp.switch_mlp`` or ``block_sparse_moe.switch_mlp``.
+    Auto-detects layer prefix (model.layers vs backbone.layers), MoE module
+    name, expert container, and projection names (gate_proj/up_proj/down_proj
+    vs fc1/fc2).
     """
-    # Try all known (moe_module, expert_container) combinations
-    _MOE_MODULES = ("mlp", "block_sparse_moe")
+    _LAYER_PREFIXES = ("model.layers", "backbone.layers")
+    _MOE_MODULES = ("mlp", "block_sparse_moe", "mixer")
     _EXPERT_CONTAINERS = ("switch_mlp", "experts")
+    # First projection name to probe for each projection style
+    _PROJ_PROBES = (
+        ("gate_proj", ("gate_proj", "up_proj", "down_proj")),
+        ("fc1", ("fc1", "fc2")),
+    )
 
-    candidates = [
-        f"{mod}.{cont}" for mod in _MOE_MODULES for cont in _EXPERT_CONTAINERS
-    ]
+    def _probe(key_exists):
+        for lp in _LAYER_PREFIXES:
+            for mod in _MOE_MODULES:
+                for cont in _EXPERT_CONTAINERS:
+                    for probe, projs in _PROJ_PROBES:
+                        name = f"{lp}.{sample_layer}.{mod}.{cont}.{probe}.weight"
+                        if key_exists(name):
+                            return _ExpertFormat(lp, f"{mod}.{cont}", projs)
+        return None
 
-    for prefix in candidates:
-        name = f"model.layers.{sample_layer}.{prefix}.gate_proj.weight"
-        # Check index first (fast, no I/O)
-        if index and name in index.get("weight_map", {}):
-            return prefix
+    # Try index first (fast path — dict lookups only)
+    if index:
+        weight_map = index.get("weight_map", {})
+        result = _probe(lambda n: n in weight_map)
+        if result:
+            return result
 
     # No index — scan single safetensors file keys
     import mlx.core as mx
@@ -198,19 +225,35 @@ def _detect_expert_prefix(
         if sf_key not in _shard_cache:
             _shard_cache[sf_key] = mx.load(sf_key)
         tensors = _shard_cache[sf_key]
-        for prefix in candidates:
-            name = f"model.layers.{sample_layer}.{prefix}.gate_proj.weight"
-            if name in tensors:
-                return prefix
+        result = _probe(lambda n: n in tensors)
+        if result:
+            return result
 
     raise ValueError(
         f"Cannot find expert weights for layer {sample_layer} "
-        f"(tried prefixes: {', '.join(candidates)})"
+        f"(tried layer prefixes: {_LAYER_PREFIXES}, "
+        f"modules: {_MOE_MODULES}, containers: {_EXPERT_CONTAINERS}, "
+        f"projections: gate_proj, fc1)"
     )
 
 
 def _detect_moe_layers(config: dict) -> list[int]:
     """Return list of layer indices that are MoE layers based on config."""
+    # Nemotron-H: hybrid_override_pattern where 'E' = MoE layer
+    pattern = config.get("hybrid_override_pattern")
+    if pattern is not None:
+        num_layers = config.get("num_hidden_layers") or config.get("num_layers", 0)
+        if not num_layers:
+            raise ValueError(
+                "hybrid_override_pattern is set but num_hidden_layers is missing or 0"
+            )
+        if len(pattern) != num_layers:
+            raise ValueError(
+                f"hybrid_override_pattern length ({len(pattern)}) != "
+                f"num_hidden_layers ({num_layers})"
+            )
+        return [i for i, c in enumerate(pattern) if c == "E"]
+
     num_layers = config.get("num_hidden_layers") or config.get("num_layers", 0)
     first_dense = config.get("first_k_dense_replace", 0)
     # Qwen3-MoE uses decoder_sparse_step instead of moe_layer_freq
@@ -263,8 +306,9 @@ def _collect_all_projections(
     model_dir: Path,
     prefix: str,
     index: dict | None,
+    projections: tuple[str, ...] = ("gate_proj", "up_proj", "down_proj"),
 ) -> tuple[list[tuple[str, str, np.ndarray]], list[dict]]:
-    """Collect all components for gate_proj, up_proj, down_proj.
+    """Collect all components for the given projections.
 
     Returns:
         (all_components, manifest_entries)
@@ -274,7 +318,7 @@ def _collect_all_projections(
     all_components = []
     manifest = []
 
-    for proj in ("gate_proj", "up_proj", "down_proj"):
+    for proj in projections:
         components = _collect_expert_components(model_dir, f"{prefix}.{proj}", index)
         for comp_name, arr in components:
             all_components.append((proj, comp_name, arr))
@@ -291,7 +335,7 @@ def _collect_all_projections(
             )
 
     # Also check for per-projection linear biases (e.g., gpt-oss has bias=True)
-    for proj in ("gate_proj", "up_proj", "down_proj"):
+    for proj in projections:
         bias = _try_load_tensor(model_dir, f"{prefix}.{proj}.bias", index)
         if bias is not None:
             all_components.append((proj, "bias", bias))
@@ -372,12 +416,15 @@ def bundle_moe_experts(
     layouts: dict[int, MoeExpertLayout] = {}
 
     try:
-        # Detect expert weight prefix, e.g. "mlp.switch_mlp" or "block_sparse_moe.switch_mlp"
-        expert_prefix = _detect_expert_prefix(model_dir, moe_layers[0], index)
+        # Detect expert weight naming convention
+        fmt = _detect_expert_format(model_dir, moe_layers[0], index)
+        expert_prefix = fmt.expert_prefix
 
         # Process first MoE layer to determine component manifest
-        first_prefix = f"model.layers.{moe_layers[0]}.{expert_prefix}"
-        _, manifest = _collect_all_projections(model_dir, first_prefix, index)
+        first_prefix = fmt.full_prefix(moe_layers[0])
+        _, manifest = _collect_all_projections(
+            model_dir, first_prefix, index, fmt.projections
+        )
         expert_byte_size = sum(entry["nbytes"] for entry in manifest)
 
         bits = 0
@@ -391,10 +438,10 @@ def bundle_moe_experts(
             group_size = quant_config.get("group_size", 32)
             quant_mode = quant_config.get("mode", "affine")
         for layer_idx in moe_layers:
-            prefix = f"model.layers.{layer_idx}.{expert_prefix}"
+            prefix = fmt.full_prefix(layer_idx)
 
             all_components, layer_manifest = _collect_all_projections(
-                model_dir, prefix, index
+                model_dir, prefix, index, fmt.projections
             )
             if layer_manifest != manifest:
                 raise ValueError(

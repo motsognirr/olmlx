@@ -39,12 +39,20 @@ class FlashMoE(nn.Module):
         self.weight_store = weight_store
         self._activation = activation
 
-    def _apply_activation(self, up_out: mx.array, gate_out: mx.array) -> mx.array:
-        """Apply the SwiGLU activation, using model-specific version if provided."""
+    def _apply_gated_activation(self, up_out: mx.array, gate_out: mx.array) -> mx.array:
+        """Apply gated activation (SwiGLU). Activation is a 2-arg callable."""
         if self._activation is not None:
             return self._activation(up_out, gate_out)
-        # Default: standard SwiGLU (silu(gate) * up)
         return nn.silu(gate_out) * up_out
+
+    def _apply_ungated_activation(self, x: mx.array) -> mx.array:
+        """Apply non-gated activation (e.g. relu2). Activation is a 1-arg callable."""
+        if self._activation is None:
+            raise ValueError(
+                "FlashMoE: non-gated (fc1/fc2) experts require an explicit activation "
+                "function — pass activation=relu2 (or your model's activation) to FlashMoE.__init__."
+            )
+        return self._activation(x)
 
     def __call__(
         self,
@@ -81,17 +89,15 @@ class FlashMoE(nn.Module):
             dtype=mx.uint32,
         ).reshape(B, L, K)
 
-        # Compute expert outputs using loaded weights
-        # For each token, for each of its K experts:
-        #   gate_out = x @ gate_w[expert].T
-        #   up_out = x @ up_w[expert].T
-        #   activated = silu(gate_out) * up_out
-        #   expert_out = activated @ down_w[expert].T
+        # Compute expert outputs using loaded weights.
+        # Gated (gate_proj+up_proj+down_proj): gate_out, up_out → silu(gate)*up → down
+        # Non-gated (fc1+fc2): up_out → activation → down
         #
         # We use gather_mm for efficient batched expert dispatch.
 
         # Expand x for gather_mm: (B, L, 1, 1, H)
         x_expanded = mx.expand_dims(x, (-2, -3))
+        gated = loaded.gate_weight is not None
 
         if loaded.is_quantized:
             qmm_kwargs = dict(
@@ -100,16 +106,17 @@ class FlashMoE(nn.Module):
                 bits=loaded.bits,
                 mode=loaded.quant_mode,
             )
-            gate_out = mx.gather_qmm(
-                x_expanded,
-                loaded.gate_weight,
-                loaded.gate_scales,
-                loaded.gate_biases,
-                rhs_indices=remap,
-                **qmm_kwargs,
-            )
-            if loaded.gate_bias is not None:
-                gate_out = gate_out + loaded.gate_bias[remap][..., None, :]
+            if gated:
+                gate_out = mx.gather_qmm(
+                    x_expanded,
+                    loaded.gate_weight,
+                    loaded.gate_scales,
+                    loaded.gate_biases,
+                    rhs_indices=remap,
+                    **qmm_kwargs,
+                )
+                if loaded.gate_bias is not None:
+                    gate_out = gate_out + loaded.gate_bias[remap][..., None, :]
             up_out = mx.gather_qmm(
                 x_expanded,
                 loaded.up_weight,
@@ -120,7 +127,11 @@ class FlashMoE(nn.Module):
             )
             if loaded.up_bias is not None:
                 up_out = up_out + loaded.up_bias[remap][..., None, :]
-            activated = self._apply_activation(up_out, gate_out)
+            activated = (
+                self._apply_gated_activation(up_out, gate_out)
+                if gated
+                else self._apply_ungated_activation(up_out)
+            )
             expert_out = mx.gather_qmm(
                 activated,
                 loaded.down_weight,
@@ -132,13 +143,14 @@ class FlashMoE(nn.Module):
             if loaded.down_bias is not None:
                 expert_out = expert_out + loaded.down_bias[remap][..., None, :]
         else:
-            gate_out = mx.gather_mm(
-                x_expanded,
-                loaded.gate_weight.swapaxes(-1, -2),
-                rhs_indices=remap,
-            )
-            if loaded.gate_bias is not None:
-                gate_out = gate_out + loaded.gate_bias[remap][..., None, :]
+            if gated:
+                gate_out = mx.gather_mm(
+                    x_expanded,
+                    loaded.gate_weight.swapaxes(-1, -2),
+                    rhs_indices=remap,
+                )
+                if loaded.gate_bias is not None:
+                    gate_out = gate_out + loaded.gate_bias[remap][..., None, :]
             up_out = mx.gather_mm(
                 x_expanded,
                 loaded.up_weight.swapaxes(-1, -2),
@@ -146,7 +158,11 @@ class FlashMoE(nn.Module):
             )
             if loaded.up_bias is not None:
                 up_out = up_out + loaded.up_bias[remap][..., None, :]
-            activated = self._apply_activation(up_out, gate_out)
+            activated = (
+                self._apply_gated_activation(up_out, gate_out)
+                if gated
+                else self._apply_ungated_activation(up_out)
+            )
             expert_out = mx.gather_mm(
                 activated,
                 loaded.down_weight.swapaxes(-1, -2),

@@ -28,6 +28,9 @@ _STR_TO_NP_DTYPE = {
     "int8": np.int8,
 }
 
+# fc1/fc2 models are non-gated; "gate" is intentionally absent so gate_weight → None
+_PROJ_ALIAS = {"fc1": "up", "fc2": "down"}
+
 # Map dtype string to mlx dtype
 _STR_TO_MX_DTYPE = {
     "float16": mx.float16,
@@ -213,8 +216,9 @@ class FlashMoeWeightStore:
             # e.g., "gate_proj.weight" -> key "gate_weight"
             # "gate_proj.scales" -> key "gate_scales"
             # "gate_proj.bias" -> key "gate_bias"
+            # For fc1/fc2 style: "fc1.weight" -> "up_weight", "fc2.weight" -> "down_weight"
             proj, comp = name.split(".", 1)
-            proj_short = proj.replace("_proj", "")
+            proj_short = _PROJ_ALIAS.get(proj, proj.replace("_proj", ""))
             key = f"{proj_short}_{comp}"
 
             result[key] = mx.array(arr)
@@ -372,7 +376,7 @@ class FlashMoeWeightStore:
             return mx.stack(lst) if lst else None
 
         return LoadedExperts(
-            gate_weight=mx.stack(components["gate_weight"]),
+            gate_weight=_stack_or_none(components["gate_weight"]),
             gate_scales=_stack_or_none(components["gate_scales"]),
             gate_biases=_stack_or_none(components["gate_biases"]),
             gate_bias=_stack_or_none(components["gate_bias"]),

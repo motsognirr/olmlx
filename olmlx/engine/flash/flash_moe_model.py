@@ -213,12 +213,12 @@ def _find_moe_module(layer: nn.Module) -> tuple[str, nn.Module]:
     Returns (attr_name, module) — the attribute may be 'mlp' (DeepSeek,
     Qwen3-Next, gpt-oss) or 'block_sparse_moe' (MiniMax).
     """
-    for attr in ("mlp", "block_sparse_moe"):
+    for attr in ("mlp", "block_sparse_moe", "mixer"):
         mod = getattr(layer, attr, None)
         if mod is not None:
             return attr, mod
     raise AttributeError(
-        f"Layer {layer} has neither 'mlp' nor 'block_sparse_moe' attribute"
+        f"Layer {layer} has no 'mlp', 'block_sparse_moe', or 'mixer' attribute"
     )
 
 
@@ -278,11 +278,11 @@ def _replace_moe_layers(
             # gpt-oss style (has router + experts)
             replacement = _FlashMoEGptOss(moe_module, flash_moe)
 
-        # Delete original SwitchGLU weights before replacing
+        # Delete original SwitchGLU/expert weights before replacing
         for attr in ("switch_mlp", "experts"):
             if hasattr(moe_module, attr):
                 switch = getattr(moe_module, attr)
-                for proj in ("gate_proj", "up_proj", "down_proj"):
+                for proj in ("gate_proj", "up_proj", "down_proj", "fc1", "fc2"):
                     if hasattr(switch, proj):
                         delattr(switch, proj)
                 delattr(moe_module, attr)

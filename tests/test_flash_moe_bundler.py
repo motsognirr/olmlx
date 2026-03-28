@@ -635,3 +635,287 @@ class TestBundleMiniMaxMoeExperts:
         layouts = bundle_moe_experts(model_dir, tmp_path / "flash_moe")
         assert 0 in layouts
         assert layouts[0].num_experts == experts
+
+
+# ---------------------------------------------------------------------------
+# Nemotron-H helpers and tests
+# ---------------------------------------------------------------------------
+
+
+def _make_synthetic_nemotron_moe_weights(
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_layers: int,
+    hybrid_override_pattern: str,
+    tmp_path: Path,
+    quantized: bool = False,
+) -> Path:
+    """Create synthetic safetensors with Nemotron-H-style naming.
+
+    Nemotron-H uses:
+      - backbone.layers.{l} (not model.layers.{l})
+      - mixer.switch_mlp (not mlp.switch_mlp)
+      - fc1/fc2 projections (not gate_proj/up_proj/down_proj)
+      - hybrid_override_pattern for MoE layer detection ('E' = MoE)
+    """
+    from safetensors.numpy import save_file
+
+    rng = np.random.RandomState(42)
+    tensors = {}
+
+    for layer_idx, block_type in enumerate(hybrid_override_pattern):
+        if block_type == "E":
+            # MoE layer
+            prefix = f"backbone.layers.{layer_idx}.mixer"
+
+            # Router weights
+            tensors[f"{prefix}.gate.weight"] = rng.randn(
+                num_experts, hidden_size
+            ).astype(np.float16)
+            tensors[f"{prefix}.gate.e_score_correction_bias"] = rng.randn(
+                num_experts
+            ).astype(np.float16)
+
+            # Shared expert
+            tensors[f"{prefix}.shared_experts.up_proj.weight"] = rng.randn(
+                intermediate_size * 2, hidden_size
+            ).astype(np.float16)
+            tensors[f"{prefix}.shared_experts.down_proj.weight"] = rng.randn(
+                hidden_size, intermediate_size * 2
+            ).astype(np.float16)
+
+            # Stacked expert weights (fc1/fc2)
+            if not quantized:
+                tensors[f"{prefix}.switch_mlp.fc1.weight"] = rng.randn(
+                    num_experts, intermediate_size, hidden_size
+                ).astype(np.float16)
+                tensors[f"{prefix}.switch_mlp.fc2.weight"] = rng.randn(
+                    num_experts, hidden_size, intermediate_size
+                ).astype(np.float16)
+            else:
+                group_size = 64
+                bits = 8
+                fc1_packed_dim = hidden_size * bits // 32
+                fc2_packed_dim = intermediate_size * bits // 32
+
+                tensors[f"{prefix}.switch_mlp.fc1.weight"] = rng.randint(
+                    0, 2**31, (num_experts, intermediate_size, fc1_packed_dim)
+                ).astype(np.uint32)
+                tensors[f"{prefix}.switch_mlp.fc1.scales"] = rng.randn(
+                    num_experts, intermediate_size, hidden_size // group_size
+                ).astype(np.float16)
+                tensors[f"{prefix}.switch_mlp.fc1.biases"] = rng.randn(
+                    num_experts, intermediate_size, hidden_size // group_size
+                ).astype(np.float16)
+
+                tensors[f"{prefix}.switch_mlp.fc2.weight"] = rng.randint(
+                    0, 2**31, (num_experts, hidden_size, fc2_packed_dim)
+                ).astype(np.uint32)
+                tensors[f"{prefix}.switch_mlp.fc2.scales"] = rng.randn(
+                    num_experts, hidden_size, intermediate_size // group_size
+                ).astype(np.float16)
+                tensors[f"{prefix}.switch_mlp.fc2.biases"] = rng.randn(
+                    num_experts, hidden_size, intermediate_size // group_size
+                ).astype(np.float16)
+        elif block_type == "M":
+            # Mamba layer — just a placeholder weight
+            tensors[f"backbone.layers.{layer_idx}.norm.weight"] = rng.randn(
+                hidden_size
+            ).astype(np.float16)
+        elif block_type == "*":
+            # Attention layer — placeholder
+            tensors[f"backbone.layers.{layer_idx}.mixer.q_proj.weight"] = rng.randn(
+                hidden_size, hidden_size
+            ).astype(np.float16)
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    save_file(tensors, str(model_dir / "model.safetensors"))
+
+    config = {
+        "model_type": "nemotron_h",
+        "hidden_size": hidden_size,
+        "intermediate_size": intermediate_size,
+        "moe_intermediate_size": intermediate_size,
+        "num_hidden_layers": num_layers,
+        "n_routed_experts": num_experts,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 2,
+        "hybrid_override_pattern": hybrid_override_pattern,
+    }
+    if quantized:
+        config["quantization"] = {"bits": 8, "group_size": 64}
+    (model_dir / "config.json").write_text(json.dumps(config))
+
+    return model_dir
+
+
+class TestBundleNemotronMoeExperts:
+    """Test bundler with Nemotron-H-style backbone.layers + mixer + fc1/fc2."""
+
+    # Pattern: M=Mamba, E=MoE, *=Attention — 6 layers, 3 MoE
+    PATTERN = "ME*EME"
+
+    def test_detect_nemotron_moe_layers(self, tmp_path):
+        """Should detect MoE layers from hybrid_override_pattern ('E' chars)."""
+        hidden, inter, experts = 64, 32, 4
+        model_dir = _make_synthetic_nemotron_moe_weights(
+            hidden, inter, experts, 6, self.PATTERN, tmp_path
+        )
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        layouts = bundle_moe_experts(model_dir, tmp_path / "flash_moe")
+
+        # E is at indices 1, 3, 5 in "ME*EME"
+        assert sorted(layouts.keys()) == [1, 3, 5]
+
+    def test_bundle_nemotron_creates_correct_files(self, tmp_path):
+        """Each Nemotron MoE layer should produce a .flashexperts file."""
+        hidden, inter, experts = 64, 32, 4
+        model_dir = _make_synthetic_nemotron_moe_weights(
+            hidden, inter, experts, 6, self.PATTERN, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        layouts = bundle_moe_experts(model_dir, output_dir)
+
+        assert len(layouts) == 3
+        for layer_idx in [1, 3, 5]:
+            assert (output_dir / f"layer_{layer_idx:02d}.flashexperts").exists()
+
+    def test_bundle_nemotron_preserves_fc1_fc2_data(self, tmp_path):
+        """Bundled data should match original fc1/fc2 weights."""
+        hidden, inter, experts = 64, 32, 8
+        model_dir = _make_synthetic_nemotron_moe_weights(
+            hidden, inter, experts, 6, self.PATTERN, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from safetensors.numpy import load_file
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        original = load_file(str(model_dir / "model.safetensors"))
+        fc1_w = original["backbone.layers.1.mixer.switch_mlp.fc1.weight"]
+        fc2_w = original["backbone.layers.1.mixer.switch_mlp.fc2.weight"]
+
+        layouts = bundle_moe_experts(model_dir, output_dir)
+        layout = layouts[1]
+
+        expert_idx = 3
+        expert_offset = int(layout.offsets[expert_idx])
+        with open(layout.file_path, "rb") as f:
+            f.seek(expert_offset)
+            raw = f.read(layout.expert_byte_size)
+
+        # fc1: (inter, hidden) float16, fc2: (hidden, inter) float16
+        fc1_size = inter * hidden * 2
+        fc2_size = hidden * inter * 2
+
+        fc1_read = np.frombuffer(raw[:fc1_size], dtype=np.float16).reshape(
+            inter, hidden
+        )
+        fc2_read = np.frombuffer(
+            raw[fc1_size : fc1_size + fc2_size], dtype=np.float16
+        ).reshape(hidden, inter)
+
+        np.testing.assert_array_equal(fc1_read, fc1_w[expert_idx])
+        np.testing.assert_array_equal(fc2_read, fc2_w[expert_idx])
+
+    def test_bundle_nemotron_quantized(self, tmp_path):
+        """Quantized Nemotron model with fc1/fc2 should bundle correctly."""
+        hidden, inter, experts = 64, 32, 4
+        model_dir = _make_synthetic_nemotron_moe_weights(
+            hidden, inter, experts, 6, self.PATTERN, tmp_path, quantized=True
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from olmlx.engine.flash.moe_bundler import (
+            MOE_HEADER_SIZE,
+            bundle_moe_experts,
+            parse_moe_header,
+        )
+
+        layouts = bundle_moe_experts(model_dir, output_dir)
+        layout = layouts[1]
+
+        with open(layout.file_path, "rb") as f:
+            header = parse_moe_header(f.read(MOE_HEADER_SIZE))
+        assert header["is_quantized"] is True
+        assert header["bits"] == 8
+
+    def test_bundle_nemotron_layout_json_has_projections(self, tmp_path):
+        """Layout JSON should record fc1/fc2 projection names in manifest."""
+        hidden, inter, experts = 64, 32, 4
+        model_dir = _make_synthetic_nemotron_moe_weights(
+            hidden, inter, experts, 6, self.PATTERN, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        bundle_moe_experts(model_dir, output_dir)
+
+        config = json.loads((output_dir / "flash_moe_layout.json").read_text())
+        manifest = config["component_manifest"]
+        proj_names = [e["name"] for e in manifest]
+        assert "fc1.weight" in proj_names
+        assert "fc2.weight" in proj_names
+        # Should NOT have gate_proj/up_proj/down_proj
+        assert all("gate_proj" not in n for n in proj_names)
+
+    def test_bundle_nemotron_sharded(self, tmp_path):
+        """Should handle sharded Nemotron models via safetensors index."""
+        from safetensors.numpy import save_file
+
+        hidden, inter, experts = 64, 32, 4
+        rng = np.random.RandomState(99)
+
+        model_dir = tmp_path / "sharded_model"
+        model_dir.mkdir()
+
+        # Shard 1: fc1
+        shard1 = {
+            "backbone.layers.1.mixer.switch_mlp.fc1.weight": rng.randn(
+                experts, inter, hidden
+            ).astype(np.float16),
+            "backbone.layers.1.mixer.gate.weight": rng.randn(experts, hidden).astype(
+                np.float16
+            ),
+        }
+        save_file(shard1, str(model_dir / "model-00001-of-00002.safetensors"))
+
+        # Shard 2: fc2
+        shard2 = {
+            "backbone.layers.1.mixer.switch_mlp.fc2.weight": rng.randn(
+                experts, hidden, inter
+            ).astype(np.float16),
+        }
+        save_file(shard2, str(model_dir / "model-00002-of-00002.safetensors"))
+
+        weight_map = {k: "model-00001-of-00002.safetensors" for k in shard1}
+        weight_map.update({k: "model-00002-of-00002.safetensors" for k in shard2})
+        (model_dir / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+
+        config = {
+            "model_type": "nemotron_h",
+            "hidden_size": hidden,
+            "moe_intermediate_size": inter,
+            "num_hidden_layers": 2,
+            "n_routed_experts": experts,
+            "num_experts_per_tok": 2,
+            "hybrid_override_pattern": "ME",  # only layer 1 is MoE
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        layouts = bundle_moe_experts(model_dir, output_dir=tmp_path / "flash_moe")
+        assert 1 in layouts
+        assert layouts[1].num_experts == experts

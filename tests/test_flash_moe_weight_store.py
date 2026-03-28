@@ -4,7 +4,10 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tests.test_flash_moe_bundler import _make_synthetic_moe_weights
+from tests.test_flash_moe_bundler import (
+    _make_synthetic_moe_weights,
+    _make_synthetic_nemotron_moe_weights,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -238,3 +241,54 @@ class TestFlashMoeWeightStoreQuantized:
             np.array(loaded.gate_scales[0]),
             gate_s_orig[1],
         )
+
+
+class TestFlashMoeWeightStoreNemotron:
+    """Test weight store with Nemotron-style fc1/fc2 projections."""
+
+    @pytest.fixture()
+    def nemotron_store(self, tmp_path):
+        """Create bundled Nemotron MoE model and return store."""
+        hidden, inter, experts = 64, 32, 8
+        pattern = "ME"  # layer 1 is MoE
+        model_dir = _make_synthetic_nemotron_moe_weights(
+            hidden, inter, experts, 2, pattern, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        bundle_moe_experts(model_dir, output_dir)
+
+        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+        store = FlashMoeWeightStore(
+            output_dir, num_io_threads=4, cache_budget_experts=16
+        )
+        return store, model_dir, hidden, inter, experts
+
+    def test_load_fc1_fc2_experts(self, nemotron_store):
+        """fc1/fc2 experts should load into up/down fields (no gate)."""
+        store, _, hidden, inter, _ = nemotron_store
+        loaded = store.load_experts(1, [0, 2, 5])
+
+        # fc1 maps to up_weight, fc2 maps to down_weight
+        assert loaded.up_weight.shape == (3, inter, hidden)
+        assert loaded.down_weight.shape == (3, hidden, inter)
+        # No gate projection for fc1/fc2 style
+        assert loaded.gate_weight is None
+
+    def test_fc1_fc2_data_matches_original(self, nemotron_store):
+        """Loaded fc1/fc2 weights must match original safetensors."""
+        from safetensors.numpy import load_file
+
+        store, model_dir, _, _, _ = nemotron_store
+        original = load_file(str(model_dir / "model.safetensors"))
+
+        fc1_w = original["backbone.layers.1.mixer.switch_mlp.fc1.weight"]
+        fc2_w = original["backbone.layers.1.mixer.switch_mlp.fc2.weight"]
+
+        loaded = store.load_experts(1, [3])
+
+        np.testing.assert_array_equal(np.array(loaded.up_weight[0]), fc1_w[3])
+        np.testing.assert_array_equal(np.array(loaded.down_weight[0]), fc2_w[3])

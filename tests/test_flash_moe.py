@@ -3,7 +3,10 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from tests.test_flash_moe_bundler import _make_synthetic_moe_weights
+from tests.test_flash_moe_bundler import (
+    _make_synthetic_moe_weights,
+    _make_synthetic_nemotron_moe_weights,
+)
 
 
 def _setup_flash_moe(tmp_path, hidden=64, inter=32, experts=8, num_experts_per_tok=2):
@@ -134,3 +137,86 @@ class TestFlashMoE:
 
         output = flash_moe(x, inds, scores)
         assert output.shape == (batch_size, seq_len, hidden)
+
+
+def _setup_nemotron_flash_moe(
+    tmp_path, hidden=64, inter=32, experts=8, num_experts_per_tok=2
+):
+    """Create bundled Nemotron fc1/fc2 MoE weights and return a FlashMoE instance."""
+    model_dir = _make_synthetic_nemotron_moe_weights(
+        hidden, inter, experts, 2, "ME", tmp_path
+    )
+    output_dir = tmp_path / "flash_moe"
+
+    from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+    bundle_moe_experts(model_dir, output_dir)
+
+    from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+    store = FlashMoeWeightStore(output_dir, num_io_threads=4, cache_budget_experts=16)
+
+    from olmlx.engine.flash.flash_moe import FlashMoE
+
+    # Nemotron uses relu2 (ReLU²) activation — no gating
+    def relu2(x):
+        return mx.square(nn.relu(x))
+
+    flash_moe = FlashMoE(
+        layer_idx=1,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        num_experts=experts,
+        num_experts_per_tok=num_experts_per_tok,
+        weight_store=store,
+        activation=relu2,
+    )
+
+    return flash_moe, store, model_dir
+
+
+class TestFlashMoENemotron:
+    """Test FlashMoE with non-gated fc1/fc2 expert style (Nemotron-H)."""
+
+    def test_output_shape(self, tmp_path):
+        """FlashMoE with fc1/fc2 experts should produce correct output shape."""
+        hidden, inter, experts = 64, 32, 8
+        flash_moe, _, _ = _setup_nemotron_flash_moe(tmp_path, hidden, inter, experts)
+
+        x = mx.random.normal((2, 3, hidden))
+        inds = mx.array([[[0, 3], [1, 5], [2, 7]], [[3, 5], [2, 4], [6, 7]]])
+        scores = mx.ones(inds.shape, dtype=mx.float32) * 0.5
+
+        output = flash_moe(x, inds, scores)
+        assert output.shape == x.shape
+
+    def test_matches_manual_computation(self, tmp_path):
+        """FlashMoE fc1/fc2 output should match manual: relu2(x @ fc1.T) @ fc2.T."""
+        hidden, inter, experts = 32, 16, 4
+        flash_moe, _, model_dir = _setup_nemotron_flash_moe(
+            tmp_path, hidden, inter, experts, num_experts_per_tok=2
+        )
+
+        from safetensors.numpy import load_file
+
+        original = load_file(str(model_dir / "model.safetensors"))
+        fc1_w = mx.array(original["backbone.layers.1.mixer.switch_mlp.fc1.weight"])
+        fc2_w = mx.array(original["backbone.layers.1.mixer.switch_mlp.fc2.weight"])
+
+        x = mx.random.normal((1, 1, hidden))
+        inds = mx.array([[[0, 2]]])
+        scores = mx.array([[[0.6, 0.4]]])
+
+        output = flash_moe(x, inds, scores)
+        mx.eval(output)
+
+        # Manual: relu2(x @ fc1.T) @ fc2.T
+        x_flat = x.reshape(1, hidden)
+        manual_output = mx.zeros((1, hidden))
+        for eidx, score in [(0, 0.6), (2, 0.4)]:
+            h = x_flat @ fc1_w[eidx].T
+            activated = mx.square(nn.relu(h))
+            expert_out = activated @ fc2_w[eidx].T
+            manual_output = manual_output + expert_out * score
+
+        assert mx.allclose(output.reshape(1, hidden), manual_output, atol=1e-3)
