@@ -28,7 +28,7 @@ _STR_TO_NP_DTYPE = {
     "int8": np.int8,
 }
 
-# Map fc1/fc2 projection names to canonical gate/up/down names
+# fc1/fc2 models are non-gated; "gate" is intentionally absent so gate_weight → None
 _PROJ_ALIAS = {"fc1": "up", "fc2": "down"}
 
 # Map dtype string to mlx dtype

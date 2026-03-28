@@ -243,7 +243,11 @@ def _detect_moe_layers(config: dict) -> list[int]:
     pattern = config.get("hybrid_override_pattern")
     if pattern is not None:
         num_layers = config.get("num_hidden_layers") or config.get("num_layers", 0)
-        if num_layers and len(pattern) != num_layers:
+        if not num_layers:
+            raise ValueError(
+                "hybrid_override_pattern is set but num_hidden_layers is missing or 0"
+            )
+        if len(pattern) != num_layers:
             raise ValueError(
                 f"hybrid_override_pattern length ({len(pattern)}) != "
                 f"num_hidden_layers ({num_layers})"
