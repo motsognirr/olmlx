@@ -1278,11 +1278,14 @@ class TestDeferredInferenceCleanup:
         mock_thread.join = MagicMock()
         mock_stream._thread = mock_thread
 
+        # Reset lazy lock for this test's event loop
+        _inf_mod._deferred_cleanup_lock = None
+
         # Manually acquire the lock to simulate _stream_completion holding it
         await _inference_lock.acquire()
 
         with patch("olmlx.engine.inference._safe_sync") as mock_safe_sync:
-            _schedule_deferred_inference_cleanup(mock_stream)
+            await _schedule_deferred_inference_cleanup(mock_stream)
             await _inf_mod._deferred_cleanup_task
 
         # _safe_sync should have been called (after thread exited)
@@ -1299,11 +1302,14 @@ class TestDeferredInferenceCleanup:
         mock_thread.join = MagicMock()
         mock_stream._thread = mock_thread
 
+        # Reset lazy lock for this test's event loop
+        _inf_mod._deferred_cleanup_lock = None
+
         await _inference_lock.acquire()
         assert _inference_lock.locked()
 
         with patch("olmlx.engine.inference._safe_sync"):
-            _schedule_deferred_inference_cleanup(mock_stream)
+            await _schedule_deferred_inference_cleanup(mock_stream)
             # Task is running — lock should still be held initially
             assert _inference_lock.locked()
             # Wait for deferred task to complete
@@ -1430,7 +1436,7 @@ class TestEstimateKvCacheBytes:
         return model
 
     def test_basic_estimate(self):
-        """KV cache bytes = layers * 2 * kv_heads * head_dim * tokens * 2."""
+        """KV cache bytes = layers * 2 * kv_heads * head_dim * tokens * 2 * MEMORY_SAFETY_FACTOR."""
         model = self._make_model(
             num_hidden_layers=32,
             num_attention_heads=32,
@@ -1438,9 +1444,10 @@ class TestEstimateKvCacheBytes:
             hidden_size=4096,
         )
         # head_dim = 4096 / 32 = 128
-        # expected = 32 * 2 * 8 * 128 * 1000 * 2 = 131_072_000
+        # raw = 32 * 2 * 8 * 128 * 1000 * 2 = 131_072_000
+        # expected = int(131_072_000 * 1.3) = 170_393_600
         result = _estimate_kv_cache_bytes(model, 1000)
-        assert result == 131_072_000
+        assert result == int(131_072_000 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_zero_tokens(self):
         model = self._make_model()
@@ -1456,9 +1463,9 @@ class TestEstimateKvCacheBytes:
         # Delete num_key_value_heads so hasattr returns False
         del model.args.num_key_value_heads
         # head_dim = 128, kv_heads = 32 (fallback)
-        # expected = 32 * 2 * 32 * 128 * 100 * 2 = 52_428_800
+        # raw = 32 * 2 * 32 * 128 * 100 * 2 = 52_428_800
         result = _estimate_kv_cache_bytes(model, 100)
-        assert result == 52_428_800
+        assert result == int(52_428_800 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_large_prompt(self):
         """Test with a 22k token prompt (the crash scenario)."""
@@ -1469,9 +1476,9 @@ class TestEstimateKvCacheBytes:
             hidden_size=3584,
         )
         # head_dim = 3584 / 28 = 128
-        # expected = 28 * 2 * 4 * 128 * 22000 * 2 = 1_261_568_000 (~1.2 GB)
+        # raw = 28 * 2 * 4 * 128 * 22000 * 2 = 1_261_568_000 (~1.2 GB)
         result = _estimate_kv_cache_bytes(model, 22000)
-        assert result == 1_261_568_000
+        assert result == int(1_261_568_000 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_explicit_head_dim(self):
         """When model.args.head_dim exists, use it instead of hidden_size // num_heads."""
@@ -1482,9 +1489,9 @@ class TestEstimateKvCacheBytes:
             hidden_size=4096,
             head_dim=256,
         )
-        # expected = 32 * 2 * 8 * 256 * 100 * 2 = 26_214_400
+        # raw = 32 * 2 * 8 * 256 * 100 * 2 = 26_214_400
         result = _estimate_kv_cache_bytes(model, 100)
-        assert result == 26_214_400
+        assert result == int(26_214_400 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_vlm_fallback_to_language_model_args(self):
         """Falls back to model.language_model.args for VLM models."""
@@ -1497,7 +1504,7 @@ class TestEstimateKvCacheBytes:
             hidden_size=4096,
         )
         result = _estimate_kv_cache_bytes(model, 1000)
-        assert result == 131_072_000
+        assert result == int(131_072_000 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_raises_when_no_args_found(self):
         """Raises AttributeError when model has no discoverable args."""

@@ -51,6 +51,12 @@ class CancellableStream:
         self._queue: asyncio.Queue | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        self._thread_stuck = False
+
+    @property
+    def thread_stuck(self) -> bool:
+        """True if drain_and_join timed out with the thread still alive (Bug #120)."""
+        return self._thread_stuck
 
     def start(self):
         self._loop = asyncio.get_running_loop()
@@ -203,6 +209,7 @@ class CancellableStream:
                 except Exception:
                     pass
             if self._thread.is_alive():
+                self._thread_stuck = True
                 if join_attempted:
                     logger.error(
                         "drain_and_join: thread still alive after %.1fs timeout — "

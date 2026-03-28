@@ -1,12 +1,13 @@
 import asyncio
+import collections.abc
 import contextlib
+import copy
 import gc
 import importlib
 import json
 import logging
 import threading
 import time
-import collections.abc
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -218,8 +219,21 @@ _generation_streams = _resolve_generation_streams()
 # we sacrifice parallelism for stability on Apple Silicon.
 _inference_lock = asyncio.Lock()
 _deferred_cleanup_task: asyncio.Task | None = None
+_deferred_cleanup_lock: asyncio.Lock | None = None
 # Tracks requests waiting for _inference_lock (not the _await_deferred_cleanup wait).
 _queue_depth = 0
+
+
+def _get_deferred_cleanup_lock() -> asyncio.Lock:
+    """Lazily create the deferred cleanup lock in the current event loop (Bug #119).
+
+    Module-level asyncio.Lock() binds to the loop at creation time, which
+    breaks in tests that create fresh event loops.
+    """
+    global _deferred_cleanup_lock
+    if _deferred_cleanup_lock is None:
+        _deferred_cleanup_lock = asyncio.Lock()
+    return _deferred_cleanup_lock
 
 
 def _safe_sync():
@@ -257,19 +271,21 @@ async def _await_deferred_cleanup():
 
     Raises ServerBusyError if cleanup doesn't finish within _DEFERRED_WAIT_TIMEOUT.
     Uses asyncio.wait() to avoid Python 3.11 wait_for race conditions.
+    Uses _deferred_cleanup_lock to prevent TOCTOU races on _deferred_cleanup_task (Bug #119).
     """
-    if _deferred_cleanup_task is not None and not _deferred_cleanup_task.done():
-        logger.info("Waiting for deferred GPU cleanup to complete")
-        done, _ = await asyncio.wait(
-            {_deferred_cleanup_task}, timeout=_DEFERRED_WAIT_TIMEOUT
-        )
-        if not done:
-            raise ServerBusyError(
-                f"Server busy: deferred GPU cleanup did not complete within {_DEFERRED_WAIT_TIMEOUT}s"
+    async with _get_deferred_cleanup_lock():
+        if _deferred_cleanup_task is not None and not _deferred_cleanup_task.done():
+            logger.info("Waiting for deferred GPU cleanup to complete")
+            done, _ = await asyncio.wait(
+                {_deferred_cleanup_task}, timeout=_DEFERRED_WAIT_TIMEOUT
             )
+            if not done:
+                raise ServerBusyError(
+                    f"Server busy: deferred GPU cleanup did not complete within {_DEFERRED_WAIT_TIMEOUT}s"
+                )
 
 
-def _schedule_deferred_inference_cleanup(stream) -> None:
+async def _schedule_deferred_inference_cleanup(stream) -> None:
     """Schedule deferred GPU cleanup when the inference thread is stuck.
 
     Polls the thread until it exits, then syncs Metal and releases the
@@ -279,60 +295,72 @@ def _schedule_deferred_inference_cleanup(stream) -> None:
     If the thread doesn't exit within _DEFERRED_CLEANUP_TIMEOUT seconds,
     releases the lock anyway (risk of Metal crash on next inference, but
     better than permanent deadlock).
+
+    Uses _deferred_cleanup_lock to prevent TOCTOU races on _deferred_cleanup_task (Bug #119).
     """
     global _deferred_cleanup_task
 
-    if _deferred_cleanup_task is not None and not _deferred_cleanup_task.done():
-        logger.error(
-            "Deferred inference cleanup already in progress — "
-            "this should not happen while the inference lock is held"
-        )
-        return  # do not create a second task; the existing one will release the lock
+    async with _get_deferred_cleanup_lock():
+        if _deferred_cleanup_task is not None and not _deferred_cleanup_task.done():
+            logger.error(
+                "Deferred inference cleanup already in progress — "
+                "this should not happen while the inference lock is held"
+            )
+            return  # do not create a second task; the existing one will release the lock
 
-    async def _cleanup():
-        thread = stream._thread
-        deadline = time.monotonic() + _DEFERRED_CLEANUP_TIMEOUT
-        try:
-            while thread is not None and thread.is_alive():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    logger.error(
-                        "Deferred inference cleanup: thread still alive after %ds — "
-                        "releasing lock anyway (risk of Metal crash on next inference)",
-                        _DEFERRED_CLEANUP_TIMEOUT,
-                    )
-                    break
-                try:
-                    wait = min(30, remaining)
-                    await asyncio.to_thread(thread.join, wait)
-                except BaseException as exc:
-                    logger.warning(
-                        "Deferred inference cleanup: poll loop aborted (%s) — "
-                        "releasing lock (thread may still be alive)",
-                        type(exc).__name__,
-                    )
-                    break  # finally will release the lock
-            else:
-                logger.info("Deferred inference cleanup: thread exited cleanly")
-        finally:
-            if thread is None or not thread.is_alive():
-                _safe_sync()
-            # Note: on timeout/abort with thread still alive, releasing the
-            # lock risks a Metal crash on the next inference (the stuck thread
-            # may still be issuing GPU commands).  Python can't kill CPU-bound
-            # threads, so this is the "least bad" option vs permanent deadlock.
-            _inference_lock.release()
-            logger.info("Deferred inference cleanup: lock released")
-            global _deferred_cleanup_task
-            _deferred_cleanup_task = None
+        async def _cleanup():
+            thread = stream._thread
+            deadline = time.monotonic() + _DEFERRED_CLEANUP_TIMEOUT
+            try:
+                while thread is not None and thread.is_alive():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.error(
+                            "Deferred inference cleanup: thread still alive after %ds — "
+                            "releasing lock anyway (risk of Metal crash on next inference)",
+                            _DEFERRED_CLEANUP_TIMEOUT,
+                        )
+                        break
+                    try:
+                        wait = min(30, remaining)
+                        await asyncio.to_thread(thread.join, wait)
+                    except BaseException as exc:
+                        logger.warning(
+                            "Deferred inference cleanup: poll loop aborted (%s) — "
+                            "releasing lock (thread may still be alive)",
+                            type(exc).__name__,
+                        )
+                        break  # finally will release the lock
+                else:
+                    logger.info("Deferred inference cleanup: thread exited cleanly")
+            finally:
+                if thread is None or not thread.is_alive():
+                    _safe_sync()
+                # Note: on timeout/abort with thread still alive, releasing the
+                # lock risks a Metal crash on the next inference (the stuck thread
+                # may still be issuing GPU commands).  Python can't kill CPU-bound
+                # threads, so this is the "least bad" option vs permanent deadlock.
+                _inference_lock.release()
+                logger.info("Deferred inference cleanup: lock released")
+                async with _get_deferred_cleanup_lock():
+                    global _deferred_cleanup_task
+                    _deferred_cleanup_task = None
 
-    _deferred_cleanup_task = asyncio.create_task(_cleanup())
+        _deferred_cleanup_task = asyncio.create_task(_cleanup())
+
+
+MEMORY_SAFETY_FACTOR = 1.3
+"""Safety multiplier for KV cache memory estimates (Bug #125).
+
+Metal alignment, intermediate buffers, and allocator overhead can cause actual
+memory usage to exceed the raw 2-bytes-per-element calculation by 20-30%.
+"""
 
 
 def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
     """Estimate KV cache memory for a given number of tokens.
 
-    Formula: num_layers * 2 (K+V) * num_kv_heads * head_dim * num_tokens * bytes_per_element
+    Formula: num_layers * 2 (K+V) * num_kv_heads * head_dim * num_tokens * bytes_per_element * MEMORY_SAFETY_FACTOR
     """
     if num_tokens <= 0:
         return 0
@@ -354,7 +382,8 @@ def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
         args.head_dim if hasattr(args, "head_dim") else args.hidden_size // num_heads
     )
     bytes_per_element = 2  # float16/bfloat16
-    return num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
+    raw = num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
+    return int(raw * MEMORY_SAFETY_FACTOR)
 
 
 def _tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
@@ -451,12 +480,18 @@ def _inference_ref(lm: LoadedModel):
     Python reference to the LoadedModel object, so the model and tokenizer
     remain alive in memory.  The only side-effect is that the next request
     would re-load the model into ``_loaded``.
+
+    Bug #118: Python ``+=`` on int is not atomic. Concurrent async tasks can
+    race on ``active_refs``. Use the model's ``_active_refs_lock`` to protect
+    increments and decrements.
     """
-    lm.active_refs += 1
+    with lm._active_refs_lock:
+        lm.active_refs += 1
     try:
         yield
     finally:
-        lm.active_refs -= 1
+        with lm._active_refs_lock:
+            lm.active_refs -= 1
         # Refresh expiry so the model doesn't expire immediately after inference
         ka = parse_keep_alive(settings.default_keep_alive)
         if ka is not None:
@@ -849,6 +884,7 @@ async def _stream_completion(
             lm.prompt_cache_store.evict_all_to_disk()
             gc.collect()
             mx.clear_cache()
+            _safe_sync()  # Bug #120: ensure freed buffers are reclaimed
             memory_too_high = memory_utils.is_memory_pressure_high(
                 settings.memory_limit_fraction
             )
@@ -895,10 +931,13 @@ async def _stream_completion(
             )
 
             if prefix_len > 0 and suffix_start > 0:
+                # Bug #123: Deep-copy the cache before trimming so the store's
+                # copy is not corrupted if the client disconnects mid-stream.
+                working_cache = copy.deepcopy(cached.cache)
                 # Trim cache to suffix_start so it aligns with where we resume
                 trim_amount = len(cached.tokens) - suffix_start
                 if trim_amount > 0:
-                    trim_prompt_cache(cached.cache, trim_amount)
+                    trim_prompt_cache(working_cache, trim_amount)
 
                 suffix_tokens = prompt_tokens[suffix_start:]
 
@@ -914,7 +953,7 @@ async def _stream_completion(
                     len(suffix_tokens),
                     len(prompt_tokens),
                 )
-                gen_kwargs["prompt_cache"] = cached.cache
+                gen_kwargs["prompt_cache"] = working_cache
                 if lm.is_vlm:
                     # VLM stream_generate expects a string prompt; pass
                     # pre-tokenized tokens via input_ids to bypass prepare_inputs.
@@ -1266,7 +1305,7 @@ async def _stream_completion(
                 "Inference thread still alive after cleanup attempts — "
                 "deferring Metal sync and lock release until thread exits"
             )
-            _schedule_deferred_inference_cleanup(stream)
+            await _schedule_deferred_inference_cleanup(stream)
         else:
             # Normal path — thread exited, safe to sync and release.
             _safe_sync()
@@ -1564,47 +1603,50 @@ async def generate_embeddings(
     lm = await manager.ensure_loaded(model_name, keep_alive)
 
     async with _inference_locked():
-        embeddings = []
+        with _inference_ref(lm):
+            embeddings = []
 
-        tokenizer = lm.text_tokenizer
+            tokenizer = lm.text_tokenizer
 
-        # Check if model has a static embedding layer we can use directly
-        embed_layer = None
-        model_inner = getattr(lm.model, "model", lm.model)
-        if hasattr(model_inner, "embed_tokens"):
-            embed_layer = model_inner.embed_tokens
+            # Check if model has a static embedding layer we can use directly
+            embed_layer = None
+            model_inner = getattr(lm.model, "model", lm.model)
+            if hasattr(model_inner, "embed_tokens"):
+                embed_layer = model_inner.embed_tokens
 
-        for text in texts:
-            tokens = tokenizer.encode(text)
-            input_ids = mx.array([tokens])
+            for text in texts:
+                tokens = tokenizer.encode(text)
+                input_ids = mx.array([tokens])
 
-            if embed_layer is not None:
-                # Use static token embeddings — no forward pass needed
-                hidden = embed_layer(input_ids)
-            else:
-                outputs = lm.model(input_ids)
-                if hasattr(outputs, "hidden_states") and outputs.hidden_states:
-                    hidden = outputs.hidden_states[-1]
-                elif hasattr(outputs, "last_hidden_state"):
-                    hidden = outputs.last_hidden_state
+                if embed_layer is not None:
+                    # Use static token embeddings — no forward pass needed
+                    hidden = embed_layer(input_ids)
                 else:
-                    hidden = outputs
+                    outputs = lm.model(input_ids)
+                    if hasattr(outputs, "hidden_states") and outputs.hidden_states:
+                        hidden = outputs.hidden_states[-1]
+                    elif hasattr(outputs, "last_hidden_state"):
+                        hidden = outputs.last_hidden_state
+                    else:
+                        hidden = outputs
 
-            # Robust shape handling
-            if hidden.ndim == 3:
-                # (batch, seq, dim) — mean-pool over sequence
-                embedding = mx.mean(hidden[0], axis=0)
-            elif hidden.ndim == 2:
-                # (seq, dim) — mean-pool over sequence
-                embedding = mx.mean(hidden, axis=0)
-            elif hidden.ndim == 1:
-                embedding = hidden
-            else:
-                raise ValueError(f"Unexpected embedding tensor shape: {hidden.shape}")
+                # Robust shape handling
+                if hidden.ndim == 3:
+                    # (batch, seq, dim) — mean-pool over sequence
+                    embedding = mx.mean(hidden[0], axis=0)
+                elif hidden.ndim == 2:
+                    # (seq, dim) — mean-pool over sequence
+                    embedding = mx.mean(hidden, axis=0)
+                elif hidden.ndim == 1:
+                    embedding = hidden
+                else:
+                    raise ValueError(
+                        f"Unexpected embedding tensor shape: {hidden.shape}"
+                    )
 
-            embeddings.append(embedding.tolist())
+                embeddings.append(embedding.tolist())
 
-        # Defensive sync — _inference_locked exit also syncs, but this
-        # ensures embedding tensors are fully evaluated before .tolist().
-        mx.synchronize()
-        return embeddings
+            # Defensive sync — _inference_locked exit also syncs, but this
+            # ensures embedding tensors are fully evaluated before .tolist().
+            mx.synchronize()
+            return embeddings

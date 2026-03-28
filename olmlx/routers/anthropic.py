@@ -584,8 +584,9 @@ async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request
     if req.thinking is not None:
         enable_thinking = _THINKING_TYPE_MAP.get(req.thinking.type)
 
-    lm.active_refs += 1
-    try:
+    from olmlx.engine.inference import _inference_ref
+
+    with _inference_ref(lm):
         loop = asyncio.get_running_loop()
         token_count = await loop.run_in_executor(
             None,
@@ -598,8 +599,6 @@ async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request
                 enable_thinking=enable_thinking,
             ),
         )
-    finally:
-        lm.active_refs -= 1
     return AnthropicTokenCountResponse(input_tokens=token_count)
 
 

@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import shutil
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -270,6 +271,7 @@ class LoadedModel:
     expires_at: float | None = None
     size_bytes: int = 0
     active_refs: int = 0
+    _active_refs_lock: threading.Lock = field(default_factory=threading.Lock)
     prompt_cache_store: PromptCacheStore = field(default=None)  # type: ignore[assignment]
 
     def __post_init__(self):
