@@ -430,3 +430,208 @@ class TestBundleMoeExperts:
 
         assert 0 in layouts
         assert layouts[0].num_experts == experts
+
+
+def _make_synthetic_minimax_moe_weights(
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_moe_layers: int,
+    tmp_path: Path,
+    quantized: bool = False,
+) -> Path:
+    """Create synthetic safetensors with MiniMax-style block_sparse_moe naming.
+
+    MiniMax uses block_sparse_moe instead of mlp as the MoE module name:
+      model.layers.{l}.block_sparse_moe.switch_mlp.gate_proj.weight
+    """
+    from safetensors.numpy import save_file
+
+    rng = np.random.RandomState(42)
+    tensors = {}
+
+    for layer in range(num_moe_layers):
+        prefix = f"model.layers.{layer}.block_sparse_moe"
+
+        # Router weights
+        tensors[f"{prefix}.gate.weight"] = rng.randn(num_experts, hidden_size).astype(
+            np.float16
+        )
+
+        if not quantized:
+            tensors[f"{prefix}.switch_mlp.gate_proj.weight"] = rng.randn(
+                num_experts, intermediate_size, hidden_size
+            ).astype(np.float16)
+            tensors[f"{prefix}.switch_mlp.up_proj.weight"] = rng.randn(
+                num_experts, intermediate_size, hidden_size
+            ).astype(np.float16)
+            tensors[f"{prefix}.switch_mlp.down_proj.weight"] = rng.randn(
+                num_experts, hidden_size, intermediate_size
+            ).astype(np.float16)
+        else:
+            group_size = 32
+            bits = 4
+            gate_packed_dim = hidden_size * bits // 32
+            down_packed_dim = intermediate_size * bits // 32
+
+            for proj, out_dim, packed_dim, in_dim in [
+                ("gate_proj", intermediate_size, gate_packed_dim, hidden_size),
+                ("up_proj", intermediate_size, gate_packed_dim, hidden_size),
+                ("down_proj", hidden_size, down_packed_dim, intermediate_size),
+            ]:
+                tensors[f"{prefix}.switch_mlp.{proj}.weight"] = rng.randint(
+                    0, 2**31, (num_experts, out_dim, packed_dim)
+                ).astype(np.uint32)
+                tensors[f"{prefix}.switch_mlp.{proj}.scales"] = rng.randn(
+                    num_experts, out_dim, in_dim // group_size
+                ).astype(np.float16)
+                tensors[f"{prefix}.switch_mlp.{proj}.biases"] = rng.randn(
+                    num_experts, out_dim, in_dim // group_size
+                ).astype(np.float16)
+
+    # Non-MLP weights
+    tensors["model.embed_tokens.weight"] = rng.randn(100, hidden_size).astype(
+        np.float16
+    )
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    save_file(tensors, str(model_dir / "model.safetensors"))
+
+    # MiniMax config: all layers are MoE, no moe_layer_freq
+    config = {
+        "hidden_size": hidden_size,
+        "intermediate_size": intermediate_size,
+        "num_hidden_layers": num_moe_layers,
+        "num_local_experts": num_experts,
+        "num_experts_per_tok": 2,
+        "model_type": "minimax_m2",
+    }
+    if quantized:
+        config["quantization"] = {"bits": 4, "group_size": 32}
+    (model_dir / "config.json").write_text(json.dumps(config))
+
+    return model_dir
+
+
+class TestBundleMiniMaxMoeExperts:
+    """Test bundler with MiniMax-style block_sparse_moe weight naming."""
+
+    def test_detect_block_sparse_moe_prefix(self, tmp_path):
+        """Should detect block_sparse_moe.switch_mlp as the expert prefix."""
+        hidden, inter, experts = 64, 32, 4
+        model_dir = _make_synthetic_minimax_moe_weights(
+            hidden, inter, experts, 1, tmp_path
+        )
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        layouts = bundle_moe_experts(model_dir, tmp_path / "flash_moe")
+
+        assert 0 in layouts
+        assert layouts[0].num_experts == experts
+
+    def test_bundle_preserves_minimax_expert_data(self, tmp_path):
+        """Bundled data should match original block_sparse_moe weights."""
+        hidden, inter, experts = 64, 32, 8
+        model_dir = _make_synthetic_minimax_moe_weights(
+            hidden, inter, experts, 1, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from safetensors.numpy import load_file
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        original = load_file(str(model_dir / "model.safetensors"))
+        gate_w = original["model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight"]
+
+        layouts = bundle_moe_experts(model_dir, output_dir)
+        layout = layouts[0]
+
+        expert_idx = 3
+        expert_offset = int(layout.offsets[expert_idx])
+        with open(layout.file_path, "rb") as f:
+            f.seek(expert_offset)
+            raw = f.read(inter * hidden * 2)  # gate_proj float16
+
+        gate_read = np.frombuffer(raw, dtype=np.float16).reshape(inter, hidden)
+        np.testing.assert_array_equal(gate_read, gate_w[expert_idx])
+
+    def test_bundle_quantized_minimax(self, tmp_path):
+        """Quantized MiniMax model should bundle correctly."""
+        hidden, inter, experts = 64, 32, 4
+        model_dir = _make_synthetic_minimax_moe_weights(
+            hidden, inter, experts, 1, tmp_path, quantized=True
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from olmlx.engine.flash.moe_bundler import (
+            MOE_HEADER_SIZE,
+            bundle_moe_experts,
+            parse_moe_header,
+        )
+
+        layouts = bundle_moe_experts(model_dir, output_dir)
+        layout = layouts[0]
+
+        with open(layout.file_path, "rb") as f:
+            header = parse_moe_header(f.read(MOE_HEADER_SIZE))
+        assert header["is_quantized"] is True
+        assert header["bits"] == 4
+
+    def test_bundle_sharded_minimax(self, tmp_path):
+        """Should handle sharded MiniMax models via safetensors index."""
+        from safetensors.numpy import save_file
+
+        hidden, inter, experts = 64, 32, 4
+        rng = np.random.RandomState(99)
+
+        model_dir = tmp_path / "sharded_model"
+        model_dir.mkdir()
+
+        # Shard 1: gate_proj
+        shard1 = {
+            "model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight": rng.randn(
+                experts, inter, hidden
+            ).astype(np.float16),
+            "model.layers.0.block_sparse_moe.gate.weight": rng.randn(
+                experts, hidden
+            ).astype(np.float16),
+        }
+        save_file(shard1, str(model_dir / "model-00001-of-00002.safetensors"))
+
+        # Shard 2: up_proj and down_proj
+        shard2 = {
+            "model.layers.0.block_sparse_moe.switch_mlp.up_proj.weight": rng.randn(
+                experts, inter, hidden
+            ).astype(np.float16),
+            "model.layers.0.block_sparse_moe.switch_mlp.down_proj.weight": rng.randn(
+                experts, hidden, inter
+            ).astype(np.float16),
+        }
+        save_file(shard2, str(model_dir / "model-00002-of-00002.safetensors"))
+
+        # Index
+        weight_map = {k: "model-00001-of-00002.safetensors" for k in shard1}
+        weight_map.update({k: "model-00002-of-00002.safetensors" for k in shard2})
+        (model_dir / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+
+        # Config
+        config = {
+            "hidden_size": hidden,
+            "intermediate_size": inter,
+            "num_hidden_layers": 1,
+            "num_local_experts": experts,
+            "num_experts_per_tok": 2,
+            "model_type": "minimax_m2",
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        layouts = bundle_moe_experts(model_dir, tmp_path / "flash_moe")
+        assert 0 in layouts
+        assert layouts[0].num_experts == experts

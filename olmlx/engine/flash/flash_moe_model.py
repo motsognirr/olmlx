@@ -116,6 +116,47 @@ class _FlashMoEQwen3Next(nn.Module):
         return y + shared_y
 
 
+class _FlashMoEMiniMax(nn.Module):
+    """Replacement MoE layer for MiniMax-style models.
+
+    Gate is nn.Linear returning logits; uses sigmoid scoring with
+    e_score_correction_bias for expert selection.
+    """
+
+    def __init__(self, original_moe, flash_moe: FlashMoE):
+        super().__init__()
+        if getattr(original_moe, "sharding_group", None) is not None:
+            raise NotImplementedError(
+                "Flash-MoE does not support distributed tensor parallelism. "
+                "Each rank loads all needed experts, so all_sum would produce "
+                "incorrect results. Disable distributed or Flash-MoE."
+            )
+        self.gate = original_moe.gate
+        self.num_experts_per_tok = original_moe.num_experts_per_tok
+        self.e_score_correction_bias = original_moe.e_score_correction_bias
+        self._flash_moe = flash_moe
+        if hasattr(original_moe, "shared_experts"):
+            self.shared_experts = original_moe.shared_experts
+
+    def __call__(self, x):
+        gates = self.gate(x.astype(mx.float32))
+        scores = mx.sigmoid(gates)
+        orig_scores = scores
+        scores = scores + self.e_score_correction_bias
+
+        k = self.num_experts_per_tok
+        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+        scores = scores.astype(x.dtype)
+
+        y = self._flash_moe(x, inds, scores)
+        y = y.astype(x.dtype)
+        if hasattr(self, "shared_experts"):
+            y = y + self.shared_experts(x)
+        return y
+
+
 class FlashMoeModelWrapper(nn.Module):
     """Wraps an mlx-lm model for Flash-MoE inference.
 
@@ -166,6 +207,21 @@ class FlashMoeModelWrapper(nn.Module):
         return self._model.args
 
 
+def _find_moe_module(layer: nn.Module) -> tuple[str, nn.Module]:
+    """Find the MoE module on a decoder layer.
+
+    Returns (attr_name, module) — the attribute may be 'mlp' (DeepSeek,
+    Qwen3-Next, gpt-oss) or 'block_sparse_moe' (MiniMax).
+    """
+    for attr in ("mlp", "block_sparse_moe"):
+        mod = getattr(layer, attr, None)
+        if mod is not None:
+            return attr, mod
+    raise AttributeError(
+        f"Layer {layer} has neither 'mlp' nor 'block_sparse_moe' attribute"
+    )
+
+
 def _replace_moe_layers(
     model: nn.Module,
     weight_store: FlashMoeWeightStore,
@@ -181,7 +237,7 @@ def _replace_moe_layers(
 
     for layer_idx in moe_layer_indices:
         layer = layers[layer_idx]
-        moe_module = layer.mlp
+        moe_attr, moe_module = _find_moe_module(layer)
 
         # Extract activation function from the original SwitchGLU before we delete it
         activation = None
@@ -203,14 +259,20 @@ def _replace_moe_layers(
         )
 
         # Detect router style and create appropriate replacement.
-        # Qwen3-Next: gate is a linear layer (nn.Linear or QuantizedLinear) returning logits; we apply softmax.
-        # DeepSeek-V3: gate is a custom module returning (inds, scores) directly.
+        # Structural checks use gate type: nn.Linear (or QuantizedLinear)
+        # returns logits; custom gate modules return (inds, scores) directly.
         gate = getattr(moe_module, "gate", None)
-        if hasattr(moe_module, "shared_expert_gate") and gate is not None:
+        gate_is_linear = isinstance(gate, (nn.Linear,)) or (
+            hasattr(nn, "QuantizedLinear") and isinstance(gate, nn.QuantizedLinear)
+        )
+        if hasattr(moe_module, "shared_expert_gate") and gate_is_linear:
             # Qwen3-Next style: linear gate + shared_expert + shared_expert_gate
             replacement = _FlashMoEQwen3Next(moe_module, flash_moe)
+        elif gate_is_linear and hasattr(moe_module, "e_score_correction_bias"):
+            # MiniMax style: linear gate with sigmoid scoring + correction bias
+            replacement = _FlashMoEMiniMax(moe_module, flash_moe)
         elif gate is not None:
-            # DeepSeek-V3 / Kimi-K2.5 style: gate returns (inds, scores)
+            # DeepSeek-V3 / Kimi-K2.5 style: custom gate returns (inds, scores)
             replacement = _FlashMoEDeepSeek(moe_module, flash_moe)
         else:
             # gpt-oss style (has router + experts)
@@ -226,8 +288,8 @@ def _replace_moe_layers(
                 delattr(moe_module, attr)
                 break
 
-        # Replace the entire mlp module
-        layer.mlp = replacement
+        # Replace the MoE module on the layer
+        setattr(layer, moe_attr, replacement)
         replaced += 1
 
     gc.collect()
