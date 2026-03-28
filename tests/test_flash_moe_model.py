@@ -412,3 +412,184 @@ class TestFlashMoeQwen3Next:
         result = wrapped.layers[1].mlp(x)
         mx.eval(result)
         assert result.shape == (1, 4, hidden)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic MiniMax-like model (block_sparse_moe instead of mlp)
+# ---------------------------------------------------------------------------
+
+
+class _MockMiniMaxSparseMoeBlock(nn.Module):
+    """Mock MiniMaxSparseMoeBlock — sigmoid routing with correction bias."""
+
+    def __init__(
+        self, hidden_size, intermediate_size, num_experts, num_experts_per_tok
+    ):
+        super().__init__()
+        self.num_experts_per_tok = num_experts_per_tok
+        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        self.switch_mlp = _MockSwitchGLU(hidden_size, intermediate_size, num_experts)
+        self.e_score_correction_bias = mx.zeros((num_experts,))
+        self.sharding_group = None
+
+    def __call__(self, x):
+        gates = self.gate(x.astype(mx.float32))
+        scores = mx.sigmoid(gates)
+        orig_scores = scores
+        scores = scores + self.e_score_correction_bias
+        k = self.num_experts_per_tok
+        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+        scores = scores.astype(x.dtype)
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+        return y
+
+
+class _MockMiniMaxDecoderLayer(nn.Module):
+    """MiniMax decoder layer: MoE is at block_sparse_moe, NOT mlp."""
+
+    def __init__(
+        self, hidden_size, intermediate_size, num_experts, num_experts_per_tok, is_moe
+    ):
+        super().__init__()
+        if is_moe:
+            self.block_sparse_moe = _MockMiniMaxSparseMoeBlock(
+                hidden_size, intermediate_size, num_experts, num_experts_per_tok
+            )
+        else:
+            self.mlp = _MockMLP(hidden_size, intermediate_size)
+
+
+class _MockMiniMaxModel(nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        num_experts_per_tok,
+        num_dense,
+        num_moe,
+    ):
+        super().__init__()
+        self.args = type(
+            "Args",
+            (),
+            {
+                "hidden_size": hidden_size,
+                "intermediate_size": intermediate_size,
+                "num_local_experts": num_experts,
+                "num_experts_per_tok": num_experts_per_tok,
+            },
+        )()
+        layers = []
+        for i in range(num_dense):
+            layers.append(
+                _MockMiniMaxDecoderLayer(
+                    hidden_size,
+                    intermediate_size,
+                    num_experts,
+                    num_experts_per_tok,
+                    is_moe=False,
+                )
+            )
+        for i in range(num_moe):
+            layers.append(
+                _MockMiniMaxDecoderLayer(
+                    hidden_size,
+                    intermediate_size,
+                    num_experts,
+                    num_experts_per_tok,
+                    is_moe=True,
+                )
+            )
+        self.layers = layers
+
+    def __call__(self, x, cache=None):
+        for layer in self.layers:
+            if hasattr(layer, "block_sparse_moe"):
+                x = layer.block_sparse_moe(x)
+            else:
+                x = layer.mlp(x)
+        return x
+
+
+class TestFlashMoeMiniMax:
+    @pytest.fixture()
+    def model_and_store(self, tmp_path):
+        from tests.test_flash_moe_bundler import _make_synthetic_minimax_moe_weights
+
+        hidden, inter, experts = 64, 32, 8
+        num_dense, num_moe = 0, 2
+        num_experts_per_tok = 2
+
+        model_dir = _make_synthetic_minimax_moe_weights(
+            hidden, inter, experts, num_moe, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        bundle_moe_experts(model_dir, output_dir)
+
+        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+        store = FlashMoeWeightStore(
+            output_dir, num_io_threads=4, cache_budget_experts=16
+        )
+
+        model = _MockMiniMaxModel(
+            hidden, inter, experts, num_experts_per_tok, num_dense, num_moe
+        )
+        return model, store, hidden, inter, experts, num_experts_per_tok
+
+    def test_replaces_block_sparse_moe_layers(self, model_and_store):
+        """MoE layers at block_sparse_moe should be replaced with FlashMoE."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+
+        moe_layer_indices = [0, 1]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        for i in [0, 1]:
+            layer = wrapped.layers[i]
+            # The MoE module should be replaced
+            moe_module = getattr(layer, "block_sparse_moe", None)
+            assert moe_module is not None
+            assert hasattr(moe_module, "_flash_moe")
+
+    def test_preserves_minimax_gate_and_bias(self, model_and_store):
+        """Gate and correction bias should be preserved in the wrapper."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+
+        moe_layer_indices = [0, 1]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        for i in [0, 1]:
+            moe = wrapped.layers[i].block_sparse_moe
+            assert hasattr(moe, "gate")
+            assert hasattr(moe, "e_score_correction_bias")
+
+    def test_minimax_forward_pass(self, model_and_store):
+        """Forward pass through MiniMax Flash-MoE wrapper should produce correct shape."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+
+        moe_layer_indices = [0, 1]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        x = mx.random.normal((1, 4, hidden))
+        result = wrapped.layers[0].block_sparse_moe(x)
+        mx.eval(result)
+        assert result.shape == (1, 4, hidden)

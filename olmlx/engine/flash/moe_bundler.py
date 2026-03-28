@@ -170,9 +170,21 @@ def _try_load_tensor(
 def _detect_expert_prefix(
     model_dir: Path, sample_layer: int, index: dict | None
 ) -> str:
-    """Detect whether expert weights use 'switch_mlp' or 'experts' prefix."""
-    for prefix in ("switch_mlp", "experts"):
-        name = f"model.layers.{sample_layer}.mlp.{prefix}.gate_proj.weight"
+    """Detect the full MoE weight prefix for expert projections.
+
+    Returns the prefix from ``model.layers.{i}.`` up to and including the
+    expert container, e.g. ``mlp.switch_mlp`` or ``block_sparse_moe.switch_mlp``.
+    """
+    # Try all known (moe_module, expert_container) combinations
+    _MOE_MODULES = ("mlp", "block_sparse_moe")
+    _EXPERT_CONTAINERS = ("switch_mlp", "experts")
+
+    candidates = [
+        f"{mod}.{cont}" for mod in _MOE_MODULES for cont in _EXPERT_CONTAINERS
+    ]
+
+    for prefix in candidates:
+        name = f"model.layers.{sample_layer}.{prefix}.gate_proj.weight"
         # Check index first (fast, no I/O)
         if index and name in index.get("weight_map", {}):
             return prefix
@@ -186,14 +198,14 @@ def _detect_expert_prefix(
         if sf_key not in _shard_cache:
             _shard_cache[sf_key] = mx.load(sf_key)
         tensors = _shard_cache[sf_key]
-        for prefix in ("switch_mlp", "experts"):
-            name = f"model.layers.{sample_layer}.mlp.{prefix}.gate_proj.weight"
+        for prefix in candidates:
+            name = f"model.layers.{sample_layer}.{prefix}.gate_proj.weight"
             if name in tensors:
                 return prefix
 
     raise ValueError(
         f"Cannot find expert weights for layer {sample_layer} "
-        f"(tried switch_mlp and experts prefixes)"
+        f"(tried prefixes: {', '.join(candidates)})"
     )
 
 
@@ -360,11 +372,11 @@ def bundle_moe_experts(
     layouts: dict[int, MoeExpertLayout] = {}
 
     try:
-        # Detect expert weight prefix: "switch_mlp" (DeepSeek-V3) or "experts" (gpt-oss)
+        # Detect expert weight prefix, e.g. "mlp.switch_mlp" or "block_sparse_moe.switch_mlp"
         expert_prefix = _detect_expert_prefix(model_dir, moe_layers[0], index)
 
         # Process first MoE layer to determine component manifest
-        first_prefix = f"model.layers.{moe_layers[0]}.mlp.{expert_prefix}"
+        first_prefix = f"model.layers.{moe_layers[0]}.{expert_prefix}"
         _, manifest = _collect_all_projections(model_dir, first_prefix, index)
         expert_byte_size = sum(entry["nbytes"] for entry in manifest)
 
@@ -379,7 +391,7 @@ def bundle_moe_experts(
             group_size = quant_config.get("group_size", 32)
             quant_mode = quant_config.get("mode", "affine")
         for layer_idx in moe_layers:
-            prefix = f"model.layers.{layer_idx}.mlp.{expert_prefix}"
+            prefix = f"model.layers.{layer_idx}.{expert_prefix}"
 
             all_components, layer_manifest = _collect_all_projections(
                 model_dir, prefix, index
