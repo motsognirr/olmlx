@@ -196,11 +196,11 @@ def make_turboquant_cache(model: Any, bits: int) -> list:
 
     # Get default cache layout from model if available (hybrid models
     # return different cache types per layer, e.g. ArraysCache for SSM)
-    try:
+    if hasattr(model, "make_cache"):
         default_caches = model.make_cache()
         if not isinstance(default_caches, list) or len(default_caches) != num_layers:
             default_caches = [None] * num_layers
-    except AttributeError:
+    else:
         default_caches = [None] * num_layers
 
     caches = []
