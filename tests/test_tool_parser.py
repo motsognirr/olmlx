@@ -337,6 +337,19 @@ class TestTryMinimax:
         tool_uses, remaining = _try_minimax(text)
         assert len(tool_uses) == 0
 
+    def test_invoke_with_extra_attributes(self):
+        text = (
+            "<minimax:tool_call>\n"
+            '<invoke name="foo" type="function">\n'
+            '<parameter name="x">1</parameter>\n'
+            "</invoke>\n"
+            "</minimax:tool_call>"
+        )
+        tool_uses, remaining = _try_minimax(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["name"] == "foo"
+        assert tool_uses[0]["input"] == {"x": 1}
+
     def test_json_parameter_value_parsed(self):
         text = (
             "<minimax:tool_call>\n"

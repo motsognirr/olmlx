@@ -64,7 +64,9 @@ _DEEPSEEK_CALL_RE = re.compile(
 _MINIMAX_TOOL_RE = re.compile(
     r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL
 )
-_MINIMAX_INVOKE_RE = re.compile(r'<invoke\s+name="([^"]*)">(.*?)</invoke>', re.DOTALL)
+_MINIMAX_INVOKE_RE = re.compile(
+    r'<invoke\b[^>]*\bname="([^"]*)"[^>]*>(.*?)</invoke>', re.DOTALL
+)
 _MINIMAX_PARAM_RE = re.compile(
     r'<parameter\s+name="([^"]*)">(.*?)</parameter>', re.DOTALL
 )
