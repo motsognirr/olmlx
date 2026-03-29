@@ -867,7 +867,9 @@ async def generate_completion(
 
     if apply_chat_template and not lm.is_vlm:
         messages = [{"role": "user", "content": prompt}]
-        prompt = _apply_chat_template_text(lm.text_tokenizer, messages)
+        prompt = _apply_chat_template_text(
+            lm.text_tokenizer, messages, caps=lm.template_caps
+        )
 
     gen_kwargs = _build_generate_kwargs(options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
