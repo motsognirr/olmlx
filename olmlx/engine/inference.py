@@ -899,7 +899,7 @@ async def generate_completion(
                 model_name,
             )
         else:
-            logger.warning(
+            logger.debug(
                 "apply_chat_template not supported for VLM %s via /api/generate",
                 model_name,
             )
