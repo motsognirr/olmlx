@@ -5,6 +5,7 @@ import gc
 import importlib
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import AsyncGenerator
@@ -45,6 +46,9 @@ from olmlx.utils.streaming import async_mlx_stream
 from olmlx.utils.timing import Timer, TimingStats
 
 logger = logging.getLogger(__name__)
+
+# Regex to match <think>...</think> blocks in model output.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 # gpt-oss special tokens used by the streaming filter
@@ -841,6 +845,59 @@ def count_chat_tokens(
     return len(tokens)
 
 
+async def _strip_thinking_stream(
+    gen: AsyncGenerator[dict, None],
+) -> AsyncGenerator[dict, None]:
+    """Wrap a streaming completion generator, stripping <think>...</think>.
+
+    Buffers tokens while inside a think block, discards them when the block
+    closes, and passes through everything else.
+    """
+    in_think = False
+    buf = ""
+
+    async for chunk in gen:
+        if chunk.get("done"):
+            # If we're still in an unclosed think block at the end, discard it.
+            yield chunk
+            return
+
+        text = chunk.get("text", "")
+        buf += text
+
+        if not in_think:
+            # Check if we're entering a think block
+            think_start = buf.find("<think>")
+            if think_start != -1:
+                # Emit text before <think>
+                before = buf[:think_start]
+                if before:
+                    yield {**chunk, "text": before}
+                buf = buf[think_start + len("<think>") :]
+                in_think = True
+            elif "<" in buf:
+                # Might be a partial "<think>" tag; hold back the ambiguous part
+                safe = buf[: buf.rfind("<")]
+                if safe:
+                    yield {**chunk, "text": safe}
+                buf = buf[len(safe) :]
+            else:
+                if buf:
+                    yield {**chunk, "text": buf}
+                buf = ""
+        # If in_think, check for closing tag
+        if in_think:
+            think_end = buf.find("</think>")
+            if think_end != -1:
+                # Discard everything up to and including </think>
+                buf = buf[think_end + len("</think>") :]
+                in_think = False
+                # Emit any remaining text after the close tag
+                if buf:
+                    yield {**chunk, "text": buf}
+                    buf = ""
+
+
 async def generate_completion(
     manager: ModelManager,
     model_name: str,
@@ -865,14 +922,13 @@ async def generate_completion(
         lm = await manager.ensure_loaded(model_name, keep_alive)
     stats.load_duration = load_timer.duration_ns
 
+    strip_thinking = False
     if apply_chat_template and not lm.is_vlm:
         messages = [{"role": "user", "content": prompt}]
         prompt = _apply_chat_template_text(
-            lm.text_tokenizer,
-            messages,
-            caps=lm.template_caps,
-            enable_thinking=False,
+            lm.text_tokenizer, messages, caps=lm.template_caps
         )
+        strip_thinking = lm.template_caps.has_thinking_tags
         logger.info(
             "Applied chat template for /api/generate (prompt length: %d chars)",
             len(prompt),
@@ -883,9 +939,15 @@ async def generate_completion(
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
     if stream:
-        return _stream_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        gen = _stream_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        if strip_thinking:
+            return _strip_thinking_stream(gen)
+        return gen
     else:
-        return await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        result = await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        if strip_thinking and result.get("text"):
+            result["text"] = _THINK_RE.sub("", result["text"]).lstrip()
+        return result
 
 
 async def _stream_completion(
