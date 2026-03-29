@@ -7,6 +7,7 @@ from olmlx.engine.tool_parser import (
     _try_bare_json,
     _try_deepseek,
     _try_llama,
+    _try_minimax,
     _try_mistral,
     _try_qwen,
     _try_xml_func,
@@ -219,6 +220,139 @@ class TestTryBareJson:
         text = '{"name": "func", "arguments": {invalid}}'
         tool_uses, remaining = _try_bare_json(text)
         assert len(tool_uses) == 0
+
+
+class TestTryMinimax:
+    def test_single_tool_call(self):
+        text = (
+            '<minimax:tool_call>\n'
+            '<invoke name="get_weather">\n'
+            '<parameter name="city">Tokyo</parameter>\n'
+            '</invoke>\n'
+            '</minimax:tool_call>'
+        )
+        tool_uses, remaining = _try_minimax(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["name"] == "get_weather"
+        assert tool_uses[0]["input"] == {"city": "Tokyo"}
+        assert tool_uses[0]["id"].startswith("toolu_")
+        assert "_span" in tool_uses[0]
+
+    def test_multiple_tool_call_blocks(self):
+        text = (
+            '<minimax:tool_call>\n'
+            '<invoke name="read_file">\n'
+            '<parameter name="path">a.py</parameter>\n'
+            '</invoke>\n'
+            '</minimax:tool_call>\n'
+            '<minimax:tool_call>\n'
+            '<invoke name="read_file">\n'
+            '<parameter name="path">b.py</parameter>\n'
+            '</invoke>\n'
+            '</minimax:tool_call>'
+        )
+        tool_uses, remaining = _try_minimax(text)
+        assert len(tool_uses) == 2
+        assert tool_uses[0]["input"] == {"path": "a.py"}
+        assert tool_uses[1]["input"] == {"path": "b.py"}
+
+    def test_multiple_parameters(self):
+        text = (
+            '<minimax:tool_call>\n'
+            '<invoke name="Agent">\n'
+            '<parameter name="description">Explore codebase</parameter>\n'
+            '<parameter name="prompt">Look at the code</parameter>\n'
+            '<parameter name="subagent_type">Explore</parameter>\n'
+            '</invoke>\n'
+            '</minimax:tool_call>'
+        )
+        tool_uses, remaining = _try_minimax(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["name"] == "Agent"
+        assert tool_uses[0]["input"] == {
+            "description": "Explore codebase",
+            "prompt": "Look at the code",
+            "subagent_type": "Explore",
+        }
+
+    def test_multiline_parameter_value(self):
+        text = (
+            '<minimax:tool_call>\n'
+            '<invoke name="Agent">\n'
+            '<parameter name="description">Explore</parameter>\n'
+            '<parameter name="prompt">Explore the codebase:\n'
+            '1. Architecture\n'
+            '2. Design patterns\n'
+            '3. Code quality</parameter>\n'
+            '</invoke>\n'
+            '</minimax:tool_call>'
+        )
+        tool_uses, remaining = _try_minimax(text)
+        assert len(tool_uses) == 1
+        assert "1. Architecture" in tool_uses[0]["input"]["prompt"]
+        assert "3. Code quality" in tool_uses[0]["input"]["prompt"]
+
+    def test_with_surrounding_text(self):
+        text = (
+            "I'll explore the codebase.\n"
+            '<minimax:tool_call>\n'
+            '<invoke name="Agent">\n'
+            '<parameter name="description">Explore</parameter>\n'
+            '</invoke>\n'
+            '</minimax:tool_call>\n'
+            "Let me know if you need more."
+        )
+        tool_uses, remaining = _try_minimax(text)
+        assert len(tool_uses) == 1
+        assert "I'll explore the codebase." in remaining
+        assert "Let me know if you need more." in remaining
+
+    def test_no_match(self):
+        tool_uses, remaining = _try_minimax("just normal text")
+        assert len(tool_uses) == 0
+        assert remaining == "just normal text"
+
+    def test_empty_name_skipped(self):
+        text = (
+            '<minimax:tool_call>\n'
+            '<invoke name="">\n'
+            '<parameter name="x">1</parameter>\n'
+            '</invoke>\n'
+            '</minimax:tool_call>'
+        )
+        tool_uses, remaining = _try_minimax(text)
+        assert len(tool_uses) == 0
+
+    def test_json_parameter_value_parsed(self):
+        text = (
+            '<minimax:tool_call>\n'
+            '<invoke name="search">\n'
+            '<parameter name="limit">10</parameter>\n'
+            '<parameter name="verbose">true</parameter>\n'
+            '</invoke>\n'
+            '</minimax:tool_call>'
+        )
+        tool_uses, remaining = _try_minimax(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["input"]["limit"] == 10
+        assert tool_uses[0]["input"]["verbose"] is True
+
+    def test_via_parse_model_output(self):
+        text = (
+            "<think>Let me check</think>"
+            '<minimax:tool_call>\n'
+            '<invoke name="get_weather">\n'
+            '<parameter name="city">Berlin</parameter>\n'
+            '</invoke>\n'
+            '</minimax:tool_call>'
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert thinking == "Let me check"
+        assert len(tools) == 1
+        assert tools[0]["name"] == "get_weather"
+        assert tools[0]["input"] == {"city": "Berlin"}
+        assert "_span" not in tools[0]
+        assert "<minimax:tool_call>" not in visible
 
 
 class TestTryXmlFunc:
