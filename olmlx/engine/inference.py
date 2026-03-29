@@ -847,13 +847,18 @@ def count_chat_tokens(
 
 async def _strip_thinking_stream(
     gen: AsyncGenerator[dict, None],
+    *,
+    starts_in_think: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """Wrap a streaming completion generator, stripping <think>...</think>.
 
     Buffers tokens while inside a think block, discards them when the block
     closes, and passes through everything else.
+
+    When *starts_in_think* is True, the model output begins inside an already-
+    opened ``<think>`` block (the tag was part of the prompt, not the output).
     """
-    in_think = False
+    in_think = starts_in_think
     buf = ""
 
     async for chunk in gen:
@@ -923,15 +928,20 @@ async def generate_completion(
     stats.load_duration = load_timer.duration_ns
 
     strip_thinking = False
+    starts_in_think = False
     if apply_chat_template and not lm.is_vlm:
         messages = [{"role": "user", "content": prompt}]
         prompt = _apply_chat_template_text(
             lm.text_tokenizer, messages, caps=lm.template_caps
         )
         strip_thinking = lm.template_caps.has_thinking_tags
+        # Some templates (e.g. Nemotron) end the prompt with <think>\n,
+        # meaning the model output starts INSIDE a thinking block.
+        starts_in_think = strip_thinking and prompt.rstrip().endswith("<think>")
         logger.info(
-            "Applied chat template for /api/generate (prompt length: %d chars)",
+            "Applied chat template for /api/generate (prompt length: %d chars%s)",
             len(prompt),
+            ", starts_in_think=True" if starts_in_think else "",
         )
         logger.debug("Templated prompt: %s", prompt[:500])
 
@@ -941,12 +951,22 @@ async def generate_completion(
     if stream:
         gen = _stream_completion(lm, prompt, mt, gen_kwargs, stats, images)
         if strip_thinking:
-            return _strip_thinking_stream(gen)
+            return _strip_thinking_stream(gen, starts_in_think=starts_in_think)
         return gen
     else:
         result = await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
         if strip_thinking and result.get("text"):
-            result["text"] = _THINK_RE.sub("", result["text"]).lstrip()
+            text = result["text"]
+            if starts_in_think:
+                # Output starts inside <think> — strip up to </think>
+                end_idx = text.find("</think>")
+                if end_idx != -1:
+                    text = text[end_idx + len("</think>") :]
+                else:
+                    # Model never closed thinking — no visible response
+                    text = ""
+            text = _THINK_RE.sub("", text).lstrip()
+            result["text"] = text
         return result
 
 

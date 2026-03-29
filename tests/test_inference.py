@@ -573,14 +573,19 @@ class TestGenerateCompletion:
         lm.template_caps = TemplateCaps(
             supports_tools=True, supports_enable_thinking=True, has_thinking_tags=True
         )
-        lm.text_tokenizer.apply_chat_template.return_value = "templated"
+        # Template ends with <think> — model output starts inside thinking
+        lm.text_tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>assistant\n<think>"
+        )
 
         with patch("olmlx.engine.inference.mx", mock_mx):
             with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
                 with patch(
                     "olmlx.engine.inference.asyncio.to_thread",
                     new_callable=AsyncMock,
-                    return_value="<think>planning stuff</think>The actual answer.",
+                    # Model output starts inside <think> (prompt ends with it),
+                    # so the raw output is just: thinking...</think>answer
+                    return_value="planning stuff</think>The actual answer.",
                 ):
                     result = await generate_completion(
                         mock_manager,
@@ -718,6 +723,39 @@ class TestStripThinkingStream:
 
         texts = [c.get("text", "") for c in chunks if not c.get("done")]
         assert "".join(texts) == "Just a normal response."
+
+    @pytest.mark.asyncio
+    async def test_starts_in_think(self):
+        """When starts_in_think=True, output begins inside a think block."""
+
+        async def source():
+            yield {"text": "planning..."}
+            yield {"text": "</think>"}
+            yield {"text": "The answer."}
+            yield {"done": True}
+
+        chunks = []
+        async for chunk in _strip_thinking_stream(source(), starts_in_think=True):
+            chunks.append(chunk)
+
+        texts = [c.get("text", "") for c in chunks if not c.get("done")]
+        assert "".join(texts) == "The answer."
+
+    @pytest.mark.asyncio
+    async def test_starts_in_think_never_closes(self):
+        """When starts_in_think=True and </think> never appears, all content is discarded."""
+
+        async def source():
+            yield {"text": "endless thinking..."}
+            yield {"text": " more thinking..."}
+            yield {"done": True}
+
+        chunks = []
+        async for chunk in _strip_thinking_stream(source(), starts_in_think=True):
+            chunks.append(chunk)
+
+        texts = [c.get("text", "") for c in chunks if not c.get("done")]
+        assert "".join(texts) == ""
 
 
 class TestGenerateChat:
