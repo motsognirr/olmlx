@@ -3,7 +3,6 @@
 import json
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from olmlx.bench.prompts import PROMPTS
 from olmlx.bench.results import PromptResult
@@ -52,7 +51,9 @@ class TestRunWorker:
         scenario = Scenario(name="test", description="Test scenario")
         prompts_data = [PROMPTS[0].to_dict()]
 
-        with patch("olmlx.bench.runner.subprocess.run", side_effect=fake_subprocess_run):
+        with patch(
+            "olmlx.bench.runner.subprocess.run", side_effect=fake_subprocess_run
+        ):
             results = _run_worker("test-model", scenario, prompts_data, None)
 
         assert len(results) == 1
@@ -294,7 +295,10 @@ class TestRunServerScenario:
             ),
         ):
             results = _run_server_scenario(
-                "model", scenario, [{"name": "factual", "category": "factual", "messages": []}], None
+                "model",
+                scenario,
+                [{"name": "factual", "category": "factual", "messages": []}],
+                None,
             )
 
         assert results == expected_results
@@ -331,14 +335,16 @@ class TestRunServerScenario:
 class TestRunPromptsOverHttp:
     def test_success(self):
         """HTTP 200 response is parsed into PromptResult."""
-        response_body = json.dumps({
-            "message": {"content": "Paris"},
-            "eval_count": 5,
-            "eval_duration": 500_000_000,
-            "prompt_eval_count": 10,
-            "prompt_eval_duration": 100_000_000,
-            "total_duration": 600_000_000,
-        }).encode()
+        response_body = json.dumps(
+            {
+                "message": {"content": "Paris"},
+                "eval_count": 5,
+                "eval_duration": 500_000_000,
+                "prompt_eval_count": 10,
+                "prompt_eval_duration": 100_000_000,
+                "total_duration": 600_000_000,
+            }
+        ).encode()
 
         mock_resp = MagicMock()
         mock_resp.status = 200
@@ -346,7 +352,12 @@ class TestRunPromptsOverHttp:
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
 
-        prompt = {"name": "factual", "category": "factual", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}
+        prompt = {
+            "name": "factual",
+            "category": "factual",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+        }
 
         with patch("olmlx.bench.runner.urllib.request.urlopen", return_value=mock_resp):
             results = _run_prompts_over_http("model", [prompt], None, 11434)
@@ -360,12 +371,21 @@ class TestRunPromptsOverHttp:
         """HTTP error responses are captured."""
         import urllib.error
 
-        prompt = {"name": "factual", "category": "factual", "messages": [], "max_tokens": 64}
+        prompt = {
+            "name": "factual",
+            "category": "factual",
+            "messages": [],
+            "max_tokens": 64,
+        }
 
         with patch(
             "olmlx.bench.runner.urllib.request.urlopen",
             side_effect=urllib.error.HTTPError(
-                url="http://test", code=503, msg="Busy", hdrs=None, fp=MagicMock(read=lambda: b"overloaded")
+                url="http://test",
+                code=503,
+                msg="Busy",
+                hdrs=None,
+                fp=MagicMock(read=lambda: b"overloaded"),
             ),
         ):
             results = _run_prompts_over_http("model", [prompt], None, 11434)
@@ -375,7 +395,12 @@ class TestRunPromptsOverHttp:
 
     def test_connection_error(self):
         """Network errors are captured."""
-        prompt = {"name": "factual", "category": "factual", "messages": [], "max_tokens": 64}
+        prompt = {
+            "name": "factual",
+            "category": "factual",
+            "messages": [],
+            "max_tokens": 64,
+        }
 
         with patch(
             "olmlx.bench.runner.urllib.request.urlopen",

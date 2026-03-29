@@ -157,7 +157,10 @@ class TestSaveLoadRun:
         loaded = load_run(run_dir)
         assert loaded.model == "test-model"
         assert len(loaded.scenarios) == 1
-        assert loaded.scenarios[0].prompt_results[0].output_text == "Paris is the capital of France."
+        assert (
+            loaded.scenarios[0].prompt_results[0].output_text
+            == "Paris is the capital of France."
+        )
 
     def test_load_from_json_file(self, tmp_path):
         run = create_run_result(model="m", scenarios=[])

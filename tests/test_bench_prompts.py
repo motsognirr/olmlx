@@ -19,9 +19,7 @@ class TestBenchPrompt:
         assert restored.max_tokens == p.max_tokens
 
     def test_from_dict_default_max_tokens(self):
-        p = BenchPrompt.from_dict(
-            {"name": "x", "category": "y", "messages": []}
-        )
+        p = BenchPrompt.from_dict({"name": "x", "category": "y", "messages": []})
         assert p.max_tokens == 256
 
 
@@ -31,7 +29,7 @@ class TestPromptsList:
 
     def test_all_have_required_fields(self):
         for p in PROMPTS:
-            assert p.name, f"Missing name"
+            assert p.name, "Missing name"
             assert p.category, f"Missing category for {p.name}"
             assert len(p.messages) > 0, f"No messages for {p.name}"
             assert p.max_tokens > 0, f"Invalid max_tokens for {p.name}"
@@ -48,7 +46,14 @@ class TestPromptsList:
 
     def test_categories_covered(self):
         cats = {p.category for p in PROMPTS}
-        for expected in ("factual", "reasoning", "coding", "creative", "instruction", "multi-turn"):
+        for expected in (
+            "factual",
+            "reasoning",
+            "coding",
+            "creative",
+            "instruction",
+            "multi-turn",
+        ):
             assert expected in cats, f"Missing category {expected}"
 
     def test_multi_turn_has_multiple_messages(self):

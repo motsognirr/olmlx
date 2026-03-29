@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -93,7 +93,9 @@ class ScenarioResult:
             scenario_name=d["scenario_name"],
             scenario_description=d["scenario_description"],
             env_overrides=d.get("env_overrides", {}),
-            prompt_results=[PromptResult.from_dict(r) for r in d.get("prompt_results", [])],
+            prompt_results=[
+                PromptResult.from_dict(r) for r in d.get("prompt_results", [])
+            ],
             skipped=d.get("skipped", False),
             skip_reason=d.get("skip_reason"),
         )
@@ -171,14 +173,16 @@ def list_runs(bench_dir: Path = DEFAULT_BENCH_DIR) -> list[dict]:
         data = json.loads(results_path.read_text())
         scenario_names = [s["scenario_name"] for s in data.get("scenarios", [])]
         skipped = sum(1 for s in data.get("scenarios", []) if s.get("skipped"))
-        runs.append({
-            "timestamp": data.get("timestamp", run_dir.name),
-            "model": data.get("model", "unknown"),
-            "git_sha": data.get("git_sha"),
-            "scenarios": len(scenario_names),
-            "skipped": skipped,
-            "dir": str(run_dir),
-        })
+        runs.append(
+            {
+                "timestamp": data.get("timestamp", run_dir.name),
+                "model": data.get("model", "unknown"),
+                "git_sha": data.get("git_sha"),
+                "scenarios": len(scenario_names),
+                "skipped": skipped,
+                "dir": str(run_dir),
+            }
+        )
     return runs
 
 
@@ -204,7 +208,9 @@ def compare_runs(run1: RunResult, run2: RunResult) -> str:
 
     # Performance comparison table
     lines.append("## Performance (tokens/sec)")
-    lines.append(f"{'Scenario':<20} {'Prompt':<15} {'Run1':>10} {'Run2':>10} {'Diff':>10}")
+    lines.append(
+        f"{'Scenario':<20} {'Prompt':<15} {'Run1':>10} {'Run2':>10} {'Diff':>10}"
+    )
     lines.append("-" * 67)
 
     for sc_name in all_scenarios:
@@ -217,7 +223,9 @@ def compare_runs(run1: RunResult, run2: RunResult) -> str:
             tps1 = f"{r1.tokens_per_second:.1f}" if r1 else "—"
             tps2 = f"{r2.tokens_per_second:.1f}" if r2 else "—"
             if r1 and r2 and r1.tokens_per_second > 0:
-                pct = ((r2.tokens_per_second - r1.tokens_per_second) / r1.tokens_per_second) * 100
+                pct = (
+                    (r2.tokens_per_second - r1.tokens_per_second) / r1.tokens_per_second
+                ) * 100
                 diff = f"{pct:+.1f}%"
             else:
                 diff = "—"

@@ -92,9 +92,7 @@ class TestSkipChecks:
         assert not moe.should_skip(tmp_path)
 
     def test_flash_moe_detects_routed_experts(self, tmp_path):
-        (tmp_path / "config.json").write_text(
-            json.dumps({"n_routed_experts": 4})
-        )
+        (tmp_path / "config.json").write_text(json.dumps({"n_routed_experts": 4}))
         moe = get_scenarios(["flash-moe"])[0]
         assert not moe.should_skip(tmp_path)
 
@@ -104,6 +102,16 @@ class TestSkipChecks:
         )
         moe = get_scenarios(["flash-moe"])[0]
         assert not moe.should_skip(tmp_path)
+
+    def test_flash_moe_skips_with_non_object_config(self, tmp_path):
+        (tmp_path / "config.json").write_text(json.dumps([1, 2, 3]))
+        moe = get_scenarios(["flash-moe"])[0]
+        assert moe.should_skip(tmp_path)
+
+    def test_flash_moe_skips_with_invalid_json_config(self, tmp_path):
+        (tmp_path / "config.json").write_text("not json")
+        moe = get_scenarios(["flash-moe"])[0]
+        assert moe.should_skip(tmp_path)
 
 
 class TestDistributedScenarios:
@@ -127,7 +135,10 @@ class TestDistributedScenarios:
     def test_distributed_tq4_has_both_overrides(self):
         dist = get_scenarios(["distributed+tq4"])[0]
         assert dist.env_overrides.get("OLMLX_EXPERIMENTAL_DISTRIBUTED") == "true"
-        assert dist.env_overrides.get("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT") == "turboquant:4"
+        assert (
+            dist.env_overrides.get("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT")
+            == "turboquant:4"
+        )
 
     def test_distributed_skips_without_hostfile(self, tmp_path, monkeypatch):
         monkeypatch.setattr(

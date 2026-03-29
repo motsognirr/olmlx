@@ -32,9 +32,19 @@ def _requires_moe(model_path: Path) -> bool:
     if not config_path.exists():
         logger.info("Skipping: no config.json at %s", model_path)
         return True
-    config = json.loads(config_path.read_text())
+    try:
+        config = json.loads(config_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        logger.info("Skipping: invalid config.json at %s", config_path)
+        return True
+    if not isinstance(config, dict):
+        logger.info("Skipping: config.json is not a JSON object")
+        return True
     if "text_config" in config:
         config = config["text_config"]
+    if not isinstance(config, dict):
+        logger.info("Skipping: text_config is not a JSON object")
+        return True
     is_moe = (
         (config.get("n_routed_experts") or 0) > 1
         or (config.get("num_local_experts") or 0) > 1
@@ -44,15 +54,6 @@ def _requires_moe(model_path: Path) -> bool:
         logger.info("Skipping: model is not MoE")
         return True
     return False
-
-
-def _requires_flash_and_moe(model_path: Path) -> bool:
-    return _requires_flash(model_path) or _requires_moe(model_path)
-
-
-def _requires_flash_or_moe(model_path: Path) -> bool:
-    """Skip only if model has neither flash preparation nor MoE architecture."""
-    return _requires_flash(model_path) and _requires_moe(model_path)
 
 
 def _requires_distributed(_model_path: Path) -> bool:
@@ -190,8 +191,6 @@ def get_scenarios(names: list[str] | None = None) -> list[Scenario]:
     result = []
     for name in names:
         if name not in by_name:
-            raise ValueError(
-                f"Unknown scenario {name!r}. Available: {sorted(by_name)}"
-            )
+            raise ValueError(f"Unknown scenario {name!r}. Available: {sorted(by_name)}")
         result.append(by_name[name])
     return result

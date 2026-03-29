@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,10 @@ PROMPTS: list[BenchPrompt] = [
         name="factual",
         category="factual",
         messages=[
-            {"role": "user", "content": "What is the capital of France? Answer in one sentence."},
+            {
+                "role": "user",
+                "content": "What is the capital of France? Answer in one sentence.",
+            },
         ],
         max_tokens=64,
     ),
@@ -57,7 +60,10 @@ PROMPTS: list[BenchPrompt] = [
         name="coding",
         category="coding",
         messages=[
-            {"role": "user", "content": "Write a Python function that checks if a string is a palindrome."},
+            {
+                "role": "user",
+                "content": "Write a Python function that checks if a string is a palindrome.",
+            },
         ],
         max_tokens=256,
     ),
@@ -73,7 +79,10 @@ PROMPTS: list[BenchPrompt] = [
         name="instruction",
         category="instruction",
         messages=[
-            {"role": "user", "content": "List exactly 3 benefits of exercise. Use numbered format."},
+            {
+                "role": "user",
+                "content": "List exactly 3 benefits of exercise. Use numbered format.",
+            },
         ],
         max_tokens=128,
     ),
@@ -86,7 +95,10 @@ PROMPTS: list[BenchPrompt] = [
                 "role": "assistant",
                 "content": "The Fibonacci sequence is a series where each number is the sum of the two preceding ones: 0, 1, 1, 2, 3, 5, 8, 13, ...",
             },
-            {"role": "user", "content": "Write a Python function to compute the nth Fibonacci number."},
+            {
+                "role": "user",
+                "content": "Write a Python function to compute the nth Fibonacci number.",
+            },
         ],
         max_tokens=256,
     ),

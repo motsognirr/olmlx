@@ -10,16 +10,16 @@ import argparse
 import asyncio
 import json
 import logging
-import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
-async def _run_prompts(model: str, prompts: list[dict], max_tokens_override: int | None) -> list[dict]:
+async def _run_prompts(
+    model: str, prompts: list[dict], max_tokens_override: int | None
+) -> list[dict]:
     """Create a real ASGI app and run each prompt through /api/chat."""
     from olmlx.app import create_app
-    from olmlx.config import settings
     from olmlx.engine.model_manager import ModelManager
     from olmlx.engine.registry import ModelRegistry
     from olmlx.models.store import ModelStore
@@ -56,44 +56,52 @@ async def _run_prompts(model: str, prompts: list[dict], max_tokens_override: int
                 resp = await client.post("/api/chat", json=body, timeout=300.0)
                 if resp.status_code == 200:
                     data = resp.json()
-                    results.append({
-                        "prompt_name": prompt["name"],
-                        "category": prompt["category"],
-                        "output_text": data.get("message", {}).get("content", ""),
-                        "status_code": resp.status_code,
-                        "error": None,
-                        "eval_count": data.get("eval_count", 0),
-                        "eval_duration_ns": data.get("eval_duration", 0),
-                        "prompt_eval_count": data.get("prompt_eval_count", 0),
-                        "prompt_eval_duration_ns": data.get("prompt_eval_duration", 0),
-                        "total_duration_ns": data.get("total_duration", 0),
-                    })
+                    results.append(
+                        {
+                            "prompt_name": prompt["name"],
+                            "category": prompt["category"],
+                            "output_text": data.get("message", {}).get("content", ""),
+                            "status_code": resp.status_code,
+                            "error": None,
+                            "eval_count": data.get("eval_count", 0),
+                            "eval_duration_ns": data.get("eval_duration", 0),
+                            "prompt_eval_count": data.get("prompt_eval_count", 0),
+                            "prompt_eval_duration_ns": data.get(
+                                "prompt_eval_duration", 0
+                            ),
+                            "total_duration_ns": data.get("total_duration", 0),
+                        }
+                    )
                 else:
-                    results.append({
+                    results.append(
+                        {
+                            "prompt_name": prompt["name"],
+                            "category": prompt["category"],
+                            "output_text": "",
+                            "status_code": resp.status_code,
+                            "error": resp.text[:500],
+                            "eval_count": 0,
+                            "eval_duration_ns": 0,
+                            "prompt_eval_count": 0,
+                            "prompt_eval_duration_ns": 0,
+                            "total_duration_ns": 0,
+                        }
+                    )
+            except Exception as e:
+                results.append(
+                    {
                         "prompt_name": prompt["name"],
                         "category": prompt["category"],
                         "output_text": "",
-                        "status_code": resp.status_code,
-                        "error": resp.text[:500],
+                        "status_code": 0,
+                        "error": str(e),
                         "eval_count": 0,
                         "eval_duration_ns": 0,
                         "prompt_eval_count": 0,
                         "prompt_eval_duration_ns": 0,
                         "total_duration_ns": 0,
-                    })
-            except Exception as e:
-                results.append({
-                    "prompt_name": prompt["name"],
-                    "category": prompt["category"],
-                    "output_text": "",
-                    "status_code": 0,
-                    "error": str(e),
-                    "eval_count": 0,
-                    "eval_duration_ns": 0,
-                    "prompt_eval_count": 0,
-                    "prompt_eval_duration_ns": 0,
-                    "total_duration_ns": 0,
-                })
+                    }
+                )
 
     await manager.stop()
     return results

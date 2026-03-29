@@ -982,7 +982,9 @@ def cmd_bench_run(args):
     from olmlx.bench.runner import run_bench
     from olmlx.bench.results import DEFAULT_BENCH_DIR
 
-    scenario_names = args.scenarios.split(",") if args.scenarios else None
+    scenario_names = (
+        [s.strip() for s in args.scenarios.split(",")] if args.scenarios else None
+    )
     bench_dir = Path(args.output_dir) if args.output_dir else DEFAULT_BENCH_DIR
 
     run_bench(
@@ -1023,7 +1025,9 @@ def cmd_bench_list(_args):
         print("No benchmark runs found.")
         return
 
-    print(f"{'Timestamp':<22} {'Model':<45} {'Git':<10} {'Scenarios':>9} {'Skipped':>7}")
+    print(
+        f"{'Timestamp':<22} {'Model':<45} {'Git':<10} {'Scenarios':>9} {'Skipped':>7}"
+    )
     print("-" * 95)
     for r in runs:
         print(
@@ -1314,9 +1318,7 @@ def build_parser() -> argparse.ArgumentParser:
     info_p.add_argument("model", help="Model name or HF path")
 
     # Bench (benchmarking)
-    bench = sub.add_parser(
-        "bench", help="Benchmarking and functional tests"
-    )
+    bench = sub.add_parser("bench", help="Benchmarking and functional tests")
     bench_sub = bench.add_subparsers(dest="bench_command")
 
     bench_run = bench_sub.add_parser("run", help="Run benchmark scenarios")
@@ -1344,9 +1346,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory (default: ~/.olmlx/bench/runs)",
     )
 
-    bench_compare = bench_sub.add_parser(
-        "compare", help="Compare two benchmark runs"
-    )
+    bench_compare = bench_sub.add_parser("compare", help="Compare two benchmark runs")
     bench_compare.add_argument("run1", help="First run (timestamp or path)")
     bench_compare.add_argument("run2", help="Second run (timestamp or path)")
 

@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import re
-import signal
 import subprocess
 import sys
 import tempfile
@@ -15,7 +14,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from olmlx.bench.prompts import PROMPTS, BenchPrompt
+from olmlx.bench.prompts import PROMPTS
 from olmlx.bench.results import (
     DEFAULT_BENCH_DIR,
     PromptResult,
@@ -28,6 +27,7 @@ from olmlx.bench.scenarios import Scenario, get_scenarios
 
 logger = logging.getLogger(__name__)
 
+_WORKER_TIMEOUT = 600  # seconds before killing a worker subprocess
 _SERVER_STARTUP_TIMEOUT = 300  # seconds to wait for olmlx serve to become ready
 _SERVER_READY_POLL_INTERVAL = 2  # seconds between readiness checks
 
@@ -65,7 +65,7 @@ def run_bench(
 
         # Check skip condition
         if scenario.should_skip(model_path):
-            print(f"  SKIPPED", file=sys.stderr)
+            print("  SKIPPED", file=sys.stderr)
             scenario_results.append(
                 ScenarioResult(
                     scenario_name=scenario.name,
@@ -90,7 +90,9 @@ def run_bench(
         ok = sum(1 for r in prompt_results if r.status_code == 200)
         fail = len(prompt_results) - ok
         avg_tps = 0.0
-        tps_values = [r.tokens_per_second for r in prompt_results if r.tokens_per_second > 0]
+        tps_values = [
+            r.tokens_per_second for r in prompt_results if r.tokens_per_second > 0
+        ]
         if tps_values:
             avg_tps = sum(tps_values) / len(tps_values)
         status = "OK" if fail == 0 else f"{fail} FAILED"
@@ -154,7 +156,7 @@ def _run_worker(
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=_WORKER_TIMEOUT,
             )
             if result.returncode != 0:
                 logger.error(
@@ -194,14 +196,16 @@ def _run_worker(
                     category="error",
                     output_text="",
                     status_code=0,
-                    error="Worker timed out after 600s",
+                    error=f"Worker timed out after {_WORKER_TIMEOUT}s",
                 )
             ]
 
 
 def _get_server_port(scenario: Scenario) -> int:
     """Determine the port the server will listen on."""
-    port_str = scenario.env_overrides.get("OLMLX_PORT", os.environ.get("OLMLX_PORT", "11434"))
+    port_str = scenario.env_overrides.get(
+        "OLMLX_PORT", os.environ.get("OLMLX_PORT", "11434")
+    )
     return int(port_str)
 
 
@@ -276,7 +280,7 @@ def _run_server_scenario(
                 )
             ]
 
-        print(f"  Server ready, running prompts...", file=sys.stderr)
+        print("  Server ready, running prompts...", file=sys.stderr)
 
         # Run prompts over HTTP
         results = _run_prompts_over_http(model, prompts_data, max_tokens, port)
@@ -346,13 +350,17 @@ def _run_prompts_over_http(
                     )
                 )
         except urllib.error.HTTPError as e:
+            try:
+                error_body = e.read().decode(errors="replace")[:500]
+            except Exception:
+                error_body = str(e)
             results.append(
                 PromptResult(
                     prompt_name=prompt["name"],
                     category=prompt["category"],
                     output_text="",
                     status_code=e.code,
-                    error=e.read().decode(errors="replace")[:500],
+                    error=error_body,
                 )
             )
         except Exception as e:
