@@ -342,6 +342,40 @@ class TestTurboQuantKVCache:
             f"Value 4-bit relative MSE too high: {v_mse / v_var}"
         )
 
+    def test_no_public_bits_attribute(self):
+        """TurboQuantKVCache must not expose a public 'bits' attribute.
+
+        mlx-lm's scaled_dot_product_attention uses ``hasattr(cache, 'bits')``
+        to decide whether to use quantized SDPA. TurboQuantKVCache returns
+        dequantized tensors, so it must not trigger that path.
+        """
+        cache = self._make_cache(bits=4, head_dim=64)
+        assert not hasattr(cache, "bits"), (
+            "TurboQuantKVCache must not have a public 'bits' attribute — "
+            "mlx-lm uses hasattr(cache, 'bits') to dispatch to quantized SDPA"
+        )
+
+    def test_state_returns_arrays_for_eval(self):
+        """state property must return arrays so mx.eval(c.state) works.
+
+        mlx-lm's generate_step calls mx.eval([c.state for c in prompt_cache])
+        to force lazy evaluation. This must not raise.
+        """
+        cache = self._make_cache(bits=4, head_dim=64)
+        keys = mx.random.normal((1, 4, 8, 64))
+        values = mx.random.normal((1, 4, 8, 64))
+        cache.update_and_fetch(keys, values)
+
+        state = cache.state
+        # Should be evaluable without error
+        mx.eval(state)
+
+    def test_state_empty_cache(self):
+        """state on an empty cache should return an empty list (like _BaseCache)."""
+        cache = self._make_cache(bits=4, head_dim=64)
+        state = cache.state
+        assert state == []
+
     def test_make_mask(self):
         """make_mask should delegate to create_attention_mask."""
         cache = self._make_cache()
@@ -615,10 +649,10 @@ class TestInferenceIntegration:
         model.args.head_dim = 64
 
         cache_4 = _make_turboquant_prompt_cache(model, bits=4)
-        assert cache_4[0].bits == 4
+        assert cache_4[0]._bits == 4
 
         cache_2 = _make_turboquant_prompt_cache(model, bits=2)
-        assert cache_2[0].bits == 2
+        assert cache_2[0]._bits == 2
 
 
 class TestBitsValidation:
