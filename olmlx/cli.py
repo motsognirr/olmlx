@@ -974,6 +974,64 @@ def cmd_config_show(_args):
         print(f"  Sideband port:        {experimental.distributed_sideband_port}")
 
 
+def cmd_bench_run(args):
+    """Run benchmark scenarios."""
+    _configure_logging()
+    from pathlib import Path
+
+    from olmlx.bench.runner import run_bench
+    from olmlx.bench.results import DEFAULT_BENCH_DIR
+
+    scenario_names = args.scenarios.split(",") if args.scenarios else None
+    bench_dir = Path(args.output_dir) if args.output_dir else DEFAULT_BENCH_DIR
+
+    run_bench(
+        model=args.model,
+        scenario_names=scenario_names,
+        max_tokens=args.max_tokens,
+        bench_dir=bench_dir,
+    )
+
+
+def cmd_bench_compare(args):
+    """Compare two benchmark runs."""
+    from pathlib import Path
+
+    from olmlx.bench.results import DEFAULT_BENCH_DIR, compare_runs, load_run
+
+    def _resolve_run(ref: str) -> Path:
+        p = Path(ref)
+        if p.exists():
+            return p
+        # Try as timestamp under default bench dir
+        candidate = DEFAULT_BENCH_DIR / ref
+        if candidate.exists():
+            return candidate
+        raise FileNotFoundError(f"Run not found: {ref}")
+
+    run1 = load_run(_resolve_run(args.run1))
+    run2 = load_run(_resolve_run(args.run2))
+    print(compare_runs(run1, run2))
+
+
+def cmd_bench_list(_args):
+    """List past benchmark runs."""
+    from olmlx.bench.results import list_runs
+
+    runs = list_runs()
+    if not runs:
+        print("No benchmark runs found.")
+        return
+
+    print(f"{'Timestamp':<22} {'Model':<45} {'Git':<10} {'Scenarios':>9} {'Skipped':>7}")
+    print("-" * 95)
+    for r in runs:
+        print(
+            f"{r['timestamp']:<22} {r['model']:<45} {r['git_sha'] or '—':<10} "
+            f"{r['scenarios']:>9} {r['skipped']:>7}"
+        )
+
+
 def _flash_progress(desc, frac):
     bar_len = 30
     filled = int(bar_len * frac)
@@ -1255,6 +1313,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     info_p.add_argument("model", help="Model name or HF path")
 
+    # Bench (benchmarking)
+    bench = sub.add_parser(
+        "bench", help="Benchmarking and functional tests"
+    )
+    bench_sub = bench.add_subparsers(dest="bench_command")
+
+    bench_run = bench_sub.add_parser("run", help="Run benchmark scenarios")
+    bench_run.add_argument(
+        "--model",
+        default="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+        help="Model name or HF path (default: mlx-community/Qwen2.5-0.5B-Instruct-4bit)",
+    )
+    bench_run.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Override max tokens for all prompts",
+    )
+    bench_run.add_argument(
+        "--scenarios",
+        type=str,
+        default=None,
+        help="Comma-separated scenario names (default: all)",
+    )
+    bench_run.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory (default: ~/.olmlx/bench/runs)",
+    )
+
+    bench_compare = bench_sub.add_parser(
+        "compare", help="Compare two benchmark runs"
+    )
+    bench_compare.add_argument("run1", help="First run (timestamp or path)")
+    bench_compare.add_argument("run2", help="Second run (timestamp or path)")
+
+    bench_sub.add_parser("list", help="List past benchmark runs")
+
     cfg = sub.add_parser("config", help="Show configuration")
     cfg_sub = cfg.add_subparsers(dest="config_command")
     cfg_sub.add_parser("show", help="Show current configuration")
@@ -1299,6 +1396,15 @@ def cli_main():
             cmd_flash_info(args)
         else:
             parser.parse_args(["flash", "--help"])
+    elif args.command == "bench":
+        if args.bench_command == "run":
+            cmd_bench_run(args)
+        elif args.bench_command == "compare":
+            cmd_bench_compare(args)
+        elif args.bench_command == "list":
+            cmd_bench_list(args)
+        else:
+            parser.parse_args(["bench", "--help"])
     elif args.command == "config":
         if args.config_command == "show":
             cmd_config_show(args)
