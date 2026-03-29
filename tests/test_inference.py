@@ -1512,6 +1512,65 @@ class TestEstimateKvCacheBytes:
         with pytest.raises(AttributeError, match="no 'args' attribute"):
             _estimate_kv_cache_bytes(model, 1000)
 
+    def test_nas_model_with_per_layer_variable_attention(self):
+        """NAS models (nemotron-nas) have per-layer variable attention.
+
+        Only layers with actual attention contribute to KV cache, and
+        the KV head count comes from each layer's n_kv_heads, not from
+        num_attention_heads (which would be a huge overestimate).
+        """
+        # Simulate nemotron-nas: 80 layers total, 49 with attention (8 kv_heads),
+        # 31 with no_op (self_attn=None). No num_key_value_heads in args.
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 80
+        args.num_attention_heads = 64
+        args.hidden_size = 8192
+        # num_key_value_heads is NOT on args (NAS model)
+        # head_dim is NOT on args
+
+        model = MagicMock(spec=[])
+        model.args = args
+
+        # Build layers: 49 with attention, 31 without
+        layers = []
+        for i in range(80):
+            layer = MagicMock()
+            if i % 80 < 49:  # first 49 layers have attention
+                attn = MagicMock()
+                attn.n_kv_heads = 8
+                layer.self_attn = attn
+            else:
+                layer.self_attn = None
+            layers.append(layer)
+        model.model = MagicMock()
+        model.model.layers = layers
+
+        # head_dim = 8192 / 64 = 128
+        # Correct: 49 layers * 2 * 8 kv_heads * 128 head_dim * 1000 tokens * 2 bytes
+        # = 49 * 2 * 8 * 128 * 1000 * 2 = 200_704_000
+        result = _estimate_kv_cache_bytes(model, 1000)
+        expected_raw = 49 * 2 * 8 * 128 * 1000 * 2
+        assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+    def test_nas_model_no_layers_introspection_fallback(self):
+        """When model has no introspectable layers, fall back to args-based estimate."""
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 80
+        args.num_attention_heads = 64
+        args.hidden_size = 8192
+        # No num_key_value_heads — falls back to num_attention_heads
+
+        model = MagicMock(spec=[])
+        model.args = args
+
+        # No model.model.layers available
+        del model.model
+
+        # Falls back to: 80 * 2 * 64 * 128 * 1000 * 2
+        result = _estimate_kv_cache_bytes(model, 1000)
+        expected_raw = 80 * 2 * 64 * 128 * 1000 * 2
+        assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
 
 class TestKvCachePreflightCheck:
     """Tests for the pre-flight KV cache memory check in _stream_completion."""

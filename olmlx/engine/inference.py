@@ -368,7 +368,13 @@ memory usage to exceed the raw 2-bytes-per-element calculation by 20-30%.
 def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
     """Estimate KV cache memory for a given number of tokens.
 
-    Formula: num_layers * 2 (K+V) * num_kv_heads * head_dim * num_tokens * bytes_per_element * MEMORY_SAFETY_FACTOR
+    Formula: sum_over_attn_layers(2 * kv_heads_i * head_dim) * num_tokens * bytes_per_element * MEMORY_SAFETY_FACTOR
+
+    For NAS models (e.g. nemotron-nas) that have per-layer variable attention
+    (some layers are no-op with self_attn=None, and KV head counts vary per
+    layer), we introspect model.model.layers to count only actual attention
+    layers and read their n_kv_heads.  Falls back to args-based estimation
+    when layer introspection isn't possible.
     """
     if num_tokens <= 0:
         return 0
@@ -383,13 +389,34 @@ def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
         raise AttributeError(
             "Model has no 'args' attribute (checked model.args and model.language_model.args)"
         )
-    num_layers = args.num_hidden_layers
     num_heads = args.num_attention_heads
-    num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
     head_dim = (
         args.head_dim if hasattr(args, "head_dim") else args.hidden_size // num_heads
     )
     bytes_per_element = 2  # float16/bfloat16
+
+    # Try layer introspection for NAS/variable-attention models
+    inner = getattr(model, "model", None)
+    layers = getattr(inner, "layers", None) if inner is not None else None
+    if isinstance(layers, (list, tuple)) and len(layers) > 0:
+        per_layer_kv_sum = 0
+        for layer in layers:
+            self_attn = getattr(layer, "self_attn", None)
+            if self_attn is None:
+                continue  # no-op attention layer — no KV cache
+            layer_kv_heads = getattr(self_attn, "n_kv_heads", None)
+            if layer_kv_heads is None:
+                # Standard model — fall back to args
+                break
+            per_layer_kv_sum += layer_kv_heads
+        else:
+            # All layers inspected successfully
+            raw = 2 * per_layer_kv_sum * head_dim * num_tokens * bytes_per_element
+            return int(raw * MEMORY_SAFETY_FACTOR)
+
+    # Fallback: uniform estimate from args
+    num_layers = args.num_hidden_layers
+    num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
     raw = num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
     return int(raw * MEMORY_SAFETY_FACTOR)
 
@@ -1067,11 +1094,13 @@ async def _stream_completion(
                     estimate_tokens = num_prefill_tokens
                     if had_cache and cache_read_tokens > 0:
                         estimate_tokens = cache_read_tokens + num_prefill_tokens
-                        kv_bytes = _estimate_kv_cache_bytes(
-                            lm.model, estimate_tokens + max_tokens
-                        )
                         if full_prompt_tokens is not None and not lm.is_vlm:
                             prompt = full_prompt_tokens
+                    # Re-estimate after eviction for the full generation window
+                    estimate_total = estimate_tokens + max_tokens
+                    kv_bytes = _estimate_kv_cache_bytes(
+                        lm.model, estimate_total
+                    )
                     # Sync Metal to ensure freed buffers are reclaimed before re-reading
                     _safe_sync()
                     current_metal = memory_utils.get_metal_memory()
@@ -1080,7 +1109,7 @@ async def _stream_completion(
                             0.0, (memory_limit - current_metal) / 1024**3
                         )
                         raise MemoryError(
-                            f"KV cache for {estimate_tokens} tokens estimated at "
+                            f"KV cache for {estimate_total} tokens estimated at "
                             f"{kv_bytes / 1024**3:.1f} GB, but only "
                             f"{available_gb:.1f} GB available "
                             f"— prompt too long, reduce context or use a smaller model"
