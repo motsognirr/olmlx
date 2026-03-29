@@ -119,12 +119,12 @@ class TurboQuantKVCache(_BaseCache):
     def state(self):
         if self._key_indices is None:
             return []
-        return (
+        return [
             self._key_indices[..., : self.offset, :],
             self._key_norms[..., : self.offset, :],
             self._value_indices[..., : self.offset, :],
             self._value_norms[..., : self.offset, :],
-        )
+        ]
 
     @state.setter
     def state(self, v):
