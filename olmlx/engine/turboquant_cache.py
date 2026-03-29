@@ -128,6 +128,8 @@ class TurboQuantKVCache(_BaseCache):
 
     @state.setter
     def state(self, v):
+        # Should be unreachable: _is_serializable_cache() guards all save paths.
+        # Raised here as a hard stop in case that guard is bypassed.
         raise NotImplementedError(
             "TurboQuantKVCache does not support state restoration. "
             "Disable disk cache offload when using TurboQuant."
