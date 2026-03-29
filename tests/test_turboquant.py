@@ -524,6 +524,42 @@ class TestMakeTurboQuantCache:
         assert isinstance(cache[2], ArraysCache)
         assert isinstance(cache[3], TurboQuantKVCache)
 
+    def test_hybrid_model_sparse_cache(self):
+        """Nemotron-H: make_cache() returns fewer entries than model.layers.
+
+        Nemotron-H has block types M, *, -, E but only M and * get cache entries.
+        make_cache() returns a list shorter than len(model.layers). The factory
+        must iterate over default_caches as-is, not pad to num_layers.
+        """
+        from unittest.mock import MagicMock
+
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from olmlx.engine.turboquant_cache import (
+            TurboQuantKVCache,
+            make_turboquant_cache,
+        )
+
+        model = MagicMock()
+        # 6 layers total: M, *, -, E, M, *
+        model.layers = [MagicMock() for _ in range(6)]
+        model.args.head_dim = 64
+        # make_cache returns only 4 entries (for M and * blocks)
+        model.make_cache.return_value = [
+            ArraysCache(size=2),  # M
+            KVCache(),  # *
+            ArraysCache(size=2),  # M
+            KVCache(),  # *
+        ]
+
+        cache = make_turboquant_cache(model, bits=4)
+        # Result should have 4 entries matching make_cache output, not 6
+        assert len(cache) == 4
+        assert isinstance(cache[0], ArraysCache)
+        assert isinstance(cache[1], TurboQuantKVCache)
+        assert isinstance(cache[2], ArraysCache)
+        assert isinstance(cache[3], TurboQuantKVCache)
+
     def test_model_without_make_cache_all_turboquant(self):
         """Models without make_cache() get TurboQuantKVCache for all layers."""
         from unittest.mock import MagicMock

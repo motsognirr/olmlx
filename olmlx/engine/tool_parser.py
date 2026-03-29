@@ -7,6 +7,7 @@ Supported formats:
 - Mistral: [TOOL_CALLS] [{"name": ..., "arguments": ...}]
 - Llama 3.x: <|python_tag|>{"name": ..., "parameters": ...}
 - DeepSeek: <|tool_calls_begin|>...<|tool_calls_end|>
+- MiniMax: <minimax:tool_call><invoke name="..."><parameter name="...">...</parameter></invoke></minimax:tool_call>
 - Bare JSON: {"name": "...", "arguments": {...}} (on its own line or at text start)
 """
 
@@ -59,6 +60,17 @@ _DEEPSEEK_CALL_RE = re.compile(
     re.DOTALL,
 )
 
+# MiniMax: <minimax:tool_call><invoke name="Name"><parameter name="key">value</parameter></invoke></minimax:tool_call>
+_MINIMAX_TOOL_RE = re.compile(
+    r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL
+)
+_MINIMAX_INVOKE_RE = re.compile(
+    r'<invoke\b[^>]*\bname="([^"]*)"[^>]*>(.*?)</invoke>', re.DOTALL
+)
+_MINIMAX_PARAM_RE = re.compile(
+    r'<parameter\s+name="([^"]*)">(.*?)</parameter>', re.DOTALL
+)
+
 # Bare JSON: find `{` at line start (possibly followed by whitespace/newline then "name")
 _BARE_JSON_START_RE = re.compile(r'(?:^|\n)\s*(\{)\s*"name"', re.MULTILINE)
 
@@ -85,6 +97,23 @@ def _parse_json_call(data: dict) -> dict | None:
     }
 
 
+def _extract_params(text: str, pattern: re.Pattern) -> dict:
+    """Extract key-value parameters from text using the given regex pattern.
+
+    The pattern must have group(1) = key name and group(2) = value.
+    Values are parsed as JSON where possible, falling back to raw strings.
+    """
+    params = {}
+    for pm in pattern.finditer(text):
+        pval = pm.group(2).strip()
+        try:
+            pval = json.loads(pval)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        params[pm.group(1).strip()] = pval
+    return params
+
+
 def _parse_func_tag(func_match: re.Match) -> dict | None:
     """Parse a <function=Name>...</function> match into a tool_use dict (without _span).
 
@@ -93,19 +122,11 @@ def _parse_func_tag(func_match: re.Match) -> dict | None:
     name = func_match.group(1).strip()
     if not name:
         return None
-    params = {}
-    for pm in _PARAM_TAG_RE.finditer(func_match.group(2)):
-        pval = pm.group(2).strip()
-        try:
-            pval = json.loads(pval)
-        except (json.JSONDecodeError, ValueError):
-            pass
-        params[pm.group(1).strip()] = pval
     return {
         "type": "tool_use",
         "id": _make_tool_use_id(),
         "name": name,
-        "input": params,
+        "input": _extract_params(func_match.group(2), _PARAM_TAG_RE),
     }
 
 
@@ -203,6 +224,29 @@ def _try_deepseek(text: str) -> tuple[list[dict], str]:
                 "_span": span,
             }
         )
+    return tool_uses, text
+
+
+def _try_minimax(text: str) -> tuple[list[dict], str]:
+    """Parse MiniMax <minimax:tool_call>...</minimax:tool_call> blocks."""
+    tool_uses = []
+    for block_match in _MINIMAX_TOOL_RE.finditer(text):
+        span = (block_match.start(), block_match.end())
+        inner = block_match.group(1)
+        for invoke_match in _MINIMAX_INVOKE_RE.finditer(inner):
+            name = invoke_match.group(1).strip()
+            if not name:
+                logger.warning("Skipping <invoke> tag with empty name")
+                continue
+            tool_uses.append(
+                {
+                    "type": "tool_use",
+                    "id": _make_tool_use_id(),
+                    "name": name,
+                    "input": _extract_params(invoke_match.group(2), _MINIMAX_PARAM_RE),
+                    "_span": span,
+                }
+            )
     return tool_uses, text
 
 
@@ -354,6 +398,7 @@ def parse_model_output(
             _try_mistral,
             _try_llama,
             _try_deepseek,
+            _try_minimax,
             _try_xml_func,
             _try_bare_json,
         ]

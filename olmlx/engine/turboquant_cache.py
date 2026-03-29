@@ -211,7 +211,7 @@ def make_turboquant_cache(model: Any, bits: int) -> list:
     # return different cache types per layer, e.g. ArraysCache for SSM)
     if hasattr(model, "make_cache"):
         default_caches = model.make_cache()
-        if not isinstance(default_caches, list) or len(default_caches) != num_layers:
+        if not isinstance(default_caches, list):
             default_caches = [None] * num_layers
     else:
         default_caches = [None] * num_layers
@@ -230,9 +230,9 @@ def make_turboquant_cache(model: Any, bits: int) -> list:
             caches.append(default)
 
     logger.info(
-        "Created TurboQuant KV cache: %d/%d layers quantized, %d-bit, head_dim=%d",
+        "Created TurboQuant KV cache: %d/%d cache entries quantized, %d-bit, head_dim=%d",
         tq_count,
-        num_layers,
+        len(caches),
         bits,
         head_dim,
     )
