@@ -890,6 +890,8 @@ async def generate_completion(
                 exc,
                 exc_info=True,
             )
+            if system:
+                prompt = f"{system}\n\n{prompt}"
     elif apply_chat_template and lm.is_vlm:
         if system:
             prompt = f"{system}\n\n{prompt}"
