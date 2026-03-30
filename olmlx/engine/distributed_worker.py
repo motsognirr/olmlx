@@ -87,7 +87,7 @@ def _load_flash_tensor_worker(model_path: str, group) -> tuple:
     # hours on a silent download.
     from huggingface_hub import try_to_load_from_cache
 
-    if try_to_load_from_cache(model_path, "config.json") is None:
+    if not try_to_load_from_cache(model_path, "config.json"):
         raise FileNotFoundError(
             f"Model {model_path!r} not found in HF cache. "
             f"Run 'olmlx flash prepare {model_path}' on this worker node first."

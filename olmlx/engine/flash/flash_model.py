@@ -140,6 +140,9 @@ class FlashModelWrapper(nn.Module):
                     f"divisible by world size ({N})"
                 )
 
+        # Mark sharded before mutation so a mid-loop failure still prevents
+        # a second shard() call on a partially-mutated model.
+        object.__setattr__(self, "_sharded", True)
         sharded_count = 0
         for layer in self._model.layers:
             if not hasattr(layer, "self_attn"):
@@ -152,7 +155,6 @@ class FlashModelWrapper(nn.Module):
             attn.n_heads //= N
             attn.n_kv_heads //= N
             sharded_count += 1
-        object.__setattr__(self, "_sharded", True)
         logger.info(
             "Sharded %d attention layers (MLP handled by Flash SSD)",
             sharded_count,

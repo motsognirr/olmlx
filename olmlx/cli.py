@@ -376,7 +376,7 @@ def _launch_distributed_workers() -> list[str]:
     validate_remote_python(remote_python)
     remote_working_dir = experimental.distributed_remote_working_dir
 
-    if experimental.flash_moe is True:
+    if experimental.flash_moe:
         print(
             "Error: Flash-MoE + distributed is not supported. "
             "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or OLMLX_EXPERIMENTAL_DISTRIBUTED.",
