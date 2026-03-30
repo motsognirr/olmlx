@@ -187,7 +187,7 @@ class FlashModelWrapper(nn.Module):
         parameters so that ``mx.eval(wrapper.parameters())`` materializes
         all weights — including sharded attention projections.
         """
-        params = super().parameters()
+        params = dict(super().parameters())
         params["_model"] = self._model.parameters()
         return params
 
@@ -198,7 +198,7 @@ class FlashModelWrapper(nn.Module):
 
     def trainable(self):
         """Return combined trainable parameters (same blind spot as parameters)."""
-        params = super().trainable()
+        params = dict(super().trainable())
         params["_model"] = self._model.trainable()
         return params
 
