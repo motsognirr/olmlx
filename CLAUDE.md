@@ -86,6 +86,7 @@ olmlx/
   - After `model.shard()`, must materialize weights with `mx.eval(model.parameters())` on both coordinator and worker before any forward pass — otherwise the combined lazy weight materialization + all_sum Metal command buffer exceeds the ~10s GPU timeout for 32B+ models.
   - Coordinator broadcasts inference params via sideband before `stream_generate`; a lightweight `all_sum` barrier synchronizes ranks before heavy compute.
   - Worker and coordinator must load the same model (all_sum requires matching tensor shapes).
+  - **Flash + distributed**: When both Flash and distributed are enabled (tensor strategy), `FlashModelWrapper.shard()` shards only attention projections, leaving FlashMLP layers unsharded. Each rank independently loads active neurons from its local SSD. This is correct because `o_proj` (sharded-to-all) replicates its output via `all_sum`, so every rank feeds identical input to FlashMLP. Pre-sharding is skipped (MLP weights live on SSD). Flash env vars are forwarded to workers. Flash-MoE + distributed remains blocked (expert weights cannot be sharded).
   - Config: `OLMLX_EXPERIMENTAL_DISTRIBUTED=true`, hostfile at `~/.olmlx/hostfile.json` with `{"hosts": ["ip1", "ip2"], "model": "hf-path"}`.
 
 ## Development

@@ -1406,6 +1406,26 @@ OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS=1024
 - **Preparation time**: The one-time preparation step can take several minutes depending on model size and calibration sample count
 - **Best for**: Models that are 1.5-2x larger than available GPU memory, where you'd otherwise be unable to run them at all
 
+### Combining with Distributed Inference
+
+Flash can be combined with distributed inference for dense (non-MoE) models. Attention is distributed across ranks while each rank independently loads active MLP neurons from its local SSD. See the [Distributed Inference](#distributed-inference-experimental) section for setup details.
+
+Each machine must independently prepare the model:
+
+```bash
+# Run on EVERY machine:
+olmlx flash prepare <model>
+```
+
+Then enable both features on the coordinator:
+
+```bash
+OLMLX_EXPERIMENTAL_FLASH=true
+OLMLX_EXPERIMENTAL_DISTRIBUTED=true
+```
+
+Flash tuning parameters (sparsity threshold, I/O threads, etc.) are forwarded to workers automatically. Pre-sharding is skipped when Flash is enabled.
+
 ---
 
 ## Distributed Inference (Experimental)
@@ -1582,11 +1602,28 @@ Tested with two M4 Mac Minis (64GB + 24GB) connected via Thunderbolt:
 - Thunderbolt is ~30% faster than WiFi for distributed inference
 - The value is enabling models that don't fit on one machine (e.g., 72B across two 64GB machines)
 
+### Combining with Flash Inference
+
+Flash and distributed can be combined for dense (non-MoE) models. When both are enabled, attention is distributed across ranks while each rank independently loads active MLP neurons from its local SSD. This provides:
+
+- **Attention speedup** from distributed sharding (`all_sum` synchronization)
+- **MLP speedup** from Flash sparsity (on-demand neuron loading)
+- **Lower RAM per rank** — MLP weights (~2/3 of model) stay on SSD, attention weights are split across ranks
+
+**Requirements:**
+- Each machine must independently run `olmlx flash prepare <model>`
+- Head counts (`n_heads`, `n_kv_heads`) must be divisible by world size
+- Flash-MoE models are not supported (expert weights cannot be sharded)
+- Pre-sharding is automatically skipped
+
+See the [Flash Inference](#llm-in-a-flash-experimental) section for preparation instructions.
+
 ### Limitations
 
 - Only one model can be used (specified in hostfile, loaded at worker startup)
 - The requested model must match the hostfile model
 - VLM (vision-language) models are not supported
+- Flash-MoE models are not supported in distributed mode (dense Flash models are supported)
 - Prompt caching is disabled in distributed mode
 - If the coordinator crashes mid-inference, workers hang indefinitely (MLX has no timeout on collective operations)
 - All machines must have the model downloaded locally
