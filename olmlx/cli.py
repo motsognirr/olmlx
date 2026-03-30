@@ -395,7 +395,7 @@ def _launch_distributed_workers() -> list[str]:
                 layer_counts=hostfile_layers,
             )
 
-    if experimental.flash and experimental.flash_moe:
+    if experimental.flash_moe is True:
         print(
             "Error: Flash-MoE + distributed is not supported. "
             "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or OLMLX_EXPERIMENTAL_DISTRIBUTED.",

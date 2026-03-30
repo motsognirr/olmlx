@@ -56,6 +56,7 @@ class FlashModelWrapper(nn.Module):
         # going through nn.Module's dict (which __getattr__ can't reach
         # for _-prefixed names).
         object.__setattr__(self, "_model", model)
+        object.__setattr__(self, "_sharded", False)
         self.window_manager = WindowManager(
             flash_config.num_layers,
             flash_config.window_size,
@@ -114,6 +115,8 @@ class FlashModelWrapper(nn.Module):
         correct because o_proj (sharded-to-all) replicates its output via
         all_sum, so every rank feeds identical input to FlashMLP.
         """
+        if self._sharded:
+            raise RuntimeError("shard() has already been called on this model")
         from mlx.nn.layers.distributed import shard_linear
 
         group = group or mx.distributed.init()
@@ -142,6 +145,7 @@ class FlashModelWrapper(nn.Module):
             attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
             attn.n_heads //= N
             attn.n_kv_heads //= N
+        self._sharded = True
         logger.info(
             "Sharded %d attention layers (MLP handled by Flash SSD)",
             len(self._model.layers),

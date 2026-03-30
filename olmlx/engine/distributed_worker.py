@@ -240,8 +240,8 @@ def worker_main() -> None:
         if experimental.flash:
             try:
                 model, tokenizer = _load_flash_tensor_worker(model_path, group)
-            except Exception as e:
-                logger.exception("Flash model load failed: %s", e)
+            except Exception:
+                logger.exception("Flash model load failed")
                 worker.close()
                 sys.exit(1)
         else:
