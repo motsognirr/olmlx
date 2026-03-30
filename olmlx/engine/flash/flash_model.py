@@ -166,6 +166,10 @@ class FlashModelWrapper(nn.Module):
         so ``nn.Module.parameters()`` cannot reach it.  Delegate directly to
         the inner model so that ``mx.eval(wrapper.parameters())`` materializes
         all weights — including sharded attention projections.
+
+        Note: this skips any ``nn.Module`` children registered directly on
+        the wrapper.  Currently none exist (``window_manager`` is a plain
+        Python object), but if one is added it must be included here.
         """
         return self._model.parameters()
 

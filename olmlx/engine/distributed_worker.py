@@ -74,7 +74,18 @@ def _load_flash_tensor_worker(model_path: str, group) -> tuple:
     from olmlx.engine.flash.weight_store import FlashWeightStore
     from olmlx.models.store import _safe_dir_name
 
-    flash_dir = Path(settings.models_dir) / _safe_dir_name(model_path) / "flash"
+    model_local = Path(settings.models_dir) / _safe_dir_name(model_path)
+    flash_dir = model_local / "flash"
+
+    # Detect Flash-MoE preparation — not supported with distributed.
+    moe_dir = model_local / "flash_moe"
+    if moe_dir.exists() and (moe_dir / "flash_moe_layout.json").exists():
+        raise RuntimeError(
+            f"Flash-MoE models are not supported in distributed mode. "
+            f"Model {model_path} was prepared for Flash-MoE (found {moe_dir}), "
+            "but expert weights cannot be sharded across ranks."
+        )
+
     if not flash_dir.exists() or not (flash_dir / "flash_layout.json").exists():
         raise FileNotFoundError(
             f"Flash data not found at {flash_dir}. "
@@ -218,6 +229,14 @@ def worker_main() -> None:
             sys.exit(1)
         mx.eval(model.parameters())  # materialize owned weights on GPU
     else:
+        if experimental.flash_moe:
+            logger.error(
+                "Flash-MoE + distributed is not supported. "
+                "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or "
+                "OLMLX_EXPERIMENTAL_DISTRIBUTED."
+            )
+            worker.close()
+            sys.exit(1)
         if experimental.flash:
             try:
                 model, tokenizer = _load_flash_tensor_worker(model_path, group)
