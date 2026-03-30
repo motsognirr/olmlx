@@ -480,7 +480,7 @@ class TestFlashModelWrapperShard:
 
         wrapper, *_ = wrapper_setup
         wrapper.shard(FakeGroup(rank=0, size=2))
-        with pytest.raises(RuntimeError, match="already been called"):
+        with pytest.raises(RuntimeError, match="already been called|indeterminate"):
             wrapper.shard(FakeGroup(rank=0, size=2))
 
     def test_shard_requires_group(self, wrapper_setup):

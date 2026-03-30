@@ -155,6 +155,14 @@ def worker_main() -> None:
         )
         sys.exit(1)
 
+    strategy = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_STRATEGY", "tensor")
+    if strategy == "pipeline" and _exp_early.flash:
+        logger.error(
+            "Flash + pipeline distributed strategy is not supported. "
+            "Use tensor strategy or disable Flash."
+        )
+        sys.exit(1)
+
     coordinator_host = os.environ.get(
         "OLMLX_EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST", "127.0.0.1"
     )
@@ -180,21 +188,10 @@ def worker_main() -> None:
         port=sideband_port,
     )
 
-    # Read distributed strategy config
-    strategy = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_STRATEGY", "tensor")
-
     # Load and shard the model
     import mlx_lm
 
     from olmlx.config import PRE_SHARDED_DIR_ENV, experimental
-
-    if strategy == "pipeline" and experimental.flash:
-        logger.error(
-            "Flash + pipeline distributed strategy is not supported. "
-            "Use tensor strategy or disable Flash."
-        )
-        worker.close()
-        sys.exit(1)
 
     if strategy == "pipeline":
         # Pipeline mode: load model, apply pipeline partitioning

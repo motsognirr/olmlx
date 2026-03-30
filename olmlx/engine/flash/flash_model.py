@@ -117,8 +117,8 @@ class FlashModelWrapper(nn.Module):
         """
         if self._sharded:
             raise RuntimeError(
-                "shard() has already been called on this model — "
-                "reload the model to retry"
+                "shard() has already been called or failed mid-loop — "
+                "model is in an indeterminate state, reload to retry"
             )
         if group is None:
             raise ValueError("shard() requires an explicit distributed group")
