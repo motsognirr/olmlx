@@ -117,14 +117,17 @@ class FlashModelWrapper(nn.Module):
         """
         if self._sharded:
             raise RuntimeError("shard() has already been called on this model")
+        if group is None:
+            raise ValueError("shard() requires an explicit distributed group")
         from mlx.nn.layers.distributed import shard_linear
 
-        group = group or mx.distributed.init()
         N = group.size()
 
         # Validate all layers before any mutation so a failure doesn't
         # leave the model in a partially-sharded state.
         for i, layer in enumerate(self._model.layers):
+            if not hasattr(layer, "self_attn"):
+                continue
             attn = layer.self_attn
             if attn.n_heads % N != 0:
                 raise ValueError(
@@ -138,6 +141,8 @@ class FlashModelWrapper(nn.Module):
                 )
 
         for layer in self._model.layers:
+            if not hasattr(layer, "self_attn"):
+                continue
             attn = layer.self_attn
             attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
             attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)

@@ -473,3 +473,12 @@ class TestFlashModelWrapperShard:
 
         with pytest.raises(ValueError, match="n_kv_heads.*not divisible"):
             wrapper.shard(FakeGroup(rank=0, size=8))
+
+    def test_shard_raises_if_called_twice(self, wrapper_setup):
+        """shard() must raise RuntimeError if called a second time."""
+        from olmlx.engine.pre_shard import FakeGroup
+
+        wrapper, *_ = wrapper_setup
+        wrapper.shard(FakeGroup(rank=0, size=2))
+        with pytest.raises(RuntimeError, match="already been called"):
+            wrapper.shard(FakeGroup(rank=0, size=2))

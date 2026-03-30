@@ -92,6 +92,8 @@ def _load_flash_tensor_worker(model_path: str, group) -> tuple:
             f"Run 'olmlx flash prepare {model_path}' on this worker node first."
         )
 
+    # Load base model from HF cache. Workers that ran `olmlx flash prepare`
+    # will have the model cached locally; if not, this triggers a download.
     logger.info("Loading flash model %s from %s", model_path, flash_dir)
     model, tokenizer = mlx_lm.load(model_path)
 
