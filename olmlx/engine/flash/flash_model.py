@@ -140,6 +140,7 @@ class FlashModelWrapper(nn.Module):
                     f"divisible by world size ({N})"
                 )
 
+        sharded_count = 0
         for layer in self._model.layers:
             if not hasattr(layer, "self_attn"):
                 continue
@@ -150,10 +151,11 @@ class FlashModelWrapper(nn.Module):
             attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
             attn.n_heads //= N
             attn.n_kv_heads //= N
+            sharded_count += 1
         object.__setattr__(self, "_sharded", True)
         logger.info(
             "Sharded %d attention layers (MLP handled by Flash SSD)",
-            len(self._model.layers),
+            sharded_count,
         )
 
     def __call__(self, inputs, cache=None, **kwargs):
@@ -182,6 +184,12 @@ class FlashModelWrapper(nn.Module):
         """
         params = super().parameters()
         params["_model"] = self._model.parameters()
+        return params
+
+    def trainable(self):
+        """Return combined trainable parameters (same blind spot as parameters)."""
+        params = super().trainable()
+        params["_model"] = self._model.trainable()
         return params
 
     @property
