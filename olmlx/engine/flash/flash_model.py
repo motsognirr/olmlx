@@ -145,7 +145,7 @@ class FlashModelWrapper(nn.Module):
             attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
             attn.n_heads //= N
             attn.n_kv_heads //= N
-        self._sharded = True
+        object.__setattr__(self, "_sharded", True)
         logger.info(
             "Sharded %d attention layers (MLP handled by Flash SSD)",
             len(self._model.layers),
@@ -166,18 +166,17 @@ class FlashModelWrapper(nn.Module):
         return getattr(model, name)
 
     def parameters(self):
-        """Return inner model's parameters.
+        """Return combined parameters of inner model and wrapper submodules.
 
         ``_model`` is stored in ``__dict__`` (bypassing ``nn.Module``'s dict),
-        so ``nn.Module.parameters()`` cannot reach it.  Delegate to the inner
-        model and merge any ``nn.Module`` children registered directly on the
-        wrapper so that ``mx.eval(wrapper.parameters())`` materializes all
-        weights — including sharded attention projections.
+        so the base ``nn.Module.parameters()`` cannot reach it.  Merge the
+        base class result (which covers ``window_manager`` and any future
+        submodules registered via normal assignment) with the inner model's
+        parameters so that ``mx.eval(wrapper.parameters())`` materializes
+        all weights — including sharded attention projections.
         """
-        params = self._model.parameters()
-        for k, v in self.__dict__.items():
-            if isinstance(v, nn.Module) and k != "_model":
-                params[k] = v.parameters()
+        params = super().parameters()
+        params["_model"] = self._model.parameters()
         return params
 
     @property

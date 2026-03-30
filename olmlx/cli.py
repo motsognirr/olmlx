@@ -376,6 +376,14 @@ def _launch_distributed_workers() -> list[str]:
     validate_remote_python(remote_python)
     remote_working_dir = experimental.distributed_remote_working_dir
 
+    if experimental.flash_moe is True:
+        print(
+            "Error: Flash-MoE + distributed is not supported. "
+            "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or OLMLX_EXPERIMENTAL_DISTRIBUTED.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Pre-shard and distribute weights to workers if enabled
     pre_sharded = False
     if experimental.distributed_pre_shard:
@@ -394,14 +402,6 @@ def _launch_distributed_workers() -> list[str]:
                 strategy=strategy,
                 layer_counts=hostfile_layers,
             )
-
-    if experimental.flash_moe is True:
-        print(
-            "Error: Flash-MoE + distributed is not supported. "
-            "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or OLMLX_EXPERIMENTAL_DISTRIBUTED.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     # Pre-compute safe model name for env var paths (used when pre-sharded)
     if pre_sharded:
