@@ -46,7 +46,6 @@ from olmlx.utils.timing import Timer, TimingStats
 
 logger = logging.getLogger(__name__)
 
-
 # gpt-oss special tokens used by the streaming filter
 _GPT_OSS_STRUCTURAL_TOKENS = frozenset(
     {
@@ -850,13 +849,57 @@ async def generate_completion(
     keep_alive: str | None = None,
     max_tokens: int = 512,
     images: list[str] | None = None,
+    apply_chat_template: bool = False,
+    system: str | None = None,
 ) -> AsyncGenerator[dict, None] | dict:
-    """Generate a text completion, streaming or not."""
+    """Generate a text completion, streaming or not.
+
+    When *apply_chat_template* is True the raw prompt is wrapped in chat
+    messages and run through the model's chat template before generation.
+    If *system* is provided, it becomes a ``{"role": "system"}`` message.
+    This is needed for chat-only models (e.g. Nemotron-H) that require the
+    template framing to produce meaningful output.
+    """
     stats = TimingStats()
 
     with Timer() as load_timer:
         lm = await manager.ensure_loaded(model_name, keep_alive)
     stats.load_duration = load_timer.duration_ns
+
+    if apply_chat_template and not lm.is_vlm:
+        messages: list[dict] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        try:
+            prompt = _apply_chat_template_text(
+                lm.text_tokenizer,
+                messages,
+                caps=lm.template_caps,
+                enable_thinking=False,
+            )
+            logger.info(
+                "Applied chat template for /api/generate (prompt length: %d chars)",
+                len(prompt),
+            )
+            logger.debug("Templated prompt: %s", prompt[:500])
+        except RuntimeError as exc:
+            logger.warning(
+                "Chat template failed for %s, falling back to raw prompt: %s",
+                model_name,
+                exc,
+                exc_info=True,
+            )
+            if system:
+                prompt = f"{system}\n\n{prompt}"
+    elif apply_chat_template and lm.is_vlm:
+        if system:
+            prompt = f"{system}\n\n{prompt}"
+            logger.warning(
+                "apply_chat_template not supported for VLM %s; "
+                "system prepended as plain text",
+                model_name,
+            )
 
     gen_kwargs = _build_generate_kwargs(options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
