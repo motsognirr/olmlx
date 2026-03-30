@@ -118,21 +118,26 @@ class FlashModelWrapper(nn.Module):
 
         group = group or mx.distributed.init()
         N = group.size()
+
+        # Validate head counts before any mutation so a failure doesn't
+        # leave the model in a partially-sharded state.
+        first_attn = self._model.layers[0].self_attn
+        if first_attn.n_heads % N != 0:
+            raise ValueError(
+                f"n_heads ({first_attn.n_heads}) is not divisible by world size ({N})"
+            )
+        if first_attn.n_kv_heads % N != 0:
+            raise ValueError(
+                f"n_kv_heads ({first_attn.n_kv_heads}) is not divisible by "
+                f"world size ({N})"
+            )
+
         for layer in self._model.layers:
             attn = layer.self_attn
             attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
             attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
             attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
             attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
-            if attn.n_heads % N != 0:
-                raise ValueError(
-                    f"n_heads ({attn.n_heads}) is not divisible by world size ({N})"
-                )
-            if attn.n_kv_heads % N != 0:
-                raise ValueError(
-                    f"n_kv_heads ({attn.n_kv_heads}) is not divisible by "
-                    f"world size ({N})"
-                )
             attn.n_heads //= N
             attn.n_kv_heads //= N
         logger.info(
