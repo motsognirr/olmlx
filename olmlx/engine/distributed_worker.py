@@ -87,7 +87,7 @@ def _load_flash_tensor_worker(model_path: str, group) -> tuple:
     # hours on a silent download.
     from huggingface_hub import try_to_load_from_cache
 
-    if not try_to_load_from_cache(model_path, "config.json"):
+    if not isinstance(try_to_load_from_cache(model_path, "config.json"), str):
         raise FileNotFoundError(
             f"Model {model_path!r} not found in HF cache. "
             f"Run 'olmlx flash prepare {model_path}' on this worker node first."
@@ -141,6 +141,18 @@ def worker_main() -> None:
     model_path = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_MODEL")
     if not model_path:
         logger.error("OLMLX_EXPERIMENTAL_DISTRIBUTED_MODEL not set")
+        sys.exit(1)
+
+    # Check Flash-MoE before ring init — exiting after init hangs the
+    # coordinator on ring collectives.
+    from olmlx.config import experimental as _exp_early
+
+    if _exp_early.flash_moe:
+        logger.error(
+            "Flash-MoE + distributed is not supported. "
+            "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or "
+            "OLMLX_EXPERIMENTAL_DISTRIBUTED."
+        )
         sys.exit(1)
 
     coordinator_host = os.environ.get(
@@ -230,14 +242,6 @@ def worker_main() -> None:
             sys.exit(1)
         mx.eval(model.parameters())  # materialize owned weights on GPU
     else:
-        if experimental.flash_moe:
-            logger.error(
-                "Flash-MoE + distributed is not supported. "
-                "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or "
-                "OLMLX_EXPERIMENTAL_DISTRIBUTED."
-            )
-            worker.close()
-            sys.exit(1)
         if experimental.flash:
             try:
                 model, tokenizer = _load_flash_tensor_worker(model_path, group)

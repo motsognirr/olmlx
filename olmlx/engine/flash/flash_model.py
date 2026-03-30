@@ -116,7 +116,10 @@ class FlashModelWrapper(nn.Module):
         all_sum, so every rank feeds identical input to FlashMLP.
         """
         if self._sharded:
-            raise RuntimeError("shard() has already been called on this model")
+            raise RuntimeError(
+                "shard() has already been called on this model — "
+                "reload the model to retry"
+            )
         if group is None:
             raise ValueError("shard() requires an explicit distributed group")
         from mlx.nn.layers.distributed import shard_linear
