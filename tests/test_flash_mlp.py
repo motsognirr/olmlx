@@ -411,12 +411,65 @@ class TestFlashModelWrapperShard:
         assert type(attn.v_proj) is not nn.Linear
         assert type(attn.o_proj) is not nn.Linear
 
-    def test_shard_parameters_materializable(self, wrapper_setup):
-        """mx.eval(wrapper.parameters()) should work after sharding."""
+    def test_shard_parameters_include_attention(self, wrapper_setup):
+        """wrapper.parameters() must include inner model's attention projections."""
         from olmlx.engine.pre_shard import FakeGroup
 
         wrapper, *_ = wrapper_setup
         wrapper.shard(FakeGroup(rank=0, size=2))
 
+        params = wrapper.parameters()
+        # Flatten nested structure (dicts + lists) to find attention params
+        param_keys = []
+
+        def _collect_keys(obj, prefix=""):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    full = f"{prefix}.{k}" if prefix else k
+                    if isinstance(v, (dict, list)):
+                        _collect_keys(v, full)
+                    else:
+                        param_keys.append(full)
+            elif isinstance(obj, list):
+                for i, v in enumerate(obj):
+                    full = f"{prefix}.{i}"
+                    if isinstance(v, (dict, list)):
+                        _collect_keys(v, full)
+                    else:
+                        param_keys.append(full)
+
+        _collect_keys(params)
+        attn_keys = [k for k in param_keys if "q_proj" in k or "k_proj" in k]
+        assert attn_keys, "wrapper.parameters() must include attention projections"
+
         # Should not raise
-        mx.eval(wrapper.parameters())
+        mx.eval(params)
+
+    def test_shard_rejects_indivisible_heads(self, tmp_path):
+        """shard() should raise ValueError if heads aren't divisible by world size."""
+        from olmlx.engine.flash.flash_model import FlashConfig, FlashModelWrapper
+        from olmlx.engine.pre_shard import FakeGroup
+
+        # dim=64, n_heads=8, n_kv_heads=4 with world_size=8:
+        # linear layers: 64/8=8 (OK for shard_linear)
+        # n_heads: 8/8=1 (OK)
+        # n_kv_heads: 4/8=0.5 (should fail)
+        dim, n_heads, n_kv_heads, num_layers = 64, 8, 4, 1
+        inter = 32
+        model = _FakeModel(dim, n_heads, n_kv_heads, num_layers)
+        flash_dir, _, _ = _make_bundled_model(
+            tmp_path, hidden=dim, inter=inter, num_layers=num_layers
+        )
+        store = FlashWeightStore(flash_dir, num_io_threads=2, cache_budget_neurons=64)
+        from types import SimpleNamespace
+
+        predictor_bank = SimpleNamespace(
+            predictors=[SparsityPredictor(dim, inter, rank=4)],
+        )
+        config = FlashConfig(
+            hidden_size=dim, intermediate_size=inter, num_layers=num_layers
+        )
+        wrapper = FlashModelWrapper(model, predictor_bank, store, config)
+
+        with pytest.raises(ValueError, match="n_kv_heads.*not divisible"):
+            wrapper.shard(FakeGroup(rank=0, size=8))

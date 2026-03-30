@@ -124,6 +124,15 @@ class FlashModelWrapper(nn.Module):
             attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
             attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
             attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+            if attn.n_heads % N != 0:
+                raise ValueError(
+                    f"n_heads ({attn.n_heads}) is not divisible by world size ({N})"
+                )
+            if attn.n_kv_heads % N != 0:
+                raise ValueError(
+                    f"n_kv_heads ({attn.n_kv_heads}) is not divisible by "
+                    f"world size ({N})"
+                )
             attn.n_heads //= N
             attn.n_kv_heads //= N
         logger.info(
@@ -144,6 +153,16 @@ class FlashModelWrapper(nn.Module):
             raise AttributeError(name)
         model = object.__getattribute__(self, "_model")
         return getattr(model, name)
+
+    def parameters(self):
+        """Return inner model's parameters.
+
+        ``_model`` is stored in ``__dict__`` (bypassing ``nn.Module``'s dict),
+        so ``nn.Module.parameters()`` cannot reach it.  Delegate directly to
+        the inner model so that ``mx.eval(wrapper.parameters())`` materializes
+        all weights — including sharded attention projections.
+        """
+        return self._model.parameters()
 
     @property
     def layers(self):

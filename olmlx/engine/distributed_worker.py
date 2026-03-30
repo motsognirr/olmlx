@@ -219,7 +219,12 @@ def worker_main() -> None:
         mx.eval(model.parameters())  # materialize owned weights on GPU
     else:
         if experimental.flash:
-            model, tokenizer = _load_flash_tensor_worker(model_path, group)
+            try:
+                model, tokenizer = _load_flash_tensor_worker(model_path, group)
+            except Exception as e:
+                logger.error("Flash model load failed: %s", e)
+                worker.close()
+                sys.exit(1)
         else:
             pre_shard_dir = os.environ.get(PRE_SHARDED_DIR_ENV)
             if pre_shard_dir:
