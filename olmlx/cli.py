@@ -395,6 +395,14 @@ def _launch_distributed_workers() -> list[str]:
                 layer_counts=hostfile_layers,
             )
 
+    if experimental.flash and experimental.flash_moe:
+        print(
+            "Error: Flash-MoE + distributed is not supported. "
+            "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or OLMLX_EXPERIMENTAL_DISTRIBUTED.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Pre-compute safe model name for env var paths (used when pre-sharded)
     if pre_sharded:
         from olmlx.config import PRE_SHARDED_DIR_ENV

@@ -119,18 +119,20 @@ class FlashModelWrapper(nn.Module):
         group = group or mx.distributed.init()
         N = group.size()
 
-        # Validate head counts before any mutation so a failure doesn't
+        # Validate all layers before any mutation so a failure doesn't
         # leave the model in a partially-sharded state.
-        first_attn = self._model.layers[0].self_attn
-        if first_attn.n_heads % N != 0:
-            raise ValueError(
-                f"n_heads ({first_attn.n_heads}) is not divisible by world size ({N})"
-            )
-        if first_attn.n_kv_heads % N != 0:
-            raise ValueError(
-                f"n_kv_heads ({first_attn.n_kv_heads}) is not divisible by "
-                f"world size ({N})"
-            )
+        for i, layer in enumerate(self._model.layers):
+            attn = layer.self_attn
+            if attn.n_heads % N != 0:
+                raise ValueError(
+                    f"Layer {i}: n_heads ({attn.n_heads}) is not divisible "
+                    f"by world size ({N})"
+                )
+            if attn.n_kv_heads % N != 0:
+                raise ValueError(
+                    f"Layer {i}: n_kv_heads ({attn.n_kv_heads}) is not "
+                    f"divisible by world size ({N})"
+                )
 
         for layer in self._model.layers:
             attn = layer.self_attn
@@ -163,15 +165,16 @@ class FlashModelWrapper(nn.Module):
         """Return inner model's parameters.
 
         ``_model`` is stored in ``__dict__`` (bypassing ``nn.Module``'s dict),
-        so ``nn.Module.parameters()`` cannot reach it.  Delegate directly to
-        the inner model so that ``mx.eval(wrapper.parameters())`` materializes
-        all weights — including sharded attention projections.
-
-        Note: this skips any ``nn.Module`` children registered directly on
-        the wrapper.  Currently none exist (``window_manager`` is a plain
-        Python object), but if one is added it must be included here.
+        so ``nn.Module.parameters()`` cannot reach it.  Delegate to the inner
+        model and merge any ``nn.Module`` children registered directly on the
+        wrapper so that ``mx.eval(wrapper.parameters())`` materializes all
+        weights — including sharded attention projections.
         """
-        return self._model.parameters()
+        params = self._model.parameters()
+        for k, v in self.__dict__.items():
+            if isinstance(v, nn.Module) and k != "_model":
+                params[k] = v.parameters()
+        return params
 
     @property
     def layers(self):
