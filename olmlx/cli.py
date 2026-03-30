@@ -441,7 +441,9 @@ def _launch_distributed_workers() -> list[str]:
             env[PRE_SHARDED_DIR_ENV] = f"{worker_shard_dir}/{safe_name}/rank{rank}"
         if experimental.flash:
             env["OLMLX_EXPERIMENTAL_FLASH"] = "true"
-            # Forward all flash tuning params so worker FlashConfig matches
+            # Forward all flash tuning params so worker FlashConfig matches.
+            # OLMLX_EXPERIMENTAL_FLASH_MOE also matches this prefix but is
+            # safe: the flash_moe guard above already exited if it was true.
             for key, val in os.environ.items():
                 if key.startswith("OLMLX_EXPERIMENTAL_FLASH_") and key not in env:
                     env[key] = val
