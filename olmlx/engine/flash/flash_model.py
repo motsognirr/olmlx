@@ -186,6 +186,11 @@ class FlashModelWrapper(nn.Module):
         params["_model"] = self._model.parameters()
         return params
 
+    def freeze(self, *args, **kwargs):
+        """Freeze parameters — delegates to inner model since it is invisible to nn.Module."""
+        super().freeze(*args, **kwargs)
+        self._model.freeze(*args, **kwargs)
+
     def trainable(self):
         """Return combined trainable parameters (same blind spot as parameters)."""
         params = super().trainable()

@@ -482,3 +482,9 @@ class TestFlashModelWrapperShard:
         wrapper.shard(FakeGroup(rank=0, size=2))
         with pytest.raises(RuntimeError, match="already been called"):
             wrapper.shard(FakeGroup(rank=0, size=2))
+
+    def test_shard_requires_group(self, wrapper_setup):
+        """shard() must raise ValueError when called without a group."""
+        wrapper, *_ = wrapper_setup
+        with pytest.raises(ValueError, match="requires an explicit"):
+            wrapper.shard(None)

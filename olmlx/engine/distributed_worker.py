@@ -81,8 +81,18 @@ def _load_flash_tensor_worker(model_path: str, group) -> tuple:
             f"Run 'olmlx flash prepare {model_path}' on this worker node first."
         )
 
-    # Load base model from HF cache. Workers that ran `olmlx flash prepare`
-    # will have the model cached locally; if not, this triggers a download.
+    # Verify the model is already in the HF cache. Any machine that ran
+    # `olmlx flash prepare` will have it cached, but the cache could have
+    # been cleared since then.  Fail fast rather than hanging the ring for
+    # hours on a silent download.
+    from huggingface_hub import try_to_load_from_cache
+
+    if try_to_load_from_cache(model_path, "config.json") is None:
+        raise FileNotFoundError(
+            f"Model {model_path!r} not found in HF cache. "
+            f"Run 'olmlx flash prepare {model_path}' on this worker node first."
+        )
+
     logger.info("Loading flash model %s from %s", model_path, flash_dir)
     model, tokenizer = mlx_lm.load(model_path)
 
