@@ -188,6 +188,14 @@ def worker_main() -> None:
 
     from olmlx.config import PRE_SHARDED_DIR_ENV, experimental
 
+    if strategy == "pipeline" and experimental.flash:
+        logger.error(
+            "Flash + pipeline distributed strategy is not supported. "
+            "Use tensor strategy or disable Flash."
+        )
+        worker.close()
+        sys.exit(1)
+
     if strategy == "pipeline":
         # Pipeline mode: load model, apply pipeline partitioning
         layer_counts_str = os.environ.get(

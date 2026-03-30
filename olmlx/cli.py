@@ -384,11 +384,19 @@ def _launch_distributed_workers() -> list[str]:
         )
         sys.exit(1)
 
+    if experimental.flash and strategy == "pipeline":
+        print(
+            "Error: Flash + pipeline distributed strategy is not supported. "
+            "Use tensor strategy or disable Flash.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Pre-shard and distribute weights to workers if enabled
     pre_sharded = False
     if experimental.distributed_pre_shard:
         if experimental.flash:
-            print(
+            logger.info(
                 "Skipping pre-sharding: Flash mode shards only attention "
                 "layers at runtime, MLP weights are loaded from SSD on "
                 "each node independently."

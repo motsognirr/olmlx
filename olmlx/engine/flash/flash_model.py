@@ -132,6 +132,13 @@ class FlashModelWrapper(nn.Module):
             if not hasattr(layer, "self_attn"):
                 continue
             attn = layer.self_attn
+            for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                if not hasattr(attn, proj):
+                    raise ValueError(
+                        f"Layer {i}: self_attn has no '{proj}' — "
+                        "fused-projection architectures are not supported "
+                        "for Flash+distributed"
+                    )
             if attn.n_heads % N != 0:
                 raise ValueError(
                     f"Layer {i}: n_heads ({attn.n_heads}) is not divisible "
