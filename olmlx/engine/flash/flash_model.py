@@ -52,7 +52,10 @@ class FlashModelWrapper(nn.Module):
         flash_config: FlashConfig,
     ):
         super().__init__()
-        self._model = model
+        # Store in __dict__ directly so __getattr__ can find it without
+        # going through nn.Module's dict (which __getattr__ can't reach
+        # for _-prefixed names).
+        object.__setattr__(self, "_model", model)
         self.window_manager = WindowManager(
             flash_config.num_layers,
             flash_config.window_size,
@@ -102,6 +105,32 @@ class FlashModelWrapper(nn.Module):
         mx.clear_cache()
         logger.info("Replaced %d MLP layers with FlashMLP", replaced)
 
+    def shard(self, group=None):
+        """Shard attention layers only — FlashMLP handles its own weights via SSD.
+
+        In distributed mode, attention projections are split across ranks with
+        all_sum synchronization, while FlashMLP layers remain unsharded. Each
+        rank independently loads active neurons from its local SSD. This is
+        correct because o_proj (sharded-to-all) replicates its output via
+        all_sum, so every rank feeds identical input to FlashMLP.
+        """
+        from mlx.nn.layers.distributed import shard_linear
+
+        group = group or mx.distributed.init()
+        N = group.size()
+        for layer in self._model.layers:
+            attn = layer.self_attn
+            attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
+            attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
+            attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
+            attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+            attn.n_heads //= N
+            attn.n_kv_heads //= N
+        logger.info(
+            "Sharded %d attention layers (MLP handled by Flash SSD)",
+            len(self._model.layers),
+        )
+
     def __call__(self, inputs, cache=None, **kwargs):
         """Forward pass — delegates to the wrapped model."""
         return self._model(inputs, cache=cache, **kwargs)
@@ -113,7 +142,8 @@ class FlashModelWrapper(nn.Module):
             "training",
         ):
             raise AttributeError(name)
-        return getattr(self._model, name)
+        model = object.__getattribute__(self, "_model")
+        return getattr(model, name)
 
     @property
     def layers(self):

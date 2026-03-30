@@ -379,14 +379,21 @@ def _launch_distributed_workers() -> list[str]:
     # Pre-shard and distribute weights to workers if enabled
     pre_sharded = False
     if experimental.distributed_pre_shard:
-        pre_sharded = _pre_shard_and_distribute(
-            hosts,
-            model,
-            world_size,
-            experimental,
-            strategy=strategy,
-            layer_counts=hostfile_layers,
-        )
+        if experimental.flash:
+            print(
+                "Skipping pre-sharding: Flash mode shards only attention "
+                "layers at runtime, MLP weights are loaded from SSD on "
+                "each node independently."
+            )
+        else:
+            pre_sharded = _pre_shard_and_distribute(
+                hosts,
+                model,
+                world_size,
+                experimental,
+                strategy=strategy,
+                layer_counts=hostfile_layers,
+            )
 
     # Pre-compute safe model name for env var paths (used when pre-sharded)
     if pre_sharded:
@@ -416,6 +423,12 @@ def _launch_distributed_workers() -> list[str]:
             )
         if pre_sharded:
             env[PRE_SHARDED_DIR_ENV] = f"{worker_shard_dir}/{safe_name}/rank{rank}"
+        if experimental.flash:
+            env["OLMLX_EXPERIMENTAL_FLASH"] = "true"
+            # Forward all flash tuning params so worker FlashConfig matches
+            for key, val in os.environ.items():
+                if key.startswith("OLMLX_EXPERIMENTAL_FLASH_") and key not in env:
+                    env[key] = val
         env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
 
         # Build remote shell script that sets up hostfile and runs worker

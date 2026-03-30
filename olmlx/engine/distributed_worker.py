@@ -55,6 +55,66 @@ def _load_pre_sharded(shard_dir_str, group):
     return model, tokenizer
 
 
+def _load_flash_tensor_worker(model_path: str, group) -> tuple:
+    """Load a Flash model for tensor-parallel worker.
+
+    Loads the model, wraps it with FlashModelWrapper (replacing MLP layers
+    with FlashMLP instances), then shards only attention layers. Each worker
+    must have flash-prepared data on its local SSD.
+    """
+    import json
+    from pathlib import Path
+
+    import mlx.core as mx
+    import mlx_lm
+
+    from olmlx.config import experimental, settings
+    from olmlx.engine.flash.flash_model import FlashConfig, FlashModelWrapper
+    from olmlx.engine.flash.predictor import PredictorBank
+    from olmlx.engine.flash.weight_store import FlashWeightStore
+    from olmlx.models.store import _safe_dir_name
+
+    flash_dir = Path(settings.models_dir) / _safe_dir_name(model_path) / "flash"
+    if not flash_dir.exists() or not (flash_dir / "flash_layout.json").exists():
+        raise FileNotFoundError(
+            f"Flash data not found at {flash_dir}. "
+            f"Run 'olmlx flash prepare {model_path}' on this worker node first."
+        )
+
+    logger.info("Loading flash model %s from %s", model_path, flash_dir)
+    model, tokenizer = mlx_lm.load(model_path)
+
+    predictor_bank = PredictorBank.load(flash_dir / "predictors")
+    layout_config = json.loads((flash_dir / "flash_layout.json").read_text())
+
+    flash_config = FlashConfig(
+        hidden_size=layout_config["hidden_size"],
+        intermediate_size=layout_config["intermediate_size"],
+        num_layers=layout_config["num_layers"],
+        sparsity_threshold=experimental.flash_sparsity_threshold,
+        min_active_neurons=experimental.flash_min_active_neurons,
+        max_active_neurons=experimental.flash_max_active_neurons,
+        window_size=experimental.flash_window_size,
+        io_threads=experimental.flash_io_threads,
+        cache_budget_neurons=experimental.flash_cache_budget_neurons,
+        memory_budget_fraction=experimental.flash_memory_budget_fraction,
+    )
+
+    weight_store = FlashWeightStore(
+        flash_dir,
+        num_io_threads=flash_config.io_threads,
+        cache_budget_neurons=flash_config.cache_budget_neurons,
+        bypass_cache=experimental.flash_bypass_os_cache,
+        use_preallocated_buffer=experimental.flash_preallocated_buffer,
+    )
+
+    wrapped = FlashModelWrapper(model, predictor_bank, weight_store, flash_config)
+    wrapped.shard(group)
+    mx.eval(wrapped.parameters())
+    logger.info("Flash model loaded and sharded (attention-only)")
+    return wrapped, tokenizer
+
+
 def worker_main() -> None:
     """Main loop for distributed worker nodes."""
     import mlx.core as mx
@@ -102,7 +162,7 @@ def worker_main() -> None:
     # Load and shard the model
     import mlx_lm
 
-    from olmlx.config import PRE_SHARDED_DIR_ENV
+    from olmlx.config import PRE_SHARDED_DIR_ENV, experimental
 
     if strategy == "pipeline":
         # Pipeline mode: load model, apply pipeline partitioning
@@ -158,29 +218,33 @@ def worker_main() -> None:
             sys.exit(1)
         mx.eval(model.parameters())  # materialize owned weights on GPU
     else:
-        pre_shard_dir = os.environ.get(PRE_SHARDED_DIR_ENV)
-        if pre_shard_dir:
-            try:
-                model, tokenizer = _load_pre_sharded(pre_shard_dir, group)
-            except Exception as e:
-                logger.warning(
-                    "Pre-sharded load failed (%s), falling back to HF download", e
-                )
-                pre_shard_dir = None
-        if not pre_shard_dir:
-            logger.info("Loading model %s", model_path)
-            model, tokenizer = mlx_lm.load(model_path)
+        if experimental.flash:
+            model, tokenizer = _load_flash_tensor_worker(model_path, group)
+        else:
+            pre_shard_dir = os.environ.get(PRE_SHARDED_DIR_ENV)
+            if pre_shard_dir:
+                try:
+                    model, tokenizer = _load_pre_sharded(pre_shard_dir, group)
+                except Exception as e:
+                    logger.warning(
+                        "Pre-sharded load failed (%s), falling back to HF download",
+                        e,
+                    )
+                    pre_shard_dir = None
+            if not pre_shard_dir:
+                logger.info("Loading model %s", model_path)
+                model, tokenizer = mlx_lm.load(model_path)
 
-            if not hasattr(model, "shard"):
-                logger.error("Model %s does not support shard()", model_path)
-                worker.close()
-                sys.exit(1)
+                if not hasattr(model, "shard"):
+                    logger.error("Model %s does not support shard()", model_path)
+                    worker.close()
+                    sys.exit(1)
 
-            model.shard(group)
-            # Materialize all lazy weight slices before entering inference.
-            # Without this, the combined lazy eval + all_sum Metal command
-            # buffer can exceed the ~10s GPU timeout for large models (32B+).
-            mx.eval(model.parameters())
+                model.shard(group)
+                # Materialize all lazy weight slices before entering inference.
+                # Without this, the combined lazy eval + all_sum Metal command
+                # buffer can exceed the ~10s GPU timeout for large models (32B+).
+                mx.eval(model.parameters())
     worker.send_ready(secret=secret)
     logger.info("Model sharded, ready signal sent, entering inference loop")
 

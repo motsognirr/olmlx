@@ -281,3 +281,142 @@ class TestFlashMLP:
         flash_mlp(x)
         w = flash_mlp.window_manager.get_window(0)
         assert len(w) > 0  # Window should have entries after inference
+
+
+# ---------------------------------------------------------------------------
+# FlashModelWrapper.shard() tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeAttention(nn.Module):
+    """Minimal attention module with projections for shard tests."""
+
+    def __init__(self, dim, n_heads, n_kv_heads):
+        super().__init__()
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.o_proj = nn.Linear(dim, dim, bias=False)
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+
+
+class _FakeLayer(nn.Module):
+    """Minimal transformer layer with attention + MLP."""
+
+    def __init__(self, dim, n_heads, n_kv_heads):
+        super().__init__()
+        self.self_attn = _FakeAttention(dim, n_heads, n_kv_heads)
+        self.mlp = nn.Linear(dim, dim)  # placeholder, will be replaced
+
+
+class _FakeModel(nn.Module):
+    """Minimal model with layers list for shard tests."""
+
+    def __init__(self, dim, n_heads, n_kv_heads, num_layers=2):
+        super().__init__()
+        self.layers = [_FakeLayer(dim, n_heads, n_kv_heads) for _ in range(num_layers)]
+
+    def __call__(self, x, cache=None, **kwargs):
+        return x
+
+
+class TestFlashModelWrapperShard:
+    @pytest.fixture()
+    def wrapper_setup(self, tmp_path):
+        """Create a FlashModelWrapper around a fake model."""
+        from olmlx.engine.flash.flash_model import FlashConfig, FlashModelWrapper
+
+        dim, n_heads, n_kv_heads, num_layers = 64, 8, 4, 2
+        inter = 32
+        model = _FakeModel(dim, n_heads, n_kv_heads, num_layers)
+
+        flash_dir, _, _ = _make_bundled_model(
+            tmp_path, hidden=dim, inter=inter, num_layers=num_layers
+        )
+        store = FlashWeightStore(flash_dir, num_io_threads=2, cache_budget_neurons=64)
+        from types import SimpleNamespace
+
+        predictor_bank = SimpleNamespace(
+            predictors=[
+                SparsityPredictor(dim, inter, rank=4) for _ in range(num_layers)
+            ],
+        )
+        config = FlashConfig(
+            hidden_size=dim,
+            intermediate_size=inter,
+            num_layers=num_layers,
+        )
+
+        wrapper = FlashModelWrapper(model, predictor_bank, store, config)
+        return wrapper, model, dim, n_heads, n_kv_heads, num_layers
+
+    def test_shard_divides_attention_heads(self, wrapper_setup):
+        """shard() should divide n_heads and n_kv_heads by world size."""
+        from olmlx.engine.pre_shard import FakeGroup
+
+        wrapper, _, _, n_heads, n_kv_heads, num_layers = wrapper_setup
+        group = FakeGroup(rank=0, size=2)
+
+        wrapper.shard(group)
+
+        for layer in wrapper.layers:
+            assert layer.self_attn.n_heads == n_heads // 2
+            assert layer.self_attn.n_kv_heads == n_kv_heads // 2
+
+    def test_shard_leaves_flash_mlp_untouched(self, wrapper_setup):
+        """shard() should not modify FlashMLP instances."""
+        from olmlx.engine.pre_shard import FakeGroup
+
+        wrapper, model, *_ = wrapper_setup
+
+        # Capture FlashMLP instances before sharding
+        mlps_before = [layer.mlp for layer in model.layers]
+        assert all(isinstance(m, FlashMLP) for m in mlps_before)
+
+        wrapper.shard(FakeGroup(rank=0, size=2))
+
+        # FlashMLP instances should be the same objects, untouched
+        for layer, mlp_before in zip(model.layers, mlps_before):
+            assert layer.mlp is mlp_before
+
+    def test_shard_does_not_proxy_to_inner_model(self, wrapper_setup):
+        """shard() on wrapper should NOT call inner model's shard()."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.pre_shard import FakeGroup
+
+        wrapper, model, *_ = wrapper_setup
+        model.shard = MagicMock()
+
+        wrapper.shard(FakeGroup(rank=0, size=2))
+
+        model.shard.assert_not_called()
+
+    def test_shard_wraps_attention_projections(self, wrapper_setup):
+        """After shard(), attention proj layers should be distributed wrappers."""
+        from olmlx.engine.pre_shard import FakeGroup
+
+        wrapper, model, *_ = wrapper_setup
+
+        # Before: plain nn.Linear
+        assert isinstance(model.layers[0].self_attn.q_proj, nn.Linear)
+
+        wrapper.shard(FakeGroup(rank=0, size=2))
+
+        # After: should NOT be plain nn.Linear (wrapped by shard_linear)
+        attn = model.layers[0].self_attn
+        assert type(attn.q_proj) is not nn.Linear
+        assert type(attn.k_proj) is not nn.Linear
+        assert type(attn.v_proj) is not nn.Linear
+        assert type(attn.o_proj) is not nn.Linear
+
+    def test_shard_parameters_materializable(self, wrapper_setup):
+        """mx.eval(wrapper.parameters()) should work after sharding."""
+        from olmlx.engine.pre_shard import FakeGroup
+
+        wrapper, *_ = wrapper_setup
+        wrapper.shard(FakeGroup(rank=0, size=2))
+
+        # Should not raise
+        mx.eval(wrapper.parameters())
