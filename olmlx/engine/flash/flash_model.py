@@ -170,6 +170,11 @@ class FlashModelWrapper(nn.Module):
                 continue
             layer.self_attn.n_heads //= N
             layer.self_attn.n_kv_heads //= N
+        if sharded_count == 0:
+            raise ValueError(
+                "shard() found no self_attn layers — model may have an "
+                "unexpected structure. Cannot shard."
+            )
         logger.info(
             "Sharded %d attention layers (MLP handled by Flash SSD)",
             sharded_count,
