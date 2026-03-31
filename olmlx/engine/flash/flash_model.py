@@ -149,6 +149,15 @@ class FlashModelWrapper(nn.Module):
                     f"Layer {i}: n_kv_heads ({attn.n_kv_heads}) is not "
                     f"divisible by world size ({N})"
                 )
+            for proj_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                w = getattr(attn, proj_name).weight
+                shard_dim = 0 if proj_name != "o_proj" else 1
+                if w.shape[shard_dim] % N != 0:
+                    raise ValueError(
+                        f"Layer {i}: {proj_name}.weight.shape[{shard_dim}]="
+                        f"{w.shape[shard_dim]} is not divisible by "
+                        f"world size ({N})"
+                    )
 
         # Mark sharded before mutation so a mid-loop failure still prevents
         # a second shard() call on a partially-mutated model.
