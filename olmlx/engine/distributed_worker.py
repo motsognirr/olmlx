@@ -90,11 +90,15 @@ def _load_flash_tensor_worker(model_path: str, group) -> tuple:
 
     try:
         snapshot_download(model_path, local_files_only=True)
-    except (LocalEntryNotFoundError, FileNotFoundError, RepositoryNotFoundError):
+    except (
+        LocalEntryNotFoundError,
+        FileNotFoundError,
+        RepositoryNotFoundError,
+    ) as e:
         raise FileNotFoundError(
             f"Model {model_path!r} not fully cached. "
             f"Run 'olmlx flash prepare {model_path}' on this worker node first."
-        )
+        ) from e
 
     logger.info("Loading flash model %s from %s", model_path, flash_dir)
     model, tokenizer = mlx_lm.load(model_path)
