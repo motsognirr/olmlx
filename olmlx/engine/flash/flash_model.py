@@ -162,6 +162,8 @@ class FlashModelWrapper(nn.Module):
         # Mark sharded before mutation so a mid-loop failure still prevents
         # a second shard() call on a partially-mutated model.
         object.__setattr__(self, "_sharded", True)
+        # Shard projections first; update head counts in a second pass so
+        # a shard_linear failure doesn't leave some layers with halved heads.
         sharded_count = 0
         for layer in self._model.layers:
             if not hasattr(layer, "self_attn"):
@@ -171,9 +173,12 @@ class FlashModelWrapper(nn.Module):
             attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
             attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
             attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
-            attn.n_heads //= N
-            attn.n_kv_heads //= N
             sharded_count += 1
+        for layer in self._model.layers:
+            if not hasattr(layer, "self_attn"):
+                continue
+            layer.self_attn.n_heads //= N
+            layer.self_attn.n_kv_heads //= N
         logger.info(
             "Sharded %d attention layers (MLP handled by Flash SSD)",
             sharded_count,
