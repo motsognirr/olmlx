@@ -174,6 +174,54 @@ The coordinator crashed first, breaking the ring socket. Check the coordinator l
 
 The worker loads the model from the hostfile at startup. If you request a different model via the API, the `all_sum` tensor shapes won't match, causing a Metal timeout. Always request the same model specified in the hostfile.
 
+## Combining with Flash Inference
+
+Flash and distributed can be used together for dense (non-MoE) models. This combines two independent speedups:
+
+- **Attention**: distributed across ranks (sharded projections, `all_sum` synchronization)
+- **MLP**: each rank independently loads only active neurons from its local SSD (Flash sparsity)
+
+### How it works
+
+When both `OLMLX_EXPERIMENTAL_FLASH=true` and `OLMLX_EXPERIMENTAL_DISTRIBUTED=true` are set:
+
+1. `FlashModelWrapper.shard()` shards only attention projections (`q/k/v/o_proj`), leaving FlashMLP layers unsharded
+2. `o_proj` uses `ShardedToAllLinear` which calls `all_sum` — its output is replicated on all ranks
+3. Every rank feeds identical input to FlashMLP → same neuron predictions → same output
+4. Pre-sharding is automatically skipped (MLP weights live on SSD, not in safetensors)
+
+### Setup
+
+Each machine must independently prepare the model for Flash:
+
+```bash
+# On EVERY machine (coordinator AND workers):
+olmlx flash prepare mlx-community/Qwen2.5-32B-Instruct-4bit
+```
+
+Then configure the coordinator:
+
+```bash
+OLMLX_EXPERIMENTAL_DISTRIBUTED=true
+OLMLX_EXPERIMENTAL_FLASH=true
+# Flash tuning params are forwarded to workers automatically
+OLMLX_EXPERIMENTAL_FLASH_IO_THREADS=32
+```
+
+### Memory advantage
+
+Flash + distributed uses less RAM per rank than either feature alone:
+
+- MLP weights (~2/3 of model) live on SSD — no RAM cost
+- Attention weights (~1/3 of model) are split across ranks
+- Each rank holds: `attention_size/N` + embeddings + lm_head + predictors + neuron cache
+
+### Constraints
+
+- **Dense models only**: Flash-MoE + distributed is explicitly blocked (expert weights cannot be sharded via `all_sum`)
+- **Head count divisibility**: `n_heads` and `n_kv_heads` must be evenly divisible by world size
+- **Local SSD required**: Each worker needs flash-prepared data on its own SSD — there is no network weight loading
+
 ## Limitations
 
 - Only one model can be used (specified in hostfile, loaded at worker startup)

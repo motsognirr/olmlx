@@ -376,17 +376,40 @@ def _launch_distributed_workers() -> list[str]:
     validate_remote_python(remote_python)
     remote_working_dir = experimental.distributed_remote_working_dir
 
+    if experimental.flash_moe:
+        print(
+            "Error: Flash-MoE + distributed is not supported. "
+            "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or OLMLX_EXPERIMENTAL_DISTRIBUTED.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if experimental.flash and strategy == "pipeline":
+        print(
+            "Error: Flash + pipeline distributed strategy is not supported. "
+            "Use tensor strategy or disable Flash.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Pre-shard and distribute weights to workers if enabled
     pre_sharded = False
     if experimental.distributed_pre_shard:
-        pre_sharded = _pre_shard_and_distribute(
-            hosts,
-            model,
-            world_size,
-            experimental,
-            strategy=strategy,
-            layer_counts=hostfile_layers,
-        )
+        if experimental.flash:
+            logger.info(
+                "Skipping pre-sharding: Flash mode shards only attention "
+                "layers at runtime, MLP weights are loaded from SSD on "
+                "each node independently."
+            )
+        else:
+            pre_sharded = _pre_shard_and_distribute(
+                hosts,
+                model,
+                world_size,
+                experimental,
+                strategy=strategy,
+                layer_counts=hostfile_layers,
+            )
 
     # Pre-compute safe model name for env var paths (used when pre-sharded)
     if pre_sharded:
@@ -416,6 +439,14 @@ def _launch_distributed_workers() -> list[str]:
             )
         if pre_sharded:
             env[PRE_SHARDED_DIR_ENV] = f"{worker_shard_dir}/{safe_name}/rank{rank}"
+        if experimental.flash:
+            env["OLMLX_EXPERIMENTAL_FLASH"] = "true"
+            # Forward all flash tuning params so worker FlashConfig matches.
+            # OLMLX_EXPERIMENTAL_FLASH_MOE also matches this prefix but is
+            # safe: the flash_moe guard above already exited if it was true.
+            for key, val in os.environ.items():
+                if key.startswith("OLMLX_EXPERIMENTAL_FLASH_") and key not in env:
+                    env[key] = val
         env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
 
         # Build remote shell script that sets up hostfile and runs worker

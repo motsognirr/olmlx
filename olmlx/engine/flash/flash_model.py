@@ -52,7 +52,11 @@ class FlashModelWrapper(nn.Module):
         flash_config: FlashConfig,
     ):
         super().__init__()
-        self._model = model
+        # Store in __dict__ directly so __getattr__ can find it without
+        # going through nn.Module's dict (which __getattr__ can't reach
+        # for _-prefixed names).
+        object.__setattr__(self, "_model", model)
+        object.__setattr__(self, "_sharded", False)
         self.window_manager = WindowManager(
             flash_config.num_layers,
             flash_config.window_size,
@@ -102,6 +106,80 @@ class FlashModelWrapper(nn.Module):
         mx.clear_cache()
         logger.info("Replaced %d MLP layers with FlashMLP", replaced)
 
+    def shard(self, group=None):
+        """Shard attention layers only — FlashMLP handles its own weights via SSD.
+
+        In distributed mode, attention projections are split across ranks with
+        all_sum synchronization, while FlashMLP layers remain unsharded. Each
+        rank independently loads active neurons from its local SSD. This is
+        correct because o_proj (sharded-to-all) replicates its output via
+        all_sum, so every rank feeds identical input to FlashMLP.
+        """
+        if self._sharded:
+            raise RuntimeError(
+                "shard() has already been called or failed mid-loop — "
+                "model is in an indeterminate state, reload to retry"
+            )
+        if group is None:
+            raise ValueError("shard() requires an explicit distributed group")
+        from mlx.nn.layers.distributed import shard_linear
+
+        N = group.size()
+
+        # Validate all layers before any mutation so a failure doesn't
+        # leave the model in a partially-sharded state.
+        attn_layer_count = 0
+        for i, layer in enumerate(self._model.layers):
+            if not hasattr(layer, "self_attn"):
+                continue
+            attn_layer_count += 1
+            attn = layer.self_attn
+            for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                if not hasattr(attn, proj):
+                    raise ValueError(
+                        f"Layer {i}: self_attn has no '{proj}' — "
+                        "fused-projection architectures are not supported "
+                        "for Flash+distributed"
+                    )
+            if attn.n_heads % N != 0:
+                raise ValueError(
+                    f"Layer {i}: n_heads ({attn.n_heads}) is not divisible "
+                    f"by world size ({N})"
+                )
+            if attn.n_kv_heads % N != 0:
+                raise ValueError(
+                    f"Layer {i}: n_kv_heads ({attn.n_kv_heads}) is not "
+                    f"divisible by world size ({N})"
+                )
+        if attn_layer_count == 0:
+            raise ValueError(
+                "shard() found no self_attn layers — model may have an "
+                "unexpected structure. Cannot shard."
+            )
+
+        # Mark sharded before mutation so a mid-loop failure still prevents
+        # a second shard() call on a partially-mutated model.
+        object.__setattr__(self, "_sharded", True)
+        # Shard projections first; update head counts in a second pass so
+        # a shard_linear failure doesn't leave some layers with halved heads.
+        for layer in self._model.layers:
+            if not hasattr(layer, "self_attn"):
+                continue
+            attn = layer.self_attn
+            attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
+            attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
+            attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
+            attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+        for layer in self._model.layers:
+            if not hasattr(layer, "self_attn"):
+                continue
+            layer.self_attn.n_heads //= N
+            layer.self_attn.n_kv_heads //= N
+        logger.info(
+            "Sharded %d attention layers (MLP handled by Flash SSD)",
+            attn_layer_count,
+        )
+
     def __call__(self, inputs, cache=None, **kwargs):
         """Forward pass — delegates to the wrapped model."""
         return self._model(inputs, cache=cache, **kwargs)
@@ -113,7 +191,40 @@ class FlashModelWrapper(nn.Module):
             "training",
         ):
             raise AttributeError(name)
-        return getattr(self._model, name)
+        model = object.__getattribute__(self, "_model")
+        return getattr(model, name)
+
+    def parameters(self):
+        """Return combined parameters of inner model and wrapper submodules.
+
+        ``_model`` is stored in ``__dict__`` (bypassing ``nn.Module``'s dict),
+        so the base ``nn.Module.parameters()`` cannot reach it.  Merge the
+        base class result (which covers ``window_manager`` and any future
+        submodules registered via normal assignment) with the inner model's
+        parameters so that ``mx.eval(wrapper.parameters())`` materializes
+        all weights — including sharded attention projections.
+        """
+        params = dict(super().parameters())
+        params["_model"] = self._model.parameters()
+        return params
+
+    def freeze(self, *args, **kwargs):
+        """Freeze parameters — delegates to inner model since it is invisible to nn.Module."""
+        super().freeze(*args, **kwargs)
+        self._model.freeze(*args, **kwargs)
+
+    def trainable(self):
+        """Return combined trainable parameters (same blind spot as parameters)."""
+        params = dict(super().trainable())
+        params["_model"] = self._model.trainable()
+        return params
+
+    def update(self, parameters):
+        """Route parameter updates to inner model (invisible to nn.Module)."""
+        model_params = parameters.get("_model", None)
+        if model_params is not None:
+            self._model.update(model_params)
+        super().update({k: v for k, v in parameters.items() if k != "_model"})
 
     @property
     def layers(self):

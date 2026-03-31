@@ -818,6 +818,8 @@ class TestFileHandleLeak:
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
+                flash=False,
+                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",
@@ -991,6 +993,8 @@ class TestSSHFailureDetection:
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
+                flash=False,
+                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="test-secret",
@@ -1080,6 +1084,8 @@ class TestLogFileHandleLifetime:
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
+                flash=False,
+                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",
@@ -1169,6 +1175,8 @@ class TestRingHostfileGeneration:
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
+                flash=False,
+                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",
@@ -1220,6 +1228,8 @@ class TestRingHostfileGeneration:
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
+                flash=False,
+                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=50000,
                 distributed_secret="",
@@ -1396,6 +1406,8 @@ class TestSSHCommandConstruction:
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
+                flash=False,
+                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",
@@ -1441,6 +1453,8 @@ class TestSSHCommandConstruction:
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
+                flash=False,
+                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",
@@ -1485,6 +1499,8 @@ class TestSSHCommandConstruction:
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
+                flash=False,
+                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",

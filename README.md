@@ -397,6 +397,10 @@ Run models across multiple Apple Silicon machines connected via network (Thunder
 - On each request, the coordinator broadcasts prompt/params, both ranks run `stream_generate` in lockstep, and `all_sum` operations synchronize partial results
 - Only the coordinator returns results; worker output is discarded
 
+### Combining with Flash inference
+
+Flash and distributed can be used together for dense (non-MoE) models. Attention is distributed across ranks while each rank loads active MLP neurons from its local SSD. Each machine must independently run `olmlx flash prepare <model>`. Enable with `OLMLX_EXPERIMENTAL_FLASH=true` alongside distributed settings. See [DISTRIBUTED.md](DISTRIBUTED.md) for details.
+
 ### Limitations
 
 - The requested model must match the model in the hostfile (workers pre-load it at startup)
