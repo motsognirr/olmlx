@@ -168,6 +168,22 @@ def worker_main() -> None:
         )
         sys.exit(1)
 
+    if _exp_early.flash:
+        from pathlib import Path
+
+        from olmlx.config import settings
+        from olmlx.models.store import _safe_dir_name
+
+        _flash_dir = Path(settings.models_dir) / _safe_dir_name(model_path) / "flash"
+        if not _flash_dir.exists() or not (_flash_dir / "flash_layout.json").exists():
+            logger.error(
+                "Flash data not found at %s. "
+                "Run 'olmlx flash prepare %s' on this worker node first.",
+                _flash_dir,
+                model_path,
+            )
+            sys.exit(1)
+
     coordinator_host = os.environ.get(
         "OLMLX_EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST", "127.0.0.1"
     )
