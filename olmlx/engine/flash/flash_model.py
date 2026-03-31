@@ -209,6 +209,13 @@ class FlashModelWrapper(nn.Module):
         params["_model"] = self._model.trainable()
         return params
 
+    def update(self, parameters):
+        """Route parameter updates to inner model (invisible to nn.Module)."""
+        model_params = parameters.pop("_model", None)
+        if model_params is not None:
+            self._model.update(model_params)
+        super().update(parameters)
+
     @property
     def layers(self):
         return self._model.layers
