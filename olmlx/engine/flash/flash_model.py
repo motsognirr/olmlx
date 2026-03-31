@@ -211,10 +211,10 @@ class FlashModelWrapper(nn.Module):
 
     def update(self, parameters):
         """Route parameter updates to inner model (invisible to nn.Module)."""
-        model_params = parameters.pop("_model", None)
+        model_params = parameters.get("_model", None)
         if model_params is not None:
             self._model.update(model_params)
-        super().update(parameters)
+        super().update({k: v for k, v in parameters.items() if k != "_model"})
 
     @property
     def layers(self):
