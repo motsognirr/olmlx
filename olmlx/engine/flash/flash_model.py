@@ -128,9 +128,11 @@ class FlashModelWrapper(nn.Module):
 
         # Validate all layers before any mutation so a failure doesn't
         # leave the model in a partially-sharded state.
+        attn_layer_count = 0
         for i, layer in enumerate(self._model.layers):
             if not hasattr(layer, "self_attn"):
                 continue
+            attn_layer_count += 1
             attn = layer.self_attn
             for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
                 if not hasattr(attn, proj):
@@ -149,13 +151,17 @@ class FlashModelWrapper(nn.Module):
                     f"Layer {i}: n_kv_heads ({attn.n_kv_heads}) is not "
                     f"divisible by world size ({N})"
                 )
+        if attn_layer_count == 0:
+            raise ValueError(
+                "shard() found no self_attn layers — model may have an "
+                "unexpected structure. Cannot shard."
+            )
 
         # Mark sharded before mutation so a mid-loop failure still prevents
         # a second shard() call on a partially-mutated model.
         object.__setattr__(self, "_sharded", True)
         # Shard projections first; update head counts in a second pass so
         # a shard_linear failure doesn't leave some layers with halved heads.
-        sharded_count = 0
         for layer in self._model.layers:
             if not hasattr(layer, "self_attn"):
                 continue
@@ -164,20 +170,14 @@ class FlashModelWrapper(nn.Module):
             attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
             attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
             attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
-            sharded_count += 1
         for layer in self._model.layers:
             if not hasattr(layer, "self_attn"):
                 continue
             layer.self_attn.n_heads //= N
             layer.self_attn.n_kv_heads //= N
-        if sharded_count == 0:
-            raise ValueError(
-                "shard() found no self_attn layers — model may have an "
-                "unexpected structure. Cannot shard."
-            )
         logger.info(
             "Sharded %d attention layers (MLP handled by Flash SSD)",
-            sharded_count,
+            attn_layer_count,
         )
 
     def __call__(self, inputs, cache=None, **kwargs):

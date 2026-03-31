@@ -85,16 +85,18 @@ def _load_flash_tensor_worker(model_path: str, group) -> tuple:
     # `olmlx flash prepare` will have it cached, but the cache could have
     # been cleared since then.  Fail fast rather than hanging the ring for
     # hours on a silent download.
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import LocalEntryNotFoundError
+    if not Path(model_path).is_dir():
+        from huggingface_hub import snapshot_download
+        from huggingface_hub.errors import LocalEntryNotFoundError
 
-    try:
-        snapshot_download(model_path, local_files_only=True)
-    except (LocalEntryNotFoundError, FileNotFoundError) as e:
-        raise FileNotFoundError(
-            f"Model {model_path!r} not fully cached. "
-            f"Run 'olmlx flash prepare {model_path}' on this worker node first."
-        ) from e
+        try:
+            snapshot_download(model_path, local_files_only=True)
+        except (LocalEntryNotFoundError, FileNotFoundError) as e:
+            raise FileNotFoundError(
+                f"Model {model_path!r} not fully cached. "
+                f"Run 'olmlx flash prepare {model_path}' on this worker node "
+                "first."
+            ) from e
 
     logger.info("Loading flash model %s from %s", model_path, flash_dir)
     model, tokenizer = mlx_lm.load(model_path)
