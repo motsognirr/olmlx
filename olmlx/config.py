@@ -77,6 +77,11 @@ class ExperimentalSettings(BaseSettings):
     flash_bypass_os_cache: bool = False
     flash_preallocated_buffer: bool = False
     flash_memory_budget_fraction: Annotated[float, Field(gt=0, le=1.0)] | None = None
+    flash_prefetch: bool = False
+    flash_prefetch_confidence_threshold: Annotated[float, Field(gt=0, le=1.0)] = 0.3
+    flash_prefetch_min_neurons: Annotated[int, Field(gt=0)] = 64
+    flash_prefetch_max_neurons: Annotated[int, Field(gt=0)] | None = None
+    flash_prefetch_io_threads: Annotated[int, Field(gt=0)] = 16
     flash_speculative: bool = False
     flash_speculative_draft_model: str | None = None
     flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4

@@ -22,7 +22,11 @@ import mlx.nn as nn
 from mlx.utils import tree_map
 
 from olmlx.engine.flash.bundler import bundle_ffn_weights
-from olmlx.engine.flash.predictor import PredictorBank, compute_layer_ranks
+from olmlx.engine.flash.predictor import (
+    LookaheadBank,
+    PredictorBank,
+    compute_layer_ranks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -472,6 +476,94 @@ def _train_predictors(
     return bank
 
 
+def _train_lookahead_predictors(
+    recordings: dict[int, tuple[list[mx.array], list[mx.array]]],
+    hidden_size: int,
+    intermediate_size: int,
+    rank: int = 64,
+    epochs: int = 5,
+    lr: float = 1e-3,
+    progress_callback: Callable[[str, float], None] | None = None,
+) -> LookaheadBank | None:
+    """Train cross-layer lookahead predictors from recorded activations.
+
+    For each layer pair (L, L+1), trains a predictor that takes layer L's
+    input hidden state and predicts layer L+1's activation pattern. This
+    enables speculative prefetching of next-layer neurons.
+
+    Returns None if insufficient recordings for cross-layer pairs.
+    """
+    from mlx.optimizers import Adam
+
+    num_layers = len(recordings)
+    if num_layers < 2:
+        logger.warning("Need at least 2 layers for lookahead predictors")
+        return None
+
+    bank = LookaheadBank(num_layers, hidden_size, intermediate_size, rank)
+
+    total_steps = (num_layers - 1) * epochs
+    step = 0
+
+    for layer_idx in range(num_layers - 1):
+        # Input: layer L's hidden states (pre-MLP)
+        inputs_list = recordings[layer_idx][0]
+        # Target: layer L+1's activation pattern
+        next_layer = layer_idx + 1
+        targets_list = recordings[next_layer][1] if next_layer in recordings else []
+
+        if not inputs_list or not targets_list:
+            logger.warning(
+                "No cross-layer pair for layers %d→%d, skipping",
+                layer_idx,
+                next_layer,
+            )
+            step += epochs
+            continue
+
+        # Align lengths (recordings may differ between layers)
+        n = min(len(inputs_list), len(targets_list))
+        inputs = mx.stack(inputs_list[:n])
+        targets = mx.stack(targets_list[:n])
+
+        pred = bank.predictors[layer_idx]
+        optimizer = Adam(learning_rate=lr)
+
+        # Heavily bias toward recall: false negatives (missing a needed neuron)
+        # cost latency, while false positives (extra prefetched neuron) only
+        # waste a cache slot.
+        eps_w = 1e-7
+        num_pos = float(mx.sum(targets).item()) + eps_w
+        num_neg = float(mx.sum(1 - targets).item()) + eps_w
+        pos_w = min(num_neg / num_pos, 1000.0) * 2.0  # 2x recall boost
+        neg_w = 1.0
+
+        def loss_fn(model, x, y):
+            scores = model(x)
+            eps = 1e-7
+            return -mx.mean(
+                pos_w * y * mx.log(scores + eps)
+                + neg_w * (1 - y) * mx.log(1 - scores + eps)
+            )
+
+        loss_and_grad = nn.value_and_grad(pred, loss_fn)
+
+        for epoch in range(epochs):
+            loss, grads = loss_and_grad(pred, inputs, targets)
+            optimizer.update(pred, grads)
+            mx.eval(pred.parameters(), optimizer.state)
+            step += 1
+
+            if progress_callback:
+                progress_callback(
+                    f"Training lookahead {layer_idx}→{next_layer} "
+                    f"(epoch {epoch + 1}/{epochs})",
+                    step / total_steps,
+                )
+
+    return bank
+
+
 def prepare_model_for_flash(
     model_path: str,
     output_dir: Path | None = None,
@@ -482,6 +574,8 @@ def prepare_model_for_flash(
     calibration_dataset: str | None = None,
     activation_threshold: float = 0.01,
     epochs: int = 5,
+    lookahead_rank: int = 64,
+    train_lookahead: bool = True,
     progress_callback: Callable[[str, float], None] | None = None,
 ) -> Path:
     """Full preparation pipeline for flash inference.
@@ -548,13 +642,32 @@ def prepare_model_for_flash(
         ranks=layer_ranks,
         epochs=epochs,
         progress_callback=lambda desc, frac: (
-            progress_callback(desc, 0.4 + frac * 0.2) if progress_callback else None
+            progress_callback(desc, 0.4 + frac * 0.15) if progress_callback else None
         ),
     )
 
+    # Step 3b: Train lookahead predictors (cross-layer)
+    lookahead_bank = None
+    if train_lookahead and num_layers >= 2:
+        if progress_callback:
+            progress_callback("Training lookahead predictors", 0.55)
+
+        lookahead_bank = _train_lookahead_predictors(
+            recordings,
+            hidden_size,
+            intermediate_size,
+            rank=lookahead_rank,
+            epochs=epochs,
+            progress_callback=lambda desc, frac: (
+                progress_callback(desc, 0.55 + frac * 0.1)
+                if progress_callback
+                else None
+            ),
+        )
+
     # Step 4: Bundle FFN weights
     if progress_callback:
-        progress_callback("Bundling weights", 0.6)
+        progress_callback("Bundling weights", 0.65)
 
     model_dir = Path(model_path)
     bundle_ffn_weights(model_dir, output_dir)
@@ -565,6 +678,9 @@ def prepare_model_for_flash(
 
     predictor_bank.save(output_dir / "predictors")
 
+    if lookahead_bank is not None:
+        lookahead_bank.save(output_dir / "lookahead_predictors")
+
     # Step 6: Write config
     flash_config = {
         "hidden_size": hidden_size,
@@ -574,6 +690,8 @@ def prepare_model_for_flash(
         "predictor_ranks": layer_ranks,
         "sensitive_layers": sensitive_layers,
         "sensitive_rank_multiplier": sensitive_rank_multiplier,
+        "lookahead_rank": lookahead_rank,
+        "has_lookahead_predictors": lookahead_bank is not None,
         "num_calibration_samples": num_samples,
         "calibration_dataset": calibration_dataset or "c4",
         "activation_threshold": activation_threshold,

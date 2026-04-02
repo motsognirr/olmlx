@@ -1004,7 +1004,7 @@ class ModelManager:
         """
         from olmlx.config import experimental
         from olmlx.engine.flash.flash_model import FlashConfig, FlashModelWrapper
-        from olmlx.engine.flash.predictor import PredictorBank
+        from olmlx.engine.flash.predictor import LookaheadBank, PredictorBank
         from olmlx.engine.flash.weight_store import FlashWeightStore
 
         import mlx_lm
@@ -1033,6 +1033,11 @@ class ModelManager:
             io_threads=experimental.flash_io_threads,
             cache_budget_neurons=experimental.flash_cache_budget_neurons,
             memory_budget_fraction=experimental.flash_memory_budget_fraction,
+            prefetch=experimental.flash_prefetch,
+            prefetch_confidence_threshold=experimental.flash_prefetch_confidence_threshold,
+            prefetch_min_neurons=experimental.flash_prefetch_min_neurons,
+            prefetch_max_neurons=experimental.flash_prefetch_max_neurons,
+            prefetch_io_threads=experimental.flash_prefetch_io_threads,
         )
 
         weight_store = FlashWeightStore(
@@ -1043,8 +1048,23 @@ class ModelManager:
             use_preallocated_buffer=experimental.flash_preallocated_buffer,
         )
 
+        # Load lookahead predictors if available (for speculative prefetching)
+        lookahead_bank = None
+        lookahead_path = flash_dir / "lookahead_predictors"
+        if experimental.flash_prefetch and lookahead_path.exists():
+            try:
+                lookahead_bank = LookaheadBank.load(lookahead_path)
+                logger.info("Loaded lookahead predictor bank from %s", lookahead_path)
+            except Exception:
+                logger.warning(
+                    "Failed to load lookahead predictors, falling back to sparsity predictor",
+                    exc_info=True,
+                )
+
         # Wrap model — this replaces FFN layers and frees original weights
-        wrapped = FlashModelWrapper(model, predictor_bank, weight_store, flash_config)
+        wrapped = FlashModelWrapper(
+            model, predictor_bank, weight_store, flash_config, lookahead_bank
+        )
 
         if experimental.flash_speculative:
             from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
@@ -1083,6 +1103,7 @@ class ModelManager:
                 draft_model=draft_model,
                 target_model=wrapped,
                 num_speculative_tokens=experimental.flash_speculative_tokens,
+                prefetcher=wrapped.prefetcher,
             )
             return wrapped, tokenizer, False, caps, decoder
 

@@ -12,8 +12,13 @@ from collections import deque
 import mlx.core as mx
 import mlx.nn as nn
 
+from typing import TYPE_CHECKING
+
 from olmlx.engine.flash.predictor import SparsityPredictor
 from olmlx.engine.flash.weight_store import FlashWeightStore
+
+if TYPE_CHECKING:
+    from olmlx.engine.flash.prefetch import Prefetcher
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +139,7 @@ class FlashMLP(nn.Module):
         sparsity_threshold: float = 0.5,
         min_active_neurons: int = 128,
         max_active_neurons: int | None = None,
+        prefetcher: Prefetcher | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -145,11 +151,17 @@ class FlashMLP(nn.Module):
         self.sparsity_threshold = sparsity_threshold
         self.min_active_neurons = min_active_neurons
         self.max_active_neurons = max_active_neurons
+        self.prefetcher = prefetcher
 
     def __call__(self, x: mx.array) -> mx.array:
         """Sparse FFN forward pass."""
         orig_shape = x.shape
         flat_x = x.reshape(-1, self.hidden_size)
+
+        # Wait for any pending prefetch for THIS layer (submitted by the
+        # previous layer's call to prefetcher.submit).
+        if self.prefetcher is not None:
+            self.prefetcher.wait(self.layer_idx)
 
         # Predict active neurons
         predicted = self.predictor.predict_active(
@@ -167,7 +179,13 @@ class FlashMLP(nn.Module):
         else:
             combined = predicted_list
 
-        # Load weights from store
+        # Start prefetch for the NEXT layer before blocking on current I/O.
+        # Uses flat_x (pre-MLP hidden state) as an approximate signal for
+        # the next layer's activation pattern.
+        if self.prefetcher is not None:
+            self.prefetcher.submit(self.layer_idx, flat_x)
+
+        # Load weights from store (blocking — but next layer I/O is in flight)
         gate_cols, up_cols, down_rows = self.weight_store.load_neurons(
             self.layer_idx, combined
         )

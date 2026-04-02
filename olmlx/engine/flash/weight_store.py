@@ -87,6 +87,18 @@ class NeuronCache:
                     result[idx] = layer_cache[idx]
             return result
 
+    def get_cached_indices(
+        self, layer_idx: int, neuron_indices: list[int]
+    ) -> tuple[list[int], list[int]]:
+        """Return (cached_indices, missing_indices)."""
+        with self._lock:
+            layer_cache = self._cache.get(layer_idx)
+            if layer_cache is None:
+                return [], list(neuron_indices)
+            cached = [idx for idx in neuron_indices if idx in layer_cache]
+            missing = [idx for idx in neuron_indices if idx not in layer_cache]
+            return cached, missing
+
 
 class PreallocatedNeuronBuffer:
     """Pre-allocated DRAM buffer for neuron weights (Paper Section 3.3).
@@ -417,6 +429,47 @@ class FlashWeightStore:
             mx.stack(up_cols, axis=1),
             mx.stack(down_rows, axis=0),
         )
+
+    def prefetch_neurons(
+        self,
+        layer_idx: int,
+        neuron_indices: list[int],
+        executor: ThreadPoolExecutor | None = None,
+    ) -> None:
+        """Load neurons into cache without returning matrices.
+
+        Used by the speculative prefetcher to warm the cache in the background.
+        An external *executor* can be passed to avoid contention with the main
+        I/O thread pool; if ``None``, the store's own pool is used.
+        """
+        pool = executor or self._executor
+
+        if self._use_preallocated:
+            buf = self._buffers[layer_idx]
+            with buf.lock:
+                _, missing = buf.get_cached_indices(neuron_indices)
+            if not missing:
+                return
+            futures = {
+                idx: pool.submit(self._read_neuron_raw, layer_idx, idx)
+                for idx in missing
+            }
+            with buf.lock:
+                for idx, future in futures.items():
+                    gate, up, down = future.result()
+                    buf.insert(idx, gate, up, down)
+        else:
+            assert self._cache is not None
+            _, missing = self._cache.get_cached_indices(layer_idx, neuron_indices)
+            if not missing:
+                return
+            futures = {
+                idx: pool.submit(self._read_neuron, layer_idx, idx)
+                for idx in missing
+            }
+            for idx, future in futures.items():
+                data = future.result()
+                self._cache.put(layer_idx, idx, data)
 
     def close(self) -> None:
         """Release file descriptors and shut down the I/O thread pool."""
