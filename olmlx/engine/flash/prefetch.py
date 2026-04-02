@@ -86,6 +86,14 @@ class Prefetcher:
     def num_layers(self) -> int:
         return self._num_layers
 
+    @property
+    def hidden_size(self) -> int | None:
+        """Input dimension the sparsity predictors expect, or None if unknown."""
+        predictors = self._predictor_bank.predictors
+        if predictors and hasattr(predictors[0], "down"):
+            return predictors[0].down.weight.shape[1]
+        return None
+
     # ------------------------------------------------------------------
     # Cross-layer prefetch (Path A)
     # ------------------------------------------------------------------
@@ -173,6 +181,8 @@ class Prefetcher:
 
         state = _LayerPrefetchState()
         with self._lock:
+            if layer_idx in self._pending:
+                return  # already in flight — don't overwrite
             self._pending[layer_idx] = state
             self.stats.submitted += 1
 
@@ -192,4 +202,4 @@ class Prefetcher:
 
     def close(self) -> None:
         """Shut down the prefetch thread pool."""
-        self._executor.shutdown(wait=False)
+        self._executor.shutdown(wait=True)

@@ -230,10 +230,16 @@ class SpeculativeFlashDecoder:
     def _submit_draft_prefetch(self, draft_logits: list[mx.array]) -> None:
         """Submit bulk prefetch using captured draft logits as proxy signals.
 
-        Logit space != hidden space, but the sparsity predictor still provides
-        useful cache warming — any hit is pure latency savings.
+        Only effective when vocab_size == hidden_size (rare). When dimensions
+        mismatch, skip silently — the cross-layer prefetch (Path A) still
+        provides coverage during the target forward pass.
         """
         assert self._prefetcher is not None
+
+        vocab_size = draft_logits[0].shape[-1]
+        expected = self._prefetcher.hidden_size
+        if expected is not None and vocab_size != expected:
+            return
 
         # Mean across draft positions as a single representative signal
         stacked = mx.concatenate([h.reshape(1, -1) for h in draft_logits], axis=0)

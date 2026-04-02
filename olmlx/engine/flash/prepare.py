@@ -410,22 +410,26 @@ def _train_single_predictor(
     targets: mx.array,
     epochs: int,
     lr: float,
-    pos_weight_multiplier: float = 1.0,
+    pos_weight_multiplier: float | None = 1.0,
 ) -> None:
     """Train a single predictor with balanced BCE loss.
 
     Args:
         pos_weight_multiplier: Extra scaling on pos_weight for recall bias
-            (e.g. 2.0 for lookahead predictors).
+            (e.g. 2.0 for lookahead predictors). ``None`` disables class
+            balancing entirely (pos_w = neg_w = 1.0).
     """
     from mlx.optimizers import Adam
 
     optimizer = Adam(learning_rate=lr)
 
-    eps_w = 1e-7
-    num_pos = float(mx.sum(targets).item()) + eps_w
-    num_neg = float(mx.sum(1 - targets).item()) + eps_w
-    pos_w = min(num_neg / num_pos, 1000.0) * pos_weight_multiplier
+    if pos_weight_multiplier is not None:
+        eps_w = 1e-7
+        num_pos = float(mx.sum(targets).item()) + eps_w
+        num_neg = float(mx.sum(1 - targets).item()) + eps_w
+        pos_w = min(num_neg / num_pos, 1000.0) * pos_weight_multiplier
+    else:
+        pos_w = 1.0
     neg_w = 1.0
 
     def loss_fn(model, x, y):
@@ -478,7 +482,7 @@ def _train_predictors(
             targets,
             epochs=epochs,
             lr=lr,
-            pos_weight_multiplier=1.0 if balanced_loss else 0.0,
+            pos_weight_multiplier=1.0 if balanced_loss else None,
         )
         step += epochs
 
