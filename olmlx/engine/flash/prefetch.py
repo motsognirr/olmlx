@@ -36,6 +36,7 @@ class PrefetchStats:
     submitted: int = 0
     cache_hits: int = 0
     cache_misses: int = 0
+    failures: int = 0
 
     def hit_rate(self) -> float:
         total = self.cache_hits + self.cache_misses
@@ -196,9 +197,11 @@ class Prefetcher:
                 if missing:
                     self._weight_store.prefetch_neurons(layer_idx, missing)
             except Exception:
-                logger.debug(
+                logger.warning(
                     "Prefetch I/O failed for layer %d", layer_idx, exc_info=True
                 )
+                with self._lock:
+                    self.stats.failures += 1
             finally:
                 state.done.set()
 

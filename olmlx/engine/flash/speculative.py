@@ -137,13 +137,13 @@ class SpeculativeFlashDecoder:
 
         # 1. Draft: feed pending token, then generate lambda candidates
         #    Draft cache advances from offset to offset + lambda.
-        draft_tokens, draft_logits = self._draft_generate_cached(
+        draft_tokens, draft_hidden = self._draft_generate_cached(
             pending_token, self._lambda
         )
 
         # 1.5. Draft-informed prefetch: submit bulk I/O before target forward pass.
-        if self._prefetcher is not None and draft_logits:
-            self._submit_draft_prefetch(draft_logits)
+        if self._prefetcher is not None and draft_hidden:
+            self._submit_draft_prefetch(draft_hidden)
 
         # 2. Target: feed [pending, D1, ..., D_lambda] in one pass.
         #    Target cache advances from offset to offset + lambda + 1.
@@ -203,46 +203,67 @@ class SpeculativeFlashDecoder:
         """Generate n candidate tokens using the persistent draft cache.
 
         Returns:
-            (tokens, captured_logits) — captured_logits is non-empty only
-            when a prefetcher is attached, for draft-informed prefetching.
+            (tokens, captured_hidden_states) — captured is non-empty only
+            when a prefetcher is attached AND the draft model exposes an
+            inner .model attribute for hidden state extraction.
         """
         assert self._draft_cache is not None
 
-        capture = self._prefetcher is not None
+        # Determine if we can capture hidden states (pre-lm_head) for prefetch.
+        # mlx-lm models expose .model (transformer) and .lm_head (projection).
+        inner_model = getattr(self._draft, "model", None)
+        lm_head = getattr(self._draft, "lm_head", None)
+        can_capture = (
+            self._prefetcher is not None
+            and inner_model is not None
+            and lm_head is not None
+        )
+
         captured: list[mx.array] = []
         next_token = pending_token
         tokens: list[int] = []
 
         for _ in range(n):
             inp = mx.array([[next_token]])
-            logits = self._draft(inp, cache=self._draft_cache)
-            next_logits = logits[:, -1, :]
-            mx.eval(next_logits)
-
-            if capture:
-                captured.append(next_logits)
+            if can_capture:
+                hidden = inner_model(inp, cache=self._draft_cache)
+                logits = lm_head(hidden)
+                next_logits = logits[:, -1, :]
+                mx.eval(next_logits)
+                captured.append(hidden[:, -1, :])
+            else:
+                logits = self._draft(inp, cache=self._draft_cache)
+                next_logits = logits[:, -1, :]
+                mx.eval(next_logits)
 
             next_token = int(mx.argmax(next_logits, axis=-1).item())
             tokens.append(next_token)
 
         return tokens, captured
 
-    def _submit_draft_prefetch(self, draft_logits: list[mx.array]) -> None:
-        """Submit bulk prefetch using captured draft logits as proxy signals.
+    def _submit_draft_prefetch(self, draft_hidden_states: list[mx.array]) -> None:
+        """Submit bulk prefetch using captured draft hidden states.
 
-        Only effective when vocab_size == hidden_size (rare). When dimensions
-        mismatch, skip silently — the cross-layer prefetch (Path A) still
-        provides coverage during the target forward pass.
+        When the draft model's hidden_size differs from the target model's
+        (as reported by the prefetcher), skip silently — the cross-layer
+        prefetch (Path A) still provides coverage during the target forward pass.
         """
         assert self._prefetcher is not None
 
-        vocab_size = draft_logits[0].shape[-1]
+        hidden_dim = draft_hidden_states[0].shape[-1]
         expected = self._prefetcher.hidden_size
-        if expected is not None and vocab_size != expected:
+        if expected is not None and hidden_dim != expected:
+            logger.debug(
+                "Draft hidden_size %d != target hidden_size %d; skipping Path B",
+                hidden_dim,
+                expected,
+            )
             return
 
         # Mean across draft positions as a single representative signal
-        stacked = mx.concatenate([h.reshape(1, -1) for h in draft_logits], axis=0)
+        stacked = mx.concatenate(
+            [h.reshape(1, -1) for h in draft_hidden_states], axis=0
+        )
         representative = stacked.mean(axis=0, keepdims=True)
         mx.eval(representative)
 

@@ -217,6 +217,22 @@ class TestPrefetcher:
 
         assert prefetcher.stats.submitted >= 1
 
+    def test_io_failure_increments_counter(self, prefetch_setup):
+        """Prefetch I/O failure should increment stats.failures."""
+        prefetcher, store, _, hidden, _, _ = prefetch_setup
+        # Monkey-patch weight_store to raise on prefetch
+        original = store.prefetch_neurons
+        store.prefetch_neurons = lambda *a, **kw: (_ for _ in ()).throw(
+            IOError("disk read failed")
+        )
+
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+        prefetcher.submit(0, x)
+        prefetcher.wait(1)
+
+        assert prefetcher.stats.failures >= 1
+        store.prefetch_neurons = original
+
     def test_close(self, prefetch_setup):
         """close() should shut down executor without error."""
         prefetcher, _, _, _, _, _ = prefetch_setup
@@ -672,23 +688,31 @@ class TestSpeculativeDecoderPrefetch:
         )
         assert decoder._prefetcher is None
 
-    def test_decoder_draft_captures_logits_with_prefetcher(self):
-        """When prefetcher is attached, draft generation should capture logits."""
+    def test_decoder_draft_captures_hidden_states_with_prefetcher(self):
+        """When prefetcher is attached, draft generation should capture hidden states."""
         from unittest.mock import MagicMock
 
         from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
 
+        hidden = 16
+        vocab = 32
+
+        class _FakeInnerModel(nn.Module):
+            def __call__(self, x, cache=None, **kwargs):
+                return mx.random.normal((x.shape[0], x.shape[1], hidden))
+
         class _FakeModel(nn.Module):
-            def __init__(self, vocab=32):
+            def __init__(self):
                 super().__init__()
-                self.lm_head = nn.Linear(16, vocab, bias=False)
+                self.model = _FakeInnerModel()
+                self.lm_head = nn.Linear(hidden, vocab, bias=False)
 
             def __call__(self, x, cache=None, **kwargs):
-                return mx.random.normal((x.shape[0], x.shape[1], vocab))
+                h = self.model(x, cache=cache)
+                return self.lm_head(h)
 
-        vocab = 32
-        draft = _FakeModel(vocab)
-        target = _FakeModel(vocab)
+        draft = _FakeModel()
+        target = _FakeModel()
         prefetcher = MagicMock()
         prefetcher.num_layers = 2
 
@@ -702,16 +726,51 @@ class TestSpeculativeDecoderPrefetch:
         # Simulate cached mode
         decoder._draft_cache = []
         decoder._target_cache = []
-        tokens, captured_logits = decoder._draft_generate_cached(0, 2)
+        tokens, captured_hidden = decoder._draft_generate_cached(0, 2)
 
         assert len(tokens) == 2
-        assert len(captured_logits) == 2
-        # Each captured logit should be a (1, vocab) array
-        for logit in captured_logits:
-            assert logit.shape[-1] == vocab
+        assert len(captured_hidden) == 2
+        # Each captured tensor should be (1, hidden_size), not (1, vocab_size)
+        for h in captured_hidden:
+            assert h.shape[-1] == hidden
+
+    def test_decoder_draft_fallback_no_inner_model(self):
+        """Draft model without .model attribute: no capture, tokens still generated."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
+
+        vocab = 32
+
+        class _FlatModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(16, vocab, bias=False)
+
+            def __call__(self, x, cache=None, **kwargs):
+                return mx.random.normal((x.shape[0], x.shape[1], vocab))
+
+        draft = _FlatModel()
+        target = _FlatModel()
+        prefetcher = MagicMock()
+        prefetcher.num_layers = 2
+
+        decoder = SpeculativeFlashDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=2,
+            prefetcher=prefetcher,
+        )
+
+        decoder._draft_cache = []
+        decoder._target_cache = []
+        tokens, captured_hidden = decoder._draft_generate_cached(0, 2)
+
+        assert len(tokens) == 2
+        assert len(captured_hidden) == 0  # gracefully skipped
 
     def test_decoder_draft_no_capture_without_prefetcher(self):
-        """Without prefetcher, draft generation should return empty logits list."""
+        """Without prefetcher, draft generation should return empty list."""
         from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
 
         vocab = 32
@@ -736,10 +795,67 @@ class TestSpeculativeDecoderPrefetch:
 
         decoder._draft_cache = []
         decoder._target_cache = []
-        tokens, captured_logits = decoder._draft_generate_cached(0, 2)
+        tokens, captured = decoder._draft_generate_cached(0, 2)
 
         assert len(tokens) == 2
-        assert len(captured_logits) == 0
+        assert len(captured) == 0
+
+    def test_submit_draft_prefetch_dimension_mismatch(self):
+        """When draft hidden_size != target hidden_size, submit_bulk is not called."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
+
+        class _FakeModel(nn.Module):
+            def __call__(self, x, cache=None, **kwargs):
+                return mx.random.normal((x.shape[0], x.shape[1], 32))
+
+        draft = _FakeModel()
+        target = _FakeModel()
+        prefetcher = MagicMock()
+        prefetcher.num_layers = 2
+        prefetcher.hidden_size = 64  # different from draft hidden dim of 16
+
+        decoder = SpeculativeFlashDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=2,
+            prefetcher=prefetcher,
+        )
+
+        # Call with hidden states of dim 16 (mismatches prefetcher's expected 64)
+        draft_hidden = [mx.random.normal((1, 16)) for _ in range(2)]
+        decoder._submit_draft_prefetch(draft_hidden)
+
+        prefetcher.submit_bulk.assert_not_called()
+
+    def test_submit_draft_prefetch_calls_submit_bulk(self):
+        """When dimensions match, submit_bulk should be called."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
+
+        class _FakeModel(nn.Module):
+            def __call__(self, x, cache=None, **kwargs):
+                return mx.random.normal((x.shape[0], x.shape[1], 32))
+
+        draft = _FakeModel()
+        target = _FakeModel()
+        prefetcher = MagicMock()
+        prefetcher.num_layers = 2
+        prefetcher.hidden_size = 16  # matches draft hidden dim
+
+        decoder = SpeculativeFlashDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=2,
+            prefetcher=prefetcher,
+        )
+
+        draft_hidden = [mx.random.normal((1, 16)) for _ in range(2)]
+        decoder._submit_draft_prefetch(draft_hidden)
+
+        prefetcher.submit_bulk.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -759,3 +875,7 @@ class TestPrefetchStats:
     def test_hit_rate_mixed(self):
         stats = PrefetchStats(cache_hits=3, cache_misses=7)
         assert abs(stats.hit_rate() - 0.3) < 1e-6
+
+    def test_failures_default_zero(self):
+        stats = PrefetchStats()
+        assert stats.failures == 0
