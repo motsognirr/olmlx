@@ -867,11 +867,12 @@ class ModelManager:
                 f"Model '{normalized}' has {lm.active_refs} active request(s)"
             )
         lm = self._loaded.pop(normalized)
-        if lm.weight_store is not None:
-            lm.weight_store.close()
-        # Close prefetcher thread pool if present
+        # Close prefetcher *before* weight store: prefetcher tasks submit into
+        # the weight store's pool, so weight store must outlive the prefetcher.
         if hasattr(lm.model, "prefetcher") and lm.model.prefetcher is not None:
             lm.model.prefetcher.close()
+        if lm.weight_store is not None:
+            lm.weight_store.close()
         # Release draft model Metal memory promptly
         lm.speculative_decoder = None
         return True

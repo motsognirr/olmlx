@@ -481,11 +481,10 @@ class FlashWeightStore:
             if not missing:
                 return
             futures = {
-                idx: pool.submit(self._read_neuron, layer_idx, idx) for idx in missing
+                pool.submit(self._read_neuron, layer_idx, idx): idx for idx in missing
             }
-            for idx, future in futures.items():
-                data = future.result()
-                self._cache.put(layer_idx, idx, data)
+            for fut in as_completed(futures):
+                self._cache.put(layer_idx, futures[fut], fut.result())
 
     def close(self) -> None:
         """Release file descriptors and shut down the I/O thread pool."""

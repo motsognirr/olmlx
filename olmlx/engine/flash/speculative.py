@@ -262,13 +262,21 @@ class SpeculativeFlashDecoder:
 
         # Map draft positions to target layers by depth ratio so early layers
         # get signals from early draft steps and deep layers from late steps.
+        # Deduplicate: with 32 layers and 4 draft steps, ~8 layers share each
+        # draft_idx — reuse the same tensor to avoid redundant predictor calls.
         num_layers = self._prefetcher.num_layers
         num_draft = len(draft_hidden_states)
-        layer_states: dict[int, mx.array] = {}
+        draft_to_layers: dict[int, list[int]] = {}
         for i in range(num_layers):
             draft_idx = round(i * (num_draft - 1) / max(num_layers - 1, 1))
-            layer_states[i] = draft_hidden_states[draft_idx].reshape(1, -1)
-        mx.eval(*layer_states.values())
+            draft_to_layers.setdefault(draft_idx, []).append(i)
+
+        layer_states: dict[int, mx.array] = {}
+        for draft_idx, layers in draft_to_layers.items():
+            hidden = draft_hidden_states[draft_idx].reshape(1, -1)
+            for layer_idx in layers:
+                layer_states[layer_idx] = hidden
+        mx.eval(*{id(v): v for v in layer_states.values()}.values())
 
         self._prefetcher.submit_bulk(layer_states)
 
