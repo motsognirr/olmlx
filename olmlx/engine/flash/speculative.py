@@ -64,9 +64,6 @@ class SpeculativeFlashDecoder:
         self._last_target_logit: mx.array | None = None
         self._pending_token: int | None = None
 
-        # Hidden state capture for draft-informed prefetch
-        self._draft_hidden_states: list[mx.array] | None = None
-
     def _update_acceptance_rate(self, num_accepted: int) -> None:
         """Update the rolling acceptance rate via EMA."""
         num_accepted_draft = (
@@ -140,12 +137,13 @@ class SpeculativeFlashDecoder:
 
         # 1. Draft: feed pending token, then generate lambda candidates
         #    Draft cache advances from offset to offset + lambda.
-        draft_tokens = self._draft_generate_cached(pending_token, self._lambda)
+        draft_tokens, draft_logits = self._draft_generate_cached(
+            pending_token, self._lambda
+        )
 
-        # 1.5. Draft-informed prefetch: use captured draft hidden states to
-        #      predict and prefetch target neurons before the target forward pass.
-        if self._prefetcher is not None and self._draft_hidden_states:
-            self._submit_draft_prefetch()
+        # 1.5. Draft-informed prefetch: submit bulk I/O before target forward pass.
+        if self._prefetcher is not None and draft_logits:
+            self._submit_draft_prefetch(draft_logits)
 
         # 2. Target: feed [pending, D1, ..., D_lambda] in one pass.
         #    Target cache advances from offset to offset + lambda + 1.
@@ -199,28 +197,19 @@ class SpeculativeFlashDecoder:
         self._update_acceptance_rate(num_accepted)
         return accepted, self._lambda
 
-    def _draft_generate_cached(self, pending_token: int, n: int) -> list[int]:
+    def _draft_generate_cached(
+        self, pending_token: int, n: int
+    ) -> tuple[list[int], list[mx.array]]:
         """Generate n candidate tokens using the persistent draft cache.
 
-        Feeds ``pending_token`` first (the last accepted token not yet in cache),
-        then generates n tokens autoregressively. Draft cache advances by n.
-
-        When a prefetcher is attached, captures the last hidden state from each
-        draft step (before the LM head) for use in draft-informed prefetching.
-
-        Args:
-            pending_token: Token to feed before generating.
-            n: Number of tokens to generate.
-
         Returns:
-            List of n generated token IDs.
+            (tokens, captured_logits) — captured_logits is non-empty only
+            when a prefetcher is attached, for draft-informed prefetching.
         """
         assert self._draft_cache is not None
 
         capture = self._prefetcher is not None
-        if capture:
-            self._draft_hidden_states = []
-
+        captured: list[mx.array] = []
         next_token = pending_token
         tokens: list[int] = []
 
@@ -231,53 +220,28 @@ class SpeculativeFlashDecoder:
             mx.eval(next_logits)
 
             if capture:
-                # Capture the last hidden state for prefetching.
-                # The logits are (1, 1, vocab); we want (1, hidden).
-                # Use the draft model's last hidden state if available,
-                # otherwise fall back to the logits centroid as a proxy.
-                self._draft_hidden_states.append(next_logits)
+                captured.append(next_logits)
 
             next_token = int(mx.argmax(next_logits, axis=-1).item())
             tokens.append(next_token)
 
-        return tokens
+        return tokens, captured
 
-    def _submit_draft_prefetch(self) -> None:
-        """Submit bulk prefetch using draft hidden states.
+    def _submit_draft_prefetch(self, draft_logits: list[mx.array]) -> None:
+        """Submit bulk prefetch using captured draft logits as proxy signals.
 
-        The draft model's output logits are used as approximate signals for
-        the target model's neuron activation patterns. While imperfect (logit
-        space != hidden space), the sparsity predictor trained on hidden states
-        still provides useful cache warming — any hit is pure latency savings.
-
-        For each captured draft step, we predict neurons for all target layers
-        and submit parallel I/O.
+        Logit space != hidden space, but the sparsity predictor still provides
+        useful cache warming — any hit is pure latency savings.
         """
         assert self._prefetcher is not None
-        assert self._draft_hidden_states is not None
 
-        if not self._draft_hidden_states:
-            return
-
-        # Stack all draft hidden states: (num_draft, hidden_or_vocab)
-        # Use the mean across draft positions as a single representative signal
-        stacked = mx.concatenate(
-            [h.reshape(1, -1) for h in self._draft_hidden_states], axis=0
-        )
-        representative = stacked.mean(axis=0, keepdims=True)  # (1, dim)
+        # Mean across draft positions as a single representative signal
+        stacked = mx.concatenate([h.reshape(1, -1) for h in draft_logits], axis=0)
+        representative = stacked.mean(axis=0, keepdims=True)
         mx.eval(representative)
 
-        # Submit prefetch for all layers using this representative signal.
-        # The predictor's Linear layers will handle dimension mismatches
-        # gracefully if vocab_size != hidden_size by only using the
-        # cross-layer prefetch path (which uses actual hidden states).
-        # Here we use bulk prefetch for all layers we can.
-        layer_states = {}
-        for layer_idx in range(self._prefetcher._num_layers):
-            layer_states[layer_idx] = representative
-
+        layer_states = {i: representative for i in range(self._prefetcher.num_layers)}
         self._prefetcher.submit_bulk(layer_states)
-        self._draft_hidden_states = None
 
     # ------------------------------------------------------------------
     # Stateless API (backward compatibility)

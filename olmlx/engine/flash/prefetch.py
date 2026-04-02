@@ -82,6 +82,10 @@ class Prefetcher:
         self._pending: dict[int, _LayerPrefetchState] = {}
         self.stats = PrefetchStats()
 
+    @property
+    def num_layers(self) -> int:
+        return self._num_layers
+
     # ------------------------------------------------------------------
     # Cross-layer prefetch (Path A)
     # ------------------------------------------------------------------
@@ -89,19 +93,9 @@ class Prefetcher:
     def submit(self, layer_idx: int, hidden_state: mx.array) -> None:
         """Predict neurons for ``layer_idx + 1`` and start background I/O.
 
-        Called from ``FlashMLP.__call__`` *before* the blocking
-        ``load_neurons`` for the current layer, so the next layer's I/O
-        overlaps with this layer's I/O + compute.
-
-        When a ``LookaheadBank`` is available, uses the dedicated cross-layer
-        predictor (trained on input_L → target_{L+1}). Otherwise, falls back
-        to the sparsity predictor for layer L+1 applied to layer L's hidden
-        state (an approximation).
-
-        Args:
-            layer_idx: Current layer being computed.
-            hidden_state: Pre-MLP hidden state at this layer, shape
-                ``(tokens, hidden_size)`` or ``(batch, tokens, hidden_size)``.
+        Uses a ``LookaheadBank`` (cross-layer predictor) when available,
+        otherwise falls back to the sparsity predictor for layer L+1
+        applied to layer L's hidden state.
         """
         next_layer = layer_idx + 1
         if next_layer >= self._num_layers:
@@ -129,17 +123,7 @@ class Prefetcher:
         self,
         layer_hidden_states: dict[int, mx.array],
     ) -> None:
-        """Predict and prefetch neurons for multiple layers at once.
-
-        Used by speculative decoding after draft generation: the caller
-        provides approximate hidden states per layer (e.g. from the draft
-        model), and we submit I/O for every layer before the target
-        forward pass begins.
-
-        Args:
-            layer_hidden_states: Mapping of ``layer_idx`` to hidden state
-                tensors (any shape with last dim = hidden_size).
-        """
+        """Predict and prefetch neurons for multiple layers at once."""
         for layer_idx, hidden in layer_hidden_states.items():
             if layer_idx >= self._num_layers:
                 continue
@@ -161,7 +145,6 @@ class Prefetcher:
     # ------------------------------------------------------------------
 
     def _predict(self, layer_idx: int, hidden_state: mx.array) -> list[int]:
-        """Run the sparsity predictor for a layer with prefetch settings."""
         flat = hidden_state.reshape(-1, hidden_state.shape[-1])
         indices = self._predictor_bank.predict_layer(
             layer_idx,
@@ -173,7 +156,6 @@ class Prefetcher:
         return indices.tolist()
 
     def _predict_lookahead(self, layer_idx: int, hidden_state: mx.array) -> list[int]:
-        """Run the dedicated cross-layer lookahead predictor."""
         assert self._lookahead_bank is not None
         flat = hidden_state.reshape(-1, hidden_state.shape[-1])
         indices = self._lookahead_bank.predict_next_layer(
@@ -186,21 +168,19 @@ class Prefetcher:
         return indices.tolist()
 
     def _submit_io(self, layer_idx: int, neuron_indices: list[int]) -> None:
-        """Submit background prefetch I/O for a layer."""
         if not neuron_indices:
             return
 
         state = _LayerPrefetchState()
         with self._lock:
-            # Cancel any prior pending prefetch for this layer
             self._pending[layer_idx] = state
             self.stats.submitted += 1
 
         def _do_prefetch():
             try:
-                self._weight_store.prefetch_neurons(
-                    layer_idx, neuron_indices, executor=self._executor
-                )
+                # Use the weight store's own I/O pool (not the prefetcher's
+                # orchestration pool) to avoid contention.
+                self._weight_store.prefetch_neurons(layer_idx, neuron_indices)
             except Exception:
                 logger.debug(
                     "Prefetch I/O failed for layer %d", layer_idx, exc_info=True

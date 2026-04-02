@@ -175,50 +175,8 @@ class PredictorBank:
         )
 
 
-class LookaheadPredictor(nn.Module):
-    """Cross-layer predictor: given hidden state at layer L, predict active
-    neurons at layer L+1.
-
-    Same low-rank architecture as SparsityPredictor but trained on a
-    cross-layer objective (input_L → target_{L+1}). Biased toward recall
-    since mispredictions only waste cache slots, not correctness.
-    """
-
-    def __init__(self, hidden_size: int, intermediate_size: int, rank: int = 64):
-        super().__init__()
-        self.down = nn.Linear(hidden_size, rank, bias=False)
-        self.up = nn.Linear(rank, intermediate_size, bias=False)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        """Return activation scores for next-layer neurons (0-1 range)."""
-        return mx.sigmoid(self.up(mx.maximum(self.down(x), 0)))
-
-    def predict_active(
-        self,
-        x: mx.array,
-        threshold: float = 0.3,
-        min_neurons: int = 64,
-        max_neurons: int | None = None,
-    ) -> mx.array:
-        """Return sorted indices of predicted-active neurons for next layer."""
-        if x.ndim == 1:
-            x = x.reshape(1, -1)
-        scores = self(x).mean(axis=0)
-        mx.eval(scores)
-
-        n = scores.shape[0]
-        min_neurons = min(min_neurons, n)
-
-        active_mask = scores > threshold
-        num_active = int(mx.sum(active_mask).item())
-
-        k = max(num_active, min_neurons)
-        if max_neurons is not None:
-            k = min(k, max_neurons)
-        k = min(k, n)
-
-        indices = mx.argpartition(scores, kth=n - k)[n - k :]
-        return mx.sort(indices)
+# Same architecture as SparsityPredictor, trained on cross-layer objective.
+LookaheadPredictor = SparsityPredictor
 
 
 class LookaheadBank:
@@ -237,7 +195,7 @@ class LookaheadBank:
     ):
         self.num_layers = num_layers
         self.predictors = [
-            LookaheadPredictor(hidden_size, intermediate_size, rank)
+            SparsityPredictor(hidden_size, intermediate_size, rank)
             for _ in range(num_layers - 1)
         ]
 
@@ -282,7 +240,7 @@ class LookaheadBank:
             rank, hidden_size = down_w.shape
             intermediate_size, _ = up_w.shape
 
-            pred = LookaheadPredictor(hidden_size, intermediate_size, rank)
+            pred = SparsityPredictor(hidden_size, intermediate_size, rank)
             pred.down.weight = down_w
             pred.up.weight = up_w
             bank.predictors.append(pred)

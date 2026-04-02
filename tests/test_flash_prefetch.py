@@ -672,8 +672,8 @@ class TestSpeculativeDecoderPrefetch:
         )
         assert decoder._prefetcher is None
 
-    def test_decoder_draft_captures_hidden_states(self):
-        """When prefetcher is attached, draft generation should capture states."""
+    def test_decoder_draft_captures_logits_with_prefetcher(self):
+        """When prefetcher is attached, draft generation should capture logits."""
         from unittest.mock import MagicMock
 
         from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
@@ -690,7 +690,7 @@ class TestSpeculativeDecoderPrefetch:
         draft = _FakeModel(vocab)
         target = _FakeModel(vocab)
         prefetcher = MagicMock()
-        prefetcher._num_layers = 2
+        prefetcher.num_layers = 2
 
         decoder = SpeculativeFlashDecoder(
             draft_model=draft,
@@ -702,11 +702,44 @@ class TestSpeculativeDecoderPrefetch:
         # Simulate cached mode
         decoder._draft_cache = []
         decoder._target_cache = []
-        tokens = decoder._draft_generate_cached(0, 2)
+        tokens, captured_logits = decoder._draft_generate_cached(0, 2)
 
         assert len(tokens) == 2
-        assert decoder._draft_hidden_states is not None
-        assert len(decoder._draft_hidden_states) == 2
+        assert len(captured_logits) == 2
+        # Each captured logit should be a (1, vocab) array
+        for logit in captured_logits:
+            assert logit.shape[-1] == vocab
+
+    def test_decoder_draft_no_capture_without_prefetcher(self):
+        """Without prefetcher, draft generation should return empty logits list."""
+        from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
+
+        vocab = 32
+
+        class _FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(16, vocab, bias=False)
+
+            def __call__(self, x, cache=None, **kwargs):
+                return mx.random.normal((x.shape[0], x.shape[1], vocab))
+
+        draft = _FakeModel()
+        target = _FakeModel()
+
+        decoder = SpeculativeFlashDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=2,
+            prefetcher=None,
+        )
+
+        decoder._draft_cache = []
+        decoder._target_cache = []
+        tokens, captured_logits = decoder._draft_generate_cached(0, 2)
+
+        assert len(tokens) == 2
+        assert len(captured_logits) == 0
 
 
 # ---------------------------------------------------------------------------
