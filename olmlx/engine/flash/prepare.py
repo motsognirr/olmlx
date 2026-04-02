@@ -547,6 +547,16 @@ def _train_lookahead_predictors(
             continue
 
         n = min(len(inputs_list), len(targets_list))
+        if n < max(len(inputs_list), len(targets_list)):
+            logger.warning(
+                "Recording count mismatch for lookahead %d→%d: %d inputs, %d targets; "
+                "using %d samples",
+                layer_idx,
+                next_layer,
+                len(inputs_list),
+                len(targets_list),
+                n,
+            )
         inputs = mx.stack(inputs_list[:n])
         targets = mx.stack(targets_list[:n])
 

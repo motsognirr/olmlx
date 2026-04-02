@@ -277,6 +277,28 @@ class TestPrefetcher:
         assert prefetcher.stats.failures >= 1
         store.prefetch_neurons = original
 
+    def test_submit_after_close_does_not_hang(self, prefetch_setup):
+        """If executor.submit() fails, wait() must not hang."""
+        prefetcher, _, _, hidden, _, _ = prefetch_setup
+        prefetcher.close()  # shut down executor so submit() will fail
+
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+        prefetcher.submit(0, x)
+
+        # wait() must return promptly, not block forever
+        import threading
+
+        completed = threading.Event()
+
+        def _wait():
+            prefetcher.wait(1)
+            completed.set()
+
+        t = threading.Thread(target=_wait)
+        t.start()
+        t.join(timeout=2.0)
+        assert completed.is_set(), "wait() hung after executor.submit() failure"
+
     def test_close(self, prefetch_setup):
         """close() should shut down executor without error."""
         prefetcher, _, _, _, _, _ = prefetch_setup
@@ -436,6 +458,20 @@ class TestLookaheadBank:
                 atol=1e-5,
             )
 
+    def test_load_preserves_all_init_attributes(self, tmp_path):
+        """LookaheadBank.load() must set all attributes that __init__ sets."""
+        hidden, inter, num_layers = 16, 8, 3
+        bank = LookaheadBank(num_layers, hidden, inter, rank=4)
+        save_dir = tmp_path / "lookahead_attrs"
+        bank.save(save_dir)
+
+        loaded = LookaheadBank.load(save_dir)
+
+        # All attributes from __init__ must exist on the loaded bank
+        init_bank = LookaheadBank(num_layers, hidden, inter, rank=4)
+        for attr in vars(init_bank):
+            assert hasattr(loaded, attr), f"Loaded bank missing attribute: {attr}"
+
     def test_predict_next_layer(self):
         hidden, inter, num_layers = 16, 8, 3
         bank = LookaheadBank(num_layers, hidden, inter, rank=4)
@@ -577,6 +613,35 @@ class TestTrainLookaheadPredictors:
         )
         assert bank is not None
         assert len(progress_calls) > 0
+
+    def test_train_warns_on_recording_count_mismatch(self, caplog):
+        """Should warn when input/target recording counts differ across layers."""
+        from olmlx.engine.flash.prepare import _train_lookahead_predictors
+
+        hidden, inter = 16, 8
+        recordings = {
+            0: (
+                [mx.random.normal((hidden,)) for _ in range(10)],
+                [
+                    (mx.random.uniform(shape=(inter,)) > 0.5).astype(mx.float32)
+                    for _ in range(10)
+                ],
+            ),
+            1: (
+                [mx.random.normal((hidden,)) for _ in range(5)],
+                [
+                    (mx.random.uniform(shape=(inter,)) > 0.5).astype(mx.float32)
+                    for _ in range(3)  # fewer targets than inputs in layer 0
+                ],
+            ),
+        }
+
+        with caplog.at_level("WARNING", logger="olmlx.engine.flash.prepare"):
+            bank = _train_lookahead_predictors(
+                recordings, hidden, inter, rank=4, epochs=1
+            )
+        assert bank is not None
+        assert any("Recording count mismatch" in r.message for r in caplog.records)
 
     def test_train_predictors_progress_per_epoch(self):
         """_train_predictors should report progress per epoch, not per layer."""

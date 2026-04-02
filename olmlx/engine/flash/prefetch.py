@@ -195,7 +195,9 @@ class Prefetcher:
                     self.stats.cache_hits += len(cached)
                     self.stats.cache_misses += len(missing)
                 if missing:
-                    self._weight_store.prefetch_neurons(layer_idx, missing)
+                    self._weight_store.prefetch_neurons(
+                        layer_idx, missing, executor=self._executor
+                    )
             except Exception:
                 logger.warning(
                     "Prefetch I/O failed for layer %d", layer_idx, exc_info=True
@@ -205,7 +207,14 @@ class Prefetcher:
             finally:
                 state.done.set()
 
-        self._executor.submit(_do_prefetch)
+        try:
+            self._executor.submit(_do_prefetch)
+        except Exception:
+            state.done.set()
+            with self._lock:
+                self._pending.pop(layer_idx, None)
+                self.stats.submitted -= 1
+            logger.warning("Failed to submit prefetch for layer %d", layer_idx)
 
     def close(self) -> None:
         """Shut down the prefetch thread pool."""

@@ -223,9 +223,6 @@ class LookaheadBank:
         if not files:
             raise FileNotFoundError(f"No lookahead predictor files found in {path}")
 
-        bank = cls.__new__(cls)
-        bank.predictors = []
-
         parsed: dict[int, Path] = {}
         for f in files:
             m = re.search(r"lookahead_(\d+)", f.stem)
@@ -240,21 +237,33 @@ class LookaheadBank:
                 f"expected {expected}"
             )
 
-        bank.num_layers = len(parsed) + 1
-
+        # Pre-load all weights to infer per-layer dimensions.
+        loaded: list[tuple[mx.array, mx.array]] = []
+        hidden_size = intermediate_size = 0
         for i in expected:
-            f = parsed[i]
-            weights = dict(mx.load(str(f)))
+            weights = dict(mx.load(str(parsed[i])))
             down_w = weights[f"pair_{i}.down.weight"]
             up_w = weights[f"pair_{i}.up.weight"]
-
-            rank, hidden_size = down_w.shape
+            _, hidden_size = down_w.shape
             intermediate_size, _ = up_w.shape
+            loaded.append((down_w, up_w))
 
-            pred = SparsityPredictor(hidden_size, intermediate_size, rank)
-            pred.down.weight = down_w
-            pred.up.weight = up_w
-            bank.predictors.append(pred)
+        # Use first file's rank for the constructor (predictors will be
+        # overwritten anyway — this just sets num_layers correctly).
+        rank = loaded[0][0].shape[0]
+        num_layers = len(parsed) + 1
+        bank = cls(num_layers, hidden_size, intermediate_size, rank)
+
+        # Replace freshly-initialized weights with loaded ones.
+        for i, (down_w, up_w) in enumerate(loaded):
+            r = down_w.shape[0]
+            if r != rank:
+                # Mixed ranks: rebuild predictor with correct dimensions.
+                bank.predictors[i] = SparsityPredictor(
+                    hidden_size, intermediate_size, r
+                )
+            bank.predictors[i].down.weight = down_w
+            bank.predictors[i].up.weight = up_w
 
         return bank
 
