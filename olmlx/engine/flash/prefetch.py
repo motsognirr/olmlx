@@ -188,9 +188,14 @@ class Prefetcher:
 
         def _do_prefetch():
             try:
-                # Use the weight store's own I/O pool (not the prefetcher's
-                # orchestration pool) to avoid contention.
-                self._weight_store.prefetch_neurons(layer_idx, neuron_indices)
+                cached, missing = self._weight_store.get_cached_indices(
+                    layer_idx, neuron_indices
+                )
+                with self._lock:
+                    self.stats.cache_hits += len(cached)
+                    self.stats.cache_misses += len(missing)
+                if missing:
+                    self._weight_store.prefetch_neurons(layer_idx, missing)
             except Exception:
                 logger.debug(
                     "Prefetch I/O failed for layer %d", layer_idx, exc_info=True

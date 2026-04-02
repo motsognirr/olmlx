@@ -430,6 +430,21 @@ class FlashWeightStore:
             mx.stack(down_rows, axis=0),
         )
 
+    def get_cached_indices(
+        self, layer_idx: int, neuron_indices: list[int]
+    ) -> tuple[list[int], list[int]]:
+        """Check which neurons are already cached without loading.
+
+        Returns:
+            (cached, missing) — two lists of neuron indices.
+        """
+        if self._use_preallocated:
+            buf = self._buffers[layer_idx]
+            with buf.lock:
+                return buf.get_cached_indices(neuron_indices)
+        assert self._cache is not None
+        return self._cache.get_cached_indices(layer_idx, neuron_indices)
+
     def prefetch_neurons(
         self,
         layer_idx: int,
@@ -464,8 +479,7 @@ class FlashWeightStore:
             if not missing:
                 return
             futures = {
-                idx: pool.submit(self._read_neuron, layer_idx, idx)
-                for idx in missing
+                idx: pool.submit(self._read_neuron, layer_idx, idx) for idx in missing
             }
             for idx, future in futures.items():
                 data = future.result()

@@ -869,6 +869,9 @@ class ModelManager:
         lm = self._loaded.pop(normalized)
         if lm.weight_store is not None:
             lm.weight_store.close()
+        # Close prefetcher thread pool if present
+        if hasattr(lm.model, "prefetcher") and lm.model.prefetcher is not None:
+            lm.model.prefetcher.close()
         # Release draft model Metal memory promptly
         lm.speculative_decoder = None
         return True
