@@ -595,7 +595,7 @@ def prepare_model_for_flash(
     activation_threshold: float = 0.01,
     epochs: int = 5,
     lookahead_rank: int = 64,
-    train_lookahead: bool = True,
+    train_lookahead: bool = False,
     progress_callback: Callable[[str, float], None] | None = None,
 ) -> Path:
     """Full preparation pipeline for flash inference.

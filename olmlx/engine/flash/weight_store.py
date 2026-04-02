@@ -8,7 +8,7 @@ import os
 import sys
 import threading
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import mlx.core as mx
@@ -466,10 +466,12 @@ class FlashWeightStore:
             if not missing:
                 return
             futures = {
-                idx: pool.submit(self._read_neuron_raw, layer_idx, idx)
+                pool.submit(self._read_neuron_raw, layer_idx, idx): idx
                 for idx in missing
             }
-            results = {idx: fut.result() for idx, fut in futures.items()}
+            results = {}
+            for fut in as_completed(futures):
+                results[futures[fut]] = fut.result()
             with buf.lock:
                 for idx, (gate, up, down) in results.items():
                     buf.insert(idx, gate, up, down)

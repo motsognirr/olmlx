@@ -195,9 +195,7 @@ class Prefetcher:
                     self.stats.cache_hits += len(cached)
                     self.stats.cache_misses += len(missing)
                 if missing:
-                    self._weight_store.prefetch_neurons(
-                        layer_idx, missing, executor=self._executor
-                    )
+                    self._weight_store.prefetch_neurons(layer_idx, missing)
             except Exception:
                 logger.warning(
                     "Prefetch I/O failed for layer %d", layer_idx, exc_info=True
