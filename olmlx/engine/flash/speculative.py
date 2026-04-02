@@ -260,14 +260,16 @@ class SpeculativeFlashDecoder:
             )
             return
 
-        # Mean across draft positions as a single representative signal
-        stacked = mx.concatenate(
-            [h.reshape(1, -1) for h in draft_hidden_states], axis=0
-        )
-        representative = stacked.mean(axis=0, keepdims=True)
-        mx.eval(representative)
+        # Map draft positions to target layers by depth ratio so early layers
+        # get signals from early draft steps and deep layers from late steps.
+        num_layers = self._prefetcher.num_layers
+        num_draft = len(draft_hidden_states)
+        layer_states: dict[int, mx.array] = {}
+        for i in range(num_layers):
+            draft_idx = round(i * (num_draft - 1) / max(num_layers - 1, 1))
+            layer_states[i] = draft_hidden_states[draft_idx].reshape(1, -1)
+        mx.eval(*layer_states.values())
 
-        layer_states = {i: representative for i in range(self._prefetcher.num_layers)}
         self._prefetcher.submit_bulk(layer_states)
 
     # ------------------------------------------------------------------

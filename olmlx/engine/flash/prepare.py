@@ -411,6 +411,7 @@ def _train_single_predictor(
     epochs: int,
     lr: float,
     pos_weight_multiplier: float | None = 1.0,
+    epoch_callback: Callable[[int], None] | None = None,
 ) -> None:
     """Train a single predictor with balanced BCE loss.
 
@@ -418,6 +419,7 @@ def _train_single_predictor(
         pos_weight_multiplier: Extra scaling on pos_weight for recall bias
             (e.g. 2.0 for lookahead predictors). ``None`` disables class
             balancing entirely (pos_w = neg_w = 1.0).
+        epoch_callback: Called after each epoch with the epoch index (0-based).
     """
     from mlx.optimizers import Adam
 
@@ -446,6 +448,8 @@ def _train_single_predictor(
         loss, grads = loss_and_grad(pred, inputs, targets)
         optimizer.update(pred, grads)
         mx.eval(pred.parameters(), optimizer.state)
+        if epoch_callback is not None:
+            epoch_callback(epoch)
 
 
 def _train_predictors(
@@ -471,10 +475,21 @@ def _train_predictors(
         if not inputs_list:
             logger.warning("No recordings for layer %d, skipping", layer_idx)
             step += epochs
+            if progress_callback:
+                progress_callback(f"Skipped layer {layer_idx}", step / total_steps)
             continue
 
         inputs = mx.stack(inputs_list)
         targets = mx.stack(targets_list)
+
+        def _on_epoch(epoch: int, _li=layer_idx) -> None:
+            nonlocal step
+            step += 1
+            if progress_callback:
+                progress_callback(
+                    f"Training layer {_li} epoch {epoch + 1}/{epochs}",
+                    step / total_steps,
+                )
 
         _train_single_predictor(
             bank.predictors[layer_idx],
@@ -483,14 +498,8 @@ def _train_predictors(
             epochs=epochs,
             lr=lr,
             pos_weight_multiplier=1.0 if balanced_loss else None,
+            epoch_callback=_on_epoch,
         )
-        step += epochs
-
-        if progress_callback:
-            progress_callback(
-                f"Trained layer {layer_idx}",
-                step / total_steps,
-            )
 
     return bank
 
@@ -530,11 +539,25 @@ def _train_lookahead_predictors(
                 next_layer,
             )
             step += epochs
+            if progress_callback:
+                progress_callback(
+                    f"Skipped lookahead {layer_idx}→{next_layer}",
+                    step / total_steps,
+                )
             continue
 
         n = min(len(inputs_list), len(targets_list))
         inputs = mx.stack(inputs_list[:n])
         targets = mx.stack(targets_list[:n])
+
+        def _on_epoch(epoch: int, _li=layer_idx, _nl=next_layer) -> None:
+            nonlocal step
+            step += 1
+            if progress_callback:
+                progress_callback(
+                    f"Training lookahead {_li}→{_nl} epoch {epoch + 1}/{epochs}",
+                    step / total_steps,
+                )
 
         # 2x recall boost: false negatives cost latency, false positives
         # only waste a cache slot.
@@ -545,14 +568,8 @@ def _train_lookahead_predictors(
             epochs=epochs,
             lr=lr,
             pos_weight_multiplier=2.0,
+            epoch_callback=_on_epoch,
         )
-        step += epochs
-
-        if progress_callback:
-            progress_callback(
-                f"Trained lookahead {layer_idx}→{next_layer}",
-                step / total_steps,
-            )
 
     return bank
 

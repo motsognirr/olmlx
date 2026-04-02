@@ -469,9 +469,9 @@ class FlashWeightStore:
                 idx: pool.submit(self._read_neuron_raw, layer_idx, idx)
                 for idx in missing
             }
+            results = {idx: fut.result() for idx, fut in futures.items()}
             with buf.lock:
-                for idx, future in futures.items():
-                    gate, up, down = future.result()
+                for idx, (gate, up, down) in results.items():
                     buf.insert(idx, gate, up, down)
         else:
             assert self._cache is not None

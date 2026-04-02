@@ -145,6 +145,50 @@ class TestPrefetchNeurons:
         mx.eval(gate, up, down)
         assert gate.shape == (hidden, inter)
 
+    def test_prefetch_preallocated_does_not_hold_lock_during_io(self, tmp_path):
+        """buf.lock must not be held while waiting on I/O futures."""
+        import threading
+        import time
+
+        hidden, inter, num_layers = 16, 8, 2
+        flash_dir, _, _ = _make_bundled_model(tmp_path, hidden, inter, num_layers)
+        store = FlashWeightStore(
+            flash_dir,
+            num_io_threads=4,
+            cache_budget_neurons=64,
+            use_preallocated_buffer=True,
+        )
+
+        buf = store._buffers[0]
+        lock_held_during_io = threading.Event()
+
+        original_read = store._read_neuron_raw
+
+        def slow_read(layer_idx, neuron_idx):
+            time.sleep(0.05)  # simulate slow I/O
+            return original_read(layer_idx, neuron_idx)
+
+        store._read_neuron_raw = slow_read
+
+        # Start prefetch in background, then try to acquire lock during I/O
+        t = threading.Thread(
+            target=store.prefetch_neurons, args=(0, list(range(inter)))
+        )
+        t.start()
+        time.sleep(0.02)  # let I/O start
+
+        # If lock is free during I/O, we can acquire it immediately
+        if not buf.lock.acquire(timeout=0.2):
+            lock_held_during_io.set()
+        else:
+            buf.lock.release()
+
+        t.join(timeout=5.0)
+
+        assert not lock_held_during_io.is_set(), (
+            "buf.lock was held while I/O futures were in progress"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Prefetcher tests (Phase 1 — cross-layer)
@@ -534,6 +578,40 @@ class TestTrainLookaheadPredictors:
         assert bank is not None
         assert len(progress_calls) > 0
 
+    def test_train_predictors_progress_per_epoch(self):
+        """_train_predictors should report progress per epoch, not per layer."""
+        from olmlx.engine.flash.prepare import _train_predictors
+
+        hidden, inter, num_layers = 16, 8, 3
+        recordings = {}
+        for i in range(num_layers):
+            recordings[i] = (
+                [mx.random.normal((hidden,)) for _ in range(5)],
+                [
+                    (mx.random.uniform(shape=(inter,)) > 0.5).astype(mx.float32)
+                    for _ in range(5)
+                ],
+            )
+
+        progress_calls = []
+
+        def callback(desc, frac):
+            progress_calls.append((desc, frac))
+
+        epochs = 3
+        _train_predictors(
+            recordings,
+            hidden,
+            inter,
+            rank=4,
+            epochs=epochs,
+            progress_callback=callback,
+        )
+
+        # Should have num_layers * epochs callbacks (one per epoch),
+        # not just num_layers callbacks (one per layer)
+        assert len(progress_calls) == num_layers * epochs
+
 
 # ---------------------------------------------------------------------------
 # FlashModelWrapper + Prefetcher integration tests
@@ -856,6 +934,46 @@ class TestSpeculativeDecoderPrefetch:
         decoder._submit_draft_prefetch(draft_hidden)
 
         prefetcher.submit_bulk.assert_called_once()
+
+    def test_submit_draft_prefetch_depth_mapping(self):
+        """Draft positions should map to target layers by depth ratio."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
+
+        class _FakeModel(nn.Module):
+            def __call__(self, x, cache=None, **kwargs):
+                return mx.random.normal((x.shape[0], x.shape[1], 32))
+
+        draft = _FakeModel()
+        target = _FakeModel()
+        prefetcher = MagicMock()
+        prefetcher.num_layers = 6
+        prefetcher.hidden_size = 8
+
+        decoder = SpeculativeFlashDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=3,
+            prefetcher=prefetcher,
+        )
+
+        # 3 draft positions, each with a distinct hidden state
+        h0 = mx.ones((1, 8)) * 1.0
+        h1 = mx.ones((1, 8)) * 2.0
+        h2 = mx.ones((1, 8)) * 3.0
+        decoder._submit_draft_prefetch([h0, h1, h2])
+
+        prefetcher.submit_bulk.assert_called_once()
+        layer_states = prefetcher.submit_bulk.call_args[0][0]
+
+        # Different layers should get different signals (not all the same mean)
+        # Early layers should get signal from early draft positions,
+        # late layers from late draft positions
+        assert len(layer_states) == 6
+        val_layer0 = layer_states[0].tolist()[0][0]
+        val_layer5 = layer_states[5].tolist()[0][0]
+        assert val_layer0 != val_layer5
 
 
 # ---------------------------------------------------------------------------
