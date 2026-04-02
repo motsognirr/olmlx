@@ -224,15 +224,26 @@ class LookaheadBank:
             raise FileNotFoundError(f"No lookahead predictor files found in {path}")
 
         bank = cls.__new__(cls)
-        bank.num_layers = len(files) + 1
         bank.predictors = []
 
+        parsed: dict[int, Path] = {}
         for f in files:
             m = re.search(r"lookahead_(\d+)", f.stem)
             if m is None:
                 raise ValueError(f"Cannot parse pair index from {f.name}")
-            i = int(m.group(1))
+            parsed[int(m.group(1))] = f
 
+        expected = list(range(len(parsed)))
+        if sorted(parsed.keys()) != expected:
+            raise ValueError(
+                f"Non-contiguous lookahead files: found indices {sorted(parsed.keys())}, "
+                f"expected {expected}"
+            )
+
+        bank.num_layers = len(parsed) + 1
+
+        for i in expected:
+            f = parsed[i]
             weights = dict(mx.load(str(f)))
             down_w = weights[f"pair_{i}.down.weight"]
             up_w = weights[f"pair_{i}.up.weight"]

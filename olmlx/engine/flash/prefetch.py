@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import mlx.core as mx
@@ -46,7 +46,6 @@ class PrefetchStats:
 class _LayerPrefetchState:
     """In-flight prefetch state for a single layer."""
 
-    futures: list[Future] = field(default_factory=list)
     done: threading.Event = field(default_factory=threading.Event)
 
 
