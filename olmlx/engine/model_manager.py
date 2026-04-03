@@ -1100,8 +1100,23 @@ class ModelManager:
 
         logger.info("Loading model %s in flash mode from %s", hf_path, flash_dir)
 
-        # Load the full model first (we'll free FFN weights after wrapping)
-        model, tokenizer = mlx_lm.load(load_path)
+        # Load the full model first (we'll free FFN weights after wrapping).
+        # VL models (e.g. Qwen3.5) have vision tower weights in safetensors
+        # that the text-only model class doesn't use — retry with strict=False.
+        try:
+            model, tokenizer = mlx_lm.load(load_path)
+        except ValueError as exc:
+            if "parameters not in model" not in str(exc):
+                raise
+            logger.info(
+                "Retrying with strict=False (extra weights in safetensors): %s", exc
+            )
+            model, config = mlx_lm.utils.load_model(
+                Path(load_path), lazy=False, strict=False
+            )
+            tokenizer = mlx_lm.utils.load_tokenizer(
+                Path(load_path), eos_token_ids=config.get("eos_token_id")
+            )
         caps = detect_caps(tokenizer)
 
         # Load predictor bank

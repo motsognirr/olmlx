@@ -355,6 +355,64 @@ class TestPrepareModelEndToEnd:
         mock_bundle.assert_called_once()
 
 
+class TestVLModelSupport:
+    """Flash prepare should handle VL models whose safetensors include vision weights."""
+
+    def _make_fake_model_and_tokenizer(self):
+        model = FakeModel()
+        mx.eval(model.parameters())
+        tokenizer = FakeTokenizer()
+        return model, tokenizer
+
+    def test_stream_record_handles_vlm_strict_load_failure(self):
+        """When mlx_lm.load() fails due to extra vision weights, should fall back
+        to load_model(strict=False) + load_tokenizer()."""
+        from olmlx.engine.flash.prepare import _stream_record_activations
+
+        model, tokenizer = self._make_fake_model_and_tokenizer()
+
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError(
+            "Received 333 parameters not in model: "
+            "language_model.vision_tower.blocks.0.attn.proj.bias"
+        )
+        # Fallback path: load_model with strict=False + load_tokenizer
+        mock_config = {"eos_token_id": [0]}
+        mock_mlx_lm.utils.load_model.return_value = (model, mock_config)
+        mock_mlx_lm.utils.load_tokenizer.return_value = tokenizer
+
+        ctx = patch.dict(sys.modules, {"mlx_lm": mock_mlx_lm})
+        with ctx:
+            texts = ["Hello world", "Test input"]
+            recordings, hidden_size, intermediate_size, num_layers = (
+                _stream_record_activations("fake_path", texts)
+            )
+
+        # Should have fallen back to load_model with strict=False
+        mock_mlx_lm.utils.load_model.assert_called_once()
+        call_kwargs = mock_mlx_lm.utils.load_model.call_args
+        assert call_kwargs[1].get("strict") is False or (
+            len(call_kwargs[0]) > 2 and call_kwargs[0][2] is False
+        )
+
+        # Should still produce correct recordings
+        assert len(recordings) == NUM_LAYERS
+        assert hidden_size == HIDDEN
+        assert intermediate_size == INTER
+
+    def test_stream_record_non_weight_valueerror_still_raises(self):
+        """ValueError not about extra weights should still propagate."""
+        from olmlx.engine.flash.prepare import _stream_record_activations
+
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError("some other error")
+
+        ctx = patch.dict(sys.modules, {"mlx_lm": mock_mlx_lm})
+        with ctx:
+            with pytest.raises(ValueError, match="some other error"):
+                _stream_record_activations("fake_path", ["Hello"])
+
+
 class TestStreamingEdgeCases:
     def test_layer_without_mlp_is_skipped(self):
         """Layers without gate_proj/up_proj should produce empty recordings."""

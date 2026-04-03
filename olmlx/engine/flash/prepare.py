@@ -310,16 +310,33 @@ def _stream_record_activations(
 
     try:
         model, tokenizer = mlx_lm.load(model_path, lazy=True)
-    except ValueError:
-        # mlx_lm doesn't support this model type (e.g. gemma4 VLM) —
-        # fall back to mlx_vlm and extract the language model.
-        import mlx_vlm
+    except ValueError as exc:
+        if "parameters not in model" in str(exc):
+            # VL models (e.g. Qwen3.5) have vision tower weights in safetensors
+            # that the text-only model class doesn't use. Retry with strict=False.
+            logger.info(
+                "Retrying with strict=False (extra weights in safetensors): %s", exc
+            )
+            model_dir = Path(model_path)
+            model, config = mlx_lm.utils.load_model(
+                model_dir, lazy=True, strict=False
+            )
+            eos = config.get("eos_token_id")
+            tokenizer = mlx_lm.utils.load_tokenizer(
+                model_dir, eos_token_ids=[eos] if isinstance(eos, int) else eos
+            )
+        else:
+            # mlx_lm doesn't support this model type (e.g. gemma4 VLM) —
+            # fall back to mlx_vlm and extract the language model.
+            import mlx_vlm
 
-        vlm_model, processor = mlx_vlm.load(model_path, lazy=True)
-        model = vlm_model.language_model
-        tokenizer = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
+            vlm_model, processor = mlx_vlm.load(model_path, lazy=True)
+            model = vlm_model.language_model
+            tokenizer = (
+                processor.tokenizer
+                if hasattr(processor, "tokenizer")
+                else processor
+            )
 
     # Access inner model (mlx-lm wraps: Model.model = LlamaModel/Qwen3Model/etc.)
     inner = model.model if hasattr(model, "model") else model
