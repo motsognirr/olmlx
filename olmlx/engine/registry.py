@@ -12,35 +12,37 @@ from olmlx.config import settings
 
 # Experimental keys that can be overridden per-model.
 # Distributed settings are excluded — they affect process startup, not per-model behavior.
-PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset({
-    # Flash inference
-    "flash",
-    "flash_sparsity_threshold",
-    "flash_min_active_neurons",
-    "flash_max_active_neurons",
-    "flash_window_size",
-    "flash_io_threads",
-    "flash_cache_budget_neurons",
-    "flash_bypass_os_cache",
-    "flash_preallocated_buffer",
-    "flash_memory_budget_fraction",
-    # Flash prefetch
-    "flash_prefetch",
-    "flash_prefetch_confidence_threshold",
-    "flash_prefetch_min_neurons",
-    "flash_prefetch_max_neurons",
-    "flash_prefetch_io_threads",
-    # Flash speculative
-    "flash_speculative",
-    "flash_speculative_draft_model",
-    "flash_speculative_tokens",
-    # KV cache quantization
-    "kv_cache_quant",
-    # Flash MoE
-    "flash_moe",
-    "flash_moe_cache_budget_experts",
-    "flash_moe_io_threads",
-})
+PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
+    {
+        # Flash inference
+        "flash",
+        "flash_sparsity_threshold",
+        "flash_min_active_neurons",
+        "flash_max_active_neurons",
+        "flash_window_size",
+        "flash_io_threads",
+        "flash_cache_budget_neurons",
+        "flash_bypass_os_cache",
+        "flash_preallocated_buffer",
+        "flash_memory_budget_fraction",
+        # Flash prefetch
+        "flash_prefetch",
+        "flash_prefetch_confidence_threshold",
+        "flash_prefetch_min_neurons",
+        "flash_prefetch_max_neurons",
+        "flash_prefetch_io_threads",
+        # Flash speculative
+        "flash_speculative",
+        "flash_speculative_draft_model",
+        "flash_speculative_tokens",
+        # KV cache quantization
+        "kv_cache_quant",
+        # Flash MoE
+        "flash_moe",
+        "flash_moe_cache_budget_experts",
+        "flash_moe_io_threads",
+    }
+)
 
 
 def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
@@ -69,6 +71,33 @@ def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
             )
 
 
+VALID_OPTION_KEYS: frozenset[str] = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "seed",
+        "num_predict",
+        "repeat_penalty",
+        "repeat_last_n",
+        "stop",
+        "frequency_penalty",
+        "presence_penalty",
+    }
+)
+
+
+def _validate_options(options: dict) -> None:
+    """Validate that option keys are recognized Ollama option names."""
+    unknown = set(options) - VALID_OPTION_KEYS
+    if unknown:
+        raise ValueError(
+            f"Unknown option key(s): {sorted(unknown)}. "
+            f"Valid keys: {sorted(VALID_OPTION_KEYS)}"
+        )
+
+
 @dataclass
 class ModelConfig:
     """Per-model configuration resolved from models.json."""
@@ -90,13 +119,18 @@ class ModelConfig:
             experimental = dict(entry.get("experimental", {}))
             if experimental:
                 _validate_experimental_overrides(experimental)
+            options = dict(entry.get("options", {}))
+            if options:
+                _validate_options(options)
             return cls(
                 hf_path=hf_path,
                 experimental=experimental,
-                options=dict(entry.get("options", {})),
+                options=options,
                 keep_alive=entry.get("keep_alive"),
             )
-        raise TypeError(f"Model config entry must be str or dict, got {type(entry).__name__}")
+        raise TypeError(
+            f"Model config entry must be str or dict, got {type(entry).__name__}"
+        )
 
     def to_entry(self) -> str | dict:
         """Serialize to models.json format. Plain models become strings."""
@@ -187,9 +221,7 @@ class ModelRegistry:
         if settings.models_config.exists():
             with open(settings.models_config) as f:
                 raw = json.load(f)
-            self._mappings = {
-                k: ModelConfig.from_entry(v) for k, v in raw.items()
-            }
+            self._mappings = {k: ModelConfig.from_entry(v) for k, v in raw.items()}
         if self._aliases_path.exists():
             with open(self._aliases_path) as f:
                 self._aliases = json.load(f)
@@ -214,12 +246,12 @@ class ModelRegistry:
         normalized = self.normalize_name(name)
         # Check aliases first, then mappings
         if normalized in self._aliases:
-            hf_path = self._aliases[normalized]
-            # Look up the target model's config if it exists in mappings
-            for mc in self._mappings.values():
-                if mc.hf_path == hf_path:
-                    return mc
-            return ModelConfig(hf_path=hf_path)
+            canonical = self._aliases[normalized]
+            # Direct lookup by canonical model name
+            if canonical in self._mappings:
+                return self._mappings[canonical]
+            # Backward compat: old aliases.json stored hf_path instead of name
+            return ModelConfig(hf_path=canonical)
         if normalized in self._mappings:
             return self._mappings[normalized]
         # Try without tag normalization
@@ -230,9 +262,13 @@ class ModelRegistry:
     def list_models(self) -> dict[str, ModelConfig]:
         """Return all known model name → ModelConfig mappings."""
         combined: dict[str, ModelConfig] = {**self._mappings}
-        for alias_name, hf_path in self._aliases.items():
+        for alias_name, canonical in self._aliases.items():
             if alias_name not in combined:
-                combined[alias_name] = ModelConfig(hf_path=hf_path)
+                if canonical in self._mappings:
+                    combined[alias_name] = self._mappings[canonical]
+                else:
+                    # Backward compat: old aliases.json stored hf_path
+                    combined[alias_name] = ModelConfig(hf_path=canonical)
         return combined
 
     def add_alias(self, alias: str, source: str):
@@ -242,7 +278,15 @@ class ModelRegistry:
         resolved = self.resolve(source)
         if resolved is None:
             raise ValueError(f"Source model '{source}' not found")
-        self._aliases[alias] = resolved.hf_path
+        # Store canonical model name (key in _mappings) for deterministic lookup
+        source_normalized = self.normalize_name(source)
+        if source_normalized in self._mappings:
+            self._aliases[alias] = source_normalized
+        elif source in self._mappings:
+            self._aliases[alias] = source
+        else:
+            # Source is itself an alias or HF path — store hf_path as fallback
+            self._aliases[alias] = resolved.hf_path
         self._save_aliases()
 
     def add_mapping(
@@ -265,7 +309,13 @@ class ModelRegistry:
             mc = model_config
         else:
             mc = ModelConfig(hf_path=hf_path)
-        if existing is not None and existing.hf_path == mc.hf_path and existing.experimental == mc.experimental and existing.options == mc.options and existing.keep_alive == mc.keep_alive:
+        if (
+            existing is not None
+            and existing.hf_path == mc.hf_path
+            and existing.experimental == mc.experimental
+            and existing.options == mc.options
+            and existing.keep_alive == mc.keep_alive
+        ):
             return  # already exists
         self._mappings[normalized] = mc
         self._save_mappings()

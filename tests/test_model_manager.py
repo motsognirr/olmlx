@@ -1860,7 +1860,7 @@ class TestPerModelConfig:
         self, tmp_path, monkeypatch
     ):
         """Per-model keep_alive is used when request doesn't specify one."""
-        from olmlx.engine.registry import ModelConfig, ModelRegistry
+        from olmlx.engine.registry import ModelRegistry
         from olmlx.models.store import ModelStore
 
         config = {
@@ -1872,7 +1872,9 @@ class TestPerModelConfig:
         config_path = tmp_path / "models.json"
         config_path.write_text(json.dumps(config))
         monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
-        monkeypatch.setattr("olmlx.models.store.settings.models_dir", tmp_path / "models")
+        monkeypatch.setattr(
+            "olmlx.models.store.settings.models_dir", tmp_path / "models"
+        )
 
         reg = ModelRegistry()
         reg.load()
@@ -1896,11 +1898,9 @@ class TestPerModelConfig:
         assert lm.expires_at >= time.time() + 1790  # ~30 minutes
 
     @pytest.mark.asyncio
-    async def test_ensure_loaded_request_keep_alive_wins(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_ensure_loaded_request_keep_alive_wins(self, tmp_path, monkeypatch):
         """Request keep_alive takes priority over per-model keep_alive."""
-        from olmlx.engine.registry import ModelConfig, ModelRegistry
+        from olmlx.engine.registry import ModelRegistry
         from olmlx.models.store import ModelStore
 
         config = {
@@ -1912,7 +1912,9 @@ class TestPerModelConfig:
         config_path = tmp_path / "models.json"
         config_path.write_text(json.dumps(config))
         monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
-        monkeypatch.setattr("olmlx.models.store.settings.models_dir", tmp_path / "models")
+        monkeypatch.setattr(
+            "olmlx.models.store.settings.models_dir", tmp_path / "models"
+        )
 
         reg = ModelRegistry()
         reg.load()

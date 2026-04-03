@@ -373,18 +373,22 @@ class TestModelConfig:
     def test_invalid_experimental_key_rejected(self):
         """Unknown keys in experimental dict are rejected."""
         with pytest.raises(ValueError, match="Unknown experimental"):
-            ModelConfig.from_entry({
-                "hf_path": "org/model",
-                "experimental": {"nonexistent_setting": True},
-            })
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "experimental": {"nonexistent_setting": True},
+                }
+            )
 
     def test_invalid_kv_cache_quant_rejected(self):
         """Invalid kv_cache_quant value is rejected."""
         with pytest.raises(ValueError, match="kv_cache_quant"):
-            ModelConfig.from_entry({
-                "hf_path": "org/model",
-                "experimental": {"kv_cache_quant": "bad_value"},
-            })
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "experimental": {"kv_cache_quant": "bad_value"},
+                }
+            )
 
 
 class TestRegistryModelConfig:
@@ -404,7 +408,10 @@ class TestRegistryModelConfig:
         reg = ModelRegistry()
         reg.load()
         assert isinstance(reg._mappings["llama3:latest"], ModelConfig)
-        assert reg._mappings["llama3:latest"].hf_path == "mlx-community/Llama-3.2-3B-Instruct-4bit"
+        assert (
+            reg._mappings["llama3:latest"].hf_path
+            == "mlx-community/Llama-3.2-3B-Instruct-4bit"
+        )
         assert isinstance(reg._mappings["qwen3:latest"], ModelConfig)
         assert reg._mappings["qwen3:latest"].experimental == {"flash": True}
 
@@ -439,7 +446,9 @@ class TestRegistryModelConfig:
         assert result.experimental == {"kv_cache_quant": "turboquant:4"}
         assert result.keep_alive == "30m"
 
-    def test_resolve_hf_path_passthrough_returns_model_config(self, tmp_path, monkeypatch):
+    def test_resolve_hf_path_passthrough_returns_model_config(
+        self, tmp_path, monkeypatch
+    ):
         """Direct HF paths return a ModelConfig with just hf_path."""
         config_path = tmp_path / "models.json"
         config_path.write_text("{}")
@@ -489,7 +498,10 @@ class TestRegistryModelConfig:
         """list_models() returns dict of ModelConfig values."""
         config = {
             "llama3:latest": "mlx-community/Llama-3.2-3B-Instruct-4bit",
-            "qwen3:latest": {"hf_path": "Qwen/Qwen3-8B-MLX", "experimental": {"flash": True}},
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "experimental": {"flash": True},
+            },
         }
         config_path = tmp_path / "models.json"
         config_path.write_text(json.dumps(config))
@@ -517,7 +529,7 @@ class TestRegistryModelConfig:
         assert result.options == {"temperature": 0.5}
 
     def test_alias_resolves_to_model_config(self, tmp_path, monkeypatch):
-        """Aliases resolve to the same ModelConfig as their source."""
+        """Aliases resolve to the full ModelConfig of their source."""
         config = {
             "qwen3:latest": {
                 "hf_path": "Qwen/Qwen3-8B-MLX",
@@ -532,6 +544,77 @@ class TestRegistryModelConfig:
         reg.load()
         reg.add_alias("my-qwen", "qwen3")
         result = reg.resolve("my-qwen")
-        # Alias stores just the hf_path (no experimental config propagation)
         assert isinstance(result, ModelConfig)
         assert result.hf_path == "Qwen/Qwen3-8B-MLX"
+        assert result.experimental == {"flash": True}
+
+    def test_alias_stores_canonical_name(self, tmp_path, monkeypatch):
+        """add_alias stores the canonical model name, not the hf_path."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "experimental": {"flash": True},
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg._aliases_path = tmp_path / "aliases.json"
+        reg.load()
+        reg.add_alias("my-qwen", "qwen3")
+        assert reg._aliases["my-qwen:latest"] == "qwen3:latest"
+
+    def test_alias_deterministic_with_shared_hf_path(self, tmp_path, monkeypatch):
+        """Alias to a specific model name returns that model's config, not another
+        model that happens to share the same hf_path."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "options": {"temperature": 0.3},
+            },
+            "qwen3:8b": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "options": {"temperature": 0.9},
+            },
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg._aliases_path = tmp_path / "aliases.json"
+        reg.load()
+        reg.add_alias("cold-qwen", "qwen3:latest")
+        reg.add_alias("hot-qwen", "qwen3:8b")
+        cold = reg.resolve("cold-qwen")
+        hot = reg.resolve("hot-qwen")
+        assert cold.options == {"temperature": 0.3}
+        assert hot.options == {"temperature": 0.9}
+
+    def test_list_models_alias_inherits_config(self, tmp_path, monkeypatch):
+        """list_models returns full ModelConfig for aliases, same as resolve."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "experimental": {"flash": True},
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg._aliases_path = tmp_path / "aliases.json"
+        reg.load()
+        reg.add_alias("my-qwen", "qwen3")
+        models = reg.list_models()
+        assert models["my-qwen:latest"].experimental == {"flash": True}
+
+    def test_invalid_option_key_rejected(self):
+        """Unknown keys in options dict are rejected at parse time."""
+        with pytest.raises(ValueError, match="Unknown option"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "options": {"tempretaure": 0.7},
+                }
+            )

@@ -131,8 +131,6 @@ def resolve_experimental(
     """
     if not overrides:
         return base
-    merged = {k: v for k, v in base.__dict__.items() if not k.startswith("_")}
+    merged = base.model_dump()
     merged.update(overrides)
-    # Remove pydantic-settings internal keys that aren't constructor params
-    merged.pop("model_config", None)
-    return ExperimentalSettings(**merged)
+    return ExperimentalSettings.model_construct(**merged)

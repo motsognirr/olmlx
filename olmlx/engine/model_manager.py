@@ -644,7 +644,9 @@ class ModelManager:
                 model = tokenizer = None
                 load_task = lm = None
                 try:
-                    coro = asyncio.to_thread(self._load_model_and_shard, hf_path, model_exp)
+                    coro = asyncio.to_thread(
+                        self._load_model_and_shard, hf_path, model_exp
+                    )
                     timeout = settings.model_load_timeout
                     is_distributed = False
                     if timeout is not None:
@@ -729,7 +731,10 @@ class ModelManager:
                     # Use per-model keep_alive as fallback when request
                     # doesn't specify one.
                     effective_keep_alive = keep_alive
-                    if effective_keep_alive is None and model_config.keep_alive is not None:
+                    if (
+                        effective_keep_alive is None
+                        and model_config.keep_alive is not None
+                    ):
                         effective_keep_alive = model_config.keep_alive
                     ka = self._resolve_keep_alive(effective_keep_alive)
                     expires = time.time() + ka if ka is not None else None
@@ -751,18 +756,21 @@ class ModelManager:
                             FlashModelWrapper,
                         )
 
-                        is_flash = isinstance(model, FlashModelWrapper)
-                    except (ImportError, TypeError):
+                        if isinstance(FlashModelWrapper, type):
+                            is_flash = isinstance(model, FlashModelWrapper)
+                    except ImportError:
                         pass
                     try:
                         from olmlx.engine.flash.flash_moe_model import (
                             FlashMoeModelWrapper,
                         )
 
-                        if isinstance(model, FlashMoeModelWrapper):
+                        if isinstance(FlashMoeModelWrapper, type) and isinstance(
+                            model, FlashMoeModelWrapper
+                        ):
                             is_flash_moe = True
                             _weight_store = getattr(model, "_weight_store", None)
-                    except (ImportError, TypeError):
+                    except ImportError:
                         pass
 
                     lm = LoadedModel(
@@ -1241,7 +1249,12 @@ class ModelManager:
         return experimental.flash_moe
 
     def _load_flash_moe_model(
-        self, hf_path: str, load_path: str, flash_moe_dir: Path, *, model_exp: Any = None
+        self,
+        hf_path: str,
+        load_path: str,
+        flash_moe_dir: Path,
+        *,
+        model_exp: Any = None,
     ) -> tuple[Any, Any, bool, TemplateCaps]:
         """Load a model in Flash-MoE mode.
 
@@ -1313,7 +1326,9 @@ class ModelManager:
             flash_moe_dir = self._flash_moe_dir(hf_path)
             if flash_moe_dir is not None:
                 return (
-                    *self._load_flash_moe_model(hf_path, load_path, flash_moe_dir, model_exp=model_exp),
+                    *self._load_flash_moe_model(
+                        hf_path, load_path, flash_moe_dir, model_exp=model_exp
+                    ),
                     None,
                 )
 
@@ -1321,7 +1336,9 @@ class ModelManager:
         if self._is_flash_enabled(model_exp):
             flash_dir = self._flash_dir(hf_path)
             if flash_dir is not None:
-                return self._load_flash_model(hf_path, load_path, flash_dir, model_exp=model_exp)
+                return self._load_flash_model(
+                    hf_path, load_path, flash_dir, model_exp=model_exp
+                )
 
         kind = self._detect_model_kind(hf_path)
         logger.info("Detected model kind for %s: %s", hf_path, kind)

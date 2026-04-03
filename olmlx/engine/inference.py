@@ -18,7 +18,7 @@ from olmlx.engine.model_manager import (
     ModelManager,
     parse_keep_alive,
 )
-from olmlx.config import experimental, settings
+from olmlx.config import settings
 from olmlx.utils import memory as memory_utils
 
 try:
@@ -920,7 +920,9 @@ async def generate_completion(
                 prompt = f"{system}\n\n{prompt}"
 
     # Merge per-model default options under request options (request wins)
-    merged_options = {**lm.default_options, **(options or {})} if lm.default_options else options
+    merged_options = (
+        {**lm.default_options, **(options or {})} if lm.default_options else options
+    )
     gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
@@ -1664,7 +1666,9 @@ async def generate_chat(
         logger.debug("Prompt (first 1000 chars): %s", prompt[:1000])
 
     # Merge per-model default options under request options (request wins)
-    merged_options = {**lm.default_options, **(options or {})} if lm.default_options else options
+    merged_options = (
+        {**lm.default_options, **(options or {})} if lm.default_options else options
+    )
     gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 

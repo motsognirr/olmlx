@@ -145,11 +145,14 @@ class TestResolveExperimental:
         monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
         monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD", raising=False)
         base = ExperimentalSettings()
-        result = resolve_experimental(base, {
-            "flash": True,
-            "flash_sparsity_threshold": 0.3,
-            "flash_moe": True,
-        })
+        result = resolve_experimental(
+            base,
+            {
+                "flash": True,
+                "flash_sparsity_threshold": 0.3,
+                "flash_moe": True,
+            },
+        )
         assert result.flash is True
         assert result.flash_sparsity_threshold == 0.3
         assert result.flash_moe is True
