@@ -393,9 +393,10 @@ OLMLX_EXPERIMENTAL_FLASH=true olmlx serve
 Combine flash with a small draft model for faster token generation:
 
 ```bash
-OLMLX_EXPERIMENTAL_FLASH=true
-OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE=true
-OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit
+OLMLX_EXPERIMENTAL_FLASH=true \
+OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE=true \
+OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+olmlx serve
 ```
 
 The draft model generates candidate tokens in-memory, then the flash model verifies them in one pass — producing multiple tokens per SSD read.

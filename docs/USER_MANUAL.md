@@ -1501,6 +1501,8 @@ OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS=1024
 
 Flash inference can be combined with speculative decoding to reduce per-token latency. A small draft model generates candidate tokens that are verified by the main flash model in a single forward pass.
 
+Add to your `.env` file or pass as environment variables:
+
 ```bash
 OLMLX_EXPERIMENTAL_FLASH=true
 OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE=true
@@ -1783,7 +1785,7 @@ On each attention step, the cache is dequantized: unpack indices, look up centro
 | Mode | Compression | Approx. Size |
 |---|---|---|
 | 4-bit | ~3.9x | ~26% of original |
-| 2-bit | ~7.5x | ~14% of original |
+| 2-bit | ~7.5x | ~13% of original |
 
 ### Constraints
 
