@@ -16,6 +16,9 @@ A comprehensive guide to olmlx — an Ollama-compatible API server powered by Ap
 - [LLM in a Flash (Experimental)](#llm-in-a-flash-experimental)
 - [Distributed Inference (Experimental)](#distributed-inference-experimental)
 - [macOS Service Management](#macos-service-management)
+- [TurboQuant KV Cache Quantization (Experimental)](#turboquant-kv-cache-quantization-experimental)
+- [Flash-MoE Expert Offloading (Experimental)](#flash-moe-expert-offloading-experimental)
+- [Benchmarking](#benchmarking)
 - [Troubleshooting](#troubleshooting)
 - [Model Compatibility](#model-compatibility)
 
@@ -226,9 +229,58 @@ olmlx models delete <model_name>
 
 # Delete without confirmation
 olmlx models delete <model_name> --yes
+
+# Search for models by name (fuzzy matching)
+olmlx models search <query>
 ```
 
+**Example search:**
+
+```bash
+olmlx models search qwen
+```
+
+Lists matching model names and HuggingFace paths from the configured registry.
+
 `olmlx models list` displays a table with columns: **NAME**, **SIZE**, **PARAMS**, **QUANT**, **HF_PATH**.
+
+### `olmlx bench`
+
+Benchmarking and functional testing.
+
+```bash
+# Run benchmark scenarios against a model
+olmlx bench run [--model MODEL] [--scenarios SCENARIOS] [--max-tokens N] [--output-dir DIR]
+
+# Compare two benchmark runs
+olmlx bench compare <run1> <run2>
+
+# List past benchmark runs
+olmlx bench list
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--model` | `mlx-community/Qwen2.5-0.5B-Instruct-4bit` | Model name or HuggingFace path |
+| `--scenarios` | all | Comma-separated scenario names to run |
+| `--max-tokens` | *(per-scenario)* | Override max tokens for all prompts |
+| `--output-dir` | `~/.olmlx/bench/runs` | Output directory for results |
+
+**Examples:**
+
+```bash
+# Run all benchmarks with default model
+olmlx bench run
+
+# Run specific scenarios with a larger model
+olmlx bench run --model qwen3:8b --scenarios throughput,latency
+
+# Compare two runs (by timestamp or path)
+olmlx bench compare 20260401T120000Z 20260402T150000Z
+
+# List all past runs
+olmlx bench list
+```
 
 ### `olmlx flash`
 
@@ -236,11 +288,21 @@ LLM in a Flash management commands (see [LLM in a Flash](#llm-in-a-flash-experim
 
 ```bash
 # Prepare a model for flash inference
-olmlx flash prepare <model> [--rank 128] [--samples 256] [--threshold 0.01] [--epochs 5]
+olmlx flash prepare <model> [options]
 
 # Show flash preparation status
 olmlx flash info <model>
 ```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--rank` | `128` | Predictor rank — higher values improve accuracy but increase predictor size |
+| `--samples` | `256` | Number of calibration samples for activation analysis |
+| `--threshold` | `0.01` | Activation threshold — neurons below this value are considered inactive |
+| `--epochs` | `5` | Predictor training epochs |
+| `--calibration-dataset` | `None` (uses `c4`) | Calibration dataset: `c4` (default) or `synthetic` |
+| `--sensitive-layers` | `0` | Number of last layers to use higher predictor rank (0 = disabled) |
+| `--sensitive-rank-multiplier` | `4` | Rank multiplier for sensitive layers |
 
 ### `olmlx service`
 
@@ -1078,6 +1140,7 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_MODEL_LOAD_TIMEOUT` | float/None | `None` | Timeout in seconds for model loading. `None` = no timeout |
 | `OLMLX_LOG_LEVEL` | string | `INFO` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `OLMLX_INFERENCE_QUEUE_TIMEOUT` | float/None | `300.0` | Max seconds to wait for inference lock (5 min). `None` = no timeout |
+| `OLMLX_MAX_TOKENS_LIMIT` | int | `131072` | Maximum tokens allowed per request |
 | `OLMLX_CORS_ORIGINS` | list | `["http://localhost:*", "http://127.0.0.1:*"]` | Allowed CORS origins |
 | `OLMLX_ANTHROPIC_MODELS` | dict | `{}` | Claude model name->local model mapping for the Anthropic endpoint |
 
@@ -1103,6 +1166,17 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE` | int | `5` | SSD window size for activation prediction |
 | `OLMLX_EXPERIMENTAL_FLASH_IO_THREADS` | int | `32` | I/O threads for SSD weight loading |
 | `OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS` | int | `1024` | Budget for cached neurons in memory |
+| `OLMLX_EXPERIMENTAL_FLASH_BYPASS_OS_CACHE` | bool | `false` | Bypass OS page cache for direct SSD I/O |
+| `OLMLX_EXPERIMENTAL_FLASH_PREALLOCATED_BUFFER` | bool | `false` | Preallocate I/O buffer for weight loading |
+| `OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION` | float/None | `None` | Memory budget as fraction of system RAM |
+| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH` | bool | `false` | Enable speculative neuron prefetching |
+| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_CONFIDENCE_THRESHOLD` | float | `0.3` | Minimum predictor confidence for prefetching |
+| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_MIN_NEURONS` | int | `64` | Minimum neurons per prefetch batch |
+| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_MAX_NEURONS` | int/None | `None` | Maximum neurons per prefetch batch |
+| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_IO_THREADS` | int | `16` | I/O threads for prefetch loading |
+| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE` | bool | `false` | Enable speculative decoding with draft model |
+| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL` | string/None | `None` | Draft model name or HuggingFace path |
+| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS` | int | `4` | Number of candidate tokens per speculative step |
 
 ### Distributed Inference Settings (Experimental)
 
@@ -1120,6 +1194,20 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_PRE_SHARD` | bool | `true` | Pre-shard model weights before distribution |
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_SHARD_DIR` | path | `~/.olmlx/shards` | Local directory for pre-sharded weights |
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_WORKER_SHARD_DIR` | string | `~/.olmlx/shards` | Shard directory on remote workers |
+
+### TurboQuant KV Cache Settings (Experimental)
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `OLMLX_EXPERIMENTAL_KV_CACHE_QUANT` | string/None | `None` | KV cache quantization method. Format: `turboquant:<bits>` where bits is `2` or `4` |
+
+### Flash-MoE Settings (Experimental)
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `OLMLX_EXPERIMENTAL_FLASH_MOE` | bool | `false` | Enable Flash-MoE expert offloading for MoE models |
+| `OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS` | int | `48` | LRU cache budget per layer (number of experts kept in RAM) |
+| `OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS` | int | `32` | Parallel I/O threads for expert loading from SSD |
 
 ### Configuration Precedence
 
@@ -1406,6 +1494,30 @@ OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS=1024
 - **Preparation time**: The one-time preparation step can take several minutes depending on model size and calibration sample count
 - **Best for**: Models that are 1.5-2x larger than available GPU memory, where you'd otherwise be unable to run them at all
 
+### Speculative Decoding
+
+Flash inference can be combined with speculative decoding to reduce per-token latency. A small draft model generates candidate tokens that are verified by the main flash model in a single forward pass.
+
+Add to your `.env` file or pass as environment variables:
+
+```bash
+OLMLX_EXPERIMENTAL_FLASH=true
+OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE=true
+OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit
+OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS=4
+```
+
+The draft model runs fully in-memory for fast autoregressive generation, while the target flash model verifies all candidates in one pass (loading only the needed neurons from SSD). On average, each step produces multiple accepted tokens, reducing total SSD reads.
+
+**Neuron prefetching** can be enabled alongside speculative decoding — during draft generation, hidden states are captured and used to prefetch target model neurons before verification begins:
+
+Add to your `.env` file or pass as environment variables:
+
+```bash
+OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true
+OLMLX_EXPERIMENTAL_FLASH_PREFETCH_CONFIDENCE_THRESHOLD=0.3
+```
+
 ### Combining with Distributed Inference
 
 Flash can be combined with distributed inference for dense (non-MoE) models. Attention is distributed across ranks while each rank independently loads active MLP neurons from its local SSD. See the [Distributed Inference](#distributed-inference-experimental) section for setup details.
@@ -1630,6 +1742,159 @@ See the [Flash Inference](#llm-in-a-flash-experimental) section for preparation 
 
 ---
 
+## TurboQuant KV Cache Quantization (Experimental)
+
+TurboQuant compresses the KV cache using the TurboQuant_mse algorithm ([arxiv 2504.19874](https://arxiv.org/abs/2504.19874)), reducing KV cache memory by ~4-8x. This allows longer context windows and more concurrent cache slots without increasing memory usage.
+
+### Enabling
+
+Add to your `.env` file or pass as environment variables:
+
+```bash
+# 4-bit quantization (~3.9x compression)
+OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:4
+
+# 2-bit quantization (~7.5x compression, lower quality)
+OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:2
+```
+
+### How It Works
+
+```
+Input K/V vector
+       │
+       ▼
+  Normalize (L2 norm, store norm separately)
+       │
+       ▼
+  Rotate (per-layer orthogonal rotation matrix via QR decomposition)
+       │
+       ▼
+  Quantize (nearest Lloyd-Max centroid per coordinate)
+       │
+       ▼
+  Bit-pack indices (4-bit: 2 per byte, 2-bit: 4 per byte)
+       │
+       ▼
+  Store: packed indices (uint8) + norms (float32)
+```
+
+On each attention step, the cache is dequantized: unpack indices, look up centroids, inverse-rotate, rescale by stored norms. This is O(n · head_dim²) per step due to the rotation matrix multiply.
+
+### Compression Ratios
+
+| Mode | Compression | Approx. Size |
+|---|---|---|
+| 4-bit | ~3.9x | ~26% of original |
+| 2-bit | ~7.5x | ~13% of original |
+
+### Constraints
+
+- **Incompatible with disk cache offload** — cannot save/restore quantized cache state to disk
+- Head dimension must be divisible by the packing factor (2 for 4-bit, 4 for 2-bit)
+- Works with hybrid models (e.g., Nemotron-H SSM+attention) — only attention layers are quantized
+- Works transparently with prompt caching (KV cache reuse)
+- Best gains on long sequences; rotation overhead dominates on short sequences
+
+---
+
+## Flash-MoE Expert Offloading (Experimental)
+
+Flash-MoE extends LLM in a Flash to Mixture-of-Experts models by keeping only the router and shared experts in RAM while loading routed expert weights from SSD on demand.
+
+### Enabling
+
+Add to your `.env` file or pass as environment variables:
+
+```bash
+OLMLX_EXPERIMENTAL_FLASH_MOE=true
+OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS=48
+OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS=32
+```
+
+### How It Works
+
+```
+Token arrives at MoE layer
+         │
+         ▼
+  Router (gate) selects top-K experts  ← stays in RAM
+         │
+         ▼
+  Check expert LRU cache (per-layer)
+   ├─ Hit → Use cached expert weights
+   └─ Miss → Load from SSD (parallel pread)
+         │
+         ▼
+  Compute expert outputs (gather_mm / gather_qmm)
+         │
+         ▼
+  Weight by router scores and sum
+         │
+         ▼
+  Update LRU cache with used experts
+```
+
+- **Expert cache**: Thread-safe per-layer LRU with configurable budget (default 48 experts per layer)
+- **Parallel I/O**: Expert weights loaded via parallel `pread()` on a thread pool
+- **Supported architectures**: DeepSeek-V3, Kimi-K2.5, gpt-oss, Qwen3-Next MoE, MiniMax models
+
+### Configuration
+
+| Setting | Default | Description |
+|---|---|---|
+| `OLMLX_EXPERIMENTAL_FLASH_MOE` | `false` | Enable Flash-MoE |
+| `OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS` | `48` | Experts cached per layer (LRU eviction) |
+| `OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS` | `32` | Parallel I/O threads for expert loading |
+
+### Constraints
+
+- **NOT compatible with distributed inference** — expert weights cannot be correctly sharded across ranks (each rank would independently load experts, causing `all_sum` to produce incorrect results)
+- Experts must be pre-bundled to SSD with layout metadata (`flash_moe_layout.json`)
+- NVMe SSD strongly recommended for I/O throughput
+
+---
+
+## Benchmarking
+
+olmlx includes a built-in benchmarking suite for measuring inference performance and running functional tests.
+
+### Running Benchmarks
+
+```bash
+# Run all scenarios with default model
+olmlx bench run
+
+# Run with a specific model
+olmlx bench run --model qwen3:8b
+
+# Run specific scenarios only
+olmlx bench run --scenarios throughput,latency
+
+# Override max tokens for all scenarios
+olmlx bench run --model qwen3:8b --max-tokens 200
+```
+
+Results are saved to `~/.olmlx/bench/runs/` by default.
+
+### Comparing Runs
+
+```bash
+# Compare two runs by timestamp
+olmlx bench compare 20260401T120000Z 20260402T150000Z
+
+# Compare by path
+olmlx bench compare ~/.olmlx/bench/runs/run1 ~/.olmlx/bench/runs/run2
+```
+
+### Listing Past Runs
+
+```bash
+olmlx bench list
+```
+
+---
+
 ## macOS Service Management
 
 olmlx can run as a macOS launchd service that starts automatically on login and restarts on crash.
@@ -1818,6 +2083,7 @@ Check a model's chat template on HuggingFace to verify feature support. Models f
 | `~/.olmlx/skills/` | Skill markdown files (chat) |
 | `~/.olmlx/plans/` | Conversation plans (chat) |
 | `~/.olmlx/cache/kv/` | Disk-based KV cache |
+| `~/.olmlx/bench/runs/` | Benchmark run results |
 | `~/.olmlx/shards/` | Pre-sharded model weights (distributed) |
 | `~/.olmlx/hostfile.json` | Distributed inference hosts |
 | `~/.olmlx/olmlx.log` | Service logs |
