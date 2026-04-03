@@ -1776,7 +1776,7 @@ Input K/V vector
   Store: packed indices (uint8) + norms (float32)
 ```
 
-On each attention step, the cache is dequantized: unpack indices, look up centroids, inverse-rotate, rescale by stored norms. This O(n) cost per step matches standard attention overhead.
+On each attention step, the cache is dequantized: unpack indices, look up centroids, inverse-rotate, rescale by stored norms. This is O(n · head_dim²) per step due to the rotation matrix multiply.
 
 ### Compression Ratios
 
@@ -1788,7 +1788,7 @@ On each attention step, the cache is dequantized: unpack indices, look up centro
 ### Constraints
 
 - **Incompatible with disk cache offload** — cannot save/restore quantized cache state to disk
-- Head dimension must be divisible by the packing factor (8 for 4-bit, 4 for 2-bit)
+- Head dimension must be divisible by the packing factor (2 for 4-bit, 4 for 2-bit)
 - Works with hybrid models (e.g., Nemotron-H SSM+attention) — only attention layers are quantized
 - Works transparently with prompt caching (KV cache reuse)
 - Best gains on long sequences; rotation overhead dominates on short sequences
@@ -1838,9 +1838,9 @@ Token arrives at MoE layer
 
 | Setting | Default | Description |
 |---|---|---|
-| `FLASH_MOE` | `false` | Enable Flash-MoE |
-| `FLASH_MOE_CACHE_BUDGET_EXPERTS` | `48` | Experts cached per layer (LRU eviction) |
-| `FLASH_MOE_IO_THREADS` | `32` | Parallel I/O threads for expert loading |
+| `OLMLX_EXPERIMENTAL_FLASH_MOE` | `false` | Enable Flash-MoE |
+| `OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS` | `48` | Experts cached per layer (LRU eviction) |
+| `OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS` | `32` | Parallel I/O threads for expert loading |
 
 ### Constraints
 
