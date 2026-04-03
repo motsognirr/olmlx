@@ -117,14 +117,19 @@ def _find_ffn_weights(
     # Match both text models (model.layers.X.mlp...) and VLMs
     # (language_model.model.layers.X.mlp...)
     pattern = re.compile(
-        r"(?:language_model\.)?model\.layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)"
+        r"(?:language_model\.)?model\.layers\.(\d+)\.mlp\."
+        r"(gate_proj|up_proj|down_proj)\.(weight|scales|biases)"
     )
 
     for sf_path in sorted(model_dir.glob("*.safetensors")):
         if sf_path.name.startswith("flash_"):
             continue
         # Use mx.load to handle bfloat16 (safetensors.numpy can't)
-        tensors = mx.load(str(sf_path))
+        try:
+            tensors = mx.load(str(sf_path))
+        except Exception:
+            logger.warning("Failed to load %s, skipping", sf_path.name)
+            continue
         for name, arr in tensors.items():
             m = pattern.match(name)
             if m:
