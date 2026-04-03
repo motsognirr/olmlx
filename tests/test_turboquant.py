@@ -497,6 +497,43 @@ class TestMakeTurboQuantCache:
         cache = make_turboquant_cache(model, bits=4)
         assert cache[0].rotation_key.matrix.shape == (128, 128)
 
+    def test_head_dim_from_text_config(self):
+        """VL models (e.g. Qwen3.5) store head_dim in args.text_config dict."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.turboquant_cache import make_turboquant_cache
+
+        class FakeArgs:
+            text_config = {"head_dim": 96, "hidden_size": 3072, "num_attention_heads": 32}
+
+        model = MagicMock()
+        # Layer 0 has linear_attn (GatedDeltaNet), no self_attn — k_proj fallback fails
+        layer = MagicMock(spec=["linear_attn"])
+        del layer.self_attn
+        model.layers = [layer]
+        model.args = FakeArgs()
+
+        cache = make_turboquant_cache(model, bits=4)
+        assert cache[0].rotation_key.matrix.shape == (96, 96)
+
+    def test_head_dim_derived_from_text_config_hidden_size(self):
+        """VL models without explicit head_dim derive it from text_config."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.turboquant_cache import make_turboquant_cache
+
+        class FakeArgs:
+            text_config = {"hidden_size": 3584, "num_attention_heads": 28}
+
+        model = MagicMock()
+        layer = MagicMock(spec=["linear_attn"])
+        del layer.self_attn
+        model.layers = [layer]
+        model.args = FakeArgs()
+
+        cache = make_turboquant_cache(model, bits=4)
+        assert cache[0].rotation_key.matrix.shape == (128, 128)
+
     def test_hybrid_model_preserves_non_kv_caches(self):
         """Hybrid models (e.g. Nemotron-H) have SSM layers needing ArraysCache."""
         from unittest.mock import MagicMock

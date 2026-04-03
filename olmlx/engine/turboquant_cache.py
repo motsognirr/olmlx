@@ -172,6 +172,12 @@ def _detect_head_dim(model: Any) -> int:
     if head_dim is not None:
         return head_dim
 
+    # VL models (e.g. Qwen3.5) store config in args.text_config dict
+    text_config = getattr(model.args, "text_config", None)
+    if isinstance(text_config, dict):
+        if "head_dim" in text_config:
+            return text_config["head_dim"]
+
     # Derive from K projection weight shape: k_proj.weight is (n_kv_heads * head_dim, hidden_size)
     try:
         layer = model.layers[0]
@@ -184,6 +190,13 @@ def _detect_head_dim(model: Any) -> int:
                 return kv_out_dim // n_kv_heads
     except (AttributeError, IndexError):
         pass
+
+    # Derive from text_config hidden_size // num_attention_heads
+    if isinstance(text_config, dict):
+        hs = text_config.get("hidden_size")
+        nh = text_config.get("num_attention_heads")
+        if hs and nh:
+            return hs // nh
 
     # Last resort: hidden_size // num_attention_heads
     try:
