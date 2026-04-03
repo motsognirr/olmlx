@@ -363,6 +363,15 @@ def _stream_record_activations(
         or getattr(inner, "wte", None)
         or getattr(inner, "tok_embeddings", None)
     )
+    # VL models (e.g. Qwen3.5): embed is at language_model.model.embed_tokens
+    if embed is None:
+        lm = getattr(inner, "language_model", None)
+        if lm is not None:
+            lm_inner = getattr(lm, "model", lm)
+            embed = (
+                getattr(lm_inner, "embed_tokens", None)
+                or getattr(lm_inner, "wte", None)
+            )
     if embed is None:
         raise ValueError(
             "Cannot find embedding layer (tried embed_tokens, wte, tok_embeddings)"

@@ -103,6 +103,39 @@ class FakeModel(nn.Module):
         return self.model.layers
 
 
+class FakeTextModel(nn.Module):
+    """Mimics mlx-lm's TextModel for VL architectures (e.g. Qwen3.5).
+
+    Structure: Model.language_model.model.embed_tokens (no .model at top level).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.model = FakeInnerModel()
+
+    def __call__(self, inputs, cache=None):
+        return self.model(inputs, cache)
+
+
+class FakeVLModel(nn.Module):
+    """Mimics mlx-lm's outer Model wrapper for VL models like Qwen3.5.
+
+    No .model attribute — uses .language_model instead. Exposes .layers
+    via property like the real Model class.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.language_model = FakeTextModel()
+
+    def __call__(self, inputs, cache=None):
+        return self.language_model(inputs, cache)
+
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
+
 class FakeTokenizer:
     def encode(self, text):
         # Return deterministic token ids based on text length
@@ -396,6 +429,25 @@ class TestVLModelSupport:
         )
 
         # Should still produce correct recordings
+        assert len(recordings) == NUM_LAYERS
+        assert hidden_size == HIDDEN
+        assert intermediate_size == INTER
+
+    def test_stream_record_handles_vlm_model_structure(self):
+        """VL models like Qwen3.5 nest embed_tokens under language_model.model
+        instead of model.model. Flash prepare should find it."""
+        from olmlx.engine.flash.prepare import _stream_record_activations
+
+        model = FakeVLModel()
+        mx.eval(model.parameters())
+        tokenizer = FakeTokenizer()
+
+        ctx, _ = _patch_mlx_lm(model, tokenizer)
+        with ctx:
+            recordings, hidden_size, intermediate_size, num_layers = (
+                _stream_record_activations("fake_path", ["Hello world"])
+            )
+
         assert len(recordings) == NUM_LAYERS
         assert hidden_size == HIDDEN
         assert intermediate_size == INTER
