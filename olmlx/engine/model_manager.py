@@ -407,6 +407,8 @@ class LoadedModel:
         default_factory=threading.Lock, compare=False, repr=False
     )
     prompt_cache_store: PromptCacheStore = field(default=None)  # type: ignore[assignment]
+    kv_cache_quant: str | None = None
+    default_options: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.prompt_cache_store is None:
@@ -583,8 +585,8 @@ class ModelManager:
 
                 # Resolve before eviction — reject unknown models without
                 # disturbing already-loaded models or their KV caches.
-                hf_path = self.registry.resolve(name)
-                if hf_path is None:
+                model_config = self.registry.resolve(name)
+                if model_config is None:
                     suggestions = self.registry.search(name, max_results=3)
                     msg = f"Model '{name}' not found."
                     if suggestions:
@@ -596,9 +598,19 @@ class ModelManager:
                     )
                     raise ValueError(msg)
 
+                hf_path = model_config.hf_path
+
                 # Auto-register direct HF paths so future requests find them
                 if "/" in name:
-                    self.registry.add_mapping(name, hf_path)
+                    self.registry.add_mapping(name, hf_path, model_config=model_config)
+
+                # Resolve per-model experimental overrides
+                from olmlx.config import experimental as global_experimental
+                from olmlx.config import resolve_experimental
+
+                model_exp = resolve_experimental(
+                    global_experimental, model_config.experimental
+                )
 
                 # Evict LRU if at capacity (skip models with active inference)
                 while len(self._loaded) >= settings.max_loaded_models:
@@ -632,7 +644,7 @@ class ModelManager:
                 model = tokenizer = None
                 load_task = lm = None
                 try:
-                    coro = asyncio.to_thread(self._load_model_and_shard, hf_path)
+                    coro = asyncio.to_thread(self._load_model_and_shard, hf_path, model_exp)
                     timeout = settings.model_load_timeout
                     is_distributed = False
                     if timeout is not None:
@@ -713,8 +725,13 @@ class ModelManager:
                             f"{settings.memory_limit_fraction})."
                         )
 
-                    # Memory check passed — register the model
-                    ka = self._resolve_keep_alive(keep_alive)
+                    # Memory check passed — register the model.
+                    # Use per-model keep_alive as fallback when request
+                    # doesn't specify one.
+                    effective_keep_alive = keep_alive
+                    if effective_keep_alive is None and model_config.keep_alive is not None:
+                        effective_keep_alive = model_config.keep_alive
+                    ka = self._resolve_keep_alive(effective_keep_alive)
                     expires = time.time() + ka if ka is not None else None
 
                     logger.info(
@@ -735,7 +752,7 @@ class ModelManager:
                         )
 
                         is_flash = isinstance(model, FlashModelWrapper)
-                    except ImportError:
+                    except (ImportError, TypeError):
                         pass
                     try:
                         from olmlx.engine.flash.flash_moe_model import (
@@ -745,7 +762,7 @@ class ModelManager:
                         if isinstance(model, FlashMoeModelWrapper):
                             is_flash_moe = True
                             _weight_store = getattr(model, "_weight_store", None)
-                    except ImportError:
+                    except (ImportError, TypeError):
                         pass
 
                     lm = LoadedModel(
@@ -761,6 +778,8 @@ class ModelManager:
                         weight_store=_weight_store,
                         template_caps=caps,
                         expires_at=expires,
+                        kv_cache_quant=model_exp.kv_cache_quant,
+                        default_options=dict(model_config.options),
                     )
                     self._loaded[normalized] = lm
                     return lm
@@ -1077,13 +1096,15 @@ class ModelManager:
             return flash_path
         return None
 
-    def _is_flash_enabled(self) -> bool:
+    def _is_flash_enabled(self, model_exp: Any = None) -> bool:
+        if model_exp is not None:
+            return model_exp.flash
         from olmlx.config import experimental
 
         return experimental.flash
 
     def _load_flash_model(
-        self, hf_path: str, load_path: str, flash_dir: Path
+        self, hf_path: str, load_path: str, flash_dir: Path, *, model_exp: Any = None
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model in flash mode (LLM in a Flash).
 
@@ -1091,8 +1112,10 @@ class ModelManager:
         2. Create FlashWeightStore, PredictorBank, WindowManager
         3. Wrap model with FlashModelWrapper (replaces FFN layers)
         """
-        from olmlx.config import experimental
+        from olmlx.config import experimental as _global_exp
         from olmlx.engine.flash.flash_model import FlashConfig, FlashModelWrapper
+
+        experimental = model_exp if model_exp is not None else _global_exp
         from olmlx.engine.flash.predictor import LookaheadBank, PredictorBank
         from olmlx.engine.flash.weight_store import FlashWeightStore
 
@@ -1210,13 +1233,15 @@ class ModelManager:
             return flash_moe_path
         return None
 
-    def _is_flash_moe_enabled(self) -> bool:
+    def _is_flash_moe_enabled(self, model_exp: Any = None) -> bool:
+        if model_exp is not None:
+            return model_exp.flash_moe
         from olmlx.config import experimental
 
         return experimental.flash_moe
 
     def _load_flash_moe_model(
-        self, hf_path: str, load_path: str, flash_moe_dir: Path
+        self, hf_path: str, load_path: str, flash_moe_dir: Path, *, model_exp: Any = None
     ) -> tuple[Any, Any, bool, TemplateCaps]:
         """Load a model in Flash-MoE mode.
 
@@ -1225,8 +1250,10 @@ class ModelManager:
         3. Wrap model with FlashMoeModelWrapper (replaces SwitchGLU)
         4. Eval only non-expert params
         """
-        from olmlx.config import experimental
+        from olmlx.config import experimental as _global_exp
         from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+
+        experimental = model_exp if model_exp is not None else _global_exp
         from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
 
         import mlx_lm
@@ -1266,8 +1293,12 @@ class ModelManager:
 
         return wrapped, tokenizer, False, caps
 
-    def _load_model(self, hf_path: str) -> tuple[Any, Any, bool, TemplateCaps, Any]:
+    def _load_model(
+        self, hf_path: str, *, model_exp: Any = None
+    ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
+
+        *model_exp* is the resolved ExperimentalSettings for this model.
 
         Returns (model, tokenizer, is_vlm, caps, speculative_decoder).
         """
@@ -1278,19 +1309,19 @@ class ModelManager:
             load_path = str(local_dir)
 
         # Check for flash-MoE-prepared model
-        if self._is_flash_moe_enabled():
+        if self._is_flash_moe_enabled(model_exp):
             flash_moe_dir = self._flash_moe_dir(hf_path)
             if flash_moe_dir is not None:
                 return (
-                    *self._load_flash_moe_model(hf_path, load_path, flash_moe_dir),
+                    *self._load_flash_moe_model(hf_path, load_path, flash_moe_dir, model_exp=model_exp),
                     None,
                 )
 
         # Check for flash-prepared model
-        if self._is_flash_enabled():
+        if self._is_flash_enabled(model_exp):
             flash_dir = self._flash_dir(hf_path)
             if flash_dir is not None:
-                return self._load_flash_model(hf_path, load_path, flash_dir)
+                return self._load_flash_model(hf_path, load_path, flash_dir, model_exp=model_exp)
 
         kind = self._detect_model_kind(hf_path)
         logger.info("Detected model kind for %s: %s", hf_path, kind)
@@ -1320,13 +1351,18 @@ class ModelManager:
         return (*self._try_lm_then_vlm(load_path, hf_path), None)
 
     def _load_model_and_shard(
-        self, hf_path: str
+        self, hf_path: str, model_exp: Any = None
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 
+        *model_exp* is the resolved ExperimentalSettings for this model
+        (global defaults merged with per-model overrides).
+
         Returns (model, tokenizer, is_vlm, caps, is_distributed, speculative_decoder).
         """
-        model, tokenizer, is_vlm, caps, speculative_decoder = self._load_model(hf_path)
+        model, tokenizer, is_vlm, caps, speculative_decoder = self._load_model(
+            hf_path, model_exp=model_exp
+        )
         is_distributed = False
 
         if self._distributed_group is not None:

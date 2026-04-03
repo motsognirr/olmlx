@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from olmlx.config import Settings
+from olmlx.config import ExperimentalSettings, Settings, resolve_experimental
 
 
 class TestSettings:
@@ -106,3 +106,50 @@ class TestSettings:
         )
         with pytest.raises(ValidationError, match="single segment"):
             Settings()
+
+
+class TestResolveExperimental:
+    def test_empty_overrides_returns_global(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", raising=False)
+        base = ExperimentalSettings()
+        result = resolve_experimental(base, {})
+        assert result.flash == base.flash
+        assert result.kv_cache_quant == base.kv_cache_quant
+
+    def test_flash_override(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
+        base = ExperimentalSettings()
+        assert base.flash is False
+        result = resolve_experimental(base, {"flash": True})
+        assert result.flash is True
+        # Original should be unchanged
+        assert base.flash is False
+
+    def test_kv_cache_quant_override(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", raising=False)
+        base = ExperimentalSettings()
+        result = resolve_experimental(base, {"kv_cache_quant": "turboquant:4"})
+        assert result.kv_cache_quant == "turboquant:4"
+
+    def test_partial_override_preserves_other_fields(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD", raising=False)
+        base = ExperimentalSettings()
+        result = resolve_experimental(base, {"flash": True})
+        # flash changed, but sparsity_threshold stays at default
+        assert result.flash is True
+        assert result.flash_sparsity_threshold == base.flash_sparsity_threshold
+
+    def test_multiple_overrides(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD", raising=False)
+        base = ExperimentalSettings()
+        result = resolve_experimental(base, {
+            "flash": True,
+            "flash_sparsity_threshold": 0.3,
+            "flash_moe": True,
+        })
+        assert result.flash is True
+        assert result.flash_sparsity_threshold == 0.3
+        assert result.flash_moe is True

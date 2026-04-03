@@ -118,3 +118,21 @@ class ExperimentalSettings(BaseSettings):
 experimental = ExperimentalSettings()
 
 PRE_SHARDED_DIR_ENV = "OLMLX_EXPERIMENTAL_DISTRIBUTED_PRE_SHARDED_DIR"
+
+
+def resolve_experimental(
+    base: ExperimentalSettings,
+    overrides: dict,
+) -> ExperimentalSettings:
+    """Create a new ExperimentalSettings with per-model overrides applied.
+
+    Fields not present in *overrides* retain their value from *base*.
+    Returns *base* unchanged if overrides is empty.
+    """
+    if not overrides:
+        return base
+    merged = {k: v for k, v in base.__dict__.items() if not k.startswith("_")}
+    merged.update(overrides)
+    # Remove pydantic-settings internal keys that aren't constructor params
+    merged.pop("model_config", None)
+    return ExperimentalSettings(**merged)

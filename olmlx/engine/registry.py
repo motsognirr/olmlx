@@ -1,10 +1,115 @@
+from __future__ import annotations
+
 import difflib
 import json
 import os
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from olmlx.config import settings
+
+# Experimental keys that can be overridden per-model.
+# Distributed settings are excluded — they affect process startup, not per-model behavior.
+PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset({
+    # Flash inference
+    "flash",
+    "flash_sparsity_threshold",
+    "flash_min_active_neurons",
+    "flash_max_active_neurons",
+    "flash_window_size",
+    "flash_io_threads",
+    "flash_cache_budget_neurons",
+    "flash_bypass_os_cache",
+    "flash_preallocated_buffer",
+    "flash_memory_budget_fraction",
+    # Flash prefetch
+    "flash_prefetch",
+    "flash_prefetch_confidence_threshold",
+    "flash_prefetch_min_neurons",
+    "flash_prefetch_max_neurons",
+    "flash_prefetch_io_threads",
+    # Flash speculative
+    "flash_speculative",
+    "flash_speculative_draft_model",
+    "flash_speculative_tokens",
+    # KV cache quantization
+    "kv_cache_quant",
+    # Flash MoE
+    "flash_moe",
+    "flash_moe_cache_budget_experts",
+    "flash_moe_io_threads",
+})
+
+
+def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
+    """Validate per-model experimental overrides."""
+    unknown = set(overrides) - PER_MODEL_EXPERIMENTAL_KEYS
+    if unknown:
+        raise ValueError(
+            f"Unknown experimental keys: {sorted(unknown)}. "
+            f"Allowed per-model keys: {sorted(PER_MODEL_EXPERIMENTAL_KEYS)}"
+        )
+    # Validate kv_cache_quant format if present
+    kv_quant = overrides.get("kv_cache_quant")
+    if kv_quant is not None:
+        _valid_methods = {"turboquant"}
+        _valid_bits = {"2", "4"}
+        parts = str(kv_quant).split(":", 1)
+        if (
+            len(parts) != 2
+            or parts[0] not in _valid_methods
+            or parts[1] not in _valid_bits
+        ):
+            raise ValueError(
+                f"Invalid kv_cache_quant={kv_quant!r}. "
+                f"Expected '<method>:<bits>' where method is one of {_valid_methods} "
+                f"and bits is one of {_valid_bits}."
+            )
+
+
+@dataclass
+class ModelConfig:
+    """Per-model configuration resolved from models.json."""
+
+    hf_path: str
+    experimental: dict[str, Any] = field(default_factory=dict)
+    options: dict[str, Any] = field(default_factory=dict)
+    keep_alive: str | None = None
+
+    @classmethod
+    def from_entry(cls, entry: str | dict) -> ModelConfig:
+        """Create a ModelConfig from a models.json entry (string or dict)."""
+        if isinstance(entry, str):
+            return cls(hf_path=entry)
+        if isinstance(entry, dict):
+            hf_path = entry.get("hf_path")
+            if not hf_path:
+                raise ValueError("Model config dict must contain 'hf_path'")
+            experimental = dict(entry.get("experimental", {}))
+            if experimental:
+                _validate_experimental_overrides(experimental)
+            return cls(
+                hf_path=hf_path,
+                experimental=experimental,
+                options=dict(entry.get("options", {})),
+                keep_alive=entry.get("keep_alive"),
+            )
+        raise TypeError(f"Model config entry must be str or dict, got {type(entry).__name__}")
+
+    def to_entry(self) -> str | dict:
+        """Serialize to models.json format. Plain models become strings."""
+        if not self.experimental and not self.options and self.keep_alive is None:
+            return self.hf_path
+        result: dict[str, Any] = {"hf_path": self.hf_path}
+        if self.experimental:
+            result["experimental"] = self.experimental
+        if self.options:
+            result["options"] = self.options
+        if self.keep_alive is not None:
+            result["keep_alive"] = self.keep_alive
+        return result
 
 
 def _atomic_write_json(data: dict, path: Path) -> None:
@@ -73,7 +178,7 @@ class ModelRegistry:
     """Resolves Ollama model names to HuggingFace paths via config file."""
 
     def __init__(self):
-        self._mappings: dict[str, str] = {}
+        self._mappings: dict[str, ModelConfig] = {}
         self._aliases: dict[str, str] = {}
         self._aliases_path = settings.models_config.parent / "aliases.json"
 
@@ -81,7 +186,10 @@ class ModelRegistry:
         """Load model mappings from config file and aliases."""
         if settings.models_config.exists():
             with open(settings.models_config) as f:
-                self._mappings = json.load(f)
+                raw = json.load(f)
+            self._mappings = {
+                k: ModelConfig.from_entry(v) for k, v in raw.items()
+            }
         if self._aliases_path.exists():
             with open(self._aliases_path) as f:
                 self._aliases = json.load(f)
@@ -93,20 +201,25 @@ class ModelRegistry:
             return f"{name}:latest"
         return name
 
-    def resolve(self, name: str) -> str | None:
-        """Resolve an Ollama model name to a HuggingFace path.
+    def resolve(self, name: str) -> ModelConfig | None:
+        """Resolve an Ollama model name to a ModelConfig.
 
-        Returns the HF path or None if not found.
-        Direct HF paths (containing '/') are passed through.
+        Returns the ModelConfig or None if not found.
+        Direct HF paths (containing '/') are wrapped in a plain ModelConfig.
         """
         if "/" in name:
             validate_hf_path(name)
-            return name
+            return ModelConfig(hf_path=name)
         validate_model_name(name)
         normalized = self.normalize_name(name)
         # Check aliases first, then mappings
         if normalized in self._aliases:
-            return self._aliases[normalized]
+            hf_path = self._aliases[normalized]
+            # Look up the target model's config if it exists in mappings
+            for mc in self._mappings.values():
+                if mc.hf_path == hf_path:
+                    return mc
+            return ModelConfig(hf_path=hf_path)
         if normalized in self._mappings:
             return self._mappings[normalized]
         # Try without tag normalization
@@ -114,33 +227,52 @@ class ModelRegistry:
             return self._mappings[name]
         return None
 
-    def list_models(self) -> dict[str, str]:
-        """Return all known model name → HF path mappings."""
-        combined = {**self._mappings, **self._aliases}
+    def list_models(self) -> dict[str, ModelConfig]:
+        """Return all known model name → ModelConfig mappings."""
+        combined: dict[str, ModelConfig] = {**self._mappings}
+        for alias_name, hf_path in self._aliases.items():
+            if alias_name not in combined:
+                combined[alias_name] = ModelConfig(hf_path=hf_path)
         return combined
 
     def add_alias(self, alias: str, source: str):
         """Create an alias from source model."""
         validate_model_name(alias)
         alias = self.normalize_name(alias)
-        hf_path = self.resolve(source)
-        if hf_path is None:
+        resolved = self.resolve(source)
+        if resolved is None:
             raise ValueError(f"Source model '{source}' not found")
-        self._aliases[alias] = hf_path
+        self._aliases[alias] = resolved.hf_path
         self._save_aliases()
 
-    def add_mapping(self, name: str, hf_path: str):
-        """Add a name → HF path mapping and persist to models.json."""
+    def add_mapping(
+        self,
+        name: str,
+        hf_path: str,
+        *,
+        model_config: ModelConfig | None = None,
+    ):
+        """Add a name → HF path mapping and persist to models.json.
+
+        If *model_config* is provided, its experimental/options/keep_alive
+        are stored.  Otherwise a plain mapping is created.
+        """
         validate_model_name(name)
         validate_hf_path(hf_path)
         normalized = self.normalize_name(name)
-        if self._mappings.get(normalized) == hf_path:
+        existing = self._mappings.get(normalized)
+        if model_config is not None:
+            mc = model_config
+        else:
+            mc = ModelConfig(hf_path=hf_path)
+        if existing is not None and existing.hf_path == mc.hf_path and existing.experimental == mc.experimental and existing.options == mc.options and existing.keep_alive == mc.keep_alive:
             return  # already exists
-        self._mappings[normalized] = hf_path
+        self._mappings[normalized] = mc
         self._save_mappings()
 
     def _save_mappings(self):
-        _atomic_write_json(self._mappings, settings.models_config)
+        serialized = {k: v.to_entry() for k, v in self._mappings.items()}
+        _atomic_write_json(serialized, settings.models_config)
 
     def remove(self, name: str):
         """Remove a model alias or mapping."""
@@ -174,7 +306,7 @@ class ModelRegistry:
             for full in full_names:
                 if full not in seen and full in all_models:
                     seen.add(full)
-                    results.append((full, all_models[full]))
+                    results.append((full, all_models[full].hf_path))
         return results[:max_results]
 
     def _save_aliases(self):

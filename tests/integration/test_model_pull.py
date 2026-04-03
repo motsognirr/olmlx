@@ -45,7 +45,7 @@ async def test_pull_downloads_and_registers(integration_ctx, tmp_path):
     assert data.get("status") == "success"
 
     huggingface_hub.snapshot_download.assert_called_once()
-    assert integration_ctx.registry.resolve("qwen3") == hf_path
+    assert integration_ctx.registry.resolve("qwen3").hf_path == hf_path
 
     # Manifest should exist
     local = integration_ctx.store.local_path(hf_path)
@@ -154,7 +154,7 @@ async def test_pull_hf_path_auto_registers(integration_ctx):
     assert resp.status_code == 200
 
     # Direct HF paths resolve to themselves
-    assert integration_ctx.registry.resolve(hf_path) == hf_path
+    assert integration_ctx.registry.resolve(hf_path).hf_path == hf_path
 
 
 async def test_pull_failure_keeps_partial_dir(integration_ctx):

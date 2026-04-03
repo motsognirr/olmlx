@@ -88,7 +88,8 @@ class ModelStore:
 
     def _resolve_model_dir(self, name: str) -> Path | None:
         """Resolve a model name to its local directory, trying HF-path-based naming first."""
-        hf_path = self.registry.resolve(name)
+        resolved = self.registry.resolve(name)
+        hf_path = resolved.hf_path if resolved is not None else None
         if hf_path is not None:
             d = self.local_path(hf_path)
             if (d / "manifest.json").exists():
@@ -159,7 +160,8 @@ class ModelStore:
 
     async def pull(self, name: str) -> AsyncGenerator[dict, None]:
         """Pull a model from HuggingFace, yielding progress dicts."""
-        hf_path = self.registry.resolve(name)
+        resolved = self.registry.resolve(name)
+        hf_path = resolved.hf_path if resolved is not None else None
         if hf_path is None:
             if "/" in name:
                 hf_path = name
