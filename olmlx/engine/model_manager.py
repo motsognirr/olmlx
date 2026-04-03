@@ -933,12 +933,27 @@ class ModelManager:
                     return "vlm"
             except (ImportError, ModuleNotFoundError):
                 pass
-            # Has vision keys but mlx-vlm doesn't recognize it — still try as VLM
+            # Has vision keys but mlx-vlm can't handle it — check mlx-lm
+            try:
+                from mlx_lm.utils import MODEL_REMAPPING as LM_REMAP
+
+                mapped = LM_REMAP.get(model_type, model_type)
+                spec = importlib.util.find_spec(f"mlx_lm.models.{mapped}")
+                if spec is not None:
+                    logger.info(
+                        "Config has vision keys but model_type '%s' not in mlx-vlm; "
+                        "mlx-lm supports it, using text",
+                        model_type,
+                    )
+                    return "text"
+            except (ImportError, ModuleNotFoundError):
+                pass
+            # Neither library explicitly supports it — try both via fallback
             logger.info(
-                "Config has vision keys but model_type '%s' not in mlx-vlm, will try anyway",
+                "Config has vision keys but model_type '%s' not in mlx-vlm or mlx-lm",
                 model_type,
             )
-            return "vlm"
+            return "unknown"
 
         # No vision keys — check mlx-lm
         try:

@@ -226,7 +226,36 @@ class TestDetectModelKind:
             kind = manager._detect_model_kind("test/model")
         assert kind == "unknown"
 
-    def test_vlm_no_spec_found(self, tmp_path, registry, mock_store):
+    def test_vision_keys_unsupported_by_vlm_but_supported_by_lm(
+        self, tmp_path, registry, mock_store
+    ):
+        """Model has vision keys but mlx-vlm doesn't support it; mlx-lm does → text."""
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "llama",  # known to mlx-lm
+                "vision_config": {},
+                "image_token_id": 42,
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def no_vlm_yes_lm(name, *args, **kwargs):
+            if name.startswith("mlx_vlm.models."):
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            with patch("importlib.util.find_spec", side_effect=no_vlm_yes_lm):
+                kind = manager._detect_model_kind("test/model")
+        assert kind == "text"
+
+    def test_vision_keys_unsupported_by_both(self, tmp_path, registry, mock_store):
+        """Model has vision keys but neither library supports it → unknown."""
         config_path = self._make_config(
             tmp_path,
             {
@@ -248,8 +277,8 @@ class TestDetectModelKind:
         with patch("huggingface_hub.hf_hub_download", return_value=config_path):
             with patch("importlib.util.find_spec", side_effect=none_for_models):
                 kind = manager._detect_model_kind("test/vlm")
-        # Has vision keys but spec not found — still returns vlm
-        assert kind == "vlm"
+        # Neither library supports it — return unknown to try both
+        assert kind == "unknown"
 
     def test_text_model_with_real_imports(self, tmp_path, registry, mock_store):
         """Test _detect_model_kind with a model_type that exists in mlx-lm."""
