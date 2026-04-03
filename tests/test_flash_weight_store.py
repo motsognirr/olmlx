@@ -186,38 +186,27 @@ class TestBundleVLModelWeights:
         assert len(layouts) == 2
         assert 0 in layouts and 1 in layouts
 
-    def test_bundle_handles_bfloat16_safetensors(self, tmp_path):
-        """Safetensors with bfloat16 weights (e.g. vision tower) should not crash."""
+    def test_bundle_handles_bfloat16_mlp_weights(self, tmp_path):
+        """MLP weights stored as bfloat16 should be converted to float16 for bundling."""
         import mlx.core as mx_core
-        from safetensors.numpy import save_file
 
         hidden, inter = 16, 8
-        # Create float16 MLP weights (numpy-compatible)
-        tensors = {}
-        prefix = "model.layers.0.mlp"
-        tensors[f"{prefix}.gate_proj.weight"] = np.random.randn(
-            inter, hidden
-        ).astype(np.float16)
-        tensors[f"{prefix}.up_proj.weight"] = np.random.randn(
-            inter, hidden
-        ).astype(np.float16)
-        tensors[f"{prefix}.down_proj.weight"] = np.random.randn(
-            hidden, inter
-        ).astype(np.float16)
         model_dir = tmp_path / "model"
         model_dir.mkdir()
-        save_file(tensors, str(model_dir / "model.safetensors"))
 
-        # Create a separate safetensors file with bfloat16 weights (vision tower)
-        # using mx.save_safetensors which supports bfloat16
-        vision_weights = {
-            "vision_tower.blocks.0.attn.weight": mx_core.random.normal(
-                shape=(64, 64)
-            ).astype(mx_core.bfloat16),
-        }
-        mx_core.save_safetensors(
-            str(model_dir / "vision.safetensors"), vision_weights
-        )
+        # Save MLP weights as bfloat16 (only mx supports this, not numpy)
+        weights = {}
+        prefix = "model.layers.0.mlp"
+        weights[f"{prefix}.gate_proj.weight"] = mx_core.random.normal(
+            shape=(inter, hidden)
+        ).astype(mx_core.bfloat16)
+        weights[f"{prefix}.up_proj.weight"] = mx_core.random.normal(
+            shape=(inter, hidden)
+        ).astype(mx_core.bfloat16)
+        weights[f"{prefix}.down_proj.weight"] = mx_core.random.normal(
+            shape=(hidden, inter)
+        ).astype(mx_core.bfloat16)
+        mx_core.save_safetensors(str(model_dir / "model.safetensors"), weights)
 
         output_dir = tmp_path / "flash"
         layouts = bundle_ffn_weights(model_dir, output_dir)
