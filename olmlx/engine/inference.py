@@ -919,7 +919,7 @@ async def generate_completion(
             if system:
                 prompt = f"{system}\n\n{prompt}"
 
-    # Merge per-model default options under request options (request wins)
+    # empty dict → no per-model defaults, pass options through unchanged
     merged_options = (
         {**lm.default_options, **(options or {})} if lm.default_options else options
     )
@@ -1665,7 +1665,7 @@ async def generate_chat(
             logger.info("Chat prompt with %d tools", len(tools))
         logger.debug("Prompt (first 1000 chars): %s", prompt[:1000])
 
-    # Merge per-model default options under request options (request wins)
+    # empty dict → no per-model defaults, pass options through unchanged
     merged_options = (
         {**lm.default_options, **(options or {})} if lm.default_options else options
     )

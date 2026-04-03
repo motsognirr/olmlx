@@ -133,4 +133,4 @@ def resolve_experimental(
         return base
     merged = base.model_dump()
     merged.update(overrides)
-    return ExperimentalSettings.model_construct(**merged)
+    return ExperimentalSettings.model_validate(merged)

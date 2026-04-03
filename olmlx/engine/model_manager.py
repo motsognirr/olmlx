@@ -756,8 +756,7 @@ class ModelManager:
                             FlashModelWrapper,
                         )
 
-                        if isinstance(FlashModelWrapper, type):
-                            is_flash = isinstance(model, FlashModelWrapper)
+                        is_flash = isinstance(model, FlashModelWrapper)
                     except ImportError:
                         pass
                     try:
@@ -765,9 +764,7 @@ class ModelManager:
                             FlashMoeModelWrapper,
                         )
 
-                        if isinstance(FlashMoeModelWrapper, type) and isinstance(
-                            model, FlashMoeModelWrapper
-                        ):
+                        if isinstance(model, FlashMoeModelWrapper):
                             is_flash_moe = True
                             _weight_store = getattr(model, "_weight_store", None)
                     except ImportError:
