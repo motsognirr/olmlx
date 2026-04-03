@@ -14,7 +14,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from olmlx.engine.flash.flash_mlp import FlashMLP, WindowManager
-from olmlx.engine.flash.predictor import PredictorBank
+from olmlx.engine.flash.prefetch import Prefetcher
+from olmlx.engine.flash.predictor import LookaheadBank, PredictorBank
 from olmlx.engine.flash.weight_store import FlashWeightStore
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,12 @@ class FlashConfig:
     io_threads: int = 32
     cache_budget_neurons: int = 1024
     memory_budget_fraction: float | None = None
+    # Speculative prefetch settings
+    prefetch: bool = False
+    prefetch_confidence_threshold: float = 0.3
+    prefetch_min_neurons: int = 64
+    prefetch_max_neurons: int | None = None
+    prefetch_io_threads: int = 16
 
 
 class FlashModelWrapper(nn.Module):
@@ -50,6 +57,7 @@ class FlashModelWrapper(nn.Module):
         predictor_bank: PredictorBank,
         weight_store: FlashWeightStore,
         flash_config: FlashConfig,
+        lookahead_bank: LookaheadBank | None = None,
     ):
         super().__init__()
         # Store in __dict__ directly so __getattr__ can find it without
@@ -63,6 +71,28 @@ class FlashModelWrapper(nn.Module):
             memory_budget_fraction=flash_config.memory_budget_fraction,
             intermediate_size=flash_config.intermediate_size,
         )
+
+        # Create speculative prefetcher if enabled
+        self.prefetcher: Prefetcher | None = None
+        if flash_config.prefetch:
+            self.prefetcher = Prefetcher(
+                predictor_bank=predictor_bank,
+                weight_store=weight_store,
+                num_layers=flash_config.num_layers,
+                lookahead_bank=lookahead_bank,
+                confidence_threshold=flash_config.prefetch_confidence_threshold,
+                min_neurons=flash_config.prefetch_min_neurons,
+                max_neurons=flash_config.prefetch_max_neurons,
+                io_threads=flash_config.prefetch_io_threads,
+            )
+            logger.info(
+                "Speculative prefetcher enabled (threshold=%.2f, io_threads=%d, "
+                "lookahead=%s)",
+                flash_config.prefetch_confidence_threshold,
+                flash_config.prefetch_io_threads,
+                "dedicated" if lookahead_bank is not None else "fallback",
+            )
+
         self._replace_mlps(predictor_bank, weight_store, flash_config)
 
     def _replace_mlps(
@@ -88,6 +118,7 @@ class FlashModelWrapper(nn.Module):
                 sparsity_threshold=config.sparsity_threshold,
                 min_active_neurons=config.min_active_neurons,
                 max_active_neurons=config.max_active_neurons,
+                prefetcher=self.prefetcher,
             )
 
             # Free original MLP weights to reclaim RAM

@@ -8,7 +8,7 @@ import os
 import sys
 import threading
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import mlx.core as mx
@@ -86,6 +86,18 @@ class NeuronCache:
                     layer_cache.move_to_end(idx)
                     result[idx] = layer_cache[idx]
             return result
+
+    def get_cached_indices(
+        self, layer_idx: int, neuron_indices: list[int]
+    ) -> tuple[list[int], list[int]]:
+        """Return (cached_indices, missing_indices)."""
+        with self._lock:
+            layer_cache = self._cache.get(layer_idx)
+            if layer_cache is None:
+                return [], list(neuron_indices)
+            cached = [idx for idx in neuron_indices if idx in layer_cache]
+            missing = [idx for idx in neuron_indices if idx not in layer_cache]
+            return cached, missing
 
 
 class PreallocatedNeuronBuffer:
@@ -417,6 +429,62 @@ class FlashWeightStore:
             mx.stack(up_cols, axis=1),
             mx.stack(down_rows, axis=0),
         )
+
+    def get_cached_indices(
+        self, layer_idx: int, neuron_indices: list[int]
+    ) -> tuple[list[int], list[int]]:
+        """Check which neurons are already cached without loading.
+
+        Returns:
+            (cached, missing) — two lists of neuron indices.
+        """
+        if self._use_preallocated:
+            buf = self._buffers[layer_idx]
+            with buf.lock:
+                return buf.get_cached_indices(neuron_indices)
+        assert self._cache is not None
+        return self._cache.get_cached_indices(layer_idx, neuron_indices)
+
+    def prefetch_neurons(
+        self,
+        layer_idx: int,
+        neuron_indices: list[int],
+        executor: ThreadPoolExecutor | None = None,
+    ) -> None:
+        """Load neurons into cache without returning matrices.
+
+        Used by the speculative prefetcher to warm the cache in the background.
+        An external *executor* can be passed to avoid contention with the main
+        I/O thread pool; if ``None``, the store's own pool is used.
+        """
+        pool = executor or self._executor
+
+        if self._use_preallocated:
+            buf = self._buffers[layer_idx]
+            with buf.lock:
+                _, missing = buf.get_cached_indices(neuron_indices)
+            if not missing:
+                return
+            futures = {
+                pool.submit(self._read_neuron_raw, layer_idx, idx): idx
+                for idx in missing
+            }
+            results = {}
+            for fut in as_completed(futures):
+                results[futures[fut]] = fut.result()
+            with buf.lock:
+                for idx, (gate, up, down) in results.items():
+                    buf.insert(idx, gate, up, down)
+        else:
+            assert self._cache is not None
+            _, missing = self._cache.get_cached_indices(layer_idx, neuron_indices)
+            if not missing:
+                return
+            futures = {
+                pool.submit(self._read_neuron, layer_idx, idx): idx for idx in missing
+            }
+            for fut in as_completed(futures):
+                self._cache.put(layer_idx, futures[fut], fut.result())
 
     def close(self) -> None:
         """Release file descriptors and shut down the I/O thread pool."""

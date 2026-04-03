@@ -173,3 +173,111 @@ class PredictorBank:
         return self.predictors[layer_idx].predict_active(
             hidden_state, threshold, min_neurons, max_neurons
         )
+
+
+# Same architecture as SparsityPredictor, trained on cross-layer objective.
+LookaheadPredictor = SparsityPredictor
+
+
+class LookaheadBank:
+    """Collection of per-layer-pair lookahead predictors.
+
+    Predictor at index i predicts layer i+1 neurons given layer i hidden state.
+    There are num_layers - 1 predictors (no predictor for the last layer).
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        hidden_size: int,
+        intermediate_size: int,
+        rank: int = 64,
+    ):
+        self.num_layers = num_layers
+        self.predictors = [
+            SparsityPredictor(hidden_size, intermediate_size, rank)
+            for _ in range(num_layers - 1)
+        ]
+
+    def save(self, path: Path) -> None:
+        """Save all lookahead predictor weights to a directory."""
+        path.mkdir(parents=True, exist_ok=True)
+        for i, pred in enumerate(self.predictors):
+            weights = dict(pred.parameters())
+            flat = {}
+            for key, val in weights.items():
+                if isinstance(val, dict):
+                    for subkey, subval in val.items():
+                        flat[f"pair_{i}.{key}.{subkey}"] = subval
+                else:
+                    flat[f"pair_{i}.{key}"] = val
+            mx.savez(str(path / f"lookahead_{i:02d}.npz"), **flat)
+
+    @classmethod
+    def load(cls, path: Path) -> LookaheadBank:
+        """Load lookahead bank from a directory."""
+        files = sorted(
+            path.glob("lookahead_*.npz"),
+            key=lambda f: int(re.search(r"(\d+)", f.name).group(1)),
+        )
+        if not files:
+            raise FileNotFoundError(f"No lookahead predictor files found in {path}")
+
+        parsed: dict[int, Path] = {}
+        for f in files:
+            m = re.search(r"lookahead_(\d+)", f.stem)
+            if m is None:
+                raise ValueError(f"Cannot parse pair index from {f.name}")
+            parsed[int(m.group(1))] = f
+
+        expected = list(range(len(parsed)))
+        if sorted(parsed.keys()) != expected:
+            raise ValueError(
+                f"Non-contiguous lookahead files: found indices {sorted(parsed.keys())}, "
+                f"expected {expected}"
+            )
+
+        # Pre-load all weights to infer per-layer dimensions.
+        loaded: list[tuple[mx.array, mx.array]] = []
+        hidden_size = intermediate_size = 0
+        for i in expected:
+            weights = dict(mx.load(str(parsed[i])))
+            down_w = weights[f"pair_{i}.down.weight"]
+            up_w = weights[f"pair_{i}.up.weight"]
+            _, hidden_size = down_w.shape
+            intermediate_size, _ = up_w.shape
+            loaded.append((down_w, up_w))
+
+        # Use first file's rank for the constructor (predictors will be
+        # overwritten anyway — this just sets num_layers correctly).
+        rank = loaded[0][0].shape[0]
+        num_layers = len(parsed) + 1
+        bank = cls(num_layers, hidden_size, intermediate_size, rank)
+
+        # Replace freshly-initialized weights with loaded ones.
+        for i, (down_w, up_w) in enumerate(loaded):
+            r = down_w.shape[0]
+            if r != rank:
+                # Mixed ranks: rebuild predictor with correct dimensions.
+                bank.predictors[i] = SparsityPredictor(
+                    hidden_size, intermediate_size, r
+                )
+            bank.predictors[i].down.weight = down_w
+            bank.predictors[i].up.weight = up_w
+
+        return bank
+
+    def predict_next_layer(
+        self,
+        layer_idx: int,
+        hidden_state: mx.array,
+        threshold: float = 0.3,
+        min_neurons: int = 64,
+        max_neurons: int | None = None,
+    ) -> mx.array:
+        """Predict active neuron indices for layer_idx + 1."""
+        if layer_idx >= len(self.predictors):
+            return mx.array([], dtype=mx.int32)
+        return self.predictors[layer_idx].predict_active(
+            hidden_state, threshold, min_neurons, max_neurons
+        )

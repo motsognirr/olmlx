@@ -8,14 +8,22 @@ where alpha is the rolling acceptance rate.
 
 from __future__ import annotations
 
+import logging
+from typing import TYPE_CHECKING
+
 import mlx.core as mx
 import mlx.nn as nn
+
+if TYPE_CHECKING:
+    from olmlx.engine.flash.prefetch import Prefetcher
 
 try:
     from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 except ImportError:
     make_prompt_cache = None  # type: ignore[assignment]
     trim_prompt_cache = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 class SpeculativeFlashDecoder:
@@ -40,12 +48,14 @@ class SpeculativeFlashDecoder:
         target_model: nn.Module,
         num_speculative_tokens: int = 4,
         acceptance_rate_ema: float = 0.9,
+        prefetcher: Prefetcher | None = None,
     ):
         self._draft = draft_model
         self._target = target_model
         self._lambda = num_speculative_tokens
         self._alpha = 0.5  # initial acceptance rate estimate
         self._alpha_ema = acceptance_rate_ema
+        self._prefetcher = prefetcher
 
         # Persistent KV cache state (populated by prefill/step)
         self._target_cache: list | None = None
@@ -127,7 +137,13 @@ class SpeculativeFlashDecoder:
 
         # 1. Draft: feed pending token, then generate lambda candidates
         #    Draft cache advances from offset to offset + lambda.
-        draft_tokens = self._draft_generate_cached(pending_token, self._lambda)
+        draft_tokens, draft_hidden = self._draft_generate_cached(
+            pending_token, self._lambda
+        )
+
+        # 1.5. Draft-informed prefetch: submit bulk I/O before target forward pass.
+        if self._prefetcher is not None and draft_hidden:
+            self._submit_draft_prefetch(draft_hidden)
 
         # 2. Target: feed [pending, D1, ..., D_lambda] in one pass.
         #    Target cache advances from offset to offset + lambda + 1.
@@ -145,6 +161,10 @@ class SpeculativeFlashDecoder:
         # 3. Verify draft tokens against target logits
         accepted = self._verify(draft_tokens, verification_logits)
         num_accepted = len(accepted)
+
+        # Cancel speculative prefetch for rejected tokens (harmless if already done)
+        if self._prefetcher is not None and num_accepted < self._lambda:
+            self._prefetcher.cancel()
 
         # 4. Trim caches to the position after the last accepted token.
         #    Desired offset after step: cache_seq_len + num_accepted
@@ -177,33 +197,88 @@ class SpeculativeFlashDecoder:
         self._update_acceptance_rate(num_accepted)
         return accepted, self._lambda
 
-    def _draft_generate_cached(self, pending_token: int, n: int) -> list[int]:
+    def _draft_generate_cached(
+        self, pending_token: int, n: int
+    ) -> tuple[list[int], list[mx.array]]:
         """Generate n candidate tokens using the persistent draft cache.
 
-        Feeds ``pending_token`` first (the last accepted token not yet in cache),
-        then generates n tokens autoregressively. Draft cache advances by n.
-
-        Args:
-            pending_token: Token to feed before generating.
-            n: Number of tokens to generate.
-
         Returns:
-            List of n generated token IDs.
+            (tokens, captured_hidden_states) — captured is non-empty only
+            when a prefetcher is attached AND the draft model exposes an
+            inner .model attribute for hidden state extraction.
         """
         assert self._draft_cache is not None
 
+        # Determine if we can capture hidden states (pre-lm_head) for prefetch.
+        # mlx-lm models expose .model (transformer) and .lm_head (projection).
+        inner_model = getattr(self._draft, "model", None)
+        lm_head = getattr(self._draft, "lm_head", None)
+        can_capture = (
+            self._prefetcher is not None
+            and inner_model is not None
+            and lm_head is not None
+        )
+
+        captured: list[mx.array] = []
         next_token = pending_token
         tokens: list[int] = []
 
         for _ in range(n):
             inp = mx.array([[next_token]])
-            logits = self._draft(inp, cache=self._draft_cache)
-            next_logits = logits[:, -1, :]
-            mx.eval(next_logits)
+            if can_capture:
+                hidden = inner_model(inp, cache=self._draft_cache)
+                logits = lm_head(hidden)
+                next_logits = logits[:, -1, :]
+                mx.eval(next_logits)
+                captured.append(hidden[:, -1, :])
+            else:
+                logits = self._draft(inp, cache=self._draft_cache)
+                next_logits = logits[:, -1, :]
+                mx.eval(next_logits)
+
             next_token = int(mx.argmax(next_logits, axis=-1).item())
             tokens.append(next_token)
 
-        return tokens
+        return tokens, captured
+
+    def _submit_draft_prefetch(self, draft_hidden_states: list[mx.array]) -> None:
+        """Submit bulk prefetch using captured draft hidden states.
+
+        When the draft model's hidden_size differs from the target model's
+        (as reported by the prefetcher), skip silently — the cross-layer
+        prefetch (Path A) still provides coverage during the target forward pass.
+        """
+        assert self._prefetcher is not None
+
+        hidden_dim = draft_hidden_states[0].shape[-1]
+        expected = self._prefetcher.hidden_size
+        if expected is not None and hidden_dim != expected:
+            logger.debug(
+                "Draft hidden_size %d != target hidden_size %d; skipping Path B",
+                hidden_dim,
+                expected,
+            )
+            return
+
+        # Map draft positions to target layers by depth ratio so early layers
+        # get signals from early draft steps and deep layers from late steps.
+        # Deduplicate: with 32 layers and 4 draft steps, ~8 layers share each
+        # draft_idx — reuse the same tensor to avoid redundant predictor calls.
+        num_layers = self._prefetcher.num_layers
+        num_draft = len(draft_hidden_states)
+        draft_to_layers: dict[int, list[int]] = {}
+        for i in range(num_layers):
+            draft_idx = round(i * (num_draft - 1) / max(num_layers - 1, 1))
+            draft_to_layers.setdefault(draft_idx, []).append(i)
+
+        layer_states: dict[int, mx.array] = {}
+        for draft_idx, layers in draft_to_layers.items():
+            hidden = draft_hidden_states[draft_idx].reshape(1, -1)
+            for layer_idx in layers:
+                layer_states[layer_idx] = hidden
+        mx.eval(*{id(v): v for v in layer_states.values()}.values())
+
+        self._prefetcher.submit_bulk(layer_states)
 
     # ------------------------------------------------------------------
     # Stateless API (backward compatibility)
