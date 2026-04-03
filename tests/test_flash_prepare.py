@@ -452,6 +452,89 @@ class TestVLModelSupport:
         assert hidden_size == HIDDEN
         assert intermediate_size == INTER
 
+    def test_stream_record_quantized_model_reports_real_hidden_size(self):
+        """Quantized models pack weights — hidden_size must come from the real
+        dimensions, not the packed weight shape."""
+        from olmlx.engine.flash.prepare import _stream_record_activations
+
+        # Use dimensions large enough for quantization (group_size=64)
+        q_hidden, q_inter = 128, 256
+        q_num_heads = 4
+        q_head_dim = q_hidden // q_num_heads
+
+        class QFakeMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.QuantizedLinear(q_hidden, q_inter, bias=False)
+                self.up_proj = nn.QuantizedLinear(q_hidden, q_inter, bias=False)
+                self.down_proj = nn.QuantizedLinear(q_inter, q_hidden, bias=False)
+
+            def __call__(self, x):
+                return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+        class QFakeAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(q_hidden, q_hidden, bias=False)
+                self.k_proj = nn.Linear(q_hidden, q_hidden, bias=False)
+                self.v_proj = nn.Linear(q_hidden, q_hidden, bias=False)
+                self.o_proj = nn.Linear(q_hidden, q_hidden, bias=False)
+                self.scale = q_head_dim**-0.5
+
+            def __call__(self, x, mask=None, cache=None):
+                B, L, _ = x.shape
+                q = self.q_proj(x).reshape(B, L, q_num_heads, q_head_dim).transpose(0, 2, 1, 3)
+                k = self.k_proj(x).reshape(B, L, q_num_heads, q_head_dim).transpose(0, 2, 1, 3)
+                v = self.v_proj(x).reshape(B, L, q_num_heads, q_head_dim).transpose(0, 2, 1, 3)
+                out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
+                return self.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, q_hidden))
+
+        class QFakeBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = QFakeAttention()
+                self.mlp = QFakeMLP()
+                self.input_layernorm = nn.RMSNorm(q_hidden)
+                self.post_attention_layernorm = nn.RMSNorm(q_hidden)
+
+            def __call__(self, x, mask=None, cache=None):
+                r = self.self_attn(self.input_layernorm(x), mask, cache)
+                h = x + r
+                return h + self.mlp(self.post_attention_layernorm(h))
+
+        class QFakeInner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = nn.Embedding(VOCAB, q_hidden)
+                self.layers = [QFakeBlock() for _ in range(2)]
+                self.norm = nn.RMSNorm(q_hidden)
+
+        class QFakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = QFakeInner()
+
+            @property
+            def layers(self):
+                return self.model.layers
+
+        model = QFakeModel()
+        mx.eval(model.parameters())
+
+        # Verify the packed shape differs from the real shape
+        packed_dim = model.model.layers[0].mlp.gate_proj.weight.shape[1]
+        assert packed_dim != q_hidden, "Test setup: packed dim should differ from hidden"
+
+        ctx, _ = _patch_mlx_lm(model, FakeTokenizer())
+        with ctx:
+            recordings, hidden_size, intermediate_size, num_layers = (
+                _stream_record_activations("fake_path", ["Hello world"])
+            )
+
+        # Must report real dimensions, not packed
+        assert hidden_size == q_hidden
+        assert intermediate_size == q_inter
+
     def test_stream_record_non_weight_valueerror_still_raises(self):
         """ValueError not about extra weights should still propagate."""
         from olmlx.engine.flash.prepare import _stream_record_activations

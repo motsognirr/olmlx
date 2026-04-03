@@ -349,8 +349,13 @@ def _stream_record_activations(
     for layer in layers:
         mlp = layer.mlp if hasattr(layer, "mlp") else None
         if mlp and hasattr(mlp, "gate_proj") and hasattr(mlp, "up_proj"):
-            intermediate_size = mlp.gate_proj.weight.shape[0]
-            hidden_size = mlp.gate_proj.weight.shape[1]
+            gate = mlp.gate_proj
+            intermediate_size = gate.weight.shape[0]
+            # For quantized models, weight is packed — derive real dim from scales
+            if hasattr(gate, "scales") and hasattr(gate, "group_size"):
+                hidden_size = gate.scales.shape[1] * gate.group_size
+            else:
+                hidden_size = gate.weight.shape[1]
             break
     if hidden_size is None:
         raise ValueError("No layer has gate_proj/up_proj — cannot determine dimensions")
