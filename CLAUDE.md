@@ -35,7 +35,22 @@ olmlx/
 │   ├── template_caps.py # Chat template capability detection (tools, thinking)
 │   ├── tool_parser.py  # Multi-format tool call parsing (Qwen, Mistral, Llama, DeepSeek, bare JSON)
 │   ├── turboquant.py   # TurboQuant_mse: rotation, Lloyd-Max codebooks, bit-packed quantize/dequantize
-│   └── turboquant_cache.py # TurboQuantKVCache: drop-in KVCache replacement with TurboQuant compression
+│   ├── turboquant_cache.py # TurboQuantKVCache: drop-in KVCache replacement with TurboQuant compression
+│   └── flash/
+│       ├── bundler.py       # Bundle FFN weights into per-layer .flashweights files
+│       ├── flash_mlp.py     # FlashMLP: sparse FFN that loads active neurons from SSD; WindowManager
+│       ├── flash_model.py   # FlashModelWrapper: wraps mlx-lm model with FlashMLP layers + Prefetcher
+│       ├── predictor.py     # SparsityPredictor, PredictorBank, LookaheadBank (cross-layer)
+│       ├── prefetch.py      # Prefetcher: background neuron prefetch with thread pool + stats
+│       ├── prepare.py       # prepare_model_for_flash pipeline, predictor training
+│       ├── speculative.py   # SpeculativeFlashDecoder: draft→target verification with prefetch
+│       ├── weight_store.py  # FlashWeightStore: SSD I/O, NeuronCache, preallocated buffers
+│       ├── flash_moe.py     # Flash-MoE sparse expert loading
+│       ├── flash_moe_model.py # Flash-MoE model wrapper
+│       ├── moe_bundler.py   # Bundle MoE expert weights
+│       ├── moe_prepare.py   # MoE preparation pipeline
+│       ├── moe_weight_store.py # MoE weight store
+│       └── speculative_stream.py # Streaming integration for speculative decoding
 ├── models/
 │   ├── manifest.py     # Model manifest/metadata
 │   └── store.py        # Local model storage
@@ -88,6 +103,11 @@ olmlx/
   - Worker and coordinator must load the same model (all_sum requires matching tensor shapes).
   - **Flash + distributed**: When both Flash and distributed are enabled (tensor strategy), `FlashModelWrapper.shard()` shards only attention projections, leaving FlashMLP layers unsharded. Each rank independently loads active neurons from its local SSD. This is correct because `o_proj` (sharded-to-all) replicates its output via `all_sum`, so every rank feeds identical input to FlashMLP. Pre-sharding is skipped (MLP weights live on SSD). Flash env vars are forwarded to workers. Flash-MoE + distributed remains blocked (expert weights cannot be sharded).
   - Config: `OLMLX_EXPERIMENTAL_DISTRIBUTED=true`, hostfile at `~/.olmlx/hostfile.json` with `{"hosts": ["ip1", "ip2"], "model": "hf-path"}`.
+- **Speculative prefetch** (experimental): Predicts and pre-loads neuron weights from SSD before they're needed, hiding I/O latency during Flash inference. Three paths:
+  - **Path A — Cross-layer**: While layer L computes, predicts layer L+1's active neurons using L's pre-MLP hidden state and starts background SSD reads. Optional `LookaheadBank` provides dedicated cross-layer predictors (trained with `OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true` during preparation); falls back to reusing layer L+1's sparsity predictor.
+  - **Path B — Draft-informed**: During speculative decoding, captures the draft model's hidden states (pre-lm_head, via `draft.model()` + `draft.lm_head()`) and submits bulk prefetch for all target layers before verification. Maps draft positions to target layers by depth ratio so early/deep layers get appropriate signals. Deduplicates predictor calls when multiple layers share the same draft position.
+  - **Prefetcher** (`prefetch.py`): Owns a dedicated `ThreadPoolExecutor` (default 16 threads) separate from the weight store's I/O pool. Prediction runs synchronously on the calling thread (MLX `mx.eval` deadlocks under concurrent multi-thread use); only I/O is async. `PrefetchStats` tracks submitted/hits/misses/failures. Lifecycle: prefetcher must be closed before weight store on model unload (prefetcher tasks submit into the weight store's pool).
+  - Config: `OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true`. Also controls whether `olmlx flash prepare` trains lookahead predictors. Tuning: `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_CONFIDENCE_THRESHOLD` (default 0.3), `_MIN_NEURONS` (64), `_MAX_NEURONS`, `_IO_THREADS` (16).
 
 ## Development
 
