@@ -6,12 +6,15 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.104",
     "uvicorn[standard]>=0.24",
-    "mlx-lm>=0.20",
+    "mlx-lm>=0.31.1",
     "huggingface-hub>=0.20",
     "jinja2>=3.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
-    "mlx-vlm>=0.3.12",
+    "mlx-vlm>=0.4.3",
+    # Pinned <5.5: AutoProcessor in 5.5.0 fails for gemma4 quantized models
+    # that lack preprocessor_config.json (mlx-community repos).
+    "transformers>=5.1.0,<5.5",
     "torch>=2.10.0",
     "torchvision>=0.25.0",
     "mcp>=1.0",

@@ -474,6 +474,8 @@ class TestMakeTurboQuantCache:
 
         model = MagicMock()
         layer = MagicMock()
+        layer.self_attn = MagicMock(spec=[])
+        layer.self_attn.k_proj = MagicMock()
         # k_proj output dim = num_kv_heads * head_dim = 4 * 64 = 256
         layer.self_attn.k_proj.weight = mx.zeros((256, 512))
         model.layers = [layer]
@@ -726,3 +728,42 @@ class TestDiskCacheGuard:
 
         cache = [KVCache()]
         assert _is_serializable_cache(cache)
+
+
+class TestDetectHeadDim:
+    """Tests for _detect_head_dim fallback to model.config."""
+
+    def test_from_args(self):
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.turboquant_cache import _detect_head_dim
+
+        model = MagicMock(spec=[])
+        model.args = MagicMock(spec=[])
+        model.args.head_dim = 128
+        assert _detect_head_dim(model) == 128
+
+    def test_from_config(self):
+        """Falls back to model.config when model.args is missing."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.turboquant_cache import _detect_head_dim
+
+        model = MagicMock(spec=[])
+        model.config = MagicMock(spec=[])
+        model.config.head_dim = 256
+        assert _detect_head_dim(model) == 256
+
+    def test_from_config_hidden_size_fallback(self):
+        """Falls back to hidden_size // num_attention_heads via config."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.turboquant_cache import _detect_head_dim
+
+        model = MagicMock(spec=[])
+        model.config = MagicMock(spec=[])
+        model.config.hidden_size = 4096
+        model.config.num_attention_heads = 32
+        del model.config.head_dim
+        # No layers for k_proj fallback
+        assert _detect_head_dim(model) == 128

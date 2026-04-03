@@ -620,6 +620,52 @@ class TestParseModelOutput:
         assert visible == ""
         assert tools == []
 
+    def test_gemma4_channel_thinking(self):
+        """Gemma4 uses <|channel>thought\\n...<channel|> for thinking blocks."""
+        text = "<|channel>thought\nLet me think about this.\n<channel|>Hello!"
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert thinking == "Let me think about this."
+        assert visible == "Hello!"
+        assert tools == []
+
+    def test_gemma4_empty_thought_channel(self):
+        """Gemma4 empty thought channel (enable_thinking=False)."""
+        text = "<|channel>thought\n<channel|>Hello! How can I help?"
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert thinking == ""
+        assert visible == "Hello! How can I help?"
+        assert tools == []
+
+    def test_gemma4_channel_with_tool_call(self):
+        """Gemma4 thinking channel followed by tool call."""
+        text = (
+            "<|channel>thought\nI should search.\n<channel|>"
+            '<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>'
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert thinking == "I should search."
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
+
+    def test_gemma4_tool_call(self):
+        """Parse gemma4 <|tool_call>call:Name{...}<tool_call|> format."""
+        text = (
+            "<|channel>thought\nI should search.\n<channel|>"
+            '<|tool_call>call:Grep{pattern:<|"|>EXPERIMENTAL<|"|>}<tool_call|>'
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert thinking == "I should search."
+        assert len(tools) == 1
+        assert tools[0]["name"] == "Grep"
+        assert tools[0]["input"] == {"pattern": "EXPERIMENTAL"}
+
+    def test_gemma4_tool_call_multiple_params(self):
+        text = '<|tool_call>call:Read{path:<|"|>/tmp/foo.txt<|"|>,offset:<|"|>10<|"|>}<tool_call|>'
+        _, _, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "Read"
+        assert tools[0]["input"]["path"] == "/tmp/foo.txt"
+
     def test_whitespace_stripping(self):
         thinking, visible, tools = parse_model_output("  hello  ", has_tools=False)
         assert visible == "hello"
