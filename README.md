@@ -35,17 +35,23 @@ The server starts on `http://localhost:11434` — the same default port as Ollam
 ## CLI
 
 ```bash
-olmlx                      # Start the server (default)
-olmlx serve                # Start the server (explicit)
-olmlx chat <model>         # Interactive terminal chat with MCP tool support
-olmlx models list          # List locally downloaded models
-olmlx models pull <name>   # Download a model
-olmlx models show <name>   # Show model details
-olmlx models delete <name> # Delete a local model
-olmlx config show          # Show current configuration
-olmlx service install      # Install as launchd service
-olmlx service status       # Check service status
-olmlx service uninstall    # Remove the service
+olmlx                        # Start the server (default)
+olmlx serve                  # Start the server (explicit)
+olmlx chat <model>           # Interactive terminal chat with MCP tool support
+olmlx models list            # List locally downloaded models
+olmlx models pull <name>     # Download a model
+olmlx models show <name>     # Show model details
+olmlx models delete <name>   # Delete a local model
+olmlx models search <query>  # Search for models by name (fuzzy matching)
+olmlx flash prepare <model>  # Prepare a model for flash inference
+olmlx flash info <model>     # Show flash preparation status
+olmlx bench run [--model M]  # Run benchmark scenarios
+olmlx bench compare <a> <b>  # Compare two benchmark runs
+olmlx bench list             # List past benchmark runs
+olmlx config show            # Show current configuration
+olmlx service install        # Install as launchd service
+olmlx service status         # Check service status
+olmlx service uninstall      # Remove the service
 ```
 
 ## Terminal Chat
@@ -321,7 +327,36 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) |
 | `OLMLX_PROMPT_CACHE` | `true` | Enable KV cache reuse across requests for faster inference |
 | `OLMLX_PROMPT_CACHE_MAX_TOKENS` | `32768` | Invalidate the KV cache after a conversation exceeds this many tokens. Use a very large value to effectively disable |
+| `OLMLX_MAX_TOKENS_LIMIT` | `131072` | Maximum tokens allowed per request |
 | `OLMLX_CORS_ORIGINS` | `http://localhost:*`, `http://127.0.0.1:*` | Allowed CORS origins |
+
+### Flash inference settings (experimental)
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLMLX_EXPERIMENTAL_FLASH` | `false` | Enable LLM in a Flash inference |
+| `OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD` | `0.5` | Activation sparsity threshold (0-1] |
+| `OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS` | `128` | Minimum active neurons per layer |
+| `OLMLX_EXPERIMENTAL_FLASH_IO_THREADS` | `32` | I/O threads for SSD weight loading |
+| `OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS` | `1024` | Budget for cached neurons in memory |
+| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE` | `false` | Enable speculative decoding with draft model |
+| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL` | `None` | Draft model name or HuggingFace path |
+| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS` | `4` | Candidate tokens per speculative step |
+| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH` | `false` | Enable speculative neuron prefetching |
+
+### TurboQuant KV cache settings (experimental)
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLMLX_EXPERIMENTAL_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x) or `turboquant:2` (~7.5x) |
+
+### Flash-MoE settings (experimental)
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLMLX_EXPERIMENTAL_FLASH_MOE` | `false` | Enable Flash-MoE expert offloading for MoE models |
+| `OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS` | `48` | Experts cached per layer (LRU eviction) |
+| `OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS` | `32` | I/O threads for expert loading |
 
 ### Distributed inference settings (experimental)
 
@@ -335,6 +370,57 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET` | *(empty)* | Shared secret for worker authentication |
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR` | *(empty)* | Working directory on remote workers |
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON` | `python` | Python command on remote workers |
+
+## LLM in a Flash (Experimental)
+
+Run models larger than available GPU memory by keeping only active neurons in RAM and loading the rest from SSD on demand.
+
+### Setup
+
+```bash
+# 1. Prepare the model (one-time)
+olmlx flash prepare mlx-community/Qwen2.5-32B-Instruct-4bit
+
+# 2. Check preparation status
+olmlx flash info mlx-community/Qwen2.5-32B-Instruct-4bit
+
+# 3. Start with flash enabled
+OLMLX_EXPERIMENTAL_FLASH=true olmlx serve
+```
+
+### Speculative decoding
+
+Combine flash with a small draft model for faster token generation:
+
+```bash
+OLMLX_EXPERIMENTAL_FLASH=true
+OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE=true
+OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit
+```
+
+The draft model generates candidate tokens in-memory, then the flash model verifies them in one pass — producing multiple tokens per SSD read.
+
+### Flash-MoE
+
+For Mixture-of-Experts models (DeepSeek-V3, Kimi-K2.5, Qwen3-Next MoE), Flash-MoE keeps only the router in RAM and loads routed experts from SSD on demand:
+
+```bash
+OLMLX_EXPERIMENTAL_FLASH_MOE=true
+```
+
+### TurboQuant KV cache
+
+Compress the KV cache ~4-8x using TurboQuant quantization, enabling longer context windows:
+
+```bash
+# 4-bit (~3.9x compression)
+OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:4
+
+# 2-bit (~7.5x compression, lower quality)
+OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:2
+```
+
+Note: TurboQuant is incompatible with disk cache offload.
 
 ## Distributed Inference (Experimental)
 
@@ -497,6 +583,7 @@ If the template doesn't support tools, olmlx falls back to injecting tool descri
 | Qwen 2.5/3/3.5 | ✓ | ✓ | ✓ (Qwen 3+) | ✗ |
 | Llama 3.1/3.2 | ✓ | ✓ | ✗ | ✗ |
 | Mistral/Nemo | ✓ | ✓ | ✗ | ✗ |
+| DeepSeek | ✓ | ✓ | ✗ | ✗ |
 | Gemma 2 | ✓ | ✗ | ✗ | ✗ |
 | Phi 3 | ✓ | ✗ | ✗ | ✗ |
 | LLava-based | ✓ | ✗ | ✗ | ✓ |
