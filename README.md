@@ -403,15 +403,15 @@ The draft model generates candidate tokens in-memory, then the flash model verif
 
 ### Flash-MoE
 
-For Mixture-of-Experts models (DeepSeek-V3, Kimi-K2.5, Qwen3-Next MoE), Flash-MoE keeps only the router in RAM and loads routed experts from SSD on demand:
+For Mixture-of-Experts models (DeepSeek-V3, Kimi-K2.5, Qwen3-Next MoE, MiniMax, gpt-oss), Flash-MoE keeps only the router in RAM and loads routed experts from SSD on demand:
 
 ```bash
-OLMLX_EXPERIMENTAL_FLASH_MOE=true
+OLMLX_EXPERIMENTAL_FLASH_MOE=true olmlx serve
 ```
 
 ### TurboQuant KV cache
 
-Compress the KV cache ~4-8x using TurboQuant quantization, enabling longer context windows:
+Compress the KV cache ~4-8x using TurboQuant quantization, enabling longer context windows. Add to your `.env` file:
 
 ```bash
 # 4-bit (~3.9x compression)

@@ -276,7 +276,7 @@ olmlx bench run
 olmlx bench run --model qwen3:8b --scenarios throughput,latency
 
 # Compare two runs (by timestamp or path)
-olmlx bench compare 20260401_120000 20260402_150000
+olmlx bench compare 20260401T120000Z 20260402T150000Z
 
 # List all past runs
 olmlx bench list
@@ -300,7 +300,7 @@ olmlx flash info <model>
 | `--samples` | `256` | Number of calibration samples for activation analysis |
 | `--threshold` | `0.01` | Activation threshold — neurons below this value are considered inactive |
 | `--epochs` | `5` | Predictor training epochs |
-| `--calibration-dataset` | `c4` | Calibration dataset: `c4` (default) or `synthetic` |
+| `--calibration-dataset` | `None` (uses `c4`) | Calibration dataset: `c4` (default) or `synthetic` |
 | `--sensitive-layers` | `0` | Number of last layers to use higher predictor rank (0 = disabled) |
 | `--sensitive-rank-multiplier` | `4` | Rank multiplier for sensitive layers |
 
@@ -1166,9 +1166,6 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE` | int | `5` | SSD window size for activation prediction |
 | `OLMLX_EXPERIMENTAL_FLASH_IO_THREADS` | int | `32` | I/O threads for SSD weight loading |
 | `OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS` | int | `1024` | Budget for cached neurons in memory |
-| `OLMLX_EXPERIMENTAL_FLASH_PREDICTOR_RANK` | int | `128` | Predictor rank at prepare-time |
-| `OLMLX_EXPERIMENTAL_FLASH_PREDICTOR_SENSITIVE_LAYERS` | int | `0` | Number of last layers with higher predictor rank (0 = disabled) |
-| `OLMLX_EXPERIMENTAL_FLASH_PREDICTOR_SENSITIVE_RANK_MULTIPLIER` | int | `4` | Rank multiplier for sensitive layers |
 | `OLMLX_EXPERIMENTAL_FLASH_BYPASS_OS_CACHE` | bool | `false` | Bypass OS page cache for direct SSD I/O |
 | `OLMLX_EXPERIMENTAL_FLASH_PREALLOCATED_BUFFER` | bool | `false` | Preallocate I/O buffer for weight loading |
 | `OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION` | float/None | `None` | Memory budget as fraction of system RAM |
@@ -1514,6 +1511,8 @@ The draft model runs fully in-memory for fast autoregressive generation, while t
 
 **Neuron prefetching** can be enabled alongside speculative decoding — during draft generation, hidden states are captured and used to prefetch target model neurons before verification begins:
 
+Add to your `.env` file or pass as environment variables:
+
 ```bash
 OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true
 OLMLX_EXPERIMENTAL_FLASH_PREFETCH_CONFIDENCE_THRESHOLD=0.3
@@ -1749,6 +1748,8 @@ TurboQuant compresses the KV cache using the TurboQuant_mse algorithm ([arxiv 25
 
 ### Enabling
 
+Add to your `.env` file or pass as environment variables:
+
 ```bash
 # 4-bit quantization (~3.9x compression)
 OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:4
@@ -1803,6 +1804,8 @@ Flash-MoE extends LLM in a Flash to Mixture-of-Experts models by keeping only th
 
 ### Enabling
 
+Add to your `.env` file or pass as environment variables:
+
 ```bash
 OLMLX_EXPERIMENTAL_FLASH_MOE=true
 OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS=48
@@ -1834,7 +1837,7 @@ Token arrives at MoE layer
 
 - **Expert cache**: Thread-safe per-layer LRU with configurable budget (default 48 experts per layer)
 - **Parallel I/O**: Expert weights loaded via parallel `pread()` on a thread pool
-- **Supported architectures**: DeepSeek-V3, Kimi-K2.5, gpt-oss, Qwen3-Next MoE models
+- **Supported architectures**: DeepSeek-V3, Kimi-K2.5, gpt-oss, Qwen3-Next MoE, MiniMax models
 
 ### Configuration
 
@@ -1878,7 +1881,7 @@ Results are saved to `~/.olmlx/bench/runs/` by default.
 
 ```bash
 # Compare two runs by timestamp
-olmlx bench compare 20260401_120000 20260402_150000
+olmlx bench compare 20260401T120000Z 20260402T150000Z
 
 # Compare by path
 olmlx bench compare ~/.olmlx/bench/runs/run1 ~/.olmlx/bench/runs/run2
