@@ -1013,7 +1013,10 @@ class ModelManager:
                         path = hf_hub_download(repo, "chat_template.jinja")
                         tokenizer.chat_template = Path(path).read_text()
                         return
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug(
+                            "chat_template.jinja not found in %s: %s", repo, exc
+                        )
                         continue
                 # Primary repo didn't have it — check base_model from model card
                 try:
@@ -1031,10 +1034,17 @@ class ModelManager:
                                 path = hf_hub_download(candidate, "chat_template.jinja")
                                 tokenizer.chat_template = Path(path).read_text()
                                 return
-                            except Exception:
+                            except Exception as exc:
+                                logger.debug(
+                                    "chat_template.jinja not found in %s: %s",
+                                    candidate,
+                                    exc,
+                                )
                                 continue
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to fetch model info for %s: %s", hf_path, exc
+                    )
             except ImportError:
                 pass
 

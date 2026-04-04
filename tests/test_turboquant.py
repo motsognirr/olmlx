@@ -729,6 +729,21 @@ class TestDiskCacheGuard:
         cache = [KVCache()]
         assert _is_serializable_cache(cache)
 
+    def test_mixed_cache_not_serializable(self):
+        """Mixed KVCache + TurboQuantKVCache list must block disk offload."""
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine.model_manager import _is_serializable_cache
+        from olmlx.engine.turboquant import TurboQuantRotation
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        rot = TurboQuantRotation(head_dim=64, seed=0)
+        cache = [
+            KVCache(),  # fallback layer
+            TurboQuantKVCache(bits=4, rotation_key=rot, rotation_value=rot),
+        ]
+        assert not _is_serializable_cache(cache)
+
 
 class TestDetectHeadDim:
     """Tests for _detect_head_dim fallback to model.config."""

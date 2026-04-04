@@ -12,9 +12,7 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "mlx-vlm>=0.4.3",
-    # Pinned <5.5: AutoProcessor in 5.5.0 fails for gemma4 quantized models
-    # that lack preprocessor_config.json (mlx-community repos).
-    "transformers>=5.1.0,<5.5",
+    "transformers>=5.5.0",
     "torch>=2.10.0",
     "torchvision>=0.25.0",
     "mcp>=1.0",

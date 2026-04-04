@@ -666,6 +666,14 @@ class TestParseModelOutput:
         assert tools[0]["name"] == "Read"
         assert tools[0]["input"]["path"] == "/tmp/foo.txt"
 
+    def test_gemma4_tool_call_nested_object(self):
+        """Nested object args must not lose inner closing braces (rstrip bug)."""
+        text = '<|tool_call>call:Func{data:{nested:<|"|>val<|"|>}}<tool_call|>'
+        _, _, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "Func"
+        assert tools[0]["input"]["data"] == {"nested": "val"}
+
     def test_whitespace_stripping(self):
         thinking, visible, tools = parse_model_output("  hello  ", has_tools=False)
         assert visible == "hello"

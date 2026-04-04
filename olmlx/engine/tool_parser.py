@@ -318,22 +318,14 @@ def _try_gemma4(text: str) -> tuple[list[dict], str]:
             args = {}
         else:
             name = rest[:brace]
-            params_str = rest[brace + 1 :].rstrip("}")
+            # Strip only the outermost closing brace (rfind to preserve nested ones)
+            raw = rest[brace + 1 :]
+            last_brace = raw.rfind("}")
+            params_str = raw[:last_brace] if last_brace >= 0 else raw
             # Parse key:value pairs. Values use <|"|> as string delimiters.
-            args = {}
             # Replace <|"|> delimiters with regular quotes for JSON-like parsing
             params_str = params_str.replace('<|"|>', '"')
-            # Simple key:value parser for the gemma4 format
-            for part in _split_gemma4_params(params_str):
-                colon = part.find(":")
-                if colon > 0:
-                    k = part[:colon].strip()
-                    v = part[colon + 1 :].strip()
-                    # Try to parse value as JSON (handles strings, numbers, etc.)
-                    try:
-                        args[k] = json.loads(v)
-                    except (json.JSONDecodeError, ValueError):
-                        args[k] = v
+            args = _parse_gemma4_params(params_str)
         if name:
             tool_uses.append(
                 {
@@ -345,6 +337,34 @@ def _try_gemma4(text: str) -> tuple[list[dict], str]:
                 }
             )
     return tool_uses, text
+
+
+def _parse_gemma4_value(v: str):
+    """Parse a single gemma4 parameter value, handling nested objects."""
+    v = v.strip()
+    if v.startswith("{"):
+        # Nested object — strip outer braces and recurse
+        inner = v[1:]
+        last = inner.rfind("}")
+        if last >= 0:
+            inner = inner[:last]
+        return _parse_gemma4_params(inner)
+    try:
+        return json.loads(v)
+    except (json.JSONDecodeError, ValueError):
+        return v
+
+
+def _parse_gemma4_params(params_str: str) -> dict:
+    """Parse gemma4 key:value parameter string into a dict."""
+    args = {}
+    for part in _split_gemma4_params(params_str):
+        colon = part.find(":")
+        if colon > 0:
+            k = part[:colon].strip()
+            v = part[colon + 1 :].strip()
+            args[k] = _parse_gemma4_value(v)
+    return args
 
 
 def _split_gemma4_params(s: str) -> list[str]:

@@ -898,13 +898,26 @@ async def generate_completion(
             if system:
                 prompt = f"{system}\n\n{prompt}"
     elif apply_chat_template and lm.is_vlm:
+        messages: list[dict] = []
         if system:
-            prompt = f"{system}\n\n{prompt}"
-            logger.warning(
-                "apply_chat_template not supported for VLM %s; "
-                "system prepended as plain text",
-                model_name,
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        try:
+            prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages)
+            logger.info(
+                "Applied VLM chat template for /api/generate (prompt length: %d chars)",
+                len(prompt),
             )
+            logger.debug("VLM templated prompt: %s", prompt[:500])
+        except Exception as exc:
+            logger.warning(
+                "VLM chat template failed for %s, falling back to raw prompt: %s",
+                model_name,
+                exc,
+                exc_info=True,
+            )
+            if system:
+                prompt = f"{system}\n\n{prompt}"
 
     gen_kwargs = _build_generate_kwargs(options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)

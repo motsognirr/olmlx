@@ -643,11 +643,12 @@ class TestGenerateCompletion:
         assert prompt_arg == "You are helpful\n\nHello"
 
     @pytest.mark.asyncio
-    async def test_apply_chat_template_vlm_skips_text_template(self, mock_manager):
-        """VLM models skip text template — VLM generation handles formatting."""
+    async def test_apply_chat_template_vlm_uses_vlm_template(self, mock_manager):
+        """VLM models apply chat template via _apply_chat_template_vlm."""
         mock_mx = MagicMock()
         mock_mx.core = mock_mx
         mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm formatted prompt"
 
         lm = mock_manager._loaded["qwen3:latest"]
         lm.is_vlm = True
@@ -669,9 +670,45 @@ class TestGenerateCompletion:
 
         # Text template should NOT be applied for VLM models
         lm.text_tokenizer.apply_chat_template.assert_not_called()
-        # Raw prompt should be passed through
+        # VLM template should be applied — prompt should be formatted
+        mock_mlx_vlm.apply_chat_template.assert_called_once()
         prompt_arg = mock_full.call_args[0][1]
-        assert prompt_arg == "Hello"
+        assert prompt_arg == "vlm formatted prompt"
+
+    @pytest.mark.asyncio
+    async def test_apply_chat_template_vlm_with_system(self, mock_manager):
+        """VLM models include system message in chat template."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm with system"
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference._full_completion",
+                    new_callable=AsyncMock,
+                ) as mock_full:
+                    mock_full.return_value = {"text": "Hi", "done": True}
+                    await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=True,
+                        system="You are helpful",
+                    )
+
+        # Check messages passed to apply_chat_template include system
+        call_args = mock_mlx_vlm.apply_chat_template.call_args
+        messages = call_args[0][2]  # 3rd positional arg
+        assert messages[0] == {"role": "system", "content": "You are helpful"}
+        assert messages[1] == {"role": "user", "content": "Hello"}
+        prompt_arg = mock_full.call_args[0][1]
+        assert prompt_arg == "vlm with system"
 
     @pytest.mark.asyncio
     async def test_streaming(self, mock_manager):
