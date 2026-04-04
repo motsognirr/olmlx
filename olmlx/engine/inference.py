@@ -765,15 +765,19 @@ def _apply_chat_template_vlm(
     model: Any,
     messages: list[dict],
     images: list[str] | None = None,
+    tools: list[dict] | None = None,
 ) -> str:
     """Apply chat template for vision-language models (mlx-vlm)."""
     import mlx_vlm
 
     config = model.config if hasattr(model, "config") else {}
     num_images = len(images) if images else 0
+    kwargs: dict = {}
+    if tools:
+        kwargs["tools"] = tools
     # Pass the full message list so the model gets proper conversation context
     return mlx_vlm.apply_chat_template(
-        processor, config, messages, num_images=num_images
+        processor, config, messages, num_images=num_images, **kwargs
     )
 
 
@@ -1641,23 +1645,33 @@ async def generate_chat(
     images = _extract_images(messages)
 
     if lm.is_vlm:
-        # VLM models must use the VLM generation path — text template
-        # formatting produces garbage through mlx_vlm.stream_generate
-        # because mlx_vlm re-tokenizes the prompt string and may not
-        # correctly parse special token text back into proper token IDs.
-        # Inject tool definitions into messages as a system message.
-        vlm_messages = messages
-        if tools:
+        # VLM models must use the VLM generation path for tokenization.
+        # Pass tools natively through the template when supported — this
+        # produces model-native formatting (e.g. <|tool> tags for Gemma 4)
+        # which is far more effective than injecting JSON into the system
+        # message.  Fall back to system-message injection for models whose
+        # template lacks tool support.
+        caps = lm.template_caps or TemplateCaps()
+        if tools and caps.supports_tools:
+            prompt = _apply_chat_template_vlm(
+                lm.tokenizer, lm.model, messages, images, tools=tools
+            )
+            logger.info("VLM chat prompt with %d tools (native template)", len(tools))
+        elif tools:
             vlm_messages = _inject_tools_into_system(list(messages), tools)
+            prompt = _apply_chat_template_vlm(
+                lm.tokenizer, lm.model, vlm_messages, images
+            )
             logger.info(
                 "VLM chat prompt with %d tools (injected into system)", len(tools)
             )
+        else:
+            prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages, images)
         if enable_thinking is not None:
             logger.debug(
                 "enable_thinking=%s ignored for VLM model (not supported by mlx-vlm template)",
                 enable_thinking,
             )
-        prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, vlm_messages, images)
     else:
         prompt = _apply_chat_template_text(
             lm.text_tokenizer,

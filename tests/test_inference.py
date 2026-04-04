@@ -1068,18 +1068,59 @@ class TestGenerateChatVlm:
         assert result["text"] == "vlm response"
 
     @pytest.mark.asyncio
-    async def test_vlm_with_tools_always_injects_into_system(self, mock_manager):
-        """VLM+tools always injects into system message (even with native tool support).
-
-        The text template path produces garbled output through mlx_vlm because
-        mlx_vlm re-tokenizes the prompt string and can't correctly parse special
-        token text back into proper token IDs.
-        """
+    async def test_vlm_with_tools_native_support(self, mock_manager):
+        """VLM+tools passes tools natively through VLM template when supported."""
         lm = mock_manager._loaded["qwen3:latest"]
         lm.is_vlm = True
-        # Even with native tool support, VLM should use injection
         lm.template_caps = TemplateCaps(
             supports_tools=True, supports_enable_thinking=True
+        )
+
+        mock_mx = MagicMock()
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt with native tools"
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search",
+                    "parameters": {},
+                },
+            }
+        ]
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                ) as mock_thread:
+                    mock_thread.return_value = "tool response"
+                    result = await generate_chat(
+                        mock_manager,
+                        "qwen3",
+                        [{"role": "user", "content": "search"}],
+                        tools=tools,
+                        stream=False,
+                    )
+
+        # Should pass tools as kwarg to mlx_vlm.apply_chat_template (native)
+        vlm_call_args = mock_mlx_vlm.apply_chat_template.call_args
+        assert vlm_call_args.kwargs.get("tools") == tools
+        # Messages should NOT have injected system message
+        messages_passed = vlm_call_args[0][2]  # 3rd positional arg = messages
+        assert messages_passed[0]["role"] == "user"
+        assert result["text"] == "tool response"
+
+    @pytest.mark.asyncio
+    async def test_vlm_with_tools_no_native_support_injects(self, mock_manager):
+        """VLM+tools injects into system message when caps.supports_tools is False."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        lm.template_caps = TemplateCaps(
+            supports_tools=False, supports_enable_thinking=False
         )
 
         mock_mx = MagicMock()
