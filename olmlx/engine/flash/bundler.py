@@ -130,8 +130,9 @@ def _find_ffn_weights(
         try:
             tensors = mx.load(str(sf_path))
         except (ValueError, RuntimeError) as exc:
-            logger.warning("Failed to load %s, skipping: %s", sf_path.name, exc)
-            continue
+            raise RuntimeError(
+                f"Failed to load {sf_path.name} during flash bundling: {exc}"
+            ) from exc
         for name, arr in tensors.items():
             m = pattern.match(name)
             if m:

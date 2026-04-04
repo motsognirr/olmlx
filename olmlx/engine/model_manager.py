@@ -1170,10 +1170,8 @@ class ModelManager:
                 "Loading draft model %s for speculative decoding",
                 experimental.flash_speculative_draft_model,
             )
-            import mlx_lm
-
-            draft_model, draft_tokenizer = mlx_lm.load(
-                experimental.flash_speculative_draft_model
+            draft_model, draft_tokenizer = load_model_with_strict_fallback(
+                experimental.flash_speculative_draft_model, lazy=False
             )
 
             # Verify vocabulary compatibility — a mismatch causes silent token ID errors

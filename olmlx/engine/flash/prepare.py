@@ -30,8 +30,24 @@ from olmlx.engine.flash.predictor import (
 
 logger = logging.getLogger(__name__)
 
-# Error substring used by mlx-lm when safetensors contain keys not in the model
+# Error substring used by mlx-lm when safetensors contain keys not in the model.
+# This is a fragile contract with mlx-lm internals — if the error wording changes,
+# VL model loading will fall through to the mlx_vlm fallback instead of using
+# strict=False, which still works but loads as a vision model unnecessarily.
 _STRICT_LOAD_ERROR = "parameters not in model"
+
+
+def _get_backbone(model: nn.Module) -> nn.Module:
+    """Navigate to the transformer backbone that has .layers and .embed_tokens.
+
+    Handles both standard models (Model.model = backbone) and VL models
+    (Model.language_model.model = backbone).
+    """
+    inner = model.model if hasattr(model, "model") else model
+    lm = getattr(inner, "language_model", None)
+    if lm is not None:
+        inner = getattr(lm, "model", lm)
+    return inner
 
 
 def load_model_with_strict_fallback(model_path: str, *, lazy: bool) -> tuple:
@@ -55,7 +71,13 @@ def load_model_with_strict_fallback(model_path: str, *, lazy: bool) -> tuple:
         )
         model_dir = Path(model_path)
         model, config = mlx_lm.utils.load_model(model_dir, lazy=lazy, strict=False)
-        eos = config.get("eos_token_id")
+        # config may be a dict or a dataclass depending on mlx-lm version
+        eos = (
+            config.get("eos_token_id")
+            if isinstance(config, dict)
+            else getattr(config, "eos_token_id", None)
+        )
+        # None is intentionally passed through to let mlx-lm use the tokenizer default
         tokenizer = mlx_lm.utils.load_tokenizer(
             model_dir, eos_token_ids=[eos] if isinstance(eos, int) else eos
         )
@@ -350,13 +372,7 @@ def _stream_record_activations(
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
 
-    # Access inner model (mlx-lm wraps: Model.model = LlamaModel/Qwen3Model/etc.)
-    # VL models (e.g. Qwen3.5) lack .model but have language_model.model;
-    # navigate to the backbone that has both .layers and .embed_tokens.
-    inner = model.model if hasattr(model, "model") else model
-    lm = getattr(inner, "language_model", None)
-    if lm is not None:
-        inner = getattr(lm, "model", lm)
+    inner = _get_backbone(model)
     layers = inner.layers
     num_layers = len(layers)
 
@@ -403,7 +419,9 @@ def _stream_record_activations(
     _nullify_module_params(embed)
     # Free LM head and final norm — not needed for layer-by-layer streaming
     for attr in ("lm_head", "norm", "output"):
-        submod = getattr(inner, attr, None) or getattr(model, attr, None)
+        submod = getattr(inner, attr, None)
+        if submod is None:
+            submod = getattr(model, attr, None)
         if submod is not None and isinstance(submod, nn.Module):
             _nullify_module_params(submod)
     gc.collect()
