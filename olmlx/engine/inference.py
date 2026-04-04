@@ -378,15 +378,20 @@ def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
     if num_tokens <= 0:
         return 0
     # mlx-lm text models: model.args
-    # mlx-vlm vision-language models: model.language_model.args
+    # mlx-vlm vision-language models: model.language_model.args or .config
     args = getattr(model, "args", None)
     if args is None:
         lang_model = getattr(model, "language_model", None)
         if lang_model is not None:
-            args = getattr(lang_model, "args", None)
+            args = getattr(lang_model, "args", None) or getattr(
+                lang_model, "config", None
+            )
+    if args is None:
+        args = getattr(model, "config", None)
     if args is None:
         raise AttributeError(
-            "Model has no 'args' attribute (checked model.args and model.language_model.args)"
+            "Model has no 'args' attribute (checked model.args, "
+            "model.language_model.args/config, model.config)"
         )
     num_heads = args.num_attention_heads
     head_dim = (
@@ -893,13 +898,26 @@ async def generate_completion(
             if system:
                 prompt = f"{system}\n\n{prompt}"
     elif apply_chat_template and lm.is_vlm:
+        messages: list[dict] = []
         if system:
-            prompt = f"{system}\n\n{prompt}"
-            logger.warning(
-                "apply_chat_template not supported for VLM %s; "
-                "system prepended as plain text",
-                model_name,
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        try:
+            prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages)
+            logger.info(
+                "Applied VLM chat template for /api/generate (prompt length: %d chars)",
+                len(prompt),
             )
+            logger.debug("VLM templated prompt: %s", prompt[:500])
+        except Exception as exc:
+            logger.warning(
+                "VLM chat template failed for %s, falling back to raw prompt: %s",
+                model_name,
+                exc,
+                exc_info=True,
+            )
+            if system:
+                prompt = f"{system}\n\n{prompt}"
 
     gen_kwargs = _build_generate_kwargs(options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
@@ -1615,37 +1633,23 @@ async def generate_chat(
 
     images = _extract_images(messages)
 
-    if lm.is_vlm and not tools:
-        # VLM template doesn't support enable_thinking. When the user
-        # explicitly sets it, there are no images, and the text template
-        # supports it, fall back to the text template path so thinking
-        # can be controlled. Images require the VLM template.
-        # Note: the text template prompt is tokenized by lm.tokenizer
-        # (VLM processor) during generation. This works for Qwen models
-        # where text and VLM tokenizers share the same vocabulary.
-        if (
-            enable_thinking is not None
-            and not images
-            and lm.template_caps
-            and lm.template_caps.supports_enable_thinking
-        ):
-            prompt = _apply_chat_template_text(
-                lm.text_tokenizer,
-                messages,
-                tools,
-                caps=lm.template_caps,
-                enable_thinking=enable_thinking,
+    if lm.is_vlm:
+        # VLM models must use the VLM generation path — text template
+        # formatting produces garbage through mlx_vlm.stream_generate.
+        # Inject tool definitions into messages as a system message.
+        vlm_messages = messages
+        if tools:
+            vlm_messages = _inject_tools_into_system(list(messages), tools)
+            logger.info(
+                "VLM chat prompt with %d tools (injected into system)", len(tools)
             )
-        else:
-            if enable_thinking is not None:
-                logger.warning(
-                    "enable_thinking=%s ignored for VLM model (not supported by mlx-vlm template)",
-                    enable_thinking,
-                )
-            prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages, images)
+        if enable_thinking is not None:
+            logger.debug(
+                "enable_thinking=%s ignored for VLM model (not supported by mlx-vlm template)",
+                enable_thinking,
+            )
+        prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, vlm_messages, images)
     else:
-        # Use text template path when tools are needed, even for VLM-loaded models,
-        # because _apply_chat_template_vlm doesn't support tool definitions.
         prompt = _apply_chat_template_text(
             lm.text_tokenizer,
             messages,

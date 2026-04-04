@@ -347,6 +347,262 @@ class TestLoadModel:
 
         assert is_vlm is True
 
+    def test_load_vlm_loads_chat_template_from_jinja_file(self, registry, mock_store):
+        """When VLM tokenizer has no chat_template, load from chat_template.jinja."""
+        manager = self._make_manager(registry, mock_store)
+        local_dir = mock_store.local_path("test/vlm")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}")
+        template = (
+            "{% if tools %}tools{% endif %}{% if enable_thinking %}<think>{% endif %}"
+        )
+        (local_dir / "chat_template.jinja").write_text(template)
+
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+        mock_tok = MagicMock()
+        mock_tok.chat_template = None
+        mock_processor.tokenizer = mock_tok
+
+        with patch.object(manager, "_detect_model_kind", return_value="vlm"):
+            mock_mlx_vlm = MagicMock()
+            mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                _, _, is_vlm, caps, _ = manager._load_model("test/vlm")
+
+        assert is_vlm is True
+        assert mock_tok.chat_template == template
+        assert caps.supports_tools is True
+        assert caps.supports_enable_thinking is True
+
+    def test_load_vlm_loads_chat_template_from_json_file(self, registry, mock_store):
+        """When VLM tokenizer has no chat_template, load from chat_template.json."""
+        manager = self._make_manager(registry, mock_store)
+        local_dir = mock_store.local_path("test/vlm")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}")
+        template = "{% if tools %}tools{% endif %}"
+        (local_dir / "chat_template.json").write_text(
+            json.dumps({"chat_template": template})
+        )
+
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+        mock_tok = MagicMock()
+        mock_tok.chat_template = None
+        mock_processor.tokenizer = mock_tok
+
+        with patch.object(manager, "_detect_model_kind", return_value="vlm"):
+            mock_mlx_vlm = MagicMock()
+            mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                _, _, is_vlm, caps, _ = manager._load_model("test/vlm")
+
+        assert is_vlm is True
+        assert mock_tok.chat_template == template
+        assert caps.supports_tools is True
+
+    def test_load_vlm_falls_back_on_oserror(self, registry, mock_store):
+        """When mlx_vlm.load fails with OSError, fall back to _try_lm_then_vlm."""
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/vlm")
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        with patch.object(manager, "_detect_model_kind", return_value="vlm"):
+            mock_mlx_vlm = MagicMock()
+            mock_mlx_vlm.load.side_effect = OSError("preprocessor_config.json")
+            mock_mlx_lm = MagicMock()
+            mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
+            with patch.dict(
+                "sys.modules", {"mlx_vlm": mock_mlx_vlm, "mlx_lm": mock_mlx_lm}
+            ):
+                model, tokenizer, is_vlm, caps, _ = manager._load_model("test/vlm")
+
+        # Should have fallen back to mlx-lm (not VLM)
+        assert is_vlm is False
+        assert model is mock_model
+
+    def test_load_vlm_skips_chat_template_when_already_set(self, registry, mock_store):
+        """When VLM tokenizer already has chat_template, don't overwrite."""
+        manager = self._make_manager(registry, mock_store)
+        local_dir = mock_store.local_path("test/vlm")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}")
+        (local_dir / "chat_template.jinja").write_text("file template")
+
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+        mock_tok = MagicMock()
+        mock_tok.chat_template = "existing template"
+        mock_processor.tokenizer = mock_tok
+
+        with patch.object(manager, "_detect_model_kind", return_value="vlm"):
+            mock_mlx_vlm = MagicMock()
+            mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                _, _, _, _, _ = manager._load_model("test/vlm")
+
+        assert mock_tok.chat_template == "existing template"
+
+    def test_load_fallback_loads_chat_template_from_jinja_file(
+        self, registry, mock_store
+    ):
+        """When fallback to VLM and tokenizer has no chat_template, load from file."""
+        manager = self._make_manager(registry, mock_store)
+        local_dir = mock_store.local_path("test/path")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}")
+        template = "{% if tools %}tools{% endif %}"
+        (local_dir / "chat_template.jinja").write_text(template)
+
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+        mock_tok = MagicMock()
+        mock_tok.chat_template = None
+        mock_processor.tokenizer = mock_tok
+
+        with patch.object(manager, "_detect_model_kind", return_value="unknown"):
+            mock_mlx_lm = MagicMock()
+            mock_mlx_lm.load.side_effect = ValueError("fail")
+            mock_mlx_vlm = MagicMock()
+            mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
+            with patch.dict(
+                "sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}
+            ):
+                _, _, is_vlm, caps, _ = manager._load_model("test/path")
+
+        assert is_vlm is True
+        assert mock_tok.chat_template == template
+        assert caps.supports_tools is True
+
+    def test_load_vlm_downloads_chat_template_from_hub(self, registry, mock_store):
+        """When chat_template.jinja not local, try downloading from HF hub."""
+        manager = self._make_manager(registry, mock_store)
+        local_dir = mock_store.local_path("test/vlm")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}")
+        # No chat_template files locally
+
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+        mock_tok = MagicMock()
+        mock_tok.chat_template = None
+        mock_processor.tokenizer = mock_tok
+
+        template = "{% if tools %}tools{% endif %}"
+        # Write the downloaded file to a temp location
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jinja", delete=False) as f:
+            f.write(template)
+            downloaded_path = f.name
+
+        mock_hf_mod = MagicMock()
+        mock_hf_mod.hf_hub_download.return_value = downloaded_path
+
+        with patch.object(manager, "_detect_model_kind", return_value="vlm"):
+            mock_mlx_vlm = MagicMock()
+            mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
+            with patch.dict(
+                "sys.modules",
+                {"mlx_vlm": mock_mlx_vlm, "huggingface_hub": mock_hf_mod},
+            ):
+                _, _, is_vlm, caps, _ = manager._load_model("test/vlm")
+
+        assert is_vlm is True
+        assert mock_tok.chat_template == template
+        assert caps.supports_tools is True
+        mock_hf_mod.hf_hub_download.assert_called_once_with(
+            "test/vlm", "chat_template.jinja"
+        )
+
+        Path(downloaded_path).unlink(missing_ok=True)
+
+    def test_load_vlm_falls_back_to_base_model_for_chat_template(
+        self, registry, mock_store
+    ):
+        """When primary repo lacks chat_template, try base_model from HF card."""
+        manager = self._make_manager(registry, mock_store)
+        local_dir = mock_store.local_path("test/vlm")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}")
+
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+        mock_tok = MagicMock()
+        mock_tok.chat_template = None
+        mock_processor.tokenizer = mock_tok
+
+        template = "{% if tools %}tools{% endif %}"
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jinja", delete=False) as f:
+            f.write(template)
+            downloaded_path = f.name
+
+        # test/vlm fails, google/base-model fails, google/base-model-it succeeds
+        mock_hf_mod = MagicMock()
+        mock_hf_mod.hf_hub_download.side_effect = [
+            Exception("404"),  # test/vlm
+            Exception("404"),  # google/base-model
+            downloaded_path,  # google/base-model-it
+        ]
+        mock_card_data = MagicMock()
+        mock_card_data.base_model = "google/base-model"
+        mock_info = MagicMock()
+        mock_info.card_data = mock_card_data
+        mock_hf_mod.model_info.return_value = mock_info
+
+        with patch.object(manager, "_detect_model_kind", return_value="vlm"):
+            mock_mlx_vlm = MagicMock()
+            mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
+            with patch.dict(
+                "sys.modules",
+                {"mlx_vlm": mock_mlx_vlm, "huggingface_hub": mock_hf_mod},
+            ):
+                _, _, is_vlm, caps, _ = manager._load_model("test/vlm")
+
+        assert is_vlm is True
+        assert mock_tok.chat_template == template
+        assert caps.supports_tools is True
+        # Should have tried base_model-it
+        mock_hf_mod.hf_hub_download.assert_any_call(
+            "google/base-model-it", "chat_template.jinja"
+        )
+
+        Path(downloaded_path).unlink(missing_ok=True)
+
+    def test_load_vlm_hub_download_fails_gracefully(self, registry, mock_store):
+        """When all HF hub attempts fail, caps remain empty but loading succeeds."""
+        manager = self._make_manager(registry, mock_store)
+        local_dir = mock_store.local_path("test/vlm")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}")
+
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+        mock_tok = MagicMock()
+        mock_tok.chat_template = None
+        mock_processor.tokenizer = mock_tok
+
+        mock_hf_mod = MagicMock()
+        mock_hf_mod.hf_hub_download.side_effect = Exception("network error")
+        mock_hf_mod.model_info.side_effect = Exception("network error")
+
+        with patch.object(manager, "_detect_model_kind", return_value="vlm"):
+            mock_mlx_vlm = MagicMock()
+            mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
+            with patch.dict(
+                "sys.modules",
+                {"mlx_vlm": mock_mlx_vlm, "huggingface_hub": mock_hf_mod},
+            ):
+                _, _, is_vlm, caps, _ = manager._load_model("test/vlm")
+
+        assert is_vlm is True
+        assert caps.supports_tools is False
+
     def test_load_text_fallback_to_vlm(self, registry, mock_store):
         manager = self._make_manager(registry, mock_store)
         self._pre_download(mock_store, "test/path")
@@ -1538,3 +1794,25 @@ class TestEnsureLoadedNotFoundSuggestions:
             await manager.ensure_loaded("qwem3")  # typo for qwen3
         # Should mention the similar model
         assert "qwen3:latest" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_not_found_does_not_evict_loaded_model(
+        self, registry, mock_store, monkeypatch
+    ):
+        """Requesting a non-existent model must not evict already-loaded models."""
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+        manager = ModelManager(registry, mock_store)
+
+        existing = LoadedModel(
+            name="qwen3:latest",
+            hf_path="Qwen/Qwen3-8B",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        manager._loaded["qwen3:latest"] = existing
+
+        with pytest.raises(ValueError, match="not found"):
+            await manager.ensure_loaded("claude-haiku-4-5-20251001")
+
+        # The existing model must still be loaded
+        assert "qwen3:latest" in manager._loaded

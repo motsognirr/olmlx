@@ -308,7 +308,18 @@ def _stream_record_activations(
     if progress_callback:
         progress_callback("Loading model skeleton", 0.0)
 
-    model, tokenizer = mlx_lm.load(model_path, lazy=True)
+    try:
+        model, tokenizer = mlx_lm.load(model_path, lazy=True)
+    except ValueError:
+        # mlx_lm doesn't support this model type (e.g. gemma4 VLM) —
+        # fall back to mlx_vlm and extract the language model.
+        import mlx_vlm
+
+        vlm_model, processor = mlx_vlm.load(model_path, lazy=True)
+        model = vlm_model.language_model
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
 
     # Access inner model (mlx-lm wraps: Model.model = LlamaModel/Qwen3Model/etc.)
     inner = model.model if hasattr(model, "model") else model

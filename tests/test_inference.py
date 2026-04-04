@@ -643,6 +643,74 @@ class TestGenerateCompletion:
         assert prompt_arg == "You are helpful\n\nHello"
 
     @pytest.mark.asyncio
+    async def test_apply_chat_template_vlm_uses_vlm_template(self, mock_manager):
+        """VLM models apply chat template via _apply_chat_template_vlm."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm formatted prompt"
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference._full_completion",
+                    new_callable=AsyncMock,
+                ) as mock_full:
+                    mock_full.return_value = {"text": "Hi", "done": True}
+                    await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=True,
+                    )
+
+        # Text template should NOT be applied for VLM models
+        lm.text_tokenizer.apply_chat_template.assert_not_called()
+        # VLM template should be applied — prompt should be formatted
+        mock_mlx_vlm.apply_chat_template.assert_called_once()
+        prompt_arg = mock_full.call_args[0][1]
+        assert prompt_arg == "vlm formatted prompt"
+
+    @pytest.mark.asyncio
+    async def test_apply_chat_template_vlm_with_system(self, mock_manager):
+        """VLM models include system message in chat template."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm with system"
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference._full_completion",
+                    new_callable=AsyncMock,
+                ) as mock_full:
+                    mock_full.return_value = {"text": "Hi", "done": True}
+                    await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=True,
+                        system="You are helpful",
+                    )
+
+        # Check messages passed to apply_chat_template include system
+        call_args = mock_mlx_vlm.apply_chat_template.call_args
+        messages = call_args[0][2]  # 3rd positional arg
+        assert messages[0] == {"role": "system", "content": "You are helpful"}
+        assert messages[1] == {"role": "user", "content": "Hello"}
+        prompt_arg = mock_full.call_args[0][1]
+        assert prompt_arg == "vlm with system"
+
+    @pytest.mark.asyncio
     async def test_streaming(self, mock_manager):
         mock_mx = MagicMock()
 
@@ -896,8 +964,8 @@ class TestFullCompletionInner:
 
 class TestGenerateChatVlm:
     @pytest.mark.asyncio
-    async def test_vlm_enable_thinking_uses_text_template(self, mock_manager):
-        """VLM path uses text template when enable_thinking is set and supported."""
+    async def test_vlm_always_uses_vlm_template(self, mock_manager):
+        """VLM models always use VLM template path, even with enable_thinking."""
         lm = mock_manager._loaded["qwen3:latest"]
         lm.is_vlm = True
         lm.template_caps = TemplateCaps(
@@ -905,29 +973,30 @@ class TestGenerateChatVlm:
         )
 
         mock_mx = MagicMock()
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
 
         with patch("olmlx.engine.inference.mx", mock_mx):
-            with patch(
-                "olmlx.engine.inference._apply_chat_template_text",
-                return_value="text prompt",
-            ) as mock_text_tpl:
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
                 with patch(
-                    "olmlx.engine.inference.asyncio.to_thread",
-                    new_callable=AsyncMock,
-                ) as mock_thread:
-                    mock_thread.return_value = "response"
-                    await generate_chat(
-                        mock_manager,
-                        "qwen3",
-                        [{"role": "user", "content": "describe"}],
-                        stream=False,
-                        enable_thinking=False,
-                    )
+                    "olmlx.engine.inference._apply_chat_template_text",
+                ) as mock_text_tpl:
+                    with patch(
+                        "olmlx.engine.inference.asyncio.to_thread",
+                        new_callable=AsyncMock,
+                    ) as mock_thread:
+                        mock_thread.return_value = "response"
+                        await generate_chat(
+                            mock_manager,
+                            "qwen3",
+                            [{"role": "user", "content": "describe"}],
+                            stream=False,
+                            enable_thinking=False,
+                        )
 
-        # Should have used text template path (not VLM template)
-        mock_text_tpl.assert_called_once()
-        call_kwargs = mock_text_tpl.call_args
-        assert call_kwargs.kwargs.get("enable_thinking") is False
+        # VLM should use VLM template, not text template
+        mock_text_tpl.assert_not_called()
+        mock_mlx_vlm.apply_chat_template.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_vlm_enable_thinking_warns_when_unsupported(
@@ -953,7 +1022,7 @@ class TestGenerateChatVlm:
                 ) as mock_thread:
                     mock_thread.return_value = "vlm response"
                     with caplog.at_level(
-                        logging.WARNING, logger="olmlx.engine.inference"
+                        logging.DEBUG, logger="olmlx.engine.inference"
                     ):
                         await generate_chat(
                             mock_manager,
@@ -1663,10 +1732,23 @@ class TestEstimateKvCacheBytes:
         expected_raw = 32 * 2 * 4 * 128 * 1000 * 2
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
-    def test_raises_when_no_args_found(self):
-        """Raises AttributeError when model has no discoverable args."""
+    def test_vlm_fallback_to_config(self):
+        """Falls back to model.config or model.language_model.config when args missing."""
         model = MagicMock(spec=[])
-        with pytest.raises(AttributeError, match="no 'args' attribute"):
+        model.language_model = MagicMock(spec=[])
+        model.language_model.config = self._make_model_args(
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            hidden_size=4096,
+        )
+        result = _estimate_kv_cache_bytes(model, 1000)
+        assert result == int(131_072_000 * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+    def test_raises_when_no_args_found(self):
+        """Raises AttributeError when model has no discoverable args or config."""
+        model = MagicMock(spec=[])
+        with pytest.raises(AttributeError, match="no 'args'"):
             _estimate_kv_cache_bytes(model, 1000)
 
     def test_nas_model_with_per_layer_variable_attention(self):

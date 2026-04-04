@@ -26,6 +26,8 @@ def _make_tool_use_id() -> str:
 # --- Regex patterns ---
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+# Gemma4 channel format: <|channel>thought\n...<channel|>
+_GEMMA4_CHANNEL_RE = re.compile(r"<\|channel>thought\n(.*?)<channel\|>", re.DOTALL)
 
 # gpt-oss channel format:
 # <|start|>assistant<|channel|>analysis<|message|>thinking<|end|>
@@ -39,6 +41,8 @@ _GPT_OSS_TOOL_NAME_RE = re.compile(
     r"(?:<\|start\|>)?[^<]*to=functions\.(\w+)[^<]*<\|channel\|>",
 )
 _GPT_OSS_DETECT = "<|channel|>"
+# Gemma4 tool call: <|tool_call>call:Name{key:<|"|>val<|"|>}<tool_call|>
+_GEMMA4_TOOL_CALL_RE = re.compile(r"<\|tool_call>(.*?)<tool_call\|>", re.DOTALL)
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _FUNC_TAG_RE = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
 _PARAM_TAG_RE = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
@@ -298,6 +302,93 @@ def _try_xml_func(text: str) -> tuple[list[dict], str]:
     return tool_uses, text
 
 
+def _try_gemma4(text: str) -> tuple[list[dict], str]:
+    """Parse Gemma4-style <|tool_call>call:Name{params}<tool_call|> blocks."""
+    tool_uses = []
+    for match in _GEMMA4_TOOL_CALL_RE.finditer(text):
+        span = (match.start(), match.end())
+        inner = match.group(1).strip()
+        # Format: call:Name{key1:<|"|>val<|"|>,key2:<|"|>val<|"|>}
+        if not inner.startswith("call:"):
+            continue
+        rest = inner[5:]  # strip "call:"
+        brace = rest.find("{")
+        if brace == -1:
+            name = rest
+            args = {}
+        else:
+            name = rest[:brace]
+            # Strip only the outermost closing brace (rfind to preserve nested ones)
+            raw = rest[brace + 1 :]
+            last_brace = raw.rfind("}")
+            params_str = raw[:last_brace] if last_brace >= 0 else raw
+            # Parse key:value pairs. Values use <|"|> as string delimiters.
+            # Replace <|"|> delimiters with regular quotes for JSON-like parsing
+            params_str = params_str.replace('<|"|>', '"')
+            args = _parse_gemma4_params(params_str)
+        if name:
+            tool_uses.append(
+                {
+                    "type": "tool_use",
+                    "id": _make_tool_use_id(),
+                    "name": name,
+                    "input": args,
+                    "_span": span,
+                }
+            )
+    return tool_uses, text
+
+
+def _parse_gemma4_value(v: str):
+    """Parse a single gemma4 parameter value, handling nested objects."""
+    v = v.strip()
+    if v.startswith("{"):
+        # Nested object — strip outer braces and recurse
+        inner = v[1:]
+        last = inner.rfind("}")
+        if last >= 0:
+            inner = inner[:last]
+        return _parse_gemma4_params(inner)
+    try:
+        return json.loads(v)
+    except (json.JSONDecodeError, ValueError):
+        return v
+
+
+def _parse_gemma4_params(params_str: str) -> dict:
+    """Parse gemma4 key:value parameter string into a dict."""
+    args = {}
+    for part in _split_gemma4_params(params_str):
+        colon = part.find(":")
+        if colon > 0:
+            k = part[:colon].strip()
+            v = part[colon + 1 :].strip()
+            args[k] = _parse_gemma4_value(v)
+    return args
+
+
+def _split_gemma4_params(s: str) -> list[str]:
+    """Split gemma4 parameter string on commas, respecting braces and quotes."""
+    parts = []
+    depth = 0
+    in_str = False
+    start = 0
+    for i, c in enumerate(s):
+        if c == '"' and (i == 0 or s[i - 1] != "\\"):
+            in_str = not in_str
+        elif not in_str:
+            if c in "{[":
+                depth += 1
+            elif c in "}]":
+                depth -= 1
+            elif c == "," and depth == 0:
+                parts.append(s[start:i])
+                start = i + 1
+    if start < len(s):
+        parts.append(s[start:])
+    return parts
+
+
 def _try_bare_json(text: str) -> tuple[list[dict], str]:
     """Parse bare JSON tool calls (must be on own line or at text start)."""
     tool_uses = []
@@ -385,15 +476,22 @@ def parse_model_output(
 
     thinking = ""
 
-    # Extract thinking blocks
+    # Extract thinking blocks — gemma4 channel format and standard <think> tags
+    gemma4_matches = _GEMMA4_CHANNEL_RE.findall(text)
+    if gemma4_matches:
+        thinking = "\n".join(m.strip() for m in gemma4_matches if m.strip())
+        text = _GEMMA4_CHANNEL_RE.sub("", text)
+
     think_matches = _THINK_RE.findall(text)
     if think_matches:
-        thinking = "\n".join(m.strip() for m in think_matches)
+        think_text = "\n".join(m.strip() for m in think_matches)
+        thinking = f"{thinking}\n{think_text}".strip() if thinking else think_text
         text = _THINK_RE.sub("", text)
 
     tool_uses: list[dict] = []
     if has_tools:
         parsers = [
+            _try_gemma4,
             _try_qwen,
             _try_mistral,
             _try_llama,

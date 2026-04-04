@@ -581,6 +581,25 @@ class ModelManager:
                         lm.expires_at = None
                     return lm
 
+                # Resolve before eviction — reject unknown models without
+                # disturbing already-loaded models or their KV caches.
+                hf_path = self.registry.resolve(name)
+                if hf_path is None:
+                    suggestions = self.registry.search(name, max_results=3)
+                    msg = f"Model '{name}' not found."
+                    if suggestions:
+                        names = ", ".join(s[0] for s in suggestions)
+                        msg += f" Did you mean: {names}?"
+                    msg += (
+                        f"\nAdd it to {settings.models_config} or use a HuggingFace path "
+                        f"like 'mlx-community/Qwen2.5-3B-Instruct-4bit'"
+                    )
+                    raise ValueError(msg)
+
+                # Auto-register direct HF paths so future requests find them
+                if "/" in name:
+                    self.registry.add_mapping(name, hf_path)
+
                 # Evict LRU if at capacity (skip models with active inference)
                 while len(self._loaded) >= settings.max_loaded_models:
                     evictable = {
@@ -604,23 +623,6 @@ class ModelManager:
                 if not self._pending_cleanups:
                     gc.collect()
                     mx.clear_cache()
-
-                hf_path = self.registry.resolve(name)
-                if hf_path is None:
-                    suggestions = self.registry.search(name, max_results=3)
-                    msg = f"Model '{name}' not found."
-                    if suggestions:
-                        names = ", ".join(s[0] for s in suggestions)
-                        msg += f" Did you mean: {names}?"
-                    msg += (
-                        f"\nAdd it to {settings.models_config} or use a HuggingFace path "
-                        f"like 'mlx-community/Qwen2.5-3B-Instruct-4bit'"
-                    )
-                    raise ValueError(msg)
-
-                # Auto-register direct HF paths so future requests find them
-                if "/" in name:
-                    self.registry.add_mapping(name, hf_path)
 
                 logger.info("Loading model %s from %s", normalized, hf_path)
                 mem_before = memory_utils.get_metal_memory()
@@ -979,6 +981,73 @@ class ModelManager:
 
         return "unknown"
 
+    @staticmethod
+    def _load_chat_template(tokenizer: Any, load_path: str, hf_path: str = "") -> None:
+        """Load chat_template from file if the tokenizer doesn't have one.
+
+        Checks local files first (chat_template.jinja, chat_template.json),
+        then tries downloading from HF hub.
+        """
+        if getattr(tokenizer, "chat_template", None):
+            return
+        model_dir = Path(load_path)
+        jinja = model_dir / "chat_template.jinja"
+        json_file = model_dir / "chat_template.json"
+        if jinja.exists():
+            tokenizer.chat_template = jinja.read_text()
+        elif json_file.exists():
+            try:
+                data = json.loads(json_file.read_text())
+                tokenizer.chat_template = data["chat_template"]
+            except (json.JSONDecodeError, KeyError):
+                pass
+        elif hf_path:
+            # Try downloading from HF hub — first from the repo itself,
+            # then from the base_model listed in the model card (and its -it variant).
+            repos_to_try = [hf_path]
+            try:
+                from huggingface_hub import hf_hub_download, model_info
+
+                for repo in repos_to_try:
+                    try:
+                        path = hf_hub_download(repo, "chat_template.jinja")
+                        tokenizer.chat_template = Path(path).read_text()
+                        return
+                    except Exception as exc:
+                        logger.debug(
+                            "chat_template.jinja not found in %s: %s", repo, exc
+                        )
+                        continue
+                # Primary repo didn't have it — check base_model from model card
+                try:
+                    info = model_info(hf_path)
+                    base = (
+                        info.card_data.base_model
+                        if info.card_data and hasattr(info.card_data, "base_model")
+                        else None
+                    )
+                    if isinstance(base, list):
+                        base = base[0] if base else None
+                    if base and base != hf_path:
+                        for candidate in (base, f"{base}-it"):
+                            try:
+                                path = hf_hub_download(candidate, "chat_template.jinja")
+                                tokenizer.chat_template = Path(path).read_text()
+                                return
+                            except Exception as exc:
+                                logger.debug(
+                                    "chat_template.jinja not found in %s: %s",
+                                    candidate,
+                                    exc,
+                                )
+                                continue
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to fetch model info for %s: %s", hf_path, exc
+                    )
+            except ImportError:
+                pass
+
     def _try_lm_then_vlm(
         self, load_path: str, label: str
     ) -> tuple[Any, Any, bool, TemplateCaps]:
@@ -995,6 +1064,7 @@ class ModelManager:
 
             model, processor = mlx_vlm.load(load_path)
             tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            self._load_chat_template(tok, load_path, label)
             caps = detect_caps(tok)
             return model, processor, True, caps
 
@@ -1227,12 +1297,24 @@ class ModelManager:
 
         if kind == "vlm":
             # VLM detected — load with mlx-vlm directly
-            import mlx_vlm
+            try:
+                import mlx_vlm
 
-            model, processor = mlx_vlm.load(load_path)
-            tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-            caps = detect_caps(tok)
-            return model, processor, True, caps, None
+                model, processor = mlx_vlm.load(load_path)
+                tok = (
+                    processor.tokenizer
+                    if hasattr(processor, "tokenizer")
+                    else processor
+                )
+                self._load_chat_template(tok, load_path, hf_path)
+                caps = detect_caps(tok)
+                return model, processor, True, caps, None
+            except OSError as exc:
+                # AutoProcessor may fail (e.g. missing preprocessor_config.json
+                # in quantized repos). Fall through to lm-then-vlm fallback.
+                logger.warning(
+                    "mlx-vlm.load failed for %s (%s), trying fallback", hf_path, exc
+                )
 
         # Text or unknown — try mlx-lm first, fall back to mlx-vlm
         return (*self._try_lm_then_vlm(load_path, hf_path), None)

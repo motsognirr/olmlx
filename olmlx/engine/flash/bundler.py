@@ -105,8 +105,6 @@ def _find_ffn_weights(
     Quantized models have .weight/.scales/.biases per projection;
     regular models have just .weight.
     """
-    from safetensors.numpy import load_file
-
     layers: dict[int, dict[str, np.ndarray]] = {}
 
     # Check for quantization config
@@ -116,14 +114,17 @@ def _find_ffn_weights(
         config = json.loads(config_path.read_text())
         quant_config = config.get("quantization")
 
+    # Match both text models (model.layers.X.mlp...) and VLMs
+    # (language_model.model.layers.X.mlp...)
     pattern = re.compile(
-        r"model\.layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)"
+        r"(?:language_model\.)?model\.layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)"
     )
 
     for sf_path in sorted(model_dir.glob("*.safetensors")):
         if sf_path.name.startswith("flash_"):
             continue
-        tensors = load_file(str(sf_path))
+        # Use mx.load to handle bfloat16 (safetensors.numpy can't)
+        tensors = mx.load(str(sf_path))
         for name, arr in tensors.items():
             m = pattern.match(name)
             if m:
@@ -133,7 +134,11 @@ def _find_ffn_weights(
                 key = f"{proj_name}.{component}"
                 if layer_idx not in layers:
                     layers[layer_idx] = {}
-                layers[layer_idx][key] = arr
+                # bfloat16 has no numpy equivalent — cast to float16
+                # (the bundler writes float16 anyway)
+                if arr.dtype == mx.bfloat16:
+                    arr = arr.astype(mx.float16)
+                layers[layer_idx][key] = np.array(arr)
 
     return layers, quant_config
 

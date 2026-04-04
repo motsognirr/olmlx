@@ -157,13 +157,18 @@ class TurboQuantKVCache(_BaseCache):
 
 
 def _detect_head_dim(model: Any) -> int:
-    """Detect head_dim from model args or K projection layer shape.
+    """Detect head_dim from model args/config or K projection layer shape.
 
     Handles models where head_dim != hidden_size // num_attention_heads
-    (e.g. Gemma 3, Phi-3/4).
+    (e.g. Gemma 3, Phi-3/4).  Falls back to model.config when model.args
+    is missing (e.g. mlx-vlm gemma4 LanguageModel).
     """
-    # Prefer explicit head_dim from model args
-    head_dim = getattr(model.args, "head_dim", None)
+    # Prefer explicit head_dim from model args or config
+    model_cfg = getattr(model, "args", None) or getattr(model, "config", None)
+    if model_cfg is None:
+        raise RuntimeError("TurboQuant: model has no 'args' or 'config' attribute")
+
+    head_dim = getattr(model_cfg, "head_dim", None)
     if head_dim is not None:
         return head_dim
 
@@ -174,7 +179,7 @@ def _detect_head_dim(model: Any) -> int:
         weight = k_proj.weight
         if isinstance(weight, mx.array):
             kv_out_dim = weight.shape[0]
-            n_kv_heads = getattr(model.args, "num_key_value_heads", None)
+            n_kv_heads = getattr(model_cfg, "num_key_value_heads", None)
             if n_kv_heads:
                 return kv_out_dim // n_kv_heads
     except (AttributeError, IndexError):
@@ -182,7 +187,7 @@ def _detect_head_dim(model: Any) -> int:
 
     # Last resort: hidden_size // num_attention_heads
     try:
-        return model.args.hidden_size // model.args.num_attention_heads
+        return model_cfg.hidden_size // model_cfg.num_attention_heads
     except AttributeError as e:
         raise RuntimeError(
             f"TurboQuant: cannot detect head_dim for this model architecture. "
@@ -220,8 +225,34 @@ def make_turboquant_cache(model: Any, bits: int) -> list:
     tq_count = 0
     for i, default in enumerate(default_caches):
         if default is None or isinstance(default, KVCache):
-            rot_k = TurboQuantRotation(head_dim=head_dim, seed=i * 2)
-            rot_v = TurboQuantRotation(head_dim=head_dim, seed=i * 2 + 1)
+            # Detect per-layer head dim from K projection weight shape.
+            # Models like gemma4 have different head dims for full vs sliding
+            # attention layers (global_head_dim=512 vs head_dim=256).
+            layer_head_dim = head_dim
+            try:
+                attn = model.layers[i].self_attn
+                k_weight = attn.k_proj.weight
+                if isinstance(k_weight, mx.array):
+                    # Prefer the layer's own n_kv_heads (handles gemma4 where
+                    # full attention uses num_global_key_value_heads ≠ num_key_value_heads)
+                    n_kv = getattr(attn, "n_kv_heads", None)
+                    if n_kv is None:
+                        model_cfg = getattr(model, "args", None) or getattr(
+                            model, "config", None
+                        )
+                        n_kv = getattr(model_cfg, "num_key_value_heads", None)
+                    if n_kv:
+                        layer_head_dim = k_weight.shape[0] // n_kv
+            except (AttributeError, IndexError):
+                pass
+
+            if layer_head_dim % (8 // bits) != 0:
+                # Not compatible with TurboQuant packing — keep default cache
+                caches.append(default if default is not None else KVCache())
+                continue
+
+            rot_k = TurboQuantRotation(head_dim=layer_head_dim, seed=i * 2)
+            rot_v = TurboQuantRotation(head_dim=layer_head_dim, seed=i * 2 + 1)
             caches.append(
                 TurboQuantKVCache(bits=bits, rotation_key=rot_k, rotation_value=rot_v)
             )

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
 
@@ -224,6 +225,40 @@ class TestStreamRecordActivations:
 
         mock_mlx_lm.load.assert_called_once_with("fake_path", lazy=True)
 
+    def test_vlm_fallback_when_mlx_lm_fails(self):
+        """When mlx_lm.load() raises ValueError, fall back to mlx_vlm."""
+        from olmlx.engine.flash.prepare import _stream_record_activations
+
+        model, tokenizer = self._make_fake_model_and_tokenizer()
+
+        # Wrap model in a VLM-like structure: vlm_model.language_model = model
+        vlm_model = MagicMock()
+        vlm_model.language_model = model
+
+        # Processor with .tokenizer attribute
+        processor = MagicMock()
+        processor.tokenizer = tokenizer
+
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError("Model type gemma4 not supported.")
+
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.load.return_value = (vlm_model, processor)
+
+        with patch.dict(sys.modules, {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}):
+            recordings, hidden_size, intermediate_size, num_layers = (
+                _stream_record_activations("fake_path", ["Hello", "Test"])
+            )
+
+        # Should have fallen back to mlx_vlm
+        mock_mlx_vlm.load.assert_called_once_with("fake_path", lazy=True)
+
+        # Should still produce valid recordings from the language model
+        assert len(recordings) == NUM_LAYERS
+        assert hidden_size == HIDDEN
+        assert intermediate_size == INTER
+        assert num_layers == NUM_LAYERS
+
 
 class TestStreamingEquivalence:
     """Verify streaming produces same recordings as full-forward pass."""
@@ -343,3 +378,48 @@ class TestStreamingEdgeCases:
         assert len(recordings[0][0]) == 1
         # Layer 1 should have empty recordings (no gate_proj/up_proj)
         assert len(recordings[1][0]) == 0
+
+
+class TestFindFFNWeights:
+    """Tests for _find_ffn_weights in the bundler."""
+
+    def test_vlm_key_prefix(self, tmp_path):
+        """VLM weights with language_model.model.layers prefix should be found."""
+        from olmlx.engine.flash.bundler import _find_ffn_weights
+
+        # Create a safetensors file with VLM-style keys
+        weights = {
+            "language_model.model.layers.0.mlp.gate_proj.weight": mx.zeros((4, 2)),
+            "language_model.model.layers.0.mlp.up_proj.weight": mx.zeros((4, 2)),
+            "language_model.model.layers.0.mlp.down_proj.weight": mx.zeros((2, 4)),
+            "language_model.model.layers.1.mlp.gate_proj.weight": mx.zeros((4, 2)),
+            "language_model.model.layers.1.mlp.up_proj.weight": mx.zeros((4, 2)),
+            "language_model.model.layers.1.mlp.down_proj.weight": mx.zeros((2, 4)),
+        }
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+
+        layers, quant_config = _find_ffn_weights(tmp_path)
+
+        assert 0 in layers
+        assert 1 in layers
+        assert "gate_proj.weight" in layers[0]
+        assert "up_proj.weight" in layers[0]
+        assert "down_proj.weight" in layers[0]
+
+    def test_bfloat16_weights(self, tmp_path):
+        """bfloat16 weights should load without error."""
+        from olmlx.engine.flash.bundler import _find_ffn_weights
+
+        weights = {
+            "model.layers.0.mlp.gate_proj.weight": mx.zeros((4, 2), dtype=mx.bfloat16),
+            "model.layers.0.mlp.up_proj.weight": mx.zeros((4, 2), dtype=mx.bfloat16),
+            "model.layers.0.mlp.down_proj.weight": mx.zeros((2, 4), dtype=mx.bfloat16),
+        }
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+
+        layers, _ = _find_ffn_weights(tmp_path)
+
+        assert 0 in layers
+        assert (
+            layers[0]["gate_proj.weight"].dtype == np.float16
+        )  # bfloat16 → float16 via mlx
