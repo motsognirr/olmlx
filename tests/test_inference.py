@@ -1069,7 +1069,7 @@ class TestGenerateChatVlm:
 
     @pytest.mark.asyncio
     async def test_vlm_with_tools_native_support(self, mock_manager):
-        """VLM+tools passes tools natively through VLM template when supported."""
+        """VLM+tools uses tokenizer directly for native tool template (bypasses mlx_vlm)."""
         lm = mock_manager._loaded["qwen3:latest"]
         lm.is_vlm = True
         lm.template_caps = TemplateCaps(
@@ -1077,9 +1077,6 @@ class TestGenerateChatVlm:
         )
 
         mock_mx = MagicMock()
-        mock_mlx_vlm = MagicMock()
-        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt with native tools"
-
         tools = [
             {
                 "type": "function",
@@ -1091,27 +1088,33 @@ class TestGenerateChatVlm:
             }
         ]
 
-        with patch("olmlx.engine.inference.mx", mock_mx):
-            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
-                with patch(
-                    "olmlx.engine.inference.asyncio.to_thread",
-                    new_callable=AsyncMock,
-                ) as mock_thread:
-                    mock_thread.return_value = "tool response"
-                    result = await generate_chat(
-                        mock_manager,
-                        "qwen3",
-                        [{"role": "user", "content": "search"}],
-                        tools=tools,
-                        stream=False,
-                    )
+        # Mock the tokenizer's apply_chat_template (called directly, not via mlx_vlm)
+        lm.tokenizer.tokenizer = MagicMock()
+        lm.tokenizer.tokenizer.apply_chat_template = MagicMock(
+            return_value="direct tokenizer prompt with tools"
+        )
 
-        # Should pass tools as kwarg to mlx_vlm.apply_chat_template (native)
-        vlm_call_args = mock_mlx_vlm.apply_chat_template.call_args
-        assert vlm_call_args.kwargs.get("tools") == tools
-        # Messages should NOT have injected system message
-        messages_passed = vlm_call_args[0][2]  # 3rd positional arg = messages
-        assert messages_passed[0]["role"] == "user"
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch(
+                "olmlx.engine.inference.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_thread:
+                mock_thread.return_value = "tool response"
+                result = await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "search"}],
+                    tools=tools,
+                    stream=False,
+                )
+
+        # Should call tokenizer.apply_chat_template directly with tools
+        tpl_call = lm.tokenizer.tokenizer.apply_chat_template
+        tpl_call.assert_called_once()
+        call_kwargs = tpl_call.call_args.kwargs
+        assert call_kwargs["tools"] == tools
+        assert call_kwargs["tokenize"] is False
+        assert call_kwargs["add_generation_prompt"] is True
         assert result["text"] == "tool response"
 
     @pytest.mark.asyncio

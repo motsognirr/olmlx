@@ -767,17 +767,30 @@ def _apply_chat_template_vlm(
     images: list[str] | None = None,
     tools: list[dict] | None = None,
 ) -> str:
-    """Apply chat template for vision-language models (mlx-vlm)."""
+    """Apply chat template for vision-language models (mlx-vlm).
+
+    When tools are provided, bypasses mlx_vlm.apply_chat_template and calls
+    the processor's tokenizer directly.  mlx_vlm's message processing wraps
+    text content in ``[{type: text, text: ..., content: ...}]`` dicts, which
+    the Jinja template renders as Python list repr — garbling the prompt.
+    """
+    if tools:
+        # Use tokenizer directly to get clean native tool formatting.
+        tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        return tok.apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
     import mlx_vlm
 
     config = model.config if hasattr(model, "config") else {}
     num_images = len(images) if images else 0
-    kwargs: dict = {}
-    if tools:
-        kwargs["tools"] = tools
     # Pass the full message list so the model gets proper conversation context
     return mlx_vlm.apply_chat_template(
-        processor, config, messages, num_images=num_images, **kwargs
+        processor, config, messages, num_images=num_images
     )
 
 
