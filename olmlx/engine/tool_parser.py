@@ -352,6 +352,12 @@ def _parse_gemma4_value(v: str):
     try:
         return json.loads(v)
     except (json.JSONDecodeError, ValueError):
+        # json.loads failed — likely unescaped quotes inside a string value.
+        # Strip the outer <|"|>-derived quotes so the raw string doesn't
+        # carry spurious delimiters (e.g. '"find . -name "*.py"..."' → the
+        # inner content without surrounding quotes).
+        if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+            return v[1:-1]
         return v
 
 

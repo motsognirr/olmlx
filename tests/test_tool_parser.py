@@ -731,6 +731,13 @@ class TestGemma4:
         assert len(tools) == 1
         assert tools[0]["input"]["enabled"] is True
 
+    def test_inner_quotes_stripped(self):
+        """Values with unescaped inner quotes must not carry outer delimiters."""
+        text = '<|tool_call>call:Bash{command:<|"|>find . -name "*.py" | wc -l<|"|>}<tool_call|>'
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 1
+        assert tools[0]["input"]["command"] == 'find . -name "*.py" | wc -l'
+
 
 class TestGemma4Thinking:
     def test_gemma4_channel_thinking(self):
