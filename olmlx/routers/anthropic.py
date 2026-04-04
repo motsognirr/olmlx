@@ -302,7 +302,44 @@ def _emit_content_block(
     return events
 
 
-async def _stream_buffered_with_tools(result):
+def _resolve_tool_names(
+    tool_uses: list[dict], declared_tools: list[dict] | None
+) -> None:
+    """Resolve parsed tool names to declared tool names.
+
+    Some models (e.g. Gemma 4) generate tool names that differ from the
+    declared name — e.g. ``bash:run_command`` instead of ``Bash``.  This
+    function maps parsed names back to declared names using:
+      1. Exact match
+      2. Case-insensitive match
+      3. Case-insensitive prefix match (before first ``:``)
+    """
+    if not declared_tools or not tool_uses:
+        return
+    declared_names = []
+    for t in declared_tools:
+        fn = t.get("function", {})
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if name:
+            declared_names.append(name)
+    if not declared_names:
+        return
+    lower_map = {n.lower(): n for n in declared_names}
+    for tu in tool_uses:
+        name = tu["name"]
+        if name in declared_names:
+            continue
+        # Case-insensitive
+        if name.lower() in lower_map:
+            tu["name"] = lower_map[name.lower()]
+            continue
+        # Prefix before first ':'
+        prefix = name.split(":")[0]
+        if prefix.lower() in lower_map:
+            tu["name"] = lower_map[prefix.lower()]
+
+
+async def _stream_buffered_with_tools(result, declared_tools=None):
     """Buffer full output, parse tools, yield SSE strings. Yields a final dict with metadata."""
     full_text = ""
     output_tokens = 0
@@ -327,6 +364,8 @@ async def _stream_buffered_with_tools(result):
         full_text,
         True,
     )
+
+    _resolve_tool_names(tool_uses, declared_tools)
 
     if tool_uses:
         logger.info(
@@ -647,7 +686,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             path = None
             try:
                 path = (
-                    _stream_buffered_with_tools(result)
+                    _stream_buffered_with_tools(result, declared_tools=tools)
                     if has_tools
                     else _stream_thinking_state_machine(result)
                 )
@@ -794,6 +833,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             text,
             has_tools,
         )
+        _resolve_tool_names(tool_uses, tools)
 
         content_blocks = []
 
