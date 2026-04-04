@@ -1067,6 +1067,88 @@ class TestGenerateChatVlm:
 
         assert result["text"] == "vlm response"
 
+    @pytest.mark.asyncio
+    async def test_vlm_with_tools_native_support(self, mock_manager):
+        """VLM+tools uses text template (native tools) when caps.supports_tools is True."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        lm.template_caps = TemplateCaps(
+            supports_tools=True, supports_enable_thinking=True
+        )
+
+        mock_mx = MagicMock()
+        tools = [{"type": "function", "function": {"name": "search"}}]
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch(
+                "olmlx.engine.inference._apply_chat_template_text",
+                return_value="native tool prompt",
+            ) as mock_text_tpl:
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                ) as mock_thread:
+                    mock_thread.return_value = "tool response"
+                    result = await generate_chat(
+                        mock_manager,
+                        "qwen3",
+                        [{"role": "user", "content": "search for cats"}],
+                        tools=tools,
+                        stream=False,
+                    )
+
+        # Should use text template path with native tools, NOT injection
+        mock_text_tpl.assert_called_once()
+        call_args = mock_text_tpl.call_args
+        assert call_args[0][2] == tools  # tools passed as positional arg
+        assert result["text"] == "tool response"
+
+    @pytest.mark.asyncio
+    async def test_vlm_with_tools_no_native_support_injects(self, mock_manager):
+        """VLM+tools injects into system message when caps.supports_tools is False."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        lm.template_caps = TemplateCaps(
+            supports_tools=False, supports_enable_thinking=False
+        )
+
+        mock_mx = MagicMock()
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt with injected tools"
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search",
+                    "parameters": {},
+                },
+            }
+        ]
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                ) as mock_thread:
+                    mock_thread.return_value = "tool response"
+                    result = await generate_chat(
+                        mock_manager,
+                        "qwen3",
+                        [{"role": "user", "content": "search"}],
+                        tools=tools,
+                        stream=False,
+                    )
+
+        # Should have called mlx_vlm.apply_chat_template with injected tools in system msg
+        vlm_call_args = mock_mlx_vlm.apply_chat_template.call_args
+        messages_passed = vlm_call_args[0][2]  # 3rd positional arg = messages
+        assert messages_passed[0]["role"] == "system"
+        assert "search" in messages_passed[0]["content"]
+        assert result["text"] == "tool response"
+
 
 class TestGenerateEmbeddings:
     def _setup_tokenizer(self, mock_manager):
