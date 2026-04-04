@@ -52,9 +52,11 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
 def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
     """Validate per-model experimental overrides.
 
-    Checks key names against the whitelist, then delegates value validation
-    to ``ExperimentalSettings.model_validate`` so constraints (gt, le, etc.)
-    are enforced from a single source of truth.
+    Checks key names against the whitelist, then validates values by
+    constructing a full ExperimentalSettings from the global defaults
+    plus the overrides.  This avoids calling ``model_validate`` on a
+    partial dict (which, for a BaseSettings subclass, would re-read env
+    vars and produce confusing errors for unrelated fields).
     """
     unknown = set(overrides) - PER_MODEL_EXPERIMENTAL_KEYS
     if unknown:
@@ -62,12 +64,14 @@ def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
             f"Unknown experimental keys: {sorted(unknown)}. "
             f"Allowed per-model keys: {sorted(PER_MODEL_EXPERIMENTAL_KEYS)}"
         )
-    # Validate values via pydantic (single source of truth for constraints)
+    # Validate values by merging with global defaults (single source of truth)
     if overrides:
-        from olmlx.config import ExperimentalSettings
+        from olmlx.config import ExperimentalSettings, experimental as _global
 
         try:
-            ExperimentalSettings.model_validate(overrides)
+            merged = _global.model_dump()
+            merged.update(overrides)
+            ExperimentalSettings.model_validate(merged)
         except Exception as e:
             raise ValueError(f"Invalid experimental override: {e}") from e
 
@@ -114,7 +118,9 @@ def _validate_options(options: dict) -> None:
         )
     for key, value in options.items():
         expected = _OPTION_TYPES.get(key)
-        if expected is not None and not isinstance(value, expected):
+        if expected is not None and (
+            not isinstance(value, expected) or isinstance(value, bool)
+        ):
             raise ValueError(
                 f"Option '{key}' must be {expected}, got {type(value).__name__}"
             )

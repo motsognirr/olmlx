@@ -52,6 +52,13 @@ class TestParseKeepAlive:
     def test_zero_integer(self):
         assert parse_keep_alive(0) == 0.0
 
+    def test_bare_integer_string(self):
+        """Bare integer string '1800' should be treated as seconds."""
+        assert parse_keep_alive("1800") == 1800.0
+
+    def test_bare_integer_string_zero(self):
+        assert parse_keep_alive("0") == 0.0
+
 
 class TestLoadedModel:
     def test_defaults(self):

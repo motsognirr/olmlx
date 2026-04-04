@@ -769,3 +769,17 @@ class TestRegistryModelConfig:
         assert mc is not None
         assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
         assert mc.options == {"temperature": 0.7}
+
+    # ------------------------------------------------------------------
+    # Review round 5 — bool rejection, bare int keep_alive at runtime
+    # ------------------------------------------------------------------
+
+    def test_boolean_option_value_rejected(self):
+        """Boolean values should be rejected for int/float options."""
+        with pytest.raises(ValueError, match="top_k"):
+            ModelConfig.from_entry({"hf_path": "org/model", "options": {"top_k": True}})
+
+    def test_boolean_seed_rejected(self):
+        """Boolean seed should be rejected (bool is subclass of int)."""
+        with pytest.raises(ValueError, match="seed"):
+            ModelConfig.from_entry({"hf_path": "org/model", "options": {"seed": False}})

@@ -458,6 +458,9 @@ def parse_keep_alive(value: str | int) -> float | None:
         return None
     if value == "0":
         return 0.0
+    # Bare integer string → treat as seconds (consistent with Ollama API)
+    if value.isdigit():
+        return float(int(value))
     match = re.match(r"^(\d+)(s|m|h)$", value)
     if not match:
         logger.warning("Invalid keep_alive format: %r, defaulting to 5m", value)
@@ -1118,7 +1121,7 @@ class ModelManager:
         from olmlx.config import experimental as _global_exp
         from olmlx.engine.flash.flash_model import FlashConfig, FlashModelWrapper
 
-        experimental = model_exp if model_exp is not None else _global_exp
+        eff_exp = model_exp if model_exp is not None else _global_exp
         from olmlx.engine.flash.predictor import LookaheadBank, PredictorBank
         from olmlx.engine.flash.weight_store import FlashWeightStore
 
@@ -1141,32 +1144,32 @@ class ModelManager:
             hidden_size=layout_config["hidden_size"],
             intermediate_size=layout_config["intermediate_size"],
             num_layers=layout_config["num_layers"],
-            sparsity_threshold=experimental.flash_sparsity_threshold,
-            min_active_neurons=experimental.flash_min_active_neurons,
-            max_active_neurons=experimental.flash_max_active_neurons,
-            window_size=experimental.flash_window_size,
-            io_threads=experimental.flash_io_threads,
-            cache_budget_neurons=experimental.flash_cache_budget_neurons,
-            memory_budget_fraction=experimental.flash_memory_budget_fraction,
-            prefetch=experimental.flash_prefetch,
-            prefetch_confidence_threshold=experimental.flash_prefetch_confidence_threshold,
-            prefetch_min_neurons=experimental.flash_prefetch_min_neurons,
-            prefetch_max_neurons=experimental.flash_prefetch_max_neurons,
-            prefetch_io_threads=experimental.flash_prefetch_io_threads,
+            sparsity_threshold=eff_exp.flash_sparsity_threshold,
+            min_active_neurons=eff_exp.flash_min_active_neurons,
+            max_active_neurons=eff_exp.flash_max_active_neurons,
+            window_size=eff_exp.flash_window_size,
+            io_threads=eff_exp.flash_io_threads,
+            cache_budget_neurons=eff_exp.flash_cache_budget_neurons,
+            memory_budget_fraction=eff_exp.flash_memory_budget_fraction,
+            prefetch=eff_exp.flash_prefetch,
+            prefetch_confidence_threshold=eff_exp.flash_prefetch_confidence_threshold,
+            prefetch_min_neurons=eff_exp.flash_prefetch_min_neurons,
+            prefetch_max_neurons=eff_exp.flash_prefetch_max_neurons,
+            prefetch_io_threads=eff_exp.flash_prefetch_io_threads,
         )
 
         weight_store = FlashWeightStore(
             flash_dir,
             num_io_threads=flash_config.io_threads,
             cache_budget_neurons=flash_config.cache_budget_neurons,
-            bypass_cache=experimental.flash_bypass_os_cache,
-            use_preallocated_buffer=experimental.flash_preallocated_buffer,
+            bypass_cache=eff_exp.flash_bypass_os_cache,
+            use_preallocated_buffer=eff_exp.flash_preallocated_buffer,
         )
 
         # Load lookahead predictors if available (for speculative prefetching)
         lookahead_bank = None
         lookahead_path = flash_dir / "lookahead_predictors"
-        if experimental.flash_prefetch and lookahead_path.exists():
+        if eff_exp.flash_prefetch and lookahead_path.exists():
             try:
                 lookahead_bank = LookaheadBank.load(lookahead_path)
                 logger.info("Loaded lookahead predictor bank from %s", lookahead_path)
@@ -1181,10 +1184,10 @@ class ModelManager:
             model, predictor_bank, weight_store, flash_config, lookahead_bank
         )
 
-        if experimental.flash_speculative:
+        if eff_exp.flash_speculative:
             from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
 
-            if not experimental.flash_speculative_draft_model:
+            if not eff_exp.flash_speculative_draft_model:
                 raise ValueError(
                     "flash_speculative requires flash_speculative_draft_model to be set "
                     "(OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL)"
@@ -1192,10 +1195,10 @@ class ModelManager:
 
             logger.info(
                 "Loading draft model %s for speculative decoding",
-                experimental.flash_speculative_draft_model,
+                eff_exp.flash_speculative_draft_model,
             )
             draft_model, draft_tokenizer = mlx_lm.load(
-                experimental.flash_speculative_draft_model
+                eff_exp.flash_speculative_draft_model
             )
 
             # Verify vocabulary compatibility — a mismatch causes silent token ID errors
@@ -1217,7 +1220,7 @@ class ModelManager:
             decoder = SpeculativeFlashDecoder(
                 draft_model=draft_model,
                 target_model=wrapped,
-                num_speculative_tokens=experimental.flash_speculative_tokens,
+                num_speculative_tokens=eff_exp.flash_speculative_tokens,
                 prefetcher=wrapped.prefetcher,
             )
             return wrapped, tokenizer, False, caps, decoder
@@ -1261,7 +1264,7 @@ class ModelManager:
         from olmlx.config import experimental as _global_exp
         from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
 
-        experimental = model_exp if model_exp is not None else _global_exp
+        eff_exp = model_exp if model_exp is not None else _global_exp
         from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
 
         import mlx_lm
@@ -1279,8 +1282,8 @@ class ModelManager:
 
         store = FlashMoeWeightStore(
             flash_moe_dir,
-            num_io_threads=experimental.flash_moe_io_threads,
-            cache_budget_experts=experimental.flash_moe_cache_budget_experts,
+            num_io_threads=eff_exp.flash_moe_io_threads,
+            cache_budget_experts=eff_exp.flash_moe_cache_budget_experts,
         )
 
         try:
