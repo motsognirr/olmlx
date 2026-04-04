@@ -674,3 +674,98 @@ class TestRegistryModelConfig:
         mc = ModelConfig(hf_path="org/other-model")
         with pytest.raises(ValueError, match="mismatch"):
             reg.add_mapping("my-model", "org/model", model_config=mc)
+
+    # ------------------------------------------------------------------
+    # Review round 4 — fixes for remaining PR comments
+    # ------------------------------------------------------------------
+
+    def test_bare_numeric_keep_alive_accepted(self):
+        """Bare numeric string like '1800' should be accepted as seconds."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model", "keep_alive": "1800"})
+        assert mc.keep_alive == "1800"
+
+    def test_integer_keep_alive_coerced_to_string(self):
+        """Integer keep_alive from JSON should be coerced to string."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model", "keep_alive": 1800})
+        assert mc.keep_alive == "1800"
+        assert isinstance(mc.keep_alive, str)
+
+    def test_string_entry_validates_hf_path(self):
+        """String entries in models.json must be valid HF paths."""
+        with pytest.raises(ValueError, match="owner/repo"):
+            ModelConfig.from_entry("no-slash-here")
+
+    def test_bad_entry_skipped_during_load(self, tmp_path, monkeypatch):
+        """A single bad entry should not crash the entire registry load."""
+        config = {
+            "good-model:latest": "Qwen/Qwen3-8B-MLX",
+            "bad-model:latest": {"missing_hf_path": True},
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        assert "good-model:latest" in reg._mappings
+        assert "bad-model:latest" not in reg._mappings
+
+    def test_resolve_hf_path_key_with_config(self, tmp_path, monkeypatch):
+        """HF path used as a key in models.json should return its full config."""
+        config = {
+            "Qwen/Qwen3-8B": {
+                "hf_path": "Qwen/Qwen3-8B",
+                "options": {"temperature": 0.5},
+            },
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        mc = reg.resolve("Qwen/Qwen3-8B")
+        assert mc is not None
+        assert mc.options == {"temperature": 0.5}
+
+    def test_list_models_alias_priority_matches_resolve(self, tmp_path, monkeypatch):
+        """list_models() should use alias-first priority, matching resolve()."""
+        config = {
+            "my-model:latest": "org/model-a",
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        # Add an alias "my-model:latest" → some other model
+        reg._mappings["other:latest"] = ModelConfig(hf_path="org/model-b")
+        reg._aliases["my-model:latest"] = "other:latest"
+        # resolve() checks aliases first → should get model-b
+        resolved = reg.resolve("my-model:latest")
+        assert resolved.hf_path == "org/model-b"
+        # list_models() should agree
+        listed = reg.list_models()
+        assert listed["my-model:latest"].hf_path == "org/model-b"
+
+    def test_alias_of_alias_preserves_config(self, tmp_path, monkeypatch):
+        """Alias-of-alias should preserve per-model config from the source."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "options": {"temperature": 0.7},
+            },
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        reg._aliases_path = tmp_path / "aliases.json"
+        # First alias: my-qwen → qwen3
+        reg.add_alias("my-qwen", "qwen3")
+        # Second alias: q3 → my-qwen (alias-of-alias)
+        reg.add_alias("q3", "my-qwen")
+        # q3 should resolve to full config with options
+        mc = reg.resolve("q3")
+        assert mc is not None
+        assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
+        assert mc.options == {"temperature": 0.7}

@@ -8,7 +8,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import logging
+
 from olmlx.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Experimental keys that can be overridden per-model.
 # Distributed settings are excluded — they affect process startup, not per-model behavior.
@@ -123,6 +127,8 @@ def _validate_keep_alive(value: str) -> None:
     v = str(value).strip()
     if v in ("-1", "0"):
         return
+    if v.isdigit():
+        return  # bare integer seconds, consistent with Ollama API
     if not re.match(r"^\d+(s|m|h)$", v):
         raise ValueError(
             f"Invalid keep_alive format: {value!r}. "
@@ -146,6 +152,7 @@ class ModelConfig:
     def from_entry(cls, entry: str | dict) -> ModelConfig:
         """Create a ModelConfig from a models.json entry (string or dict)."""
         if isinstance(entry, str):
+            validate_hf_path(entry)
             return cls(hf_path=entry)
         if isinstance(entry, dict):
             hf_path = entry.get("hf_path")
@@ -158,9 +165,12 @@ class ModelConfig:
             options = dict(entry.get("options", {}))
             if options:
                 _validate_options(options)
-            keep_alive = entry.get("keep_alive")
-            if keep_alive is not None:
+            keep_alive_raw = entry.get("keep_alive")
+            if keep_alive_raw is not None:
+                keep_alive = str(keep_alive_raw)
                 _validate_keep_alive(keep_alive)
+            else:
+                keep_alive = None
             return cls(
                 hf_path=hf_path,
                 experimental=experimental,
@@ -260,7 +270,12 @@ class ModelRegistry:
         if settings.models_config.exists():
             with open(settings.models_config) as f:
                 raw = json.load(f)
-            self._mappings = {k: ModelConfig.from_entry(v) for k, v in raw.items()}
+            self._mappings = {}
+            for k, v in raw.items():
+                try:
+                    self._mappings[k] = ModelConfig.from_entry(v)
+                except (ValueError, TypeError) as exc:
+                    logger.warning("Skipping invalid models.json entry %r: %s", k, exc)
         if self._aliases_path.exists():
             with open(self._aliases_path) as f:
                 self._aliases = json.load(f)
@@ -280,6 +295,8 @@ class ModelRegistry:
         """
         if "/" in name:
             validate_hf_path(name)
+            if name in self._mappings:
+                return self._mappings[name]
             return ModelConfig(hf_path=name)
         validate_model_name(name)
         normalized = self.normalize_name(name)
@@ -299,15 +316,23 @@ class ModelRegistry:
         return None
 
     def list_models(self) -> dict[str, ModelConfig]:
-        """Return all known model name → ModelConfig mappings."""
-        combined: dict[str, ModelConfig] = {**self._mappings}
+        """Return all known model name → ModelConfig mappings.
+
+        Aliases take priority over mappings with the same name,
+        matching the behavior of ``resolve()``.
+        """
+        combined: dict[str, ModelConfig] = {}
+        # Aliases first (matching resolve() priority)
         for alias_name, canonical in self._aliases.items():
-            if alias_name not in combined:
-                if canonical in self._mappings:
-                    combined[alias_name] = self._mappings[canonical]
-                else:
-                    # Backward compat: old aliases.json stored hf_path
-                    combined[alias_name] = ModelConfig(hf_path=canonical)
+            if canonical in self._mappings:
+                combined[alias_name] = self._mappings[canonical]
+            else:
+                # Backward compat: old aliases.json stored hf_path
+                combined[alias_name] = ModelConfig(hf_path=canonical)
+        # Then mappings for names not already covered by aliases
+        for name, mc in self._mappings.items():
+            if name not in combined:
+                combined[name] = mc
         return combined
 
     def add_alias(self, alias: str, source: str):
@@ -324,8 +349,17 @@ class ModelRegistry:
         elif source in self._mappings:
             self._aliases[alias] = source
         else:
-            # Source is itself an alias or HF path — store hf_path as fallback
-            self._aliases[alias] = resolved.hf_path
+            # Source is itself an alias — walk the chain to find the _mappings key
+            canonical = source_normalized
+            seen: set[str] = set()
+            while canonical in self._aliases and canonical not in seen:
+                seen.add(canonical)
+                canonical = self._aliases[canonical]
+            if canonical in self._mappings:
+                self._aliases[alias] = canonical
+            else:
+                # Ultimate fallback: store hf_path
+                self._aliases[alias] = resolved.hf_path
         self._save_aliases()
 
     def add_mapping(
