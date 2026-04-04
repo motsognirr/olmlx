@@ -190,9 +190,9 @@ def _detect_expert_format(
     name, expert container, and projection names (gate_proj/up_proj/down_proj
     vs fc1/fc2).
     """
-    _LAYER_PREFIXES = ("model.layers", "backbone.layers")
-    _MOE_MODULES = ("mlp", "block_sparse_moe", "mixer")
-    _EXPERT_CONTAINERS = ("switch_mlp", "experts")
+    _LAYER_PREFIXES = ("model.layers", "backbone.layers", "language_model.model.layers")
+    _MOE_MODULES = ("mlp", "block_sparse_moe", "mixer", "experts")
+    _EXPERT_CONTAINERS = ("switch_mlp", "experts", "switch_glu")
     # First projection name to probe for each projection style
     _PROJ_PROBES = (
         ("gate_proj", ("gate_proj", "up_proj", "down_proj")),

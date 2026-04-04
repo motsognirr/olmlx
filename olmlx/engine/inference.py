@@ -1641,21 +1641,35 @@ async def generate_chat(
     images = _extract_images(messages)
 
     if lm.is_vlm:
-        # VLM models must use the VLM generation path — text template
-        # formatting produces garbage through mlx_vlm.stream_generate.
-        # Inject tool definitions into messages as a system message.
-        vlm_messages = messages
-        if tools:
+        caps = lm.template_caps or TemplateCaps()
+        if tools and caps.supports_tools:
+            # Native tool support (e.g. Gemma 4): use text template which
+            # passes tools as structured kwargs to the Jinja template.
+            prompt = _apply_chat_template_text(
+                lm.text_tokenizer,
+                messages,
+                tools,
+                caps=caps,
+                enable_thinking=enable_thinking,
+            )
+            logger.info("VLM chat prompt with %d tools (native template)", len(tools))
+        elif tools:
+            # Template lacks native tool support — inject tool descriptions
+            # into the system message, then use VLM template path.
             vlm_messages = _inject_tools_into_system(list(messages), tools)
+            prompt = _apply_chat_template_vlm(
+                lm.tokenizer, lm.model, vlm_messages, images
+            )
             logger.info(
                 "VLM chat prompt with %d tools (injected into system)", len(tools)
             )
-        if enable_thinking is not None:
-            logger.debug(
-                "enable_thinking=%s ignored for VLM model (not supported by mlx-vlm template)",
-                enable_thinking,
-            )
-        prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, vlm_messages, images)
+        else:
+            if enable_thinking is not None:
+                logger.debug(
+                    "enable_thinking=%s ignored for VLM model (not supported by mlx-vlm template)",
+                    enable_thinking,
+                )
+            prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages, images)
     else:
         prompt = _apply_chat_template_text(
             lm.text_tokenizer,

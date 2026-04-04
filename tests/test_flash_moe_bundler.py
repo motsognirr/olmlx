@@ -919,3 +919,171 @@ class TestBundleNemotronMoeExperts:
         layouts = bundle_moe_experts(model_dir, output_dir=tmp_path / "flash_moe")
         assert 1 in layouts
         assert layouts[1].num_experts == experts
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4 helpers and tests
+# ---------------------------------------------------------------------------
+
+
+def _make_synthetic_gemma4_moe_weights(
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_layers: int,
+    tmp_path: Path,
+    quantized: bool = False,
+) -> Path:
+    """Create synthetic safetensors with Gemma 4-style naming.
+
+    Gemma 4 uses:
+      - language_model.model.layers.{l} prefix (VLM wrapper)
+      - experts.switch_glu container (not mlp.switch_mlp)
+      - gate_proj/up_proj/down_proj projections
+      - enable_moe_block=True, num_experts, no moe_layer_freq
+    """
+    from safetensors.numpy import save_file
+
+    rng = np.random.RandomState(42)
+    tensors = {}
+
+    for layer in range(num_layers):
+        prefix = f"language_model.model.layers.{layer}"
+
+        # Router weights
+        tensors[f"{prefix}.router.proj.weight"] = rng.randn(
+            num_experts, hidden_size
+        ).astype(np.float16)
+
+        # Dense MLP (shared)
+        tensors[f"{prefix}.mlp.gate_proj.weight"] = rng.randn(
+            intermediate_size, hidden_size
+        ).astype(np.float16)
+
+        # Stacked expert weights
+        if not quantized:
+            tensors[f"{prefix}.experts.switch_glu.gate_proj.weight"] = rng.randn(
+                num_experts, intermediate_size, hidden_size
+            ).astype(np.float16)
+            tensors[f"{prefix}.experts.switch_glu.up_proj.weight"] = rng.randn(
+                num_experts, intermediate_size, hidden_size
+            ).astype(np.float16)
+            tensors[f"{prefix}.experts.switch_glu.down_proj.weight"] = rng.randn(
+                num_experts, hidden_size, intermediate_size
+            ).astype(np.float16)
+        else:
+            group_size = 32
+            bits = 4
+            gate_packed_dim = hidden_size * bits // 32
+            down_packed_dim = intermediate_size * bits // 32
+
+            for proj, out_dim, packed_dim, in_dim in [
+                ("gate_proj", intermediate_size, gate_packed_dim, hidden_size),
+                ("up_proj", intermediate_size, gate_packed_dim, hidden_size),
+                ("down_proj", hidden_size, down_packed_dim, intermediate_size),
+            ]:
+                tensors[f"{prefix}.experts.switch_glu.{proj}.weight"] = rng.randint(
+                    0, 2**31, (num_experts, out_dim, packed_dim)
+                ).astype(np.uint32)
+                tensors[f"{prefix}.experts.switch_glu.{proj}.scales"] = rng.randn(
+                    num_experts, out_dim, in_dim // group_size
+                ).astype(np.float16)
+                tensors[f"{prefix}.experts.switch_glu.{proj}.biases"] = rng.randn(
+                    num_experts, out_dim, in_dim // group_size
+                ).astype(np.float16)
+
+    tensors["language_model.model.embed_tokens.weight"] = rng.randn(
+        100, hidden_size
+    ).astype(np.float16)
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    save_file(tensors, str(model_dir / "model.safetensors"))
+
+    config = {
+        "model_type": "gemma4",
+        "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+            "moe_intermediate_size": intermediate_size,
+            "num_hidden_layers": num_layers,
+            "num_experts": num_experts,
+            "top_k_experts": 8,
+            "enable_moe_block": True,
+        },
+    }
+    if quantized:
+        config["text_config"]["quantization"] = {"bits": 4, "group_size": 32}
+    (model_dir / "config.json").write_text(json.dumps(config))
+
+    return model_dir
+
+
+class TestBundleGemma4MoeExperts:
+    """Test bundler with Gemma 4-style experts.switch_glu weight naming."""
+
+    def test_detect_gemma4_expert_format(self, tmp_path):
+        """Should detect language_model.model.layers + experts.switch_glu."""
+        hidden, inter, experts = 64, 32, 4
+        model_dir = _make_synthetic_gemma4_moe_weights(
+            hidden, inter, experts, 1, tmp_path
+        )
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        layouts = bundle_moe_experts(model_dir, tmp_path / "flash_moe")
+
+        assert 0 in layouts
+        assert layouts[0].num_experts == experts
+
+    def test_bundle_preserves_gemma4_expert_data(self, tmp_path):
+        """Bundled data should match original experts.switch_glu weights."""
+        hidden, inter, experts = 64, 32, 8
+        model_dir = _make_synthetic_gemma4_moe_weights(
+            hidden, inter, experts, 1, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from safetensors.numpy import load_file
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        original = load_file(str(model_dir / "model.safetensors"))
+        gate_w = original[
+            "language_model.model.layers.0.experts.switch_glu.gate_proj.weight"
+        ]
+
+        layouts = bundle_moe_experts(model_dir, output_dir)
+        layout = layouts[0]
+
+        expert_idx = 3
+        expert_offset = int(layout.offsets[expert_idx])
+        with open(layout.file_path, "rb") as f:
+            f.seek(expert_offset)
+            raw = f.read(inter * hidden * 2)  # gate_proj float16
+
+        gate_read = np.frombuffer(raw, dtype=np.float16).reshape(inter, hidden)
+        np.testing.assert_array_equal(gate_read, gate_w[expert_idx])
+
+    def test_bundle_quantized_gemma4(self, tmp_path):
+        """Quantized Gemma 4 model should bundle correctly."""
+        hidden, inter, experts = 64, 32, 4
+        model_dir = _make_synthetic_gemma4_moe_weights(
+            hidden, inter, experts, 1, tmp_path, quantized=True
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from olmlx.engine.flash.moe_bundler import (
+            MOE_HEADER_SIZE,
+            bundle_moe_experts,
+            parse_moe_header,
+        )
+
+        layouts = bundle_moe_experts(model_dir, output_dir)
+        layout = layouts[0]
+
+        with open(layout.file_path, "rb") as f:
+            header = parse_moe_header(f.read(MOE_HEADER_SIZE))
+        assert header["is_quantized"] is True
+        assert header["bits"] == 4
