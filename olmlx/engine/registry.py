@@ -46,29 +46,26 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
 
 
 def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
-    """Validate per-model experimental overrides."""
+    """Validate per-model experimental overrides.
+
+    Checks key names against the whitelist, then delegates value validation
+    to ``ExperimentalSettings.model_validate`` so constraints (gt, le, etc.)
+    are enforced from a single source of truth.
+    """
     unknown = set(overrides) - PER_MODEL_EXPERIMENTAL_KEYS
     if unknown:
         raise ValueError(
             f"Unknown experimental keys: {sorted(unknown)}. "
             f"Allowed per-model keys: {sorted(PER_MODEL_EXPERIMENTAL_KEYS)}"
         )
-    # Validate kv_cache_quant format if present
-    kv_quant = overrides.get("kv_cache_quant")
-    if kv_quant is not None:
-        _valid_methods = {"turboquant"}
-        _valid_bits = {"2", "4"}
-        parts = str(kv_quant).split(":", 1)
-        if (
-            len(parts) != 2
-            or parts[0] not in _valid_methods
-            or parts[1] not in _valid_bits
-        ):
-            raise ValueError(
-                f"Invalid kv_cache_quant={kv_quant!r}. "
-                f"Expected '<method>:<bits>' where method is one of {_valid_methods} "
-                f"and bits is one of {_valid_bits}."
-            )
+    # Validate values via pydantic (single source of truth for constraints)
+    if overrides:
+        from olmlx.config import ExperimentalSettings
+
+        try:
+            ExperimentalSettings.model_validate(overrides)
+        except Exception as e:
+            raise ValueError(f"Invalid experimental override: {e}") from e
 
 
 VALID_OPTION_KEYS: frozenset[str] = frozenset(
@@ -88,13 +85,48 @@ VALID_OPTION_KEYS: frozenset[str] = frozenset(
 )
 
 
+_OPTION_TYPES: dict[str, type | tuple[type, ...]] = {
+    "temperature": (int, float),
+    "top_p": (int, float),
+    "top_k": int,
+    "min_p": (int, float),
+    "seed": int,
+    "num_predict": int,
+    "repeat_penalty": (int, float),
+    "repeat_last_n": int,
+    "stop": list,
+    "frequency_penalty": (int, float),
+    "presence_penalty": (int, float),
+}
+
+
 def _validate_options(options: dict) -> None:
-    """Validate that option keys are recognized Ollama option names."""
+    """Validate option keys and value types."""
     unknown = set(options) - VALID_OPTION_KEYS
     if unknown:
         raise ValueError(
             f"Unknown option key(s): {sorted(unknown)}. "
             f"Valid keys: {sorted(VALID_OPTION_KEYS)}"
+        )
+    for key, value in options.items():
+        expected = _OPTION_TYPES.get(key)
+        if expected is not None and not isinstance(value, expected):
+            raise ValueError(
+                f"Option '{key}' must be {expected}, got {type(value).__name__}"
+            )
+
+
+def _validate_keep_alive(value: str) -> None:
+    """Validate keep_alive format at parse time."""
+    import re
+
+    v = str(value).strip()
+    if v in ("-1", "0"):
+        return
+    if not re.match(r"^\d+(s|m|h)$", v):
+        raise ValueError(
+            f"Invalid keep_alive format: {value!r}. "
+            f"Expected a duration like '5m', '1h', '300s', '0', or '-1'."
         )
 
 
@@ -105,6 +137,9 @@ class ModelConfig:
     hf_path: str
     experimental: dict[str, Any] = field(default_factory=dict)
     options: dict[str, Any] = field(default_factory=dict)
+    #: Per-model keep_alive duration (e.g. "30m"). Only applied on initial
+    #: model load; changes to models.json are not picked up while the model
+    #: is already loaded — an explicit unload is required.
     keep_alive: str | None = None
 
     @classmethod
@@ -116,17 +151,21 @@ class ModelConfig:
             hf_path = entry.get("hf_path")
             if not hf_path:
                 raise ValueError("Model config dict must contain 'hf_path'")
+            validate_hf_path(hf_path)
             experimental = dict(entry.get("experimental", {}))
             if experimental:
                 _validate_experimental_overrides(experimental)
             options = dict(entry.get("options", {}))
             if options:
                 _validate_options(options)
+            keep_alive = entry.get("keep_alive")
+            if keep_alive is not None:
+                _validate_keep_alive(keep_alive)
             return cls(
                 hf_path=hf_path,
                 experimental=experimental,
                 options=options,
-                keep_alive=entry.get("keep_alive"),
+                keep_alive=keep_alive,
             )
         raise TypeError(
             f"Model config entry must be str or dict, got {type(entry).__name__}"
@@ -306,6 +345,11 @@ class ModelRegistry:
         normalized = self.normalize_name(name)
         existing = self._mappings.get(normalized)
         if model_config is not None:
+            if model_config.hf_path != hf_path:
+                raise ValueError(
+                    f"hf_path mismatch: argument {hf_path!r} != "
+                    f"model_config.hf_path {model_config.hf_path!r}"
+                )
             mc = model_config
         else:
             mc = ModelConfig(hf_path=hf_path)

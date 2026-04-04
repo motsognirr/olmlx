@@ -618,3 +618,59 @@ class TestRegistryModelConfig:
                     "options": {"tempretaure": 0.7},
                 }
             )
+
+    def test_invalid_option_value_type_rejected(self):
+        """Wrong value types in options are rejected at parse time."""
+        with pytest.raises(ValueError, match="temperature"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "options": {"temperature": "hot"},
+                }
+            )
+
+    def test_invalid_hf_path_in_dict_rejected(self):
+        """Invalid hf_path in dict entry is rejected at parse time."""
+        with pytest.raises(ValueError, match="owner/repo"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "no-slash-here",
+                }
+            )
+
+    def test_invalid_keep_alive_format_rejected(self):
+        """Invalid keep_alive format is rejected at parse time."""
+        with pytest.raises(ValueError, match="keep_alive"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "keep_alive": "30x",
+                }
+            )
+
+    def test_valid_keep_alive_formats_accepted(self):
+        """Valid keep_alive formats are accepted."""
+        for val in ["5m", "1h", "300s", "0", "-1"]:
+            mc = ModelConfig.from_entry({"hf_path": "org/model", "keep_alive": val})
+            assert mc.keep_alive == val
+
+    def test_invalid_experimental_value_rejected(self):
+        """Invalid experimental values (e.g. negative threshold) are rejected."""
+        with pytest.raises(ValueError, match="experimental"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "experimental": {"flash_sparsity_threshold": -1.0},
+                }
+            )
+
+    def test_add_mapping_hf_path_mismatch_rejected(self, tmp_path, monkeypatch):
+        """add_mapping rejects model_config with mismatched hf_path."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text("{}")
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        mc = ModelConfig(hf_path="org/other-model")
+        with pytest.raises(ValueError, match="mismatch"):
+            reg.add_mapping("my-model", "org/model", model_config=mc)

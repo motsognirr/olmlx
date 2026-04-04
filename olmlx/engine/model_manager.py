@@ -16,7 +16,8 @@ from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
-from olmlx.config import settings
+from olmlx.config import experimental as global_experimental
+from olmlx.config import resolve_experimental, settings
 from olmlx.engine.registry import ModelRegistry
 from olmlx.utils import memory as memory_utils
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
@@ -605,9 +606,6 @@ class ModelManager:
                     self.registry.add_mapping(name, hf_path, model_config=model_config)
 
                 # Resolve per-model experimental overrides
-                from olmlx.config import experimental as global_experimental
-                from olmlx.config import resolve_experimental
-
                 model_exp = resolve_experimental(
                     global_experimental, model_config.experimental
                 )
