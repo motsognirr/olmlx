@@ -169,9 +169,9 @@ class TestBundleVLModelWeights:
             tensors[f"{prefix}.gate_proj.weight"] = np.random.randn(
                 inter, hidden
             ).astype(np.float16)
-            tensors[f"{prefix}.up_proj.weight"] = np.random.randn(
-                inter, hidden
-            ).astype(np.float16)
+            tensors[f"{prefix}.up_proj.weight"] = np.random.randn(inter, hidden).astype(
+                np.float16
+            )
             tensors[f"{prefix}.down_proj.weight"] = np.random.randn(
                 hidden, inter
             ).astype(np.float16)

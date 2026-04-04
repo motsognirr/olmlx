@@ -173,7 +173,7 @@ def _detect_head_dim(model: Any) -> int:
         return head_dim
 
     # VL models (e.g. Qwen3.5) store config in args.text_config dict
-    text_config = getattr(model.args, "text_config", None)
+    text_config = getattr(model_cfg, "text_config", None)
     if isinstance(text_config, dict):
         if "head_dim" in text_config:
             return text_config["head_dim"]

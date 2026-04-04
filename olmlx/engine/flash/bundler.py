@@ -124,11 +124,13 @@ def _find_ffn_weights(
     for sf_path in sorted(model_dir.glob("*.safetensors")):
         if sf_path.name.startswith("flash_"):
             continue
-        # Use mx.load to handle bfloat16 (safetensors.numpy can't)
+        # Use mx.load to handle bfloat16 (safetensors.numpy can't).
+        # mx.load allocates Metal-backed arrays; convert matched tensors to
+        # numpy immediately and delete the rest to free Metal memory per shard.
         try:
             tensors = mx.load(str(sf_path))
-        except Exception:
-            logger.warning("Failed to load %s, skipping", sf_path.name)
+        except (ValueError, RuntimeError) as exc:
+            logger.warning("Failed to load %s, skipping: %s", sf_path.name, exc)
             continue
         for name, arr in tensors.items():
             m = pattern.match(name)
@@ -144,6 +146,8 @@ def _find_ffn_weights(
                 if arr.dtype == mx.bfloat16:
                     arr = arr.astype(mx.float16)
                 layers[layer_idx][key] = np.array(arr)
+        del tensors
+        mx.clear_cache()
 
     return layers, quant_config
 

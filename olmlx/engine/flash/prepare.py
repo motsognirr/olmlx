@@ -30,6 +30,37 @@ from olmlx.engine.flash.predictor import (
 
 logger = logging.getLogger(__name__)
 
+# Error substring used by mlx-lm when safetensors contain keys not in the model
+_STRICT_LOAD_ERROR = "parameters not in model"
+
+
+def load_model_with_strict_fallback(model_path: str, *, lazy: bool) -> tuple:
+    """Load model via mlx-lm, retrying with strict=False for VL models.
+
+    VL models (e.g. Qwen3.5) ship vision tower weights in safetensors that the
+    text-only model class doesn't use. When mlx-lm raises ValueError containing
+    "parameters not in model", retries with strict=False.
+
+    Returns (model, tokenizer).
+    """
+    import mlx_lm
+
+    try:
+        return mlx_lm.load(model_path, lazy=lazy)
+    except ValueError as exc:
+        if _STRICT_LOAD_ERROR not in str(exc):
+            raise
+        logger.info(
+            "Retrying with strict=False (extra weights in safetensors): %s", exc
+        )
+        model_dir = Path(model_path)
+        model, config = mlx_lm.utils.load_model(model_dir, lazy=lazy, strict=False)
+        eos = config.get("eos_token_id")
+        tokenizer = mlx_lm.utils.load_tokenizer(
+            model_dir, eos_token_ids=[eos] if isinstance(eos, int) else eos
+        )
+        return model, tokenizer
+
 
 def _encode_tokens(tokenizer, text: str) -> list[int]:
     """Encode text to token ids, handling both fast and slow tokenizers."""
@@ -303,43 +334,29 @@ def _stream_record_activations(
     Returns:
         (recordings, hidden_size, intermediate_size, num_layers)
     """
-    import mlx_lm  # deferred — triggers slow import transformers
-
     if progress_callback:
         progress_callback("Loading model skeleton", 0.0)
 
     try:
-        model, tokenizer = mlx_lm.load(model_path, lazy=True)
-    except ValueError as exc:
-        if "parameters not in model" in str(exc):
-            # VL models (e.g. Qwen3.5) have vision tower weights in safetensors
-            # that the text-only model class doesn't use. Retry with strict=False.
-            logger.info(
-                "Retrying with strict=False (extra weights in safetensors): %s", exc
-            )
-            model_dir = Path(model_path)
-            model, config = mlx_lm.utils.load_model(
-                model_dir, lazy=True, strict=False
-            )
-            eos = config.get("eos_token_id")
-            tokenizer = mlx_lm.utils.load_tokenizer(
-                model_dir, eos_token_ids=[eos] if isinstance(eos, int) else eos
-            )
-        else:
-            # mlx_lm doesn't support this model type (e.g. gemma4 VLM) —
-            # fall back to mlx_vlm and extract the language model.
-            import mlx_vlm
+        model, tokenizer = load_model_with_strict_fallback(model_path, lazy=True)
+    except ValueError:
+        # mlx_lm doesn't support this model type (e.g. gemma4 VLM) —
+        # fall back to mlx_vlm and extract the language model.
+        import mlx_vlm
 
-            vlm_model, processor = mlx_vlm.load(model_path, lazy=True)
-            model = vlm_model.language_model
-            tokenizer = (
-                processor.tokenizer
-                if hasattr(processor, "tokenizer")
-                else processor
-            )
+        vlm_model, processor = mlx_vlm.load(model_path, lazy=True)
+        model = vlm_model.language_model
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
 
     # Access inner model (mlx-lm wraps: Model.model = LlamaModel/Qwen3Model/etc.)
+    # VL models (e.g. Qwen3.5) lack .model but have language_model.model;
+    # navigate to the backbone that has both .layers and .embed_tokens.
     inner = model.model if hasattr(model, "model") else model
+    lm = getattr(inner, "language_model", None)
+    if lm is not None:
+        inner = getattr(lm, "model", lm)
     layers = inner.layers
     num_layers = len(layers)
 
@@ -368,15 +385,6 @@ def _stream_record_activations(
         or getattr(inner, "wte", None)
         or getattr(inner, "tok_embeddings", None)
     )
-    # VL models (e.g. Qwen3.5): embed is at language_model.model.embed_tokens
-    if embed is None:
-        lm = getattr(inner, "language_model", None)
-        if lm is not None:
-            lm_inner = getattr(lm, "model", lm)
-            embed = (
-                getattr(lm_inner, "embed_tokens", None)
-                or getattr(lm_inner, "wte", None)
-            )
     if embed is None:
         raise ValueError(
             "Cannot find embedding layer (tried embed_tokens, wte, tok_embeddings)"

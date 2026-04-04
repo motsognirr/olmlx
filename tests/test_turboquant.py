@@ -504,7 +504,11 @@ class TestMakeTurboQuantCache:
         from olmlx.engine.turboquant_cache import make_turboquant_cache
 
         class FakeArgs:
-            text_config = {"head_dim": 96, "hidden_size": 3072, "num_attention_heads": 32}
+            text_config = {
+                "head_dim": 96,
+                "hidden_size": 3072,
+                "num_attention_heads": 32,
+            }
 
         model = MagicMock()
         # Layer 0 has linear_attn (GatedDeltaNet), no self_attn — k_proj fallback fails
