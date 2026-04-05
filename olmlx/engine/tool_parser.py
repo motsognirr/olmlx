@@ -45,7 +45,7 @@ _GEMMA4_CHANNEL_RE = re.compile(r"<\|channel>thought\n(.*?)<channel\|>", re.DOTA
 # Group 3: header content between channel and <|message|> (may contain to=functions.*, <|constrain|>, etc.)
 # Group 4: message content
 _GPT_OSS_BLOCK_RE = re.compile(
-    r"<\|start\|>([^<\|]*?)(?:<\|channel\|>\s*(\w+)(.*?))<\|message\|>(.*?)<\|(?:end|call|return)\|>",
+    r"<\|start\|>([^<\|]*?)(?:<\|channel\|>\s*(\w+)(.*?))<\|message\|>(.*?)(?:<\|(?:end|call|return)\|>|\Z)",
     re.DOTALL,
 )
 _GPT_OSS_TOOL_NAME_RE = re.compile(r"to=functions\.(\w+)")

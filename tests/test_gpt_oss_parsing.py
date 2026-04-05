@@ -251,6 +251,33 @@ class TestParseGptOssChannels:
         assert len(tools) == 1
         assert tools[0]["name"] == "search"
 
+    def test_final_without_terminal_end_marker(self):
+        """Final channel without <|end|> or <|return|> should still be parsed.
+
+        mlx-lm strips EOS tokens, so the last block may end at end-of-string.
+        """
+        text = "<|start|>assistant<|channel|>final<|message|>Just a final message"
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert thinking == ""
+        assert visible == "Just a final message"
+        assert tools == []
+
+    def test_tool_call_without_terminal_marker(self):
+        """Tool call without <|call|> terminator should still be parsed.
+
+        When EOS is stripped, tool calls may end at end-of-string.
+        """
+        text = (
+            "<|start|>assistant<|channel|>commentary to=functions.search<|message|>"
+            '{"query": "test"}'
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert thinking == ""
+        assert visible == ""
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
+        assert tools[0]["input"] == {"query": "test"}
+
 
 # ---------------------------------------------------------------------------
 # Streaming filter
