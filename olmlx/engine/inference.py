@@ -876,7 +876,9 @@ def _convert_tool_messages_to_responses(messages: list[dict]) -> list[dict]:
             else:
                 # No preceding assistant — shouldn't happen, but create a
                 # model-role message to keep the turn correct.
-                result.append({"role": "assistant", "tool_responses": [resp]})
+                result.append(
+                    {"role": "assistant", "content": "", "tool_responses": [resp]}
+                )
         else:
             result.append(dict(m))  # shallow copy to avoid mutating input
 
@@ -1455,11 +1457,20 @@ async def _stream_completion(
                             "(cache token sequence will be incomplete)",
                             token.generation_tokens,
                         )
-                    # Yield text only if the filter allows it (or no filter)
-                    if channel_filter is None or channel_filter.should_yield(
-                        token.text
-                    ):
+                    # Yield text only if the filter allows it (or no filter).
+                    # When channel filter is active, always include raw_text so
+                    # downstream consumers (e.g. tool call parsers) can
+                    # reconstruct the full unfiltered output.
+                    if channel_filter is None:
                         yield {"text": token.text, "done": False}
+                    elif channel_filter.should_yield(token.text):
+                        yield {
+                            "text": token.text,
+                            "done": False,
+                            "raw_text": token.text,
+                        }
+                    else:
+                        yield {"text": "", "done": False, "raw_text": token.text}
 
             # Fallback: yield analysis content if no final channel was produced
             if channel_filter is not None:
@@ -1767,16 +1778,22 @@ async def _full_completion_inner(
     else:
         text = str(result)
 
-    # Strip gpt-oss channel tokens for non-streaming path
+    # Strip gpt-oss channel tokens for non-streaming path.
+    # Keep raw_text so routers can parse tool calls from the full output.
+    raw_text = None
     if lm.template_caps.has_channel_format and "<|channel|>" in text:
         from olmlx.engine.tool_parser import _parse_gpt_oss_channels
 
+        raw_text = text
         parsed = _parse_gpt_oss_channels(text, has_tools=has_tools)
         if parsed is not None:
             _, visible, _ = parsed
             text = visible
 
-    return {"text": text, "done": True, "stats": stats}
+    result_dict: dict = {"text": text, "done": True, "stats": stats}
+    if raw_text is not None:
+        result_dict["raw_text"] = raw_text
+    return result_dict
 
 
 async def generate_chat(

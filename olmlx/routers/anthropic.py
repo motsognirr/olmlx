@@ -9,7 +9,11 @@ from fastapi.responses import StreamingResponse
 
 from olmlx.config import settings
 from olmlx.engine.inference import _inference_ref, count_chat_tokens, generate_chat
-from olmlx.engine.tool_parser import _make_tool_use_id, parse_model_output
+from olmlx.engine.tool_parser import (
+    _make_tool_use_id,
+    parse_model_output,
+    resolve_tool_names,
+)
 from olmlx.schemas.anthropic import (
     AnthropicContentBlock,
     AnthropicMessagesRequest,
@@ -302,46 +306,10 @@ def _emit_content_block(
     return events
 
 
-def _resolve_tool_names(
-    tool_uses: list[dict], declared_tools: list[dict] | None
-) -> None:
-    """Resolve parsed tool names to declared tool names.
-
-    Some models (e.g. Gemma 4) generate tool names that differ from the
-    declared name — e.g. ``bash:run_command`` instead of ``Bash``.  This
-    function maps parsed names back to declared names using:
-      1. Exact match
-      2. Case-insensitive match
-      3. Case-insensitive prefix match (before first ``:``)
-    """
-    if not declared_tools or not tool_uses:
-        return
-    declared_names = []
-    for t in declared_tools:
-        fn = t.get("function", {})
-        name = fn.get("name") if isinstance(fn, dict) else None
-        if name:
-            declared_names.append(name)
-    if not declared_names:
-        return
-    lower_map = {n.lower(): n for n in declared_names}
-    for tu in tool_uses:
-        name = tu["name"]
-        if name in declared_names:
-            continue
-        # Case-insensitive
-        if name.lower() in lower_map:
-            tu["name"] = lower_map[name.lower()]
-            continue
-        # Prefix before first ':'
-        prefix = name.split(":")[0]
-        if prefix.lower() in lower_map:
-            tu["name"] = lower_map[prefix.lower()]
-
-
 async def _stream_buffered_with_tools(result, declared_tools=None):
     """Buffer full output, parse tools, yield SSE strings. Yields a final dict with metadata."""
     full_text = ""
+    raw_text = ""
     output_tokens = 0
 
     async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
@@ -357,15 +325,16 @@ async def _stream_buffered_with_tools(result, declared_tools=None):
                 output_tokens = stats.eval_count
             break
         full_text += chunk.get("text", "")
+        raw_text += chunk.get("raw_text", chunk.get("text", ""))
 
-    logger.info("Raw model output (%d chars): %s", len(full_text), full_text[:1000])
+    logger.info("Raw model output (%d chars): %s", len(raw_text), raw_text[:1000])
 
     thinking, visible_text, tool_uses = parse_model_output(
-        full_text,
+        raw_text,
         True,
     )
 
-    _resolve_tool_names(tool_uses, declared_tools)
+    resolve_tool_names(tool_uses, declared_tools)
 
     if tool_uses:
         logger.info(
@@ -828,15 +797,18 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             enable_thinking=enable_thinking,
         )
         text = result.get("text", "")
+        parse_text = result.get("raw_text", text)
         stats = result.get("stats")
 
-        logger.debug("Raw model output (%d chars): %s", len(text), text[:500])
+        logger.debug(
+            "Raw model output (%d chars): %s", len(parse_text), parse_text[:500]
+        )
 
         thinking, visible_text, tool_uses = parse_model_output(
-            text,
+            parse_text,
             has_tools,
         )
-        _resolve_tool_names(tool_uses, tools)
+        resolve_tool_names(tool_uses, tools)
 
         content_blocks = []
 

@@ -541,3 +541,41 @@ def parse_model_output(
 
     visible_text = text.strip()
     return thinking, visible_text, tool_uses
+
+
+def resolve_tool_names(
+    tool_uses: list[dict], declared_tools: list[dict] | None
+) -> None:
+    """Resolve parsed tool names to declared tool names.
+
+    Some models (e.g. Gemma 4) generate tool names that differ from the
+    declared name — e.g. ``bash:run_command`` instead of ``Bash``.  This
+    function maps parsed names back to declared names using:
+      1. Exact match
+      2. Case-insensitive match
+      3. Case-insensitive prefix match (before first ``:``)
+    """
+    if not declared_tools or not tool_uses:
+        return
+    declared_names = []
+    for t in declared_tools:
+        # Support both OpenAI format {function: {name}} and flat {name}
+        fn = t.get("function", t)
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if name:
+            declared_names.append(name)
+    if not declared_names:
+        return
+    lower_map = {n.lower(): n for n in declared_names}
+    for tu in tool_uses:
+        name = tu.get("name", "")
+        if name in declared_names:
+            continue
+        # Case-insensitive
+        if name.lower() in lower_map:
+            tu["name"] = lower_map[name.lower()]
+            continue
+        # Prefix before first ':'
+        prefix = name.split(":")[0]
+        if prefix.lower() in lower_map:
+            tu["name"] = lower_map[prefix.lower()]

@@ -12,7 +12,7 @@ from olmlx.engine.inference import (
     generate_completion,
     generate_embeddings,
 )
-from olmlx.engine.tool_parser import parse_model_output
+from olmlx.engine.tool_parser import parse_model_output, resolve_tool_names
 from olmlx.schemas.openai import (
     OpenAIChatMessage,
     OpenAIChatRequest,
@@ -101,15 +101,19 @@ def _strip_thinking_streaming(text: str, state: dict) -> str:
                 buf = buf[open_idx + len("<think>") :]
                 phase = "in_think"
             else:
-                # Neither tag yet — keep buffering.  Check for partial tags
-                # at the end so we don't emit a half-tag.
-                longest_partial = 0
-                for tag in ("<think>", "</think>"):
-                    for i in range(1, min(len(tag), len(buf) + 1)):
-                        if tag.startswith(buf[-i:]):
-                            longest_partial = max(longest_partial, i)
-                # Hold the entire buffer (don't emit) — we can't be sure
-                # the text before a potential </think> isn't thinking.
+                # Neither tag yet.  Keep buffering to detect a potential
+                # orphaned </think> at the start of the stream.  Once the
+                # buffer grows large enough that an orphaned tag is very
+                # unlikely, emit the safe prefix and transition to
+                # passthrough so non-thinking models stream progressively.
+                # The threshold is generous to catch real orphaned tags
+                # (thinking content before </think>) while avoiding
+                # unbounded buffering for non-thinking models.
+                _DETECT_LIMIT = 200
+                if len(buf) > _DETECT_LIMIT:
+                    out_parts.append(buf)
+                    buf = ""
+                    phase = "passthrough"
                 break
 
         elif phase == "in_think":
@@ -173,7 +177,7 @@ async def _stream_openai_sse(
     format_content(text) -> choices[0] dict for content chunks
     format_done() -> choices[0] dict for the final chunk
     """
-    think_state: dict = {} if strip_thinking else {}
+    think_state: dict = {}
     try:
         async for chunk in result:
             if chunk.get("cache_info"):
@@ -231,7 +235,9 @@ async def _stream_openai_sse(
         await result.aclose()
 
 
-async def _stream_openai_sse_with_tools(result, response_id, model, created):
+async def _stream_openai_sse_with_tools(
+    result, response_id, model, created, declared_tools=None
+):
     """Buffer full output, parse tool calls, then emit OpenAI-compliant SSE.
 
     Matches the exact chunk sequence that OpenAI produces and that the
@@ -245,6 +251,7 @@ async def _stream_openai_sse_with_tools(result, response_id, model, created):
     4. Done:  delta={}, finish_reason="tool_calls"
     """
     full_text = ""
+    raw_text = ""
     try:
         async for chunk in result:
             if chunk.get("cache_info"):
@@ -252,8 +259,13 @@ async def _stream_openai_sse_with_tools(result, response_id, model, created):
             if chunk.get("done"):
                 break
             full_text += chunk.get("text", "")
+            # raw_text carries unfiltered output (e.g. gpt-oss channel tokens)
+            # for tool call parsing; falls back to filtered text when absent.
+            raw_text += chunk.get("raw_text", chunk.get("text", ""))
 
-        _thinking, visible_text, tool_uses = parse_model_output(full_text, True)
+        # Use raw_text for parsing so channel-format tool calls aren't lost
+        _thinking, visible_text, tool_uses = parse_model_output(raw_text, True)
+        resolve_tool_names(tool_uses, declared_tools)
         logger.debug(
             "Buffered tool stream (%d chars): thinking=%d visible=%d tool_uses=%d raw=%s",
             len(full_text),
@@ -410,6 +422,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
                     chat_id,
                     req.model,
                     created,
+                    declared_tools=req.tools,
                 ),
                 media_type="text/event-stream",
             )
@@ -443,11 +456,16 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             cache_id=cache_id,
         )
         text = result.get("text", "")
-        logger.debug("Raw model output (%d chars): %s", len(text), text[:1000])
+        # Use raw_text for tool parsing (preserves gpt-oss channel tokens)
+        parse_text = result.get("raw_text", text)
+        logger.debug(
+            "Raw model output (%d chars): %s", len(parse_text), parse_text[:1000]
+        )
         usage = OpenAIUsage.from_stats(result.get("stats"))
 
         has_tools = bool(req.tools)
-        _thinking, visible_text, tool_uses = parse_model_output(text, has_tools)
+        _thinking, visible_text, tool_uses = parse_model_output(parse_text, has_tools)
+        resolve_tool_names(tool_uses, req.tools)
 
         tool_calls = _to_openai_tool_calls(tool_uses) if tool_uses else None
         finish_reason = "tool_calls" if tool_uses else "stop"

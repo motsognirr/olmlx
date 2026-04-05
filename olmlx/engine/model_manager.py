@@ -70,7 +70,8 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
             raise
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-        cfg = json.loads(config_file.read_text())
+        original_text = config_file.read_text()
+        cfg = json.loads(original_text)
         mt = cfg.get("model_type", "")
         # Strip last digit: deepseek_v32 → deepseek_v3
         fallback = re.sub(r"\d+$", lambda m: m.group()[:-1], mt) if mt else ""
@@ -89,7 +90,6 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
             **{k: v for k, v in kwargs.items() if k in ("lazy", "model_config")},
         )
         # Temporarily patch config.json for tokenizer loading only.
-        original_text = config_file.read_text()
         try:
             cfg["model_type"] = fallback
             config_file.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))

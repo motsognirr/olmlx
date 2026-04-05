@@ -2047,50 +2047,50 @@ class TestResolveToolNames:
     """Test _resolve_tool_names mapping parsed names to declared tool names."""
 
     def test_exact_match_unchanged(self):
-        from olmlx.routers.anthropic import _resolve_tool_names
+        from olmlx.engine.tool_parser import resolve_tool_names
 
         tools = [{"function": {"name": "Bash"}}]
         uses = [{"name": "Bash", "id": "1", "input": {}}]
-        _resolve_tool_names(uses, tools)
+        resolve_tool_names(uses, tools)
         assert uses[0]["name"] == "Bash"
 
     def test_case_insensitive_match(self):
-        from olmlx.routers.anthropic import _resolve_tool_names
+        from olmlx.engine.tool_parser import resolve_tool_names
 
         tools = [{"function": {"name": "Bash"}}]
         uses = [{"name": "bash", "id": "1", "input": {}}]
-        _resolve_tool_names(uses, tools)
+        resolve_tool_names(uses, tools)
         assert uses[0]["name"] == "Bash"
 
     def test_colon_prefix_match(self):
         """Gemma 4 generates 'bash:run_command' for tool 'Bash'."""
-        from olmlx.routers.anthropic import _resolve_tool_names
+        from olmlx.engine.tool_parser import resolve_tool_names
 
         tools = [
             {"function": {"name": "Bash"}},
             {"function": {"name": "Read"}},
         ]
         uses = [{"name": "bash:run_command", "id": "1", "input": {}}]
-        _resolve_tool_names(uses, tools)
+        resolve_tool_names(uses, tools)
         assert uses[0]["name"] == "Bash"
 
     def test_no_declared_tools(self):
-        from olmlx.routers.anthropic import _resolve_tool_names
+        from olmlx.engine.tool_parser import resolve_tool_names
 
         uses = [{"name": "bash", "id": "1", "input": {}}]
-        _resolve_tool_names(uses, None)
+        resolve_tool_names(uses, None)
         assert uses[0]["name"] == "bash"
 
     def test_no_match_unchanged(self):
-        from olmlx.routers.anthropic import _resolve_tool_names
+        from olmlx.engine.tool_parser import resolve_tool_names
 
         tools = [{"function": {"name": "Read"}}]
         uses = [{"name": "unknown_tool", "id": "1", "input": {}}]
-        _resolve_tool_names(uses, tools)
+        resolve_tool_names(uses, tools)
         assert uses[0]["name"] == "unknown_tool"
 
     def test_multiple_tool_uses(self):
-        from olmlx.routers.anthropic import _resolve_tool_names
+        from olmlx.engine.tool_parser import resolve_tool_names
 
         tools = [
             {"function": {"name": "Bash"}},
@@ -2102,7 +2102,7 @@ class TestResolveToolNames:
             {"name": "Read", "id": "2", "input": {}},
             {"name": "glob", "id": "3", "input": {}},
         ]
-        _resolve_tool_names(uses, tools)
+        resolve_tool_names(uses, tools)
         assert uses[0]["name"] == "Bash"
         assert uses[1]["name"] == "Read"
         assert uses[2]["name"] == "Glob"

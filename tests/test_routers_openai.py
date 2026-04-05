@@ -6,8 +6,65 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from olmlx.routers.openai import JSON_MODE_SYSTEM_MSG
+from olmlx.routers.openai import (
+    JSON_MODE_SYSTEM_MSG,
+    _flush_thinking_buffer,
+    _strip_thinking_streaming,
+)
 from olmlx.utils.timing import TimingStats
+
+
+class TestStripThinkingStreaming:
+    """Unit tests for _strip_thinking_streaming."""
+
+    def _stream(self, chunks):
+        """Feed chunks through _strip_thinking_streaming, return list of outputs."""
+        state = {}
+        results = []
+        for chunk in chunks:
+            out = _strip_thinking_streaming(chunk, state)
+            results.append(out)
+        flushed = _flush_thinking_buffer(state)
+        if flushed:
+            results.append(flushed)
+        return results
+
+    def test_non_thinking_model_streams_progressively(self):
+        """Models without think tags must NOT buffer all content until done.
+
+        Once enough content arrives to rule out an orphaned </think>, the
+        detect phase should emit buffered content and transition to
+        passthrough so subsequent chunks stream immediately.
+        """
+        # Build chunks that exceed the detect phase buffer limit (200 chars)
+        chunks = [f"token_{i} " for i in range(40)]  # ~280 chars total
+        results = self._stream(chunks)
+        # Content must start arriving before the final flush — not all held
+        non_empty = [r for r in results if r]
+        assert len(non_empty) > 1, (
+            f"Expected progressive output, got single flush: {results}"
+        )
+        # All content should be present
+        full = "".join(results)
+        assert "token_0" in full
+        assert "token_39" in full
+
+    def test_think_tags_still_stripped(self):
+        """Standard <think>...</think> blocks must still be stripped."""
+        chunks = ["<think>", "reasoning", "</think>", "The answer."]
+        results = self._stream(chunks)
+        full = "".join(results)
+        assert "reasoning" not in full
+        assert "The answer." in full
+
+    def test_orphaned_close_think_still_stripped(self):
+        """Orphaned </think> must still be detected and stripped."""
+        chunks = ["internal ", "thinking", "</think>", "visible"]
+        results = self._stream(chunks)
+        full = "".join(results)
+        assert "internal" not in full
+        assert "thinking" not in full
+        assert "visible" in full
 
 
 class TestOpenAIRouter:
@@ -993,6 +1050,112 @@ class TestToolCallParsing:
         assert "reasoning about" not in full_content
         assert "</think>" not in full_content
         assert "The answer is 42." in full_content
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_gpt_oss_tool_call(self, app_client):
+        """Non-streaming gpt-oss tool calls use raw_text for parsing."""
+        raw = (
+            "<|start|>assistant<|channel|>analysis<|message|>I need to search.<|end|>"
+            '<|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{"city": "London"}<|call|>'
+        )
+        mock_result = {
+            "text": "I need to search.",
+            "raw_text": raw,
+            "done": True,
+            "stats": TimingStats(prompt_eval_count=10, eval_count=20),
+        }
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-oss",
+                    "messages": [{"role": "user", "content": "weather?"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        msg = data["choices"][0]["message"]
+        assert msg["tool_calls"] is not None
+        assert len(msg["tool_calls"]) == 1
+        assert msg["tool_calls"][0]["function"]["name"] == "get_weather"
+
+    @pytest.mark.asyncio
+    async def test_streaming_gpt_oss_tool_call(self, app_client):
+        """gpt-oss models emit tool calls in commentary channel via raw_text.
+
+        The channel filter suppresses commentary from the visible text stream,
+        but raw_text must carry the full unfiltered output so the router can
+        parse tool calls from it.
+        """
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                # Channel filter yields analysis as fallback text, but raw_text
+                # carries the full channel-tagged output including commentary.
+                yield {
+                    "text": "I need to search.",
+                    "done": False,
+                    "raw_text": "<|start|>assistant<|channel|>analysis<|message|>I need to search.<|end|>",
+                }
+                yield {
+                    "text": "",
+                    "done": False,
+                    "raw_text": '<|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{"city": "London"}<|call|>',
+                }
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-oss",
+                    "messages": [{"role": "user", "content": "weather?"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        events = []
+        for line in resp.text.strip().split("\n"):
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+
+        # Must have tool call chunks
+        tool_chunks = [
+            e
+            for e in events
+            if e.get("choices", [{}])[0].get("delta", {}).get("tool_calls")
+        ]
+        assert len(tool_chunks) >= 1, f"Expected tool call chunks, got events: {events}"
+
+        # Verify tool call name
+        tc = tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]
+        assert tc["function"]["name"] == "get_weather"
 
     @pytest.mark.asyncio
     async def test_response_format_json_schema_accepted(self, app_client):
