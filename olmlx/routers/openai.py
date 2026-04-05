@@ -93,12 +93,12 @@ def _strip_thinking_streaming(text: str, state: dict) -> str:
 
             if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
                 # Orphaned </think> — discard everything before it.
-                buf = buf[close_idx + len("</think>"):]
+                buf = buf[close_idx + len("</think>") :]
                 phase = "passthrough"
             elif open_idx != -1:
                 # Normal <think> — emit text before it, enter in_think.
                 out_parts.append(buf[:open_idx])
-                buf = buf[open_idx + len("<think>"):]
+                buf = buf[open_idx + len("<think>") :]
                 phase = "in_think"
             else:
                 # Neither tag yet — keep buffering.  Check for partial tags
@@ -117,7 +117,7 @@ def _strip_thinking_streaming(text: str, state: dict) -> str:
             if end == -1:
                 buf = ""
             else:
-                buf = buf[end + len("</think>"):]
+                buf = buf[end + len("</think>") :]
                 phase = "passthrough"
 
         else:  # passthrough
@@ -136,7 +136,7 @@ def _strip_thinking_streaming(text: str, state: dict) -> str:
                     buf = ""
             else:
                 out_parts.append(buf[:open_idx])
-                buf = buf[open_idx + len("<think>"):]
+                buf = buf[open_idx + len("<think>") :]
                 phase = "in_think"
 
     state["buffer"] = buf
@@ -159,7 +159,13 @@ def _flush_thinking_buffer(state: dict) -> str:
 
 
 async def _stream_openai_sse(
-    result, response_id, model, created, object_type, format_content, format_done,
+    result,
+    response_id,
+    model,
+    created,
+    object_type,
+    format_content,
+    format_done,
     strip_thinking=False,
 ):
     """Shared SSE streaming for OpenAI-compatible endpoints.
@@ -250,18 +256,23 @@ async def _stream_openai_sse_with_tools(result, response_id, model, created):
         _thinking, visible_text, tool_uses = parse_model_output(full_text, True)
         logger.debug(
             "Buffered tool stream (%d chars): thinking=%d visible=%d tool_uses=%d raw=%s",
-            len(full_text), len(_thinking), len(visible_text), len(tool_uses),
+            len(full_text),
+            len(_thinking),
+            len(visible_text),
+            len(tool_uses),
             full_text[:2000],
         )
 
         def _chunk(choices_0):
-            return json.dumps({
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, **choices_0}],
-            })
+            return json.dumps(
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, **choices_0}],
+                }
+            )
 
         if tool_uses:
             tool_calls = _to_openai_tool_calls(tool_uses)
@@ -395,7 +406,10 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         if req.tools:
             return StreamingResponse(
                 _stream_openai_sse_with_tools(
-                    result, chat_id, req.model, created,
+                    result,
+                    chat_id,
+                    req.model,
+                    created,
                 ),
                 media_type="text/event-stream",
             )

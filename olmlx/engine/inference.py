@@ -393,6 +393,26 @@ def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
             "Model has no 'args' attribute (checked model.args, "
             "model.language_model.args/config, model.config)"
         )
+
+    # MLA (Multi-head Latent Attention) models like DeepSeek V3 compress the
+    # KV cache to (kv_lora_rank + qk_rope_head_dim) per layer instead of
+    # (2 * num_kv_heads * head_dim).  Detect via kv_lora_rank in model args.
+    kv_lora_rank = getattr(args, "kv_lora_rank", None)
+    if isinstance(kv_lora_rank, int) and kv_lora_rank > 0:
+        qk_rope_head_dim = getattr(args, "qk_rope_head_dim", 0)
+        num_layers = args.num_hidden_layers
+        bytes_per_element = 2  # float16/bfloat16
+        # MLA stores compressed_kv (kv_lora_rank dims) as keys and
+        # k_pe (qk_rope_head_dim dims) as values, each with 1 effective head.
+        raw = (
+            num_layers
+            * 2
+            * (kv_lora_rank + qk_rope_head_dim)
+            * num_tokens
+            * bytes_per_element
+        )
+        return int(raw * MEMORY_SAFETY_FACTOR)
+
     num_heads = args.num_attention_heads
     head_dim = (
         args.head_dim if hasattr(args, "head_dim") else args.hidden_size // num_heads

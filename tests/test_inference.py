@@ -2409,6 +2409,37 @@ class TestEstimateKvCacheBytes:
         expected_raw = 32 * 2 * 8 * 128 * 1000 * 2
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
+    def test_mla_model_uses_compressed_kv_dimensions(self):
+        """MLA models (DeepSeek V3) store compressed KV: kv_lora_rank + qk_rope_head_dim per layer.
+
+        The KV cache should NOT use num_key_value_heads * head_dim (which is the
+        uncompressed attention dimension), but instead kv_lora_rank + qk_rope_head_dim.
+        """
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 61
+        args.num_attention_heads = 128
+        args.num_key_value_heads = 128
+        args.hidden_size = 7168
+        args.kv_lora_rank = 512
+        args.qk_rope_head_dim = 64
+        model = MagicMock(spec=[])
+        model.args = args
+
+        result = _estimate_kv_cache_bytes(model, 1000)
+
+        # MLA cache per layer per token: (kv_lora_rank + qk_rope_head_dim) * 2 bytes
+        # = (512 + 64) * 2 = 1152 bytes  (keys=compressed_kv, values=k_pe, 1 "head" each)
+        # Total raw = 61 * (512 + 64) * 2 * 1000 * 2 = 140_608_000
+        # Note: factor of 2 for K+V cache entries (compressed_kv stored as keys,
+        # k_pe stored as values — both have 1 effective head).
+        expected_raw = 61 * 2 * (512 + 64) * 1000 * 2
+        assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+        # Verify it's dramatically less than the naive MHA estimate
+        naive_head_dim = 7168 // 128  # = 56
+        naive_raw = 61 * 2 * 128 * naive_head_dim * 1000 * 2
+        assert result < naive_raw  # MLA should be ~25x smaller
+
 
 class TestKvCachePreflightCheck:
     """Tests for the pre-flight KV cache memory check in _stream_completion."""

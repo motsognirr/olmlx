@@ -503,9 +503,11 @@ def parse_model_output(
         orphan_thinking = text[:orphan_idx].strip()
         if orphan_thinking:
             thinking = (
-                f"{thinking}\n{orphan_thinking}".strip() if thinking else orphan_thinking
+                f"{thinking}\n{orphan_thinking}".strip()
+                if thinking
+                else orphan_thinking
             )
-        text = text[orphan_idx + len("</think>"):].lstrip("\n")
+        text = text[orphan_idx + len("</think>") :].lstrip("\n")
 
     tool_uses: list[dict] = []
     if has_tools:
