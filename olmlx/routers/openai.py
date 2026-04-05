@@ -12,6 +12,7 @@ from olmlx.engine.inference import (
     generate_completion,
     generate_embeddings,
 )
+from olmlx.engine.tool_parser import parse_model_output
 from olmlx.schemas.openai import (
     OpenAIChatMessage,
     OpenAIChatRequest,
@@ -41,19 +42,149 @@ def _make_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
 
+def _to_openai_tool_calls(tool_uses: list[dict]) -> list[dict]:
+    """Convert parsed tool_use blocks to OpenAI tool_calls format."""
+    return [
+        {
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {
+                "name": tu["name"],
+                "arguments": json.dumps(tu.get("input", {})),
+            },
+        }
+        for tu in tool_uses
+    ]
+
+
+def _strip_thinking_streaming(text: str, state: dict) -> str:
+    """Strip ``<think>...</think>`` blocks from streaming text chunks.
+
+    Uses *state* dict to track position across calls.  Keys:
+
+    - ``phase``: one of ``"detect"``, ``"in_think"``, ``"passthrough"``
+    - ``buffer``: accumulated text waiting to be resolved
+
+    **Phases:**
+
+    ``detect`` (initial) — The chat template may have opened ``<think>``
+    inside the prompt, so the generated text could start mid-think with
+    only a closing ``</think>``.  We buffer all content until we can
+    determine which case we're in:
+
+    * ``</think>`` seen first → discard buffer (orphaned thinking),
+      switch to ``passthrough``.
+    * ``<think>`` seen first → emit buffer, switch to ``in_think``.
+    * Neither tag after the stream ends → emit buffer (no thinking).
+
+    ``in_think`` — Inside a ``<think>`` block; discard until ``</think>``.
+
+    ``passthrough`` — Emit everything, but still strip any new
+    ``<think>...</think>`` blocks that appear later.
+    """
+    buf = state.get("buffer", "") + text
+    out_parts: list[str] = []
+    phase = state.get("phase", "detect")
+
+    while buf:
+        if phase == "detect":
+            open_idx = buf.find("<think>")
+            close_idx = buf.find("</think>")
+
+            if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
+                # Orphaned </think> — discard everything before it.
+                buf = buf[close_idx + len("</think>"):]
+                phase = "passthrough"
+            elif open_idx != -1:
+                # Normal <think> — emit text before it, enter in_think.
+                out_parts.append(buf[:open_idx])
+                buf = buf[open_idx + len("<think>"):]
+                phase = "in_think"
+            else:
+                # Neither tag yet — keep buffering.  Check for partial tags
+                # at the end so we don't emit a half-tag.
+                longest_partial = 0
+                for tag in ("<think>", "</think>"):
+                    for i in range(1, min(len(tag), len(buf) + 1)):
+                        if tag.startswith(buf[-i:]):
+                            longest_partial = max(longest_partial, i)
+                # Hold the entire buffer (don't emit) — we can't be sure
+                # the text before a potential </think> isn't thinking.
+                break
+
+        elif phase == "in_think":
+            end = buf.find("</think>")
+            if end == -1:
+                buf = ""
+            else:
+                buf = buf[end + len("</think>"):]
+                phase = "passthrough"
+
+        else:  # passthrough
+            open_idx = buf.find("<think>")
+            if open_idx == -1:
+                longest_partial = 0
+                for i in range(1, min(len("<think>"), len(buf) + 1)):
+                    if "<think>".startswith(buf[-i:]):
+                        longest_partial = i
+                        break
+                if longest_partial:
+                    out_parts.append(buf[:-longest_partial])
+                    buf = buf[-longest_partial:]
+                else:
+                    out_parts.append(buf)
+                    buf = ""
+            else:
+                out_parts.append(buf[:open_idx])
+                buf = buf[open_idx + len("<think>"):]
+                phase = "in_think"
+
+    state["buffer"] = buf
+    state["phase"] = phase
+    return "".join(out_parts)
+
+
+def _flush_thinking_buffer(state: dict) -> str:
+    """Flush any remaining buffer when the stream ends.
+
+    If we're still in ``detect`` phase (never saw any think tag),
+    the buffered content is real output — emit it.
+    """
+    buf = state.get("buffer", "")
+    phase = state.get("phase", "detect")
+    state["buffer"] = ""
+    if phase == "detect":
+        return buf
+    return ""
+
+
 async def _stream_openai_sse(
-    result, response_id, model, created, object_type, format_content, format_done
+    result, response_id, model, created, object_type, format_content, format_done,
+    strip_thinking=False,
 ):
     """Shared SSE streaming for OpenAI-compatible endpoints.
 
     format_content(text) -> choices[0] dict for content chunks
     format_done() -> choices[0] dict for the final chunk
     """
+    think_state: dict = {} if strip_thinking else {}
     try:
         async for chunk in result:
             if chunk.get("cache_info"):
                 continue
             if chunk.get("done"):
+                # Flush any buffered content from thinking detection.
+                if strip_thinking:
+                    flushed = _flush_thinking_buffer(think_state)
+                    if flushed:
+                        data = {
+                            "id": response_id,
+                            "object": object_type,
+                            "created": created,
+                            "model": model,
+                            "choices": [format_content(flushed)],
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
                 data = {
                     "id": response_id,
                     "object": object_type,
@@ -64,14 +195,112 @@ async def _stream_openai_sse(
                 yield f"data: {json.dumps(data)}\n\n"
                 yield "data: [DONE]\n\n"
             else:
+                text = chunk.get("text", "")
+                if strip_thinking:
+                    text = _strip_thinking_streaming(text, think_state)
+                if not text:
+                    continue
                 data = {
                     "id": response_id,
                     "object": object_type,
                     "created": created,
                     "model": model,
-                    "choices": [format_content(chunk.get("text", ""))],
+                    "choices": [format_content(text)],
                 }
                 yield f"data: {json.dumps(data)}\n\n"
+    except Exception as exc:
+        logger.error("Error during OpenAI streaming: %s", exc, exc_info=True)
+        error_payload = json.dumps(
+            {
+                "error": {
+                    "message": "An internal server error occurred during streaming.",
+                    "type": "server_error",
+                    "code": "internal_error",
+                }
+            }
+        )
+        yield f"data: {error_payload}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        await result.aclose()
+
+
+async def _stream_openai_sse_with_tools(result, response_id, model, created):
+    """Buffer full output, parse tool calls, then emit OpenAI-compliant SSE.
+
+    Matches the exact chunk sequence that OpenAI produces and that the
+    Vercel AI SDK (used by Opencode) expects:
+
+    1. Role chunk:  delta={role: "assistant", content: null}
+    2. (Optional) Content chunks if visible text precedes tool calls
+    3. Per tool call:
+       a. Intro:  delta={tool_calls: [{index, id, type, function: {name, arguments: ""}}]}
+       b. Args:   delta={tool_calls: [{index, function: {arguments: "<json>"}}]}
+    4. Done:  delta={}, finish_reason="tool_calls"
+    """
+    full_text = ""
+    try:
+        async for chunk in result:
+            if chunk.get("cache_info"):
+                continue
+            if chunk.get("done"):
+                break
+            full_text += chunk.get("text", "")
+
+        _thinking, visible_text, tool_uses = parse_model_output(full_text, True)
+        logger.debug(
+            "Buffered tool stream (%d chars): thinking=%d visible=%d tool_uses=%d raw=%s",
+            len(full_text), len(_thinking), len(visible_text), len(tool_uses),
+            full_text[:2000],
+        )
+
+        def _chunk(choices_0):
+            return json.dumps({
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, **choices_0}],
+            })
+
+        if tool_uses:
+            tool_calls = _to_openai_tool_calls(tool_uses)
+
+            # 1. Role announcement
+            yield f"data: {_chunk({'delta': {'role': 'assistant', 'content': None}, 'finish_reason': None})}\n\n"
+
+            # 2. Content chunks if visible text present
+            if visible_text:
+                yield f"data: {_chunk({'delta': {'content': visible_text}, 'finish_reason': None})}\n\n"
+
+            # 3. Per-tool-call: intro (name + empty args) then args
+            for i, tc in enumerate(tool_calls):
+                # Intro chunk: id, type, name, empty arguments
+                intro = {
+                    "index": i,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["function"]["name"], "arguments": ""},
+                }
+                yield f"data: {_chunk({'delta': {'tool_calls': [intro]}, 'finish_reason': None})}\n\n"
+
+                # Arguments chunk
+                args_chunk = {
+                    "index": i,
+                    "function": {"arguments": tc["function"]["arguments"]},
+                }
+                yield f"data: {_chunk({'delta': {'tool_calls': [args_chunk]}, 'finish_reason': None})}\n\n"
+
+            # 4. Done
+            yield f"data: {_chunk({'delta': {}, 'finish_reason': 'tool_calls'})}\n\n"
+        else:
+            # No tool calls — emit as normal content
+            yield f"data: {_chunk({'delta': {'role': 'assistant', 'content': None}, 'finish_reason': None})}\n\n"
+            if visible_text:
+                yield f"data: {_chunk({'delta': {'content': visible_text}, 'finish_reason': None})}\n\n"
+            yield f"data: {_chunk({'delta': {}, 'finish_reason': 'stop'})}\n\n"
+
+        yield "data: [DONE]\n\n"
     except Exception as exc:
         logger.error("Error during OpenAI streaming: %s", exc, exc_info=True)
         error_payload = json.dumps(
@@ -108,6 +337,15 @@ def _build_options(req) -> dict:
 
 @router.post("/v1/chat/completions")
 async def openai_chat(req: OpenAIChatRequest, request: Request):
+    logger.info(
+        "OpenAI chat request: model=%s stream=%s tools=%d messages=%d max_tokens=%s max_completion_tokens=%s",
+        req.model,
+        req.stream,
+        len(req.tools or []),
+        len(req.messages),
+        req.max_tokens,
+        req.max_completion_tokens,
+    )
     manager = request.app.state.model_manager
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
     if req.response_format and req.response_format.type in (
@@ -154,6 +392,14 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             cache_id=cache_id,
         )
 
+        if req.tools:
+            return StreamingResponse(
+                _stream_openai_sse_with_tools(
+                    result, chat_id, req.model, created,
+                ),
+                media_type="text/event-stream",
+            )
+
         return StreamingResponse(
             _stream_openai_sse(
                 result,
@@ -167,6 +413,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
                     "finish_reason": None,
                 },
                 lambda: {"index": 0, "delta": {}, "finish_reason": "stop"},
+                strip_thinking=True,
             ),
             media_type="text/event-stream",
         )
@@ -182,7 +429,18 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             cache_id=cache_id,
         )
         text = result.get("text", "")
+        logger.debug("Raw model output (%d chars): %s", len(text), text[:1000])
         usage = OpenAIUsage.from_stats(result.get("stats"))
+
+        has_tools = bool(req.tools)
+        _thinking, visible_text, tool_uses = parse_model_output(text, has_tools)
+
+        tool_calls = _to_openai_tool_calls(tool_uses) if tool_uses else None
+        finish_reason = "tool_calls" if tool_uses else "stop"
+        content = visible_text
+        if not content:
+            content = None
+
         return OpenAIChatResponse(
             id=chat_id,
             created=created,
@@ -190,8 +448,12 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             choices=[
                 OpenAIChoice(
                     index=0,
-                    message=OpenAIChatMessage(role="assistant", content=text),
-                    finish_reason="stop",
+                    message=OpenAIChatMessage(
+                        role="assistant",
+                        content=content,
+                        tool_calls=tool_calls,
+                    ),
+                    finish_reason=finish_reason,
                 )
             ],
             usage=usage,

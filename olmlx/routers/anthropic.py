@@ -663,6 +663,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     enable_thinking: bool | None = None
     if req.thinking is not None:
         enable_thinking = _THINKING_TYPE_MAP.get(req.thinking.type)
+        logger.debug(
+            "enable_thinking=%s (thinking.type=%s)", enable_thinking, req.thinking.type
+        )
         if req.thinking.budget_tokens is not None:
             logger.info(
                 "budget_tokens=%d received but not supported (thinking is on/off only)",

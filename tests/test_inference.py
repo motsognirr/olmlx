@@ -673,6 +673,151 @@ class TestApplyChatTemplateVlm:
         assert result == "result"
 
 
+class TestGemma4TemplateOrdering:
+    """Document Gemma 4 template ordering: system prompt before tool declarations.
+
+    Gemma 4's chat template places the system prompt content *before* native
+    ``<|tool>`` declarations.  When the system prompt is long and contains its
+    own natural-language tool-usage instructions (e.g. Claude Code's system
+    prompt), the model may follow those instructions instead of producing
+    native ``<|tool_call>`` output.
+
+    Qwen 3.5's template avoids this by placing explicit tool-calling format
+    instructions (with examples) *before* the system prompt.
+    """
+
+    GEMMA4_TEMPLATE = (
+        "/Users/daniel/.olmlx/models/"
+        "mlx-community_gemma-4-26b-a4b-it-4bit/chat_template.jinja"
+    )
+    QWEN35_TEMPLATE = (
+        "/Users/daniel/.olmlx/models/mlx-community_Qwen3.5-27B-4bit/chat_template.jinja"
+    )
+
+    @staticmethod
+    def _render(template_path, messages, tools=None, enable_thinking=None):
+        """Render a Jinja2 chat template from file."""
+        import os
+
+        from jinja2 import BaseLoader, Environment
+
+        if not os.path.exists(template_path):
+            pytest.skip(f"Template not found: {template_path}")
+
+        with open(template_path) as f:
+            source = f.read()
+
+        env = Environment(loader=BaseLoader())
+        env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(
+            ValueError(msg)
+        )
+        tmpl = env.from_string(source)
+
+        kwargs = {
+            "messages": messages,
+            "add_generation_prompt": True,
+            "bos_token": "<bos>",
+        }
+        if tools:
+            kwargs["tools"] = tools
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
+        return tmpl.render(**kwargs)
+
+    def test_gemma4_system_before_tools(self):
+        """Gemma 4 places system content before <|tool> declarations."""
+        messages = [
+            {"role": "system", "content": "SYSTEM_MARKER"},
+            {"role": "user", "content": "hello"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run a command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The command",
+                            }
+                        },
+                        "required": ["command"],
+                    },
+                },
+            }
+        ]
+        prompt = self._render(self.GEMMA4_TEMPLATE, messages, tools=tools)
+        sys_pos = prompt.find("SYSTEM_MARKER")
+        tool_pos = prompt.find("<|tool>")
+        assert sys_pos != -1, "System content not found in prompt"
+        assert tool_pos != -1, "Tool declaration not found in prompt"
+        assert sys_pos < tool_pos, (
+            f"Expected system content (pos {sys_pos}) before tool declarations "
+            f"(pos {tool_pos}), but tools came first"
+        )
+
+    def test_qwen35_tools_before_system(self):
+        """Qwen 3.5 places tool instructions before system content."""
+        messages = [
+            {"role": "system", "content": "SYSTEM_MARKER"},
+            {"role": "user", "content": "hello"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run a command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The command",
+                            }
+                        },
+                        "required": ["command"],
+                    },
+                },
+            }
+        ]
+        prompt = self._render(self.QWEN35_TEMPLATE, messages, tools=tools)
+        sys_pos = prompt.find("SYSTEM_MARKER")
+        tool_pos = prompt.find("# Tools")
+        assert sys_pos != -1, "System content not found in prompt"
+        assert tool_pos != -1, "Tool instructions not found in prompt"
+        assert tool_pos < sys_pos, (
+            f"Expected tool instructions (pos {tool_pos}) before system content "
+            f"(pos {sys_pos}), but system came first"
+        )
+
+    def test_gemma4_thinking_disabled_by_default(self):
+        """When enable_thinking is not passed, Gemma 4 forces empty thinking."""
+        messages = [
+            {"role": "user", "content": "hello"},
+        ]
+        prompt = self._render(self.GEMMA4_TEMPLATE, messages)
+        assert "<|channel>thought\n<channel|>" in prompt, (
+            "Expected empty thinking block when enable_thinking is not set"
+        )
+
+    def test_gemma4_thinking_enabled(self):
+        """When enable_thinking=True, Gemma 4 allows the model to think."""
+        messages = [
+            {"role": "user", "content": "hello"},
+        ]
+        prompt = self._render(self.GEMMA4_TEMPLATE, messages, enable_thinking=True)
+        assert "<|think|>" in prompt, (
+            "Expected <|think|> token when enable_thinking=True"
+        )
+        assert "<|channel>thought\n<channel|>" not in prompt, (
+            "Should NOT force empty thinking when enable_thinking=True"
+        )
+
+
 class TestGenerateCompletion:
     @pytest.mark.asyncio
     async def test_non_streaming(self, mock_manager):

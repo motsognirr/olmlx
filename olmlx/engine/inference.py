@@ -1761,6 +1761,8 @@ async def generate_chat(
             )
         else:
             prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages, images)
+        logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
+        logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
         if enable_thinking is not None and vlm_thinking is None:
             logger.debug(
                 "enable_thinking=%s ignored for VLM model (template does not support it)",
@@ -1776,7 +1778,8 @@ async def generate_chat(
         )
         if tools:
             logger.info("Chat prompt with %d tools", len(tools))
-        logger.debug("Prompt (first 1000 chars): %s", prompt[:1000])
+        logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
+        logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
 
     # Merge per-model defaults with request options.  options=None means
     # "use defaults"; options={} means "override all defaults" (empty).

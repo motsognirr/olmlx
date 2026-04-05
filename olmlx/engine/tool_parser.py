@@ -496,6 +496,17 @@ def parse_model_output(
         thinking = f"{thinking}\n{think_text}".strip() if thinking else think_text
         text = _THINK_RE.sub("", text)
 
+    # Handle orphaned </think> — the chat template may open <think> in the
+    # prompt so the generated text starts mid-think with only a closing tag.
+    orphan_idx = text.find("</think>")
+    if orphan_idx != -1:
+        orphan_thinking = text[:orphan_idx].strip()
+        if orphan_thinking:
+            thinking = (
+                f"{thinking}\n{orphan_thinking}".strip() if thinking else orphan_thinking
+            )
+        text = text[orphan_idx + len("</think>"):].lstrip("\n")
+
     tool_uses: list[dict] = []
     if has_tools:
         parsers = [

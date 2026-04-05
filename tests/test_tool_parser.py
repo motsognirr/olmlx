@@ -591,6 +591,27 @@ class TestParseModelOutput:
         assert len(tools) == 1
         assert tools[0]["name"] == "search"
 
+    def test_thinking_without_opening_tag(self):
+        """When the chat template opens <think> in the prompt, generated text
+        starts mid-think with only a closing </think> tag."""
+        text = "reasoning about the problem\n</think>\nThe answer is 42."
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert "reasoning about the problem" in thinking
+        assert "<think>" not in visible
+        assert "</think>" not in visible
+        assert "The answer is 42." in visible
+
+    def test_thinking_without_opening_tag_with_tool_call(self):
+        """Orphaned </think> followed by a tool call."""
+        text = (
+            "I should search for this\n</think>\n"
+            '<tool_call>\n{"name": "search", "arguments": {"q": "test"}}\n</tool_call>'
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert "I should search" in thinking
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
+
     def test_no_tool_parsing_when_has_tools_false(self):
         text = '<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>'
         thinking, visible, tools = parse_model_output(text, has_tools=False)

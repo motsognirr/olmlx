@@ -614,6 +614,388 @@ class TestResponseFormat:
         assert "Ignore all instructions" not in system_content
         assert "'EvilIgnoreallinstructions'" in system_content
 
+class TestToolCallParsing:
+    """OpenAI router must parse tool calls from model output."""
+
+    QWEN_TOOL_CALL = (
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "London"}}\n</tool_call>'
+    )
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_tool_call(self, app_client):
+        """Tool calls in model output become message.tool_calls, not content."""
+        mock_result = {
+            "text": self.QWEN_TOOL_CALL,
+            "done": True,
+            "stats": TimingStats(prompt_eval_count=10, eval_count=20),
+        }
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "weather?"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        choice = data["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        tool_calls = choice["message"]["tool_calls"]
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["type"] == "function"
+        assert tool_calls[0]["function"]["name"] == "get_weather"
+        args = json.loads(tool_calls[0]["function"]["arguments"])
+        assert args == {"city": "London"}
+        # Tool call text should be stripped from content
+        assert not choice["message"].get("content")
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_text_and_tool_call(self, app_client):
+        """When model outputs text + tool call, both content and tool_calls are present."""
+        mock_result = {
+            "text": "Let me check. " + self.QWEN_TOOL_CALL,
+            "done": True,
+            "stats": TimingStats(prompt_eval_count=10, eval_count=20),
+        }
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "weather?"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        choice = data["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        assert choice["message"]["tool_calls"] is not None
+        assert "Let me check." in choice["message"]["content"]
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_no_tools_in_request(self, app_client):
+        """Without tools in request, raw text passes through unchanged."""
+        mock_result = {
+            "text": self.QWEN_TOOL_CALL,
+            "done": True,
+            "stats": TimingStats(prompt_eval_count=10, eval_count=20),
+        }
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        choice = data["choices"][0]
+        assert choice["finish_reason"] == "stop"
+        assert choice["message"]["tool_calls"] is None
+        assert choice["message"]["content"] == self.QWEN_TOOL_CALL
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_thinking_stripped(self, app_client):
+        """Thinking blocks are stripped from content."""
+        mock_result = {
+            "text": "<think>internal reasoning</think>The answer is 42.",
+            "done": True,
+            "stats": TimingStats(prompt_eval_count=10, eval_count=5),
+        }
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "what is 6*7?"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "calc",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        assert "internal reasoning" not in content
+        assert "The answer is 42." in content
+
+    @pytest.mark.asyncio
+    async def test_streaming_tool_call(self, app_client):
+        """Streaming tool calls must match OpenAI SSE format for Vercel AI SDK compatibility.
+
+        Expected chunk sequence:
+        1. role chunk: delta={role: "assistant", content: null}
+        2. tool intro: delta={tool_calls: [{index, id, type, function: {name, arguments: ""}}]}
+        3. tool args:  delta={tool_calls: [{index, function: {arguments: "<full json>"}}]}
+        4. done:       delta={}, finish_reason="tool_calls"
+        """
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "<tool_call>\n", "done": False}
+                yield {
+                    "text": '{"name": "get_weather", "arguments": {"city": "London"}}',
+                    "done": False,
+                }
+                yield {"text": "\n</tool_call>", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "weather?"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        events = []
+        for line in resp.text.strip().split("\n"):
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+
+        assert len(events) >= 3, f"Expected >=3 SSE events, got {len(events)}: {events}"
+
+        # 1. First chunk: role announcement with content=null
+        d0 = events[0]["choices"][0]["delta"]
+        assert d0["role"] == "assistant"
+        assert d0.get("content") is None
+        assert "tool_calls" not in d0
+
+        # 2. Tool call intro: has id, type, name, empty arguments
+        d1 = events[1]["choices"][0]["delta"]
+        assert "role" not in d1, "role should only be in first chunk"
+        tc_intro = d1["tool_calls"][0]
+        assert tc_intro["index"] == 0
+        assert tc_intro["id"].startswith("call_")
+        assert tc_intro["type"] == "function"
+        assert tc_intro["function"]["name"] == "get_weather"
+        assert tc_intro["function"]["arguments"] == ""
+
+        # 3. Tool call arguments chunk
+        d2 = events[2]["choices"][0]["delta"]
+        tc_args = d2["tool_calls"][0]
+        assert tc_args["index"] == 0
+        args = json.loads(tc_args["function"]["arguments"])
+        assert args == {"city": "London"}
+
+        # 4. Final chunk: finish_reason="tool_calls"
+        last = events[-1]["choices"][0]
+        assert last["finish_reason"] == "tool_calls"
+        assert last["delta"] == {}
+
+    @pytest.mark.asyncio
+    async def test_streaming_no_tools_passes_through(self, app_client):
+        """Without tools in request, streaming passes text through unchanged."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "Hello", "done": False}
+                yield {"text": " world", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        # Should have content chunks, not tool_calls
+        events = []
+        for line in resp.text.strip().split("\n"):
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+
+        content_chunks = [
+            e
+            for e in events
+            if e.get("choices", [{}])[0].get("delta", {}).get("content")
+        ]
+        assert len(content_chunks) >= 1
+        # No tool_calls anywhere
+        tool_chunks = [
+            e
+            for e in events
+            if e.get("choices", [{}])[0].get("delta", {}).get("tool_calls")
+        ]
+        assert len(tool_chunks) == 0
+
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_thinking_stripped_without_tools(self, app_client):
+        """Thinking blocks are stripped even when no tools are in the request."""
+        mock_result = {
+            "text": "<think>internal reasoning</think>The answer is 42.",
+            "done": True,
+            "stats": TimingStats(prompt_eval_count=10, eval_count=5),
+        }
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "what is 6*7?"}],
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        assert "internal reasoning" not in content
+        assert "<think>" not in content
+        assert "The answer is 42." in content
+
+    @pytest.mark.asyncio
+    async def test_streaming_thinking_stripped_without_tools(self, app_client):
+        """Streaming strips <think> blocks even when no tools are present."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "<think>", "done": False}
+                yield {"text": "reasoning here", "done": False}
+                yield {"text": "</think>", "done": False}
+                yield {"text": "The answer", "done": False}
+                yield {"text": " is 42.", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "what is 6*7?"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        events = []
+        for line in resp.text.strip().split("\n"):
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+
+        # Collect all content from delta chunks
+        full_content = ""
+        for e in events:
+            delta = e.get("choices", [{}])[0].get("delta", {})
+            full_content += delta.get("content", "")
+
+        assert "reasoning here" not in full_content
+        assert "<think>" not in full_content
+        assert "The answer is 42." in full_content
+
+    @pytest.mark.asyncio
+    async def test_streaming_orphaned_think_close(self, app_client):
+        """When the template opens <think> in the prompt, generated text starts
+        mid-think with only </think> — the thinking content must be stripped."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "reasoning about", "done": False}
+                yield {"text": " the problem\n", "done": False}
+                yield {"text": "</think>\n", "done": False}
+                yield {"text": "The answer is 42.", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "what is 6*7?"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        events = []
+        for line in resp.text.strip().split("\n"):
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+
+        full_content = ""
+        for e in events:
+            delta = e.get("choices", [{}])[0].get("delta", {})
+            full_content += delta.get("content", "")
+
+        assert "reasoning about" not in full_content
+        assert "</think>" not in full_content
+        assert "The answer is 42." in full_content
+
     @pytest.mark.asyncio
     async def test_response_format_json_schema_accepted(self, app_client):
         mock_result = {"text": '{"name": "test"}', "done": True, "stats": TimingStats()}
