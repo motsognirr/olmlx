@@ -282,8 +282,8 @@ class TestConvertToolMessagesToResponses:
         result = _convert_tool_messages_to_responses(messages)
         assert result == messages
 
-    def test_tool_message_converted_to_tool_responses(self):
-        """role=tool messages become tool_responses on a user message."""
+    def test_tool_message_merged_into_preceding_assistant(self):
+        """role=tool messages become tool_responses on the preceding assistant message."""
         from olmlx.engine.inference import _convert_tool_messages_to_responses
 
         messages = [
@@ -305,15 +305,16 @@ class TestConvertToolMessagesToResponses:
         result = _convert_tool_messages_to_responses(messages)
         # role=tool message should be gone
         assert not any(m.get("role") == "tool" for m in result)
-        # Should have a user message with tool_responses
-        tool_resp_msg = [m for m in result if "tool_responses" in m]
-        assert len(tool_resp_msg) == 1
-        assert tool_resp_msg[0]["tool_responses"] == [
+        # tool_responses should be on the assistant message (index 1)
+        assert result[1]["role"] == "assistant"
+        assert result[1]["tool_responses"] == [
             {"name": "search", "response": "found 3 cats"}
         ]
+        # user message still present
+        assert result[2] == {"role": "user", "content": "thanks"}
 
-    def test_multiple_tool_results_grouped(self):
-        """Multiple consecutive tool messages become one tool_responses array."""
+    def test_multiple_tool_results_merged_into_assistant(self):
+        """Multiple consecutive tool messages merged into preceding assistant."""
         from olmlx.engine.inference import _convert_tool_messages_to_responses
 
         messages = [
@@ -338,11 +339,13 @@ class TestConvertToolMessagesToResponses:
             {"role": "tool", "tool_call_id": "tc2", "content": "ok"},
         ]
         result = _convert_tool_messages_to_responses(messages)
-        tool_resp_msg = [m for m in result if "tool_responses" in m]
-        assert len(tool_resp_msg) == 1
-        assert len(tool_resp_msg[0]["tool_responses"]) == 2
-        assert tool_resp_msg[0]["tool_responses"][0]["name"] == "read"
-        assert tool_resp_msg[0]["tool_responses"][1]["name"] == "write"
+        # Both tool responses merged into the assistant message
+        assert result[1]["role"] == "assistant"
+        assert len(result[1]["tool_responses"]) == 2
+        assert result[1]["tool_responses"][0]["name"] == "read"
+        assert result[1]["tool_responses"][1]["name"] == "write"
+        # Only 2 messages remain (user + assistant)
+        assert len(result) == 2
 
     def test_tool_name_resolved_from_preceding_assistant(self):
         """Tool name is resolved from the assistant's tool_calls by matching tool_call_id."""
@@ -1342,9 +1345,10 @@ class TestGenerateChatVlm:
         tpl_call.assert_called_once()
         passed_messages = tpl_call.call_args[0][0]
         assert not any(m.get("role") == "tool" for m in passed_messages)
-        # Should have a message with tool_responses
+        # tool_responses should be merged into the assistant message
         tool_resp_msgs = [m for m in passed_messages if "tool_responses" in m]
         assert len(tool_resp_msgs) == 1
+        assert tool_resp_msgs[0]["role"] == "assistant"
         assert tool_resp_msgs[0]["tool_responses"][0]["name"] == "Bash"
         assert tool_resp_msgs[0]["tool_responses"][0]["response"] == "file1\nfile2"
 

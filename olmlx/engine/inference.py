@@ -764,15 +764,16 @@ def _convert_tool_messages_to_responses(messages: list[dict]) -> list[dict]:
     """Convert ``role: "tool"`` messages to ``tool_responses`` format.
 
     Some models (e.g. Gemma 4) don't support OpenAI-style ``role: "tool"``
-    messages.  Instead they expect a ``tool_responses`` array on a message.
-    This function collects consecutive tool messages, resolves each tool's
-    name from the preceding assistant's ``tool_calls``, and emits a synthetic
-    user message carrying the ``tool_responses`` list.
+    messages.  Instead they expect a ``tool_responses`` array merged into the
+    preceding assistant message that made the ``tool_calls``.  This keeps
+    tool responses inside the model turn, which is critical — the template
+    omits ``<turn|>`` after tool_responses so the model continues in the same
+    turn.  Placing them on a separate user message would put the model's
+    generation inside a user turn, producing degenerate output.
     """
     if not any(m.get("role") == "tool" for m in messages):
         return messages
 
-    result: list[dict] = []
     # Build a mapping from tool_call_id → function name across all assistant messages.
     id_to_name: dict[str, str] = {}
     for m in messages:
@@ -783,23 +784,23 @@ def _convert_tool_messages_to_responses(messages: list[dict]) -> list[dict]:
             if tc_id and name:
                 id_to_name[tc_id] = name
 
-    pending_responses: list[dict] = []
-
-    def _flush_pending() -> None:
-        if pending_responses:
-            result.append({"role": "user", "tool_responses": list(pending_responses)})
-            pending_responses.clear()
-
+    result: list[dict] = []
     for m in messages:
         if m.get("role") == "tool":
             tc_id = m.get("tool_call_id", "")
             name = id_to_name.get(tc_id, "unknown")
-            pending_responses.append({"name": name, "response": m.get("content", "")})
+            resp = {"name": name, "response": m.get("content", "")}
+            # Merge into the preceding assistant message.
+            prev = result[-1] if result else None
+            if prev and prev.get("role") == "assistant":
+                prev.setdefault("tool_responses", []).append(resp)
+            else:
+                # No preceding assistant — shouldn't happen, but create a
+                # model-role message to keep the turn correct.
+                result.append({"role": "assistant", "tool_responses": [resp]})
         else:
-            _flush_pending()
-            result.append(m)
+            result.append(dict(m))  # shallow copy to avoid mutating input
 
-    _flush_pending()
     return result
 
 
