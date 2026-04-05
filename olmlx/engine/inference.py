@@ -770,6 +770,12 @@ def _convert_tool_messages_to_responses(messages: list[dict]) -> list[dict]:
     omits ``<turn|>`` after tool_responses so the model continues in the same
     turn.  Placing them on a separate user message would put the model's
     generation inside a user turn, producing degenerate output.
+
+    For *intermediate* assistant messages (followed by more messages), a
+    newline content placeholder ensures the template emits ``<turn|>`` to
+    properly close the model turn before the next turn opens.  The last
+    assistant message with tool_responses keeps empty content so the model
+    continues generating in the same turn.
     """
     if not any(m.get("role") == "tool" for m in messages):
         return messages
@@ -800,6 +806,21 @@ def _convert_tool_messages_to_responses(messages: list[dict]) -> list[dict]:
                 result.append({"role": "assistant", "tool_responses": [resp]})
         else:
             result.append(dict(m))  # shallow copy to avoid mutating input
+
+    # Ensure intermediate assistant messages with tool_responses get their
+    # model turn closed.  The template omits <turn|> when tool_responses is
+    # present and content is falsy.  Setting content to "\n" makes it truthy
+    # (triggering <turn|>) while rendering as empty after strip_thinking().
+    # The *last* such message keeps empty content so the model can continue
+    # generating in the same turn.
+    for i in range(len(result) - 1):
+        m = result[i]
+        if (
+            m.get("role") == "assistant"
+            and m.get("tool_responses")
+            and not m.get("content")
+        ):
+            m["content"] = "\n"
 
     return result
 

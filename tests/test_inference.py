@@ -310,6 +310,8 @@ class TestConvertToolMessagesToResponses:
         assert result[1]["tool_responses"] == [
             {"name": "search", "response": "found 3 cats"}
         ]
+        # Intermediate assistant gets newline content to close the model turn
+        assert result[1]["content"] == "\n"
         # user message still present
         assert result[2] == {"role": "user", "content": "thanks"}
 
@@ -368,6 +370,68 @@ class TestConvertToolMessagesToResponses:
         result = _convert_tool_messages_to_responses(messages)
         tool_resp_msg = [m for m in result if "tool_responses" in m]
         assert tool_resp_msg[0]["tool_responses"][0]["name"] == "Bash"
+
+    def test_last_assistant_keeps_empty_content(self):
+        """Last assistant with tool_responses keeps empty content for model continuation."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "Bash", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "done"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        # Last message — content stays empty so model turn stays open
+        assert result[1]["content"] == ""
+
+    def test_intermediate_assistant_gets_newline_content(self):
+        """Intermediate assistant with tool_responses gets newline to close model turn."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "Bash", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "file1"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc2",
+                        "type": "function",
+                        "function": {"name": "Read", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc2", "content": "contents"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        # First assistant (intermediate) gets newline to close turn
+        assert result[1]["content"] == "\n"
+        assert result[1]["tool_responses"][0]["name"] == "Bash"
+        # Second assistant (last) keeps empty content
+        assert result[2]["content"] == ""
+        assert result[2]["tool_responses"][0]["name"] == "Read"
 
     def test_original_messages_not_modified(self):
         """Conversion does not mutate the input list."""

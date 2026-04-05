@@ -27,7 +27,9 @@ def _make_tool_use_id() -> str:
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 # Gemma4 channel format: <|channel>thought\n...<channel|>
-_GEMMA4_CHANNEL_RE = re.compile(r"<\|channel>thought\n(.*?)<channel\|>", re.DOTALL)
+# The <|channel> opening token may be absent in decoded text when
+# skip_special_tokens strips it, so the pattern is optional.
+_GEMMA4_CHANNEL_RE = re.compile(r"(?:<\|channel>)?thought\n(.*?)<channel\|>", re.DOTALL)
 
 # gpt-oss channel format:
 # <|start|>assistant<|channel|>analysis<|message|>thinking<|end|>
