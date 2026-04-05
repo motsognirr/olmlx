@@ -766,6 +766,7 @@ def _apply_chat_template_vlm(
     messages: list[dict],
     images: list[str] | None = None,
     tools: list[dict] | None = None,
+    enable_thinking: bool | None = None,
 ) -> str:
     """Apply chat template for vision-language models (mlx-vlm).
 
@@ -777,11 +778,15 @@ def _apply_chat_template_vlm(
     if tools:
         # Use tokenizer directly to get clean native tool formatting.
         tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        kwargs: dict = {}
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
         return tok.apply_chat_template(
             messages,
             tools=tools,
             tokenize=False,
             add_generation_prompt=True,
+            **kwargs,
         )
 
     import mlx_vlm
@@ -1665,9 +1670,16 @@ async def generate_chat(
         # message.  Fall back to system-message injection for models whose
         # template lacks tool support.
         caps = lm.template_caps or TemplateCaps()
+        # Resolve enable_thinking for templates that support it.
+        vlm_thinking = enable_thinking if caps.supports_enable_thinking else None
         if tools and caps.supports_tools:
             prompt = _apply_chat_template_vlm(
-                lm.tokenizer, lm.model, messages, images, tools=tools
+                lm.tokenizer,
+                lm.model,
+                messages,
+                images,
+                tools=tools,
+                enable_thinking=vlm_thinking,
             )
             logger.info("VLM chat prompt with %d tools (native template)", len(tools))
         elif tools:
@@ -1680,9 +1692,9 @@ async def generate_chat(
             )
         else:
             prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages, images)
-        if enable_thinking is not None:
+        if enable_thinking is not None and vlm_thinking is None:
             logger.debug(
-                "enable_thinking=%s ignored for VLM model (not supported by mlx-vlm template)",
+                "enable_thinking=%s ignored for VLM model (template does not support it)",
                 enable_thinking,
             )
     else:
