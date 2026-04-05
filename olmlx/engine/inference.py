@@ -760,6 +760,59 @@ def _apply_chat_template_text(
     )
 
 
+def _normalize_tool_calls_in_messages(messages: list[dict]) -> list[dict]:
+    """Normalise tool_calls in assistant messages for chat templates.
+
+    Different chat templates expect different tool_call layouts:
+
+    * **Qwen / Llama**: flat ``{name, arguments: dict}``
+    * **Gemma 4**: nested ``{function: {name, arguments}, id, type}``
+
+    Rather than guessing which layout a template needs, this function
+    produces a *union* dict that satisfies both::
+
+        {
+            "name": "read",
+            "arguments": {"path": "/foo"},
+            "function": {"name": "read", "arguments": {"path": "/foo"}},
+            "id": "call_x",
+            "type": "function",
+        }
+
+    It also ensures ``arguments`` is always a parsed dict (never a JSON
+    string), which is what both Qwen's ``|items`` filter and Gemma's
+    ``is mapping`` test require.
+    """
+    result = []
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            m = dict(m)
+            normalised = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function", tc)
+                name = fn.get("name", tc.get("name", ""))
+                args = fn.get("arguments", tc.get("arguments", {}))
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                normalised.append(
+                    {
+                        "name": name,
+                        "arguments": args,
+                        "function": {"name": name, "arguments": args},
+                        "id": tc.get("id", ""),
+                        "type": tc.get("type", "function"),
+                    }
+                )
+            m["tool_calls"] = normalised
+            result.append(m)
+        else:
+            result.append(m)
+    return result
+
+
 def _convert_tool_messages_to_responses(messages: list[dict]) -> list[dict]:
     """Convert ``role: "tool"`` messages to ``tool_responses`` format.
 
@@ -1726,6 +1779,10 @@ async def generate_chat(
     stats.load_duration = load_timer.duration_ns
 
     images = _extract_images(messages)
+
+    # Normalise OpenAI-format tool_calls ({function: {name, arguments: "json"}})
+    # to the flat format chat templates expect ({name, arguments: {...}}).
+    messages = _normalize_tool_calls_in_messages(messages)
 
     if lm.is_vlm:
         # VLM models must use the VLM generation path for tokenization.

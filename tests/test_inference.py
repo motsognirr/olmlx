@@ -15,6 +15,7 @@ from olmlx.engine.inference import (
     _inference_lock,
     _inference_locked,
     _inject_tools_into_system,
+    _normalize_tool_calls_in_messages,
     _apply_chat_template_text,
     _safe_sync,
     _schedule_deferred_inference_cleanup,
@@ -671,6 +672,85 @@ class TestApplyChatTemplateVlm:
                 [{"role": "user", "content": "hi"}],
             )
         assert result == "result"
+
+
+class TestNormalizeToolCallsInMessages:
+    """Normalise OpenAI-format tool_calls to flat format for chat templates."""
+
+    def test_openai_format_converted(self):
+        """OpenAI format produces union dict with both flat and nested keys."""
+        messages = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "London"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "sunny"},
+        ]
+        result = _normalize_tool_calls_in_messages(messages)
+        tc = result[1]["tool_calls"][0]
+        # Flat keys (Qwen)
+        assert tc["name"] == "get_weather"
+        assert tc["arguments"] == {"city": "London"}
+        # Nested keys (Gemma)
+        assert tc["function"]["name"] == "get_weather"
+        assert tc["function"]["arguments"] == {"city": "London"}
+        # Preserved metadata
+        assert tc["id"] == "call_abc"
+        assert tc["type"] == "function"
+        # Non-assistant messages unchanged
+        assert result[0] == messages[0]
+        assert result[2] == messages[2]
+
+    def test_already_flat_format_gets_function_key(self):
+        """Qwen-style {name, arguments: dict} gets function key added."""
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"name": "search", "arguments": {"q": "test"}},
+                ],
+            },
+        ]
+        result = _normalize_tool_calls_in_messages(messages)
+        tc = result[0]["tool_calls"][0]
+        assert tc["name"] == "search"
+        assert tc["arguments"] == {"q": "test"}
+        assert tc["function"]["name"] == "search"
+
+    def test_no_tool_calls_unchanged(self):
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        result = _normalize_tool_calls_in_messages(messages)
+        assert result == messages
+
+    def test_invalid_json_arguments(self):
+        """Malformed JSON arguments fall back to empty dict."""
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "type": "function",
+                        "function": {"name": "foo", "arguments": "not json"},
+                    }
+                ],
+            },
+        ]
+        result = _normalize_tool_calls_in_messages(messages)
+        assert result[0]["tool_calls"][0]["arguments"] == {}
 
 
 class TestGemma4TemplateOrdering:
