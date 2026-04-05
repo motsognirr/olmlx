@@ -53,10 +53,10 @@ def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
     """Validate per-model experimental overrides.
 
     Checks key names against the whitelist, then validates values by
-    constructing a full ExperimentalSettings from the global defaults
-    plus the overrides.  This avoids calling ``model_validate`` on a
-    partial dict (which, for a BaseSettings subclass, would re-read env
-    vars and produce confusing errors for unrelated fields).
+    calling ``resolve_experimental`` with the global defaults as base.
+    This uses ``model_dump()`` + ``model_validate()`` on a complete dict
+    (all fields present), so pydantic-settings env var resolution cannot
+    override any values or produce confusing errors for unrelated fields.
     """
     unknown = set(overrides) - PER_MODEL_EXPERIMENTAL_KEYS
     if unknown:
@@ -64,14 +64,11 @@ def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
             f"Unknown experimental keys: {sorted(unknown)}. "
             f"Allowed per-model keys: {sorted(PER_MODEL_EXPERIMENTAL_KEYS)}"
         )
-    # Validate values by merging with global defaults (single source of truth)
     if overrides:
-        from olmlx.config import ExperimentalSettings, experimental as _global
+        from olmlx.config import experimental as _global, resolve_experimental
 
         try:
-            merged = _global.model_dump()
-            merged.update(overrides)
-            ExperimentalSettings.model_validate(merged)
+            resolve_experimental(_global, overrides)
         except Exception as e:
             raise ValueError(f"Invalid experimental override: {e}") from e
 
@@ -268,6 +265,7 @@ class ModelRegistry:
 
     def __init__(self):
         self._mappings: dict[str, ModelConfig] = {}
+        self._raw_unrecognized: dict[str, Any] = {}
         self._aliases: dict[str, str] = {}
         self._aliases_path = settings.models_config.parent / "aliases.json"
 
@@ -277,11 +275,13 @@ class ModelRegistry:
             with open(settings.models_config) as f:
                 raw = json.load(f)
             self._mappings = {}
+            self._raw_unrecognized = {}
             for k, v in raw.items():
                 try:
                     self._mappings[k] = ModelConfig.from_entry(v)
                 except (ValueError, TypeError) as exc:
                     logger.warning("Skipping invalid models.json entry %r: %s", k, exc)
+                    self._raw_unrecognized[k] = v
         if self._aliases_path.exists():
             with open(self._aliases_path) as f:
                 self._aliases = json.load(f)
@@ -378,7 +378,9 @@ class ModelRegistry:
         """Add a name → HF path mapping and persist to models.json.
 
         If *model_config* is provided, its experimental/options/keep_alive
-        are stored.  Otherwise a plain mapping is created.
+        are stored.  When *model_config* is ``None`` and an existing entry
+        already has the same ``hf_path``, the existing entry is preserved
+        (avoids erasing per-model config from callers that don't carry it).
         """
         validate_model_name(name)
         validate_hf_path(hf_path)
@@ -392,20 +394,23 @@ class ModelRegistry:
                 )
             mc = model_config
         else:
+            # No rich config supplied — preserve existing entry if hf_path matches
+            if existing is not None and existing.hf_path == hf_path:
+                return
             mc = ModelConfig(hf_path=hf_path)
-        if (
-            existing is not None
-            and existing.hf_path == mc.hf_path
-            and existing.experimental == mc.experimental
-            and existing.options == mc.options
-            and existing.keep_alive == mc.keep_alive
-        ):
-            return  # already exists
+        if existing is not None and existing == mc:
+            return  # identical, no save needed
         self._mappings[normalized] = mc
+        self._raw_unrecognized.pop(normalized, None)
         self._save_mappings()
 
     def _save_mappings(self):
+        # Preserve unrecognized entries so they survive round-trips through
+        # versions that can't parse them (forward/backward compatibility).
         serialized = {k: v.to_entry() for k, v in self._mappings.items()}
+        for k, v in self._raw_unrecognized.items():
+            if k not in serialized:
+                serialized[k] = v
         _atomic_write_json(serialized, settings.models_config)
 
     def remove(self, name: str):

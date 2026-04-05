@@ -919,9 +919,12 @@ async def generate_completion(
             if system:
                 prompt = f"{system}\n\n{prompt}"
 
-    # empty dict → no per-model defaults, pass options through unchanged
+    # Merge per-model defaults with request options.  options=None means
+    # "use defaults"; options={} means "override all defaults" (empty).
     merged_options = (
-        {**lm.default_options, **(options or {})} if lm.default_options else options
+        {**lm.default_options, **(options or {})}
+        if lm.default_options and options is None
+        else options
     )
     gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
@@ -1665,9 +1668,12 @@ async def generate_chat(
             logger.info("Chat prompt with %d tools", len(tools))
         logger.debug("Prompt (first 1000 chars): %s", prompt[:1000])
 
-    # empty dict → no per-model defaults, pass options through unchanged
+    # Merge per-model defaults with request options.  options=None means
+    # "use defaults"; options={} means "override all defaults" (empty).
     merged_options = (
-        {**lm.default_options, **(options or {})} if lm.default_options else options
+        {**lm.default_options, **(options or {})}
+        if lm.default_options and options is None
+        else options
     )
     gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)

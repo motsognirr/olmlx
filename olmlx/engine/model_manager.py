@@ -1102,15 +1102,11 @@ class ModelManager:
             return flash_path
         return None
 
-    def _is_flash_enabled(self, model_exp: Any = None) -> bool:
-        if model_exp is not None:
-            return model_exp.flash
-        from olmlx.config import experimental
-
-        return experimental.flash
+    def _is_flash_enabled(self, model_exp: Any) -> bool:
+        return model_exp.flash
 
     def _load_flash_model(
-        self, hf_path: str, load_path: str, flash_dir: Path, *, model_exp: Any = None
+        self, hf_path: str, load_path: str, flash_dir: Path, *, model_exp: Any
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model in flash mode (LLM in a Flash).
 
@@ -1118,10 +1114,7 @@ class ModelManager:
         2. Create FlashWeightStore, PredictorBank, WindowManager
         3. Wrap model with FlashModelWrapper (replaces FFN layers)
         """
-        from olmlx.config import experimental as _global_exp
         from olmlx.engine.flash.flash_model import FlashConfig, FlashModelWrapper
-
-        eff_exp = model_exp if model_exp is not None else _global_exp
         from olmlx.engine.flash.predictor import LookaheadBank, PredictorBank
         from olmlx.engine.flash.weight_store import FlashWeightStore
 
@@ -1144,32 +1137,32 @@ class ModelManager:
             hidden_size=layout_config["hidden_size"],
             intermediate_size=layout_config["intermediate_size"],
             num_layers=layout_config["num_layers"],
-            sparsity_threshold=eff_exp.flash_sparsity_threshold,
-            min_active_neurons=eff_exp.flash_min_active_neurons,
-            max_active_neurons=eff_exp.flash_max_active_neurons,
-            window_size=eff_exp.flash_window_size,
-            io_threads=eff_exp.flash_io_threads,
-            cache_budget_neurons=eff_exp.flash_cache_budget_neurons,
-            memory_budget_fraction=eff_exp.flash_memory_budget_fraction,
-            prefetch=eff_exp.flash_prefetch,
-            prefetch_confidence_threshold=eff_exp.flash_prefetch_confidence_threshold,
-            prefetch_min_neurons=eff_exp.flash_prefetch_min_neurons,
-            prefetch_max_neurons=eff_exp.flash_prefetch_max_neurons,
-            prefetch_io_threads=eff_exp.flash_prefetch_io_threads,
+            sparsity_threshold=model_exp.flash_sparsity_threshold,
+            min_active_neurons=model_exp.flash_min_active_neurons,
+            max_active_neurons=model_exp.flash_max_active_neurons,
+            window_size=model_exp.flash_window_size,
+            io_threads=model_exp.flash_io_threads,
+            cache_budget_neurons=model_exp.flash_cache_budget_neurons,
+            memory_budget_fraction=model_exp.flash_memory_budget_fraction,
+            prefetch=model_exp.flash_prefetch,
+            prefetch_confidence_threshold=model_exp.flash_prefetch_confidence_threshold,
+            prefetch_min_neurons=model_exp.flash_prefetch_min_neurons,
+            prefetch_max_neurons=model_exp.flash_prefetch_max_neurons,
+            prefetch_io_threads=model_exp.flash_prefetch_io_threads,
         )
 
         weight_store = FlashWeightStore(
             flash_dir,
             num_io_threads=flash_config.io_threads,
             cache_budget_neurons=flash_config.cache_budget_neurons,
-            bypass_cache=eff_exp.flash_bypass_os_cache,
-            use_preallocated_buffer=eff_exp.flash_preallocated_buffer,
+            bypass_cache=model_exp.flash_bypass_os_cache,
+            use_preallocated_buffer=model_exp.flash_preallocated_buffer,
         )
 
         # Load lookahead predictors if available (for speculative prefetching)
         lookahead_bank = None
         lookahead_path = flash_dir / "lookahead_predictors"
-        if eff_exp.flash_prefetch and lookahead_path.exists():
+        if model_exp.flash_prefetch and lookahead_path.exists():
             try:
                 lookahead_bank = LookaheadBank.load(lookahead_path)
                 logger.info("Loaded lookahead predictor bank from %s", lookahead_path)
@@ -1184,10 +1177,10 @@ class ModelManager:
             model, predictor_bank, weight_store, flash_config, lookahead_bank
         )
 
-        if eff_exp.flash_speculative:
+        if model_exp.flash_speculative:
             from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
 
-            if not eff_exp.flash_speculative_draft_model:
+            if not model_exp.flash_speculative_draft_model:
                 raise ValueError(
                     "flash_speculative requires flash_speculative_draft_model to be set "
                     "(OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL)"
@@ -1195,10 +1188,10 @@ class ModelManager:
 
             logger.info(
                 "Loading draft model %s for speculative decoding",
-                eff_exp.flash_speculative_draft_model,
+                model_exp.flash_speculative_draft_model,
             )
             draft_model, draft_tokenizer = mlx_lm.load(
-                eff_exp.flash_speculative_draft_model
+                model_exp.flash_speculative_draft_model
             )
 
             # Verify vocabulary compatibility — a mismatch causes silent token ID errors
@@ -1220,7 +1213,7 @@ class ModelManager:
             decoder = SpeculativeFlashDecoder(
                 draft_model=draft_model,
                 target_model=wrapped,
-                num_speculative_tokens=eff_exp.flash_speculative_tokens,
+                num_speculative_tokens=model_exp.flash_speculative_tokens,
                 prefetcher=wrapped.prefetcher,
             )
             return wrapped, tokenizer, False, caps, decoder
@@ -1239,12 +1232,8 @@ class ModelManager:
             return flash_moe_path
         return None
 
-    def _is_flash_moe_enabled(self, model_exp: Any = None) -> bool:
-        if model_exp is not None:
-            return model_exp.flash_moe
-        from olmlx.config import experimental
-
-        return experimental.flash_moe
+    def _is_flash_moe_enabled(self, model_exp: Any) -> bool:
+        return model_exp.flash_moe
 
     def _load_flash_moe_model(
         self,
@@ -1252,7 +1241,7 @@ class ModelManager:
         load_path: str,
         flash_moe_dir: Path,
         *,
-        model_exp: Any = None,
+        model_exp: Any,
     ) -> tuple[Any, Any, bool, TemplateCaps]:
         """Load a model in Flash-MoE mode.
 
@@ -1261,10 +1250,7 @@ class ModelManager:
         3. Wrap model with FlashMoeModelWrapper (replaces SwitchGLU)
         4. Eval only non-expert params
         """
-        from olmlx.config import experimental as _global_exp
         from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
-
-        eff_exp = model_exp if model_exp is not None else _global_exp
         from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
 
         import mlx_lm
@@ -1282,8 +1268,8 @@ class ModelManager:
 
         store = FlashMoeWeightStore(
             flash_moe_dir,
-            num_io_threads=eff_exp.flash_moe_io_threads,
-            cache_budget_experts=eff_exp.flash_moe_cache_budget_experts,
+            num_io_threads=model_exp.flash_moe_io_threads,
+            cache_budget_experts=model_exp.flash_moe_cache_budget_experts,
         )
 
         try:
@@ -1310,9 +1296,15 @@ class ModelManager:
         """Load a model, using config.json inspection to choose the right library.
 
         *model_exp* is the resolved ExperimentalSettings for this model.
+        Falls back to global defaults if not provided.
 
         Returns (model, tokenizer, is_vlm, caps, speculative_decoder).
         """
+        if model_exp is None:
+            from olmlx.config import experimental
+
+            model_exp = experimental
+
         # Ensure model is downloaded to the store
         load_path: str = hf_path
         if self.store is not None:

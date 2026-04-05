@@ -80,9 +80,9 @@ class TestModelManagerFlashDetection:
         registry = MagicMock()
         manager = self.ModelManager(registry, store=None)
 
-        with patch("olmlx.config.experimental") as mock_cfg_exp:
-            mock_cfg_exp.flash = True
-            assert manager._is_flash_enabled() is True
+        mock_exp = MagicMock()
+        mock_exp.flash = True
+        assert manager._is_flash_enabled(mock_exp) is True
 
     def test_loaded_model_is_flash_field(self):
         lm = self.LoadedModel(

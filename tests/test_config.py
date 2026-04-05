@@ -156,3 +156,15 @@ class TestResolveExperimental:
         assert result.flash is True
         assert result.flash_sparsity_threshold == 0.3
         assert result.flash_moe is True
+
+    def test_env_var_does_not_leak_into_overrides(self, monkeypatch):
+        """resolve_experimental should not re-read env vars for unrelated fields."""
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", raising=False)
+        base = ExperimentalSettings()
+        # Set a bad env var *after* base is created
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", "bad_value")
+        # Overriding only 'flash' should not trigger kv_cache_quant env var parsing
+        result = resolve_experimental(base, {"flash": True})
+        assert result.flash is True
+        assert result.kv_cache_quant is None
