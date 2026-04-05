@@ -52,6 +52,13 @@ class TestParseKeepAlive:
     def test_zero_integer(self):
         assert parse_keep_alive(0) == 0.0
 
+    def test_bare_integer_string(self):
+        """Bare integer string '1800' should be treated as seconds."""
+        assert parse_keep_alive("1800") == 1800.0
+
+    def test_bare_integer_string_zero(self):
+        assert parse_keep_alive("0") == 0.0
+
 
 class TestLoadedModel:
     def test_defaults(self):
@@ -774,7 +781,7 @@ class TestModelLoadTimeout:
         )
         manager = ModelManager(registry, mock_store)
 
-        def slow_load(hf_path):
+        def slow_load(hf_path, **kwargs):
             time.sleep(0.4)
             return (MagicMock(), MagicMock(), False, TemplateCaps(), None)
 
@@ -868,7 +875,7 @@ class TestModelLoadTimeout:
         )
         manager = ModelManager(registry, mock_store)
 
-        def slow_load(hf_path):
+        def slow_load(hf_path, **kwargs):
             time.sleep(0.4)
             return (MagicMock(), MagicMock(), False, TemplateCaps(), None)
 
@@ -900,7 +907,7 @@ class TestModelLoadTimeout:
         )
         manager = ModelManager(registry, mock_store)
 
-        def slow_load(hf_path):
+        def slow_load(hf_path, **kwargs):
             time.sleep(0.3)  # Short enough to finish during the test
             return (MagicMock(), MagicMock(), False, TemplateCaps(), None)
 
@@ -941,7 +948,7 @@ class TestModelLoadTimeout:
 
         call_count = 0
 
-        def slow_then_fast(hf_path):
+        def slow_then_fast(hf_path, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -998,7 +1005,7 @@ class TestModelLoadTimeout:
 
         call_count = 0
 
-        def slow_then_fast(hf_path):
+        def slow_then_fast(hf_path, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1061,7 +1068,7 @@ class TestModelLoadTimeout:
         )
         manager = ModelManager(registry, mock_store)
 
-        def slow_load(hf_path):
+        def slow_load(hf_path, **kwargs):
             time.sleep(0.3)
             return (MagicMock(), MagicMock(), False, TemplateCaps(), None)
 
@@ -1109,7 +1116,7 @@ class TestModelLoadTimeout:
         )
         manager = ModelManager(registry, mock_store)
 
-        def very_slow_load(hf_path):
+        def very_slow_load(hf_path, **kwargs):
             time.sleep(10)  # Would run forever without cancellation
             return (MagicMock(), MagicMock(), False, TemplateCaps(), None)
 
@@ -1143,7 +1150,7 @@ class TestModelLoadTimeout:
         )
         manager = ModelManager(registry, mock_store)
 
-        def slow_load(hf_path):
+        def slow_load(hf_path, **kwargs):
             time.sleep(0.4)
             return (MagicMock(), MagicMock(), False, TemplateCaps(), None)
 
@@ -1816,3 +1823,122 @@ class TestEnsureLoadedNotFoundSuggestions:
 
         # The existing model must still be loaded
         assert "qwen3:latest" in manager._loaded
+
+
+class TestPerModelConfig:
+    @pytest.mark.asyncio
+    async def test_kv_cache_quant_stored_on_loaded_model(self, mock_manager):
+        """LoadedModel should have kv_cache_quant from per-model config."""
+        lm = LoadedModel(
+            name="test:latest",
+            hf_path="test/model",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            kv_cache_quant="turboquant:4",
+        )
+        assert lm.kv_cache_quant == "turboquant:4"
+
+    @pytest.mark.asyncio
+    async def test_default_options_stored_on_loaded_model(self):
+        """LoadedModel should have default_options from per-model config."""
+        lm = LoadedModel(
+            name="test:latest",
+            hf_path="test/model",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            default_options={"temperature": 0.5, "num_predict": 1024},
+        )
+        assert lm.default_options == {"temperature": 0.5, "num_predict": 1024}
+
+    @pytest.mark.asyncio
+    async def test_default_options_empty_by_default(self):
+        """LoadedModel default_options should be empty dict by default."""
+        lm = LoadedModel(
+            name="test:latest",
+            hf_path="test/model",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        assert lm.default_options == {}
+        assert lm.kv_cache_quant is None
+
+    @pytest.mark.asyncio
+    async def test_ensure_loaded_uses_model_config_keep_alive(
+        self, tmp_path, monkeypatch
+    ):
+        """Per-model keep_alive is used when request doesn't specify one."""
+        from olmlx.engine.registry import ModelRegistry
+        from olmlx.models.store import ModelStore
+
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "keep_alive": "30m",
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        monkeypatch.setattr(
+            "olmlx.models.store.settings.models_dir", tmp_path / "models"
+        )
+
+        reg = ModelRegistry()
+        reg.load()
+        store = ModelStore(reg)
+        manager = ModelManager(reg, store)
+
+        # Pre-load a mock model to avoid actual loading
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        with patch.object(
+            manager,
+            "_load_model",
+            return_value=(mock_model, mock_tokenizer, False, TemplateCaps(), None),
+        ):
+            lm = await manager.ensure_loaded("qwen3")  # no keep_alive specified
+
+        # Should use per-model keep_alive of 30m = 1800s
+        assert lm.expires_at is not None
+        assert lm.expires_at >= time.time() + 1790  # ~30 minutes
+
+    @pytest.mark.asyncio
+    async def test_ensure_loaded_request_keep_alive_wins(self, tmp_path, monkeypatch):
+        """Request keep_alive takes priority over per-model keep_alive."""
+        from olmlx.engine.registry import ModelRegistry
+        from olmlx.models.store import ModelStore
+
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "keep_alive": "30m",
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        monkeypatch.setattr(
+            "olmlx.models.store.settings.models_dir", tmp_path / "models"
+        )
+
+        reg = ModelRegistry()
+        reg.load()
+        store = ModelStore(reg)
+        manager = ModelManager(reg, store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        with patch.object(
+            manager,
+            "_load_model",
+            return_value=(mock_model, mock_tokenizer, False, TemplateCaps(), None),
+        ):
+            lm = await manager.ensure_loaded("qwen3", keep_alive="1m")
+
+        # Should use request keep_alive of 1m = 60s, not model's 30m
+        assert lm.expires_at is not None
+        assert lm.expires_at < time.time() + 70  # ~1 minute

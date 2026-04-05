@@ -40,13 +40,13 @@ async def list_models(request: Request):
             )
         )
     # Add configured but not-yet-pulled models
-    for name, hf_path in configured.items():
+    for name, model_config in configured.items():
         normalized = registry.normalize_name(name)
         if normalized not in local_names:
             models.append(
                 ModelInfo(
                     name=normalized,
-                    model=hf_path,
+                    model=model_config.hf_path,
                 )
             )
 

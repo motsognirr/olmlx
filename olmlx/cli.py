@@ -1083,7 +1083,8 @@ def cmd_flash_prepare(args):
     _configure_logging()
 
     store = _create_store()
-    hf_path = store.registry.resolve(args.model) or args.model
+    _resolved = store.registry.resolve(args.model)
+    hf_path = _resolved.hf_path if _resolved is not None else args.model
     local_dir = store.ensure_downloaded(hf_path)
     model_path = str(local_dir)
 
@@ -1157,7 +1158,8 @@ def _cmd_flash_dense_prepare(args, model_path):
 def cmd_flash_info(args):
     """Show flash preparation info for a model."""
     store = _create_store()
-    hf_path = store.registry.resolve(args.model) or args.model
+    _resolved = store.registry.resolve(args.model)
+    hf_path = _resolved.hf_path if _resolved is not None else args.model
     local_dir = store.local_path(hf_path)
 
     # Check for Flash-MoE first

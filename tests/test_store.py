@@ -134,7 +134,9 @@ class TestModelStore:
         local_dir = mock_store.local_path("test/model")
         local_dir.mkdir(parents=True)
         # Register the mapping so resolve works
-        mock_store.registry._mappings["test:latest"] = "test/model"
+        from olmlx.engine.registry import ModelConfig
+
+        mock_store.registry._mappings["test:latest"] = ModelConfig(hf_path="test/model")
         manifest = ModelManifest(name="test:latest", hf_path="test/model")
         manifest.save(local_dir / "manifest.json")
 
@@ -214,7 +216,7 @@ class TestModelStore:
                 pass
 
         # Check that registry was updated
-        assert mock_store.registry.resolve("qwen3") == "Qwen/Qwen3-8B-MLX"
+        assert mock_store.registry.resolve("qwen3").hf_path == "Qwen/Qwen3-8B-MLX"
 
     @pytest.mark.asyncio
     async def test_pull_skips_if_downloaded(self, mock_store, tmp_path):

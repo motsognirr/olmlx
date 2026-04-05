@@ -16,7 +16,8 @@ from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
-from olmlx.config import settings
+from olmlx.config import experimental as global_experimental
+from olmlx.config import resolve_experimental, settings
 from olmlx.engine.registry import ModelRegistry
 from olmlx.utils import memory as memory_utils
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
@@ -407,6 +408,8 @@ class LoadedModel:
         default_factory=threading.Lock, compare=False, repr=False
     )
     prompt_cache_store: PromptCacheStore = field(default=None)  # type: ignore[assignment]
+    kv_cache_quant: str | None = None
+    default_options: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.prompt_cache_store is None:
@@ -455,6 +458,9 @@ def parse_keep_alive(value: str | int) -> float | None:
         return None
     if value == "0":
         return 0.0
+    # Bare integer string → treat as seconds (consistent with Ollama API)
+    if value.isdigit():
+        return float(int(value))
     match = re.match(r"^(\d+)(s|m|h)$", value)
     if not match:
         logger.warning("Invalid keep_alive format: %r, defaulting to 5m", value)
@@ -583,8 +589,8 @@ class ModelManager:
 
                 # Resolve before eviction — reject unknown models without
                 # disturbing already-loaded models or their KV caches.
-                hf_path = self.registry.resolve(name)
-                if hf_path is None:
+                model_config = self.registry.resolve(name)
+                if model_config is None:
                     suggestions = self.registry.search(name, max_results=3)
                     msg = f"Model '{name}' not found."
                     if suggestions:
@@ -596,9 +602,16 @@ class ModelManager:
                     )
                     raise ValueError(msg)
 
+                hf_path = model_config.hf_path
+
                 # Auto-register direct HF paths so future requests find them
                 if "/" in name:
-                    self.registry.add_mapping(name, hf_path)
+                    self.registry.add_mapping(name, hf_path, model_config=model_config)
+
+                # Resolve per-model experimental overrides
+                model_exp = resolve_experimental(
+                    global_experimental, model_config.experimental
+                )
 
                 # Evict LRU if at capacity (skip models with active inference)
                 while len(self._loaded) >= settings.max_loaded_models:
@@ -632,7 +645,9 @@ class ModelManager:
                 model = tokenizer = None
                 load_task = lm = None
                 try:
-                    coro = asyncio.to_thread(self._load_model_and_shard, hf_path)
+                    coro = asyncio.to_thread(
+                        self._load_model_and_shard, hf_path, model_exp
+                    )
                     timeout = settings.model_load_timeout
                     is_distributed = False
                     if timeout is not None:
@@ -713,8 +728,16 @@ class ModelManager:
                             f"{settings.memory_limit_fraction})."
                         )
 
-                    # Memory check passed — register the model
-                    ka = self._resolve_keep_alive(keep_alive)
+                    # Memory check passed — register the model.
+                    # Use per-model keep_alive as fallback when request
+                    # doesn't specify one.
+                    effective_keep_alive = keep_alive
+                    if (
+                        effective_keep_alive is None
+                        and model_config.keep_alive is not None
+                    ):
+                        effective_keep_alive = model_config.keep_alive
+                    ka = self._resolve_keep_alive(effective_keep_alive)
                     expires = time.time() + ka if ka is not None else None
 
                     logger.info(
@@ -761,6 +784,8 @@ class ModelManager:
                         weight_store=_weight_store,
                         template_caps=caps,
                         expires_at=expires,
+                        kv_cache_quant=model_exp.kv_cache_quant,
+                        default_options=dict(model_config.options),
                     )
                     self._loaded[normalized] = lm
                     return lm
@@ -1077,13 +1102,11 @@ class ModelManager:
             return flash_path
         return None
 
-    def _is_flash_enabled(self) -> bool:
-        from olmlx.config import experimental
-
-        return experimental.flash
+    def _is_flash_enabled(self, model_exp: Any) -> bool:
+        return model_exp.flash
 
     def _load_flash_model(
-        self, hf_path: str, load_path: str, flash_dir: Path
+        self, hf_path: str, load_path: str, flash_dir: Path, *, model_exp: Any
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model in flash mode (LLM in a Flash).
 
@@ -1091,7 +1114,6 @@ class ModelManager:
         2. Create FlashWeightStore, PredictorBank, WindowManager
         3. Wrap model with FlashModelWrapper (replaces FFN layers)
         """
-        from olmlx.config import experimental
         from olmlx.engine.flash.flash_model import FlashConfig, FlashModelWrapper
         from olmlx.engine.flash.predictor import LookaheadBank, PredictorBank
         from olmlx.engine.flash.weight_store import FlashWeightStore
@@ -1117,32 +1139,32 @@ class ModelManager:
             hidden_size=layout_config["hidden_size"],
             intermediate_size=layout_config["intermediate_size"],
             num_layers=layout_config["num_layers"],
-            sparsity_threshold=experimental.flash_sparsity_threshold,
-            min_active_neurons=experimental.flash_min_active_neurons,
-            max_active_neurons=experimental.flash_max_active_neurons,
-            window_size=experimental.flash_window_size,
-            io_threads=experimental.flash_io_threads,
-            cache_budget_neurons=experimental.flash_cache_budget_neurons,
-            memory_budget_fraction=experimental.flash_memory_budget_fraction,
-            prefetch=experimental.flash_prefetch,
-            prefetch_confidence_threshold=experimental.flash_prefetch_confidence_threshold,
-            prefetch_min_neurons=experimental.flash_prefetch_min_neurons,
-            prefetch_max_neurons=experimental.flash_prefetch_max_neurons,
-            prefetch_io_threads=experimental.flash_prefetch_io_threads,
+            sparsity_threshold=model_exp.flash_sparsity_threshold,
+            min_active_neurons=model_exp.flash_min_active_neurons,
+            max_active_neurons=model_exp.flash_max_active_neurons,
+            window_size=model_exp.flash_window_size,
+            io_threads=model_exp.flash_io_threads,
+            cache_budget_neurons=model_exp.flash_cache_budget_neurons,
+            memory_budget_fraction=model_exp.flash_memory_budget_fraction,
+            prefetch=model_exp.flash_prefetch,
+            prefetch_confidence_threshold=model_exp.flash_prefetch_confidence_threshold,
+            prefetch_min_neurons=model_exp.flash_prefetch_min_neurons,
+            prefetch_max_neurons=model_exp.flash_prefetch_max_neurons,
+            prefetch_io_threads=model_exp.flash_prefetch_io_threads,
         )
 
         weight_store = FlashWeightStore(
             flash_dir,
             num_io_threads=flash_config.io_threads,
             cache_budget_neurons=flash_config.cache_budget_neurons,
-            bypass_cache=experimental.flash_bypass_os_cache,
-            use_preallocated_buffer=experimental.flash_preallocated_buffer,
+            bypass_cache=model_exp.flash_bypass_os_cache,
+            use_preallocated_buffer=model_exp.flash_preallocated_buffer,
         )
 
         # Load lookahead predictors if available (for speculative prefetching)
         lookahead_bank = None
         lookahead_path = flash_dir / "lookahead_predictors"
-        if experimental.flash_prefetch and lookahead_path.exists():
+        if model_exp.flash_prefetch and lookahead_path.exists():
             try:
                 lookahead_bank = LookaheadBank.load(lookahead_path)
                 logger.info("Loaded lookahead predictor bank from %s", lookahead_path)
@@ -1157,10 +1179,10 @@ class ModelManager:
             model, predictor_bank, weight_store, flash_config, lookahead_bank
         )
 
-        if experimental.flash_speculative:
+        if model_exp.flash_speculative:
             from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
 
-            if not experimental.flash_speculative_draft_model:
+            if not model_exp.flash_speculative_draft_model:
                 raise ValueError(
                     "flash_speculative requires flash_speculative_draft_model to be set "
                     "(OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL)"
@@ -1168,10 +1190,10 @@ class ModelManager:
 
             logger.info(
                 "Loading draft model %s for speculative decoding",
-                experimental.flash_speculative_draft_model,
+                model_exp.flash_speculative_draft_model,
             )
             draft_model, draft_tokenizer = load_model_with_strict_fallback(
-                experimental.flash_speculative_draft_model, lazy=False
+                model_exp.flash_speculative_draft_model, lazy=False
             )
 
             # Verify vocabulary compatibility — a mismatch causes silent token ID errors
@@ -1193,7 +1215,7 @@ class ModelManager:
             decoder = SpeculativeFlashDecoder(
                 draft_model=draft_model,
                 target_model=wrapped,
-                num_speculative_tokens=experimental.flash_speculative_tokens,
+                num_speculative_tokens=model_exp.flash_speculative_tokens,
                 prefetcher=wrapped.prefetcher,
             )
             return wrapped, tokenizer, False, caps, decoder
@@ -1212,13 +1234,16 @@ class ModelManager:
             return flash_moe_path
         return None
 
-    def _is_flash_moe_enabled(self) -> bool:
-        from olmlx.config import experimental
-
-        return experimental.flash_moe
+    def _is_flash_moe_enabled(self, model_exp: Any) -> bool:
+        return model_exp.flash_moe
 
     def _load_flash_moe_model(
-        self, hf_path: str, load_path: str, flash_moe_dir: Path
+        self,
+        hf_path: str,
+        load_path: str,
+        flash_moe_dir: Path,
+        *,
+        model_exp: Any,
     ) -> tuple[Any, Any, bool, TemplateCaps]:
         """Load a model in Flash-MoE mode.
 
@@ -1227,7 +1252,6 @@ class ModelManager:
         3. Wrap model with FlashMoeModelWrapper (replaces SwitchGLU)
         4. Eval only non-expert params
         """
-        from olmlx.config import experimental
         from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
         from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
 
@@ -1246,8 +1270,8 @@ class ModelManager:
 
         store = FlashMoeWeightStore(
             flash_moe_dir,
-            num_io_threads=experimental.flash_moe_io_threads,
-            cache_budget_experts=experimental.flash_moe_cache_budget_experts,
+            num_io_threads=model_exp.flash_moe_io_threads,
+            cache_budget_experts=model_exp.flash_moe_cache_budget_experts,
         )
 
         try:
@@ -1268,11 +1292,21 @@ class ModelManager:
 
         return wrapped, tokenizer, False, caps
 
-    def _load_model(self, hf_path: str) -> tuple[Any, Any, bool, TemplateCaps, Any]:
+    def _load_model(
+        self, hf_path: str, *, model_exp: Any = None
+    ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
+
+        *model_exp* is the resolved ExperimentalSettings for this model.
+        Falls back to global defaults if not provided.
 
         Returns (model, tokenizer, is_vlm, caps, speculative_decoder).
         """
+        if model_exp is None:
+            from olmlx.config import experimental
+
+            model_exp = experimental
+
         # Ensure model is downloaded to the store
         load_path: str = hf_path
         if self.store is not None:
@@ -1280,19 +1314,23 @@ class ModelManager:
             load_path = str(local_dir)
 
         # Check for flash-MoE-prepared model
-        if self._is_flash_moe_enabled():
+        if self._is_flash_moe_enabled(model_exp):
             flash_moe_dir = self._flash_moe_dir(hf_path)
             if flash_moe_dir is not None:
                 return (
-                    *self._load_flash_moe_model(hf_path, load_path, flash_moe_dir),
+                    *self._load_flash_moe_model(
+                        hf_path, load_path, flash_moe_dir, model_exp=model_exp
+                    ),
                     None,
                 )
 
         # Check for flash-prepared model
-        if self._is_flash_enabled():
+        if self._is_flash_enabled(model_exp):
             flash_dir = self._flash_dir(hf_path)
             if flash_dir is not None:
-                return self._load_flash_model(hf_path, load_path, flash_dir)
+                return self._load_flash_model(
+                    hf_path, load_path, flash_dir, model_exp=model_exp
+                )
 
         kind = self._detect_model_kind(hf_path)
         logger.info("Detected model kind for %s: %s", hf_path, kind)
@@ -1322,13 +1360,18 @@ class ModelManager:
         return (*self._try_lm_then_vlm(load_path, hf_path), None)
 
     def _load_model_and_shard(
-        self, hf_path: str
+        self, hf_path: str, model_exp: Any = None
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 
+        *model_exp* is the resolved ExperimentalSettings for this model
+        (global defaults merged with per-model overrides).
+
         Returns (model, tokenizer, is_vlm, caps, is_distributed, speculative_decoder).
         """
-        model, tokenizer, is_vlm, caps, speculative_decoder = self._load_model(hf_path)
+        model, tokenizer, is_vlm, caps, speculative_decoder = self._load_model(
+            hf_path, model_exp=model_exp
+        )
         is_distributed = False
 
         if self._distributed_group is not None:

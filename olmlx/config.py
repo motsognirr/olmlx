@@ -118,3 +118,27 @@ class ExperimentalSettings(BaseSettings):
 experimental = ExperimentalSettings()
 
 PRE_SHARDED_DIR_ENV = "OLMLX_EXPERIMENTAL_DISTRIBUTED_PRE_SHARDED_DIR"
+
+
+def resolve_experimental(
+    base: ExperimentalSettings,
+    overrides: dict,
+) -> ExperimentalSettings:
+    """Create a new ExperimentalSettings with per-model overrides applied.
+
+    Fields not present in *overrides* retain their value from *base*.
+    Returns *base* unchanged if overrides is empty.
+
+    Uses the pydantic core validator directly to avoid pydantic-settings
+    re-reading ``OLMLX_EXPERIMENTAL_*`` env vars, which would produce
+    confusing errors if an unrelated env var is malformed.
+    """
+    if not overrides:
+        return base
+    merged = base.model_dump()
+    merged.update(overrides)
+    # Validate field constraints and custom validators without triggering
+    # BaseSettings env var resolution.  __pydantic_validator__ is the core
+    # schema validator shared by __init__ and model_validate; calling it
+    # directly bypasses _settings_build_values().
+    return ExperimentalSettings.__pydantic_validator__.validate_python(merged)

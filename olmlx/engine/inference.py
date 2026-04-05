@@ -18,7 +18,7 @@ from olmlx.engine.model_manager import (
     ModelManager,
     parse_keep_alive,
 )
-from olmlx.config import experimental, settings
+from olmlx.config import settings
 from olmlx.utils import memory as memory_utils
 
 try:
@@ -919,7 +919,14 @@ async def generate_completion(
             if system:
                 prompt = f"{system}\n\n{prompt}"
 
-    gen_kwargs = _build_generate_kwargs(options, is_vlm=lm.is_vlm)
+    # Merge per-model defaults with request options.  options=None means
+    # "use defaults"; options={} means "override all defaults" (empty).
+    merged_options = (
+        {**lm.default_options, **(options or {})}
+        if lm.default_options and options is None
+        else options
+    )
+    gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
     if stream:
@@ -1076,7 +1083,7 @@ async def _stream_completion(
             else:
                 # No usable prefix — free old cache and create fresh
                 lm.prompt_cache_store.remove(cache_id)
-                kv_quant = experimental.kv_cache_quant
+                kv_quant = lm.kv_cache_quant
                 if kv_quant is not None:
                     bits = int(kv_quant.split(":")[1])
                     new_cache = _make_turboquant_prompt_cache(
@@ -1661,7 +1668,14 @@ async def generate_chat(
             logger.info("Chat prompt with %d tools", len(tools))
         logger.debug("Prompt (first 1000 chars): %s", prompt[:1000])
 
-    gen_kwargs = _build_generate_kwargs(options, is_vlm=lm.is_vlm)
+    # Merge per-model defaults with request options.  options=None means
+    # "use defaults"; options={} means "override all defaults" (empty).
+    merged_options = (
+        {**lm.default_options, **(options or {})}
+        if lm.default_options and options is None
+        else options
+    )
+    gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
     # Prompt caching: streaming only, when enabled.

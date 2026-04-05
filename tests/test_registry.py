@@ -7,13 +7,13 @@ from unittest.mock import patch
 
 import pytest
 
-from olmlx.engine.registry import ModelRegistry, _atomic_write_json
+from olmlx.engine.registry import ModelConfig, ModelRegistry, _atomic_write_json
 
 
 class TestModelRegistry:
     def test_load(self, registry):
         assert "qwen3:latest" in registry._mappings
-        assert registry._mappings["qwen3:latest"] == "Qwen/Qwen3-8B-MLX"
+        assert registry._mappings["qwen3:latest"].hf_path == "Qwen/Qwen3-8B-MLX"
 
     def test_normalize_name_no_tag(self):
         assert ModelRegistry.normalize_name("qwen3") == "qwen3:latest"
@@ -22,16 +22,16 @@ class TestModelRegistry:
         assert ModelRegistry.normalize_name("qwen3:8b") == "qwen3:8b"
 
     def test_resolve_found(self, registry):
-        assert registry.resolve("qwen3:latest") == "Qwen/Qwen3-8B-MLX"
+        assert registry.resolve("qwen3:latest").hf_path == "Qwen/Qwen3-8B-MLX"
 
     def test_resolve_without_tag(self, registry):
-        assert registry.resolve("qwen3") == "Qwen/Qwen3-8B-MLX"
+        assert registry.resolve("qwen3").hf_path == "Qwen/Qwen3-8B-MLX"
 
     def test_resolve_not_found(self, registry):
         assert registry.resolve("nonexistent") is None
 
     def test_resolve_hf_path_passthrough(self, registry):
-        assert registry.resolve("org/model-name") == "org/model-name"
+        assert registry.resolve("org/model-name").hf_path == "org/model-name"
 
     def test_list_models(self, registry):
         models = registry.list_models()
@@ -45,7 +45,7 @@ class TestModelRegistry:
         )
         registry._aliases_path = tmp_path / "aliases.json"
         registry.add_alias("my-model", "qwen3:latest")
-        assert registry.resolve("my-model") == "Qwen/Qwen3-8B-MLX"
+        assert registry.resolve("my-model").hf_path == "Qwen/Qwen3-8B-MLX"
         # Alias should be persisted
         assert (tmp_path / "aliases.json").exists()
 
@@ -64,14 +64,14 @@ class TestModelRegistry:
         monkeypatch.setattr("olmlx.engine.registry.settings.models_config", models_json)
         registry._aliases_path = tmp_path / "aliases.json"
         registry.add_mapping("removable", "org/removable-model")
-        assert registry.resolve("removable") == "org/removable-model"
+        assert registry.resolve("removable").hf_path == "org/removable-model"
         registry.remove("removable")
         assert registry.resolve("removable") is None
 
     def test_alias_priority_over_mapping(self, registry, tmp_path):
         registry._aliases_path = tmp_path / "aliases.json"
         registry._aliases["qwen3:latest"] = "custom/override"
-        assert registry.resolve("qwen3") == "custom/override"
+        assert registry.resolve("qwen3").hf_path == "custom/override"
 
     def test_load_empty_config(self, tmp_path, monkeypatch):
         config_path = tmp_path / "models.json"
@@ -85,7 +85,7 @@ class TestModelRegistry:
         models_json = tmp_path / "models2.json"
         monkeypatch.setattr("olmlx.engine.registry.settings.models_config", models_json)
         registry.add_mapping("new-model", "org/new-model-MLX")
-        assert registry.resolve("new-model") == "org/new-model-MLX"
+        assert registry.resolve("new-model").hf_path == "org/new-model-MLX"
         # Should be persisted
         assert models_json.exists()
 
@@ -302,3 +302,529 @@ class TestAtomicWriteJson:
         _atomic_write_json({"a": 1}, target)
         mode = stat.S_IMODE(os.stat(target).st_mode)
         assert mode == 0o644
+
+
+class TestModelConfig:
+    def test_from_string(self):
+        """String entries in models.json become ModelConfig with just hf_path."""
+        mc = ModelConfig.from_entry("mlx-community/Llama-3.2-3B-Instruct-4bit")
+        assert mc.hf_path == "mlx-community/Llama-3.2-3B-Instruct-4bit"
+        assert mc.experimental == {}
+        assert mc.options == {}
+        assert mc.keep_alive is None
+
+    def test_from_dict(self):
+        """Dict entries in models.json become ModelConfig with full config."""
+        entry = {
+            "hf_path": "Qwen/Qwen3-8B-MLX",
+            "experimental": {"flash": True, "kv_cache_quant": "turboquant:4"},
+            "options": {"temperature": 0.7, "num_predict": 2048},
+            "keep_alive": "30m",
+        }
+        mc = ModelConfig.from_entry(entry)
+        assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
+        assert mc.experimental == {"flash": True, "kv_cache_quant": "turboquant:4"}
+        assert mc.options == {"temperature": 0.7, "num_predict": 2048}
+        assert mc.keep_alive == "30m"
+
+    def test_from_dict_minimal(self):
+        """Dict entry with only hf_path works."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model"})
+        assert mc.hf_path == "org/model"
+        assert mc.experimental == {}
+        assert mc.options == {}
+
+    def test_from_dict_missing_hf_path_raises(self):
+        with pytest.raises(ValueError, match="hf_path"):
+            ModelConfig.from_entry({"experimental": {"flash": True}})
+
+    def test_from_invalid_type_raises(self):
+        with pytest.raises(TypeError, match="str or dict"):
+            ModelConfig.from_entry(42)
+
+    def test_to_entry_plain(self):
+        """ModelConfig with no overrides serializes to plain string."""
+        mc = ModelConfig(hf_path="org/model")
+        assert mc.to_entry() == "org/model"
+
+    def test_to_entry_rich(self):
+        """ModelConfig with overrides serializes to dict."""
+        mc = ModelConfig(
+            hf_path="org/model",
+            experimental={"flash": True},
+            options={"temperature": 0.5},
+            keep_alive="10m",
+        )
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["hf_path"] == "org/model"
+        assert entry["experimental"] == {"flash": True}
+        assert entry["options"] == {"temperature": 0.5}
+        assert entry["keep_alive"] == "10m"
+
+    def test_to_entry_omits_empty_sections(self):
+        """Only non-empty sections are included in dict serialization."""
+        mc = ModelConfig(hf_path="org/model", experimental={"flash": True})
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert "options" not in entry
+        assert "keep_alive" not in entry
+
+    def test_invalid_experimental_key_rejected(self):
+        """Unknown keys in experimental dict are rejected."""
+        with pytest.raises(ValueError, match="Unknown experimental"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "experimental": {"nonexistent_setting": True},
+                }
+            )
+
+    def test_invalid_kv_cache_quant_rejected(self):
+        """Invalid kv_cache_quant value is rejected."""
+        with pytest.raises(ValueError, match="kv_cache_quant"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "experimental": {"kv_cache_quant": "bad_value"},
+                }
+            )
+
+
+class TestRegistryModelConfig:
+    def test_load_mixed_format(self, tmp_path, monkeypatch):
+        """models.json with both string and dict entries loads correctly."""
+        config = {
+            "llama3:latest": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "experimental": {"flash": True},
+                "options": {"temperature": 0.3},
+            },
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        assert isinstance(reg._mappings["llama3:latest"], ModelConfig)
+        assert (
+            reg._mappings["llama3:latest"].hf_path
+            == "mlx-community/Llama-3.2-3B-Instruct-4bit"
+        )
+        assert isinstance(reg._mappings["qwen3:latest"], ModelConfig)
+        assert reg._mappings["qwen3:latest"].experimental == {"flash": True}
+
+    def test_resolve_returns_model_config(self, tmp_path, monkeypatch):
+        """resolve() returns ModelConfig instead of plain string."""
+        config = {"qwen3:latest": "Qwen/Qwen3-8B-MLX"}
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        result = reg.resolve("qwen3")
+        assert isinstance(result, ModelConfig)
+        assert result.hf_path == "Qwen/Qwen3-8B-MLX"
+
+    def test_resolve_rich_entry_returns_config(self, tmp_path, monkeypatch):
+        """resolve() returns full ModelConfig for rich entries."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "experimental": {"kv_cache_quant": "turboquant:4"},
+                "keep_alive": "30m",
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        result = reg.resolve("qwen3")
+        assert result.hf_path == "Qwen/Qwen3-8B-MLX"
+        assert result.experimental == {"kv_cache_quant": "turboquant:4"}
+        assert result.keep_alive == "30m"
+
+    def test_resolve_hf_path_passthrough_returns_model_config(
+        self, tmp_path, monkeypatch
+    ):
+        """Direct HF paths return a ModelConfig with just hf_path."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text("{}")
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        result = reg.resolve("org/model-name")
+        assert isinstance(result, ModelConfig)
+        assert result.hf_path == "org/model-name"
+        assert result.experimental == {}
+
+    def test_save_preserves_rich_config(self, tmp_path, monkeypatch):
+        """Round-trip: load → save → load preserves experimental overrides."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "experimental": {"flash": True, "kv_cache_quant": "turboquant:4"},
+                "options": {"temperature": 0.7},
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        # Trigger save by adding a new mapping
+        reg.add_mapping("new-model", "org/new-model")
+        # Reload and verify rich config preserved
+        reg2 = ModelRegistry()
+        reg2.load()
+        qwen = reg2._mappings["qwen3:latest"]
+        assert qwen.experimental == {"flash": True, "kv_cache_quant": "turboquant:4"}
+        assert qwen.options == {"temperature": 0.7}
+
+    def test_save_compacts_plain_models(self, tmp_path, monkeypatch):
+        """Models with no overrides are saved as plain strings for readability."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text("{}")
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        reg.add_mapping("simple", "org/simple-model")
+        saved = json.loads(config_path.read_text())
+        assert saved["simple:latest"] == "org/simple-model"
+
+    def test_list_models_returns_model_configs(self, tmp_path, monkeypatch):
+        """list_models() returns dict of ModelConfig values."""
+        config = {
+            "llama3:latest": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "experimental": {"flash": True},
+            },
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        models = reg.list_models()
+        assert all(isinstance(v, ModelConfig) for v in models.values())
+
+    def test_add_mapping_with_model_config(self, tmp_path, monkeypatch):
+        """add_mapping() can accept a ModelConfig to store rich config."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text("{}")
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        mc = ModelConfig(
+            hf_path="org/model",
+            experimental={"flash": True},
+            options={"temperature": 0.5},
+        )
+        reg.add_mapping("my-model", "org/model", model_config=mc)
+        result = reg.resolve("my-model")
+        assert result.experimental == {"flash": True}
+        assert result.options == {"temperature": 0.5}
+
+    def test_alias_resolves_to_model_config(self, tmp_path, monkeypatch):
+        """Aliases resolve to the full ModelConfig of their source."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "experimental": {"flash": True},
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg._aliases_path = tmp_path / "aliases.json"
+        reg.load()
+        reg.add_alias("my-qwen", "qwen3")
+        result = reg.resolve("my-qwen")
+        assert isinstance(result, ModelConfig)
+        assert result.hf_path == "Qwen/Qwen3-8B-MLX"
+        assert result.experimental == {"flash": True}
+
+    def test_alias_stores_canonical_name(self, tmp_path, monkeypatch):
+        """add_alias stores the canonical model name, not the hf_path."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "experimental": {"flash": True},
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg._aliases_path = tmp_path / "aliases.json"
+        reg.load()
+        reg.add_alias("my-qwen", "qwen3")
+        assert reg._aliases["my-qwen:latest"] == "qwen3:latest"
+
+    def test_alias_deterministic_with_shared_hf_path(self, tmp_path, monkeypatch):
+        """Alias to a specific model name returns that model's config, not another
+        model that happens to share the same hf_path."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "options": {"temperature": 0.3},
+            },
+            "qwen3:8b": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "options": {"temperature": 0.9},
+            },
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg._aliases_path = tmp_path / "aliases.json"
+        reg.load()
+        reg.add_alias("cold-qwen", "qwen3:latest")
+        reg.add_alias("hot-qwen", "qwen3:8b")
+        cold = reg.resolve("cold-qwen")
+        hot = reg.resolve("hot-qwen")
+        assert cold.options == {"temperature": 0.3}
+        assert hot.options == {"temperature": 0.9}
+
+    def test_list_models_alias_inherits_config(self, tmp_path, monkeypatch):
+        """list_models returns full ModelConfig for aliases, same as resolve."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "experimental": {"flash": True},
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg._aliases_path = tmp_path / "aliases.json"
+        reg.load()
+        reg.add_alias("my-qwen", "qwen3")
+        models = reg.list_models()
+        assert models["my-qwen:latest"].experimental == {"flash": True}
+
+    def test_invalid_option_key_rejected(self):
+        """Unknown keys in options dict are rejected at parse time."""
+        with pytest.raises(ValueError, match="Unknown option"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "options": {"tempretaure": 0.7},
+                }
+            )
+
+    def test_invalid_option_value_type_rejected(self):
+        """Wrong value types in options are rejected at parse time."""
+        with pytest.raises(ValueError, match="temperature"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "options": {"temperature": "hot"},
+                }
+            )
+
+    def test_invalid_hf_path_in_dict_rejected(self):
+        """Invalid hf_path in dict entry is rejected at parse time."""
+        with pytest.raises(ValueError, match="owner/repo"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "no-slash-here",
+                }
+            )
+
+    def test_invalid_keep_alive_format_rejected(self):
+        """Invalid keep_alive format is rejected at parse time."""
+        with pytest.raises(ValueError, match="keep_alive"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "keep_alive": "30x",
+                }
+            )
+
+    def test_valid_keep_alive_formats_accepted(self):
+        """Valid keep_alive formats are accepted."""
+        for val in ["5m", "1h", "300s", "0", "-1"]:
+            mc = ModelConfig.from_entry({"hf_path": "org/model", "keep_alive": val})
+            assert mc.keep_alive == val
+
+    def test_invalid_experimental_value_rejected(self):
+        """Invalid experimental values (e.g. negative threshold) are rejected."""
+        with pytest.raises(ValueError, match="experimental"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "experimental": {"flash_sparsity_threshold": -1.0},
+                }
+            )
+
+    def test_add_mapping_hf_path_mismatch_rejected(self, tmp_path, monkeypatch):
+        """add_mapping rejects model_config with mismatched hf_path."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text("{}")
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        mc = ModelConfig(hf_path="org/other-model")
+        with pytest.raises(ValueError, match="mismatch"):
+            reg.add_mapping("my-model", "org/model", model_config=mc)
+
+    # ------------------------------------------------------------------
+    # Review round 4 — fixes for remaining PR comments
+    # ------------------------------------------------------------------
+
+    def test_bare_numeric_keep_alive_accepted(self):
+        """Bare numeric string like '1800' should be accepted as seconds."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model", "keep_alive": "1800"})
+        assert mc.keep_alive == "1800"
+
+    def test_integer_keep_alive_coerced_to_string(self):
+        """Integer keep_alive from JSON should be coerced to string."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model", "keep_alive": 1800})
+        assert mc.keep_alive == "1800"
+        assert isinstance(mc.keep_alive, str)
+
+    def test_string_entry_validates_hf_path(self):
+        """String entries in models.json must be valid HF paths."""
+        with pytest.raises(ValueError, match="owner/repo"):
+            ModelConfig.from_entry("no-slash-here")
+
+    def test_bad_entry_skipped_during_load(self, tmp_path, monkeypatch):
+        """A single bad entry should not crash the entire registry load."""
+        config = {
+            "good-model:latest": "Qwen/Qwen3-8B-MLX",
+            "bad-model:latest": {"missing_hf_path": True},
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        assert "good-model:latest" in reg._mappings
+        assert "bad-model:latest" not in reg._mappings
+
+    def test_resolve_hf_path_key_with_config(self, tmp_path, monkeypatch):
+        """HF path used as a key in models.json should return its full config."""
+        config = {
+            "Qwen/Qwen3-8B": {
+                "hf_path": "Qwen/Qwen3-8B",
+                "options": {"temperature": 0.5},
+            },
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        mc = reg.resolve("Qwen/Qwen3-8B")
+        assert mc is not None
+        assert mc.options == {"temperature": 0.5}
+
+    def test_list_models_alias_priority_matches_resolve(self, tmp_path, monkeypatch):
+        """list_models() should use alias-first priority, matching resolve()."""
+        config = {
+            "my-model:latest": "org/model-a",
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        # Add an alias "my-model:latest" → some other model
+        reg._mappings["other:latest"] = ModelConfig(hf_path="org/model-b")
+        reg._aliases["my-model:latest"] = "other:latest"
+        # resolve() checks aliases first → should get model-b
+        resolved = reg.resolve("my-model:latest")
+        assert resolved.hf_path == "org/model-b"
+        # list_models() should agree
+        listed = reg.list_models()
+        assert listed["my-model:latest"].hf_path == "org/model-b"
+
+    def test_alias_of_alias_preserves_config(self, tmp_path, monkeypatch):
+        """Alias-of-alias should preserve per-model config from the source."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "options": {"temperature": 0.7},
+            },
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        reg._aliases_path = tmp_path / "aliases.json"
+        # First alias: my-qwen → qwen3
+        reg.add_alias("my-qwen", "qwen3")
+        # Second alias: q3 → my-qwen (alias-of-alias)
+        reg.add_alias("q3", "my-qwen")
+        # q3 should resolve to full config with options
+        mc = reg.resolve("q3")
+        assert mc is not None
+        assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
+        assert mc.options == {"temperature": 0.7}
+
+    # ------------------------------------------------------------------
+    # Review round 5 — bool rejection, bare int keep_alive at runtime
+    # ------------------------------------------------------------------
+
+    def test_boolean_option_value_rejected(self):
+        """Boolean values should be rejected for int/float options."""
+        with pytest.raises(ValueError, match="top_k"):
+            ModelConfig.from_entry({"hf_path": "org/model", "options": {"top_k": True}})
+
+    def test_boolean_seed_rejected(self):
+        """Boolean seed should be rejected (bool is subclass of int)."""
+        with pytest.raises(ValueError, match="seed"):
+            ModelConfig.from_entry({"hf_path": "org/model", "options": {"seed": False}})
+
+    def test_add_mapping_without_config_preserves_existing(self, tmp_path, monkeypatch):
+        """add_mapping with model_config=None should not erase existing rich config."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "experimental": {"flash": True},
+                "options": {"temperature": 0.7},
+                "keep_alive": "30m",
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        # Call add_mapping without model_config (as store.py pull does)
+        reg.add_mapping("qwen3", "Qwen/Qwen3-8B-MLX")
+        # Rich config should be preserved
+        mc = reg._mappings["qwen3:latest"]
+        assert mc.experimental == {"flash": True}
+        assert mc.options == {"temperature": 0.7}
+        assert mc.keep_alive == "30m"
+
+    def test_unrecognized_entries_survive_save(self, tmp_path, monkeypatch):
+        """Entries that fail parsing should be preserved on save."""
+        config = {
+            "good:latest": "Qwen/Qwen3-8B-MLX",
+            "future-format:latest": {"hf_path": "org/model", "new_field": "value"},
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        # "future-format" should be in _raw_unrecognized (it has unknown fields
+        # but from_entry only validates experimental/options/keep_alive, so
+        # extra keys are ignored). Force an unrecognized entry for testing:
+        reg._raw_unrecognized["broken:latest"] = {"weird": True}
+        # Trigger a save
+        reg.add_mapping("new-model", "org/new-model")
+        # Reload and verify unrecognized entry survived
+        saved = json.loads(config_path.read_text())
+        assert "broken:latest" in saved
+        assert saved["broken:latest"] == {"weird": True}

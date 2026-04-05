@@ -98,8 +98,8 @@ async def create_model(req: CreateRequest, request: Request):
         return JSONResponse({"error": "FROM is required in Modelfile"}, status_code=400)
 
     # Resolve the base model
-    hf_path = registry.resolve(from_model)
-    if hf_path is None:
+    resolved = registry.resolve(from_model)
+    if resolved is None:
         return JSONResponse(
             {"error": f"base model '{from_model}' not found"}, status_code=404
         )
