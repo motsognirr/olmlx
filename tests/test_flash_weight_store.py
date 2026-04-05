@@ -155,6 +155,66 @@ class TestBundleFFNWeights:
         assert config["intermediate_size"] == inter
 
 
+class TestBundleVLModelWeights:
+    """Bundler should handle VL model weight naming and bfloat16 tensors."""
+
+    def test_bundle_finds_vlm_prefixed_weights(self, tmp_path):
+        """VL models like Qwen3.5 use language_model.model.layers.N.mlp.* naming."""
+        from safetensors.numpy import save_file
+
+        hidden, inter = 16, 8
+        tensors = {}
+        for layer in range(2):
+            prefix = f"language_model.model.layers.{layer}.mlp"
+            tensors[f"{prefix}.gate_proj.weight"] = np.random.randn(
+                inter, hidden
+            ).astype(np.float16)
+            tensors[f"{prefix}.up_proj.weight"] = np.random.randn(inter, hidden).astype(
+                np.float16
+            )
+            tensors[f"{prefix}.down_proj.weight"] = np.random.randn(
+                hidden, inter
+            ).astype(np.float16)
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        save_file(tensors, str(model_dir / "model.safetensors"))
+        output_dir = tmp_path / "flash"
+
+        layouts = bundle_ffn_weights(model_dir, output_dir)
+
+        assert len(layouts) == 2
+        assert 0 in layouts and 1 in layouts
+
+    def test_bundle_handles_bfloat16_mlp_weights(self, tmp_path):
+        """MLP weights stored as bfloat16 should be converted to float16 for bundling."""
+        import mlx.core as mx_core
+
+        hidden, inter = 16, 8
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+
+        # Save MLP weights as bfloat16 (only mx supports this, not numpy)
+        weights = {}
+        prefix = "model.layers.0.mlp"
+        weights[f"{prefix}.gate_proj.weight"] = mx_core.random.normal(
+            shape=(inter, hidden)
+        ).astype(mx_core.bfloat16)
+        weights[f"{prefix}.up_proj.weight"] = mx_core.random.normal(
+            shape=(inter, hidden)
+        ).astype(mx_core.bfloat16)
+        weights[f"{prefix}.down_proj.weight"] = mx_core.random.normal(
+            shape=(hidden, inter)
+        ).astype(mx_core.bfloat16)
+        mx_core.save_safetensors(str(model_dir / "model.safetensors"), weights)
+
+        output_dir = tmp_path / "flash"
+        layouts = bundle_ffn_weights(model_dir, output_dir)
+
+        assert len(layouts) == 1
+        assert 0 in layouts
+
+
 # ---------------------------------------------------------------------------
 # NeuronCache tests
 # ---------------------------------------------------------------------------

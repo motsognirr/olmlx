@@ -30,6 +30,59 @@ from olmlx.engine.flash.predictor import (
 
 logger = logging.getLogger(__name__)
 
+# Error substring used by mlx-lm when safetensors contain keys not in the model.
+# This is a fragile contract with mlx-lm internals — if the error wording changes,
+# VL model loading will fall through to the mlx_vlm fallback instead of using
+# strict=False, which still works but loads as a vision model unnecessarily.
+_STRICT_LOAD_ERROR = "parameters not in model"
+
+
+def _get_backbone(model: nn.Module) -> nn.Module:
+    """Navigate to the transformer backbone that has .layers and .embed_tokens.
+
+    Handles both standard models (Model.model = backbone) and VL models
+    (Model.language_model.model = backbone).
+    """
+    inner = model.model if hasattr(model, "model") else model
+    lm = getattr(inner, "language_model", None)
+    if lm is not None:
+        inner = getattr(lm, "model", lm)
+    return inner
+
+
+def load_model_with_strict_fallback(model_path: str, *, lazy: bool) -> tuple:
+    """Load model via mlx-lm, retrying with strict=False for VL models.
+
+    VL models (e.g. Qwen3.5) ship vision tower weights in safetensors that the
+    text-only model class doesn't use. When mlx-lm raises ValueError containing
+    "parameters not in model", retries with strict=False.
+
+    Returns (model, tokenizer).
+    """
+    import mlx_lm
+
+    try:
+        return mlx_lm.load(model_path, lazy=lazy)
+    except ValueError as exc:
+        if _STRICT_LOAD_ERROR not in str(exc):
+            raise
+        logger.info(
+            "Retrying with strict=False (extra weights in safetensors): %s", exc
+        )
+        model_dir = Path(model_path)
+        model, config = mlx_lm.utils.load_model(model_dir, lazy=lazy, strict=False)
+        # config may be a dict or a dataclass depending on mlx-lm version
+        eos = (
+            config.get("eos_token_id")
+            if isinstance(config, dict)
+            else getattr(config, "eos_token_id", None)
+        )
+        # None is intentionally passed through to let mlx-lm use the tokenizer default
+        tokenizer = mlx_lm.utils.load_tokenizer(
+            model_dir, eos_token_ids=[eos] if isinstance(eos, int) else eos
+        )
+        return model, tokenizer
+
 
 def _encode_tokens(tokenizer, text: str) -> list[int]:
     """Encode text to token ids, handling both fast and slow tokenizers."""
@@ -303,13 +356,11 @@ def _stream_record_activations(
     Returns:
         (recordings, hidden_size, intermediate_size, num_layers)
     """
-    import mlx_lm  # deferred — triggers slow import transformers
-
     if progress_callback:
         progress_callback("Loading model skeleton", 0.0)
 
     try:
-        model, tokenizer = mlx_lm.load(model_path, lazy=True)
+        model, tokenizer = load_model_with_strict_fallback(model_path, lazy=True)
     except ValueError:
         # mlx_lm doesn't support this model type (e.g. gemma4 VLM) —
         # fall back to mlx_vlm and extract the language model.
@@ -321,8 +372,7 @@ def _stream_record_activations(
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
 
-    # Access inner model (mlx-lm wraps: Model.model = LlamaModel/Qwen3Model/etc.)
-    inner = model.model if hasattr(model, "model") else model
+    inner = _get_backbone(model)
     layers = inner.layers
     num_layers = len(layers)
 
@@ -332,8 +382,13 @@ def _stream_record_activations(
     for layer in layers:
         mlp = layer.mlp if hasattr(layer, "mlp") else None
         if mlp and hasattr(mlp, "gate_proj") and hasattr(mlp, "up_proj"):
-            intermediate_size = mlp.gate_proj.weight.shape[0]
-            hidden_size = mlp.gate_proj.weight.shape[1]
+            gate = mlp.gate_proj
+            intermediate_size = gate.weight.shape[0]
+            # For quantized models, weight is packed — derive real dim from scales
+            if hasattr(gate, "scales") and hasattr(gate, "group_size"):
+                hidden_size = gate.scales.shape[1] * gate.group_size
+            else:
+                hidden_size = gate.weight.shape[1]
             break
     if hidden_size is None:
         raise ValueError("No layer has gate_proj/up_proj — cannot determine dimensions")
@@ -364,7 +419,9 @@ def _stream_record_activations(
     _nullify_module_params(embed)
     # Free LM head and final norm — not needed for layer-by-layer streaming
     for attr in ("lm_head", "norm", "output"):
-        submod = getattr(inner, attr, None) or getattr(model, attr, None)
+        submod = getattr(inner, attr, None)
+        if submod is None:
+            submod = getattr(model, attr, None)
         if submod is not None and isinstance(submod, nn.Module):
             _nullify_module_params(submod)
     gc.collect()

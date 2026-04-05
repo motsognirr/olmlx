@@ -103,6 +103,39 @@ class FakeModel(nn.Module):
         return self.model.layers
 
 
+class FakeTextModel(nn.Module):
+    """Mimics mlx-lm's TextModel for VL architectures (e.g. Qwen3.5).
+
+    Structure: Model.language_model.model.embed_tokens (no .model at top level).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.model = FakeInnerModel()
+
+    def __call__(self, inputs, cache=None):
+        return self.model(inputs, cache)
+
+
+class FakeVLModel(nn.Module):
+    """Mimics mlx-lm's outer Model wrapper for VL models like Qwen3.5.
+
+    No .model attribute — uses .language_model instead. Exposes .layers
+    via property like the real Model class.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.language_model = FakeTextModel()
+
+    def __call__(self, inputs, cache=None):
+        return self.language_model(inputs, cache)
+
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
+
 class FakeTokenizer:
     def encode(self, text):
         # Return deterministic token ids based on text length
@@ -353,6 +386,232 @@ class TestPrepareModelEndToEnd:
 
         # Verify bundler was called
         mock_bundle.assert_called_once()
+
+
+class TestVLModelSupport:
+    """Flash prepare should handle VL models whose safetensors include vision weights."""
+
+    def _make_fake_model_and_tokenizer(self):
+        model = FakeModel()
+        mx.eval(model.parameters())
+        tokenizer = FakeTokenizer()
+        return model, tokenizer
+
+    def test_stream_record_handles_vlm_strict_load_failure(self):
+        """When mlx_lm.load() fails due to extra vision weights, should fall back
+        to load_model(strict=False) + load_tokenizer()."""
+        from olmlx.engine.flash.prepare import _stream_record_activations
+
+        model, tokenizer = self._make_fake_model_and_tokenizer()
+
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError(
+            "Received 333 parameters not in model: "
+            "language_model.vision_tower.blocks.0.attn.proj.bias"
+        )
+        # Fallback path: load_model with strict=False + load_tokenizer
+        mock_config = {"eos_token_id": [0]}
+        mock_mlx_lm.utils.load_model.return_value = (model, mock_config)
+        mock_mlx_lm.utils.load_tokenizer.return_value = tokenizer
+
+        ctx = patch.dict(sys.modules, {"mlx_lm": mock_mlx_lm})
+        with ctx:
+            texts = ["Hello world", "Test input"]
+            recordings, hidden_size, intermediate_size, num_layers = (
+                _stream_record_activations("fake_path", texts)
+            )
+
+        # Should have fallen back to load_model with strict=False
+        mock_mlx_lm.utils.load_model.assert_called_once()
+        assert mock_mlx_lm.utils.load_model.call_args.kwargs["strict"] is False
+
+        # Should still produce correct recordings
+        assert len(recordings) == NUM_LAYERS
+        assert hidden_size == HIDDEN
+        assert intermediate_size == INTER
+
+    def test_stream_record_handles_vlm_model_structure(self):
+        """VL models like Qwen3.5 nest embed_tokens under language_model.model
+        instead of model.model. Flash prepare should find it."""
+        from olmlx.engine.flash.prepare import _stream_record_activations
+
+        model = FakeVLModel()
+        mx.eval(model.parameters())
+        tokenizer = FakeTokenizer()
+
+        ctx, _ = _patch_mlx_lm(model, tokenizer)
+        with ctx:
+            recordings, hidden_size, intermediate_size, num_layers = (
+                _stream_record_activations("fake_path", ["Hello world"])
+            )
+
+        assert len(recordings) == NUM_LAYERS
+        assert hidden_size == HIDDEN
+        assert intermediate_size == INTER
+
+    def test_stream_record_vlm_strict_load_failure_with_vlm_structure(self):
+        """Combined scenario: mlx_lm.load() fails due to extra vision weights
+        AND the strict=False retry returns a VL-structured model."""
+        from olmlx.engine.flash.prepare import _stream_record_activations
+
+        model = FakeVLModel()
+        mx.eval(model.parameters())
+        tokenizer = FakeTokenizer()
+
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError(
+            "Received 333 parameters not in model: "
+            "language_model.vision_tower.blocks.0.attn.proj.bias"
+        )
+        mock_config = {"eos_token_id": 151645}  # bare int, not a list
+        mock_mlx_lm.utils.load_model.return_value = (model, mock_config)
+        mock_mlx_lm.utils.load_tokenizer.return_value = tokenizer
+
+        ctx = patch.dict(sys.modules, {"mlx_lm": mock_mlx_lm})
+        with ctx:
+            recordings, hidden_size, intermediate_size, num_layers = (
+                _stream_record_activations("fake_path", ["Hello world"])
+            )
+
+        # Should have fallen back to load_model with strict=False
+        mock_mlx_lm.utils.load_model.assert_called_once()
+        assert mock_mlx_lm.utils.load_model.call_args.kwargs["strict"] is False
+
+        # eos_token_id should have been wrapped in a list
+        eos_arg = mock_mlx_lm.utils.load_tokenizer.call_args.kwargs.get("eos_token_ids")
+        assert eos_arg == [151645]
+
+        assert len(recordings) == NUM_LAYERS
+        assert hidden_size == HIDDEN
+        assert intermediate_size == INTER
+
+    def test_stream_record_quantized_model_reports_real_hidden_size(self):
+        """Quantized models pack weights — hidden_size must come from the real
+        dimensions, not the packed weight shape."""
+        from olmlx.engine.flash.prepare import _stream_record_activations
+
+        # Use dimensions large enough for quantization (group_size=64)
+        q_hidden, q_inter = 128, 256
+        q_num_heads = 4
+        q_head_dim = q_hidden // q_num_heads
+
+        class QFakeMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.QuantizedLinear(q_hidden, q_inter, bias=False)
+                self.up_proj = nn.QuantizedLinear(q_hidden, q_inter, bias=False)
+                self.down_proj = nn.QuantizedLinear(q_inter, q_hidden, bias=False)
+
+            def __call__(self, x):
+                return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+        class QFakeAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(q_hidden, q_hidden, bias=False)
+                self.k_proj = nn.Linear(q_hidden, q_hidden, bias=False)
+                self.v_proj = nn.Linear(q_hidden, q_hidden, bias=False)
+                self.o_proj = nn.Linear(q_hidden, q_hidden, bias=False)
+                self.scale = q_head_dim**-0.5
+
+            def __call__(self, x, mask=None, cache=None):
+                B, L, _ = x.shape
+                q = (
+                    self.q_proj(x)
+                    .reshape(B, L, q_num_heads, q_head_dim)
+                    .transpose(0, 2, 1, 3)
+                )
+                k = (
+                    self.k_proj(x)
+                    .reshape(B, L, q_num_heads, q_head_dim)
+                    .transpose(0, 2, 1, 3)
+                )
+                v = (
+                    self.v_proj(x)
+                    .reshape(B, L, q_num_heads, q_head_dim)
+                    .transpose(0, 2, 1, 3)
+                )
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=self.scale, mask=mask
+                )
+                return self.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, q_hidden))
+
+        class QFakeBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = QFakeAttention()
+                self.mlp = QFakeMLP()
+                self.input_layernorm = nn.RMSNorm(q_hidden)
+                self.post_attention_layernorm = nn.RMSNorm(q_hidden)
+
+            def __call__(self, x, mask=None, cache=None):
+                r = self.self_attn(self.input_layernorm(x), mask, cache)
+                h = x + r
+                return h + self.mlp(self.post_attention_layernorm(h))
+
+        class QFakeInner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = nn.Embedding(VOCAB, q_hidden)
+                self.layers = [QFakeBlock() for _ in range(2)]
+                self.norm = nn.RMSNorm(q_hidden)
+
+        class QFakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = QFakeInner()
+
+            @property
+            def layers(self):
+                return self.model.layers
+
+        model = QFakeModel()
+        mx.eval(model.parameters())
+
+        # Verify the packed shape differs from the real shape
+        packed_dim = model.model.layers[0].mlp.gate_proj.weight.shape[1]
+        assert packed_dim != q_hidden, (
+            "Test setup: packed dim should differ from hidden"
+        )
+
+        ctx, _ = _patch_mlx_lm(model, FakeTokenizer())
+        with ctx:
+            recordings, hidden_size, intermediate_size, num_layers = (
+                _stream_record_activations("fake_path", ["Hello world"])
+            )
+
+        # Must report real dimensions, not packed
+        assert hidden_size == q_hidden
+        assert intermediate_size == q_inter
+
+    def test_stream_record_non_weight_valueerror_falls_back_to_vlm(self):
+        """ValueError not about extra weights should fall back to mlx_vlm."""
+        from olmlx.engine.flash.prepare import _stream_record_activations
+
+        model = FakeVLModel()
+        mx.eval(model.parameters())
+        tokenizer = FakeTokenizer()
+
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError("some other error")
+
+        mock_mlx_vlm = MagicMock()
+        # mlx_vlm returns (vlm_model, processor); code extracts .language_model
+        mock_vlm_model = MagicMock()
+        mock_vlm_model.language_model = model
+        mock_processor = MagicMock()
+        mock_processor.tokenizer = tokenizer
+        mock_mlx_vlm.load.return_value = (mock_vlm_model, mock_processor)
+
+        ctx = patch.dict(sys.modules, {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm})
+        with ctx:
+            recordings, hidden_size, intermediate_size, num_layers = (
+                _stream_record_activations("fake_path", ["Hello"])
+            )
+
+        mock_mlx_vlm.load.assert_called_once()
+        assert len(recordings) == NUM_LAYERS
+        assert hidden_size == HIDDEN
 
 
 class TestStreamingEdgeCases:

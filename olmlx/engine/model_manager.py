@@ -1118,12 +1118,14 @@ class ModelManager:
         from olmlx.engine.flash.predictor import LookaheadBank, PredictorBank
         from olmlx.engine.flash.weight_store import FlashWeightStore
 
-        import mlx_lm
-
         logger.info("Loading model %s in flash mode from %s", hf_path, flash_dir)
 
-        # Load the full model first (we'll free FFN weights after wrapping)
-        model, tokenizer = mlx_lm.load(load_path)
+        # Load the full model first (we'll free FFN weights after wrapping).
+        # VL models (e.g. Qwen3.5) have vision tower weights in safetensors
+        # that the text-only model class doesn't use — retry with strict=False.
+        from olmlx.engine.flash.prepare import load_model_with_strict_fallback
+
+        model, tokenizer = load_model_with_strict_fallback(load_path, lazy=False)
         caps = detect_caps(tokenizer)
 
         # Load predictor bank
@@ -1190,8 +1192,8 @@ class ModelManager:
                 "Loading draft model %s for speculative decoding",
                 model_exp.flash_speculative_draft_model,
             )
-            draft_model, draft_tokenizer = mlx_lm.load(
-                model_exp.flash_speculative_draft_model
+            draft_model, draft_tokenizer = load_model_with_strict_fallback(
+                model_exp.flash_speculative_draft_model, lazy=False
             )
 
             # Verify vocabulary compatibility — a mismatch causes silent token ID errors

@@ -117,14 +117,22 @@ def _find_ffn_weights(
     # Match both text models (model.layers.X.mlp...) and VLMs
     # (language_model.model.layers.X.mlp...)
     pattern = re.compile(
-        r"(?:language_model\.)?model\.layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)"
+        r"(?:language_model\.)?model\.layers\.(\d+)\.mlp\."
+        r"(gate_proj|up_proj|down_proj)\.(weight|scales|biases)"
     )
 
     for sf_path in sorted(model_dir.glob("*.safetensors")):
         if sf_path.name.startswith("flash_"):
             continue
-        # Use mx.load to handle bfloat16 (safetensors.numpy can't)
-        tensors = mx.load(str(sf_path))
+        # Use mx.load to handle bfloat16 (safetensors.numpy can't).
+        # mx.load allocates Metal-backed arrays; convert matched tensors to
+        # numpy immediately and delete the rest to free Metal memory per shard.
+        try:
+            tensors = mx.load(str(sf_path))
+        except (ValueError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"Failed to load {sf_path.name} during flash bundling: {exc}"
+            ) from exc
         for name, arr in tensors.items():
             m = pattern.match(name)
             if m:
@@ -139,6 +147,8 @@ def _find_ffn_weights(
                 if arr.dtype == mx.bfloat16:
                     arr = arr.astype(mx.float16)
                 layers[layer_idx][key] = np.array(arr)
+        del tensors
+        mx.clear_cache()
 
     return layers, quant_config
 
