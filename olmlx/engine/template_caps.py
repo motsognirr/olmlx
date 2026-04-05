@@ -13,6 +13,7 @@ class TemplateCaps:
     supports_enable_thinking: bool = False
     has_thinking_tags: bool = False
     has_channel_format: bool = False
+    uses_tool_responses: bool = False
 
 
 def _find_template_variables(tpl: str) -> set[str] | None:
@@ -58,9 +59,14 @@ def detect_caps(tokenizer: Any) -> TemplateCaps:
 
     has_channel_format = "<|channel|>" in tpl
 
+    # tool_responses is accessed as message.tool_responses — substring check is
+    # sufficient since it's never a top-level Jinja2 variable.
+    uses_tool_responses = "tool_responses" in tpl
+
     return TemplateCaps(
         supports_tools=supports_tools,
         supports_enable_thinking=supports_enable_thinking,
         has_thinking_tags=has_thinking_tags,
         has_channel_format=has_channel_format,
+        uses_tool_responses=uses_tool_responses,
     )

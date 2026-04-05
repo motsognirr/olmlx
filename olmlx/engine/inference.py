@@ -760,6 +760,49 @@ def _apply_chat_template_text(
     )
 
 
+def _convert_tool_messages_to_responses(messages: list[dict]) -> list[dict]:
+    """Convert ``role: "tool"`` messages to ``tool_responses`` format.
+
+    Some models (e.g. Gemma 4) don't support OpenAI-style ``role: "tool"``
+    messages.  Instead they expect a ``tool_responses`` array on a message.
+    This function collects consecutive tool messages, resolves each tool's
+    name from the preceding assistant's ``tool_calls``, and emits a synthetic
+    user message carrying the ``tool_responses`` list.
+    """
+    if not any(m.get("role") == "tool" for m in messages):
+        return messages
+
+    result: list[dict] = []
+    # Build a mapping from tool_call_id → function name across all assistant messages.
+    id_to_name: dict[str, str] = {}
+    for m in messages:
+        for tc in m.get("tool_calls", []):
+            tc_id = tc.get("id", "")
+            fn = tc.get("function", {})
+            name = fn.get("name", "") if isinstance(fn, dict) else ""
+            if tc_id and name:
+                id_to_name[tc_id] = name
+
+    pending_responses: list[dict] = []
+
+    def _flush_pending() -> None:
+        if pending_responses:
+            result.append({"role": "user", "tool_responses": list(pending_responses)})
+            pending_responses.clear()
+
+    for m in messages:
+        if m.get("role") == "tool":
+            tc_id = m.get("tool_call_id", "")
+            name = id_to_name.get(tc_id, "unknown")
+            pending_responses.append({"name": name, "response": m.get("content", "")})
+        else:
+            _flush_pending()
+            result.append(m)
+
+    _flush_pending()
+    return result
+
+
 def _apply_chat_template_vlm(
     processor: Any,
     model: Any,
@@ -1672,6 +1715,10 @@ async def generate_chat(
         caps = lm.template_caps or TemplateCaps()
         # Resolve enable_thinking for templates that support it.
         vlm_thinking = enable_thinking if caps.supports_enable_thinking else None
+        # Convert role="tool" messages to tool_responses format for models
+        # that don't support OpenAI-style tool messages (e.g. Gemma 4).
+        if caps.uses_tool_responses:
+            messages = _convert_tool_messages_to_responses(messages)
         if tools and caps.supports_tools:
             prompt = _apply_chat_template_vlm(
                 lm.tokenizer,

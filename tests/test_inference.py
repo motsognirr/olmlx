@@ -269,6 +269,127 @@ class TestInjectToolsIntoSystem:
         assert "direct_tool" in result[0]["content"]
 
 
+class TestConvertToolMessagesToResponses:
+    def test_no_tool_messages_unchanged(self):
+        """Messages without role=tool pass through unchanged."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        assert result == messages
+
+    def test_tool_message_converted_to_tool_responses(self):
+        """role=tool messages become tool_responses on a user message."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {"role": "user", "content": "search for cats"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": {"q": "cats"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "found 3 cats"},
+            {"role": "user", "content": "thanks"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        # role=tool message should be gone
+        assert not any(m.get("role") == "tool" for m in result)
+        # Should have a user message with tool_responses
+        tool_resp_msg = [m for m in result if "tool_responses" in m]
+        assert len(tool_resp_msg) == 1
+        assert tool_resp_msg[0]["tool_responses"] == [
+            {"name": "search", "response": "found 3 cats"}
+        ]
+
+    def test_multiple_tool_results_grouped(self):
+        """Multiple consecutive tool messages become one tool_responses array."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {"role": "user", "content": "do things"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": {"f": "a.py"}},
+                    },
+                    {
+                        "id": "tc2",
+                        "type": "function",
+                        "function": {"name": "write", "arguments": {"f": "b.py"}},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "contents of a"},
+            {"role": "tool", "tool_call_id": "tc2", "content": "ok"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        tool_resp_msg = [m for m in result if "tool_responses" in m]
+        assert len(tool_resp_msg) == 1
+        assert len(tool_resp_msg[0]["tool_responses"]) == 2
+        assert tool_resp_msg[0]["tool_responses"][0]["name"] == "read"
+        assert tool_resp_msg[0]["tool_responses"][1]["name"] == "write"
+
+    def test_tool_name_resolved_from_preceding_assistant(self):
+        """Tool name is resolved from the assistant's tool_calls by matching tool_call_id."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "Bash", "arguments": {"cmd": "ls"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "file1\nfile2"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        tool_resp_msg = [m for m in result if "tool_responses" in m]
+        assert tool_resp_msg[0]["tool_responses"][0]["name"] == "Bash"
+
+    def test_original_messages_not_modified(self):
+        """Conversion does not mutate the input list."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "foo", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "bar"},
+        ]
+        original_len = len(messages)
+        _convert_tool_messages_to_responses(messages)
+        assert len(messages) == original_len
+        assert messages[1]["role"] == "tool"
+
+
 class TestApplyChatTemplateText:
     def test_basic(self):
         tokenizer = MagicMock()
@@ -1162,6 +1283,70 @@ class TestGenerateChatVlm:
         assert messages_passed[0]["role"] == "system"
         assert "search" in messages_passed[0]["content"]
         assert result["text"] == "tool response"
+
+    @pytest.mark.asyncio
+    async def test_vlm_tool_messages_converted_to_tool_responses(self, mock_manager):
+        """VLM with uses_tool_responses converts role=tool to tool_responses format."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        lm.template_caps = TemplateCaps(
+            supports_tools=True,
+            supports_enable_thinking=True,
+            uses_tool_responses=True,
+        )
+
+        mock_mx = MagicMock()
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "Bash", "description": "Run", "parameters": {}},
+            }
+        ]
+
+        lm.tokenizer.tokenizer = MagicMock()
+        lm.tokenizer.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
+
+        messages = [
+            {"role": "user", "content": "list files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "Bash", "arguments": {"cmd": "ls"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "file1\nfile2"},
+            {"role": "user", "content": "thanks"},
+        ]
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch(
+                "olmlx.engine.inference.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_thread:
+                mock_thread.return_value = "done"
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    messages,
+                    tools=tools,
+                    stream=False,
+                )
+
+        # Verify the messages passed to apply_chat_template have no role=tool
+        tpl_call = lm.tokenizer.tokenizer.apply_chat_template
+        tpl_call.assert_called_once()
+        passed_messages = tpl_call.call_args[0][0]
+        assert not any(m.get("role") == "tool" for m in passed_messages)
+        # Should have a message with tool_responses
+        tool_resp_msgs = [m for m in passed_messages if "tool_responses" in m]
+        assert len(tool_resp_msgs) == 1
+        assert tool_resp_msgs[0]["tool_responses"][0]["name"] == "Bash"
+        assert tool_resp_msgs[0]["tool_responses"][0]["response"] == "file1\nfile2"
 
 
 class TestGenerateEmbeddings:
