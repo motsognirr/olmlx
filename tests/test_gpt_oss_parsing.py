@@ -132,12 +132,16 @@ class TestParseGptOssChannels:
         assert visible == "Answer."
 
     def test_commentary_channel_with_tool_call(self):
-        """Commentary channel should be parsed as a tool call."""
+        """Commentary channel should be parsed as a tool call (harmony format).
+
+        The correct harmony format has to=functions.* AFTER <|channel|>:
+        <|start|>assistant<|channel|>commentary to=functions.search<|constrain|>json<|message|>{...}<|call|>
+        """
         text = (
             "<|start|>assistant<|channel|>analysis<|message|>"
             "I need to search."
             "<|end|>"
-            "<|start|>assistant to=functions.search<|channel|>commentary json<|message|>"
+            "<|start|>assistant<|channel|>commentary to=functions.search<|constrain|>json<|message|>"
             '{"query": "test"}'
             "<|call|>"
         )
@@ -146,6 +150,106 @@ class TestParseGptOssChannels:
         assert len(tools) == 1
         assert tools[0]["name"] == "search"
         assert tools[0]["input"] == {"query": "test"}
+
+    def test_tool_call_without_constrain(self):
+        """Tool call without <|constrain|> should still parse correctly."""
+        text = (
+            "<|start|>assistant<|channel|>commentary to=functions.get_weather<|message|>"
+            '{"location": "Paris"}'
+            "<|call|>"
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert thinking == ""
+        assert visible == ""
+        assert len(tools) == 1
+        assert tools[0]["name"] == "get_weather"
+        assert tools[0]["input"] == {"location": "Paris"}
+
+    def test_multiple_tool_calls(self):
+        """Multiple tool calls should all be parsed."""
+        text = (
+            "<|start|>assistant<|channel|>commentary to=functions.search<|message|>"
+            '{"query": "weather"}'
+            "<|call|>"
+            "<|start|>assistant<|channel|>commentary to=functions.get_location<|message|>"
+            "{}"
+            "<|call|>"
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 2
+        assert tools[0]["name"] == "search"
+        assert tools[0]["input"] == {"query": "weather"}
+        assert tools[1]["name"] == "get_location"
+        assert tools[1]["input"] == {}
+
+    def test_tool_call_with_complex_args(self):
+        """Tool call with nested objects and arrays should parse correctly."""
+        text = (
+            "<|start|>assistant<|channel|>commentary to=functions.search<|message|>"
+            '{"query": "restaurants", "filters": {"cuisine": "italian", "price": ["$", "$$"]}, "limit": 5}'
+            "<|call|>"
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
+        assert tools[0]["input"] == {
+            "query": "restaurants",
+            "filters": {"cuisine": "italian", "price": ["$", "$$"]},
+            "limit": 5,
+        }
+
+    def test_tool_call_without_tools_flag(self):
+        """Tool calls should be ignored when has_tools=False.
+
+        When tools are not provided, commentary channel content is discarded
+        (it's metadata, not visible text). The content doesn't appear in
+        visible text because it's not meant for end users.
+        """
+        text = (
+            "<|start|>assistant<|channel|>commentary to=functions.search<|message|>"
+            '{"query": "test"}'
+            "<|call|>"
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert thinking == ""
+        assert visible == ""  # Commentary content is discarded when has_tools=False
+        assert tools == []
+
+    def test_tool_call_with_return_token(self):
+        """Tool call ending with <|return|> should work (end-of-string case)."""
+        text = (
+            "<|start|>assistant<|channel|>commentary to=functions.search<|message|>"
+            '{"query": "test"}'
+            "<|return|>"  # mlx-lm strips EOS, using return as terminator
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
+
+    def test_tool_call_name_extraction(self):
+        """Tool name should be correctly extracted from to=functions.XYZ format."""
+        text = (
+            "<|start|>assistant<|channel|>commentary to=functions.get_current_weather<|message|>"
+            '{"location": "NYC"}'
+            "<|call|>"
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert tools[0]["name"] == "get_current_weather"
+
+    def test_mixed_final_and_tool_call(self):
+        """Final channel content and tool calls should coexist."""
+        text = (
+            "<|start|>assistant<|channel|>commentary to=functions.search<|message|>"
+            '{"query": "test"}'
+            "<|call|>"
+            "<|start|>assistant<|channel|>final<|message|>"
+            "I found some results!"
+            "<|end|>"
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert visible == "I found some results!"
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
 
 
 # ---------------------------------------------------------------------------

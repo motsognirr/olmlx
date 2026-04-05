@@ -62,13 +62,15 @@ _GPT_OSS_STRUCTURAL_TOKENS = frozenset(
 class _GptOssChannelFilter:
     """Stateful filter for gpt-oss channel tokens.
 
+    Tracks the full text during streaming so tool calls can be parsed after
+    the stream completes. The filter yields only visible content (final channel)
+    during streaming, but the full text is available via ``get_full_text()``
+    for post-stream parsing.
+
     Call ``should_yield(text)`` for each token. Returns True if the token's text
     should be sent to the client. After the stream ends, call
     ``get_fallback_texts()`` — if non-empty, yield those as fallback (the model
     produced analysis but no final channel).
-
-    This is a class (not an async generator) so the caller can iterate the raw
-    stream for prompt-cache token accumulation while only yielding filtered text.
     """
 
     _INIT = "init"
@@ -83,9 +85,12 @@ class _GptOssChannelFilter:
         self._saw_any_channel = False
         self._saw_final = False
         self._analysis_texts: list[str] = []
+        self._full_text_parts: list[str] = []
 
     def should_yield(self, text: str) -> bool:
         """Process one token's text and return whether it should be yielded."""
+        self._full_text_parts.append(text)
+
         if text == "<|start|>":
             self._state = self._AFTER_START
             self._saw_any_channel = True
@@ -140,6 +145,10 @@ class _GptOssChannelFilter:
         if not self._saw_final and self._analysis_texts:
             return self._analysis_texts
         return []
+
+    def get_full_text(self) -> str:
+        """Return the complete raw text accumulated during streaming."""
+        return "".join(self._full_text_parts)
 
 
 async def _gpt_oss_filter(token_stream):
@@ -1305,6 +1314,10 @@ async def _stream_completion(
             if channel_filter is not None:
                 for text in channel_filter.get_fallback_texts():
                     yield {"text": text, "done": False}
+                # Capture raw text for tool call parsing (will be included in done chunk)
+                raw_text = channel_filter.get_full_text()
+            else:
+                raw_text = ""
 
             stats.eval_duration = eval_timer.duration_ns
             prompt_tps = getattr(token, "prompt_tps", 0) or 0
@@ -1396,6 +1409,7 @@ async def _stream_completion(
             "text": "",
             "done": True,
             "stats": stats,
+            "raw_text": raw_text,
         }
     finally:
         # Release GPU-backed references from gen_kwargs so they can be
@@ -1607,16 +1621,20 @@ async def _full_completion_inner(
     else:
         text = str(result)
 
+    tool_uses = None
     # Strip gpt-oss channel tokens for non-streaming path
     if lm.template_caps.has_channel_format and "<|channel|>" in text:
         from olmlx.engine.tool_parser import _parse_gpt_oss_channels
 
         parsed = _parse_gpt_oss_channels(text, has_tools=has_tools)
         if parsed is not None:
-            _, visible, _ = parsed
+            thinking, visible, tool_uses = parsed
             text = visible
 
-    return {"text": text, "done": True, "stats": stats}
+    result_dict = {"text": text, "done": True, "stats": stats}
+    if tool_uses:
+        result_dict["tool_uses"] = tool_uses
+    return result_dict
 
 
 async def generate_chat(

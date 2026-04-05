@@ -29,17 +29,26 @@ _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 # Gemma4 channel format: <|channel>thought\n...<channel|>
 _GEMMA4_CHANNEL_RE = re.compile(r"<\|channel>thought\n(.*?)<channel\|>", re.DOTALL)
 
-# gpt-oss channel format:
+# gpt-oss channel format (harmony):
 # <|start|>assistant<|channel|>analysis<|message|>thinking<|end|>
 # <|start|>assistant<|channel|>final<|message|>visible<|return|>  (or end-of-string — mlx-lm strips EOS)
-# <|start|>assistant to=functions.NAME<|channel|>commentary json<|message|>{"args"}<|call|>
-_GPT_OSS_CHANNEL_RE = re.compile(
-    r"(?:<\|start\|>[^<]*)?<\|channel\|>\s*(\w+)[^<]*<\|message\|>(.*?)(?:<\|(?:end|call|return)\|>|$)",
+# <|start|>assistant<|channel|>commentary to=functions.NAME<|constrain|>json<|message|>{"args"}<|call|>
+#
+# The header (between channel name and <|message|>) may contain:
+# - to=functions.TOOL_NAME (appears AFTER <|channel|>)
+# - <|constrain|>json
+#
+# Match full assistant message blocks. We consume the end marker (<|end|>, <|call|>, <|return|>)
+# so that finditer can find subsequent blocks that start with <|start|>.
+# Group 1: role (e.g. "assistant")
+# Group 2: channel name (e.g. "commentary", "analysis", "final")
+# Group 3: header content between channel and <|message|> (may contain to=functions.*, <|constrain|>, etc.)
+# Group 4: message content
+_GPT_OSS_BLOCK_RE = re.compile(
+    r"<\|start\|>([^<\|]*?)(?:<\|channel\|>\s*(\w+)(.*?))<\|message\|>(.*?)<\|(?:end|call|return)\|>",
     re.DOTALL,
 )
-_GPT_OSS_TOOL_NAME_RE = re.compile(
-    r"(?:<\|start\|>)?[^<]*to=functions\.(\w+)[^<]*<\|channel\|>",
-)
+_GPT_OSS_TOOL_NAME_RE = re.compile(r"to=functions\.(\w+)")
 _GPT_OSS_DETECT = "<|channel|>"
 # Gemma4 tool call: <|tool_call>call:Name{key:<|"|>val<|"|>}<tool_call|>
 _GEMMA4_TOOL_CALL_RE = re.compile(r"<\|tool_call>(.*?)<tool_call\|>", re.DOTALL)
@@ -411,9 +420,17 @@ def _try_bare_json(text: str) -> tuple[list[dict], str]:
 def _parse_gpt_oss_channels(
     text: str, has_tools: bool
 ) -> tuple[str, str, list[dict]] | None:
-    """Parse gpt-oss channel-formatted output.
+    """Parse gpt-oss channel-formatted output (harmony format).
 
     Returns (thinking, visible_text, tool_uses) or None if not gpt-oss format.
+
+    Harmony format example:
+        <|start|>assistant<|channel|>commentary to=functions.get_current_weather \\
+            <|constrain|>json<|message|>{"location":"San Francisco"}<|call|>
+
+    The header (between channel name and <|message|>) may contain:
+    - to=functions.TOOL_NAME
+    - <|constrain|>json
     """
     if _GPT_OSS_DETECT not in text:
         return None
@@ -422,18 +439,19 @@ def _parse_gpt_oss_channels(
     visible_parts = []
     tool_uses = []
 
-    for match in _GPT_OSS_CHANNEL_RE.finditer(text):
-        channel = match.group(1).strip()
-        content = match.group(2).strip()
+    for match in _GPT_OSS_BLOCK_RE.finditer(text):
+        _role = match.group(1).strip()  # captured but not currently used
+        channel = match.group(2).strip() if match.group(2) else ""
+        header = match.group(3) or ""
+        content = match.group(4).strip()
 
         if channel == "analysis":
             thinking_parts.append(content)
         elif channel == "final":
             visible_parts.append(content)
         elif channel == "commentary" and has_tools and content:
-            # Extract tool name from within the matched block
-            name_match = _GPT_OSS_TOOL_NAME_RE.search(match.group(0))
-            tool_name = name_match.group(1) if name_match else "unknown"
+            tool_name_match = _GPT_OSS_TOOL_NAME_RE.search(header)
+            tool_name = tool_name_match.group(1) if tool_name_match else "unknown"
             try:
                 args = json.loads(content)
             except (json.JSONDecodeError, ValueError):
@@ -450,8 +468,6 @@ def _parse_gpt_oss_channels(
     thinking = "\n".join(thinking_parts)
     visible = " ".join(visible_parts) if visible_parts else ""
 
-    # Fallback: if the model put everything in analysis and nothing in final,
-    # promote analysis content to visible text (otherwise user sees nothing)
     if not visible and not tool_uses and thinking:
         visible = thinking
         thinking = ""

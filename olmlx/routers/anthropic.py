@@ -305,6 +305,7 @@ def _emit_content_block(
 async def _stream_buffered_with_tools(result):
     """Buffer full output, parse tools, yield SSE strings. Yields a final dict with metadata."""
     full_text = ""
+    raw_text = ""
     output_tokens = 0
 
     async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
@@ -318,13 +319,22 @@ async def _stream_buffered_with_tools(result):
             stats = chunk.get("stats")
             if stats:
                 output_tokens = stats.eval_count
+            # For gpt-oss channel format, raw_text is in the done chunk
+            raw_text = chunk.get("raw_text", "")
             break
         full_text += chunk.get("text", "")
 
-    logger.info("Raw model output (%d chars): %s", len(full_text), full_text[:1000])
+    logger.info(
+        "Raw model output (%d chars, %d filtered): %s",
+        len(raw_text) if raw_text else len(full_text),
+        len(full_text),
+        (raw_text if raw_text else full_text)[:1000],
+    )
 
+    # Use raw_text if available (for gpt-oss channel format), otherwise use full_text
+    text_for_parsing = raw_text if raw_text else full_text
     thinking, visible_text, tool_uses = parse_model_output(
-        full_text,
+        text_for_parsing,
         True,
     )
 
