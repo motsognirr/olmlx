@@ -303,6 +303,10 @@ class ModelRegistry:
             validate_hf_path(name)
             if name in self._mappings:
                 return self._mappings[name]
+            # Try with :latest tag appended (models.json keys include tags)
+            normalized = self.normalize_name(name)
+            if normalized in self._mappings:
+                return self._mappings[normalized]
             return ModelConfig(hf_path=name)
         validate_model_name(name)
         normalized = self.normalize_name(name)
