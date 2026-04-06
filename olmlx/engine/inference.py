@@ -1810,7 +1810,7 @@ async def _full_completion_inner(
     result_dict: dict = {"text": text, "done": True, "stats": stats}
     if raw_text is not None:
         result_dict["raw_text"] = raw_text
-    if tool_uses:
+    if tool_uses is not None:
         result_dict["tool_uses"] = tool_uses
     if thinking:
         result_dict["thinking"] = thinking

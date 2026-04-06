@@ -261,9 +261,6 @@ async def _stream_openai_sse_with_tools(
                 raw_text = chunk.get("raw_text", raw_text)
                 break
             full_text += chunk.get("text", "")
-            # raw_text carries unfiltered output (e.g. gpt-oss channel tokens)
-            # for tool call parsing; falls back to filtered text when absent.
-            raw_text += chunk.get("raw_text", "")
 
         # Use raw_text for parsing so channel-format tool calls aren't lost;
         # fall back to full_text for non-gpt-oss models
