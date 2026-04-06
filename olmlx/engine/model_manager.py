@@ -1200,7 +1200,7 @@ class ModelManager:
         is_vlm = False
         try:
             model, tokenizer = load_model_with_strict_fallback(load_path, lazy=False)
-        except ValueError:
+        except _FALLBACK_EXCEPTIONS:
             model, tokenizer, _ = self._vlm_fallback_load(
                 load_path, hf_path, lazy=False
             )
@@ -1345,7 +1345,7 @@ class ModelManager:
             model, tokenizer = _load_with_model_type_fallback(
                 mlx_lm, load_path, lazy=True
             )
-        except ValueError:
+        except _FALLBACK_EXCEPTIONS:
             model, tokenizer, _ = self._vlm_fallback_load(load_path, hf_path, lazy=True)
             is_vlm = True
         caps = detect_caps(tokenizer)

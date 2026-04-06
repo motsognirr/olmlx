@@ -367,8 +367,11 @@ class TestSpeculativeKVCache:
 class TestTrimPromptCacheNoneGuard:
     """Regression tests for #189: trim_prompt_cache called without None guard."""
 
-    def test_step_survives_when_trim_prompt_cache_is_none(self, monkeypatch):
-        """step() must not crash when trim_prompt_cache is None (mlx_lm missing)."""
+    def test_step_raises_runtime_error_when_trim_prompt_cache_is_none(
+        self, monkeypatch
+    ):
+        """step() must raise RuntimeError (not TypeError) when trim needs to happen
+        but trim_prompt_cache is None — silent skip would corrupt cache state."""
         import olmlx.engine.flash.speculative as spec_mod
 
         monkeypatch.setattr(spec_mod, "trim_prompt_cache", None)
@@ -384,6 +387,6 @@ class TestTrimPromptCacheNoneGuard:
 
         prompt = mx.array([[1, 2, 3]])
         decoder.prefill(prompt)
-        # Should not raise TypeError: 'NoneType' object is not callable
-        accepted, num_draft = decoder.step()
-        assert len(accepted) >= 1
+        # Should raise RuntimeError instead of TypeError: 'NoneType' not callable
+        with pytest.raises(RuntimeError, match="trim_prompt_cache is unavailable"):
+            decoder.step()

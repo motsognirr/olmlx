@@ -1228,7 +1228,7 @@ async def _stream_completion(
 
             prefix_len = (
                 _find_common_prefix(prompt_tokens, cached.tokens)
-                if cached is not None and _find_common_prefix is not None
+                if cached is not None
                 else 0
             )
             logger.debug(

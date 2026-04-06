@@ -72,7 +72,7 @@ def _fill_missing_required_args(
         required_params = schema_by_tool.get(tu["name"].lower())
         if not required_params:
             continue
-        inp = tu.get("input", {})
+        inp = tu.get("input") or {}
         for param, param_type in required_params.items():
             if param not in inp and param_type == "string":
                 inp[param] = ""

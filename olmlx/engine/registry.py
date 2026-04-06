@@ -300,6 +300,7 @@ class ModelRegistry:
                     self._aliases_path,
                     exc,
                 )
+                self._aliases = {}
 
     @staticmethod
     def normalize_name(name: str) -> str:
