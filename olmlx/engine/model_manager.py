@@ -49,6 +49,60 @@ _FALLBACK_EXCEPTIONS = (
 )
 
 
+def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
+    """Load model + tokenizer, remapping unrecognised model_type if needed.
+
+    Some very new models (e.g. DeepSeek V3.2 with model_type "deepseek_v32")
+    aren't in the installed transformers' CONFIG_MAPPING yet, causing
+    ``PreTrainedConfig.__post_init__`` to crash during tokenizer loading.
+
+    The model architecture (loaded by mlx-lm's own registry) is fine — only
+    the tokenizer loading via ``AutoTokenizer`` / ``PreTrainedConfig`` fails.
+    So we load the model first with the real config, then patch config.json
+    temporarily to load only the tokenizer.
+    """
+    kwargs.setdefault("tokenizer_config", {"trust_remote_code": True})
+    try:
+        return mlx_lm.load(str(load_path), **kwargs)
+    except (AttributeError, ValueError, KeyError) as exc:
+        config_file = Path(load_path) / "config.json"
+        if not config_file.exists():
+            raise
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        original_text = config_file.read_text()
+        cfg = json.loads(original_text)
+        mt = cfg.get("model_type", "")
+        # Strip last digit: deepseek_v32 → deepseek_v3
+        fallback = re.sub(r"\d+$", lambda m: m.group()[:-1], mt) if mt else ""
+        if not fallback or fallback == mt or fallback not in CONFIG_MAPPING:
+            raise
+
+        logger.info(
+            "Loading model with real config, tokenizer with %r -> %r (%s)",
+            mt,
+            fallback,
+            exc,
+        )
+        # Load model with the real config (mlx-lm knows the architecture).
+        model, model_cfg = mlx_lm.utils.load_model(
+            Path(load_path),
+            **{k: v for k, v in kwargs.items() if k in ("lazy", "model_config")},
+        )
+        # Temporarily patch config.json for tokenizer loading only.
+        try:
+            cfg["model_type"] = fallback
+            config_file.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+            tokenizer = mlx_lm.utils.load_tokenizer(
+                Path(load_path),
+                kwargs.get("tokenizer_config"),
+                eos_token_ids=model_cfg.get("eos_token_id", None),
+            )
+        finally:
+            config_file.write_text(original_text)
+        return model, tokenizer
+
+
 def _is_serializable_cache(cache: list) -> bool:
     """Check if a cache list can be serialized with mlx-lm's save_prompt_cache."""
     from olmlx.engine.turboquant_cache import TurboQuantKVCache
@@ -1029,20 +1083,17 @@ class ModelManager:
         elif hf_path:
             # Try downloading from HF hub — first from the repo itself,
             # then from the base_model listed in the model card (and its -it variant).
-            repos_to_try = [hf_path]
             try:
                 from huggingface_hub import hf_hub_download, model_info
 
-                for repo in repos_to_try:
-                    try:
-                        path = hf_hub_download(repo, "chat_template.jinja")
-                        tokenizer.chat_template = Path(path).read_text()
-                        return
-                    except Exception as exc:
-                        logger.debug(
-                            "chat_template.jinja not found in %s: %s", repo, exc
-                        )
-                        continue
+                try:
+                    path = hf_hub_download(hf_path, "chat_template.jinja")
+                    tokenizer.chat_template = Path(path).read_text()
+                    return
+                except Exception as exc:
+                    logger.debug(
+                        "chat_template.jinja not found in %s: %s", hf_path, exc
+                    )
                 # Primary repo didn't have it — check base_model from model card
                 try:
                     info = model_info(hf_path)
@@ -1054,7 +1105,10 @@ class ModelManager:
                     if isinstance(base, list):
                         base = base[0] if base else None
                     if base and base != hf_path:
-                        for candidate in (base, f"{base}-it"):
+                        candidates = [base]
+                        if not base.endswith("-it"):
+                            candidates.append(f"{base}-it")
+                        for candidate in candidates:
                             try:
                                 path = hf_hub_download(candidate, "chat_template.jinja")
                                 tokenizer.chat_template = Path(path).read_text()
@@ -1080,7 +1134,7 @@ class ModelManager:
         try:
             import mlx_lm
 
-            model, tokenizer = mlx_lm.load(load_path)
+            model, tokenizer = _load_with_model_type_fallback(mlx_lm, load_path)
             caps = detect_caps(tokenizer)
             return model, tokenizer, False, caps
         except _FALLBACK_EXCEPTIONS as exc:
@@ -1261,8 +1315,7 @@ class ModelManager:
             "Loading model %s in Flash-MoE mode from %s", hf_path, flash_moe_dir
         )
 
-        # Lazy load — weights remain unmaterialized until eval
-        model, tokenizer = mlx_lm.load(load_path, lazy=True)
+        model, tokenizer = _load_with_model_type_fallback(mlx_lm, load_path, lazy=True)
         caps = detect_caps(tokenizer)
 
         # Read flash_moe_config for architecture info

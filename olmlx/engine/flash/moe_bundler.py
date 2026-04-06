@@ -190,9 +190,15 @@ def _detect_expert_format(
     name, expert container, and projection names (gate_proj/up_proj/down_proj
     vs fc1/fc2).
     """
-    _LAYER_PREFIXES = ("model.layers", "backbone.layers")
-    _MOE_MODULES = ("mlp", "block_sparse_moe", "mixer")
-    _EXPERT_CONTAINERS = ("switch_mlp", "experts")
+    _LAYER_PREFIXES = ("model.layers", "backbone.layers", "language_model.model.layers")
+    # Layer-level attribute containing the MoE sub-module
+    # Gemma 4: .experts  |  Mixtral/Qwen: .mlp  |  Nemotron: .block_sparse_moe
+    _MOE_MODULES = ("mlp", "block_sparse_moe", "mixer", "experts")
+    # Attribute inside the MoE module holding stacked expert weights
+    # Gemma 4: .switch_glu  |  Mixtral: .experts  |  Qwen: .switch_mlp
+    # Note: "experts" appears in both tuples — Mixtral uses {layer}.mlp.experts
+    # while Gemma 4 uses {layer}.experts.switch_glu; the overlap is intentional.
+    _EXPERT_CONTAINERS = ("switch_mlp", "experts", "switch_glu")
     # First projection name to probe for each projection style
     _PROJ_PROBES = (
         ("gate_proj", ("gate_proj", "up_proj", "down_proj")),

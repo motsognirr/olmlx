@@ -393,6 +393,26 @@ def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
             "Model has no 'args' attribute (checked model.args, "
             "model.language_model.args/config, model.config)"
         )
+
+    # MLA (Multi-head Latent Attention) models like DeepSeek V3 compress the
+    # KV cache to (kv_lora_rank + qk_rope_head_dim) per layer instead of
+    # (2 * num_kv_heads * head_dim).  Detect via kv_lora_rank in model args.
+    kv_lora_rank = getattr(args, "kv_lora_rank", None)
+    if isinstance(kv_lora_rank, int) and kv_lora_rank > 0:
+        qk_rope_head_dim = getattr(args, "qk_rope_head_dim", 0)
+        num_layers = args.num_hidden_layers
+        bytes_per_element = 2  # float16/bfloat16
+        # MLA stores compressed_kv (kv_lora_rank dims) as keys and
+        # k_pe (qk_rope_head_dim dims) as values, each with 1 effective head.
+        raw = (
+            num_layers
+            * 2
+            * (kv_lora_rank + qk_rope_head_dim)
+            * num_tokens
+            * bytes_per_element
+        )
+        return int(raw * MEMORY_SAFETY_FACTOR)
+
     num_heads = args.num_attention_heads
     head_dim = (
         args.head_dim if hasattr(args, "head_dim") else args.hidden_size // num_heads
@@ -760,13 +780,166 @@ def _apply_chat_template_text(
     )
 
 
+def _normalize_tool_calls_in_messages(messages: list[dict]) -> list[dict]:
+    """Normalise tool_calls in assistant messages for chat templates.
+
+    Different chat templates expect different tool_call layouts:
+
+    * **Qwen / Llama**: flat ``{name, arguments: dict}``
+    * **Gemma 4**: nested ``{function: {name, arguments}, id, type}``
+
+    Rather than guessing which layout a template needs, this function
+    produces a *union* dict that satisfies both::
+
+        {
+            "name": "read",
+            "arguments": {"path": "/foo"},
+            "function": {"name": "read", "arguments": {"path": "/foo"}},
+            "id": "call_x",
+            "type": "function",
+        }
+
+    It also ensures ``arguments`` is always a parsed dict (never a JSON
+    string), which is what both Qwen's ``|items`` filter and Gemma's
+    ``is mapping`` test require.
+    """
+    result = []
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            m = dict(m)
+            normalised = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function", tc)
+                name = fn.get("name", tc.get("name", ""))
+                args = fn.get("arguments", tc.get("arguments", {}))
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                normalised.append(
+                    {
+                        "name": name,
+                        "arguments": args,
+                        "function": {"name": name, "arguments": args},
+                        "id": tc.get("id", ""),
+                        "type": tc.get("type", "function"),
+                    }
+                )
+            m["tool_calls"] = normalised
+            result.append(m)
+        else:
+            result.append(m)
+    return result
+
+
+def _convert_tool_messages_to_responses(messages: list[dict]) -> list[dict]:
+    """Convert ``role: "tool"`` messages to ``tool_responses`` format.
+
+    Some models (e.g. Gemma 4) don't support OpenAI-style ``role: "tool"``
+    messages.  Instead they expect a ``tool_responses`` array merged into the
+    preceding assistant message that made the ``tool_calls``.  This keeps
+    tool responses inside the model turn, which is critical — the template
+    omits ``<turn|>`` after tool_responses so the model continues in the same
+    turn.  Placing them on a separate user message would put the model's
+    generation inside a user turn, producing degenerate output.
+
+    For *intermediate* assistant messages (followed by more messages), a
+    newline content placeholder ensures the template emits ``<turn|>`` to
+    properly close the model turn before the next turn opens.  The last
+    assistant message with tool_responses keeps empty content so the model
+    continues generating in the same turn.
+    """
+    if not any(m.get("role") == "tool" for m in messages):
+        return messages
+
+    # Build a mapping from tool_call_id → function name across all assistant messages.
+    id_to_name: dict[str, str] = {}
+    for m in messages:
+        for tc in m.get("tool_calls", []):
+            tc_id = tc.get("id", "")
+            fn = tc.get("function", {})
+            name = fn.get("name", "") if isinstance(fn, dict) else ""
+            if tc_id and name:
+                id_to_name[tc_id] = name
+
+    result: list[dict] = []
+    for m in messages:
+        if m.get("role") == "tool":
+            tc_id = m.get("tool_call_id", "")
+            name = id_to_name.get(tc_id, "unknown")
+            resp = {"name": name, "response": m.get("content", "")}
+            # Merge into the preceding assistant message.
+            prev = result[-1] if result else None
+            if prev and prev.get("role") == "assistant":
+                prev.setdefault("tool_responses", []).append(resp)
+            else:
+                # No preceding assistant — shouldn't happen, but create a
+                # model-role message to keep the turn correct.
+                result.append(
+                    {"role": "assistant", "content": "", "tool_responses": [resp]}
+                )
+        else:
+            result.append(dict(m))  # shallow copy to avoid mutating input
+
+    # Ensure intermediate assistant messages with tool_responses get their
+    # model turn closed.  The template omits <turn|> when tool_responses is
+    # present and content is falsy.  Setting content to "\n" makes it truthy
+    # (triggering <turn|>) while rendering as empty after strip_thinking().
+    # The *last* such message keeps empty content so the model can continue
+    # generating in the same turn.
+    for i in range(len(result) - 1):
+        m = result[i]
+        if (
+            m.get("role") == "assistant"
+            and m.get("tool_responses")
+            and not m.get("content")
+        ):
+            m["content"] = "\n"
+
+    return result
+
+
 def _apply_chat_template_vlm(
     processor: Any,
     model: Any,
     messages: list[dict],
     images: list[str] | None = None,
+    tools: list[dict] | None = None,
+    enable_thinking: bool | None = None,
 ) -> str:
-    """Apply chat template for vision-language models (mlx-vlm)."""
+    """Apply chat template for vision-language models (mlx-vlm).
+
+    When tools are provided, bypasses mlx_vlm.apply_chat_template and calls
+    the processor's tokenizer directly.  mlx_vlm's message processing wraps
+    text content in ``[{type: text, text: ..., content: ...}]`` dicts, which
+    the Jinja template renders as Python list repr — garbling the prompt.
+    """
+    if tools:
+        if images:
+            logger.warning(
+                "VLM native-tools path does not support images; "
+                "%d image(s) will be ignored",
+                len(images),
+            )
+        # Use tokenizer directly to get clean native tool formatting.
+        tok = (
+            processor.tokenizer
+            if hasattr(processor, "tokenizer")
+            and hasattr(processor.tokenizer, "apply_chat_template")
+            else processor
+        )
+        kwargs: dict = {}
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
+        return tok.apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+            **kwargs,
+        )
+
     import mlx_vlm
 
     config = model.config if hasattr(model, "config") else {}
@@ -1295,11 +1468,20 @@ async def _stream_completion(
                             "(cache token sequence will be incomplete)",
                             token.generation_tokens,
                         )
-                    # Yield text only if the filter allows it (or no filter)
-                    if channel_filter is None or channel_filter.should_yield(
-                        token.text
-                    ):
+                    # Yield text only if the filter allows it (or no filter).
+                    # When channel filter is active, always include raw_text so
+                    # downstream consumers (e.g. tool call parsers) can
+                    # reconstruct the full unfiltered output.
+                    if channel_filter is None:
                         yield {"text": token.text, "done": False}
+                    elif channel_filter.should_yield(token.text):
+                        yield {
+                            "text": token.text,
+                            "done": False,
+                            "raw_text": token.text,
+                        }
+                    else:
+                        yield {"text": "", "done": False, "raw_text": token.text}
 
             # Fallback: yield analysis content if no final channel was produced
             if channel_filter is not None:
@@ -1607,16 +1789,22 @@ async def _full_completion_inner(
     else:
         text = str(result)
 
-    # Strip gpt-oss channel tokens for non-streaming path
+    # Strip gpt-oss channel tokens for non-streaming path.
+    # Keep raw_text so routers can parse tool calls from the full output.
+    raw_text = None
     if lm.template_caps.has_channel_format and "<|channel|>" in text:
         from olmlx.engine.tool_parser import _parse_gpt_oss_channels
 
+        raw_text = text
         parsed = _parse_gpt_oss_channels(text, has_tools=has_tools)
         if parsed is not None:
             _, visible, _ = parsed
             text = visible
 
-    return {"text": text, "done": True, "stats": stats}
+    result_dict: dict = {"text": text, "done": True, "stats": stats}
+    if raw_text is not None:
+        result_dict["raw_text"] = raw_text
+    return result_dict
 
 
 async def generate_chat(
@@ -1640,22 +1828,51 @@ async def generate_chat(
 
     images = _extract_images(messages)
 
+    # Normalise OpenAI-format tool_calls ({function: {name, arguments: "json"}})
+    # to the flat format chat templates expect ({name, arguments: {...}}).
+    messages = _normalize_tool_calls_in_messages(messages)
+
     if lm.is_vlm:
-        # VLM models must use the VLM generation path — text template
-        # formatting produces garbage through mlx_vlm.stream_generate.
-        # Inject tool definitions into messages as a system message.
-        vlm_messages = messages
-        if tools:
+        # VLM models must use the VLM generation path for tokenization.
+        # Pass tools natively through the template when supported — this
+        # produces model-native formatting (e.g. <|tool> tags for Gemma 4)
+        # which is far more effective than injecting JSON into the system
+        # message.  Fall back to system-message injection for models whose
+        # template lacks tool support.
+        caps = lm.template_caps or TemplateCaps()
+        # Resolve enable_thinking for templates that support it.
+        vlm_thinking = enable_thinking if caps.supports_enable_thinking else None
+        # Convert role="tool" messages to tool_responses format for models
+        # that don't support OpenAI-style tool messages (e.g. Gemma 4).
+        if caps.uses_tool_responses:
+            messages = _convert_tool_messages_to_responses(messages)
+        if tools and caps.supports_tools:
+            prompt = _apply_chat_template_vlm(
+                lm.tokenizer,
+                lm.model,
+                messages,
+                images,
+                tools=tools,
+                enable_thinking=vlm_thinking,
+            )
+            logger.info("VLM chat prompt with %d tools (native template)", len(tools))
+        elif tools:
             vlm_messages = _inject_tools_into_system(list(messages), tools)
+            prompt = _apply_chat_template_vlm(
+                lm.tokenizer, lm.model, vlm_messages, images
+            )
             logger.info(
                 "VLM chat prompt with %d tools (injected into system)", len(tools)
             )
-        if enable_thinking is not None:
+        else:
+            prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages, images)
+        logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
+        logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
+        if enable_thinking is not None and vlm_thinking is None:
             logger.debug(
-                "enable_thinking=%s ignored for VLM model (not supported by mlx-vlm template)",
+                "enable_thinking=%s ignored for VLM model (template does not support it)",
                 enable_thinking,
             )
-        prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, vlm_messages, images)
     else:
         prompt = _apply_chat_template_text(
             lm.text_tokenizer,
@@ -1666,7 +1883,8 @@ async def generate_chat(
         )
         if tools:
             logger.info("Chat prompt with %d tools", len(tools))
-        logger.debug("Prompt (first 1000 chars): %s", prompt[:1000])
+        logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
+        logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
 
     # Merge per-model defaults with request options.  options=None means
     # "use defaults"; options={} means "override all defaults" (empty).

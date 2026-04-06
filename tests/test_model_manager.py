@@ -581,6 +581,56 @@ class TestLoadModel:
 
         Path(downloaded_path).unlink(missing_ok=True)
 
+    def test_load_vlm_no_double_it_suffix_for_instruct_base(self, registry, mock_store):
+        """When base_model already ends with -it, don't try base-model-it-it."""
+        manager = self._make_manager(registry, mock_store)
+        local_dir = mock_store.local_path("test/vlm")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}")
+
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+        mock_tok = MagicMock()
+        mock_tok.chat_template = None
+        mock_processor.tokenizer = mock_tok
+
+        template = "{% if tools %}tools{% endif %}"
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jinja", delete=False) as f:
+            f.write(template)
+            downloaded_path = f.name
+
+        # test/vlm fails, google/gemma-4-27b-it fails → must NOT try -it-it
+        mock_hf_mod = MagicMock()
+        mock_hf_mod.hf_hub_download.side_effect = [
+            Exception("404"),  # test/vlm
+            Exception("404"),  # google/gemma-4-27b-it (base)
+        ]
+        mock_card_data = MagicMock()
+        mock_card_data.base_model = "google/gemma-4-27b-it"
+        mock_info = MagicMock()
+        mock_info.card_data = mock_card_data
+        mock_hf_mod.model_info.return_value = mock_info
+
+        with patch.object(manager, "_detect_model_kind", return_value="vlm"):
+            mock_mlx_vlm = MagicMock()
+            mock_mlx_vlm.load.return_value = (mock_model, mock_processor)
+            with patch.dict(
+                "sys.modules",
+                {"mlx_vlm": mock_mlx_vlm, "huggingface_hub": mock_hf_mod},
+            ):
+                _, _, is_vlm, caps, _ = manager._load_model("test/vlm")
+
+        assert is_vlm is True
+        # Must NOT have tried google/gemma-4-27b-it-it
+        all_repos = [c[0][0] for c in mock_hf_mod.hf_hub_download.call_args_list]
+        assert "google/gemma-4-27b-it-it" not in all_repos, (
+            f"Should not try double -it suffix, but tried: {all_repos}"
+        )
+
+        Path(downloaded_path).unlink(missing_ok=True)
+
     def test_load_vlm_hub_download_fails_gracefully(self, registry, mock_store):
         """When all HF hub attempts fail, caps remain empty but loading succeeds."""
         manager = self._make_manager(registry, mock_store)

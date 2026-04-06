@@ -15,6 +15,7 @@ from olmlx.engine.inference import (
     _inference_lock,
     _inference_locked,
     _inject_tools_into_system,
+    _normalize_tool_calls_in_messages,
     _apply_chat_template_text,
     _safe_sync,
     _schedule_deferred_inference_cleanup,
@@ -269,6 +270,194 @@ class TestInjectToolsIntoSystem:
         assert "direct_tool" in result[0]["content"]
 
 
+class TestConvertToolMessagesToResponses:
+    def test_no_tool_messages_unchanged(self):
+        """Messages without role=tool pass through unchanged."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        assert result == messages
+
+    def test_tool_message_merged_into_preceding_assistant(self):
+        """role=tool messages become tool_responses on the preceding assistant message."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {"role": "user", "content": "search for cats"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": {"q": "cats"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "found 3 cats"},
+            {"role": "user", "content": "thanks"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        # role=tool message should be gone
+        assert not any(m.get("role") == "tool" for m in result)
+        # tool_responses should be on the assistant message (index 1)
+        assert result[1]["role"] == "assistant"
+        assert result[1]["tool_responses"] == [
+            {"name": "search", "response": "found 3 cats"}
+        ]
+        # Intermediate assistant gets newline content to close the model turn
+        assert result[1]["content"] == "\n"
+        # user message still present
+        assert result[2] == {"role": "user", "content": "thanks"}
+
+    def test_multiple_tool_results_merged_into_assistant(self):
+        """Multiple consecutive tool messages merged into preceding assistant."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {"role": "user", "content": "do things"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": {"f": "a.py"}},
+                    },
+                    {
+                        "id": "tc2",
+                        "type": "function",
+                        "function": {"name": "write", "arguments": {"f": "b.py"}},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "contents of a"},
+            {"role": "tool", "tool_call_id": "tc2", "content": "ok"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        # Both tool responses merged into the assistant message
+        assert result[1]["role"] == "assistant"
+        assert len(result[1]["tool_responses"]) == 2
+        assert result[1]["tool_responses"][0]["name"] == "read"
+        assert result[1]["tool_responses"][1]["name"] == "write"
+        # Only 2 messages remain (user + assistant)
+        assert len(result) == 2
+
+    def test_tool_name_resolved_from_preceding_assistant(self):
+        """Tool name is resolved from the assistant's tool_calls by matching tool_call_id."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "Bash", "arguments": {"cmd": "ls"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "file1\nfile2"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        tool_resp_msg = [m for m in result if "tool_responses" in m]
+        assert tool_resp_msg[0]["tool_responses"][0]["name"] == "Bash"
+
+    def test_last_assistant_keeps_empty_content(self):
+        """Last assistant with tool_responses keeps empty content for model continuation."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "Bash", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "done"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        # Last message — content stays empty so model turn stays open
+        assert result[1]["content"] == ""
+
+    def test_intermediate_assistant_gets_newline_content(self):
+        """Intermediate assistant with tool_responses gets newline to close model turn."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "Bash", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "file1"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc2",
+                        "type": "function",
+                        "function": {"name": "Read", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc2", "content": "contents"},
+        ]
+        result = _convert_tool_messages_to_responses(messages)
+        # First assistant (intermediate) gets newline to close turn
+        assert result[1]["content"] == "\n"
+        assert result[1]["tool_responses"][0]["name"] == "Bash"
+        # Second assistant (last) keeps empty content
+        assert result[2]["content"] == ""
+        assert result[2]["tool_responses"][0]["name"] == "Read"
+
+    def test_original_messages_not_modified(self):
+        """Conversion does not mutate the input list."""
+        from olmlx.engine.inference import _convert_tool_messages_to_responses
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "foo", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "bar"},
+        ]
+        original_len = len(messages)
+        _convert_tool_messages_to_responses(messages)
+        assert len(messages) == original_len
+        assert messages[1]["role"] == "tool"
+
+
 class TestApplyChatTemplateText:
     def test_basic(self):
         tokenizer = MagicMock()
@@ -448,6 +637,31 @@ class TestApplyChatTemplateText:
 
 
 class TestApplyChatTemplateVlm:
+    def test_vlm_tools_with_images_warns(self, caplog):
+        """When tools and images are both provided, a warning must be logged."""
+        from olmlx.engine.inference import _apply_chat_template_vlm
+
+        mock_processor = MagicMock()
+        mock_tok = MagicMock()
+        mock_tok.apply_chat_template.return_value = "prompt"
+        mock_processor.tokenizer = mock_tok
+        mock_model = MagicMock()
+
+        tools = [{"type": "function", "function": {"name": "test"}}]
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
+            _apply_chat_template_vlm(
+                mock_processor,
+                mock_model,
+                [{"role": "user", "content": "describe"}],
+                images=["img.jpg"],
+                tools=tools,
+            )
+
+        assert any("image" in r.message.lower() for r in caplog.records), (
+            f"Expected warning about images, got: {[r.message for r in caplog.records]}"
+        )
+
     def test_vlm_template(self):
         from olmlx.engine.inference import _apply_chat_template_vlm
 
@@ -483,6 +697,230 @@ class TestApplyChatTemplateVlm:
                 [{"role": "user", "content": "hi"}],
             )
         assert result == "result"
+
+
+class TestNormalizeToolCallsInMessages:
+    """Normalise OpenAI-format tool_calls to flat format for chat templates."""
+
+    def test_openai_format_converted(self):
+        """OpenAI format produces union dict with both flat and nested keys."""
+        messages = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "London"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "sunny"},
+        ]
+        result = _normalize_tool_calls_in_messages(messages)
+        tc = result[1]["tool_calls"][0]
+        # Flat keys (Qwen)
+        assert tc["name"] == "get_weather"
+        assert tc["arguments"] == {"city": "London"}
+        # Nested keys (Gemma)
+        assert tc["function"]["name"] == "get_weather"
+        assert tc["function"]["arguments"] == {"city": "London"}
+        # Preserved metadata
+        assert tc["id"] == "call_abc"
+        assert tc["type"] == "function"
+        # Non-assistant messages unchanged
+        assert result[0] == messages[0]
+        assert result[2] == messages[2]
+
+    def test_already_flat_format_gets_function_key(self):
+        """Qwen-style {name, arguments: dict} gets function key added."""
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"name": "search", "arguments": {"q": "test"}},
+                ],
+            },
+        ]
+        result = _normalize_tool_calls_in_messages(messages)
+        tc = result[0]["tool_calls"][0]
+        assert tc["name"] == "search"
+        assert tc["arguments"] == {"q": "test"}
+        assert tc["function"]["name"] == "search"
+
+    def test_no_tool_calls_unchanged(self):
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        result = _normalize_tool_calls_in_messages(messages)
+        assert result == messages
+
+    def test_invalid_json_arguments(self):
+        """Malformed JSON arguments fall back to empty dict."""
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "type": "function",
+                        "function": {"name": "foo", "arguments": "not json"},
+                    }
+                ],
+            },
+        ]
+        result = _normalize_tool_calls_in_messages(messages)
+        assert result[0]["tool_calls"][0]["arguments"] == {}
+
+
+class TestGemma4TemplateOrdering:
+    """Document Gemma 4 template ordering: system prompt before tool declarations.
+
+    Gemma 4's chat template places the system prompt content *before* native
+    ``<|tool>`` declarations.  When the system prompt is long and contains its
+    own natural-language tool-usage instructions (e.g. Claude Code's system
+    prompt), the model may follow those instructions instead of producing
+    native ``<|tool_call>`` output.
+
+    Qwen 3.5's template avoids this by placing explicit tool-calling format
+    instructions (with examples) *before* the system prompt.
+    """
+
+    GEMMA4_TEMPLATE = (
+        "/Users/daniel/.olmlx/models/"
+        "mlx-community_gemma-4-26b-a4b-it-4bit/chat_template.jinja"
+    )
+    QWEN35_TEMPLATE = (
+        "/Users/daniel/.olmlx/models/mlx-community_Qwen3.5-27B-4bit/chat_template.jinja"
+    )
+
+    @staticmethod
+    def _render(template_path, messages, tools=None, enable_thinking=None):
+        """Render a Jinja2 chat template from file."""
+        import os
+
+        from jinja2 import BaseLoader, Environment
+
+        if not os.path.exists(template_path):
+            pytest.skip(f"Template not found: {template_path}")
+
+        with open(template_path) as f:
+            source = f.read()
+
+        env = Environment(loader=BaseLoader())
+        env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(
+            ValueError(msg)
+        )
+        tmpl = env.from_string(source)
+
+        kwargs = {
+            "messages": messages,
+            "add_generation_prompt": True,
+            "bos_token": "<bos>",
+        }
+        if tools:
+            kwargs["tools"] = tools
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
+        return tmpl.render(**kwargs)
+
+    def test_gemma4_system_before_tools(self):
+        """Gemma 4 places system content before <|tool> declarations."""
+        messages = [
+            {"role": "system", "content": "SYSTEM_MARKER"},
+            {"role": "user", "content": "hello"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run a command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The command",
+                            }
+                        },
+                        "required": ["command"],
+                    },
+                },
+            }
+        ]
+        prompt = self._render(self.GEMMA4_TEMPLATE, messages, tools=tools)
+        sys_pos = prompt.find("SYSTEM_MARKER")
+        tool_pos = prompt.find("<|tool>")
+        assert sys_pos != -1, "System content not found in prompt"
+        assert tool_pos != -1, "Tool declaration not found in prompt"
+        assert sys_pos < tool_pos, (
+            f"Expected system content (pos {sys_pos}) before tool declarations "
+            f"(pos {tool_pos}), but tools came first"
+        )
+
+    def test_qwen35_tools_before_system(self):
+        """Qwen 3.5 places tool instructions before system content."""
+        messages = [
+            {"role": "system", "content": "SYSTEM_MARKER"},
+            {"role": "user", "content": "hello"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run a command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The command",
+                            }
+                        },
+                        "required": ["command"],
+                    },
+                },
+            }
+        ]
+        prompt = self._render(self.QWEN35_TEMPLATE, messages, tools=tools)
+        sys_pos = prompt.find("SYSTEM_MARKER")
+        tool_pos = prompt.find("# Tools")
+        assert sys_pos != -1, "System content not found in prompt"
+        assert tool_pos != -1, "Tool instructions not found in prompt"
+        assert tool_pos < sys_pos, (
+            f"Expected tool instructions (pos {tool_pos}) before system content "
+            f"(pos {sys_pos}), but system came first"
+        )
+
+    def test_gemma4_thinking_disabled_by_default(self):
+        """When enable_thinking is not passed, Gemma 4 forces empty thinking."""
+        messages = [
+            {"role": "user", "content": "hello"},
+        ]
+        prompt = self._render(self.GEMMA4_TEMPLATE, messages)
+        assert "<|channel>thought\n<channel|>" in prompt, (
+            "Expected empty thinking block when enable_thinking is not set"
+        )
+
+    def test_gemma4_thinking_enabled(self):
+        """When enable_thinking=True, Gemma 4 allows the model to think."""
+        messages = [
+            {"role": "user", "content": "hello"},
+        ]
+        prompt = self._render(self.GEMMA4_TEMPLATE, messages, enable_thinking=True)
+        assert "<|think|>" in prompt, (
+            "Expected <|think|> token when enable_thinking=True"
+        )
+        assert "<|channel>thought\n<channel|>" not in prompt, (
+            "Should NOT force empty thinking when enable_thinking=True"
+        )
 
 
 class TestGenerateCompletion:
@@ -1066,6 +1504,167 @@ class TestGenerateChatVlm:
                     )
 
         assert result["text"] == "vlm response"
+
+    @pytest.mark.asyncio
+    async def test_vlm_with_tools_native_support(self, mock_manager):
+        """VLM+tools uses tokenizer directly for native tool template (bypasses mlx_vlm)."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        lm.template_caps = TemplateCaps(
+            supports_tools=True, supports_enable_thinking=True
+        )
+
+        mock_mx = MagicMock()
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search",
+                    "parameters": {},
+                },
+            }
+        ]
+
+        # Mock the tokenizer's apply_chat_template (called directly, not via mlx_vlm)
+        lm.tokenizer.tokenizer = MagicMock()
+        lm.tokenizer.tokenizer.apply_chat_template = MagicMock(
+            return_value="direct tokenizer prompt with tools"
+        )
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch(
+                "olmlx.engine.inference.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_thread:
+                mock_thread.return_value = "tool response"
+                result = await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "search"}],
+                    tools=tools,
+                    stream=False,
+                )
+
+        # Should call tokenizer.apply_chat_template directly with tools
+        tpl_call = lm.tokenizer.tokenizer.apply_chat_template
+        tpl_call.assert_called_once()
+        call_kwargs = tpl_call.call_args.kwargs
+        assert call_kwargs["tools"] == tools
+        assert call_kwargs["tokenize"] is False
+        assert call_kwargs["add_generation_prompt"] is True
+        assert result["text"] == "tool response"
+
+    @pytest.mark.asyncio
+    async def test_vlm_with_tools_no_native_support_injects(self, mock_manager):
+        """VLM+tools injects into system message when caps.supports_tools is False."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        lm.template_caps = TemplateCaps(
+            supports_tools=False, supports_enable_thinking=False
+        )
+
+        mock_mx = MagicMock()
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt with injected tools"
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search",
+                    "parameters": {},
+                },
+            }
+        ]
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                ) as mock_thread:
+                    mock_thread.return_value = "tool response"
+                    result = await generate_chat(
+                        mock_manager,
+                        "qwen3",
+                        [{"role": "user", "content": "search"}],
+                        tools=tools,
+                        stream=False,
+                    )
+
+        # Should have called mlx_vlm.apply_chat_template with injected tools in system msg
+        vlm_call_args = mock_mlx_vlm.apply_chat_template.call_args
+        messages_passed = vlm_call_args[0][2]  # 3rd positional arg = messages
+        assert messages_passed[0]["role"] == "system"
+        assert "search" in messages_passed[0]["content"]
+        assert result["text"] == "tool response"
+
+    @pytest.mark.asyncio
+    async def test_vlm_tool_messages_converted_to_tool_responses(self, mock_manager):
+        """VLM with uses_tool_responses converts role=tool to tool_responses format."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        lm.template_caps = TemplateCaps(
+            supports_tools=True,
+            supports_enable_thinking=True,
+            uses_tool_responses=True,
+        )
+
+        mock_mx = MagicMock()
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "Bash", "description": "Run", "parameters": {}},
+            }
+        ]
+
+        lm.tokenizer.tokenizer = MagicMock()
+        lm.tokenizer.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
+
+        messages = [
+            {"role": "user", "content": "list files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "Bash", "arguments": {"cmd": "ls"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "file1\nfile2"},
+            {"role": "user", "content": "thanks"},
+        ]
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch(
+                "olmlx.engine.inference.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_thread:
+                mock_thread.return_value = "done"
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    messages,
+                    tools=tools,
+                    stream=False,
+                )
+
+        # Verify the messages passed to apply_chat_template have no role=tool
+        tpl_call = lm.tokenizer.tokenizer.apply_chat_template
+        tpl_call.assert_called_once()
+        passed_messages = tpl_call.call_args[0][0]
+        assert not any(m.get("role") == "tool" for m in passed_messages)
+        # tool_responses should be merged into the assistant message
+        tool_resp_msgs = [m for m in passed_messages if "tool_responses" in m]
+        assert len(tool_resp_msgs) == 1
+        assert tool_resp_msgs[0]["role"] == "assistant"
+        assert tool_resp_msgs[0]["tool_responses"][0]["name"] == "Bash"
+        assert tool_resp_msgs[0]["tool_responses"][0]["response"] == "file1\nfile2"
 
 
 class TestGenerateEmbeddings:
@@ -1834,6 +2433,37 @@ class TestEstimateKvCacheBytes:
         result = _estimate_kv_cache_bytes(model, 1000)
         expected_raw = 32 * 2 * 8 * 128 * 1000 * 2
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+    def test_mla_model_uses_compressed_kv_dimensions(self):
+        """MLA models (DeepSeek V3) store compressed KV: kv_lora_rank + qk_rope_head_dim per layer.
+
+        The KV cache should NOT use num_key_value_heads * head_dim (which is the
+        uncompressed attention dimension), but instead kv_lora_rank + qk_rope_head_dim.
+        """
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 61
+        args.num_attention_heads = 128
+        args.num_key_value_heads = 128
+        args.hidden_size = 7168
+        args.kv_lora_rank = 512
+        args.qk_rope_head_dim = 64
+        model = MagicMock(spec=[])
+        model.args = args
+
+        result = _estimate_kv_cache_bytes(model, 1000)
+
+        # MLA cache per layer per token: (kv_lora_rank + qk_rope_head_dim) * 2 bytes
+        # = (512 + 64) * 2 = 1152 bytes  (keys=compressed_kv, values=k_pe, 1 "head" each)
+        # Total raw = 61 * (512 + 64) * 2 * 1000 * 2 = 140_608_000
+        # Note: factor of 2 for K+V cache entries (compressed_kv stored as keys,
+        # k_pe stored as values — both have 1 effective head).
+        expected_raw = 61 * 2 * (512 + 64) * 1000 * 2
+        assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+        # Verify it's dramatically less than the naive MHA estimate
+        naive_head_dim = 7168 // 128  # = 56
+        naive_raw = 61 * 2 * 128 * naive_head_dim * 1000 * 2
+        assert result < naive_raw  # MLA should be ~25x smaller
 
 
 class TestKvCachePreflightCheck:

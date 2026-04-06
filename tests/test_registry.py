@@ -460,6 +460,30 @@ class TestRegistryModelConfig:
         assert result.hf_path == "org/model-name"
         assert result.experimental == {}
 
+    def test_resolve_hf_path_with_tag_in_registry(self, tmp_path, monkeypatch):
+        """Direct HF path resolves rich config when stored with :latest tag."""
+        config = {
+            "mlx-community/DeepSeek-V3.2-4bit:latest": {
+                "hf_path": "mlx-community/DeepSeek-V3.2-4bit",
+                "experimental": {
+                    "flash_moe": True,
+                    "flash_moe_cache_budget_experts": 6,
+                },
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        # Request without :latest tag — must still find the rich config
+        result = reg.resolve("mlx-community/DeepSeek-V3.2-4bit")
+        assert result.hf_path == "mlx-community/DeepSeek-V3.2-4bit"
+        assert result.experimental == {
+            "flash_moe": True,
+            "flash_moe_cache_budget_experts": 6,
+        }
+
     def test_save_preserves_rich_config(self, tmp_path, monkeypatch):
         """Round-trip: load → save → load preserves experimental overrides."""
         config = {

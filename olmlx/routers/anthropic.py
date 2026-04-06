@@ -9,7 +9,11 @@ from fastapi.responses import StreamingResponse
 
 from olmlx.config import settings
 from olmlx.engine.inference import _inference_ref, count_chat_tokens, generate_chat
-from olmlx.engine.tool_parser import _make_tool_use_id, parse_model_output
+from olmlx.engine.tool_parser import (
+    _make_tool_use_id,
+    parse_model_output,
+    resolve_tool_names,
+)
 from olmlx.schemas.anthropic import (
     AnthropicContentBlock,
     AnthropicMessagesRequest,
@@ -302,9 +306,10 @@ def _emit_content_block(
     return events
 
 
-async def _stream_buffered_with_tools(result):
+async def _stream_buffered_with_tools(result, declared_tools=None):
     """Buffer full output, parse tools, yield SSE strings. Yields a final dict with metadata."""
     full_text = ""
+    raw_text = ""
     output_tokens = 0
 
     async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
@@ -320,13 +325,16 @@ async def _stream_buffered_with_tools(result):
                 output_tokens = stats.eval_count
             break
         full_text += chunk.get("text", "")
+        raw_text += chunk.get("raw_text", chunk.get("text", ""))
 
-    logger.info("Raw model output (%d chars): %s", len(full_text), full_text[:1000])
+    logger.info("Raw model output (%d chars): %s", len(raw_text), raw_text[:1000])
 
     thinking, visible_text, tool_uses = parse_model_output(
-        full_text,
+        raw_text,
         True,
     )
+
+    resolve_tool_names(tool_uses, declared_tools)
 
     if tool_uses:
         logger.info(
@@ -624,6 +632,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     enable_thinking: bool | None = None
     if req.thinking is not None:
         enable_thinking = _THINKING_TYPE_MAP.get(req.thinking.type)
+        logger.debug(
+            "enable_thinking=%s (thinking.type=%s)", enable_thinking, req.thinking.type
+        )
         if req.thinking.budget_tokens is not None:
             logger.info(
                 "budget_tokens=%d received but not supported (thinking is on/off only)",
@@ -647,7 +658,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             path = None
             try:
                 path = (
-                    _stream_buffered_with_tools(result)
+                    _stream_buffered_with_tools(result, declared_tools=tools)
                     if has_tools
                     else _stream_thinking_state_machine(result)
                 )
@@ -786,14 +797,18 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             enable_thinking=enable_thinking,
         )
         text = result.get("text", "")
+        parse_text = result.get("raw_text", text)
         stats = result.get("stats")
 
-        logger.debug("Raw model output (%d chars): %s", len(text), text[:500])
+        logger.debug(
+            "Raw model output (%d chars): %s", len(parse_text), parse_text[:500]
+        )
 
         thinking, visible_text, tool_uses = parse_model_output(
-            text,
+            parse_text,
             has_tools,
         )
+        resolve_tool_names(tool_uses, tools)
 
         content_blocks = []
 

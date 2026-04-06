@@ -27,7 +27,9 @@ def _make_tool_use_id() -> str:
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 # Gemma4 channel format: <|channel>thought\n...<channel|>
-_GEMMA4_CHANNEL_RE = re.compile(r"<\|channel>thought\n(.*?)<channel\|>", re.DOTALL)
+# The <|channel> opening token may be absent in decoded text when
+# skip_special_tokens strips it, so the pattern is optional.
+_GEMMA4_CHANNEL_RE = re.compile(r"(?:<\|channel>)?thought\n(.*?)<channel\|>", re.DOTALL)
 
 # gpt-oss channel format:
 # <|start|>assistant<|channel|>analysis<|message|>thinking<|end|>
@@ -352,6 +354,12 @@ def _parse_gemma4_value(v: str):
     try:
         return json.loads(v)
     except (json.JSONDecodeError, ValueError):
+        # json.loads failed — likely unescaped quotes inside a string value.
+        # Strip the outer <|"|>-derived quotes so the raw string doesn't
+        # carry spurious delimiters (e.g. '"find . -name "*.py"..."' → the
+        # inner content without surrounding quotes).
+        if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+            return v[1:-1]
         return v
 
 
@@ -488,6 +496,19 @@ def parse_model_output(
         thinking = f"{thinking}\n{think_text}".strip() if thinking else think_text
         text = _THINK_RE.sub("", text)
 
+    # Handle orphaned </think> — the chat template may open <think> in the
+    # prompt so the generated text starts mid-think with only a closing tag.
+    orphan_idx = text.find("</think>")
+    if orphan_idx != -1:
+        orphan_thinking = text[:orphan_idx].strip()
+        if orphan_thinking:
+            thinking = (
+                f"{thinking}\n{orphan_thinking}".strip()
+                if thinking
+                else orphan_thinking
+            )
+        text = text[orphan_idx + len("</think>") :].lstrip("\n")
+
     tool_uses: list[dict] = []
     if has_tools:
         parsers = [
@@ -520,3 +541,43 @@ def parse_model_output(
 
     visible_text = text.strip()
     return thinking, visible_text, tool_uses
+
+
+def resolve_tool_names(
+    tool_uses: list[dict], declared_tools: list[dict] | None
+) -> None:
+    """Resolve parsed tool names to declared tool names.
+
+    Some models (e.g. Gemma 4) generate tool names that differ from the
+    declared name — e.g. ``bash:run_command`` instead of ``Bash``.  This
+    function maps parsed names back to declared names using:
+      1. Exact match
+      2. Case-insensitive match
+      3. Case-insensitive prefix match (before first ``:``)
+    """
+    if not declared_tools or not tool_uses:
+        return
+    declared_names = []
+    for t in declared_tools:
+        # Support both OpenAI format {function: {name}} and flat {name}
+        fn = t.get("function", t)
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if name:
+            declared_names.append(name)
+    if not declared_names:
+        return
+    lower_map = {n.lower(): n for n in declared_names}
+    for tu in tool_uses:
+        name = tu.get("name", "")
+        if name in declared_names:
+            continue
+        # Case-insensitive
+        if name.lower() in lower_map:
+            tu["name"] = lower_map[name.lower()]
+            continue
+        # Prefix before first ':'
+        prefix = name.split(":")[0]
+        if prefix.lower() in lower_map:
+            resolved = lower_map[prefix.lower()]
+            logger.debug("Resolved tool name %r → %r via prefix match", name, resolved)
+            tu["name"] = resolved

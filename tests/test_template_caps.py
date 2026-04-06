@@ -153,3 +153,34 @@ class TestDetectCaps:
         ]
         caps = detect_caps(tok)
         assert caps.supports_tools is True
+
+    def test_uses_tool_responses_detected(self):
+        """Template accessing message.tool_responses → uses_tool_responses=True."""
+        tok = MagicMock()
+        tok.chat_template = (
+            "{% for msg in messages %}"
+            "{% if msg.tool_responses %}{{ msg.tool_responses }}{% endif %}"
+            "{% endfor %}"
+        )
+        caps = detect_caps(tok)
+        assert caps.uses_tool_responses is True
+
+    def test_uses_tool_responses_false_by_default(self):
+        """Standard template without tool_responses → uses_tool_responses=False."""
+        tok = MagicMock()
+        tok.chat_template = "{{ messages }}{% if tools %}{{ tools }}{% endif %}"
+        caps = detect_caps(tok)
+        assert caps.uses_tool_responses is False
+
+    def test_uses_tool_responses_false_for_comment(self):
+        """A Jinja comment mentioning tool_responses must not trigger the flag."""
+        tok = MagicMock()
+        tok.chat_template = (
+            "{# This model does not support tool_responses #}{{ messages }}"
+        )
+        caps = detect_caps(tok)
+        assert caps.uses_tool_responses is False
+
+    def test_uses_tool_responses_defaults(self):
+        caps = TemplateCaps()
+        assert caps.uses_tool_responses is False

@@ -6,6 +6,7 @@ from olmlx.engine.tool_parser import (
     _parse_json_call,
     _try_bare_json,
     _try_deepseek,
+    _try_gemma4,
     _try_llama,
     _try_minimax,
     _try_mistral,
@@ -590,6 +591,27 @@ class TestParseModelOutput:
         assert len(tools) == 1
         assert tools[0]["name"] == "search"
 
+    def test_thinking_without_opening_tag(self):
+        """When the chat template opens <think> in the prompt, generated text
+        starts mid-think with only a closing </think> tag."""
+        text = "reasoning about the problem\n</think>\nThe answer is 42."
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert "reasoning about the problem" in thinking
+        assert "<think>" not in visible
+        assert "</think>" not in visible
+        assert "The answer is 42." in visible
+
+    def test_thinking_without_opening_tag_with_tool_call(self):
+        """Orphaned </think> followed by a tool call."""
+        text = (
+            "I should search for this\n</think>\n"
+            '<tool_call>\n{"name": "search", "arguments": {"q": "test"}}\n</tool_call>'
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert "I should search" in thinking
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
+
     def test_no_tool_parsing_when_has_tools_false(self):
         text = '<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>'
         thinking, visible, tools = parse_model_output(text, has_tools=False)
@@ -677,3 +699,100 @@ class TestParseModelOutput:
     def test_whitespace_stripping(self):
         thinking, visible, tools = parse_model_output("  hello  ", has_tools=False)
         assert visible == "hello"
+
+
+class TestGemma4:
+    def test_basic_tool_call(self):
+        text = '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>'
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "get_weather"
+        assert tools[0]["input"] == {"location": "Tokyo"}
+
+    def test_multiple_params(self):
+        text = '<|tool_call>call:search{query:<|"|>cats<|"|>,limit:10}<tool_call|>'
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
+        assert tools[0]["input"]["query"] == "cats"
+        assert tools[0]["input"]["limit"] == 10
+
+    def test_no_params(self):
+        text = "<|tool_call>call:get_time{}<tool_call|>"
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "get_time"
+        assert tools[0]["input"] == {}
+
+    def test_nested_object(self):
+        text = '<|tool_call>call:create{data:{name:<|"|>test<|"|>,count:5}}<tool_call|>'
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "create"
+        assert tools[0]["input"]["data"] == {"name": "test", "count": 5}
+
+    def test_multiple_tool_calls(self):
+        text = (
+            '<|tool_call>call:func_a{x:<|"|>1<|"|>}<tool_call|>'
+            '<|tool_call>call:func_b{y:<|"|>2<|"|>}<tool_call|>'
+        )
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 2
+        assert tools[0]["name"] == "func_a"
+        assert tools[1]["name"] == "func_b"
+
+    def test_not_call_prefix_skipped(self):
+        text = "<|tool_call>response:func{}<tool_call|>"
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 0
+
+    def test_boolean_values(self):
+        text = "<|tool_call>call:toggle{enabled:true}<tool_call|>"
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 1
+        assert tools[0]["input"]["enabled"] is True
+
+    def test_inner_quotes_stripped(self):
+        """Values with unescaped inner quotes must not carry outer delimiters."""
+        text = '<|tool_call>call:Bash{command:<|"|>find . -name "*.py" | wc -l<|"|>}<tool_call|>'
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 1
+        assert tools[0]["input"]["command"] == 'find . -name "*.py" | wc -l'
+
+    def test_inner_quotes_with_multiple_params(self):
+        """Unescaped inner quotes in a multi-parameter call must not break splitting."""
+        text = '<|tool_call>call:Bash{command:<|"|>a "b" c<|"|>,limit:5}<tool_call|>'
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 1
+        assert tools[0]["input"]["command"] == 'a "b" c'
+        assert tools[0]["input"]["limit"] == 5
+
+    def test_array_parameter(self):
+        """Array-valued parameters like ids:[1,2,3] parse correctly."""
+        text = "<|tool_call>call:func{ids:[1,2,3]}<tool_call|>"
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "func"
+        assert tools[0]["input"]["ids"] == [1, 2, 3]
+
+
+class TestGemma4Thinking:
+    # Note: basic channel thinking is tested in TestParseModelOutput.test_gemma4_channel_thinking
+
+    def test_gemma4_thinking_with_tool_call(self):
+        text = (
+            "<|channel>thought\nLet me search<channel|>"
+            '<|tool_call>call:search{q:<|"|>test<|"|>}<tool_call|>'
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert "Let me search" in thinking
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
+        assert visible == ""
+
+    def test_gemma4_thinking_priority(self):
+        """Gemma4 format is tried first in parse_model_output."""
+        text = '<|tool_call>call:func{x:<|"|>1<|"|>}<tool_call|>'
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "func"

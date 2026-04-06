@@ -2041,3 +2041,68 @@ class TestAnthropicStreamingCleanup:
         assert resp.status_code == 200
         # The finally block in stream_sse should call result.aclose()
         error_stream.aclose.assert_awaited_once()
+
+
+class TestResolveToolNames:
+    """Test _resolve_tool_names mapping parsed names to declared tool names."""
+
+    def test_exact_match_unchanged(self):
+        from olmlx.engine.tool_parser import resolve_tool_names
+
+        tools = [{"function": {"name": "Bash"}}]
+        uses = [{"name": "Bash", "id": "1", "input": {}}]
+        resolve_tool_names(uses, tools)
+        assert uses[0]["name"] == "Bash"
+
+    def test_case_insensitive_match(self):
+        from olmlx.engine.tool_parser import resolve_tool_names
+
+        tools = [{"function": {"name": "Bash"}}]
+        uses = [{"name": "bash", "id": "1", "input": {}}]
+        resolve_tool_names(uses, tools)
+        assert uses[0]["name"] == "Bash"
+
+    def test_colon_prefix_match(self):
+        """Gemma 4 generates 'bash:run_command' for tool 'Bash'."""
+        from olmlx.engine.tool_parser import resolve_tool_names
+
+        tools = [
+            {"function": {"name": "Bash"}},
+            {"function": {"name": "Read"}},
+        ]
+        uses = [{"name": "bash:run_command", "id": "1", "input": {}}]
+        resolve_tool_names(uses, tools)
+        assert uses[0]["name"] == "Bash"
+
+    def test_no_declared_tools(self):
+        from olmlx.engine.tool_parser import resolve_tool_names
+
+        uses = [{"name": "bash", "id": "1", "input": {}}]
+        resolve_tool_names(uses, None)
+        assert uses[0]["name"] == "bash"
+
+    def test_no_match_unchanged(self):
+        from olmlx.engine.tool_parser import resolve_tool_names
+
+        tools = [{"function": {"name": "Read"}}]
+        uses = [{"name": "unknown_tool", "id": "1", "input": {}}]
+        resolve_tool_names(uses, tools)
+        assert uses[0]["name"] == "unknown_tool"
+
+    def test_multiple_tool_uses(self):
+        from olmlx.engine.tool_parser import resolve_tool_names
+
+        tools = [
+            {"function": {"name": "Bash"}},
+            {"function": {"name": "Read"}},
+            {"function": {"name": "Glob"}},
+        ]
+        uses = [
+            {"name": "bash:execute", "id": "1", "input": {}},
+            {"name": "Read", "id": "2", "input": {}},
+            {"name": "glob", "id": "3", "input": {}},
+        ]
+        resolve_tool_names(uses, tools)
+        assert uses[0]["name"] == "Bash"
+        assert uses[1]["name"] == "Read"
+        assert uses[2]["name"] == "Glob"
