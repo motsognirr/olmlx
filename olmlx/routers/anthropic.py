@@ -323,14 +323,25 @@ async def _stream_buffered_with_tools(result, declared_tools=None):
             stats = chunk.get("stats")
             if stats:
                 output_tokens = stats.eval_count
+            # For gpt-oss channel format, raw_text is in the done chunk
+            raw_text = chunk.get("raw_text", "")
             break
         full_text += chunk.get("text", "")
-        raw_text += chunk.get("raw_text", chunk.get("text", ""))
 
-    logger.info("Raw model output (%d chars): %s", len(raw_text), raw_text[:1000])
+    if raw_text:
+        logger.info(
+            "Raw model output (%d chars before filter, %d chars visible): %s",
+            len(raw_text),
+            len(full_text),
+            raw_text[:1000],
+        )
+        text_for_parsing = raw_text
+    else:
+        logger.info("Model output (%d chars): %s", len(full_text), full_text[:1000])
+        text_for_parsing = full_text
 
     thinking, visible_text, tool_uses = parse_model_output(
-        raw_text,
+        text_for_parsing,
         True,
     )
 
@@ -797,18 +808,26 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             enable_thinking=enable_thinking,
         )
         text = result.get("text", "")
-        parse_text = result.get("raw_text", text)
         stats = result.get("stats")
+        thinking = result.get("thinking", "")
 
-        logger.debug(
-            "Raw model output (%d chars): %s", len(parse_text), parse_text[:500]
-        )
+        logger.debug("Raw model output (%d chars): %s", len(text), text[:500])
 
-        thinking, visible_text, tool_uses = parse_model_output(
-            parse_text,
-            has_tools,
-        )
-        resolve_tool_names(tool_uses, tools)
+        # For gpt-oss, tool_uses may already be pre-parsed in generate_chat
+        pre_parsed_tool_uses = result.get("tool_uses")
+
+        if pre_parsed_tool_uses is not None:
+            # Already parsed by _parse_gpt_oss_channels in generate_chat
+            tool_uses = pre_parsed_tool_uses
+            visible_text = text
+        else:
+            # Parse normally for other model formats
+            thinking_parsed, visible_text, tool_uses = parse_model_output(
+                text,
+                has_tools,
+            )
+            thinking = thinking or thinking_parsed
+            resolve_tool_names(tool_uses, tools)
 
         content_blocks = []
 
