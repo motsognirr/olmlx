@@ -459,7 +459,14 @@ def _parse_gpt_oss_channels(
             visible_parts.append(content)
         elif channel == "commentary" and has_tools and content:
             tool_name_match = _GPT_OSS_TOOL_NAME_RE.search(header)
-            tool_name = tool_name_match.group(1) if tool_name_match else "unknown"
+            if not tool_name_match:
+                logger.warning(
+                    "gpt-oss tool call missing to=functions.NAME in header: %s",
+                    header[:200],
+                )
+                tool_name = "unknown"
+            else:
+                tool_name = tool_name_match.group(1)
             try:
                 args = json.loads(content)
             except (json.JSONDecodeError, ValueError):

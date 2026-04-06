@@ -1579,6 +1579,9 @@ async def _stream_completion(
                     len(generated_tokens),
                 )
 
+        # raw_text contains the complete unfiltered output (e.g. gpt-oss channel tokens).
+        # It is only present in the done chunk when gpt-oss channel format was used,
+        # allowing consumers to parse tool calls from the full raw text.
         done_chunk: dict = {"text": "", "done": True, "stats": stats}
         if raw_text:
             done_chunk["raw_text"] = raw_text
@@ -1810,7 +1813,7 @@ async def _full_completion_inner(
     result_dict: dict = {"text": text, "done": True, "stats": stats}
     if raw_text is not None:
         result_dict["raw_text"] = raw_text
-    if tool_uses is not None:
+    if tool_uses:
         result_dict["tool_uses"] = tool_uses
     if thinking:
         result_dict["thinking"] = thinking
