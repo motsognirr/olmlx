@@ -578,4 +578,6 @@ def resolve_tool_names(
         # Prefix before first ':'
         prefix = name.split(":")[0]
         if prefix.lower() in lower_map:
-            tu["name"] = lower_map[prefix.lower()]
+            resolved = lower_map[prefix.lower()]
+            logger.debug("Resolved tool name %r → %r via prefix match", name, resolved)
+            tu["name"] = resolved

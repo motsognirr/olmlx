@@ -637,6 +637,31 @@ class TestApplyChatTemplateText:
 
 
 class TestApplyChatTemplateVlm:
+    def test_vlm_tools_with_images_warns(self, caplog):
+        """When tools and images are both provided, a warning must be logged."""
+        from olmlx.engine.inference import _apply_chat_template_vlm
+
+        mock_processor = MagicMock()
+        mock_tok = MagicMock()
+        mock_tok.apply_chat_template.return_value = "prompt"
+        mock_processor.tokenizer = mock_tok
+        mock_model = MagicMock()
+
+        tools = [{"type": "function", "function": {"name": "test"}}]
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
+            _apply_chat_template_vlm(
+                mock_processor,
+                mock_model,
+                [{"role": "user", "content": "describe"}],
+                images=["img.jpg"],
+                tools=tools,
+            )
+
+        assert any("image" in r.message.lower() for r in caplog.records), (
+            f"Expected warning about images, got: {[r.message for r in caplog.records]}"
+        )
+
     def test_vlm_template(self):
         from olmlx.engine.inference import _apply_chat_template_vlm
 

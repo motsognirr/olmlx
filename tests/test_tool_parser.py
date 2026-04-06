@@ -759,13 +759,25 @@ class TestGemma4:
         assert len(tools) == 1
         assert tools[0]["input"]["command"] == 'find . -name "*.py" | wc -l'
 
+    def test_inner_quotes_with_multiple_params(self):
+        """Unescaped inner quotes in a multi-parameter call must not break splitting."""
+        text = '<|tool_call>call:Bash{command:<|"|>a "b" c<|"|>,limit:5}<tool_call|>'
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 1
+        assert tools[0]["input"]["command"] == 'a "b" c'
+        assert tools[0]["input"]["limit"] == 5
+
+    def test_array_parameter(self):
+        """Array-valued parameters like ids:[1,2,3] parse correctly."""
+        text = "<|tool_call>call:func{ids:[1,2,3]}<tool_call|>"
+        tools, _ = _try_gemma4(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "func"
+        assert tools[0]["input"]["ids"] == [1, 2, 3]
+
 
 class TestGemma4Thinking:
-    def test_gemma4_channel_thinking(self):
-        text = "<|channel>thought\nI need to think about this<channel|>The answer is 42"
-        thinking, visible, tools = parse_model_output(text, has_tools=False)
-        assert "I need to think about this" in thinking
-        assert "42" in visible
+    # Note: basic channel thinking is tested in TestParseModelOutput.test_gemma4_channel_thinking
 
     def test_gemma4_thinking_with_tool_call(self):
         text = (
@@ -776,6 +788,7 @@ class TestGemma4Thinking:
         assert "Let me search" in thinking
         assert len(tools) == 1
         assert tools[0]["name"] == "search"
+        assert visible == ""
 
     def test_gemma4_thinking_priority(self):
         """Gemma4 format is tried first in parse_model_output."""

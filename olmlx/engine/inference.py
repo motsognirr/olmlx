@@ -916,8 +916,19 @@ def _apply_chat_template_vlm(
     the Jinja template renders as Python list repr — garbling the prompt.
     """
     if tools:
+        if images:
+            logger.warning(
+                "VLM native-tools path does not support images; "
+                "%d image(s) will be ignored",
+                len(images),
+            )
         # Use tokenizer directly to get clean native tool formatting.
-        tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        tok = (
+            processor.tokenizer
+            if hasattr(processor, "tokenizer")
+            and hasattr(processor.tokenizer, "apply_chat_template")
+            else processor
+        )
         kwargs: dict = {}
         if enable_thinking is not None:
             kwargs["enable_thinking"] = enable_thinking

@@ -59,9 +59,9 @@ def detect_caps(tokenizer: Any) -> TemplateCaps:
 
     has_channel_format = "<|channel|>" in tpl
 
-    # tool_responses is accessed as message.tool_responses — substring check is
-    # sufficient since it's never a top-level Jinja2 variable.
-    uses_tool_responses = "tool_responses" in tpl
+    # tool_responses is accessed as message.tool_responses — use the dot prefix
+    # to avoid false-matching template comments or string literals.
+    uses_tool_responses = ".tool_responses" in tpl
 
     return TemplateCaps(
         supports_tools=supports_tools,

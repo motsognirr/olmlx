@@ -1083,20 +1083,17 @@ class ModelManager:
         elif hf_path:
             # Try downloading from HF hub — first from the repo itself,
             # then from the base_model listed in the model card (and its -it variant).
-            repos_to_try = [hf_path]
             try:
                 from huggingface_hub import hf_hub_download, model_info
 
-                for repo in repos_to_try:
-                    try:
-                        path = hf_hub_download(repo, "chat_template.jinja")
-                        tokenizer.chat_template = Path(path).read_text()
-                        return
-                    except Exception as exc:
-                        logger.debug(
-                            "chat_template.jinja not found in %s: %s", repo, exc
-                        )
-                        continue
+                try:
+                    path = hf_hub_download(hf_path, "chat_template.jinja")
+                    tokenizer.chat_template = Path(path).read_text()
+                    return
+                except Exception as exc:
+                    logger.debug(
+                        "chat_template.jinja not found in %s: %s", hf_path, exc
+                    )
                 # Primary repo didn't have it — check base_model from model card
                 try:
                     info = model_info(hf_path)
@@ -1108,7 +1105,10 @@ class ModelManager:
                     if isinstance(base, list):
                         base = base[0] if base else None
                     if base and base != hf_path:
-                        for candidate in (base, f"{base}-it"):
+                        candidates = [base]
+                        if not base.endswith("-it"):
+                            candidates.append(f"{base}-it")
+                        for candidate in candidates:
                             try:
                                 path = hf_hub_download(candidate, "chat_template.jinja")
                                 tokenizer.chat_template = Path(path).read_text()
