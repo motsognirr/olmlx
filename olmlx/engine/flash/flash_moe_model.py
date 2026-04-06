@@ -19,10 +19,10 @@ from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
 logger = logging.getLogger(__name__)
 
 
-class _FlashMoEDeepSeek(nn.Module):
-    """Replacement MoE layer for DeepSeek-V3 / Kimi-K2.5 style models.
+class _FlashMoEBase(nn.Module):
+    """Base class for Flash-MoE replacement layers.
 
-    Keeps gate and shared_experts in RAM, uses FlashMoE for expert dispatch.
+    Subclasses implement _route() and optionally _combine().
     """
 
     def __init__(self, original_moe, flash_moe: FlashMoE):
@@ -33,39 +33,52 @@ class _FlashMoEDeepSeek(nn.Module):
                 "Each rank loads all needed experts, so all_sum would produce "
                 "incorrect results. Disable distributed or Flash-MoE."
             )
-        self.gate = original_moe.gate
         self._flash_moe = flash_moe
-        if hasattr(original_moe, "shared_experts"):
-            self.shared_experts = original_moe.shared_experts
+        self._shared_experts = None
 
-    def __call__(self, x):
-        inds, scores = self.gate(x)
-        y = self._flash_moe(x, inds, scores)
-        y = y.astype(x.dtype)
-        if hasattr(self, "shared_experts"):
-            y = y + self.shared_experts(x)
+    def _route(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        """Return (inds, scores) for expert selection."""
+        raise NotImplementedError
+
+    def _combine(self, x: mx.array, y: mx.array) -> mx.array:
+        """Combine expert output with input. Adds shared experts if present."""
+        if self._shared_experts is not None:
+            y = y + self._shared_experts(x)
         return y
 
+    def __call__(self, x):
+        inds, scores = self._route(x)
+        y = self._flash_moe(x, inds, scores).astype(x.dtype)
+        return self._combine(x, y)
 
-class _FlashMoEGptOss(nn.Module):
+
+class _FlashMoEDeepSeek(_FlashMoEBase):
+    """Replacement MoE layer for DeepSeek-V3 / Kimi-K2.5 style models.
+
+    Keeps gate and shared_experts in RAM, uses FlashMoE for expert dispatch.
+    """
+
+    def __init__(self, original_moe, flash_moe: FlashMoE):
+        super().__init__(original_moe, flash_moe)
+        self.gate = original_moe.gate
+        self._shared_experts = getattr(original_moe, "shared_experts", None)
+
+    def _route(self, x):
+        return self.gate(x)
+
+
+class _FlashMoEGptOss(_FlashMoEBase):
     """Replacement MoE layer for gpt-oss style models.
 
     Keeps router in RAM, uses FlashMoE for expert dispatch.
     """
 
     def __init__(self, original_mlp, flash_moe: FlashMoE):
-        super().__init__()
-        if getattr(original_mlp, "sharding_group", None) is not None:
-            raise NotImplementedError(
-                "Flash-MoE does not support distributed tensor parallelism. "
-                "Each rank loads all needed experts, so all_sum would produce "
-                "incorrect results. Disable distributed or Flash-MoE."
-            )
+        super().__init__(original_mlp, flash_moe)
         self.router = original_mlp.router
         self.num_experts_per_tok = original_mlp.num_experts_per_tok
-        self._flash_moe = flash_moe
 
-    def __call__(self, x):
+    def _route(self, x):
         g = self.router(x)
         k = self.num_experts_per_tok
         # topk
@@ -73,11 +86,10 @@ class _FlashMoEGptOss(nn.Module):
         inds = part_inds[..., -k:]
         scores = mx.take_along_axis(g, inds, axis=-1)
         scores = mx.softmax(scores, axis=-1, precise=True)
-        y = self._flash_moe(x, inds, scores)
-        return y.astype(x.dtype)
+        return inds, scores
 
 
-class _FlashMoEQwen3Next(nn.Module):
+class _FlashMoEQwen3Next(_FlashMoEBase):
     """Replacement MoE layer for Qwen3-Next style models.
 
     Gate is a plain nn.Linear (returns logits, not (inds, scores)).
@@ -85,38 +97,29 @@ class _FlashMoEQwen3Next(nn.Module):
     """
 
     def __init__(self, original_moe, flash_moe: FlashMoE):
-        super().__init__()
-        if getattr(original_moe, "sharding_group", None) is not None:
-            raise NotImplementedError(
-                "Flash-MoE does not support distributed tensor parallelism. "
-                "Each rank loads all needed experts, so all_sum would produce "
-                "incorrect results. Disable distributed or Flash-MoE."
-            )
+        super().__init__(original_moe, flash_moe)
         self.gate = original_moe.gate
         self.top_k = original_moe.top_k
         self.norm_topk_prob = original_moe.norm_topk_prob
-        self._flash_moe = flash_moe
         self.shared_expert = original_moe.shared_expert
         self.shared_expert_gate = original_moe.shared_expert_gate
 
-    def __call__(self, x):
+    def _route(self, x):
         scores = mx.softmax(self.gate(x).astype(mx.float32), axis=-1)
         k = self.top_k
         inds = mx.argpartition(scores, kth=-k, axis=-1)[..., -k:]
         scores = mx.take_along_axis(scores, inds, axis=-1)
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
+        return inds, scores
 
-        y = self._flash_moe(x, inds, scores)
-        y = y.astype(x.dtype)
-
+    def _combine(self, x, y):
         shared_y = self.shared_expert(x)
         shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-
         return y + shared_y
 
 
-class _FlashMoEMiniMax(nn.Module):
+class _FlashMoEMiniMax(_FlashMoEBase):
     """Replacement MoE layer for MiniMax-style models.
 
     Gate is nn.Linear returning logits; uses sigmoid scoring with
@@ -124,21 +127,13 @@ class _FlashMoEMiniMax(nn.Module):
     """
 
     def __init__(self, original_moe, flash_moe: FlashMoE):
-        super().__init__()
-        if getattr(original_moe, "sharding_group", None) is not None:
-            raise NotImplementedError(
-                "Flash-MoE does not support distributed tensor parallelism. "
-                "Each rank loads all needed experts, so all_sum would produce "
-                "incorrect results. Disable distributed or Flash-MoE."
-            )
+        super().__init__(original_moe, flash_moe)
         self.gate = original_moe.gate
         self.num_experts_per_tok = original_moe.num_experts_per_tok
         self.e_score_correction_bias = original_moe.e_score_correction_bias
-        self._flash_moe = flash_moe
-        if hasattr(original_moe, "shared_experts"):
-            self.shared_experts = original_moe.shared_experts
+        self._shared_experts = getattr(original_moe, "shared_experts", None)
 
-    def __call__(self, x):
+    def _route(self, x):
         gates = self.gate(x.astype(mx.float32))
         scores = mx.sigmoid(gates)
         orig_scores = scores
@@ -149,12 +144,8 @@ class _FlashMoEMiniMax(nn.Module):
         scores = mx.take_along_axis(orig_scores, inds, axis=-1)
         scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
         scores = scores.astype(x.dtype)
+        return inds, scores
 
-        y = self._flash_moe(x, inds, scores)
-        y = y.astype(x.dtype)
-        if hasattr(self, "shared_experts"):
-            y = y + self.shared_experts(x)
-        return y
 
 
 class _FlashMoEGemma4(nn.Module):

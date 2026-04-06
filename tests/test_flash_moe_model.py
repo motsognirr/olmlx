@@ -221,7 +221,7 @@ class TestFlashMoeModelWrapper:
         for i in [1, 2]:
             mlp = wrapped.layers[i].mlp
             assert hasattr(mlp, "gate")
-            assert hasattr(mlp, "shared_experts")
+            assert mlp._shared_experts is not None
 
     def test_frees_switch_mlp_weights(self, model_and_store):
         """Original SwitchGLU weights should be deleted after wrapping."""
@@ -253,6 +253,33 @@ class TestFlashMoeModelWrapper:
 
         assert wrapped.layers is model.layers
         assert wrapped.args is model.args
+
+    def test_base_class_sharding_check(self):
+        """_FlashMoEBase should reject modules with a sharding group."""
+        from olmlx.engine.flash.flash_moe_model import _FlashMoEBase
+
+        class _FakeMoE:
+            sharding_group = object()
+
+        with pytest.raises(NotImplementedError, match="distributed tensor parallelism"):
+            _FlashMoEBase(_FakeMoE(), flash_moe=None)
+
+    def test_subclasses_inherit_base(self, model_and_store):
+        """All Flash-MoE replacement classes should inherit _FlashMoEBase."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import (
+            FlashMoeModelWrapper,
+            _FlashMoEBase,
+        )
+
+        moe_layer_indices = [1, 2]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        for i in [1, 2]:
+            assert isinstance(wrapped.layers[i].mlp, _FlashMoEBase)
 
 
 # ---------------------------------------------------------------------------
