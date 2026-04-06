@@ -1056,7 +1056,7 @@ class TestToolCallParsing:
         """Non-streaming gpt-oss tool calls use raw_text for parsing."""
         raw = (
             "<|start|>assistant<|channel|>analysis<|message|>I need to search.<|end|>"
-            '<|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{"city": "London"}<|call|>'
+            '<|start|>assistant<|channel|>commentary to=functions.get_weather<|message|>{"city": "London"}<|call|>'
         )
         mock_result = {
             "text": "I need to search.",
@@ -1106,17 +1106,25 @@ class TestToolCallParsing:
             async def gen():
                 # Channel filter yields analysis as fallback text, but raw_text
                 # carries the full channel-tagged output including commentary.
+                # raw_text is now only in the done chunk.
                 yield {
                     "text": "I need to search.",
                     "done": False,
-                    "raw_text": "<|start|>assistant<|channel|>analysis<|message|>I need to search.<|end|>",
                 }
                 yield {
                     "text": "",
                     "done": False,
-                    "raw_text": '<|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{"city": "London"}<|call|>',
                 }
-                yield {"text": "", "done": True, "stats": TimingStats()}
+                raw = (
+                    "<|start|>assistant<|channel|>analysis<|message|>I need to search.<|end|>"
+                    '<|start|>assistant<|channel|>commentary to=functions.get_weather<|message|>{"city": "London"}<|call|>'
+                )
+                yield {
+                    "text": "",
+                    "done": True,
+                    "stats": TimingStats(),
+                    "raw_text": raw,
+                }
 
             return gen()
 
