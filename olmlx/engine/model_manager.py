@@ -1147,6 +1147,24 @@ class ModelManager:
             caps = detect_caps(tok)
             return model, processor, True, caps
 
+    @staticmethod
+    def _vlm_fallback_load(
+        load_path: str, hf_path: str, *, lazy: bool
+    ) -> tuple[Any, Any, Any]:
+        """Load a VLM via mlx-vlm and extract the language model + tokenizer.
+
+        Returns (language_model, tokenizer, vlm_model).
+        """
+        import mlx_vlm
+
+        logger.info("mlx-lm failed for %s, falling back to mlx-vlm", hf_path)
+        vlm_model, processor = mlx_vlm.load(load_path, lazy=lazy)
+        model = vlm_model.language_model
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        return model, tokenizer, vlm_model
+
     def _flash_dir(self, hf_path: str) -> Path | None:
         """Return the flash-prepared directory for a model, if it exists."""
         if self.store is None:
@@ -1179,7 +1197,14 @@ class ModelManager:
         # that the text-only model class doesn't use — retry with strict=False.
         from olmlx.engine.flash.prepare import load_model_with_strict_fallback
 
-        model, tokenizer = load_model_with_strict_fallback(load_path, lazy=False)
+        is_vlm = False
+        try:
+            model, tokenizer = load_model_with_strict_fallback(load_path, lazy=False)
+        except ValueError:
+            model, tokenizer, _ = self._vlm_fallback_load(
+                load_path, hf_path, lazy=False
+            )
+            is_vlm = True
         caps = detect_caps(tokenizer)
 
         # Load predictor bank
@@ -1272,9 +1297,9 @@ class ModelManager:
                 num_speculative_tokens=model_exp.flash_speculative_tokens,
                 prefetcher=wrapped.prefetcher,
             )
-            return wrapped, tokenizer, False, caps, decoder
+            return wrapped, tokenizer, is_vlm, caps, decoder
 
-        return wrapped, tokenizer, False, caps, None
+        return wrapped, tokenizer, is_vlm, caps, None
 
     def _flash_moe_dir(self, hf_path: str) -> Path | None:
         """Return the flash-MoE directory for a model, if it exists."""
@@ -1315,7 +1340,14 @@ class ModelManager:
             "Loading model %s in Flash-MoE mode from %s", hf_path, flash_moe_dir
         )
 
-        model, tokenizer = _load_with_model_type_fallback(mlx_lm, load_path, lazy=True)
+        is_vlm = False
+        try:
+            model, tokenizer = _load_with_model_type_fallback(
+                mlx_lm, load_path, lazy=True
+            )
+        except ValueError:
+            model, tokenizer, _ = self._vlm_fallback_load(load_path, hf_path, lazy=True)
+            is_vlm = True
         caps = detect_caps(tokenizer)
 
         # Read flash_moe_config for architecture info
@@ -1343,7 +1375,7 @@ class ModelManager:
             store.close()
             raise
 
-        return wrapped, tokenizer, False, caps
+        return wrapped, tokenizer, is_vlm, caps
 
     def _load_model(
         self, hf_path: str, *, model_exp: Any = None

@@ -42,6 +42,43 @@ def _make_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
 
+def _fill_missing_required_args(
+    tool_uses: list[dict],
+    declared_tools: list[dict] | None,
+) -> None:
+    """Fill missing required string arguments in tool calls from the client's schema.
+
+    Models sometimes omit fields the client marks as required (e.g. opencode's
+    ``description`` on bash).  Walk the declared tool schemas and inject an
+    empty string for any required string parameter the model left out.
+    Mutates *tool_uses* in place.
+    """
+    if not declared_tools:
+        return
+
+    # Build lookup: lowercase tool name -> {param: type} for required params
+    schema_by_tool: dict[str, dict[str, str]] = {}
+    for tool in declared_tools:
+        func = tool.get("function") or {}
+        name = (func.get("name") or "").lower()
+        params = func.get("parameters") or {}
+        required = set(params.get("required", []))
+        properties = params.get("properties") or {}
+        schema_by_tool[name] = {
+            k: v.get("type", "") for k, v in properties.items() if k in required
+        }
+
+    for tu in tool_uses:
+        required_params = schema_by_tool.get(tu["name"].lower())
+        if not required_params:
+            continue
+        inp = tu.get("input", {})
+        for param, param_type in required_params.items():
+            if param not in inp and param_type == "string":
+                inp[param] = ""
+        tu["input"] = inp
+
+
 def _to_openai_tool_calls(tool_uses: list[dict]) -> list[dict]:
     """Convert parsed tool_use blocks to OpenAI tool_calls format."""
     return [
@@ -267,6 +304,7 @@ async def _stream_openai_sse_with_tools(
         text_for_parsing = raw_text if raw_text else full_text
         _thinking, visible_text, tool_uses = parse_model_output(text_for_parsing, True)
         resolve_tool_names(tool_uses, declared_tools)
+        _fill_missing_required_args(tool_uses, declared_tools)
         logger.debug(
             "Buffered tool stream (%d chars): thinking=%d visible=%d tool_uses=%d raw=%s",
             len(full_text),
@@ -467,6 +505,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         has_tools = bool(req.tools)
         _thinking, visible_text, tool_uses = parse_model_output(parse_text, has_tools)
         resolve_tool_names(tool_uses, req.tools)
+        _fill_missing_required_args(tool_uses, req.tools)
 
         tool_calls = _to_openai_tool_calls(tool_uses) if tool_uses else None
         finish_reason = "tool_calls" if tool_uses else "stop"

@@ -362,3 +362,28 @@ class TestSpeculativeKVCache:
         accepted2, _ = decoder.step()
         assert len(accepted2) >= 1
         assert decoder._target_cache[0].offset == decoder._cache_seq_len
+
+
+class TestTrimPromptCacheNoneGuard:
+    """Regression tests for #189: trim_prompt_cache called without None guard."""
+
+    def test_step_survives_when_trim_prompt_cache_is_none(self, monkeypatch):
+        """step() must not crash when trim_prompt_cache is None (mlx_lm missing)."""
+        import olmlx.engine.flash.speculative as spec_mod
+
+        monkeypatch.setattr(spec_mod, "trim_prompt_cache", None)
+
+        vocab_size, hidden_size = 32, 16
+        draft = MockDraftModel(vocab_size, hidden_size)
+        target = MockTargetModel(vocab_size, hidden_size)
+        decoder = SpeculativeFlashDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=3,
+        )
+
+        prompt = mx.array([[1, 2, 3]])
+        decoder.prefill(prompt)
+        # Should not raise TypeError: 'NoneType' object is not callable
+        accepted, num_draft = decoder.step()
+        assert len(accepted) >= 1

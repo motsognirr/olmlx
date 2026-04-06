@@ -818,6 +818,160 @@ class TestLoadModel:
         assert model is mock_model
 
 
+class TestFlashMoeVlmFallback:
+    """Flash-MoE loading should fall back to mlx-vlm for unsupported model types."""
+
+    def _make_manager(self, registry, mock_store):
+        return ModelManager(registry, mock_store)
+
+    def _pre_download(self, mock_store, hf_path):
+        local_dir = mock_store.local_path(hf_path)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}")
+
+    def _make_flash_moe_dir(self, mock_store, hf_path):
+        flash_moe_dir = mock_store.local_path(hf_path) / "flash_moe"
+        flash_moe_dir.mkdir(parents=True, exist_ok=True)
+        moe_config = {
+            "moe_layer_indices": [0, 1],
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+        }
+        (flash_moe_dir / "flash_moe_config.json").write_text(json.dumps(moe_config))
+        (flash_moe_dir / "flash_moe_layout.json").write_text("{}")
+        return flash_moe_dir
+
+    def _mock_model_exp(self):
+        exp = MagicMock()
+        exp.flash_moe = True
+        exp.flash_moe_io_threads = 4
+        exp.flash_moe_cache_budget_experts = 16
+        exp.kv_cache_quant = None
+        return exp
+
+    def test_flash_moe_falls_back_to_vlm_on_unsupported_model_type(
+        self, registry, mock_store
+    ):
+        """When mlx-lm can't load the model (e.g. gemma4), fall back to mlx-vlm."""
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/moe-vlm")
+        flash_moe_dir = self._make_flash_moe_dir(mock_store, "test/moe-vlm")
+        model_exp = self._mock_model_exp()
+
+        mock_vlm_model = MagicMock()
+        mock_vlm_model.language_model = MagicMock()
+        mock_processor = MagicMock()
+        mock_processor.tokenizer = MagicMock()
+        mock_processor.tokenizer.chat_template = None
+
+        mock_wrapped = MagicMock()
+
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError("Model type gemma4 not supported.")
+
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.load.return_value = (mock_vlm_model, mock_processor)
+
+        with patch.dict(
+            "sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}
+        ):
+            with patch(
+                "olmlx.engine.model_manager._load_with_model_type_fallback",
+                side_effect=ValueError("Model type gemma4 not supported."),
+            ):
+                with patch(
+                    "olmlx.engine.flash.flash_moe_model.FlashMoeModelWrapper",
+                    return_value=mock_wrapped,
+                ):
+                    with patch(
+                        "olmlx.engine.flash.moe_weight_store.FlashMoeWeightStore"
+                    ):
+                        model, tokenizer, is_vlm, caps = manager._load_flash_moe_model(
+                            "test/moe-vlm",
+                            str(mock_store.local_path("test/moe-vlm")),
+                            flash_moe_dir,
+                            model_exp=model_exp,
+                        )
+
+        assert is_vlm is True
+        mock_mlx_vlm.load.assert_called_once()
+
+    def test_flash_moe_uses_language_model_from_vlm(self, registry, mock_store):
+        """VLM fallback should extract language_model for the MoE wrapper."""
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/moe-vlm2")
+        flash_moe_dir = self._make_flash_moe_dir(mock_store, "test/moe-vlm2")
+        model_exp = self._mock_model_exp()
+
+        mock_language_model = MagicMock()
+        mock_vlm_model = MagicMock()
+        mock_vlm_model.language_model = mock_language_model
+        mock_processor = MagicMock()
+        mock_processor.tokenizer = MagicMock()
+        mock_processor.tokenizer.chat_template = None
+
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.load.return_value = (mock_vlm_model, mock_processor)
+
+        captured_model = {}
+
+        def capture_wrapper(model, store, **kwargs):
+            captured_model["model"] = model
+            return MagicMock()
+
+        with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+            with patch(
+                "olmlx.engine.model_manager._load_with_model_type_fallback",
+                side_effect=ValueError("Model type gemma4 not supported."),
+            ):
+                with patch(
+                    "olmlx.engine.flash.flash_moe_model.FlashMoeModelWrapper",
+                    side_effect=capture_wrapper,
+                ):
+                    with patch(
+                        "olmlx.engine.flash.moe_weight_store.FlashMoeWeightStore"
+                    ):
+                        manager._load_flash_moe_model(
+                            "test/moe-vlm2",
+                            str(mock_store.local_path("test/moe-vlm2")),
+                            flash_moe_dir,
+                            model_exp=model_exp,
+                        )
+
+        assert captured_model["model"] is mock_language_model
+
+    def test_flash_moe_still_works_with_mlx_lm(self, registry, mock_store):
+        """When mlx-lm succeeds, it should NOT fall back to mlx-vlm."""
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/moe-text")
+        flash_moe_dir = self._make_flash_moe_dir(mock_store, "test/moe-text")
+        model_exp = self._mock_model_exp()
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        with patch(
+            "olmlx.engine.model_manager._load_with_model_type_fallback",
+            return_value=(mock_model, mock_tokenizer),
+        ):
+            with patch(
+                "olmlx.engine.flash.flash_moe_model.FlashMoeModelWrapper",
+                return_value=MagicMock(),
+            ):
+                with patch("olmlx.engine.flash.moe_weight_store.FlashMoeWeightStore"):
+                    model, tokenizer, is_vlm, caps = manager._load_flash_moe_model(
+                        "test/moe-text",
+                        str(mock_store.local_path("test/moe-text")),
+                        flash_moe_dir,
+                        model_exp=model_exp,
+                    )
+
+        assert is_vlm is False
+
+
 class TestModelLoadTimeout:
     """Test configurable timeout for model loading."""
 

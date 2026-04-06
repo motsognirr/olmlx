@@ -187,6 +187,12 @@ class TestFlashMoeWeightStore:
 
         assert loaded.expert_index_map == {3: 0, 7: 1, 1: 2}
 
+    def test_load_experts_empty_indices_raises(self, store_with_model):
+        """load_experts with empty indices should raise ValueError, not mx.stack crash."""
+        store, _, _, _, _ = store_with_model
+        with pytest.raises(ValueError, match="expert_indices"):
+            store.load_experts(1, [])
+
 
 class TestFlashMoeWeightStoreQuantized:
     @pytest.fixture()

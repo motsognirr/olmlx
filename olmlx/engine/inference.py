@@ -371,10 +371,16 @@ memory usage to exceed the raw 2-bytes-per-element calculation by 20-30%.
 """
 
 
-def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
+def _estimate_kv_cache_bytes(
+    model: Any, num_tokens: int, *, kv_cache_quant: str | None = None
+) -> int:
     """Estimate KV cache memory for a given number of tokens.
 
     Formula: sum_over_attn_layers(2 * kv_heads_i * head_dim) * num_tokens * bytes_per_element * MEMORY_SAFETY_FACTOR
+
+    When *kv_cache_quant* is set (e.g. ``"turboquant:4"``), the per-head
+    storage is reduced from ``head_dim * 2`` bytes (fp16) to the compressed
+    size: ``head_dim / (8 / bits)`` packed-index bytes + 4 norm bytes.
 
     For NAS models (e.g. nemotron-nas) that have per-layer variable attention
     (some layers are no-op with self_attn=None, and KV head counts vary per
@@ -384,6 +390,14 @@ def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
     """
     if num_tokens <= 0:
         return 0
+
+    # TurboQuant compression ratio.  Normal fp16 stores head_dim * 2 bytes
+    # per K or V entry.  TurboQuant stores head_dim/(8/bits) packed-index
+    # bytes + 4 float32 norm bytes.  We compute a multiplier <1 to scale
+    # the fp16 estimate.  MLA models use a different cache layout so
+    # TurboQuant does not apply there (ratio stays 1.0).
+    _tq_ratio = 1.0  # applied to raw estimate before safety factor
+
     # mlx-lm text models: model.args
     # mlx-vlm vision-language models: model.language_model.args or .config
     args = getattr(model, "args", None)
@@ -426,6 +440,14 @@ def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
     )
     bytes_per_element = 2  # float16/bfloat16
 
+    if kv_cache_quant is not None and kv_cache_quant.startswith("turboquant:"):
+        tq_bits = int(kv_cache_quant.split(":")[1])
+        # fp16: head_dim * 2 bytes per K or V entry
+        fp16_per_entry = head_dim * bytes_per_element
+        # TurboQuant: packed indices + float32 norm
+        tq_per_entry = head_dim // (8 // tq_bits) + 4  # 4 bytes for f32 norm
+        _tq_ratio = tq_per_entry / fp16_per_entry
+
     # Try layer introspection for NAS/variable-attention models.
     # Track which sub-model owns the args so we introspect the right layers
     # (for VLMs, args came from model.language_model — introspect that, not
@@ -457,13 +479,13 @@ def _estimate_kv_cache_bytes(model: Any, num_tokens: int) -> int:
             # args-based estimate in that case.
             if per_layer_kv_sum > 0:
                 raw = 2 * per_layer_kv_sum * head_dim * num_tokens * bytes_per_element
-                return int(raw * MEMORY_SAFETY_FACTOR)
+                return int(raw * _tq_ratio * MEMORY_SAFETY_FACTOR)
 
     # Fallback: uniform estimate from args
     num_layers = args.num_hidden_layers
     num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
     raw = num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
-    return int(raw * MEMORY_SAFETY_FACTOR)
+    return int(raw * _tq_ratio * MEMORY_SAFETY_FACTOR)
 
 
 def _tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
@@ -1206,7 +1228,7 @@ async def _stream_completion(
 
             prefix_len = (
                 _find_common_prefix(prompt_tokens, cached.tokens)
-                if cached is not None
+                if cached is not None and _find_common_prefix is not None
                 else 0
             )
             logger.debug(
@@ -1236,7 +1258,7 @@ async def _stream_completion(
                 lm.prompt_cache_store.remove(cache_id)
                 # Trim cache to suffix_start so it aligns with where we resume
                 trim_amount = len(cached.tokens) - suffix_start
-                if trim_amount > 0:
+                if trim_amount > 0 and trim_prompt_cache is not None:
                     trim_prompt_cache(working_cache, trim_amount)
 
                 suffix_tokens = prompt_tokens[suffix_start:]
@@ -1321,7 +1343,9 @@ async def _stream_completion(
         if total_physical > 0 and num_prefill_tokens > 0:
             try:
                 kv_bytes = _estimate_kv_cache_bytes(
-                    lm.model, num_prefill_tokens + max_tokens
+                    lm.model,
+                    num_prefill_tokens + max_tokens,
+                    kv_cache_quant=lm.kv_cache_quant,
                 )
                 current_metal = memory_utils.get_metal_memory()
                 if current_metal + kv_bytes > memory_limit:
@@ -1360,7 +1384,11 @@ async def _stream_completion(
                             prompt = full_prompt_tokens
                     # Re-estimate after eviction for the full generation window
                     estimate_total = estimate_tokens + max_tokens
-                    kv_bytes = _estimate_kv_cache_bytes(lm.model, estimate_total)
+                    kv_bytes = _estimate_kv_cache_bytes(
+                        lm.model,
+                        estimate_total,
+                        kv_cache_quant=lm.kv_cache_quant,
+                    )
                     # Sync Metal to ensure freed buffers are reclaimed before re-reading
                     _safe_sync()
                     current_metal = memory_utils.get_metal_memory()
@@ -1520,13 +1548,14 @@ async def _stream_completion(
             if max_cache_tokens is not None and actual_total > max_cache_tokens:
                 trim_amount = actual_total - max_cache_tokens
                 try:
-                    trim_prompt_cache(prompt_cache, trim_amount)
+                    if trim_prompt_cache is not None:
+                        trim_prompt_cache(prompt_cache, trim_amount)
                     if stats.eval_count != len(generated_tokens):
                         # None-ID tokens present: can't map generated_tokens
                         # to KV cache positions. Trim KV cache down to prompt
                         # boundary so depth == len(stored_tokens).
                         extra = max_cache_tokens - len(full_prompt_tokens)
-                        if extra > 0:
+                        if extra > 0 and trim_prompt_cache is not None:
                             trim_prompt_cache(prompt_cache, extra)
                         stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
                     else:
