@@ -324,15 +324,17 @@ async def _stream_buffered_with_tools(result):
             break
         full_text += chunk.get("text", "")
 
-    logger.info(
-        "Raw model output (%d chars, %d filtered): %s",
-        len(raw_text) if raw_text else len(full_text),
-        len(full_text),
-        (raw_text if raw_text else full_text)[:1000],
-    )
-
-    # Use raw_text if available (for gpt-oss channel format), otherwise use full_text
-    text_for_parsing = raw_text if raw_text else full_text
+    if raw_text:
+        logger.info(
+            "Raw model output (%d chars before filter, %d chars visible): %s",
+            len(raw_text),
+            len(full_text),
+            raw_text[:1000],
+        )
+        text_for_parsing = raw_text
+    else:
+        logger.info("Model output (%d chars): %s", len(full_text), full_text[:1000])
+        text_for_parsing = full_text
     thinking, visible_text, tool_uses = parse_model_output(
         text_for_parsing,
         True,
@@ -797,13 +799,24 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         )
         text = result.get("text", "")
         stats = result.get("stats")
+        thinking = result.get("thinking", "")
 
         logger.debug("Raw model output (%d chars): %s", len(text), text[:500])
 
-        thinking, visible_text, tool_uses = parse_model_output(
-            text,
-            has_tools,
-        )
+        # For gpt-oss, tool_uses may already be pre-parsed in generate_chat
+        pre_parsed_tool_uses = result.get("tool_uses")
+
+        if pre_parsed_tool_uses is not None:
+            # Already parsed by _parse_gpt_oss_channels in generate_chat
+            tool_uses = pre_parsed_tool_uses
+            visible_text = text
+        else:
+            # Parse normally for other model formats
+            thinking_parsed, visible_text, tool_uses = parse_model_output(
+                text,
+                has_tools,
+            )
+            thinking = thinking or thinking_parsed
 
         content_blocks = []
 

@@ -1622,6 +1622,7 @@ async def _full_completion_inner(
         text = str(result)
 
     tool_uses = None
+    thinking = ""
     # Strip gpt-oss channel tokens for non-streaming path
     if lm.template_caps.has_channel_format and "<|channel|>" in text:
         from olmlx.engine.tool_parser import _parse_gpt_oss_channels
@@ -1634,6 +1635,8 @@ async def _full_completion_inner(
     result_dict = {"text": text, "done": True, "stats": stats}
     if tool_uses:
         result_dict["tool_uses"] = tool_uses
+    if thinking:
+        result_dict["thinking"] = thinking
     return result_dict
 
 
