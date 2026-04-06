@@ -34,16 +34,13 @@ class _FlashMoEBase(nn.Module):
                 "incorrect results. Disable distributed or Flash-MoE."
             )
         self._flash_moe = flash_moe
-        self._shared_experts = None
 
     def _route(self, x: mx.array) -> tuple[mx.array, mx.array]:
         """Return (inds, scores) for expert selection."""
         raise NotImplementedError
 
     def _combine(self, x: mx.array, y: mx.array) -> mx.array:
-        """Combine expert output with input. Adds shared experts if present."""
-        if self._shared_experts is not None:
-            y = y + self._shared_experts(x)
+        """Combine expert output with input (e.g. add shared experts)."""
         return y
 
     def __call__(self, x):
@@ -65,6 +62,11 @@ class _FlashMoEDeepSeek(_FlashMoEBase):
 
     def _route(self, x):
         return self.gate(x)
+
+    def _combine(self, x, y):
+        if self._shared_experts is not None:
+            return y + self._shared_experts(x)
+        return y
 
 
 class _FlashMoEGptOss(_FlashMoEBase):
@@ -146,6 +148,10 @@ class _FlashMoEMiniMax(_FlashMoEBase):
         scores = scores.astype(x.dtype)
         return inds, scores
 
+    def _combine(self, x, y):
+        if self._shared_experts is not None:
+            return y + self._shared_experts(x)
+        return y
 
 
 class _FlashMoEGemma4(nn.Module):
