@@ -1579,12 +1579,10 @@ async def _stream_completion(
                     len(generated_tokens),
                 )
 
-        yield {
-            "text": "",
-            "done": True,
-            "stats": stats,
-            "raw_text": raw_text,
-        }
+        done_chunk: dict = {"text": "", "done": True, "stats": stats}
+        if raw_text:
+            done_chunk["raw_text"] = raw_text
+        yield done_chunk
     finally:
         # Release GPU-backed references from gen_kwargs so they can be
         # garbage-collected.  prompt_cache is either stored in the cache

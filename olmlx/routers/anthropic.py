@@ -820,6 +820,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             # Already parsed by _parse_gpt_oss_channels in generate_chat
             tool_uses = pre_parsed_tool_uses
             visible_text = text
+            resolve_tool_names(tool_uses, tools)
         else:
             # Parse normally for other model formats
             thinking_parsed, visible_text, tool_uses = parse_model_output(

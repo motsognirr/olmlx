@@ -257,14 +257,18 @@ async def _stream_openai_sse_with_tools(
             if chunk.get("cache_info"):
                 continue
             if chunk.get("done"):
+                # Read raw_text from done chunk for gpt-oss tool call parsing
+                raw_text = chunk.get("raw_text", raw_text)
                 break
             full_text += chunk.get("text", "")
             # raw_text carries unfiltered output (e.g. gpt-oss channel tokens)
             # for tool call parsing; falls back to filtered text when absent.
-            raw_text += chunk.get("raw_text", chunk.get("text", ""))
+            raw_text += chunk.get("raw_text", "")
 
-        # Use raw_text for parsing so channel-format tool calls aren't lost
-        _thinking, visible_text, tool_uses = parse_model_output(raw_text, True)
+        # Use raw_text for parsing so channel-format tool calls aren't lost;
+        # fall back to full_text for non-gpt-oss models
+        text_for_parsing = raw_text if raw_text else full_text
+        _thinking, visible_text, tool_uses = parse_model_output(text_for_parsing, True)
         resolve_tool_names(tool_uses, declared_tools)
         logger.debug(
             "Buffered tool stream (%d chars): thinking=%d visible=%d tool_uses=%d raw=%s",
