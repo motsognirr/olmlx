@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from olmlx.engine.inference import generate_chat
+from olmlx.routers.common import format_error
 from olmlx.schemas.chat import ChatRequest, Message
 from olmlx.utils.streaming import safe_ndjson_stream
 
@@ -65,25 +66,11 @@ async def chat(req: ChatRequest, request: Request):
                 + "\n"
             )
 
-        def format_error(exc):
-            return (
-                json.dumps(
-                    {
-                        "model": req.model,
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                        "error": "An internal server error occurred during streaming.",
-                        "done": True,
-                        "done_reason": "error",
-                    }
-                )
-                + "\n"
-            )
-
         return StreamingResponse(
             safe_ndjson_stream(
                 result,
                 format_chunk,
-                format_error,
+                lambda exc: format_error(req.model),
                 log=logger,
                 log_prefix="chat streaming",
             ),

@@ -5,6 +5,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 ModelName = Annotated[str, Field(min_length=1, max_length=256)]
 
 
+def validate_token_limit(v: int, field_name: str) -> int:
+    from olmlx.config import settings
+
+    if v > settings.max_tokens_limit:
+        raise ValueError(
+            f"{field_name} {v} exceeds configured limit {settings.max_tokens_limit} "
+            f"(set OLMLX_MAX_TOKENS_LIMIT to increase)"
+        )
+    return v
+
+
 class ModelOptions(BaseModel):
     """Ollama model options / parameters."""
 
@@ -19,14 +30,7 @@ class ModelOptions(BaseModel):
     def validate_num_predict(cls, v: int | None) -> int | None:
         if v is None or v < 0:
             return v  # special values -1 (infinite) and -2 (fill context)
-        from olmlx.config import settings
-
-        if v > settings.max_tokens_limit:
-            raise ValueError(
-                f"num_predict {v} exceeds configured limit {settings.max_tokens_limit} "
-                f"(set OLMLX_MAX_TOKENS_LIMIT to increase)"
-            )
-        return v
+        return validate_token_limit(v, "num_predict")
 
     top_k: int | None = Field(None, ge=0)
     top_p: float | None = Field(None, ge=0, le=1)

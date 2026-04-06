@@ -60,14 +60,9 @@ class OpenAIChatRequest(BaseModel):
     def validate_max_tokens(cls, v: int | None) -> int | None:
         if v is None:
             return v
-        from olmlx.config import settings
+        from olmlx.schemas.common import validate_token_limit
 
-        if v > settings.max_tokens_limit:
-            raise ValueError(
-                f"value {v} exceeds configured limit {settings.max_tokens_limit} "
-                f"(set OLMLX_MAX_TOKENS_LIMIT to increase)"
-            )
-        return v
+        return validate_token_limit(v, "value")
 
 
 class OpenAIUsage(BaseModel):
@@ -126,14 +121,9 @@ class OpenAICompletionRequest(BaseModel):
     def validate_max_tokens(cls, v: int | None) -> int | None:
         if v is None:
             return v
-        from olmlx.config import settings
+        from olmlx.schemas.common import validate_token_limit
 
-        if v > settings.max_tokens_limit:
-            raise ValueError(
-                f"value {v} exceeds configured limit {settings.max_tokens_limit} "
-                f"(set OLMLX_MAX_TOKENS_LIMIT to increase)"
-            )
-        return v
+        return validate_token_limit(v, "value")
 
 
 class OpenAICompletionChoice(BaseModel):
