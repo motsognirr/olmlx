@@ -151,25 +151,18 @@ class Prefetcher:
     ) -> None:
         """Predict and prefetch neurons for multiple layers at once.
 
-        Hidden states are materialized on the calling thread; predictions
-        are enqueued to the single prediction thread.
+        Unlike :meth:`submit`, predictions run synchronously on the calling
+        thread so that all I/O is queued before the caller starts the target
+        forward pass.  This is important for speculative decoding (Path B)
+        where the target pass starts immediately after ``submit_bulk``
+        returns — serialising predictions on the background thread would
+        delay later layers' I/O.
         """
-        if layer_hidden_states:
-            mx.eval(*layer_hidden_states.values())
         for layer_idx, hidden in layer_hidden_states.items():
             if layer_idx >= self._num_layers:
                 continue
-            state = _LayerPrefetchState()
-            with self._lock:
-                if layer_idx in self._pending:
-                    continue
-                self._pending[layer_idx] = state
-            try:
-                self._predict_executor.submit(
-                    self._do_predict_and_io_direct, layer_idx, hidden, state
-                )
-            except RuntimeError:
-                state.done.set()
+            indices = self._predict(layer_idx, hidden)
+            self._submit_io(layer_idx, indices)
 
     def cancel(self) -> None:
         """Cancel all in-flight prefetch I/O (e.g. on draft rejection).
@@ -201,20 +194,6 @@ class Prefetcher:
             self._enqueue_io(next_layer, indices, state)
         except Exception:
             logger.warning("Prediction failed for layer %d", next_layer, exc_info=True)
-            state.done.set()
-
-    def _do_predict_and_io_direct(
-        self,
-        layer_idx: int,
-        hidden_state: mx.array,
-        state: _LayerPrefetchState,
-    ) -> None:
-        """Run on the prediction thread for submit_bulk: predict specified layer."""
-        try:
-            indices = self._predict(layer_idx, hidden_state)
-            self._enqueue_io(layer_idx, indices, state)
-        except Exception:
-            logger.warning("Prediction failed for layer %d", layer_idx, exc_info=True)
             state.done.set()
 
     def _predict(self, layer_idx: int, hidden_state: mx.array) -> list[int]:
@@ -280,6 +259,18 @@ class Prefetcher:
             with self._lock:
                 self.stats.submitted -= 1
             logger.warning("Failed to submit prefetch for layer %d", layer_idx)
+
+    def _submit_io(self, layer_idx: int, neuron_indices: list[int]) -> None:
+        """Register a pending entry and submit I/O (used by synchronous submit_bulk)."""
+        if not neuron_indices:
+            return
+
+        state = _LayerPrefetchState()
+        with self._lock:
+            if layer_idx in self._pending:
+                return  # already in flight
+            self._pending[layer_idx] = state
+        self._enqueue_io(layer_idx, neuron_indices, state)
 
     def close(self) -> None:
         """Shut down both the prediction and I/O thread pools.

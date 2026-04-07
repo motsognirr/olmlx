@@ -389,31 +389,20 @@ class TestAsyncPrediction:
 
         assert prefetcher.stats.submitted >= 1
 
-    def test_submit_bulk_async(self, prefetch_setup):
-        """submit_bulk should return quickly and process predictions in background."""
-        import time
-        from unittest.mock import patch
-
+    def test_submit_bulk_synchronous(self, prefetch_setup):
+        """submit_bulk runs predictions synchronously (all I/O queued before return)."""
         prefetcher, _, _, hidden, _, num_layers = prefetch_setup
         x = mx.random.normal((1, hidden)).astype(mx.float16)
 
-        original_predict = prefetcher._predict
-
-        def slow_predict(*args, **kwargs):
-            time.sleep(0.2)
-            return original_predict(*args, **kwargs)
-
         layer_states = {i: x for i in range(num_layers)}
-        with patch.object(prefetcher, "_predict", side_effect=slow_predict):
-            start = time.monotonic()
-            prefetcher.submit_bulk(layer_states)
-            elapsed = time.monotonic() - start
+        prefetcher.submit_bulk(layer_states)
 
-        assert elapsed < 0.1, (
-            f"submit_bulk() took {elapsed:.3f}s, should return immediately"
-        )
-        # Wait for background to finish
+        # All I/O should be queued already — wait() should not hang
+        for i in range(num_layers):
+            prefetcher.wait(i)
         prefetcher.close()
+
+        assert prefetcher.stats.submitted >= 1
 
     def test_prediction_failure_no_hang(self, prefetch_setup):
         """If prediction raises, wait() should not hang."""
@@ -423,12 +412,17 @@ class TestAsyncPrediction:
         prefetcher, _, _, hidden, _, _ = prefetch_setup
         x = mx.random.normal((1, hidden)).astype(mx.float16)
 
-        with patch.object(
-            prefetcher, "_predict", side_effect=RuntimeError("prediction boom")
-        ):
-            prefetcher.submit(0, x)
+        entered = threading.Event()
 
-        # wait() should return promptly (no event was created)
+        def failing_predict(*args, **kwargs):
+            entered.set()
+            raise RuntimeError("prediction boom")
+
+        with patch.object(prefetcher, "_predict", side_effect=failing_predict):
+            prefetcher.submit(0, x)
+            entered.wait(timeout=2.0)  # ensure mock ran before patch is restored
+
+        # wait() should return promptly (done was set by error handler)
         completed = threading.Event()
 
         def _wait():
