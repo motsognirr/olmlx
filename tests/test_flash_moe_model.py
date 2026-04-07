@@ -264,6 +264,17 @@ class TestFlashMoeModelWrapper:
         with pytest.raises(NotImplementedError, match="distributed tensor parallelism"):
             _FlashMoEBase(_FakeMoE(), flash_moe=None)
 
+    def test_base_class_route_not_implemented(self):
+        """_FlashMoEBase.__call__ should raise when _route is not overridden."""
+        from olmlx.engine.flash.flash_moe_model import _FlashMoEBase
+
+        class _FakeMoE:
+            sharding_group = None
+
+        base = _FlashMoEBase(_FakeMoE(), flash_moe=None)
+        with pytest.raises(NotImplementedError):
+            base(mx.zeros((1, 1, 8)))
+
     def test_subclasses_inherit_base(self, model_and_store):
         """All Flash-MoE replacement classes should inherit _FlashMoEBase."""
         model, store, hidden, inter, experts, num_experts_per_tok = model_and_store

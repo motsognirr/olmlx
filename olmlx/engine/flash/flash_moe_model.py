@@ -40,7 +40,7 @@ class _FlashMoEBase(nn.Module):
         raise NotImplementedError
 
     def _combine(self, x: mx.array, y: mx.array) -> mx.array:
-        """Combine expert output with input (e.g. add shared experts)."""
+        """Combine expert output with input. Default: returns expert output unchanged."""
         return y
 
     def __call__(self, x):
@@ -113,7 +113,7 @@ class _FlashMoEQwen3Next(_FlashMoEBase):
         scores = mx.take_along_axis(scores, inds, axis=-1)
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
-        return inds, scores
+        return inds, scores.astype(x.dtype)
 
     def _combine(self, x, y):
         shared_y = self.shared_expert(x)
