@@ -58,14 +58,14 @@ class _FlashMoEDeepSeek(_FlashMoEBase):
     def __init__(self, original_moe, flash_moe: FlashMoE):
         super().__init__(original_moe, flash_moe)
         self.gate = original_moe.gate
-        self._shared_experts = getattr(original_moe, "shared_experts", None)
+        self.shared_experts = getattr(original_moe, "shared_experts", None)
 
     def _route(self, x):
         return self.gate(x)
 
     def _combine(self, x, y):
-        if self._shared_experts is not None:
-            return y + self._shared_experts(x)
+        if self.shared_experts is not None:
+            return y + self.shared_experts(x)
         return y
 
 
@@ -133,7 +133,7 @@ class _FlashMoEMiniMax(_FlashMoEBase):
         self.gate = original_moe.gate
         self.num_experts_per_tok = original_moe.num_experts_per_tok
         self.e_score_correction_bias = original_moe.e_score_correction_bias
-        self._shared_experts = getattr(original_moe, "shared_experts", None)
+        self.shared_experts = getattr(original_moe, "shared_experts", None)
 
     def _route(self, x):
         gates = self.gate(x.astype(mx.float32))
@@ -149,8 +149,8 @@ class _FlashMoEMiniMax(_FlashMoEBase):
         return inds, scores
 
     def _combine(self, x, y):
-        if self._shared_experts is not None:
-            return y + self._shared_experts(x)
+        if self.shared_experts is not None:
+            return y + self.shared_experts(x)
         return y
 
 
