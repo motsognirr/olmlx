@@ -190,7 +190,20 @@ def worker_main() -> None:
     sideband_port = int(
         os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT", "32400")
     )
-    secret = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET", "") or None
+
+    secret_file = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET_FILE")
+    if secret_file:
+        from pathlib import Path
+
+        secret_path = Path(secret_file).expanduser()
+        try:
+            secret = secret_path.read_text().strip()
+            secret_path.unlink()
+        except OSError as e:
+            logger.error("Failed to read secret from %s: %s", secret_file, e)
+            sys.exit(1)
+    else:
+        secret = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET", "") or None
 
     # Initialize MLX distributed
     backend = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND", "ring")

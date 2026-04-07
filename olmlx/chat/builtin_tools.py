@@ -2,14 +2,19 @@
 
 import asyncio
 import glob as glob_module
-import html.parser
+import http.client
+import ipaddress
 import logging
 import os
 import signal
+import socket
+import ssl
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+import urllib.error
+from html.parser import HTMLParser
 from pathlib import Path
+from typing import Callable
 
 from olmlx.chat.config import ChatConfig
 
@@ -37,7 +42,7 @@ def _web_search_impl(query: str, max_results: int = 5) -> list[dict]:
         return list(ddgs.text(query, max_results=max_results))
 
 
-class _HTMLTextExtractor(html.parser.HTMLParser):
+class _HTMLTextExtractor(HTMLParser):
     """Extract visible text from HTML, stripping tags."""
 
     def __init__(self):
@@ -68,17 +73,56 @@ def _strip_html(text: str) -> str:
     return parser.get_text()
 
 
+def _resolve_path(path: str, base_dir: Path | None = None) -> Path:
+    """Resolve and validate path to prevent path traversal attacks.
+
+    Handles both relative and absolute paths. For absolute paths, returns
+    resolved directly. For relative paths, resolves relative to base_dir
+    (defaults to cwd) and prevents traversal via '..'.
+
+    Args:
+        path: User-provided file path (absolute or relative)
+        base_dir: Allowed base directory for relative paths (defaults to cwd)
+
+    Returns:
+        Resolved absolute Path
+
+    Raises:
+        ValueError: If path attempts to escape base_dir via traversal
+    """
+    input_path = Path(path).expanduser()
+
+    if input_path.is_absolute():
+        return input_path.resolve()
+
+    if base_dir is None:
+        base_dir = Path.cwd()
+    base_dir = base_dir.resolve()
+
+    resolved = (base_dir / path).resolve()
+
+    try:
+        resolved.relative_to(base_dir)
+    except ValueError:
+        raise ValueError(f"Path {path!r} is outside allowed directory {base_dir}")
+    return resolved
+
+
 # -- Tool handler functions --
 
 
 async def _handle_read_file(args: dict) -> str:
     path = args.get("path", "")
+    try:
+        safe_path = _resolve_path(path)
+    except ValueError as exc:
+        return f"Error: {exc}"
     offset = args.get("offset", 1)
     limit = args.get("limit")
     start = max(offset - 1, 0)
 
     def _read() -> list[str]:
-        with open(path, errors="replace") as f:
+        with open(safe_path, errors="replace") as f:
             # Check file size after opening to avoid TOCTOU
             f.seek(0, 2)
             size = f.tell()
@@ -114,35 +158,45 @@ async def _handle_read_file(args: dict) -> str:
 
 
 async def _handle_write_file(args: dict) -> str:
-    path = Path(args.get("path", ""))
+    path = args.get("path", "")
     content = args.get("content", "")
 
+    try:
+        safe_path = _resolve_path(path)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
     def _write():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        safe_path.parent.mkdir(parents=True, exist_ok=True)
+        safe_path.write_text(content, encoding="utf-8")
 
     try:
         await asyncio.to_thread(_write)
     except OSError as exc:
         return f"Error writing file: {exc}"
 
-    return f"Wrote {len(content.encode())} bytes to {path}"
+    return f"Wrote {len(content.encode())} bytes to {safe_path}"
 
 
 async def _handle_edit_file(args: dict) -> str:
-    path = Path(args.get("path", ""))
+    path = args.get("path", "")
     old_text = args.get("old_text", "")
     new_text = args.get("new_text", "")
 
+    try:
+        safe_path = _resolve_path(path)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
     def _edit() -> str:
-        content = path.read_text(encoding="utf-8", errors="replace")
+        content = safe_path.read_text(encoding="utf-8", errors="replace")
         count = content.count(old_text)
         if count == 0:
             return "Error: old_text not found in file."
         if count > 1:
             return f"Error: old_text found {count} times (multiple matches). Provide more context to make it unique."
         new_content = content.replace(old_text, new_text, 1)
-        path.write_text(new_content, encoding="utf-8")
+        safe_path.write_text(new_content, encoding="utf-8")
         return "Applied edit successfully."
 
     try:
@@ -334,33 +388,91 @@ async def _handle_read_plan(args: dict, plans_dir: Path) -> str:
         return f"Error reading plan: {exc}"
 
 
+def _is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv4Address):
+        return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_site_local
+    )
+
+
 async def _handle_web_fetch(args: dict) -> str:
     url = args.get("url", "")
-    # NOTE: Scheme check does not prevent SSRF to link-local/loopback via DNS.
-    # Acceptable for single-user local chat; revisit before any multi-user deployment.
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return f"Error: unsupported URL scheme {parsed.scheme!r}. Only http and https are allowed."
 
-    # Cap raw read to avoid unbounded memory use
-    max_read = _WEB_FETCH_MAX_CHARS * 10
+    if not parsed.hostname:
+        return "Error: invalid URL: missing hostname."
+
+    class _SafeHTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            super().connect()
+            sock_ip = self.sock.getpeername()[0]
+            try:
+                addr = ipaddress.ip_address(sock_ip)
+            except ValueError:
+                raise urllib.error.URLError(f"Invalid IP address: {sock_ip}")
+            if _is_private_ip(addr):
+                raise urllib.error.URLError(
+                    f"Connection to private IP {sock_ip} blocked"
+                )
+
+    class _SafeHTTPSConnection(_SafeHTTPConnection, http.client.HTTPSConnection):
+        pass
+
+    class _SafeHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req, *args, **kwargs):
+            return self.do_open(_SafeHTTPConnection, req, *args, **kwargs)
+
+    class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req, *args, **kwargs):
+            ctx = ssl.create_default_context()
+            return self.do_open(
+                lambda host, **kw: _SafeHTTPSConnection(host, context=ctx, **kw),
+                req,
+                *args,
+                **kwargs,
+            )
 
     class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-        """Block redirects to non-HTTP(S) URLs to prevent SSRF."""
-
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             p = urllib.parse.urlparse(newurl)
             if p.scheme not in ("http", "https"):
                 raise urllib.error.URLError(
                     f"Redirect to non-HTTP(S) URL blocked: {newurl}"
                 )
+            if p.hostname:
+                try:
+                    results = socket.getaddrinfo(
+                        p.hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+                    )
+                    for family, _, _, _, sockaddr in results:
+                        ip = sockaddr[0]
+                        addr = ipaddress.ip_address(ip)
+                        if _is_private_ip(addr):
+                            raise urllib.error.URLError(
+                                f"Redirect to private IP blocked: {ip}"
+                            )
+                except socket.gaierror as exc:
+                    raise urllib.error.URLError(
+                        f"Failed to resolve redirect hostname {p.hostname}: {exc}"
+                    )
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
     def _fetch() -> str:
-        opener = urllib.request.build_opener(_SafeRedirectHandler)
+        opener = urllib.request.build_opener(
+            _SafeHTTPHandler, _SafeHTTPSHandler, _SafeRedirectHandler
+        )
         with opener.open(url, timeout=30) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
-            return resp.read(max_read).decode(charset, errors="replace")
+            return resp.read(_WEB_FETCH_MAX_CHARS * 10).decode(
+                charset, errors="replace"
+            )
 
     try:
         raw = await asyncio.to_thread(_fetch)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -12,6 +13,22 @@ if TYPE_CHECKING:
     from olmlx.chat.tool_safety import ToolSafetyConfig
 
 logger = logging.getLogger(__name__)
+
+_BLOCKED_ENV_VARS = {
+    "PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "PYTHONPATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "DYLD_IMAGE_SUFFIX",
+    "DYLD_FORCE_FLAT_NAMESPACE",
+    "SYSTEMROOT",
+    "WINDIR",
+}
 
 
 @dataclass
@@ -80,6 +97,39 @@ def load_mcp_config(path: Path) -> dict:
             logger.debug("Skipping MCP server %r: no 'command' or 'url'", name)
 
     return result
+
+
+def sanitize_mcp_env(user_env: dict[str, str] | None) -> dict[str, str] | None:
+    """Sanitize environment variables for MCP server processes.
+
+    Starts with full parent environment, removes blocked dangerous variables
+    (PATH, LD_PRELOAD, etc.) from user-provided overrides only. Returns None
+    when no user_env is provided to preserve inherited environment.
+
+    Args:
+        user_env: User-provided environment dict from MCP config
+
+    Returns:
+        Sanitized environment dict safe for subprocess execution, or None
+        to inherit parent environment unchanged.
+    """
+    if user_env is None:
+        return None
+
+    allowed_env = os.environ.copy()
+
+    allowed_env.update(
+        {k: v for k, v in user_env.items() if k not in _BLOCKED_ENV_VARS}
+    )
+
+    blocked_found = [k for k in user_env if k in _BLOCKED_ENV_VARS]
+    if blocked_found:
+        logger.warning(
+            "Blocked dangerous environment variables in MCP config: %s",
+            ", ".join(blocked_found),
+        )
+
+    return allowed_env
 
 
 def load_tool_safety_config(path: Path) -> ToolSafetyConfig:
