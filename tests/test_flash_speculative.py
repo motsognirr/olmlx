@@ -332,14 +332,13 @@ class TestSpeculativeKVCache:
             assert decoder._last_target_logit is not None
             assert decoder._last_target_logit.shape == (vocab_size,)
 
-    def test_step_works_when_trim_prompt_cache_is_none(self):
-        """step() should not crash when trim_prompt_cache is None (import fallback)."""
+    def test_prefill_raises_when_trim_prompt_cache_is_none(self):
+        """prefill() should raise early when trim_prompt_cache is None."""
         import olmlx.engine.flash.speculative as spec_mod
 
         vocab_size, hidden_size = 32, 16
         draft = MockDraftModel(vocab_size, hidden_size)
         target = MockTargetModel(vocab_size, hidden_size)
-        # Different weights → likely rejection → triggers trim path
         decoder = SpeculativeFlashDecoder(
             draft_model=draft,
             target_model=target,
@@ -347,16 +346,12 @@ class TestSpeculativeKVCache:
         )
 
         prompt = mx.array([[1, 2, 3]])
-        decoder.prefill(prompt)
 
-        # Simulate the import fallback: trim_prompt_cache = None
         original = spec_mod.trim_prompt_cache
         try:
             spec_mod.trim_prompt_cache = None
-            # This should NOT raise TypeError
-            accepted, num_draft = decoder.step()
-            assert len(accepted) >= 1
-            assert num_draft == 3
+            with pytest.raises(RuntimeError, match="mlx_lm.models.cache not available"):
+                decoder.prefill(prompt)
         finally:
             spec_mod.trim_prompt_cache = original
 

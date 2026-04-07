@@ -115,6 +115,18 @@ MAX_SHARD_CACHE_SIZE = 3
 _shard_cache: dict[str, dict] = {}
 
 
+def _cache_shard(sf_path: str) -> dict:
+    """Load a shard into the bounded cache, evicting oldest if full."""
+    import mlx.core as mx
+
+    if sf_path not in _shard_cache:
+        while len(_shard_cache) >= MAX_SHARD_CACHE_SIZE:
+            oldest = next(iter(_shard_cache))
+            del _shard_cache[oldest]
+        _shard_cache[sf_path] = mx.load(sf_path)
+    return _shard_cache[sf_path]
+
+
 def _load_tensor(model_dir: Path, name: str, index: dict | None) -> np.ndarray:
     """Load a single tensor from safetensors, handling sharded models.
 
@@ -133,13 +145,7 @@ def _load_tensor(model_dir: Path, name: str, index: dict | None) -> np.ndarray:
     else:
         sf_path = str(model_dir / "model.safetensors")
 
-    if sf_path not in _shard_cache:
-        # Evict oldest entries if cache is full
-        while len(_shard_cache) >= MAX_SHARD_CACHE_SIZE:
-            oldest = next(iter(_shard_cache))
-            del _shard_cache[oldest]
-        _shard_cache[sf_path] = mx.load(sf_path)
-    tensors = _shard_cache[sf_path]
+    tensors = _cache_shard(sf_path)
 
     if name not in tensors:
         raise KeyError(f"Tensor {name!r} not found in {sf_path}")
@@ -229,14 +235,9 @@ def _detect_expert_format(
             return result
 
     # No index — scan single safetensors file keys
-    import mlx.core as mx
-
     sf_path = model_dir / "model.safetensors"
     if sf_path.exists():
-        sf_key = str(sf_path)
-        if sf_key not in _shard_cache:
-            _shard_cache[sf_key] = mx.load(sf_key)
-        tensors = _shard_cache[sf_key]
+        tensors = _cache_shard(str(sf_path))
         result = _probe(lambda n: n in tensors)
         if result:
             return result
