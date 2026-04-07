@@ -308,7 +308,7 @@ def _emit_content_block(
 
 async def _stream_buffered_with_tools(result, declared_tools=None):
     """Buffer full output, parse tools, yield SSE strings. Yields a final dict with metadata."""
-    full_text = ""
+    text_chunks: list[str] = []
     raw_text = ""
     output_tokens = 0
 
@@ -326,7 +326,9 @@ async def _stream_buffered_with_tools(result, declared_tools=None):
             # For gpt-oss channel format, raw_text is in the done chunk
             raw_text = chunk.get("raw_text", "")
             break
-        full_text += chunk.get("text", "")
+        text_chunks.append(chunk.get("text", ""))
+
+    full_text = "".join(text_chunks)
 
     if raw_text:
         logger.info(

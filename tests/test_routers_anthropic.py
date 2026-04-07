@@ -2106,3 +2106,39 @@ class TestResolveToolNames:
         assert uses[0]["name"] == "Bash"
         assert uses[1]["name"] == "Read"
         assert uses[2]["name"] == "Glob"
+
+
+class TestStreamBufferedWithTools:
+    """Tests for _stream_buffered_with_tools text accumulation."""
+
+    @pytest.mark.asyncio
+    async def test_many_chunks_accumulated_correctly(self):
+        """500+ chunks should be accumulated into correct full_text."""
+        from olmlx.routers.anthropic import _stream_buffered_with_tools
+
+        words = [f"word{i} " for i in range(500)]
+
+        async def fake_result():
+            for word in words:
+                yield {"text": word}
+            yield {"done": True, "stats": MagicMock(eval_count=500)}
+
+        events = []
+        async for event in _stream_buffered_with_tools(fake_result()):
+            events.append(event)
+
+        # Find the text content block events and reconstruct
+        text_deltas = []
+        for event in events:
+            if isinstance(event, str) and '"text_delta"' in event:
+                # Parse SSE event to extract text
+                for line in event.split("\n"):
+                    if line.startswith("data: "):
+                        data = json.loads(line[6:])
+                        if data.get("type") == "content_block_delta":
+                            text_deltas.append(data["delta"]["text"])
+
+        full_text = "".join(text_deltas)
+        expected = "".join(words)
+        # parse_model_output may strip trailing whitespace; check content is preserved
+        assert full_text == expected or full_text == expected.strip()

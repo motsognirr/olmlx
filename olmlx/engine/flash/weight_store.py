@@ -298,17 +298,17 @@ class FlashWeightStore:
     @staticmethod
     def _full_pread(fd: int, size: int, offset: int) -> bytes:
         """Read exactly *size* bytes via pread, retrying on short reads."""
-        buf = b""
+        buf = bytearray()
         pos = offset
         remaining = size
         while remaining > 0:
             chunk = os.pread(fd, remaining, pos)
             if not chunk:
                 raise OSError(f"Unexpected EOF: wanted {size} bytes at offset {offset}")
-            buf += chunk
+            buf.extend(chunk)
             pos += len(chunk)
             remaining -= len(chunk)
-        return buf
+        return bytes(buf)
 
     def _read_neuron_raw(
         self, layer_idx: int, neuron_idx: int
