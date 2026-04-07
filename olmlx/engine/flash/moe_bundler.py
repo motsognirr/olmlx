@@ -120,10 +120,10 @@ def _cache_shard(sf_path: str) -> dict:
     import mlx.core as mx
 
     if sf_path not in _shard_cache:
+        data = mx.load(sf_path)
         while len(_shard_cache) >= MAX_SHARD_CACHE_SIZE:
-            oldest = next(iter(_shard_cache))
-            del _shard_cache[oldest]
-        _shard_cache[sf_path] = mx.load(sf_path)
+            del _shard_cache[next(iter(_shard_cache))]
+        _shard_cache[sf_path] = data
     return _shard_cache[sf_path]
 
 
