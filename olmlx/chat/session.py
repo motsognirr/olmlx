@@ -119,6 +119,182 @@ class ChatSession:
                 },
             }
 
+    def _prepare_tools(self) -> list[dict] | None:
+        """Merge MCP, builtin, and skill tool definitions."""
+        tools = None
+        if self.mcp is not None:
+            tools = self.mcp.get_tools_for_chat() or None
+
+        # Merge built-in tool definitions, skipping collisions with MCP tools
+        if self.builtin:
+            builtin_defs = self.builtin.get_tool_definitions()
+            if tools:
+                mcp_names = {t["function"]["name"] for t in tools}
+                filtered = []
+                for d in builtin_defs:
+                    n = d["function"]["name"]
+                    if n in mcp_names:
+                        logger.warning(
+                            "Built-in tool %r skipped: MCP tool with same name takes precedence",
+                            n,
+                        )
+                    else:
+                        filtered.append(d)
+                builtin_defs = filtered
+            tools = (tools or []) + builtin_defs
+
+        # Merge skill tool into the tools list
+        skill_tool = self.skills.get_tool_definition() if self.skills else None
+        if skill_tool:
+            tools = (tools or []) + [skill_tool]
+
+        return tools
+
+    async def _execute_tool_calls(
+        self, tool_uses: list[dict]
+    ) -> AsyncGenerator[dict, None]:
+        """Classify, confirm, and execute tool calls. Yields event dicts.
+
+        Appends tool result messages to self.messages in original call order.
+        Raises the first tool execution exception after all events are yielded.
+        """
+        # Classify tools by safety policy.
+        # Local tools (skills, builtins) bypass the safety policy.
+        local_tools = []
+        remote_tools = []
+        for tu in tool_uses:
+            if tu["name"] == "use_skill" and self.skills:
+                local_tools.append(tu)
+            elif self.builtin and tu["name"] in self.builtin.tool_names:
+                local_tools.append(tu)
+            else:
+                remote_tools.append(tu)
+
+        if self.tool_safety:
+            allow, confirm, deny = self.tool_safety.classify_batch(remote_tools)
+            allow = local_tools + allow
+        else:
+            allow, confirm, deny = local_tools + remote_tools, [], []
+
+        # Collect results by tool_call_id for call-order output.
+        results_by_id: dict[str, dict] = {}
+
+        # Handle denied tools
+        for tu in deny:
+            yield {
+                "type": "tool_denied",
+                "name": tu["name"],
+                "arguments": tu["input"],
+                "id": tu["id"],
+                "reason": "policy",
+            }
+            results_by_id[tu["id"]] = {
+                "message": {
+                    "role": "tool",
+                    "tool_call_id": tu["id"],
+                    "name": tu["name"],
+                    "content": f"Tool '{tu['name']}' is blocked by safety policy",
+                },
+            }
+
+        # Prompt for confirmation on confirm tools
+        approved = []
+        for tu in confirm:
+            yield {
+                "type": "tool_confirmation_needed",
+                "name": tu["name"],
+                "arguments": tu["input"],
+                "id": tu["id"],
+            }
+            if await self.tool_safety.check_and_confirm(tu["name"], tu["input"]):
+                approved.append(tu)
+                yield {
+                    "type": "tool_approved",
+                    "name": tu["name"],
+                    "id": tu["id"],
+                }
+            else:
+                yield {
+                    "type": "tool_denied",
+                    "name": tu["name"],
+                    "arguments": tu["input"],
+                    "id": tu["id"],
+                    "reason": "user",
+                }
+                results_by_id[tu["id"]] = {
+                    "message": {
+                        "role": "tool",
+                        "tool_call_id": tu["id"],
+                        "name": tu["name"],
+                        "content": f"Tool '{tu['name']}' was not approved",
+                    },
+                }
+
+        # Execute allowed + approved tools concurrently
+        to_execute = allow + approved
+        deferred_exc = None
+        if to_execute:
+            exec_results = await asyncio.gather(
+                *(self._exec_tool(tu) for tu in to_execute),
+                return_exceptions=True,
+            )
+            for tu, r in zip(to_execute, exec_results):
+                if isinstance(r, BaseException):
+                    if deferred_exc is None:
+                        deferred_exc = r
+                    name = tu["name"]
+                    error_content = f"Error calling {name}: {r}"
+                    yield {
+                        "type": "tool_call",
+                        "name": name,
+                        "arguments": tu["input"],
+                        "id": tu["id"],
+                    }
+                    yield {
+                        "type": "tool_error",
+                        "name": name,
+                        "error": str(r),
+                        "id": tu["id"],
+                    }
+                    results_by_id[tu["id"]] = {
+                        "message": {
+                            "role": "tool",
+                            "tool_call_id": tu["id"],
+                            "name": name,
+                            "content": error_content,
+                        },
+                    }
+                else:
+                    yield r["call_event"]
+                    yield r["result_event"]
+                    results_by_id[r["message"]["tool_call_id"]] = r
+
+        # Append messages in original call order
+        for tu in tool_uses:
+            r = results_by_id.get(tu["id"])
+            if r:
+                self.messages.append(r["message"])
+            else:
+                error_detail = "no result received"
+                error_content = f"Error calling {tu['name']}: {error_detail}"
+                yield {
+                    "type": "tool_error",
+                    "name": tu["name"],
+                    "error": error_detail,
+                    "id": tu["id"],
+                }
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tu["id"],
+                        "name": tu["name"],
+                        "content": error_content,
+                    }
+                )
+
+        if deferred_exc is not None:
+            raise deferred_exc
+
     async def send_message(self, user_text: str) -> AsyncGenerator[dict, None]:
         """Send a user message and run the agent loop.
 
@@ -135,32 +311,7 @@ class ChatSession:
         """
         self.messages.append({"role": "user", "content": user_text})
 
-        mcp_tools = None
-        if self.mcp is not None:
-            mcp_tools = self.mcp.get_tools_for_chat() or None
-
-        # Merge built-in tool definitions, skipping collisions with MCP tools
-        if self.builtin:
-            builtin_defs = self.builtin.get_tool_definitions()
-            if mcp_tools:
-                mcp_names = {t["function"]["name"] for t in mcp_tools}
-                filtered = []
-                for d in builtin_defs:
-                    n = d["function"]["name"]
-                    if n in mcp_names:
-                        logger.warning(
-                            "Built-in tool %r skipped: MCP tool with same name takes precedence",
-                            n,
-                        )
-                    else:
-                        filtered.append(d)
-                builtin_defs = filtered
-            mcp_tools = (mcp_tools or []) + builtin_defs
-
-        # Merge skill tool into the tools list
-        skill_tool = self.skills.get_tool_definition() if self.skills else None
-        if skill_tool:
-            mcp_tools = (mcp_tools or []) + [skill_tool]
+        mcp_tools = self._prepare_tools()
 
         options = {
             "repeat_penalty": self.config.repeat_penalty,
@@ -343,150 +494,8 @@ class ChatSession:
             if not tool_uses or repetition_stopped:
                 break
 
-            # Classify tools by safety policy.
-            # Local tools (skills, builtins) bypass the safety policy
-            # because they run in-process and were already trusted by
-            # the user when configured. Note: tool names come from model
-            # output (not MCP directly), so a prompt injection could
-            # cause the model to emit a local tool name — but local
-            # tools are no more dangerous than the model calling them
-            # without the safety layer.
-            local_tools = []
-            remote_tools = []
-            for tu in tool_uses:
-                if tu["name"] == "use_skill" and self.skills:
-                    local_tools.append(tu)
-                elif self.builtin and tu["name"] in self.builtin.tool_names:
-                    local_tools.append(tu)
-                else:
-                    remote_tools.append(tu)
-
-            if self.tool_safety:
-                allow, confirm, deny = self.tool_safety.classify_batch(remote_tools)
-                allow = local_tools + allow
-            else:
-                allow, confirm, deny = local_tools + remote_tools, [], []
-
-            # Collect results by tool_call_id for call-order output.
-            # Events are yielded immediately (deny/confirm prompts),
-            # but messages are buffered and appended in call order.
-            results_by_id: dict[str, dict] = {}
-
-            # Handle denied tools
-            for tu in deny:
-                yield {
-                    "type": "tool_denied",
-                    "name": tu["name"],
-                    "arguments": tu["input"],
-                    "id": tu["id"],
-                    "reason": "policy",
-                }
-                results_by_id[tu["id"]] = {
-                    "message": {
-                        "role": "tool",
-                        "tool_call_id": tu["id"],
-                        "name": tu["name"],
-                        "content": f"Tool '{tu['name']}' is blocked by safety policy",
-                    },
-                }
-
-            # Prompt for confirmation on confirm tools
-            approved = []
-            for tu in confirm:
-                yield {
-                    "type": "tool_confirmation_needed",
-                    "name": tu["name"],
-                    "arguments": tu["input"],
-                    "id": tu["id"],
-                }
-                if await self.tool_safety.check_and_confirm(tu["name"], tu["input"]):
-                    approved.append(tu)
-                    yield {
-                        "type": "tool_approved",
-                        "name": tu["name"],
-                        "id": tu["id"],
-                    }
-                else:
-                    yield {
-                        "type": "tool_denied",
-                        "name": tu["name"],
-                        "arguments": tu["input"],
-                        "id": tu["id"],
-                        "reason": "user",
-                    }
-                    results_by_id[tu["id"]] = {
-                        "message": {
-                            "role": "tool",
-                            "tool_call_id": tu["id"],
-                            "name": tu["name"],
-                            "content": f"Tool '{tu['name']}' was not approved",
-                        },
-                    }
-
-            # Execute allowed + approved tools concurrently
-            to_execute = allow + approved
-            deferred_exc = None
-            if to_execute:
-                exec_results = await asyncio.gather(
-                    *(self._exec_tool(tu) for tu in to_execute),
-                    return_exceptions=True,
-                )
-                for tu, r in zip(to_execute, exec_results):
-                    if isinstance(r, BaseException):
-                        if deferred_exc is None:
-                            deferred_exc = r
-                        name = tu["name"]
-                        error_content = f"Error calling {name}: {r}"
-                        yield {
-                            "type": "tool_call",
-                            "name": name,
-                            "arguments": tu["input"],
-                            "id": tu["id"],
-                        }
-                        yield {
-                            "type": "tool_error",
-                            "name": name,
-                            "error": str(r),
-                            "id": tu["id"],
-                        }
-                        results_by_id[tu["id"]] = {
-                            "message": {
-                                "role": "tool",
-                                "tool_call_id": tu["id"],
-                                "name": name,
-                                "content": error_content,
-                            },
-                        }
-                    else:
-                        yield r["call_event"]
-                        yield r["result_event"]
-                        results_by_id[r["message"]["tool_call_id"]] = r
-
-            # Append messages in original call order
-            for tu in tool_uses:
-                r = results_by_id.get(tu["id"])
-                if r:
-                    self.messages.append(r["message"])
-                else:
-                    error_detail = "no result received"
-                    error_content = f"Error calling {tu['name']}: {error_detail}"
-                    yield {
-                        "type": "tool_error",
-                        "name": tu["name"],
-                        "error": error_detail,
-                        "id": tu["id"],
-                    }
-                    self.messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tu["id"],
-                            "name": tu["name"],
-                            "content": error_content,
-                        }
-                    )
-
-            if deferred_exc is not None:
-                raise deferred_exc
+            async for event in self._execute_tool_calls(tool_uses):
+                yield event
         else:
             # max_turns reached
             yield {"type": "max_turns_exceeded"}

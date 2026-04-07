@@ -2142,3 +2142,89 @@ class TestStreamBufferedWithTools:
         expected = "".join(words)
         # parse_model_output may strip trailing whitespace; check content is preserved
         assert full_text == expected or full_text == expected.strip()
+
+
+class TestFlushThinkingBuffer:
+    """Tests for _flush_thinking_buffer extracted from _stream_thinking_state_machine."""
+
+    def test_flush_from_thinking_state_with_buffer(self):
+        from olmlx.routers.anthropic import _flush_thinking_buffer
+
+        events, new_idx = _flush_thinking_buffer(
+            state="thinking",
+            buffer="remaining thought",
+            block_idx=0,
+            text_block_started=False,
+        )
+        # Should emit: thinking delta, thinking stop, empty text start+stop
+        assert len(events) == 4
+        assert '"thinking_delta"' in events[0]
+        assert "remaining thought" in events[0]
+        assert '"content_block_stop"' in events[1]
+        assert '"content_block_start"' in events[2]
+        assert '"type": "text"' in events[2]
+        assert '"content_block_stop"' in events[3]
+        assert new_idx == 1  # thinking block 0, text block 1
+
+    def test_flush_from_thinking_state_empty_buffer(self):
+        from olmlx.routers.anthropic import _flush_thinking_buffer
+
+        events, new_idx = _flush_thinking_buffer(
+            state="thinking", buffer="", block_idx=0, text_block_started=False
+        )
+        # Should emit: thinking stop (no delta), empty text start+stop
+        assert len(events) == 3
+        assert '"content_block_stop"' in events[0]
+        assert '"content_block_start"' in events[1]
+        assert '"content_block_stop"' in events[2]
+        assert new_idx == 1
+
+    def test_flush_text_block_started(self):
+        from olmlx.routers.anthropic import _flush_thinking_buffer
+
+        events, new_idx = _flush_thinking_buffer(
+            state="text", buffer="", block_idx=1, text_block_started=True
+        )
+        # Should emit: content_block_stop only
+        assert len(events) == 1
+        assert '"content_block_stop"' in events[0]
+        assert new_idx == 1  # unchanged
+
+    def test_flush_text_not_started_with_buffer(self):
+        from olmlx.routers.anthropic import _flush_thinking_buffer
+
+        events, new_idx = _flush_thinking_buffer(
+            state="text", buffer="leftover text", block_idx=1, text_block_started=False
+        )
+        # Should emit: text start, text delta, text stop
+        assert len(events) == 3
+        assert '"content_block_start"' in events[0]
+        assert '"text_delta"' in events[1]
+        assert "leftover text" in events[1]
+        assert '"content_block_stop"' in events[2]
+        assert new_idx == 1
+
+    def test_flush_text_not_started_empty_buffer(self):
+        from olmlx.routers.anthropic import _flush_thinking_buffer
+
+        events, new_idx = _flush_thinking_buffer(
+            state="text", buffer="", block_idx=1, text_block_started=False
+        )
+        # Should emit: text start, text stop (no delta)
+        assert len(events) == 2
+        assert '"content_block_start"' in events[0]
+        assert '"content_block_stop"' in events[1]
+        assert new_idx == 1
+
+    def test_flush_init_state(self):
+        from olmlx.routers.anthropic import _flush_thinking_buffer
+
+        events, new_idx = _flush_thinking_buffer(
+            state="init", buffer="", block_idx=0, text_block_started=False
+        )
+        # Should emit: empty text start+stop
+        assert len(events) == 2
+        assert '"content_block_start"' in events[0]
+        assert '"type": "text"' in events[0]
+        assert '"content_block_stop"' in events[1]
+        assert new_idx == 0

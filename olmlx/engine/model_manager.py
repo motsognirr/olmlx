@@ -604,6 +604,33 @@ class ModelManager:
             keep_alive if keep_alive is not None else settings.default_keep_alive
         )
 
+    def _evict_lru_if_needed(self) -> None:
+        """Evict least-recently-used models until below max_loaded_models.
+
+        Must be called while holding self._lock.
+        Raises RuntimeError if all loaded models are in active use.
+        """
+        while len(self._loaded) >= settings.max_loaded_models:
+            evictable = {k: v for k, v in self._loaded.items() if v.active_refs == 0}
+            if not evictable:
+                raise RuntimeError(
+                    "All loaded models are in use, cannot evict to load a new model"
+                )
+            oldest_name = min(evictable, key=lambda k: evictable[k].loaded_at)
+            logger.info("Evicting model %s", oldest_name)
+            evicted = self._loaded.pop(oldest_name)
+            # Release draft model Metal memory promptly
+            evicted.speculative_decoder = None
+            del evicted
+
+        # Flush Metal allocator cache so that buffers from evicted models
+        # don't inflate the mem_before measurement below.  Skip when
+        # any deferred cleanup is pending — a different model's
+        # background thread may still be allocating Metal memory.
+        if not self._pending_cleanups:
+            gc.collect()
+            mx.clear_cache()
+
     async def ensure_loaded(
         self, name: str, keep_alive: str | None = None
     ) -> LoadedModel:
@@ -675,29 +702,7 @@ class ModelManager:
                     global_experimental, model_config.experimental
                 )
 
-                # Evict LRU if at capacity (skip models with active inference)
-                while len(self._loaded) >= settings.max_loaded_models:
-                    evictable = {
-                        k: v for k, v in self._loaded.items() if v.active_refs == 0
-                    }
-                    if not evictable:
-                        raise RuntimeError(
-                            "All loaded models are in use, cannot evict to load a new model"
-                        )
-                    oldest_name = min(evictable, key=lambda k: evictable[k].loaded_at)
-                    logger.info("Evicting model %s", oldest_name)
-                    evicted = self._loaded.pop(oldest_name)
-                    # Release draft model Metal memory promptly
-                    evicted.speculative_decoder = None
-                    del evicted
-
-                # Flush Metal allocator cache so that buffers from evicted models
-                # don't inflate the mem_before measurement below.  Skip when
-                # any deferred cleanup is pending — a different model's
-                # background thread may still be allocating Metal memory.
-                if not self._pending_cleanups:
-                    gc.collect()
-                    mx.clear_cache()
+                self._evict_lru_if_needed()
 
                 logger.info("Loading model %s from %s", normalized, hf_path)
                 mem_before = memory_utils.get_metal_memory()
