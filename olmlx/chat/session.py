@@ -305,6 +305,12 @@ class ChatSession:
                         repetition_stopped = True
                         break
 
+            # If thinking is disabled and the model skipped the thinking block
+            # entirely (no </think> found), flush buffered content as visible.
+            if implicit_mode and close_pos == -1 and not self.config.thinking:
+                if len(accumulated) > visible_emitted:
+                    yield {"type": "token", "text": accumulated[visible_emitted:]}
+
             # Close any open thinking block (unclosed <think> or implicit)
             if in_thinking:
                 yield {"type": "thinking_end"}

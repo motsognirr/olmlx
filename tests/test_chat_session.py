@@ -186,6 +186,27 @@ class TestImplicitThinkingStreaming:
         assert token_text == "The visible answer."
 
     @pytest.mark.asyncio
+    async def test_thinking_disabled_model_skips_thinking(self):
+        """When thinking=False and model outputs no thinking tags, text must be visible."""
+        session = _make_session(thinking=False, template_has_thinking=True)
+
+        async def fake_stream(*args, **kwargs):
+            # Model skips thinking entirely — no <think> or </think>
+            yield {"text": "Direct answer.", "done": False}
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch("olmlx.chat.session.generate_chat", return_value=fake_stream()):
+            events = []
+            async for event in session.send_message("Q"):
+                events.append(event)
+
+        types = [e["type"] for e in events]
+        assert "thinking_start" not in types
+        assert "thinking_token" not in types
+        token_text = "".join(e["text"] for e in events if e["type"] == "token")
+        assert token_text == "Direct answer."
+
+    @pytest.mark.asyncio
     async def test_no_thinking_output_not_duplicated(self):
         """If model skips thinking (no tags), content shown once, not duplicated."""
         session = _make_session(thinking=True, template_has_thinking=True)
