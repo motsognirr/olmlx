@@ -178,10 +178,11 @@ class SpeculativeFlashDecoder:
         trim_target = max(self._lambda + 1 - num_accepted, 0)
         trim_draft = max(self._lambda - num_accepted, 0)
 
-        if trim_target > 0:
-            trim_prompt_cache(self._target_cache, trim_target)
-        if trim_draft > 0:
-            trim_prompt_cache(self._draft_cache, trim_draft)
+        if trim_prompt_cache is not None:
+            if trim_target > 0:
+                trim_prompt_cache(self._target_cache, trim_target)
+            if trim_draft > 0:
+                trim_prompt_cache(self._draft_cache, trim_draft)
 
         # On full acceptance (num_accepted == lambda + 1), the draft cache is at
         # offset + lambda while the target is at offset + lambda + 1.  Feed the
