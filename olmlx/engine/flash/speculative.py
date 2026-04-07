@@ -50,6 +50,11 @@ class SpeculativeFlashDecoder:
         acceptance_rate_ema: float = 0.9,
         prefetcher: Prefetcher | None = None,
     ):
+        if trim_prompt_cache is None:
+            raise RuntimeError(
+                "trim_prompt_cache is unavailable (mlx-lm import missing); "
+                "speculative decoding requires it for correct cache trimming"
+            )
         self._draft = draft_model
         self._target = target_model
         self._lambda = num_speculative_tokens

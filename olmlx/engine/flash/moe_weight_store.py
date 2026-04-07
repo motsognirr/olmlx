@@ -326,6 +326,8 @@ class FlashMoeWeightStore:
         expert_indices: list[int],
     ) -> LoadedExperts:
         """Load expert weights for given indices, using cache and parallel I/O."""
+        if not expert_indices:
+            raise ValueError("expert_indices must not be empty")
         layout = self._layouts[layer_idx]
 
         # Check cache

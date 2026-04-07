@@ -157,6 +157,23 @@ class _FlashMoEMiniMax(nn.Module):
         return y
 
 
+class _FlashMoEGemma4(nn.Module):
+    """Replacement experts module for Gemma4 VLM-style layers.
+
+    In Gemma4 VLM, router and experts are separate attributes on the decoder
+    layer.  The router stays untouched; this replaces ``layer.experts`` and
+    accepts pre-routed ``(x, top_k_indices, top_k_weights)`` directly.
+    """
+
+    def __init__(self, flash_moe: FlashMoE):
+        super().__init__()
+        self._flash_moe = flash_moe
+
+    def __call__(self, x, top_k_indices, top_k_weights):
+        y = self._flash_moe(x, top_k_indices, top_k_weights)
+        return y.astype(x.dtype)
+
+
 class FlashMoeModelWrapper(nn.Module):
     """Wraps an mlx-lm model for Flash-MoE inference.
 
@@ -210,9 +227,19 @@ class FlashMoeModelWrapper(nn.Module):
 def _find_moe_module(layer: nn.Module) -> tuple[str, nn.Module]:
     """Find the MoE module on a decoder layer.
 
-    Returns (attr_name, module) — the attribute may be 'mlp' (DeepSeek,
-    Qwen3-Next, gpt-oss) or 'block_sparse_moe' (MiniMax).
+    Returns (attr_name, module) — the attribute may be 'experts' (Gemma4 VLM,
+    where router + experts live directly on the layer), 'mlp' (DeepSeek,
+    Qwen3-Next, gpt-oss), or 'block_sparse_moe' (MiniMax).
     """
+    # Gemma4 VLM: router + experts are on the layer, mlp is a separate dense path
+    experts = getattr(layer, "experts", None)
+    if (
+        experts is not None
+        and getattr(layer, "router", None) is not None
+        and getattr(experts, "switch_glu", None) is not None
+    ):
+        return "experts", experts
+
     for attr in ("mlp", "block_sparse_moe", "mixer"):
         mod = getattr(layer, attr, None)
         if mod is not None:
@@ -241,11 +268,16 @@ def _replace_moe_layers(
 
         # Extract activation function from the original SwitchGLU before we delete it
         activation = None
-        for attr in ("switch_mlp", "experts"):
-            switch = getattr(moe_module, attr, None)
-            if switch is not None and hasattr(switch, "activation"):
-                activation = switch.activation
-                break
+        # For Gemma4 VLM, moe_module is the Experts wrapper itself
+        switch_glu = getattr(moe_module, "switch_glu", None)
+        if switch_glu is not None and hasattr(switch_glu, "activation"):
+            activation = switch_glu.activation
+        else:
+            for attr in ("switch_mlp", "experts"):
+                switch = getattr(moe_module, attr, None)
+                if switch is not None and hasattr(switch, "activation"):
+                    activation = switch.activation
+                    break
 
         # Create FlashMoE for this layer
         flash_moe = FlashMoE(
@@ -258,35 +290,57 @@ def _replace_moe_layers(
             activation=activation,
         )
 
-        # Detect router style and create appropriate replacement.
-        # Structural checks use gate type: nn.Linear (or QuantizedLinear)
-        # returns logits; custom gate modules return (inds, scores) directly.
-        gate = getattr(moe_module, "gate", None)
-        gate_is_linear = isinstance(gate, (nn.Linear,)) or (
-            hasattr(nn, "QuantizedLinear") and isinstance(gate, nn.QuantizedLinear)
-        )
-        if hasattr(moe_module, "shared_expert_gate") and gate_is_linear:
-            # Qwen3-Next style: linear gate + shared_expert + shared_expert_gate
-            replacement = _FlashMoEQwen3Next(moe_module, flash_moe)
-        elif gate_is_linear and hasattr(moe_module, "e_score_correction_bias"):
-            # MiniMax style: linear gate with sigmoid scoring + correction bias
-            replacement = _FlashMoEMiniMax(moe_module, flash_moe)
-        elif gate is not None:
-            # DeepSeek-V3 / Kimi-K2.5 style: custom gate returns (inds, scores)
-            replacement = _FlashMoEDeepSeek(moe_module, flash_moe)
-        else:
-            # gpt-oss style (has router + experts)
-            replacement = _FlashMoEGptOss(moe_module, flash_moe)
-
-        # Delete original SwitchGLU/expert weights before replacing
-        for attr in ("switch_mlp", "experts"):
-            if hasattr(moe_module, attr):
-                switch = getattr(moe_module, attr)
+        if moe_attr == "experts":
+            # Gemma4 VLM: router stays on layer, only replace experts
+            if getattr(moe_module, "sharding_group", None) is not None:
+                raise NotImplementedError(
+                    "Flash-MoE does not support distributed tensor parallelism. "
+                    "Each rank loads all needed experts, so all_sum would produce "
+                    "incorrect results. Disable distributed or Flash-MoE."
+                )
+            replacement = _FlashMoEGemma4(flash_moe)
+            # Free SwitchGLU weights from the original Experts module
+            if switch_glu is not None:
                 for proj in ("gate_proj", "up_proj", "down_proj", "fc1", "fc2"):
-                    if hasattr(switch, proj):
-                        delattr(switch, proj)
-                delattr(moe_module, attr)
-                break
+                    if hasattr(switch_glu, proj):
+                        delattr(switch_glu, proj)
+                delattr(moe_module, "switch_glu")
+        else:
+            # Detect router style and create appropriate replacement.
+            # Structural checks use gate type: nn.Linear (or QuantizedLinear)
+            # returns logits; custom gate modules return (inds, scores) directly.
+            gate = getattr(moe_module, "gate", None)
+            gate_is_linear = isinstance(gate, (nn.Linear,)) or (
+                hasattr(nn, "QuantizedLinear") and isinstance(gate, nn.QuantizedLinear)
+            )
+            if hasattr(moe_module, "shared_expert_gate") and gate_is_linear:
+                # Qwen3-Next style: linear gate + shared_expert + shared_expert_gate
+                replacement = _FlashMoEQwen3Next(moe_module, flash_moe)
+            elif gate_is_linear and hasattr(moe_module, "e_score_correction_bias"):
+                # MiniMax style: linear gate with sigmoid scoring + correction bias
+                replacement = _FlashMoEMiniMax(moe_module, flash_moe)
+            elif gate is not None:
+                # DeepSeek-V3 / Kimi-K2.5 style: custom gate returns (inds, scores)
+                replacement = _FlashMoEDeepSeek(moe_module, flash_moe)
+            else:
+                # gpt-oss style (has router + experts)
+                replacement = _FlashMoEGptOss(moe_module, flash_moe)
+
+            # Delete original SwitchGLU/expert weights before replacing
+            for attr in ("switch_mlp", "experts"):
+                if hasattr(moe_module, attr):
+                    switch = getattr(moe_module, attr)
+                    for proj in (
+                        "gate_proj",
+                        "up_proj",
+                        "down_proj",
+                        "fc1",
+                        "fc2",
+                    ):
+                        if hasattr(switch, proj):
+                            delattr(switch, proj)
+                    delattr(moe_module, attr)
+                    break
 
         # Replace the MoE module on the layer
         setattr(layer, moe_attr, replacement)

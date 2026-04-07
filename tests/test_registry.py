@@ -852,3 +852,28 @@ class TestRegistryModelConfig:
         saved = json.loads(config_path.read_text())
         assert "broken:latest" in saved
         assert saved["broken:latest"] == {"weird": True}
+
+
+class TestCorruptedJsonFiles:
+    """Regression tests for #180: corrupted JSON config files should not crash."""
+
+    def test_load_corrupted_models_json(self, tmp_path, monkeypatch):
+        """Corrupted models.json should log a warning, not crash."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text("{invalid json content!!!")
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        # Should fall back to empty mappings
+        assert reg._mappings == {}
+
+    def test_load_corrupted_aliases_json(self, tmp_path, monkeypatch):
+        """Corrupted aliases.json should log a warning, not crash."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text("{}")
+        aliases_path = tmp_path / "aliases.json"
+        aliases_path.write_text("not valid json [[[")
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        assert reg._aliases == {}

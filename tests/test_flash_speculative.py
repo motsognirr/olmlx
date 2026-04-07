@@ -362,3 +362,23 @@ class TestSpeculativeKVCache:
         accepted2, _ = decoder.step()
         assert len(accepted2) >= 1
         assert decoder._target_cache[0].offset == decoder._cache_seq_len
+
+
+class TestTrimPromptCacheNoneGuard:
+    """Regression tests for #189: trim_prompt_cache called without None guard."""
+
+    def test_init_raises_when_trim_prompt_cache_is_none(self, monkeypatch):
+        """Construction must fail early when trim_prompt_cache is None."""
+        import olmlx.engine.flash.speculative as spec_mod
+
+        monkeypatch.setattr(spec_mod, "trim_prompt_cache", None)
+
+        vocab_size, hidden_size = 32, 16
+        draft = MockDraftModel(vocab_size, hidden_size)
+        target = MockTargetModel(vocab_size, hidden_size)
+        with pytest.raises(RuntimeError, match="trim_prompt_cache is unavailable"):
+            SpeculativeFlashDecoder(
+                draft_model=draft,
+                target_model=target,
+                num_speculative_tokens=3,
+            )

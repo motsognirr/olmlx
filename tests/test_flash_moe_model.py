@@ -593,3 +593,191 @@ class TestFlashMoeMiniMax:
         result = wrapped.layers[0].block_sparse_moe(x)
         mx.eval(result)
         assert result.shape == (1, 4, hidden)
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 VLM-style model (router + experts on layer, dense mlp separate)
+# ---------------------------------------------------------------------------
+
+
+class _MockGemma4Router(nn.Module):
+    """Mock Gemma4 Router that returns fixed indices and uniform scores."""
+
+    def __init__(self, hidden_size, num_experts, num_experts_per_tok):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, num_experts, bias=False)
+        self.num_experts_per_tok = num_experts_per_tok
+
+    def __call__(self, x):
+        B, L, _ = x.shape
+        K = self.num_experts_per_tok
+        inds = mx.zeros((B, L, K), dtype=mx.int32)
+        scores = mx.ones((B, L, K)) / K
+        return inds, scores
+
+
+class _MockGemma4Experts(nn.Module):
+    """Mock Gemma4 Experts wrapping SwitchGLU."""
+
+    def __init__(self, hidden_size, intermediate_size, num_experts):
+        super().__init__()
+        self.switch_glu = _MockSwitchGLU(hidden_size, intermediate_size, num_experts)
+
+    def __call__(self, x, top_k_indices, top_k_weights):
+        return x  # Simplified for testing
+
+
+class _MockGemma4DecoderLayer(nn.Module):
+    """Gemma4 VLM decoder layer: dense mlp + separate router/experts."""
+
+    def __init__(
+        self, hidden_size, intermediate_size, num_experts, num_experts_per_tok, is_moe
+    ):
+        super().__init__()
+        self.mlp = _MockMLP(hidden_size, intermediate_size)
+        self.enable_moe = is_moe
+        if is_moe:
+            self.router = _MockGemma4Router(
+                hidden_size, num_experts, num_experts_per_tok
+            )
+            self.experts = _MockGemma4Experts(
+                hidden_size, intermediate_size, num_experts
+            )
+
+    def __call__(self, x):
+        h = self.mlp(x)
+        if self.enable_moe:
+            inds, weights = self.router(x)
+            h = h + self.experts(x, inds, weights)
+        return h
+
+
+class _MockGemma4Model(nn.Module):
+    """Mock Gemma4 VLM language model."""
+
+    def __init__(
+        self,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        num_experts_per_tok,
+        num_dense,
+        num_moe,
+    ):
+        super().__init__()
+        self.args = type(
+            "Args",
+            (),
+            {
+                "hidden_size": hidden_size,
+                "moe_intermediate_size": intermediate_size,
+                "num_experts": num_experts,
+                "num_experts_per_tok": num_experts_per_tok,
+            },
+        )()
+        layers = []
+        for _ in range(num_dense):
+            layers.append(
+                _MockGemma4DecoderLayer(
+                    hidden_size,
+                    intermediate_size,
+                    num_experts,
+                    num_experts_per_tok,
+                    is_moe=False,
+                )
+            )
+        for _ in range(num_moe):
+            layers.append(
+                _MockGemma4DecoderLayer(
+                    hidden_size,
+                    intermediate_size,
+                    num_experts,
+                    num_experts_per_tok,
+                    is_moe=True,
+                )
+            )
+        self.layers = layers
+
+    def __call__(self, x, cache=None):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class TestFlashMoeGemma4Vlm:
+    """Test Flash-MoE with Gemma4 VLM layer structure (router+experts on layer)."""
+
+    @pytest.fixture()
+    def model_and_store(self, tmp_path):
+        hidden, inter, experts = 64, 32, 8
+        num_dense, num_moe = 1, 2
+        num_experts_per_tok = 2
+
+        model_dir = _make_synthetic_moe_weights(
+            hidden, inter, experts, num_moe, num_dense, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        bundle_moe_experts(model_dir, output_dir)
+
+        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+        store = FlashMoeWeightStore(
+            output_dir, num_io_threads=4, cache_budget_experts=16
+        )
+
+        model = _MockGemma4Model(
+            hidden, inter, experts, num_experts_per_tok, num_dense, num_moe
+        )
+        return model, store, hidden, inter, experts, num_experts_per_tok
+
+    def test_replaces_experts_not_mlp(self, model_and_store):
+        """Gemma4 VLM: should replace layer.experts, keep layer.mlp intact."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+
+        moe_layer_indices = [1, 2]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        # Dense MLP should be preserved on all layers
+        for i in range(3):
+            assert isinstance(wrapped.layers[i].mlp, _MockMLP)
+
+        # Experts should be replaced on MoE layers
+        for i in [1, 2]:
+            layer = wrapped.layers[i]
+            assert not isinstance(layer.experts, _MockGemma4Experts)
+            assert hasattr(layer, "router")  # router stays
+
+    def test_preserves_router(self, model_and_store):
+        """Gemma4 VLM: router should remain untouched."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+
+        moe_layer_indices = [1, 2]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        for i in [1, 2]:
+            assert isinstance(wrapped.layers[i].router, _MockGemma4Router)
+
+    def test_dense_layer_untouched(self, model_and_store):
+        """Gemma4 VLM: dense layers should not be modified at all."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+
+        moe_layer_indices = [1, 2]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        assert isinstance(wrapped.layers[0].mlp, _MockMLP)
+        assert not hasattr(wrapped.layers[0], "router")

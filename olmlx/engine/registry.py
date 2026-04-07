@@ -272,8 +272,16 @@ class ModelRegistry:
     def load(self):
         """Load model mappings from config file and aliases."""
         if settings.models_config.exists():
-            with open(settings.models_config) as f:
-                raw = json.load(f)
+            try:
+                with open(settings.models_config) as f:
+                    raw = json.load(f)
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "Corrupted %s, starting with empty config: %s",
+                    settings.models_config,
+                    exc,
+                )
+                raw = {}
             self._mappings = {}
             self._raw_unrecognized = {}
             for k, v in raw.items():
@@ -283,8 +291,16 @@ class ModelRegistry:
                     logger.warning("Skipping invalid models.json entry %r: %s", k, exc)
                     self._raw_unrecognized[k] = v
         if self._aliases_path.exists():
-            with open(self._aliases_path) as f:
-                self._aliases = json.load(f)
+            try:
+                with open(self._aliases_path) as f:
+                    self._aliases = json.load(f)
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "Corrupted %s, ignoring aliases: %s",
+                    self._aliases_path,
+                    exc,
+                )
+                self._aliases = {}
 
     @staticmethod
     def normalize_name(name: str) -> str:

@@ -2465,6 +2465,53 @@ class TestEstimateKvCacheBytes:
         naive_raw = 61 * 2 * 128 * naive_head_dim * 1000 * 2
         assert result < naive_raw  # MLA should be ~25x smaller
 
+    def test_turboquant_4bit_reduces_estimate(self):
+        """TurboQuant 4-bit KV cache should reduce the memory estimate.
+
+        Normal: head_dim * 2 bytes per head per K or V entry
+        TurboQuant 4-bit: head_dim/2 bytes (packed indices) + 4 bytes (norm)
+        For head_dim=128: 256 bytes → 68 bytes ≈ 3.76x reduction.
+        """
+        model = self._make_model(
+            num_hidden_layers=80,
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            head_dim=128,
+            hidden_size=8192,
+        )
+        fp16_result = _estimate_kv_cache_bytes(model, 37000)
+        tq4_result = _estimate_kv_cache_bytes(
+            model, 37000, kv_cache_quant="turboquant:4"
+        )
+        # TurboQuant 4-bit should be significantly smaller
+        assert tq4_result < fp16_result
+        # Per-element: fp16 = 256 bytes, tq4 = 68 bytes → ratio ≈ 3.76x
+        assert fp16_result / tq4_result == pytest.approx(256 / 68, rel=0.01)
+
+    def test_turboquant_2bit_reduces_estimate(self):
+        """TurboQuant 2-bit should compress even more than 4-bit."""
+        model = self._make_model(
+            num_hidden_layers=80,
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            head_dim=128,
+            hidden_size=8192,
+        )
+        fp16_result = _estimate_kv_cache_bytes(model, 37000)
+        tq2_result = _estimate_kv_cache_bytes(
+            model, 37000, kv_cache_quant="turboquant:2"
+        )
+        # Per-element: fp16 = 256 bytes, tq2 = 36 bytes → ratio ≈ 7.1x
+        assert tq2_result < fp16_result
+        assert fp16_result / tq2_result == pytest.approx(256 / 36, rel=0.01)
+
+    def test_turboquant_none_unchanged(self):
+        """Passing kv_cache_quant=None should give the same result as no arg."""
+        model = self._make_model()
+        assert _estimate_kv_cache_bytes(model, 1000) == _estimate_kv_cache_bytes(
+            model, 1000, kv_cache_quant=None
+        )
+
 
 class TestKvCachePreflightCheck:
     """Tests for the pre-flight KV cache memory check in _stream_completion."""

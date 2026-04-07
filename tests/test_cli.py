@@ -268,13 +268,17 @@ class TestCreateStore:
         data = json.loads(config_path.read_text())
         assert data == DEFAULT_MODELS
 
-    def test_malformed_config_raises(self, tmp_path, monkeypatch):
-        """Malformed models.json should raise, not sys.exit."""
+    def test_malformed_config_logs_warning(self, tmp_path, monkeypatch, caplog):
+        """Malformed models.json should log a warning and start with empty config."""
         config_path = tmp_path / "models.json"
         config_path.write_text("{bad json")
         monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
-        with pytest.raises(Exception):
-            _create_store()
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            store = _create_store()
+        assert store is not None
+        assert "Corrupted" in caplog.text
 
     def test_ensure_config_permission_error_raises(self, tmp_path, monkeypatch):
         """Permission error in ensure_config should propagate."""
