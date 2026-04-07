@@ -2,11 +2,13 @@
 
 import asyncio
 import glob as glob_module
+import http.client
 import ipaddress
 import logging
 import os
 import signal
 import socket
+import ssl
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -407,12 +409,10 @@ async def _handle_web_fetch(args: dict) -> str:
     if not parsed.hostname:
         return "Error: invalid URL: missing hostname."
 
-    class _SafeHTTPHandler(urllib.request.HTTPHandler):
-        """Validate IP at connect time to prevent DNS rebinding."""
-
-        def connect(self, req, *args, **kwargs):
-            sock = super().connect(req, *args, **kwargs)
-            sock_ip = sock.getpeername()[0]
+    class _SafeHTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            super().connect()
+            sock_ip = self.sock.getpeername()[0]
             try:
                 addr = ipaddress.ip_address(sock_ip)
             except ValueError:
@@ -421,10 +421,23 @@ async def _handle_web_fetch(args: dict) -> str:
                 raise urllib.error.URLError(
                     f"Connection to private IP {sock_ip} blocked"
                 )
-            return sock
 
-    class _SafeHTTPSHandler(_SafeHTTPHandler, urllib.request.HTTPSHandler):
+    class _SafeHTTPSConnection(_SafeHTTPConnection, http.client.HTTPSConnection):
         pass
+
+    class _SafeHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req, *args, **kwargs):
+            return self.do_open(_SafeHTTPConnection, req, *args, **kwargs)
+
+    class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req, *args, **kwargs):
+            ctx = ssl.create_default_context()
+            return self.do_open(
+                lambda host, **kw: _SafeHTTPSConnection(host, context=ctx, **kw),
+                req,
+                *args,
+                **kwargs,
+            )
 
     class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
