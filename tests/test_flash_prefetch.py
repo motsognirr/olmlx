@@ -218,8 +218,8 @@ class TestPrefetcher:
         x = mx.random.normal((1, hidden)).astype(mx.float16)
 
         prefetcher.submit(0, x)
-        # Drain both prediction and I/O executors to ensure completion
-        prefetcher.close()
+        prefetcher.wait(1)  # exercises the blocking wait() path
+        prefetcher.close()  # drain any residual background work
 
         # Stats should show submission
         assert prefetcher.stats.submitted >= 1
@@ -256,7 +256,8 @@ class TestPrefetcher:
         layer_states = {i: x for i in range(num_layers)}
         prefetcher.submit_bulk(layer_states)
 
-        # Drain both prediction and I/O executors
+        for i in range(num_layers):
+            prefetcher.wait(i)
         prefetcher.close()
 
         assert prefetcher.stats.submitted >= 1
@@ -272,7 +273,7 @@ class TestPrefetcher:
 
         x = mx.random.normal((1, hidden)).astype(mx.float16)
         prefetcher.submit(0, x)
-        # Drain to ensure prediction + I/O complete
+        prefetcher.wait(1)
         prefetcher.close()
 
         assert prefetcher.stats.failures >= 1

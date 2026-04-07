@@ -118,13 +118,14 @@ class Prefetcher:
         if next_layer >= self._num_layers:
             return
 
+        mx.eval(hidden_state)
+
         state = _LayerPrefetchState()
         with self._lock:
             if next_layer in self._pending:
                 return  # already in flight
             self._pending[next_layer] = state
 
-        mx.eval(hidden_state)
         try:
             self._predict_executor.submit(
                 self._do_predict_and_io, layer_idx, hidden_state, state
