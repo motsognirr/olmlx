@@ -5,6 +5,8 @@ import logging
 import sys
 from typing import Any
 
+from olmlx.chat.config import sanitize_mcp_env
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,10 +52,13 @@ class MCPClientManager:
         from mcp import StdioServerParameters
         from mcp.client.stdio import stdio_client
 
+        user_env = cfg.get("env")
+        safe_env = sanitize_mcp_env(user_env)
+
         params = StdioServerParameters(
             command=cfg["command"],
             args=cfg.get("args", []),
-            env=cfg.get("env"),
+            env=safe_env,
         )
         transport_cm = stdio_client(params)
         await self._connect_transport(name, transport_cm)

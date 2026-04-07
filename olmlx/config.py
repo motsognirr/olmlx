@@ -57,6 +57,7 @@ class ExperimentalSettings(BaseSettings):
     distributed_port: int = 32323
     distributed_sideband_port: int = 32400
     distributed_secret: str = ""
+    distributed_secret_file: bool = False
     distributed_remote_working_dir: str = ""
     distributed_remote_python: str = "python"
     distributed_pre_shard: bool = True
