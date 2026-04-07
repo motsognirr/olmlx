@@ -331,26 +331,31 @@ class TestAsyncPrediction:
         )
         return prefetcher, store, bank, hidden, inter, num_layers
 
-    def test_submit_returns_immediately(self, prefetch_setup):
-        """submit() should return before prediction completes."""
-        import time
+    def test_submit_returns_before_prediction_completes(self, prefetch_setup):
+        """submit() should return while prediction is still running."""
+        import threading
         from unittest.mock import patch
 
         prefetcher, _, _, hidden, _, _ = prefetch_setup
         x = mx.random.normal((1, hidden)).astype(mx.float16)
 
+        predict_finished = threading.Event()
         original_predict = prefetcher._predict
 
         def slow_predict(*args, **kwargs):
+            import time
+
             time.sleep(0.5)
-            return original_predict(*args, **kwargs)
+            result = original_predict(*args, **kwargs)
+            predict_finished.set()
+            return result
 
         with patch.object(prefetcher, "_predict", side_effect=slow_predict):
-            start = time.monotonic()
             prefetcher.submit(0, x)
-            elapsed = time.monotonic() - start
-
-        assert elapsed < 0.1, f"submit() took {elapsed:.3f}s, should return immediately"
+            # submit() returned — prediction should NOT have finished yet
+            assert not predict_finished.is_set(), (
+                "submit() blocked until prediction completed"
+            )
         # Clean up: wait for background work to finish
         prefetcher.close()
 

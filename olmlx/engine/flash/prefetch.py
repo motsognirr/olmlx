@@ -118,12 +118,17 @@ class Prefetcher:
         if next_layer >= self._num_layers:
             return
 
+        # Check before mx.eval to avoid wasted materialization when
+        # the previous prediction is still in flight.  submit() is only
+        # called from the single forward-pass thread, so no TOCTOU race.
+        with self._lock:
+            if next_layer in self._pending:
+                return  # already in flight
+
         mx.eval(hidden_state)
 
         state = _LayerPrefetchState()
         with self._lock:
-            if next_layer in self._pending:
-                return  # already in flight
             self._pending[next_layer] = state
 
         try:
@@ -258,8 +263,9 @@ class Prefetcher:
             self._executor.submit(_do_prefetch)
         except Exception:
             state.done.set()
+            # Don't pop _pending: the entry may belong to a newer submit()
+            # after cancel(). wait() and cancel() own _pending cleanup.
             with self._lock:
-                self._pending.pop(layer_idx, None)
                 self.stats.submitted -= 1
             logger.warning("Failed to submit prefetch for layer %d", layer_idx)
 
