@@ -1258,7 +1258,7 @@ async def _stream_completion(
                 lm.prompt_cache_store.remove(cache_id)
                 # Trim cache to suffix_start so it aligns with where we resume
                 trim_amount = len(cached.tokens) - suffix_start
-                if trim_amount > 0 and trim_prompt_cache is not None:
+                if trim_amount > 0:
                     trim_prompt_cache(working_cache, trim_amount)
 
                 suffix_tokens = prompt_tokens[suffix_start:]
@@ -1548,14 +1548,13 @@ async def _stream_completion(
             if max_cache_tokens is not None and actual_total > max_cache_tokens:
                 trim_amount = actual_total - max_cache_tokens
                 try:
-                    if trim_prompt_cache is not None:
-                        trim_prompt_cache(prompt_cache, trim_amount)
+                    trim_prompt_cache(prompt_cache, trim_amount)
                     if stats.eval_count != len(generated_tokens):
                         # None-ID tokens present: can't map generated_tokens
                         # to KV cache positions. Trim KV cache down to prompt
                         # boundary so depth == len(stored_tokens).
                         extra = max_cache_tokens - len(full_prompt_tokens)
-                        if extra > 0 and trim_prompt_cache is not None:
+                        if extra > 0:
                             trim_prompt_cache(prompt_cache, extra)
                         stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
                     else:
