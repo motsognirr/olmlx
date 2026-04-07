@@ -62,7 +62,7 @@ class OpenAIChatRequest(BaseModel):
             return v
         from olmlx.schemas.common import validate_token_limit
 
-        return validate_token_limit(v, "value")
+        return validate_token_limit(v, "max_tokens")
 
 
 class OpenAIUsage(BaseModel):
@@ -123,7 +123,11 @@ class OpenAICompletionRequest(BaseModel):
             return v
         from olmlx.schemas.common import validate_token_limit
 
+<<<<<<< HEAD
         return validate_token_limit(v, "value")
+=======
+        return validate_token_limit(v, "max_tokens")
+>>>>>>> origin/main
 
 
 class OpenAICompletionChoice(BaseModel):

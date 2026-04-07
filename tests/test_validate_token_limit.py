@@ -16,7 +16,9 @@ class TestValidateTokenLimit:
 
     def test_over_limit(self, monkeypatch):
         monkeypatch.setattr("olmlx.config.settings.max_tokens_limit", 1000)
-        with pytest.raises(ValueError, match="max_tokens 1001 exceeds configured limit 1000"):
+        with pytest.raises(
+            ValueError, match="max_tokens 1001 exceeds configured limit 1000"
+        ):
             validate_token_limit(1001, "max_tokens")
 
     def test_error_message_includes_field_name(self, monkeypatch):
