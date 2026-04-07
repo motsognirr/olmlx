@@ -407,46 +407,24 @@ async def _handle_web_fetch(args: dict) -> str:
     if not parsed.hostname:
         return "Error: invalid URL: missing hostname."
 
-    def _get_allowed_addresses() -> list[str]:
-        """Resolve hostname and return all IP addresses, blocking private ranges."""
-        try:
-            results = socket.getaddrinfo(
-                parsed.hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
-            )
-        except socket.gaierror as exc:
-            raise ValueError(f"Failed to resolve hostname {parsed.hostname!r}: {exc}")
+    class _SafeHTTPHandler(urllib.request.HTTPHandler):
+        """Validate IP at connect time to prevent DNS rebinding."""
 
-        allowed = []
-        for family, _, _, _, sockaddr in results:
-            ip = sockaddr[0]
-            try:
-                addr = ipaddress.ip_address(ip)
-            except ValueError:
-                continue
-            if _is_private_ip(addr):
-                raise ValueError(
-                    f"Hostname {parsed.hostname!r} resolves to private IP {ip}"
-                )
-            allowed.append(ip)
-        if not allowed:
-            raise ValueError(f"No valid addresses for hostname {parsed.hostname!r}")
-        return allowed
-
-    allowed_addresses = _get_allowed_addresses()
-
-    class _SafeSocketWrapper(urllib.request.AbstractHTTPHandler):
-        """Wrap socket to validate connection address at connect time."""
-
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-
-        def socket_connect(self, req, sock, host, port, *args, **kwargs):
+        def connect(self, req, *args, **kwargs):
+            sock = super().connect(req, *args, **kwargs)
             sock_ip = sock.getpeername()[0]
-            if sock_ip not in allowed_addresses:
+            try:
+                addr = ipaddress.ip_address(sock_ip)
+            except ValueError:
+                raise urllib.error.URLError(f"Invalid IP address: {sock_ip}")
+            if _is_private_ip(addr):
                 raise urllib.error.URLError(
-                    f"Connection redirected to unauthorized IP {sock_ip}"
+                    f"Connection to private IP {sock_ip} blocked"
                 )
-            return super().socket_connect(req, sock, host, port, *args, **kwargs)
+            return sock
+
+    class _SafeHTTPSHandler(_SafeHTTPHandler, urllib.request.HTTPSHandler):
+        pass
 
     class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -474,7 +452,9 @@ async def _handle_web_fetch(args: dict) -> str:
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
     def _fetch() -> str:
-        opener = urllib.request.build_opener(_SafeSocketWrapper, _SafeRedirectHandler)
+        opener = urllib.request.build_opener(
+            _SafeHTTPHandler, _SafeHTTPSHandler, _SafeRedirectHandler
+        )
         with opener.open(url, timeout=30) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
             return resp.read(_WEB_FETCH_MAX_CHARS * 10).decode(
@@ -483,8 +463,6 @@ async def _handle_web_fetch(args: dict) -> str:
 
     try:
         raw = await asyncio.to_thread(_fetch)
-    except ValueError as exc:
-        return f"Error: {exc}"
     except Exception as exc:
         return f"Error fetching URL: {exc}"
 
