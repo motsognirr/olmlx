@@ -433,6 +433,7 @@ class TestAsyncPrediction:
         t.start()
         t.join(timeout=2.0)
         assert completed.is_set(), "wait() hung after prediction failure"
+        prefetcher.close()
 
     def test_close_drains_prediction_queue(self, prefetch_setup):
         """close() should block until in-flight predictions complete."""

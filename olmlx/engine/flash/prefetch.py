@@ -131,7 +131,9 @@ class Prefetcher:
                 self._do_predict_and_io, layer_idx, hidden_state, state
             )
         except RuntimeError:
-            state.done.set()  # unblock wait()
+            with self._lock:
+                self._pending.pop(next_layer, None)
+            state.done.set()  # unblock any concurrent wait()
 
     def wait(self, layer_idx: int) -> None:
         """Block until any pending prefetch for *layer_idx* completes."""
@@ -257,6 +259,7 @@ class Prefetcher:
         except Exception:
             state.done.set()
             with self._lock:
+                self._pending.pop(layer_idx, None)
                 self.stats.submitted -= 1
             logger.warning("Failed to submit prefetch for layer %d", layer_idx)
 
