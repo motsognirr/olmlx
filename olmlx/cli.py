@@ -450,7 +450,6 @@ def _launch_distributed_workers() -> list[str]:
 
         script_parts = [
             "HOSTFILE=$(mktemp)",
-            'trap "rm -f $HOSTFILE" EXIT',
             f"echo {shlex.quote(ring_hostfile_json)} > $HOSTFILE",
             "export MLX_HOSTFILE=$HOSTFILE",
         ]
@@ -461,12 +460,13 @@ def _launch_distributed_workers() -> list[str]:
             script_parts.extend(
                 [
                     "SECRET_FILE=$(mktemp)",
-                    'trap "rm -f $SECRET_FILE" EXIT',
                     f"echo {shlex.quote(experimental.distributed_secret)} > $SECRET_FILE",
                     "chmod 600 $SECRET_FILE",
                     "export OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET_FILE=$SECRET_FILE",
                 ]
             )
+
+        script_parts.append('trap "rm -f $HOSTFILE $SECRET_FILE" EXIT')
 
         script_parts.append(
             f"{env_str} {remote_python} -m olmlx.engine.distributed_worker"

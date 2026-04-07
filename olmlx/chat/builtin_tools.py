@@ -74,23 +74,30 @@ def _strip_html(text: str) -> str:
 def _resolve_path(path: str, base_dir: Path | None = None) -> Path:
     """Resolve and validate path to prevent path traversal attacks.
 
+    Handles both relative and absolute paths. For absolute paths, returns
+    resolved directly. For relative paths, resolves relative to base_dir
+    (defaults to cwd) and prevents traversal via '..'.
+
     Args:
         path: User-provided file path (absolute or relative)
-        base_dir: Allowed base directory (defaults to cwd)
+        base_dir: Allowed base directory for relative paths (defaults to cwd)
 
     Returns:
-        Resolved absolute Path within base_dir
+        Resolved absolute Path
 
     Raises:
-        ValueError: If path attempts to escape base_dir
+        ValueError: If path attempts to escape base_dir via traversal
     """
     input_path = Path(path).expanduser()
+
+    if input_path.is_absolute():
+        return input_path.resolve()
 
     if base_dir is None:
         base_dir = Path.cwd()
     base_dir = base_dir.resolve()
 
-    resolved = input_path.resolve()
+    resolved = (base_dir / path).resolve()
 
     try:
         resolved.relative_to(base_dir)
@@ -400,15 +407,46 @@ async def _handle_web_fetch(args: dict) -> str:
     if not parsed.hostname:
         return "Error: invalid URL: missing hostname."
 
-    try:
-        ip_str = await asyncio.to_thread(socket.gethostbyname, parsed.hostname)
-        ip = ipaddress.ip_address(ip_str)
-        if _is_private_ip(ip):
-            return f"Error: connection to private IP {ip} blocked."
-    except socket.gaierror as exc:
-        return f"Error: failed to resolve hostname {parsed.hostname!r}: {exc}"
+    def _get_allowed_addresses() -> list[str]:
+        """Resolve hostname and return all IP addresses, blocking private ranges."""
+        try:
+            results = socket.getaddrinfo(
+                parsed.hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+            )
+        except socket.gaierror as exc:
+            raise ValueError(f"Failed to resolve hostname {parsed.hostname!r}: {exc}")
 
-    max_read = _WEB_FETCH_MAX_CHARS * 10
+        allowed = []
+        for family, _, _, _, sockaddr in results:
+            ip = sockaddr[0]
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if _is_private_ip(addr):
+                raise ValueError(
+                    f"Hostname {parsed.hostname!r} resolves to private IP {ip}"
+                )
+            allowed.append(ip)
+        if not allowed:
+            raise ValueError(f"No valid addresses for hostname {parsed.hostname!r}")
+        return allowed
+
+    allowed_addresses = _get_allowed_addresses()
+
+    class _SafeSocketWrapper(urllib.request.AbstractHTTPHandler):
+        """Wrap socket to validate connection address at connect time."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+        def socket_connect(self, req, sock, host, port, *args, **kwargs):
+            sock_ip = sock.getpeername()[0]
+            if sock_ip not in allowed_addresses:
+                raise urllib.error.URLError(
+                    f"Connection redirected to unauthorized IP {sock_ip}"
+                )
+            return super().socket_connect(req, sock, host, port, *args, **kwargs)
 
     class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -419,12 +457,16 @@ async def _handle_web_fetch(args: dict) -> str:
                 )
             if p.hostname:
                 try:
-                    redirect_ip = socket.gethostbyname(p.hostname)
-                    redirect_addr = ipaddress.ip_address(redirect_ip)
-                    if _is_private_ip(redirect_addr):
-                        raise urllib.error.URLError(
-                            f"Redirect to private IP blocked: {redirect_ip}"
-                        )
+                    results = socket.getaddrinfo(
+                        p.hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+                    )
+                    for family, _, _, _, sockaddr in results:
+                        ip = sockaddr[0]
+                        addr = ipaddress.ip_address(ip)
+                        if _is_private_ip(addr):
+                            raise urllib.error.URLError(
+                                f"Redirect to private IP blocked: {ip}"
+                            )
                 except socket.gaierror as exc:
                     raise urllib.error.URLError(
                         f"Failed to resolve redirect hostname {p.hostname}: {exc}"
@@ -432,13 +474,17 @@ async def _handle_web_fetch(args: dict) -> str:
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
     def _fetch() -> str:
-        opener = urllib.request.build_opener(_SafeRedirectHandler)
+        opener = urllib.request.build_opener(_SafeSocketWrapper, _SafeRedirectHandler)
         with opener.open(url, timeout=30) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
-            return resp.read(max_read).decode(charset, errors="replace")
+            return resp.read(_WEB_FETCH_MAX_CHARS * 10).decode(
+                charset, errors="replace"
+            )
 
     try:
         raw = await asyncio.to_thread(_fetch)
+    except ValueError as exc:
+        return f"Error: {exc}"
     except Exception as exc:
         return f"Error fetching URL: {exc}"
 
