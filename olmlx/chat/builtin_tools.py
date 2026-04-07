@@ -76,7 +76,7 @@ def _resolve_path(path: str, base_dir: Path | None = None) -> Path:
 
     Args:
         path: User-provided file path (absolute or relative)
-        base_dir: Allowed base directory (defaults to cwd, but absolute paths bypass check)
+        base_dir: Allowed base directory (defaults to cwd)
 
     Returns:
         Resolved absolute Path within base_dir
@@ -84,17 +84,17 @@ def _resolve_path(path: str, base_dir: Path | None = None) -> Path:
     Raises:
         ValueError: If path attempts to escape base_dir
     """
-    input_path = Path(path)
-    if input_path.is_absolute():
-        return input_path.resolve()
+    input_path = Path(path).expanduser()
 
     if base_dir is None:
         base_dir = Path.cwd()
     base_dir = base_dir.resolve()
 
-    resolved = (base_dir / path).resolve()
+    resolved = input_path.resolve()
 
-    if not str(resolved).startswith(str(base_dir)):
+    try:
+        resolved.relative_to(base_dir)
+    except ValueError:
         raise ValueError(f"Path {path!r} is outside allowed directory {base_dir}")
     return resolved
 
@@ -425,8 +425,10 @@ async def _handle_web_fetch(args: dict) -> str:
                         raise urllib.error.URLError(
                             f"Redirect to private IP blocked: {redirect_ip}"
                         )
-                except socket.gaierror:
-                    pass
+                except socket.gaierror as exc:
+                    raise urllib.error.URLError(
+                        f"Failed to resolve redirect hostname {p.hostname}: {exc}"
+                    )
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
     def _fetch() -> str:

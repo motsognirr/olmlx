@@ -429,7 +429,6 @@ def _launch_distributed_workers() -> list[str]:
             "OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT": str(
                 experimental.distributed_sideband_port
             ),
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET": experimental.distributed_secret,
             "OLMLX_EXPERIMENTAL_DISTRIBUTED_STRATEGY": strategy,
             "MLX_RANK": str(rank),
         }

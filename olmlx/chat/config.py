@@ -24,18 +24,6 @@ _BLOCKED_ENV_VARS = {
     "SYSTEMROOT",
     "WINDIR",
 }
-_ALLOWED_ENV_VARS = {
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TERM",
-    "TMPDIR",
-    "PWD",
-    "SHELL",
-}
 
 
 @dataclass
@@ -106,21 +94,22 @@ def load_mcp_config(path: Path) -> dict:
     return result
 
 
-def sanitize_mcp_env(user_env: dict[str, str] | None) -> dict[str, str]:
+def sanitize_mcp_env(user_env: dict[str, str] | None) -> dict[str, str] | None:
     """Sanitize environment variables for MCP server processes.
 
-    Blocks dangerous variables (PATH, LD_PRELOAD, etc.) that could be
-    exploited to inject code execution. Allows safe variables (HOME, USER, etc.)
-    and any OLMLX_* variables needed for configuration.
+    Starts with full parent environment, removes blocked dangerous variables
+    (PATH, LD_PRELOAD, etc.) from user-provided overrides only. Returns None
+    when no user_env is provided to preserve inherited environment.
 
     Args:
         user_env: User-provided environment dict from MCP config
 
     Returns:
-        Sanitized environment dict safe for subprocess execution
+        Sanitized environment dict safe for subprocess execution, or None
+        to inherit parent environment unchanged.
     """
-    if not user_env:
-        return {}
+    if user_env is None:
+        return None
 
     allowed_env = os.environ.copy()
 
