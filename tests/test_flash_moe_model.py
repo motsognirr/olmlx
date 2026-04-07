@@ -406,7 +406,10 @@ class TestFlashMoeQwen3Next:
         """Qwen3-Next MoE layers (plain nn.Linear gate) should be detected and replaced."""
         model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
 
-        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper, _FlashMoEBase
+        from olmlx.engine.flash.flash_moe_model import (
+            FlashMoeModelWrapper,
+            _FlashMoEBase,
+        )
 
         moe_layer_indices = [1, 2]
         wrapped = FlashMoeModelWrapper(
@@ -576,7 +579,10 @@ class TestFlashMoeMiniMax:
         """MoE layers at block_sparse_moe should be replaced with FlashMoE."""
         model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
 
-        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper, _FlashMoEBase
+        from olmlx.engine.flash.flash_moe_model import (
+            FlashMoeModelWrapper,
+            _FlashMoEBase,
+        )
 
         moe_layer_indices = [0, 1]
         wrapped = FlashMoeModelWrapper(
