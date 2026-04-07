@@ -72,14 +72,9 @@ class AnthropicMessagesRequest(BaseModel):
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens(cls, v: int) -> int:
-        from olmlx.config import settings
+        from olmlx.schemas.common import validate_token_limit
 
-        if v > settings.max_tokens_limit:
-            raise ValueError(
-                f"max_tokens {v} exceeds configured limit {settings.max_tokens_limit} "
-                f"(set OLMLX_MAX_TOKENS_LIMIT to increase)"
-            )
-        return v
+        return validate_token_limit(v, "max_tokens")
 
     temperature: float | None = Field(None, ge=0, le=1)
     top_p: float | None = Field(None, ge=0, le=1)
