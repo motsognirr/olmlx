@@ -221,7 +221,7 @@ class TestFlashMoeModelWrapper:
         for i in [1, 2]:
             mlp = wrapped.layers[i].mlp
             assert hasattr(mlp, "gate")
-            assert hasattr(mlp, "shared_experts")
+            assert mlp.shared_experts is not None
 
     def test_frees_switch_mlp_weights(self, model_and_store):
         """Original SwitchGLU weights should be deleted after wrapping."""
@@ -253,6 +253,44 @@ class TestFlashMoeModelWrapper:
 
         assert wrapped.layers is model.layers
         assert wrapped.args is model.args
+
+    def test_base_class_sharding_check(self):
+        """_FlashMoEBase should reject modules with a sharding group."""
+        from olmlx.engine.flash.flash_moe_model import _FlashMoEBase
+
+        class _FakeMoE:
+            sharding_group = object()
+
+        with pytest.raises(NotImplementedError, match="distributed tensor parallelism"):
+            _FlashMoEBase(_FakeMoE(), flash_moe=None)
+
+    def test_base_class_route_not_implemented(self):
+        """_FlashMoEBase.__call__ should raise when _route is not overridden."""
+        from olmlx.engine.flash.flash_moe_model import _FlashMoEBase
+
+        class _FakeMoE:
+            sharding_group = None
+
+        base = _FlashMoEBase(_FakeMoE(), flash_moe=None)
+        with pytest.raises(NotImplementedError):
+            base(mx.zeros((1, 1, 8)))
+
+    def test_subclasses_inherit_base(self, model_and_store):
+        """All Flash-MoE replacement classes should inherit _FlashMoEBase."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import (
+            FlashMoeModelWrapper,
+            _FlashMoEBase,
+        )
+
+        moe_layer_indices = [1, 2]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        for i in [1, 2]:
+            assert isinstance(wrapped.layers[i].mlp, _FlashMoEBase)
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +417,10 @@ class TestFlashMoeQwen3Next:
         """Qwen3-Next MoE layers (plain nn.Linear gate) should be detected and replaced."""
         model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
 
-        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+        from olmlx.engine.flash.flash_moe_model import (
+            FlashMoeModelWrapper,
+            _FlashMoEBase,
+        )
 
         moe_layer_indices = [1, 2]
         wrapped = FlashMoeModelWrapper(
@@ -392,6 +433,7 @@ class TestFlashMoeQwen3Next:
         # Layers 1, 2 (MoE) should be replaced
         for i in [1, 2]:
             mlp = wrapped.layers[i].mlp
+            assert isinstance(mlp, _FlashMoEBase)
             assert hasattr(mlp, "_flash_moe")
             assert hasattr(mlp, "shared_expert")
             assert hasattr(mlp, "shared_expert_gate")
@@ -548,7 +590,10 @@ class TestFlashMoeMiniMax:
         """MoE layers at block_sparse_moe should be replaced with FlashMoE."""
         model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
 
-        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+        from olmlx.engine.flash.flash_moe_model import (
+            FlashMoeModelWrapper,
+            _FlashMoEBase,
+        )
 
         moe_layer_indices = [0, 1]
         wrapped = FlashMoeModelWrapper(
@@ -560,6 +605,7 @@ class TestFlashMoeMiniMax:
             # The MoE module should be replaced
             moe_module = getattr(layer, "block_sparse_moe", None)
             assert moe_module is not None
+            assert isinstance(moe_module, _FlashMoEBase)
             assert hasattr(moe_module, "_flash_moe")
 
     def test_preserves_minimax_gate_and_bias(self, model_and_store):
