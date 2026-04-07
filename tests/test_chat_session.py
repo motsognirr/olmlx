@@ -160,6 +160,32 @@ class TestImplicitThinkingStreaming:
         assert "</think>" not in token_text
 
     @pytest.mark.asyncio
+    async def test_implicit_strip_multi_chunk(self):
+        """When thinking=False, implicit thinking across chunks is stripped correctly."""
+        session = _make_session(thinking=False, template_has_thinking=True)
+
+        async def fake_stream(*args, **kwargs):
+            # Thinking content arrives in multiple chunks before </think>
+            yield {"text": "First thought. ", "done": False}
+            yield {"text": "Second thought.", "done": False}
+            yield {"text": "</think>", "done": False}
+            yield {"text": "The visible answer.", "done": False}
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch("olmlx.chat.session.generate_chat", return_value=fake_stream()):
+            events = []
+            async for event in session.send_message("Q"):
+                events.append(event)
+
+        types = [e["type"] for e in events]
+        # No thinking events should be emitted
+        assert "thinking_start" not in types
+        assert "thinking_token" not in types
+        # Only visible text after </think>
+        token_text = "".join(e["text"] for e in events if e["type"] == "token")
+        assert token_text == "The visible answer."
+
+    @pytest.mark.asyncio
     async def test_no_thinking_output_not_duplicated(self):
         """If model skips thinking (no tags), content shown once, not duplicated."""
         session = _make_session(thinking=True, template_has_thinking=True)

@@ -405,3 +405,51 @@ class TestFlashWeightStore:
         expected = mx.array(gate_w[indices].T)
         assert mx.allclose(gate_cols, expected, atol=1e-6)
         store.close()
+
+
+class TestFullPread:
+    """Tests for FlashWeightStore._full_pread handling short reads."""
+
+    def test_single_complete_read(self, tmp_path):
+        """Normal case: pread returns all bytes in one call."""
+        data = b"hello world, this is test data!"
+        p = tmp_path / "test.bin"
+        p.write_bytes(data)
+
+        import os
+
+        fd = os.open(str(p), os.O_RDONLY)
+        try:
+            result = FlashWeightStore._full_pread(fd, len(data), 0)
+            assert result == data
+        finally:
+            os.close(fd)
+
+    def test_short_reads_reassembled(self, tmp_path):
+        """When pread returns partial data, _full_pread retries and assembles."""
+        data = b"abcdefghijklmnopqrstuvwxyz"
+        p = tmp_path / "test.bin"
+        p.write_bytes(data)
+
+        import os
+        from unittest.mock import patch
+
+        fd = os.open(str(p), os.O_RDONLY)
+        try:
+            # Simulate short reads by returning small chunks
+            real_pread = os.pread
+            call_count = [0]
+
+            def short_pread(fd, size, offset):
+                call_count[0] += 1
+                # Return at most 5 bytes per call
+                return real_pread(fd, min(size, 5), offset)
+
+            with patch("os.pread", side_effect=short_pread):
+                result = FlashWeightStore._full_pread(fd, len(data), 0)
+
+            assert result == data
+            # Should have needed multiple calls
+            assert call_count[0] > 1
+        finally:
+            os.close(fd)

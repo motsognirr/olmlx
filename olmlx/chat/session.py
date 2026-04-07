@@ -183,7 +183,9 @@ class ChatSession:
 
         # Implicit thinking: model injects <think> into the template prompt,
         # so generated text starts with thinking content (no <think> prefix).
-        assume_implicit_thinking = self.config.thinking and template_has_thinking
+        # Buffer content before </think> regardless of the thinking display
+        # flag — when disabled, we still need to strip thinking from output.
+        assume_implicit_thinking = template_has_thinking
 
         for turn in range(self.config.max_turns):
             accumulated = ""
@@ -263,19 +265,18 @@ class ChatSession:
                         else:
                             think_content = accumulated[cs:]
                             visible = ""
+                        # When thinking is disabled, suppress thinking events
+                        # but keep the visible text (already stripped above).
+                        if not self.config.thinking:
+                            think_content = ""
                     elif implicit_strip:
-                        # Model produced thinking despite being disabled;
-                        # strip everything before </think> from visible.
+                        # Model produced </think> despite thinking being disabled
+                        # and no explicit <think> tag — strip everything before it.
                         think_content = ""
                         visible = accumulated[close_pos + len(_THINK_CLOSE) :]
                     else:
                         think_content = ""
                         visible = accumulated
-
-                    # When thinking is disabled, suppress thinking events
-                    # but still strip thinking content from visible output.
-                    if not self.config.thinking:
-                        think_content = ""
 
                     # Emit thinking delta
                     if len(think_content) > think_emitted:
