@@ -161,7 +161,12 @@ def _load_tensor(model_dir: Path, name: str, index: dict | None) -> np.ndarray:
 
 def _clear_shard_cache():
     """Clear the shard cache to free memory."""
+    import mlx.core as mx
+
+    if _shard_cache:
+        logger.debug("Clearing shard cache (%d files)", len(_shard_cache))
     _shard_cache.clear()
+    mx.clear_cache()
 
 
 def _try_load_tensor(

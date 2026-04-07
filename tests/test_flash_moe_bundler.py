@@ -431,6 +431,28 @@ class TestBundleMoeExperts:
         assert 0 in layouts
         assert layouts[0].num_experts == experts
 
+    def test_bundle_clears_metal_memory(self, tmp_path):
+        """Bundling should call mx.clear_cache() to release Metal GPU memory."""
+        hidden, inter, experts = 64, 32, 4
+        num_moe, num_dense = 2, 1
+        model_dir = _make_synthetic_moe_weights(
+            hidden, inter, experts, num_moe, num_dense, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from unittest.mock import patch
+
+        from olmlx.engine.flash.moe_bundler import _shard_cache, bundle_moe_experts
+
+        with patch("mlx.core.clear_cache") as mock_clear:
+            bundle_moe_experts(model_dir, output_dir)
+
+            # mx.clear_cache() should be called at least once per layer + bookkeeping
+            assert mock_clear.call_count >= num_moe
+
+        # Cache must be empty after bundling
+        assert len(_shard_cache) == 0
+
 
 def _make_synthetic_minimax_moe_weights(
     hidden_size: int,
