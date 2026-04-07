@@ -332,6 +332,29 @@ class TestSpeculativeKVCache:
             assert decoder._last_target_logit is not None
             assert decoder._last_target_logit.shape == (vocab_size,)
 
+    def test_prefill_raises_when_trim_prompt_cache_is_none(self):
+        """prefill() should raise early when trim_prompt_cache is None."""
+        import olmlx.engine.flash.speculative as spec_mod
+
+        vocab_size, hidden_size = 32, 16
+        draft = MockDraftModel(vocab_size, hidden_size)
+        target = MockTargetModel(vocab_size, hidden_size)
+        decoder = SpeculativeFlashDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=3,
+        )
+
+        prompt = mx.array([[1, 2, 3]])
+
+        original = spec_mod.trim_prompt_cache
+        try:
+            spec_mod.trim_prompt_cache = None
+            with pytest.raises(RuntimeError, match="mlx_lm.models.cache not available"):
+                decoder.prefill(prompt)
+        finally:
+            spec_mod.trim_prompt_cache = original
+
     def test_full_acceptance_then_step(self):
         """After a full acceptance step, the next step should work correctly."""
         vocab_size, hidden_size = 32, 16

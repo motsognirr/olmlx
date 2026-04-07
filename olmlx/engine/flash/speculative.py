@@ -99,7 +99,7 @@ class SpeculativeFlashDecoder:
         """
         self.reset()
 
-        if make_prompt_cache is None:
+        if make_prompt_cache is None or trim_prompt_cache is None:
             raise RuntimeError(
                 "mlx_lm.models.cache not available; cannot use cached speculative decoding"
             )

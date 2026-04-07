@@ -1087,3 +1087,74 @@ class TestBundleGemma4MoeExperts:
             header = parse_moe_header(f.read(MOE_HEADER_SIZE))
         assert header["is_quantized"] is True
         assert header["bits"] == 4
+
+
+class TestShardCacheCleanup:
+    """Tests for _shard_cache lifecycle — issue #171."""
+
+    def test_shard_cache_empty_after_bundle(self, tmp_path):
+        """_shard_cache should be empty after bundle_moe_experts completes."""
+        from olmlx.engine.flash.moe_bundler import _shard_cache, bundle_moe_experts
+
+        hidden, inter, experts = 64, 32, 4
+        model_dir = _make_synthetic_moe_weights(hidden, inter, experts, 1, 0, tmp_path)
+        output_dir = tmp_path / "flash_moe"
+
+        bundle_moe_experts(model_dir, output_dir)
+
+        assert len(_shard_cache) == 0, (
+            f"_shard_cache should be empty after bundling, has {len(_shard_cache)} entries"
+        )
+
+    def test_shard_cache_empty_after_sequential_bundles(self, tmp_path):
+        """_shard_cache should not accumulate across sequential bundle calls."""
+        from olmlx.engine.flash.moe_bundler import _shard_cache, bundle_moe_experts
+
+        for i in range(3):
+            sub = tmp_path / f"run_{i}"
+            sub.mkdir()
+            model_dir = _make_synthetic_moe_weights(64, 32, 4, 1, 0, sub)
+            output_dir = sub / "flash_moe"
+            bundle_moe_experts(model_dir, output_dir)
+            assert len(_shard_cache) == 0, (
+                f"_shard_cache leaked after bundle call {i}: {len(_shard_cache)} entries"
+            )
+
+    def test_shard_cache_bounded_during_load(self, tmp_path):
+        """_shard_cache should respect max size during tensor loading."""
+        from olmlx.engine.flash.moe_bundler import (
+            MAX_SHARD_CACHE_SIZE,
+            _clear_shard_cache,
+            _load_tensor,
+            _shard_cache,
+        )
+
+        _clear_shard_cache()
+
+        # Create a model with enough shards to exceed the cache limit
+        from safetensors.numpy import save_file
+
+        rng = np.random.RandomState(42)
+        model_dir = tmp_path / "sharded_model"
+        model_dir.mkdir()
+
+        # Create MAX_SHARD_CACHE_SIZE + 2 shard files
+        weight_map = {}
+        num_shards = MAX_SHARD_CACHE_SIZE + 2
+        for i in range(num_shards):
+            shard_name = f"model-{i:05d}-of-{num_shards:05d}.safetensors"
+            tensor_name = f"layer.{i}.weight"
+            tensors = {tensor_name: rng.randn(4, 4).astype(np.float16)}
+            save_file(tensors, str(model_dir / shard_name))
+            weight_map[tensor_name] = shard_name
+
+        index = {"weight_map": weight_map}
+
+        # Load all tensors — cache should stay bounded
+        for i in range(num_shards):
+            _load_tensor(model_dir, f"layer.{i}.weight", index)
+
+        assert len(_shard_cache) <= MAX_SHARD_CACHE_SIZE, (
+            f"_shard_cache exceeded max size: {len(_shard_cache)} > {MAX_SHARD_CACHE_SIZE}"
+        )
+        _clear_shard_cache()

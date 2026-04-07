@@ -179,6 +179,12 @@ class TestFlashMoeWeightStore:
 
         assert not mx.array_equal(loaded_1.gate_weight, loaded_2.gate_weight)
 
+    def test_load_experts_empty_list_raises(self, store_with_model):
+        """load_experts with empty expert_indices should raise ValueError, not mx.stack crash."""
+        store, _, _, _, _ = store_with_model
+        with pytest.raises(ValueError, match="expert_indices must not be empty"):
+            store.load_experts(1, [])
+
     def test_expert_index_map(self, store_with_model):
         """LoadedExperts should provide a mapping from global to local indices."""
         store, _, _, _, _ = store_with_model
