@@ -233,7 +233,11 @@ def _find_moe_module(layer: nn.Module) -> tuple[str, nn.Module]:
     """
     # Gemma4 VLM: router + experts are on the layer, mlp is a separate dense path
     experts = getattr(layer, "experts", None)
-    if experts is not None and getattr(layer, "router", None) is not None:
+    if (
+        experts is not None
+        and getattr(layer, "router", None) is not None
+        and getattr(experts, "switch_glu", None) is not None
+    ):
         return "experts", experts
 
     for attr in ("mlp", "block_sparse_moe", "mixer"):
