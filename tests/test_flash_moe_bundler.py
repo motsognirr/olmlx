@@ -1113,9 +1113,7 @@ class TestShardCacheCleanup:
         for i in range(3):
             sub = tmp_path / f"run_{i}"
             sub.mkdir()
-            model_dir = _make_synthetic_moe_weights(
-                64, 32, 4, 1, 0, sub
-            )
+            model_dir = _make_synthetic_moe_weights(64, 32, 4, 1, 0, sub)
             output_dir = sub / "flash_moe"
             bundle_moe_experts(model_dir, output_dir)
             assert len(_shard_cache) == 0, (
