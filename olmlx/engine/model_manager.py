@@ -1201,6 +1201,8 @@ class ModelManager:
         try:
             model, tokenizer = load_model_with_strict_fallback(load_path, lazy=False)
         except _FALLBACK_EXCEPTIONS:
+            # lazy=True: avoid materializing vision encoder weights that are
+            # discarded after extracting language_model; Flash loads from SSD.
             model, tokenizer, _ = self._vlm_fallback_load(load_path, hf_path, lazy=True)
             is_vlm = True
         caps = detect_caps(tokenizer)

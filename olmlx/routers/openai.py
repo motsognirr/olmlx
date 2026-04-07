@@ -69,19 +69,30 @@ def _fill_missing_required_args(
         }
 
     for tu in tool_uses:
-        required_params = schema_by_tool.get(tu["name"].lower())
+        required_params = schema_by_tool.get((tu.get("name") or "").lower())
         if not required_params:
             continue
         inp = tu.get("input") or {}
+        changed = False
         for param, param_type in required_params.items():
-            if param not in inp and param_type == "string":
-                logger.warning(
-                    "Tool '%s' missing required string param '%s', injecting empty string",
-                    tu.get("name"),
-                    param,
-                )
-                inp[param] = ""
-        tu["input"] = inp
+            if param not in inp:
+                if param_type == "string":
+                    logger.warning(
+                        "Tool '%s' missing required string param '%s', injecting empty string",
+                        tu.get("name"),
+                        param,
+                    )
+                    inp[param] = ""
+                    changed = True
+                else:
+                    logger.warning(
+                        "Tool '%s' missing required param '%s' (type %r), cannot inject default",
+                        tu.get("name"),
+                        param,
+                        param_type,
+                    )
+        if changed:
+            tu["input"] = inp
 
 
 def _to_openai_tool_calls(tool_uses: list[dict]) -> list[dict]:
