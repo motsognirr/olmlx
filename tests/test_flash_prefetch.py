@@ -218,7 +218,8 @@ class TestPrefetcher:
         x = mx.random.normal((1, hidden)).astype(mx.float16)
 
         prefetcher.submit(0, x)
-        prefetcher.wait(1)
+        # Drain both prediction and I/O executors to ensure completion
+        prefetcher.close()
 
         # Stats should show submission
         assert prefetcher.stats.submitted >= 1
@@ -255,9 +256,8 @@ class TestPrefetcher:
         layer_states = {i: x for i in range(num_layers)}
         prefetcher.submit_bulk(layer_states)
 
-        # Wait for all layers
-        for i in range(num_layers):
-            prefetcher.wait(i)
+        # Drain both prediction and I/O executors
+        prefetcher.close()
 
         assert prefetcher.stats.submitted >= 1
 
@@ -272,7 +272,8 @@ class TestPrefetcher:
 
         x = mx.random.normal((1, hidden)).astype(mx.float16)
         prefetcher.submit(0, x)
-        prefetcher.wait(1)
+        # Drain to ensure prediction + I/O complete
+        prefetcher.close()
 
         assert prefetcher.stats.failures >= 1
         store.prefetch_neurons = original
@@ -303,6 +304,173 @@ class TestPrefetcher:
         """close() should shut down executor without error."""
         prefetcher, _, _, _, _, _ = prefetch_setup
         prefetcher.close()
+
+
+# ---------------------------------------------------------------------------
+# Async prediction tests (#148)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncPrediction:
+    """Tests for moving prediction off the forward-pass thread."""
+
+    @pytest.fixture()
+    def prefetch_setup(self, tmp_path):
+        hidden, inter, num_layers = 16, 8, 2
+        flash_dir, _, _ = _make_bundled_model(tmp_path, hidden, inter, num_layers)
+        store = FlashWeightStore(flash_dir, num_io_threads=4, cache_budget_neurons=64)
+        bank = PredictorBank(num_layers, hidden, inter, rank=4)
+        prefetcher = Prefetcher(
+            predictor_bank=bank,
+            weight_store=store,
+            num_layers=num_layers,
+            confidence_threshold=0.3,
+            min_neurons=2,
+            io_threads=4,
+        )
+        return prefetcher, store, bank, hidden, inter, num_layers
+
+    def test_submit_returns_immediately(self, prefetch_setup):
+        """submit() should return before prediction completes."""
+        import time
+        from unittest.mock import patch
+
+        prefetcher, _, _, hidden, _, _ = prefetch_setup
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+
+        original_predict = prefetcher._predict
+
+        def slow_predict(*args, **kwargs):
+            time.sleep(0.5)
+            return original_predict(*args, **kwargs)
+
+        with patch.object(prefetcher, "_predict", side_effect=slow_predict):
+            start = time.monotonic()
+            prefetcher.submit(0, x)
+            elapsed = time.monotonic() - start
+
+        assert elapsed < 0.1, f"submit() took {elapsed:.3f}s, should return immediately"
+        # Clean up: wait for background work to finish
+        prefetcher.close()
+
+    def test_prediction_runs_on_background_thread(self, prefetch_setup):
+        """Prediction should run on the prediction thread, not the calling thread."""
+        import threading
+        from unittest.mock import patch
+
+        prefetcher, _, _, hidden, _, _ = prefetch_setup
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+
+        predict_thread_name = []
+        original_predict = prefetcher._predict
+
+        def capture_thread(*args, **kwargs):
+            predict_thread_name.append(threading.current_thread().name)
+            return original_predict(*args, **kwargs)
+
+        with patch.object(prefetcher, "_predict", side_effect=capture_thread):
+            prefetcher.submit(0, x)
+            prefetcher.close()  # wait for prediction to complete
+
+        assert len(predict_thread_name) == 1
+        assert "prefetch-predict" in predict_thread_name[0], (
+            f"Prediction ran on {predict_thread_name[0]!r}, expected prefetch-predict thread"
+        )
+
+    def test_submit_and_wait_async(self, prefetch_setup):
+        """submit + close should ensure prediction and I/O complete."""
+        prefetcher, _, _, hidden, _, _ = prefetch_setup
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+
+        prefetcher.submit(0, x)
+        # close() drains both prediction and I/O executors
+        prefetcher.close()
+
+        assert prefetcher.stats.submitted >= 1
+
+    def test_submit_bulk_async(self, prefetch_setup):
+        """submit_bulk should return quickly and process predictions in background."""
+        import time
+        from unittest.mock import patch
+
+        prefetcher, _, _, hidden, _, num_layers = prefetch_setup
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+
+        original_predict = prefetcher._predict
+
+        def slow_predict(*args, **kwargs):
+            time.sleep(0.2)
+            return original_predict(*args, **kwargs)
+
+        layer_states = {i: x for i in range(num_layers)}
+        with patch.object(prefetcher, "_predict", side_effect=slow_predict):
+            start = time.monotonic()
+            prefetcher.submit_bulk(layer_states)
+            elapsed = time.monotonic() - start
+
+        assert elapsed < 0.1, (
+            f"submit_bulk() took {elapsed:.3f}s, should return immediately"
+        )
+        # Wait for background to finish
+        prefetcher.close()
+
+    def test_prediction_failure_no_hang(self, prefetch_setup):
+        """If prediction raises, wait() should not hang."""
+        import threading
+        from unittest.mock import patch
+
+        prefetcher, _, _, hidden, _, _ = prefetch_setup
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+
+        with patch.object(
+            prefetcher, "_predict", side_effect=RuntimeError("prediction boom")
+        ):
+            prefetcher.submit(0, x)
+
+        # wait() should return promptly (no event was created)
+        completed = threading.Event()
+
+        def _wait():
+            prefetcher.wait(1)
+            completed.set()
+
+        t = threading.Thread(target=_wait)
+        t.start()
+        t.join(timeout=2.0)
+        assert completed.is_set(), "wait() hung after prediction failure"
+
+    def test_close_drains_prediction_queue(self, prefetch_setup):
+        """close() should block until in-flight predictions complete."""
+        import time
+        from unittest.mock import patch
+
+        prefetcher, _, _, hidden, _, _ = prefetch_setup
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+
+        original_predict = prefetcher._predict
+        predict_completed = False
+
+        def slow_predict(*args, **kwargs):
+            nonlocal predict_completed
+            time.sleep(0.3)
+            result = original_predict(*args, **kwargs)
+            predict_completed = True
+            return result
+
+        with patch.object(prefetcher, "_predict", side_effect=slow_predict):
+            prefetcher.submit(0, x)
+            prefetcher.close()
+
+        assert predict_completed, "close() returned before prediction finished"
+
+    def test_submit_after_close_no_error(self, prefetch_setup):
+        """submit() after close() should silently drop, not raise."""
+        prefetcher, _, _, hidden, _, _ = prefetch_setup
+        prefetcher.close()
+
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+        # Should not raise
+        prefetcher.submit(0, x)
 
 
 # ---------------------------------------------------------------------------
@@ -348,17 +516,16 @@ class TestFlashMLPWithPrefetcher:
         mlps, prefetcher, hidden = mlp_setup
         x = mx.random.normal((1, 1, hidden)).astype(mx.float16)
 
-        # Run layer 0 — should trigger prefetch for layer 1
+        # Run both layers without mx.eval between them — prediction runs
+        # on a background thread and mx.eval is not safe for concurrent calls.
         out0 = mlps[0](x)
-        mx.eval(out0)
-        assert out0.shape == (1, 1, hidden)
-
-        # Run layer 1 — should benefit from prefetch
         out1 = mlps[1](out0)
         mx.eval(out1)
+        assert out0.shape == (1, 1, hidden)
         assert out1.shape == (1, 1, hidden)
 
         # Prefetcher should have submitted at least 1 prefetch
+        prefetcher.close()
         assert prefetcher.stats.submitted >= 1
 
     def test_forward_without_prefetcher(self, tmp_path):

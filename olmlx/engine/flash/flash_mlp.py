@@ -179,9 +179,16 @@ class FlashMLP(nn.Module):
         else:
             combined = predicted_list
 
+        # Update window before submit — update calls mx.eval internally,
+        # and submit enqueues prediction to a background thread whose
+        # mx.eval must not overlap with the main thread's mx.eval.
+        self.window_manager.update(self.layer_idx, predicted)
+
         # Start prefetch for the NEXT layer before blocking on current I/O.
         # Uses flat_x (pre-MLP hidden state) as an approximate signal for
-        # the next layer's activation pattern.
+        # the next layer's activation pattern.  After this call returns,
+        # the main thread must avoid mx.eval until the next wait() call
+        # to prevent deadlock with the prediction thread.
         if self.prefetcher is not None:
             self.prefetcher.submit(self.layer_idx, flat_x)
 
@@ -190,13 +197,10 @@ class FlashMLP(nn.Module):
             self.layer_idx, combined
         )
 
-        # Sparse SwiGLU forward
+        # Sparse SwiGLU forward (all lazy — no mx.eval)
         gate_out = flat_x @ gate_cols
         up_out = flat_x @ up_cols
         act = mx.sigmoid(gate_out) * gate_out * up_out
         output = act @ down_rows
-
-        # Update window
-        self.window_manager.update(self.layer_idx, predicted)
 
         return output.reshape(orig_shape)
