@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -202,7 +203,12 @@ class FlashMoeModelWrapper(nn.Module):
             num_experts_per_tok,
         )
 
-    def __call__(self, inputs, cache=None, **kwargs):
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Any | None = None,
+        **kwargs: Any,
+    ) -> mx.array:
         """Forward pass — delegates to the wrapped model."""
         return self._model(inputs, cache=cache, **kwargs)
 

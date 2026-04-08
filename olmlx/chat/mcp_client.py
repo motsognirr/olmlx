@@ -1,13 +1,48 @@
 """MCP client manager for connecting to external tool servers."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import sys
-from typing import Any
+from typing import Any, Protocol
+from typing_extensions import TypedDict
 
 from olmlx.chat.config import sanitize_mcp_env
 
 logger = logging.getLogger(__name__)
+
+
+class MCPToolInputSchema(TypedDict, total=False):
+    """TypedDict for MCP tool input schema."""
+
+    type: str
+    properties: dict[str, Any]
+
+
+class MCPToolDict(TypedDict):
+    """TypedDict for MCP tool in config format."""
+
+    name: str
+    description: str
+    inputSchema: MCPToolInputSchema
+
+
+class MCPSessionProtocol(Protocol):
+    """Protocol for MCP ClientSession (for type annotation)."""
+
+    async def initialize(self) -> None: ...
+    async def list_tools(self) -> Any: ...
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any: ...
+
+
+class MCPTransport(Protocol):
+    """Protocol for MCP transport context manager."""
+
+    async def __aenter__(self) -> tuple[Any, Any]: ...
+    async def __aexit__(
+        self, exc_type: Any, exc_val: Any, exc_tb: Any
+    ) -> bool | None: ...
 
 
 class MCPClientManager:
@@ -19,8 +54,7 @@ class MCPClientManager:
         self._tools: list[dict] = []  # OpenAI function-calling format
 
     @staticmethod
-    def _convert_tool(mcp_tool: dict) -> dict:
-        """Convert MCP tool schema to OpenAI function-calling format."""
+    def _convert_tool(mcp_tool: MCPToolDict) -> dict[str, Any]:
         return {
             "type": "function",
             "function": {
@@ -36,7 +70,7 @@ class MCPClientManager:
             },
         }
 
-    async def connect_all(self, config: dict) -> None:
+    async def connect_all(self, config: dict[str, Any]) -> None:
         """Connect to each configured MCP server and discover tools."""
         for name, server_cfg in config.items():
             try:
@@ -47,7 +81,7 @@ class MCPClientManager:
             except Exception as exc:
                 logger.warning("Failed to connect to MCP server %r: %s", name, exc)
 
-    async def _connect_stdio(self, name: str, cfg: dict) -> None:
+    async def _connect_stdio(self, name: str, cfg: dict[str, Any]) -> None:
         """Connect to a stdio MCP server."""
         from mcp import StdioServerParameters
         from mcp.client.stdio import stdio_client
@@ -60,24 +94,24 @@ class MCPClientManager:
             args=cfg.get("args", []),
             env=safe_env,
         )
-        transport_cm = stdio_client(params)
+        transport_cm: MCPTransport = stdio_client(params)
         await self._connect_transport(name, transport_cm)
 
-    async def _connect_sse(self, name: str, cfg: dict) -> None:
+    async def _connect_sse(self, name: str, cfg: dict[str, Any]) -> None:
         """Connect to an SSE MCP server."""
         from mcp.client.sse import sse_client
 
-        transport_cm = sse_client(cfg["url"])
+        transport_cm: MCPTransport = sse_client(cfg["url"])
         await self._connect_transport(name, transport_cm)
 
-    async def _connect_transport(self, name: str, transport_cm: Any) -> None:
+    async def _connect_transport(self, name: str, transport_cm: MCPTransport) -> None:
         """Connect via a transport context manager, create session, discover tools."""
         from mcp import ClientSession
 
         read_stream, write_stream = await transport_cm.__aenter__()
         try:
             session_cm = ClientSession(read_stream, write_stream)
-            session = await session_cm.__aenter__()
+            session: MCPSessionProtocol = await session_cm.__aenter__()
             try:
                 await session.initialize()
             except BaseException:
@@ -99,9 +133,13 @@ class MCPClientManager:
             "transport_cm": transport_cm,
         }
 
-    async def _discover_tools(self, server_name: str, session: Any) -> None:
+    async def _discover_tools(
+        self, server_name: str, session: MCPSessionProtocol
+    ) -> None:
         """Discover tools from an MCP session and register them."""
-        result = await session.list_tools()
+        from mcp.types import ListToolsResult
+
+        result: ListToolsResult = await session.list_tools()
         for tool in result.tools:
             converted = self._convert_tool(
                 {

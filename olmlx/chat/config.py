@@ -7,7 +7,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from olmlx.chat.tool_safety import ToolSafetyConfig
@@ -50,7 +50,7 @@ class ChatConfig:
     plans_dir: Path = field(default_factory=lambda: Path.home() / ".olmlx" / "plans")
 
 
-def _load_json_file(path: Path) -> dict:
+def _load_json_file(path: Path) -> dict[str, Any]:
     """Load a JSON file with error handling. Returns empty dict on failure."""
     if not path.exists():
         return {}
@@ -68,7 +68,7 @@ def _load_json_file(path: Path) -> dict:
         return {}
 
 
-def load_mcp_config(path: Path) -> dict:
+def load_mcp_config(path: Path) -> dict[str, Any]:
     """Parse MCP config file in Claude Desktop format.
 
     Entries with ``command`` get ``transport: "stdio"``.

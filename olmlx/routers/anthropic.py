@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import AsyncIterator
 from functools import partial
+from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -238,7 +240,10 @@ def _sse(event: str, data: dict) -> str:
 _PING_SENTINEL = object()
 
 
-async def _with_keepalive_pings(aiter, interval=KEEPALIVE_PING_INTERVAL):
+async def _with_keepalive_pings(
+    aiter: AsyncIterator[Any],
+    interval: float = KEEPALIVE_PING_INTERVAL,
+) -> AsyncIterator[Any]:
     """Yield items from aiter; yield _PING_SENTINEL if no item arrives within interval seconds."""
     ait = aiter.__aiter__()
     next_item_task = None
@@ -306,7 +311,10 @@ def _emit_content_block(
     return events
 
 
-async def _stream_buffered_with_tools(result, declared_tools=None):
+async def _stream_buffered_with_tools(
+    result: AsyncIterator[dict[str, Any]],
+    declared_tools: list[dict[str, Any]] | None = None,
+) -> AsyncIterator[str]:
     """Buffer full output, parse tools, yield SSE strings. Yields a final dict with metadata."""
     text_chunks: list[str] = []
     raw_text = ""

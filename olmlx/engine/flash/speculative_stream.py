@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from collections.abc import Generator
-from typing import Any
+from typing import Any, Protocol
 
 import mlx.core as mx
 
@@ -20,13 +20,19 @@ from olmlx.utils.streaming import StreamToken
 logger = logging.getLogger(__name__)
 
 
+class TokenizerProtocol(Protocol):
+    """Protocol for tokenizer with decode method."""
+
+    def decode(self, token_ids: list[int]) -> str: ...
+
+
 def speculative_stream_generate(
     decoder: SpeculativeFlashDecoder,
     prompt_tokens: list[int],
     max_tokens: int,
     cancel_event: threading.Event,
     eos_token_id: int | None = None,
-    tokenizer: Any = None,
+    tokenizer: TokenizerProtocol | None = None,
 ) -> Generator[StreamToken, None, None]:
     """Sync generator that yields StreamToken objects for speculative decoding.
 

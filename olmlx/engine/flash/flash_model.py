@@ -9,6 +9,7 @@ from __future__ import annotations
 import gc
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -211,7 +212,12 @@ class FlashModelWrapper(nn.Module):
             attn_layer_count,
         )
 
-    def __call__(self, inputs, cache=None, **kwargs):
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Any | None = None,
+        **kwargs: Any,
+    ) -> mx.array:
         """Forward pass — delegates to the wrapped model."""
         return self._model(inputs, cache=cache, **kwargs)
 

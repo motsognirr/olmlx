@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -17,7 +17,7 @@ class OpenAIChatMessage(BaseModel):
     role: str
     content: str | None = None
     name: str | None = None
-    tool_calls: list[dict] | None = None
+    tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
 
 
@@ -50,8 +50,8 @@ class OpenAIChatRequest(BaseModel):
     max_completion_tokens: int | None = Field(None, ge=1)
     presence_penalty: float = Field(0.0, ge=-2, le=2)
     frequency_penalty: float = Field(0.0, ge=-2, le=2)
-    tools: list[dict] | None = None
-    tool_choice: str | dict | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
     seed: int | None = None
     response_format: ResponseFormat | None = None
 
