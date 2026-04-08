@@ -1274,31 +1274,45 @@ async def _stream_completion(
                 lm.prompt_cache_store.remove(cache_id)
                 # Trim cache to suffix_start so it aligns with where we resume
                 trim_amount = len(cached.tokens) - suffix_start
+                trimmed = 0
                 if trim_amount > 0:
-                    trim_prompt_cache(working_cache, trim_amount)
+                    trimmed = trim_prompt_cache(working_cache, trim_amount)
 
-                suffix_tokens = prompt_tokens[suffix_start:]
-
-                # Report suffix_start as cache_read — the number of tokens
-                # whose KV entries are actually reused from cache.  On exact
-                # match, suffix_start = prefix_len - 1 because stream_generate
-                # re-processes the token at suffix_start (its KV is not reused).
-                cache_read_tokens = suffix_start
-                cache_creation_tokens = len(suffix_tokens)
-                logger.info(
-                    "Prompt cache hit: %d prefix tokens reused, %d new tokens to process (was %d total)",
-                    prefix_len,
-                    len(suffix_tokens),
-                    len(prompt_tokens),
-                )
-                gen_kwargs["prompt_cache"] = working_cache
-                if lm.is_vlm:
-                    # VLM stream_generate expects a string prompt; pass
-                    # pre-tokenized tokens via input_ids to bypass prepare_inputs.
-                    gen_kwargs["input_ids"] = mx.array([suffix_tokens])
+                if trimmed == 0 and trim_amount > 0:
+                    # Cache layers are non-trimmable (e.g. Qwen3-Next hybrid
+                    # cache with ArraysCache for linear attention layers).
+                    # Fall through to create a fresh cache instead of passing
+                    # a stale, misaligned cache to stream_generate.
+                    logger.warning(
+                        "Prompt cache trim returned 0 (non-trimmable cache layers); "
+                        "discarding stale cache and creating fresh"
+                    )
+                    del working_cache
+                    # Fall through to fresh-cache creation below
                 else:
-                    prompt = suffix_tokens
-            else:
+                    suffix_tokens = prompt_tokens[suffix_start:]
+
+                    # Report suffix_start as cache_read — the number of tokens
+                    # whose KV entries are actually reused from cache.  On exact
+                    # match, suffix_start = prefix_len - 1 because stream_generate
+                    # re-processes the token at suffix_start (its KV is not reused).
+                    cache_read_tokens = suffix_start
+                    cache_creation_tokens = len(suffix_tokens)
+                    logger.info(
+                        "Prompt cache hit: %d prefix tokens reused, %d new tokens to process (was %d total)",
+                        prefix_len,
+                        len(suffix_tokens),
+                        len(prompt_tokens),
+                    )
+                    gen_kwargs["prompt_cache"] = working_cache
+                    if lm.is_vlm:
+                        # VLM stream_generate expects a string prompt; pass
+                        # pre-tokenized tokens via input_ids to bypass prepare_inputs.
+                        gen_kwargs["input_ids"] = mx.array([suffix_tokens])
+                    else:
+                        prompt = suffix_tokens
+
+            if "prompt_cache" not in gen_kwargs:
                 # No usable prefix — free old cache and create fresh
                 lm.prompt_cache_store.remove(cache_id)
                 kv_quant = lm.kv_cache_quant

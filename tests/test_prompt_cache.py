@@ -263,6 +263,89 @@ class TestCacheReusedOnPrefixMatch:
         )  # same object, removed from store before use
 
 
+class TestNonTrimmableCacheFallback:
+    @pytest.mark.asyncio
+    async def test_non_trimmable_cache_creates_fresh(self, mock_manager):
+        """When trim_prompt_cache returns 0 (e.g. ArraysCache layers), fall back to fresh cache.
+
+        Regression test for Qwen3-Next hybrid cache: ArraysCache.is_trimmable()
+        returns False, causing trim_prompt_cache to silently return 0.  Without
+        the fallback, the stale untrimmed cache is passed to stream_generate
+        with misaligned prompt tokens, producing garbage output.
+        """
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt v2")
+        lm.tokenizer.bos_token = None
+
+        # Previously cached: 5 prompt tokens + 2 generated tokens
+        stale_cache = [MagicMock()]
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50, 100, 101],
+                cache=stale_cache,
+            ),
+        )
+
+        # New prompt: shares first 5 tokens, adds 3 more
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50, 60, 70, 80])
+
+        tokens = _make_stream_tokens("New", " output", prompt_tokens=3)
+        mock_stream = _make_mock_stream(tokens)
+
+        # trim_prompt_cache returns 0 — simulates non-trimmable cache (ArraysCache)
+        mock_trim = MagicMock(return_value=0)
+
+        fresh_cache = [MagicMock()]
+        mock_make_cache = MagicMock(return_value=fresh_cache)
+
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ) as mock_async_stream,
+            patch(
+                "olmlx.engine.inference.trim_prompt_cache",
+                mock_trim,
+            ),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache",
+                mock_make_cache,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi again"}],
+                stream=True,
+            )
+            chunks = []
+            async for chunk in gen:
+                chunks.append(chunk)
+
+        # trim was attempted
+        mock_trim.assert_called_once()
+
+        # Since trim returned 0, should fall back to fresh cache
+        mock_make_cache.assert_called_once_with(lm.model)
+
+        # async_mlx_stream should receive the FULL prompt (not suffix)
+        # and the fresh cache (not the stale one)
+        call_args = mock_async_stream.call_args
+        prompt_cache_arg = call_args[1].get("prompt_cache")
+        assert prompt_cache_arg is fresh_cache
+        assert prompt_cache_arg is not stale_cache
+
+
 class TestCacheMissCreatesFresh:
     @pytest.mark.asyncio
     async def test_no_common_prefix_creates_fresh_cache(self, mock_manager):
