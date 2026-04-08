@@ -3233,8 +3233,7 @@ class TestKvCachePreflightCheckHelper:
                 cache_id="test",
             )
 
-        # VLM text path excluded, no tokens → skip check
-        mock_lm.is_vlm = True
+        # cache_creation_tokens=0 and no tokenizable prompt → num_prefill_tokens=0 → skip check
         assert result.memory_limit == 12 * 1024**3
 
     @pytest.mark.asyncio

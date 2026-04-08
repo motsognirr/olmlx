@@ -1760,6 +1760,7 @@ async def _stream_completion(
     stream = None
     generation_complete = False
     generated_tokens: list[int] = []
+    full_prompt_tokens: list[int] | None = None
     # Save original string prompt before cache setup may replace it with token IDs.
     # prompt is always str at entry; cache setup may later reassign it to list[int].
     original_prompt = prompt
