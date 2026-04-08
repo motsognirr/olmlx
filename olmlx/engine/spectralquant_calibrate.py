@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 def compute_covariance(data: mx.array) -> mx.array:
-    """Compute uncentered covariance matrix.
+    """Compute centered sample covariance matrix.
 
     Args:
         data: (N, D) matrix of vectors.

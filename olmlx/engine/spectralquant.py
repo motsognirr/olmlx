@@ -180,8 +180,10 @@ def spectral_quantize(
 
     # Compute norms in float32 to avoid overflow
     norms = mx.sqrt(mx.sum(x.astype(mx.float32) ** 2, axis=-1, keepdims=True))
-    # Keep guard in float32 — 1e-8 underflows to 0.0 in float16
-    x_norm = x / mx.maximum(norms, mx.array(1e-8, dtype=mx.float32)).astype(x.dtype)
+    # Normalize in float32 — 1e-8 underflows to 0.0 in float16
+    x_norm = (
+        x.astype(mx.float32) / mx.maximum(norms, mx.array(1e-8, dtype=mx.float32))
+    ).astype(x.dtype)
 
     # Rotate into spectral basis
     y = rotation.rotate(x_norm)
