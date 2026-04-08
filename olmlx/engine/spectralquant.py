@@ -91,7 +91,7 @@ def allocate_bits(d_eff: int, head_dim: int, avg_bits: int) -> tuple[int, int]:
     d_tail = head_dim - d_eff
 
     best_pair = (avg_bits, avg_bits)  # fallback: uniform
-    best_slack = abs(d_eff * avg_bits + d_tail * avg_bits - budget)
+    best_slack = float("inf")
 
     for b_high in range(8, 0, -1):
         for b_low in range(min(b_high, 8), 0, -1):
@@ -180,7 +180,8 @@ def spectral_quantize(
 
     # Compute norms in float32 to avoid overflow
     norms = mx.sqrt(mx.sum(x.astype(mx.float32) ** 2, axis=-1, keepdims=True))
-    x_norm = x / mx.maximum(norms.astype(x.dtype), mx.array(1e-8, dtype=x.dtype))
+    # Keep guard in float32 — 1e-8 underflows to 0.0 in float16
+    x_norm = x / mx.maximum(norms, mx.array(1e-8, dtype=mx.float32)).astype(x.dtype)
 
     # Rotate into spectral basis
     y = rotation.rotate(x_norm)

@@ -256,12 +256,6 @@ def make_spectral_cache(
     num_layers = len(model.layers)
     head_dim = _detect_head_dim(model)
 
-    # Determine n_kv_heads
-    model_cfg = getattr(model, "args", None) or getattr(model, "config", None)
-    n_kv_heads = getattr(model_cfg, "num_key_value_heads", None)
-    if n_kv_heads is None:
-        n_kv_heads = getattr(model_cfg, "num_attention_heads", 1)
-
     # Get default cache layout (hybrid model support)
     if hasattr(model, "make_cache"):
         default_caches = model.make_cache()
@@ -290,7 +284,13 @@ def make_spectral_cache(
             caches.append(default if default is not None else KVCache())
             continue
 
-        # For simplicity, use head 0's calibration for the layer cache
+        # Use the shared per-layer calibration (stored at head_idx=0).
+        # Calibration aggregates all heads' KV data into one covariance
+        # matrix per layer, so the rotation captures the cross-head
+        # eigenstructure.  Known limitation: individual heads can have
+        # different spectral profiles (especially in GQA/MHA models).
+        # Per-head rotation would be more precise but requires splitting
+        # inside update_and_fetch — tracked as future work.
         # (the cache operates on all heads simultaneously, so we use
         # per-layer calibration rather than per-head)
         rotation_k = SpectralRotation(key_cal["eigenvectors"])

@@ -117,6 +117,10 @@ class ModelLoadTimeoutError(TimeoutError):
     """Raised when model loading exceeds OLMLX_MODEL_LOAD_TIMEOUT."""
 
 
+class SpectralCalibrationMissingError(FileNotFoundError):
+    """Raised when SpectralQuant is configured but calibration data is absent."""
+
+
 @dataclass
 class CachedPromptState:
     """KV cache state from a previous generation, for prompt cache reuse."""
@@ -1192,7 +1196,7 @@ class ModelManager:
         spectral_path = self.store.local_path(hf_path) / "spectral"
         if spectral_path.exists() and (spectral_path / "spectral_config.json").exists():
             return spectral_path
-        raise FileNotFoundError(
+        raise SpectralCalibrationMissingError(
             f"SpectralQuant configured ({kv_cache_quant}) but no calibration data "
             f"found at {spectral_path}. Run 'olmlx spectral prepare <model>' first."
         )

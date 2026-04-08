@@ -317,87 +317,62 @@ def calibrate_model(
         for k in ("key", "value")
     }
 
-    # Hook attention layers by replacing them with wrapper objects that
-    # capture K/V projections.  We cannot monkey-patch __call__ on instances
-    # because Python resolves obj(x) via type(obj).__call__, bypassing any
-    # instance attribute.  Instead we swap the self_attn attribute on each
-    # layer with a thin wrapper that delegates and records.
-    import mlx.nn as nn
+    # Collect post-RoPE K/V vectors by running each sample with a fresh
+    # KV cache, then extracting the cached tensors.  This captures keys and
+    # values *after* rotary positional embeddings — the actual distribution
+    # that gets stored in the KV cache at inference time.
+    from mlx_lm.models.cache import make_prompt_cache
 
-    class _KVCapturingAttn(nn.Module):
-        """Wraps an attention module to capture K/V projections."""
+    cache_model = inner if hasattr(inner, "layers") else model
+    for sample_idx, text in enumerate(texts):
+        tokens = _encode_tokens(tokenizer, text)
+        if len(tokens) > 512:
+            tokens = tokens[:512]
+        input_ids = mx.array([tokens])
 
-        def __init__(self, wrapped, layer_idx, collectors, collected):
-            super().__init__()
-            self._wrapped = wrapped
-            self._layer_idx = layer_idx
-            self._collectors = collectors
-            self._collected = collected
-            # Expose k_proj/v_proj so any external introspection still works
-            self.k_proj = wrapped.k_proj
-            self.v_proj = wrapped.v_proj
+        # Create a fresh cache and run the forward pass
+        prompt_cache = make_prompt_cache(cache_model)
+        try:
+            model(input_ids, cache=prompt_cache)
+        except Exception as exc:
+            logger.debug("Skipping sample %d: %s", sample_idx, exc)
+            continue
+        mx.eval([c.state for c in prompt_cache if hasattr(c, "state")])
 
-        def __call__(self, x, mask=None, cache=None):
-            result = self._wrapped(x, mask=mask, cache=cache)
-
-            # Re-compute K/V projections (cheap compared to full attention)
-            k = self._wrapped.k_proj(x)
-            v = self._wrapped.v_proj(x)
-            mx.eval(k, v)
-
-            B, S = k.shape[:2]
-            k = k.reshape(B, S, n_kv_heads, head_dim)
-            v = v.reshape(B, S, n_kv_heads, head_dim)
-
-            li = self._layer_idx
-            for h in range(n_kv_heads):
-                if self._collected[(li, h, "key")] < max_tokens_per_head:
-                    k_h = k[:, :, h, :].reshape(-1, head_dim)
-                    remaining = max_tokens_per_head - self._collected[(li, h, "key")]
-                    k_h = k_h[:remaining]
-                    self._collectors[li][h]["key"].append(k_h)
-                    self._collected[(li, h, "key")] += k_h.shape[0]
-
-                if self._collected[(li, h, "value")] < max_tokens_per_head:
-                    v_h = v[:, :, h, :].reshape(-1, head_dim)
-                    remaining = max_tokens_per_head - self._collected[(li, h, "value")]
-                    v_h = v_h[:remaining]
-                    self._collectors[li][h]["value"].append(v_h)
-                    self._collected[(li, h, "value")] += v_h.shape[0]
-
-            return result
-
-    # Install hooks — save originals for cleanup
-    original_attns = {}
-    for i in range(num_layers):
-        original_attns[i] = layers[i].self_attn
-        layers[i].self_attn = _KVCapturingAttn(
-            layers[i].self_attn, i, kv_collectors, tokens_collected
-        )
-
-    # Run calibration texts through the model (with try/finally to ensure cleanup)
-    try:
-        for sample_idx, text in enumerate(texts):
-            tokens = _encode_tokens(tokenizer, text)
-            if len(tokens) > 512:
-                tokens = tokens[:512]
-            input_ids = mx.array([tokens])
-
-            try:
-                model(input_ids)
-            except Exception as exc:
-                logger.debug("Skipping sample %d: %s", sample_idx, exc)
+        # Extract K/V from each layer's cache
+        for layer_idx in range(min(num_layers, len(prompt_cache))):
+            cache_entry = prompt_cache[layer_idx]
+            state = cache_entry.state if hasattr(cache_entry, "state") else None
+            if not state or len(state) < 2:
                 continue
+            # KVCache.state returns [keys, values] with shape
+            # (1, n_kv_heads, seq_len, head_dim)
+            cached_keys = state[0]  # (1, n_kv_heads, seq, head_dim)
+            cached_values = state[1]  # (1, n_kv_heads, seq, head_dim)
 
-            if progress_callback:
-                frac = 0.1 + (sample_idx + 1) / len(texts) * 0.4
-                progress_callback(
-                    f"Collected {sample_idx + 1}/{len(texts)} samples", frac
-                )
-    finally:
-        # Restore original attention modules
-        for i in range(num_layers):
-            layers[i].self_attn = original_attns[i]
+            for h in range(min(n_kv_heads, cached_keys.shape[1])):
+                if tokens_collected[(layer_idx, h, "key")] < max_tokens_per_head:
+                    k_h = cached_keys[0, h, :, :]  # (seq, head_dim)
+                    remaining = (
+                        max_tokens_per_head - tokens_collected[(layer_idx, h, "key")]
+                    )
+                    k_h = k_h[:remaining]
+                    kv_collectors[layer_idx][h]["key"].append(k_h)
+                    tokens_collected[(layer_idx, h, "key")] += k_h.shape[0]
+
+                if tokens_collected[(layer_idx, h, "value")] < max_tokens_per_head:
+                    v_h = cached_values[0, h, :, :]  # (seq, head_dim)
+                    remaining = (
+                        max_tokens_per_head - tokens_collected[(layer_idx, h, "value")]
+                    )
+                    v_h = v_h[:remaining]
+                    kv_collectors[layer_idx][h]["value"].append(v_h)
+                    tokens_collected[(layer_idx, h, "value")] += v_h.shape[0]
+
+        del prompt_cache
+        if progress_callback:
+            frac = 0.1 + (sample_idx + 1) / len(texts) * 0.4
+            progress_callback(f"Collected {sample_idx + 1}/{len(texts)} samples", frac)
 
     if progress_callback:
         progress_callback("Running eigenspectral analysis", 0.5)
