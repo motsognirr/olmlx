@@ -348,7 +348,7 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 
 | Variable | Default | Description |
 |---|---|---|
-| `OLMLX_EXPERIMENTAL_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x) or `turboquant:2` (~7.5x) |
+| `OLMLX_EXPERIMENTAL_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), or `spectral:2` |
 
 ### Flash-MoE settings (experimental)
 
@@ -421,7 +421,17 @@ OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:4
 OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:2
 ```
 
-Note: TurboQuant is incompatible with disk cache offload.
+**SpectralQuant** improves on TurboQuant with data-driven eigenvector rotations and non-uniform bit allocation (~19% better compression, +2.6pp cosine similarity). Requires one-time calibration:
+
+```bash
+# Calibrate the model (one-time, ~15 seconds)
+olmlx spectral prepare <model>
+
+# Use spectral quant
+OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=spectral:4
+```
+
+Note: TurboQuant and SpectralQuant are incompatible with disk cache offload.
 
 ## Distributed Inference (Experimental)
 

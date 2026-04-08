@@ -440,13 +440,19 @@ def _estimate_kv_cache_bytes(
     )
     bytes_per_element = 2  # float16/bfloat16
 
-    if kv_cache_quant is not None and kv_cache_quant.startswith("turboquant:"):
-        tq_bits = int(kv_cache_quant.split(":")[1])
-        # fp16: head_dim * 2 bytes per K or V entry
+    if kv_cache_quant is not None:
+        method, bits_str = kv_cache_quant.split(":")
+        quant_bits = int(bits_str)
         fp16_per_entry = head_dim * bytes_per_element
-        # TurboQuant: packed indices + float32 norm
-        tq_per_entry = head_dim // (8 // tq_bits) + 4  # 4 bytes for f32 norm
-        _tq_ratio = tq_per_entry / fp16_per_entry
+        if method == "turboquant":
+            # TurboQuant: packed indices + float32 norm
+            tq_per_entry = head_dim // (8 // quant_bits) + 4  # 4 bytes for f32 norm
+            _tq_ratio = tq_per_entry / fp16_per_entry
+        elif method == "spectral":
+            # SpectralQuant: two packed regimes (semantic + tail) + float32 norm
+            # Conservative estimate using avg_bits (actual varies per head)
+            sq_per_entry = head_dim // (8 // quant_bits) + 4
+            _tq_ratio = sq_per_entry / fp16_per_entry
 
     # Try layer introspection for NAS/variable-attention models.
     # Track which sub-model owns the args so we introspect the right layers
@@ -998,6 +1004,16 @@ def _make_turboquant_prompt_cache(model: Any, bits: int, is_vlm: bool = False) -
     return make_turboquant_cache(cache_model, bits=bits)
 
 
+def _make_spectral_prompt_cache(
+    model: Any, bits: int, calibration_dir: Any, is_vlm: bool = False
+) -> list:
+    """Create a SpectralQuant-compressed prompt cache for the model."""
+    from olmlx.engine.spectralquant_cache import make_spectral_cache
+
+    cache_model = _get_model_for_cache(model, is_vlm)
+    return make_spectral_cache(cache_model, calibration_dir, avg_bits=bits)
+
+
 def _extract_images(messages: list[dict]) -> list[str] | None:
     """Extract image URLs/paths from message content."""
     images = []
@@ -1287,10 +1303,19 @@ async def _stream_completion(
                 lm.prompt_cache_store.remove(cache_id)
                 kv_quant = lm.kv_cache_quant
                 if kv_quant is not None:
-                    bits = int(kv_quant.split(":")[1])
-                    new_cache = _make_turboquant_prompt_cache(
-                        lm.model, bits, is_vlm=lm.is_vlm
-                    )
+                    method, bits_str = kv_quant.split(":")
+                    bits = int(bits_str)
+                    if method == "spectral":
+                        new_cache = _make_spectral_prompt_cache(
+                            lm.model,
+                            bits,
+                            lm.spectral_calibration_dir,
+                            is_vlm=lm.is_vlm,
+                        )
+                    else:
+                        new_cache = _make_turboquant_prompt_cache(
+                            lm.model, bits, is_vlm=lm.is_vlm
+                        )
                 else:
                     cache_model = _get_model_for_cache(lm.model, lm.is_vlm)
                     new_cache = make_prompt_cache(cache_model)

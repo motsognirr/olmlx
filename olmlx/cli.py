@@ -1085,6 +1085,42 @@ def _flash_progress(desc, frac):
         print()
 
 
+def cmd_spectral_prepare(args):
+    """Prepare a model for spectral quant (eigenspectral calibration)."""
+    _configure_logging()
+
+    store = _create_store()
+    _resolved = store.registry.resolve(args.model)
+    hf_path = _resolved.hf_path if _resolved is not None else args.model
+    local_dir = store.ensure_downloaded(hf_path)
+    model_path = str(local_dir)
+
+    print(f"Running spectral calibration for {args.model}...")
+    print(f"  Model path: {model_path}")
+    print(f"  Average bits: {args.avg_bits}")
+    dataset_label = args.calibration_dataset or "c4"
+    print(f"  Calibration dataset: {dataset_label}")
+    print(f"  Calibration samples: {args.samples}")
+    print(f"  Max tokens per head: {args.max_tokens}")
+    print()
+
+    from olmlx.engine.spectralquant_calibrate import calibrate_model
+
+    output_dir = calibrate_model(
+        model_path=model_path,
+        num_samples=args.samples,
+        calibration_dataset=args.calibration_dataset,
+        avg_bits=args.avg_bits,
+        max_tokens_per_head=args.max_tokens,
+        progress_callback=_flash_progress,
+    )
+
+    print("\nSpectral calibration complete!")
+    print(f"  Output: {output_dir}")
+    print("\nTo use spectral quant:")
+    print(f"  OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=spectral:{args.avg_bits} olmlx serve")
+
+
 def cmd_flash_prepare(args):
     """Prepare a model for flash inference (auto-detects MoE vs dense)."""
     _configure_logging()
@@ -1361,6 +1397,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     info_p.add_argument("model", help="Model name or HF path")
 
+    # Spectral quant calibration
+    spectral = sub.add_parser("spectral", help="SpectralQuant KV cache compression")
+    spectral_sub = spectral.add_subparsers(dest="spectral_command")
+
+    spectral_prepare_p = spectral_sub.add_parser(
+        "prepare", help="Run spectral calibration for a model"
+    )
+    spectral_prepare_p.add_argument("model", help="Model name or HF path")
+    spectral_prepare_p.add_argument(
+        "--samples",
+        type=int,
+        default=256,
+        help="Number of calibration samples (default: 256)",
+    )
+    spectral_prepare_p.add_argument(
+        "--avg-bits",
+        type=int,
+        default=4,
+        choices=[2, 4],
+        help="Target average bits per dimension (default: 4)",
+    )
+    spectral_prepare_p.add_argument(
+        "--calibration-dataset",
+        type=str,
+        default=None,
+        help="Calibration dataset: 'c4' (default) or 'synthetic'",
+    )
+    spectral_prepare_p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=8192,
+        help="Max tokens to collect per head (default: 8192)",
+    )
+
     # Bench (benchmarking)
     bench = sub.add_parser("bench", help="Benchmarking and functional tests")
     bench_sub = bench.add_subparsers(dest="bench_command")
@@ -1440,6 +1510,11 @@ def cli_main():
             cmd_flash_info(args)
         else:
             parser.parse_args(["flash", "--help"])
+    elif args.command == "spectral":
+        if args.spectral_command == "prepare":
+            cmd_spectral_prepare(args)
+        else:
+            parser.parse_args(["spectral", "--help"])
     elif args.command == "bench":
         if args.bench_command == "run":
             cmd_bench_run(args)
