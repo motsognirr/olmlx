@@ -105,9 +105,12 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
 
 def _is_serializable_cache(cache: list) -> bool:
     """Check if a cache list can be serialized with mlx-lm's save_prompt_cache."""
+    from olmlx.engine.spectralquant_cache import SpectralQuantKVCache
     from olmlx.engine.turboquant_cache import TurboQuantKVCache
 
-    return not any(isinstance(c, TurboQuantKVCache) for c in cache)
+    return not any(
+        isinstance(c, (TurboQuantKVCache, SpectralQuantKVCache)) for c in cache
+    )
 
 
 class ModelLoadTimeoutError(TimeoutError):
@@ -463,6 +466,7 @@ class LoadedModel:
     )
     prompt_cache_store: PromptCacheStore = field(default=None)  # type: ignore[assignment]
     kv_cache_quant: str | None = None
+    spectral_calibration_dir: Any = None  # Path | None, typed as Any to avoid import
     default_options: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -839,6 +843,9 @@ class ModelManager:
                         template_caps=caps,
                         expires_at=expires,
                         kv_cache_quant=model_exp.kv_cache_quant,
+                        spectral_calibration_dir=self._find_spectral_dir(
+                            hf_path, model_exp.kv_cache_quant
+                        ),
                         default_options=dict(model_config.options),
                     )
                     self._loaded[normalized] = lm
@@ -1173,6 +1180,20 @@ class ModelManager:
         if flash_path.exists() and (flash_path / "flash_layout.json").exists():
             return flash_path
         return None
+
+    def _find_spectral_dir(self, hf_path: str, kv_cache_quant: str | None) -> Path | None:
+        """Return the spectral calibration directory if spectral quant is configured."""
+        if kv_cache_quant is None or not kv_cache_quant.startswith("spectral:"):
+            return None
+        if self.store is None:
+            return None
+        spectral_path = self.store.local_path(hf_path) / "spectral"
+        if spectral_path.exists() and (spectral_path / "spectral_config.json").exists():
+            return spectral_path
+        raise FileNotFoundError(
+            f"SpectralQuant configured ({kv_cache_quant}) but no calibration data "
+            f"found at {spectral_path}. Run 'olmlx spectral prepare <model>' first."
+        )
 
     def _is_flash_enabled(self, model_exp: Any) -> bool:
         return model_exp.flash

@@ -94,7 +94,7 @@ class ExperimentalSettings(BaseSettings):
     def validate_kv_cache_quant(cls, v: str | None) -> str | None:
         if v is None:
             return v
-        _VALID_METHODS = {"turboquant"}
+        _VALID_METHODS = {"turboquant", "spectral"}
         _VALID_BITS = {"2", "4"}
         parts = v.split(":", 1)
         if (
