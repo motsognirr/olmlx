@@ -75,7 +75,7 @@ class SpectralQuantKVCache(_BaseCache):
             if bits == 1:
                 return (dim + 7) // 8
             factor = 8 // bits
-            return dim // factor
+            return (dim + factor - 1) // factor
 
         return _packed(self.d_eff, self.bits_high), _packed(d_tail, self.bits_low)
 

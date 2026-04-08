@@ -250,6 +250,10 @@ def spectral_dequantize(
     return result.astype(dtype) if dtype is not None else result
 
 
+# TODO: Wire QJLSketcher into SpectralQuantKVCache for attention score
+# correction.  Currently unused — scores are computed on raw dequantized keys.
+
+
 class QJLSketcher:
     """Selective Johnson-Lindenstrauss sketcher for attention score correction.
 

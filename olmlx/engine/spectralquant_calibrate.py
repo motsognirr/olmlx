@@ -317,71 +317,87 @@ def calibrate_model(
         for k in ("key", "value")
     }
 
-    # Hook into attention layers to capture K/V after projection
-    original_calls = {}
+    # Hook attention layers by replacing them with wrapper objects that
+    # capture K/V projections.  We cannot monkey-patch __call__ on instances
+    # because Python resolves obj(x) via type(obj).__call__, bypassing any
+    # instance attribute.  Instead we swap the self_attn attribute on each
+    # layer with a thin wrapper that delegates and records.
+    import mlx.nn as nn
 
-    def _make_hooked_call(original_call, attn, layer_idx, collectors, collected):
-        """Create a hooked attention call that captures K/V vectors."""
+    class _KVCapturingAttn(nn.Module):
+        """Wraps an attention module to capture K/V projections."""
 
-        def hooked_call(x, mask=None, cache=None):
-            result = original_call(x, mask=mask, cache=cache)
+        def __init__(self, wrapped, layer_idx, collectors, collected):
+            super().__init__()
+            self._wrapped = wrapped
+            self._layer_idx = layer_idx
+            self._collectors = collectors
+            self._collected = collected
+            # Expose k_proj/v_proj so any external introspection still works
+            self.k_proj = wrapped.k_proj
+            self.v_proj = wrapped.v_proj
+
+        def __call__(self, x, mask=None, cache=None):
+            result = self._wrapped(x, mask=mask, cache=cache)
 
             # Re-compute K/V projections (cheap compared to full attention)
-            k = attn.k_proj(x)  # (B, seq, n_kv_heads * head_dim)
-            v = attn.v_proj(x)  # (B, seq, n_kv_heads * head_dim)
+            k = self._wrapped.k_proj(x)
+            v = self._wrapped.v_proj(x)
             mx.eval(k, v)
 
             B, S = k.shape[:2]
             k = k.reshape(B, S, n_kv_heads, head_dim)
             v = v.reshape(B, S, n_kv_heads, head_dim)
 
+            li = self._layer_idx
             for h in range(n_kv_heads):
-                if collected[(layer_idx, h, "key")] < max_tokens_per_head:
+                if self._collected[(li, h, "key")] < max_tokens_per_head:
                     k_h = k[:, :, h, :].reshape(-1, head_dim)
-                    remaining = max_tokens_per_head - collected[(layer_idx, h, "key")]
+                    remaining = max_tokens_per_head - self._collected[(li, h, "key")]
                     k_h = k_h[:remaining]
-                    collectors[layer_idx][h]["key"].append(k_h)
-                    collected[(layer_idx, h, "key")] += k_h.shape[0]
+                    self._collectors[li][h]["key"].append(k_h)
+                    self._collected[(li, h, "key")] += k_h.shape[0]
 
-                if collected[(layer_idx, h, "value")] < max_tokens_per_head:
+                if self._collected[(li, h, "value")] < max_tokens_per_head:
                     v_h = v[:, :, h, :].reshape(-1, head_dim)
-                    remaining = max_tokens_per_head - collected[(layer_idx, h, "value")]
+                    remaining = max_tokens_per_head - self._collected[(li, h, "value")]
                     v_h = v_h[:remaining]
-                    collectors[layer_idx][h]["value"].append(v_h)
-                    collected[(layer_idx, h, "value")] += v_h.shape[0]
+                    self._collectors[li][h]["value"].append(v_h)
+                    self._collected[(li, h, "value")] += v_h.shape[0]
 
             return result
 
-        return hooked_call
-
-    # Install hooks
+    # Install hooks — save originals for cleanup
+    original_attns = {}
     for i in range(num_layers):
-        attn = layers[i].self_attn
-        original_calls[i] = attn.__call__
-        attn.__call__ = _make_hooked_call(
-            attn.__call__, attn, i, kv_collectors, tokens_collected
+        original_attns[i] = layers[i].self_attn
+        layers[i].self_attn = _KVCapturingAttn(
+            layers[i].self_attn, i, kv_collectors, tokens_collected
         )
 
-    # Run calibration texts through the model
-    for sample_idx, text in enumerate(texts):
-        tokens = _encode_tokens(tokenizer, text)
-        if len(tokens) > 512:
-            tokens = tokens[:512]
-        input_ids = mx.array([tokens])
+    # Run calibration texts through the model (with try/finally to ensure cleanup)
+    try:
+        for sample_idx, text in enumerate(texts):
+            tokens = _encode_tokens(tokenizer, text)
+            if len(tokens) > 512:
+                tokens = tokens[:512]
+            input_ids = mx.array([tokens])
 
-        try:
-            model(input_ids)
-        except Exception as exc:
-            logger.debug("Skipping sample %d: %s", sample_idx, exc)
-            continue
+            try:
+                model(input_ids)
+            except Exception as exc:
+                logger.debug("Skipping sample %d: %s", sample_idx, exc)
+                continue
 
-        if progress_callback:
-            frac = 0.1 + (sample_idx + 1) / len(texts) * 0.4
-            progress_callback(f"Collected {sample_idx + 1}/{len(texts)} samples", frac)
-
-    # Remove hooks
-    for i in range(num_layers):
-        layers[i].self_attn.__call__ = original_calls[i]
+            if progress_callback:
+                frac = 0.1 + (sample_idx + 1) / len(texts) * 0.4
+                progress_callback(
+                    f"Collected {sample_idx + 1}/{len(texts)} samples", frac
+                )
+    finally:
+        # Restore original attention modules
+        for i in range(num_layers):
+            layers[i].self_attn = original_attns[i]
 
     if progress_callback:
         progress_callback("Running eigenspectral analysis", 0.5)
