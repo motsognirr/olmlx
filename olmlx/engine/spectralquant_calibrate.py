@@ -374,6 +374,14 @@ def calibrate_model(
             frac = 0.1 + (sample_idx + 1) / len(texts) * 0.4
             progress_callback(f"Collected {sample_idx + 1}/{len(texts)} samples", frac)
 
+    # Guard: if no KV vectors were collected, fail early with a clear message
+    total_collected = sum(tokens_collected.values())
+    if total_collected == 0:
+        raise RuntimeError(
+            "No KV vectors were collected during calibration. "
+            "All forward passes failed — check that the model loads correctly."
+        )
+
     if progress_callback:
         progress_callback("Running eigenspectral analysis", 0.5)
 

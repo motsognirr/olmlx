@@ -175,9 +175,6 @@ def spectral_quantize(
     Returns:
         (packed_sem, packed_tail, norms): bit-packed indices + float32 norms.
     """
-    head_dim = x.shape[-1]
-    d_tail = head_dim - d_eff
-
     # Compute norms in float32 to avoid overflow
     norms = mx.sqrt(mx.sum(x.astype(mx.float32) ** 2, axis=-1, keepdims=True))
     # Normalize in float32 — 1e-8 underflows to 0.0 in float16
@@ -193,14 +190,14 @@ def spectral_quantize(
     y_tail = y[..., d_eff:]
 
     # Quantize each regime: find nearest centroid via vectorized broadcast
-    def _quantize_regime(data, codebook, bits, dim):
+    def _quantize_regime(data, codebook, bits):
         # (..., dim, 1) vs (n_centroids,) → (..., dim, n_centroids)
         dists = mx.abs(data[..., None] - codebook)
         best_idx = mx.argmin(dists, axis=-1).astype(mx.uint8)
         return pack_indices(best_idx, bits)
 
-    packed_sem = _quantize_regime(y_sem, codebook_sem, bits_high, d_eff)
-    packed_tail = _quantize_regime(y_tail, codebook_tail, bits_low, d_tail)
+    packed_sem = _quantize_regime(y_sem, codebook_sem, bits_high)
+    packed_tail = _quantize_regime(y_tail, codebook_tail, bits_low)
 
     return packed_sem, packed_tail, norms
 

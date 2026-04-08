@@ -247,11 +247,29 @@ def make_spectral_cache(
         List of cache objects (SpectralQuantKVCache for attention layers,
         preserved for non-attention layers).
     """
+    import json
+
     from olmlx.engine.spectralquant_calibrate import load_calibration
     from olmlx.engine.turboquant_cache import _detect_head_dim
 
     calibration_dir = Path(calibration_dir)
     calibration = load_calibration(calibration_dir)
+
+    # Warn if runtime avg_bits differs from what the calibration was trained with
+    config_path = calibration_dir / "spectral_config.json"
+    if config_path.exists():
+        meta = json.loads(config_path.read_text()).get("meta", {})
+        cal_bits = meta.get("avg_bits")
+        if cal_bits is not None and cal_bits != avg_bits:
+            logger.warning(
+                "Calibration was run with avg_bits=%d but spectral:%d was configured; "
+                "using calibrated bit allocation (%d-bit). Re-run "
+                "'olmlx spectral prepare' with --avg-bits %d to match.",
+                cal_bits,
+                avg_bits,
+                cal_bits,
+                avg_bits,
+            )
 
     num_layers = len(model.layers)
     head_dim = _detect_head_dim(model)
