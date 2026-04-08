@@ -1181,7 +1181,9 @@ class ModelManager:
             return flash_path
         return None
 
-    def _find_spectral_dir(self, hf_path: str, kv_cache_quant: str | None) -> Path | None:
+    def _find_spectral_dir(
+        self, hf_path: str, kv_cache_quant: str | None
+    ) -> Path | None:
         """Return the spectral calibration directory if spectral quant is configured."""
         if kv_cache_quant is None or not kv_cache_quant.startswith("spectral:"):
             return None

@@ -1307,7 +1307,9 @@ async def _stream_completion(
                     bits = int(bits_str)
                     if method == "spectral":
                         new_cache = _make_spectral_prompt_cache(
-                            lm.model, bits, lm.spectral_calibration_dir,
+                            lm.model,
+                            bits,
+                            lm.spectral_calibration_dir,
                             is_vlm=lm.is_vlm,
                         )
                     else:
