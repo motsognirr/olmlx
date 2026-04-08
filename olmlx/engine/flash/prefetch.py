@@ -164,6 +164,13 @@ class Prefetcher:
         where the target pass starts immediately after ``submit_bulk``
         returns — serialising predictions on the background thread would
         delay later layers' I/O.
+
+        .. warning::
+           Must not be called while a ``submit()``-based prediction thread
+           is in-flight — ``_predict()`` calls ``mx.eval`` internally, which
+           would deadlock with the concurrent ``mx.eval`` on the prediction
+           thread.  Current callers (``_submit_draft_prefetch``) invoke this
+           between forward-pass steps when no prediction is in-flight.
         """
         for layer_idx, hidden in layer_hidden_states.items():
             if layer_idx >= self._num_layers:
@@ -201,6 +208,8 @@ class Prefetcher:
             self._enqueue_io(next_layer, indices, state)
         except Exception:
             logger.warning("Prediction failed for layer %d", next_layer, exc_info=True)
+            with self._lock:
+                self.stats.failures += 1
             state.done.set()
 
     def _predict(self, layer_idx: int, hidden_state: mx.array) -> list[int]:
