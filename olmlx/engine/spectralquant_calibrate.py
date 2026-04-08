@@ -32,7 +32,9 @@ def compute_covariance(data: mx.array) -> mx.array:
     """
     data = data.astype(mx.float32)
     n = data.shape[0]
-    return (data.T @ data) / n
+    mean = mx.mean(data, axis=0, keepdims=True)
+    data_c = data - mean
+    return (data_c.T @ data_c) / n
 
 
 def eigendecompose(cov: mx.array) -> tuple[mx.array, mx.array]:
@@ -373,8 +375,6 @@ def calibrate_model(
             logger.debug("Skipping sample %d: %s", sample_idx, exc)
             continue
 
-        mx.eval([])  # Ensure computation is done
-
         if progress_callback:
             frac = 0.1 + (sample_idx + 1) / len(texts) * 0.4
             progress_callback(f"Collected {sample_idx + 1}/{len(texts)} samples", frac)
@@ -386,32 +386,37 @@ def calibrate_model(
     if progress_callback:
         progress_callback("Running eigenspectral analysis", 0.5)
 
-    # Calibrate each head
+    # Calibrate per layer by aggregating all heads.
+    # The KV cache operates on all heads simultaneously (shape: B, n_heads,
+    # seq, head_dim), so a single rotation per layer is applied to every head.
+    # Aggregating across heads produces a rotation that captures the shared
+    # eigenstructure rather than being tuned to one head's statistics.
     calibration: CalibrationData = {}
-    total_heads = num_layers * n_kv_heads * 2  # key + value
+    total_items = num_layers * 2  # key + value per layer
     done = 0
 
     for layer_idx in range(num_layers):
-        for head_idx in range(n_kv_heads):
-            for kind in ("key", "value"):
-                chunks = kv_collectors[layer_idx][head_idx][kind]
-                if not chunks:
-                    logger.warning(
-                        "No KV data for layer %d head %d %s, skipping",
-                        layer_idx,
-                        head_idx,
-                        kind,
-                    )
-                    continue
+        for kind in ("key", "value"):
+            # Concatenate all heads' data for this layer+kind
+            all_chunks = []
+            for head_idx in range(n_kv_heads):
+                all_chunks.extend(kv_collectors[layer_idx][head_idx][kind])
+            if not all_chunks:
+                logger.warning(
+                    "No KV data for layer %d %s, skipping",
+                    layer_idx,
+                    kind,
+                )
+                continue
 
-                kv_data = mx.concatenate(chunks, axis=0)
-                result = calibrate_head(kv_data, avg_bits=avg_bits)
-                calibration[(layer_idx, head_idx, kind)] = result
+            kv_data = mx.concatenate(all_chunks, axis=0)
+            result = calibrate_head(kv_data, avg_bits=avg_bits)
+            calibration[(layer_idx, 0, kind)] = result
 
-                done += 1
-                if progress_callback:
-                    frac = 0.5 + done / total_heads * 0.4
-                    progress_callback(f"Calibrated {done}/{total_heads} heads", frac)
+            done += 1
+            if progress_callback:
+                frac = 0.5 + done / total_items * 0.4
+                progress_callback(f"Calibrated {done}/{total_items} layer-kinds", frac)
 
     # Free collectors
     del kv_collectors

@@ -23,11 +23,18 @@ def pack_indices(indices: mx.array, bits: int) -> mx.array:
     if bits == 8:
         return indices.astype(mx.uint8)
     if bits == 1:
-        # Pack 8 indices per byte (pad to full byte if dim not multiple of 8)
+        # Pack 8 indices per byte — pad to next multiple of 8 first so
+        # indices[..., i::8] always has shape (..., n_bytes) for every i.
         dim = indices.shape[-1]
         n_bytes = (dim + 7) // 8
+        pad = n_bytes * 8 - dim
+        if pad > 0:
+            indices = mx.concatenate(
+                [indices, mx.zeros(indices.shape[:-1] + (pad,), dtype=mx.uint8)],
+                axis=-1,
+            )
         result = mx.zeros(indices.shape[:-1] + (n_bytes,), dtype=mx.uint8)
-        for i in range(min(8, dim)):
+        for i in range(8):
             result = result | ((indices[..., i::8] & 0x1) << i).astype(mx.uint8)
         return result
     return _tq_pack(indices, bits)
@@ -182,15 +189,11 @@ def spectral_quantize(
     y_sem = y[..., :d_eff]
     y_tail = y[..., d_eff:]
 
-    # Quantize each regime with its codebook (iterate centroids to avoid OOM)
+    # Quantize each regime: find nearest centroid via vectorized broadcast
     def _quantize_regime(data, codebook, bits, dim):
-        best_idx = mx.zeros(data.shape, dtype=mx.uint8)
-        best_dist = mx.full(data.shape, float("inf"))
-        for ci in range(len(codebook)):
-            d = mx.abs(data - codebook[ci])
-            better = d < best_dist
-            best_idx = mx.where(better, mx.array(ci, dtype=mx.uint8), best_idx)
-            best_dist = mx.minimum(best_dist, d)
+        # (..., dim, 1) vs (n_centroids,) → (..., dim, n_centroids)
+        dists = mx.abs(data[..., None] - codebook)
+        best_idx = mx.argmin(dists, axis=-1).astype(mx.uint8)
         return pack_indices(best_idx, bits)
 
     packed_sem = _quantize_regime(y_sem, codebook_sem, bits_high, d_eff)
