@@ -789,7 +789,9 @@ _CLIENT_TOOL_FORMAT_PATTERNS = (
 )
 
 
-def _add_native_tool_hint(messages: list[dict]) -> list[dict]:
+def _add_native_tool_hint(
+    messages: list[dict], native_template_text: str = ""
+) -> list[dict]:
     """Append a hint to the system message to use native tool call format.
 
     Clients like opencode and Claude Code embed their own tool-format
@@ -810,9 +812,13 @@ def _add_native_tool_hint(messages: list[dict]) -> list[dict]:
     fallback for models *without* native tool support — when the model DOES
     have native support, the template format is authoritative.
 
-    Only applied when the system message actually contains a known
-    conflicting format pattern — leaves untouched system prompts (and
-    user-authored intentional tool guidance) alone.
+    Only applied when the system message contains a conflict pattern that
+    is NOT also present in the model's own chat template.  This prevents
+    false positives for models like Mistral whose template natively contains
+    ``[TOOL_CALLS]``: in that case the client's instructions match the
+    model's native format and the "Disregard" override would suppress
+    legitimate guidance.  Pass ``native_template_text`` from the call site;
+    omit it (or pass empty) to skip the suppression check.
     """
     if not messages or messages[0].get("role") != "system":
         return messages
@@ -823,7 +829,14 @@ def _add_native_tool_hint(messages: list[dict]) -> list[dict]:
         return messages
     if _NATIVE_TOOL_HINT in content:
         return messages
-    if not any(p in content for p in _CLIENT_TOOL_FORMAT_PATTERNS):
+    # A pattern is only a "conflict" if it appears in the system message
+    # AND the model's own template doesn't use it natively.
+    triggered = [
+        p
+        for p in _CLIENT_TOOL_FORMAT_PATTERNS
+        if p in content and p not in native_template_text
+    ]
+    if not triggered:
         return messages
     messages = list(messages)  # shallow copy
     messages[0] = {
@@ -831,6 +844,25 @@ def _add_native_tool_hint(messages: list[dict]) -> list[dict]:
         "content": content + "\n\n" + _NATIVE_TOOL_HINT,
     }
     return messages
+
+
+def _get_chat_template_text(tokenizer: Any) -> str:
+    """Extract the chat template as a single string for substring matching.
+
+    Handles both text tokenizers (chat_template directly) and VLM processors
+    (chat_template on the wrapped tokenizer).  Lists of named templates are
+    flattened into a single space-joined string.
+    """
+    tpl = getattr(tokenizer, "chat_template", None)
+    if tpl is None:
+        sub = getattr(tokenizer, "tokenizer", None)
+        if sub is not None:
+            tpl = getattr(sub, "chat_template", None)
+    if tpl is None:
+        return ""
+    if isinstance(tpl, list):
+        return " ".join(t.get("template", "") for t in tpl if isinstance(t, dict))
+    return tpl if isinstance(tpl, str) else ""
 
 
 def _apply_chat_template(
@@ -2063,10 +2095,13 @@ async def generate_chat(
     # conflict with the model's native tool call format.  With long prompts,
     # models like Gemma 4 follow the client's text instructions instead of
     # generating native tool call tokens.  Appending a short override to the
-    # system message steers the model back to the native format.
+    # system message steers the model back to the native format.  We pass
+    # the model's own chat template so the helper can suppress patterns the
+    # template uses natively (e.g. Mistral's `[TOOL_CALLS]`).
     caps = lm.template_caps or TemplateCaps()
     if tools and caps.supports_tools:
-        messages = _add_native_tool_hint(messages)
+        template_text = _get_chat_template_text(lm.tokenizer)
+        messages = _add_native_tool_hint(messages, template_text)
 
     if lm.is_vlm:
         # VLM models must use the VLM generation path for tokenization.

@@ -319,6 +319,35 @@ class TestAddNativeToolHint:
         result = _add_native_tool_hint(messages)
         assert "native tool call format" not in result[0]["content"]
 
+    def test_no_hint_when_pattern_is_in_template(self):
+        """Skip patterns that the model's own chat template uses natively.
+
+        Mistral's template literally contains `[TOOL_CALLS]`, so client
+        instructions referencing that pattern match the native format and
+        should not trigger the override.
+        """
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "Use [TOOL_CALLS] [...]"},
+        ]
+        # Mistral-style template — contains [TOOL_CALLS] natively
+        template_text = "{% if tools %}[TOOL_CALLS] {{ tools }}{% endif %}"
+        result = _add_native_tool_hint(messages, template_text)
+        assert "native tool call format" not in result[0]["content"]
+
+    def test_hint_fires_when_pattern_not_in_template(self):
+        """Pattern in system message but NOT in template → hint fires."""
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "Use <function=Name>...</function>"},
+        ]
+        # Gemma 4-style template — uses <|tool_call> tokens, not <function=
+        template_text = "{% if tools %}<|tool_call>{{ tools }}<tool_call|>{% endif %}"
+        result = _add_native_tool_hint(messages, template_text)
+        assert "native tool call format" in result[0]["content"]
+
     def test_no_hint_when_no_conflict_pattern(self):
         """Plain system prompts without conflicting format instructions are untouched."""
         from olmlx.engine.inference import _add_native_tool_hint
