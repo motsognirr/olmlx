@@ -412,6 +412,102 @@ async def _stream_buffered_with_tools(result, declared_tools=None):
     }
 
 
+def _flush_thinking_buffer(
+    state: str, buffer: str, block_idx: int, text_block_started: bool
+) -> tuple[list[str], int]:
+    """Flush remaining buffer at end of stream. Returns (sse_events, updated_block_idx)."""
+    events: list[str] = []
+    if state == "thinking":
+        if buffer:
+            events.append(
+                _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_idx,
+                        "delta": {"type": "thinking_delta", "thinking": buffer},
+                    },
+                )
+            )
+        events.append(
+            _sse(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block_idx},
+            )
+        )
+        block_idx += 1
+        events.append(
+            _sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_idx,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+        )
+        events.append(
+            _sse(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block_idx},
+            )
+        )
+    elif text_block_started:
+        events.append(
+            _sse(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block_idx},
+            )
+        )
+    elif state == "text" and not text_block_started:
+        events.append(
+            _sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_idx,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+        )
+        if buffer:
+            events.append(
+                _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_idx,
+                        "delta": {"type": "text_delta", "text": buffer},
+                    },
+                )
+            )
+        events.append(
+            _sse(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block_idx},
+            )
+        )
+    else:
+        # state == "init" — no output at all, emit empty text block
+        events.append(
+            _sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_idx,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+        )
+        events.append(
+            _sse(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block_idx},
+            )
+        )
+    return events, block_idx
+
+
 async def _stream_thinking_state_machine(result):
     """Stream incrementally with thinking state machine. Yields a final dict with metadata."""
     block_idx = 0
@@ -516,69 +612,11 @@ async def _stream_thinking_state_machine(result):
                 break
 
     # Flush remaining buffer
-    if state == "thinking":
-        if buffer:
-            yield _sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "thinking_delta", "thinking": buffer},
-                },
-            )
-        yield _sse(
-            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
-        )
-        block_idx += 1
-        yield _sse(
-            "content_block_start",
-            {
-                "type": "content_block_start",
-                "index": block_idx,
-                "content_block": {"type": "text", "text": ""},
-            },
-        )
-        yield _sse(
-            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
-        )
-    elif text_block_started:
-        yield _sse(
-            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
-        )
-    elif state == "text" and not text_block_started:
-        yield _sse(
-            "content_block_start",
-            {
-                "type": "content_block_start",
-                "index": block_idx,
-                "content_block": {"type": "text", "text": ""},
-            },
-        )
-        if buffer:
-            yield _sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "text_delta", "text": buffer},
-                },
-            )
-        yield _sse(
-            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
-        )
-    else:
-        # state == "init" — no output at all, emit empty text block
-        yield _sse(
-            "content_block_start",
-            {
-                "type": "content_block_start",
-                "index": block_idx,
-                "content_block": {"type": "text", "text": ""},
-            },
-        )
-        yield _sse(
-            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
-        )
+    flush_events, block_idx = _flush_thinking_buffer(
+        state, buffer, block_idx, text_block_started
+    )
+    for event in flush_events:
+        yield event
 
     yield {
         "stop_reason": "end_turn",

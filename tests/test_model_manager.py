@@ -2146,3 +2146,80 @@ class TestPerModelConfig:
         # Should use request keep_alive of 1m = 60s, not model's 30m
         assert lm.expires_at is not None
         assert lm.expires_at < time.time() + 70  # ~1 minute
+
+
+class TestEvictLruIfNeeded:
+    """Tests for ModelManager._evict_lru_if_needed."""
+
+    def test_no_eviction_below_capacity(self, registry, mock_store, monkeypatch):
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 3)
+        manager = ModelManager(registry, mock_store)
+        lm = LoadedModel(
+            name="a", hf_path="a/a", model=MagicMock(), tokenizer=MagicMock()
+        )
+        manager._loaded["a"] = lm
+        manager._evict_lru_if_needed()
+        assert "a" in manager._loaded
+
+    def test_evicts_oldest_inactive(self, registry, mock_store, monkeypatch):
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+        manager = ModelManager(registry, mock_store)
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["old"] = old
+        manager._evict_lru_if_needed()
+        assert "old" not in manager._loaded
+
+    def test_raises_when_all_active(self, registry, mock_store, monkeypatch):
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+        manager = ModelManager(registry, mock_store)
+        active = LoadedModel(
+            name="active",
+            hf_path="a/a",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        active.active_refs = 1
+        manager._loaded["active"] = active
+        with pytest.raises(RuntimeError, match="All loaded models are in use"):
+            manager._evict_lru_if_needed()
+
+    def test_skips_gc_when_pending_cleanup(self, registry, mock_store, monkeypatch):
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+        manager = ModelManager(registry, mock_store)
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["old"] = old
+        # Simulate pending cleanup — use a truthy sentinel (dict only checks key presence)
+        manager._pending_cleanups["other"] = True
+        with patch("olmlx.engine.model_manager.gc.collect") as mock_gc:
+            manager._evict_lru_if_needed()
+            mock_gc.assert_not_called()
+        assert "old" not in manager._loaded
+        del manager._pending_cleanups["other"]
+
+    def test_nulls_speculative_decoder(self, registry, mock_store, monkeypatch):
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+        manager = ModelManager(registry, mock_store)
+        decoder = MagicMock()
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            speculative_decoder=decoder,
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["old"] = old
+        manager._evict_lru_if_needed()
+        assert "old" not in manager._loaded

@@ -1,6 +1,7 @@
 import asyncio
 import collections.abc
 import contextlib
+import dataclasses
 import gc
 import importlib
 import json
@@ -1302,6 +1303,425 @@ async def generate_completion(
         return await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
 
 
+@dataclasses.dataclass
+class _CacheSetupResult:
+    """Result of prompt cache setup."""
+
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    full_prompt_tokens: list[int] | None = None
+    prompt: str | list[int] = ""
+    cache_setup_done: bool = False
+
+
+async def _setup_prompt_cache(
+    lm: LoadedModel,
+    prompt: str | list[int],
+    gen_kwargs: dict,
+    *,
+    prompt_tokens: list[int] | None,
+    cache_id: str,
+) -> _CacheSetupResult:
+    """Set up prompt cache for a streaming completion.
+
+    Handles memory pressure eviction, cache lookup, prefix matching,
+    and cache hit/miss logic. Mutates gen_kwargs in place (adds
+    prompt_cache and optionally input_ids).
+    """
+    result = _CacheSetupResult(prompt=prompt)
+
+    # Memory pressure check — invalidate cache to prevent Metal OOM
+    memory_too_high = (
+        prompt_tokens is not None
+        and make_prompt_cache is not None
+        and memory_utils.is_memory_pressure_high(settings.memory_limit_fraction)
+    )
+    if memory_too_high:
+        logger.warning(
+            "Memory pressure high, evicting prompt caches to free GPU memory"
+        )
+        await lm.prompt_cache_store.async_evict_all_to_disk()
+        gc.collect()
+        mx.clear_cache()
+        _safe_sync()  # Bug #120: ensure freed buffers are reclaimed
+        memory_too_high = memory_utils.is_memory_pressure_high(
+            settings.memory_limit_fraction
+        )
+
+    if memory_too_high or prompt_tokens is None or make_prompt_cache is None:
+        return result
+
+    cached = await lm.prompt_cache_store.async_get(cache_id)
+    logger.debug(
+        "Cache lookup: cached=%s, new prompt=%d tokens",
+        (
+            f"{len(cached.tokens)} tokens (first 5: {cached.tokens[:5]})"
+            if cached
+            else "none"
+        ),
+        len(prompt_tokens),
+    )
+
+    prefix_len = (
+        _find_common_prefix(prompt_tokens, cached.tokens) if cached is not None else 0
+    )
+    logger.debug(
+        "Common prefix length: %d / %d prompt tokens",
+        prefix_len,
+        len(prompt_tokens),
+    )
+
+    # Set before mutation so finally guard can clean up on error
+    result.full_prompt_tokens = prompt_tokens
+
+    # Label for the fresh-cache log line.  Set to "trim-fallback" if
+    # we discard a stale cache because trim_prompt_cache could not
+    # align it (e.g. Qwen3-Next hybrid cache).  Otherwise the log
+    # block below picks "miss" or "init" based on whether `cached`
+    # was populated.
+    fresh_cache_label: str | None = None
+
+    # stream_generate requires at least 1 token, so we must back up
+    # by one position on exact-match.  If that would mean suffix_start=0
+    # (single-token prompt), the cache hit is useless — trimming the
+    # entire cache to re-process the lone token is a cold start.  Treat
+    # it as a miss and create a fresh cache instead.
+    suffix_start = min(prefix_len, len(prompt_tokens) - 1) if prompt_tokens else 0
+
+    if prefix_len > 0 and suffix_start > 0:
+        # Bug #123: Remove cache from store before mutation so the
+        # store's copy is not corrupted if the client disconnects
+        # mid-stream.  The cache will be re-stored on successful
+        # completion; on disconnect the finally block is a no-op.
+        working_cache = cached.cache
+        lm.prompt_cache_store.remove(cache_id)
+        # Trim cache to suffix_start so it aligns with where we resume
+        trim_amount = len(cached.tokens) - suffix_start
+        trimmed = 0
+        if trim_amount > 0:
+            trimmed = trim_prompt_cache(working_cache, trim_amount)
+
+        if trim_amount > 0 and trimmed != trim_amount:
+            # Cache layers are non-trimmable or only partially
+            # trimmable (e.g. Qwen3-Next hybrid cache with ArraysCache
+            # for linear attention layers — trim_prompt_cache returns
+            # 0 for any cache where some layer is non-trimmable).  A
+            # partial trim would leave the KV state misaligned with
+            # the prompt, so fall through to fresh-cache creation
+            # rather than passing a stale cache to stream_generate.
+            logger.warning(
+                "Prompt cache trim incomplete (asked for %d, got %d); "
+                "discarding stale cache and creating fresh",
+                trim_amount,
+                trimmed,
+            )
+            # Release the stale cache's GPU memory before allocating
+            # the fresh one.  Both `working_cache` and `cached.cache`
+            # hold references to the same KV tensors — both must be
+            # broken or the tensors stay resident.  Then force GC +
+            # Metal buffer reclamation: CPython's GC is non-deterministic
+            # and Metal buffers won't be reclaimed in time for the
+            # fresh cache allocation otherwise — for a 32B+ model this
+            # could transiently double KV memory and trigger the
+            # uncatchable Metal OOM the memory guards exist to prevent.
+            del working_cache
+            cached = None
+            gc.collect()
+            mx.clear_cache()
+            _safe_sync()
+            fresh_cache_label = "trim-fallback"
+            # Fall through to fresh-cache creation below
+        else:
+            suffix_tokens = prompt_tokens[suffix_start:]
+
+            result.cache_read_tokens = suffix_start
+            result.cache_creation_tokens = len(suffix_tokens)
+            logger.info(
+                "Prompt cache hit: %d prefix tokens reused, %d new tokens to process (was %d total)",
+                prefix_len,
+                len(suffix_tokens),
+                len(prompt_tokens),
+            )
+            gen_kwargs["prompt_cache"] = working_cache
+            if lm.is_vlm:
+                gen_kwargs["input_ids"] = mx.array([suffix_tokens])
+            else:
+                result.prompt = suffix_tokens
+
+    if "prompt_cache" not in gen_kwargs:
+        # Reached on either: (a) no usable prefix in cache miss, or
+        # (b) trim-fallback above.  In the trim-fallback path the
+        # cache was already removed before the trim attempt — this
+        # remove is then a harmless no-op (PromptCacheStore.remove
+        # is idempotent).  Kept for the cache-miss path.
+        lm.prompt_cache_store.remove(cache_id)
+        kv_quant = lm.kv_cache_quant
+        if kv_quant is not None:
+            method, bits_str = kv_quant.split(":")
+            bits = int(bits_str)
+            if method == "spectral":
+                new_cache = _make_spectral_prompt_cache(
+                    lm.model,
+                    bits,
+                    lm.spectral_calibration_dir,
+                    is_vlm=lm.is_vlm,
+                )
+            else:
+                new_cache = _make_turboquant_prompt_cache(
+                    lm.model, bits, is_vlm=lm.is_vlm
+                )
+        else:
+            cache_model = _get_model_for_cache(lm.model, lm.is_vlm)
+            new_cache = make_prompt_cache(cache_model)
+        gen_kwargs["prompt_cache"] = new_cache
+        result.cache_creation_tokens = len(prompt_tokens)
+        if fresh_cache_label is None:
+            fresh_cache_label = "miss" if cached is not None else "init"
+        logger.info(
+            "Prompt cache %s: creating fresh cache for %d tokens",
+            fresh_cache_label,
+            len(prompt_tokens),
+        )
+        if lm.is_vlm:
+            gen_kwargs["input_ids"] = mx.array([prompt_tokens])
+        else:
+            result.prompt = prompt_tokens
+
+    result.cache_setup_done = True
+
+    # Release the cached reference
+    del cached
+
+    return result
+
+
+@dataclasses.dataclass
+class _PreflightResult:
+    """Result of KV cache pre-flight memory check."""
+
+    prompt: str | list[int] = ""
+    memory_limit: int = 0
+
+
+async def _kv_cache_preflight_check(
+    lm: LoadedModel,
+    prompt: str | list[int],
+    max_tokens: int,
+    gen_kwargs: dict,
+    *,
+    cache_read_tokens: int,
+    cache_creation_tokens: int,
+    full_prompt_tokens: list[int] | None,
+    cache_id: str,
+) -> _PreflightResult:
+    """Estimate KV cache memory and reject if it would exceed the limit.
+
+    Evicts prompt caches under pressure and restores prompt if needed.
+    Mutates gen_kwargs in place (may remove prompt_cache and input_ids).
+    Raises MemoryError if the KV cache would exceed the memory limit.
+    """
+    result = _PreflightResult(prompt=prompt)
+
+    if cache_creation_tokens > 0:
+        num_prefill_tokens = cache_creation_tokens
+    elif isinstance(prompt, list):
+        num_prefill_tokens = len(prompt)
+    elif isinstance(prompt, str) and not lm.is_vlm:
+        # Non-cached text path — tokenize to get a count.
+        # VLMs excluded: text_tokenizer.encode() misses image patch
+        # tokens, giving a systematic undercount.
+        try:
+            num_prefill_tokens = len(lm.text_tokenizer.encode(prompt))
+        except Exception:
+            num_prefill_tokens = 0
+    else:
+        num_prefill_tokens = 0
+
+    total_physical = memory_utils.get_system_memory_bytes()
+    result.memory_limit = (
+        int(total_physical * settings.memory_limit_fraction)
+        if total_physical > 0
+        else 0
+    )
+
+    if total_physical <= 0 or num_prefill_tokens <= 0:
+        return result
+
+    try:
+        kv_bytes = _estimate_kv_cache_bytes(
+            lm.model,
+            num_prefill_tokens + max_tokens,
+            kv_cache_quant=lm.kv_cache_quant,
+        )
+        current_metal = memory_utils.get_metal_memory()
+        if current_metal + kv_bytes > result.memory_limit:
+            # Drop cached KV tensors so eviction + gc can reclaim them
+            working = gen_kwargs.pop("prompt_cache", None)
+            had_cache = working is not None
+            gen_kwargs.pop("input_ids", None)
+            # Re-add cache temporarily so evict_all_to_disk() can persist it.
+            # Use cache_read_tokens to match the trimmed KV state.
+            if had_cache and full_prompt_tokens is not None:
+                await lm.prompt_cache_store.async_set(
+                    cache_id,
+                    CachedPromptState(
+                        tokens=list(full_prompt_tokens[:cache_read_tokens]),
+                        cache=working,
+                    ),
+                )
+            working = None
+            await lm.prompt_cache_store.async_evict_all_to_disk()
+            gc.collect()
+            mx.clear_cache()
+            # Re-estimate for the full generation window
+            estimate_tokens = num_prefill_tokens
+            if had_cache and cache_read_tokens > 0:
+                estimate_tokens = cache_read_tokens + num_prefill_tokens
+                if full_prompt_tokens is not None and not lm.is_vlm:
+                    result.prompt = full_prompt_tokens
+            estimate_total = estimate_tokens + max_tokens
+            kv_bytes = _estimate_kv_cache_bytes(
+                lm.model,
+                estimate_total,
+                kv_cache_quant=lm.kv_cache_quant,
+            )
+            _safe_sync()
+            current_metal = memory_utils.get_metal_memory()
+            if current_metal + kv_bytes > result.memory_limit:
+                available_gb = max(0.0, (result.memory_limit - current_metal) / 1024**3)
+                raise MemoryError(
+                    f"KV cache for {estimate_total} tokens estimated at "
+                    f"{kv_bytes / 1024**3:.1f} GB, but only "
+                    f"{available_gb:.1f} GB available "
+                    f"— prompt too long, reduce context or use a smaller model"
+                )
+    except MemoryError:
+        raise
+    except Exception:
+        logger.warning(
+            "KV cache pre-flight check skipped — OOM protection inactive",
+            exc_info=True,
+        )
+
+    return result
+
+
+async def _store_prompt_cache_after_generation(
+    lm: LoadedModel,
+    gen_kwargs: dict,
+    full_prompt_tokens: list[int] | None,
+    generated_tokens: list[int],
+    eval_count: int,
+    cache_id: str,
+) -> None:
+    """Store prompt cache state after successful generation.
+
+    Handles trimming to max_cache_tokens, eviction pressure cleanup,
+    and cache invalidation on trim failure.
+    """
+    prompt_cache = gen_kwargs.get("prompt_cache")
+    if prompt_cache is None or full_prompt_tokens is None:
+        return
+
+    stored_tokens = list(full_prompt_tokens) + generated_tokens
+    actual_total = len(full_prompt_tokens) + eval_count
+    max_cache_tokens = settings.prompt_cache_max_tokens
+    if max_cache_tokens is not None and actual_total > max_cache_tokens:
+        trim_amount = actual_total - max_cache_tokens
+        # cache_invalidated drives the post-trim flow.  Set when:
+        # (a) trim returns the wrong amount (non-trimmable hybrid
+        # cache like Qwen3-Next — expected operating condition), or
+        # (b) trim raises an unexpected exception.  In either case
+        # the storage block is skipped and the cache reference is
+        # released.  Using a flag avoids signalling a normal "this
+        # cache type can't be trimmed" outcome via an exception.
+        cache_invalidated = False
+        try:
+            trimmed = trim_prompt_cache(prompt_cache, trim_amount)
+            if trimmed != trim_amount:
+                # Hybrid/non-trimmable cache: a partial trim would
+                # leave the stored cache misaligned with stored_tokens
+                # metadata, so invalidate rather than carry a broken
+                # cache forward.
+                logger.warning(
+                    "Cache trim incomplete (asked for %d, got %d); invalidating cache",
+                    trim_amount,
+                    trimmed,
+                )
+                cache_invalidated = True
+            elif eval_count != len(generated_tokens):
+                # None-ID tokens present: can't map generated_tokens
+                # to KV cache positions. Trim KV cache down to prompt
+                # boundary so depth == len(stored_tokens).
+                extra = max_cache_tokens - len(full_prompt_tokens)
+                if extra > 0:
+                    trimmed_extra = trim_prompt_cache(prompt_cache, extra)
+                    if trimmed_extra != extra:
+                        logger.warning(
+                            "Cache trim incomplete (asked for %d, got %d); "
+                            "invalidating cache",
+                            extra,
+                            trimmed_extra,
+                        )
+                        cache_invalidated = True
+                if not cache_invalidated:
+                    stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
+            else:
+                stored_tokens = stored_tokens[:max_cache_tokens]
+        except Exception:
+            cache_invalidated = True
+            logger.warning(
+                "Cache trim raised; invalidating cache",
+                exc_info=True,
+            )
+
+        if cache_invalidated:
+            lm.prompt_cache_store.remove(cache_id)
+            prompt_cache = None
+            gc.collect()
+            mx.clear_cache()
+            # No _safe_sync() needed here (unlike the pre-generation
+            # trim-fallback path): no fresh cache allocation follows
+            # immediately — the function is about to return.  The
+            # next request's pre-generation path will sync before
+            # its own allocation.
+        else:
+            evicted = await lm.prompt_cache_store.async_set(
+                cache_id,
+                CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
+            )
+            if evicted is not None:
+                del evicted
+                if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+                    gc.collect()
+                    mx.clear_cache()
+            logger.info(
+                "Cache trimmed: %d → %d tokens (limit %d)",
+                actual_total,
+                len(stored_tokens),
+                max_cache_tokens,
+            )
+    else:
+        evicted = await lm.prompt_cache_store.async_set(
+            cache_id,
+            CachedPromptState(
+                tokens=stored_tokens,
+                cache=prompt_cache,
+            ),
+        )
+        if evicted is not None:
+            del evicted
+            if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+                gc.collect()
+                mx.clear_cache()
+        logger.debug(
+            "Cache stored: %d tokens (%d prompt + %d generated)",
+            len(stored_tokens),
+            len(full_prompt_tokens),
+            len(generated_tokens),
+        )
+
+
 async def _stream_completion(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -1346,293 +1766,41 @@ async def _stream_completion(
     stream = None
     generation_complete = False
     generated_tokens: list[int] = []
-    cache_read_tokens = 0
-    cache_creation_tokens = 0
     full_prompt_tokens: list[int] | None = None
     # Save original string prompt before cache setup may replace it with token IDs.
     # prompt is always str at entry; cache setup may later reassign it to list[int].
     original_prompt = prompt
-    cache_setup_done = False
     try:
-        # Memory pressure check — invalidate cache to prevent Metal OOM
-        memory_too_high = (
-            use_prompt_cache
-            and prompt_tokens is not None
-            and make_prompt_cache is not None
-            and memory_utils.is_memory_pressure_high(settings.memory_limit_fraction)
-        )
-        if memory_too_high:
-            logger.warning(
-                "Memory pressure high, evicting prompt caches to free GPU memory"
-            )
-            await lm.prompt_cache_store.async_evict_all_to_disk()
-            gc.collect()
-            mx.clear_cache()
-            _safe_sync()  # Bug #120: ensure freed buffers are reclaimed
-            memory_too_high = memory_utils.is_memory_pressure_high(
-                settings.memory_limit_fraction
-            )
-
         # Cache setup — must happen after lock to prevent concurrent cache corruption
-        if (
-            use_prompt_cache
-            and not memory_too_high
-            and prompt_tokens is not None
-            and make_prompt_cache is not None
-        ):
-            cached = await lm.prompt_cache_store.async_get(cache_id)
-            logger.debug(
-                "Cache lookup: cached=%s, new prompt=%d tokens",
-                (
-                    f"{len(cached.tokens)} tokens (first 5: {cached.tokens[:5]})"
-                    if cached
-                    else "none"
-                ),
-                len(prompt_tokens),
+        if use_prompt_cache:
+            cs = await _setup_prompt_cache(
+                lm,
+                prompt,
+                gen_kwargs,
+                prompt_tokens=prompt_tokens,
+                cache_id=cache_id,
             )
-
-            prefix_len = (
-                _find_common_prefix(prompt_tokens, cached.tokens)
-                if cached is not None
-                else 0
-            )
-            logger.debug(
-                "Common prefix length: %d / %d prompt tokens",
-                prefix_len,
-                len(prompt_tokens),
-            )
-
-            # Set before mutation so finally guard can clean up on error
-            full_prompt_tokens = prompt_tokens
-
-            # Label for the fresh-cache log line.  Set to "trim-fallback" if
-            # we discard a stale cache because trim_prompt_cache could not
-            # align it (e.g. Qwen3-Next hybrid cache).  Otherwise the log
-            # block below picks "miss" or "init" based on whether `cached`
-            # was populated.
-            fresh_cache_label: str | None = None
-
-            # stream_generate requires at least 1 token, so we must back up
-            # by one position on exact-match.  If that would mean suffix_start=0
-            # (single-token prompt), the cache hit is useless — trimming the
-            # entire cache to re-process the lone token is a cold start.  Treat
-            # it as a miss and create a fresh cache instead.
-            suffix_start = (
-                min(prefix_len, len(prompt_tokens) - 1) if prompt_tokens else 0
-            )
-
-            if prefix_len > 0 and suffix_start > 0:
-                # Bug #123: Remove cache from store before mutation so the
-                # store's copy is not corrupted if the client disconnects
-                # mid-stream.  The cache will be re-stored on successful
-                # completion; on disconnect the finally block is a no-op.
-                working_cache = cached.cache
-                lm.prompt_cache_store.remove(cache_id)
-                # Trim cache to suffix_start so it aligns with where we resume
-                trim_amount = len(cached.tokens) - suffix_start
-                trimmed = 0
-                if trim_amount > 0:
-                    trimmed = trim_prompt_cache(working_cache, trim_amount)
-
-                if trim_amount > 0 and trimmed != trim_amount:
-                    # Cache layers are non-trimmable or only partially
-                    # trimmable (e.g. Qwen3-Next hybrid cache with ArraysCache
-                    # for linear attention layers — trim_prompt_cache returns
-                    # 0 for any cache where some layer is non-trimmable).  A
-                    # partial trim would leave the KV state misaligned with
-                    # the prompt, so fall through to fresh-cache creation
-                    # rather than passing a stale cache to stream_generate.
-                    logger.warning(
-                        "Prompt cache trim incomplete (asked for %d, got %d); "
-                        "discarding stale cache and creating fresh",
-                        trim_amount,
-                        trimmed,
-                    )
-                    # Release the stale cache's GPU memory before allocating
-                    # the fresh one.  Both `working_cache` (a local alias)
-                    # and `cached.cache` (via the CachedPromptState) hold
-                    # references to the same KV tensors — both must be
-                    # broken or the tensors stay resident through the
-                    # remainder of this function.  Then force GC + Metal
-                    # buffer reclamation, mirroring the memory-pressure
-                    # eviction path above: CPython's GC is non-deterministic
-                    # and Metal buffers won't be reclaimed in time for the
-                    # fresh cache allocation otherwise — for a 32B+ model
-                    # this could transiently double KV memory and trigger
-                    # the uncatchable Metal OOM the memory guards exist to
-                    # prevent.
-                    del working_cache
-                    cached = None
-                    gc.collect()
-                    mx.clear_cache()
-                    _safe_sync()
-                    fresh_cache_label = "trim-fallback"
-                    # Fall through to fresh-cache creation below
-                else:
-                    suffix_tokens = prompt_tokens[suffix_start:]
-
-                    # Report suffix_start as cache_read — the number of tokens
-                    # whose KV entries are actually reused from cache.  On exact
-                    # match, suffix_start = prefix_len - 1 because stream_generate
-                    # re-processes the token at suffix_start (its KV is not reused).
-                    cache_read_tokens = suffix_start
-                    cache_creation_tokens = len(suffix_tokens)
-                    logger.info(
-                        "Prompt cache hit: %d prefix tokens reused, %d new tokens to process (was %d total)",
-                        prefix_len,
-                        len(suffix_tokens),
-                        len(prompt_tokens),
-                    )
-                    gen_kwargs["prompt_cache"] = working_cache
-                    if lm.is_vlm:
-                        # VLM stream_generate expects a string prompt; pass
-                        # pre-tokenized tokens via input_ids to bypass prepare_inputs.
-                        gen_kwargs["input_ids"] = mx.array([suffix_tokens])
-                    else:
-                        prompt = suffix_tokens
-
-            if "prompt_cache" not in gen_kwargs:
-                # Reached on either: (a) no usable prefix in cache miss, or
-                # (b) trim-fallback above.  In the trim-fallback path the
-                # cache was already removed before the trim attempt — this
-                # remove is then a harmless no-op (PromptCacheStore.remove
-                # is idempotent).  Kept for the cache-miss path.
-                lm.prompt_cache_store.remove(cache_id)
-                kv_quant = lm.kv_cache_quant
-                if kv_quant is not None:
-                    method, bits_str = kv_quant.split(":")
-                    bits = int(bits_str)
-                    if method == "spectral":
-                        new_cache = _make_spectral_prompt_cache(
-                            lm.model,
-                            bits,
-                            lm.spectral_calibration_dir,
-                            is_vlm=lm.is_vlm,
-                        )
-                    else:
-                        new_cache = _make_turboquant_prompt_cache(
-                            lm.model, bits, is_vlm=lm.is_vlm
-                        )
-                else:
-                    cache_model = _get_model_for_cache(lm.model, lm.is_vlm)
-                    new_cache = make_prompt_cache(cache_model)
-                gen_kwargs["prompt_cache"] = new_cache
-                cache_creation_tokens = len(prompt_tokens)
-                if fresh_cache_label is None:
-                    fresh_cache_label = "miss" if cached is not None else "init"
-                logger.info(
-                    "Prompt cache %s: creating fresh cache for %d tokens",
-                    fresh_cache_label,
-                    len(prompt_tokens),
-                )
-                if lm.is_vlm:
-                    gen_kwargs["input_ids"] = mx.array([prompt_tokens])
-                else:
-                    prompt = prompt_tokens
-
-            cache_setup_done = True
-
-            # Release the cached reference — on cache miss the old
-            # CachedPromptState was removed from the store but this local
-            # variable still pins its KV cache tensors in GPU memory.
-            del cached
-
-        # Pre-flight KV cache memory check — estimate how much GPU memory
-        # the KV cache will need and reject if it would exceed the limit.
-        # This prevents uncatchable Metal OOM crashes during prefill.
-        # MUST run before yielding cache_info, because that yield starts
-        # the HTTP response — after which we can't return a clean 503.
-        if cache_creation_tokens > 0:
-            num_prefill_tokens = cache_creation_tokens
-        elif isinstance(prompt, list):
-            num_prefill_tokens = len(prompt)
-        elif isinstance(prompt, str) and not lm.is_vlm:
-            # Non-cached text path — tokenize to get a count.
-            # VLMs excluded: text_tokenizer.encode() misses image patch
-            # tokens, giving a systematic undercount.
-            try:
-                num_prefill_tokens = len(lm.text_tokenizer.encode(prompt))
-            except Exception:
-                num_prefill_tokens = 0
         else:
-            num_prefill_tokens = 0
-        # Compute memory_limit before try so the streaming callback always
-        # has the correct limit, even when the pre-flight estimate throws.
-        total_physical = memory_utils.get_system_memory_bytes()
-        memory_limit = (
-            int(total_physical * settings.memory_limit_fraction)
-            if total_physical > 0
-            else 0
+            cs = _CacheSetupResult(prompt=prompt)
+        prompt = cs.prompt
+        cache_read_tokens = cs.cache_read_tokens
+        cache_creation_tokens = cs.cache_creation_tokens
+        full_prompt_tokens = cs.full_prompt_tokens
+        cache_setup_done = cs.cache_setup_done
+
+        # Pre-flight KV cache memory check
+        pf = await _kv_cache_preflight_check(
+            lm,
+            prompt,
+            max_tokens,
+            gen_kwargs,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            full_prompt_tokens=full_prompt_tokens,
+            cache_id=cache_id,
         )
-        if total_physical > 0 and num_prefill_tokens > 0:
-            try:
-                kv_bytes = _estimate_kv_cache_bytes(
-                    lm.model,
-                    num_prefill_tokens + max_tokens,
-                    kv_cache_quant=lm.kv_cache_quant,
-                )
-                current_metal = memory_utils.get_metal_memory()
-                if current_metal + kv_bytes > memory_limit:
-                    # Drop cached KV tensors so eviction + gc can reclaim them
-                    working = gen_kwargs.pop("prompt_cache", None)
-                    had_cache = working is not None
-                    gen_kwargs.pop(
-                        "input_ids", None
-                    )  # VLMs: force re-tokenize from string prompt
-                    # Bug #123 removes cache from store before mutation.
-                    # Re-add it temporarily so evict_all_to_disk() can persist it.
-                    # Use full_prompt_tokens[:suffix_start] to match the trimmed
-                    # KV state — working_cache was trimmed to suffix_start tokens.
-                    if had_cache and full_prompt_tokens is not None:
-                        await lm.prompt_cache_store.async_set(
-                            cache_id,
-                            CachedPromptState(
-                                tokens=list(full_prompt_tokens[:suffix_start]),
-                                cache=working,
-                            ),
-                        )
-                    # Drop Python references so gc.collect() + mx.clear_cache()
-                    # can actually reclaim GPU memory.
-                    working_cache = None  # noqa: F841
-                    working = None
-                    await lm.prompt_cache_store.async_evict_all_to_disk()
-                    gc.collect()
-                    mx.clear_cache()
-                    # After evicting the prompt cache, mlx_lm will prefill
-                    # the full prompt from scratch — re-estimate for all tokens
-                    # and restore prompt from suffix_tokens to the full sequence.
-                    estimate_tokens = num_prefill_tokens
-                    if had_cache and cache_read_tokens > 0:
-                        estimate_tokens = cache_read_tokens + num_prefill_tokens
-                        if full_prompt_tokens is not None and not lm.is_vlm:
-                            prompt = full_prompt_tokens
-                    # Re-estimate after eviction for the full generation window
-                    estimate_total = estimate_tokens + max_tokens
-                    kv_bytes = _estimate_kv_cache_bytes(
-                        lm.model,
-                        estimate_total,
-                        kv_cache_quant=lm.kv_cache_quant,
-                    )
-                    # Sync Metal to ensure freed buffers are reclaimed before re-reading
-                    _safe_sync()
-                    current_metal = memory_utils.get_metal_memory()
-                    if current_metal + kv_bytes > memory_limit:
-                        available_gb = max(
-                            0.0, (memory_limit - current_metal) / 1024**3
-                        )
-                        raise MemoryError(
-                            f"KV cache for {estimate_total} tokens estimated at "
-                            f"{kv_bytes / 1024**3:.1f} GB, but only "
-                            f"{available_gb:.1f} GB available "
-                            f"— prompt too long, reduce context or use a smaller model"
-                        )
-            except MemoryError:
-                raise
-            except Exception:
-                logger.warning(
-                    "KV cache pre-flight check skipped — OOM protection inactive",
-                    exc_info=True,
-                )
+        prompt = pf.prompt
+        memory_limit = pf.memory_limit
 
         # Yield cache stats after the pre-flight check so routers can
         # use them.  This starts the HTTP response — no 503 after this.
@@ -1761,113 +1929,14 @@ async def _stream_completion(
         generation_complete = True
 
         # Store cache state after successful generation
-        prompt_cache = gen_kwargs.get("prompt_cache")
-        if prompt_cache is not None and full_prompt_tokens is not None:
-            stored_tokens = list(full_prompt_tokens) + generated_tokens
-            # The KV cache has an entry for every generation step, including
-            # steps where the token ID was None (skipped in generated_tokens).
-            # Use stats.eval_count for the real generation depth.
-            actual_total = len(full_prompt_tokens) + stats.eval_count
-            max_cache_tokens = settings.prompt_cache_max_tokens
-            if max_cache_tokens is not None and actual_total > max_cache_tokens:
-                trim_amount = actual_total - max_cache_tokens
-                # cache_invalidated drives the post-trim flow.  Set when:
-                # (a) trim returns the wrong amount (non-trimmable hybrid
-                # cache like Qwen3-Next — expected operating condition), or
-                # (b) trim raises an unexpected exception.  In either case
-                # the storage block is skipped and the cache reference is
-                # released.  Using a flag avoids signalling a normal "this
-                # cache type can't be trimmed" outcome via an exception.
-                cache_invalidated = False
-                try:
-                    trimmed = trim_prompt_cache(prompt_cache, trim_amount)
-                    if trimmed != trim_amount:
-                        # Hybrid/non-trimmable cache: a partial trim would
-                        # leave the stored cache misaligned with stored_tokens
-                        # metadata, so invalidate rather than carry a broken
-                        # cache forward.
-                        logger.warning(
-                            "Cache trim incomplete (asked for %d, got %d); "
-                            "invalidating cache",
-                            trim_amount,
-                            trimmed,
-                        )
-                        cache_invalidated = True
-                    elif stats.eval_count != len(generated_tokens):
-                        # None-ID tokens present: can't map generated_tokens
-                        # to KV cache positions. Trim KV cache down to prompt
-                        # boundary so depth == len(stored_tokens).
-                        extra = max_cache_tokens - len(full_prompt_tokens)
-                        if extra > 0:
-                            trimmed_extra = trim_prompt_cache(prompt_cache, extra)
-                            if trimmed_extra != extra:
-                                logger.warning(
-                                    "Cache trim incomplete (asked for %d, got %d); "
-                                    "invalidating cache",
-                                    extra,
-                                    trimmed_extra,
-                                )
-                                cache_invalidated = True
-                        if not cache_invalidated:
-                            stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
-                    else:
-                        stored_tokens = stored_tokens[:max_cache_tokens]
-                except Exception:
-                    cache_invalidated = True
-                    logger.warning(
-                        "Cache trim raised; invalidating cache",
-                        exc_info=True,
-                    )
-
-                if cache_invalidated:
-                    lm.prompt_cache_store.remove(cache_id)
-                    prompt_cache = None
-                    gc.collect()
-                    mx.clear_cache()
-                    # No _safe_sync() needed here (unlike the pre-generation
-                    # trim-fallback path): no fresh cache allocation follows
-                    # immediately — the function is about to return.  The
-                    # next request's pre-generation path will sync before
-                    # its own allocation.
-                else:
-                    evicted = await lm.prompt_cache_store.async_set(
-                        cache_id,
-                        CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
-                    )
-                    if evicted is not None:
-                        del evicted
-                        if memory_utils.is_memory_pressure_high(
-                            settings.memory_limit_fraction
-                        ):
-                            gc.collect()
-                            mx.clear_cache()
-                    logger.info(
-                        "Cache trimmed: %d → %d tokens (limit %d)",
-                        actual_total,
-                        len(stored_tokens),
-                        max_cache_tokens,
-                    )
-            else:
-                evicted = await lm.prompt_cache_store.async_set(
-                    cache_id,
-                    CachedPromptState(
-                        tokens=stored_tokens,
-                        cache=prompt_cache,
-                    ),
-                )
-                if evicted is not None:
-                    del evicted
-                    if memory_utils.is_memory_pressure_high(
-                        settings.memory_limit_fraction
-                    ):
-                        gc.collect()
-                        mx.clear_cache()
-                logger.debug(
-                    "Cache stored: %d tokens (%d prompt + %d generated)",
-                    len(stored_tokens),
-                    len(full_prompt_tokens),
-                    len(generated_tokens),
-                )
+        await _store_prompt_cache_after_generation(
+            lm,
+            gen_kwargs,
+            full_prompt_tokens,
+            generated_tokens,
+            stats.eval_count,
+            cache_id,
+        )
 
         # raw_text contains the complete unfiltered output (e.g. gpt-oss channel tokens).
         # It is only present in the done chunk when gpt-oss channel format was used,

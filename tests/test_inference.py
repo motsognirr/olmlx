@@ -2973,3 +2973,396 @@ class TestPrefillMemoryCallback:
         callback = _make_prefill_progress(cancel_event, memory_limit=0)
         result = callback(0.5)
         assert result is True
+
+
+class TestSetupPromptCache:
+    """Tests for the extracted _setup_prompt_cache helper."""
+
+    @pytest.fixture
+    def mock_lm(self):
+        lm = MagicMock()
+        lm.is_vlm = False
+        lm.kv_cache_quant = None
+        lm.model = MagicMock()
+        lm.prompt_cache_store = MagicMock()
+        lm.prompt_cache_store.async_get = AsyncMock(return_value=None)
+        lm.prompt_cache_store.async_set = AsyncMock(return_value=None)
+        lm.prompt_cache_store.async_evict_all_to_disk = AsyncMock()
+        return lm
+
+    @pytest.mark.asyncio
+    async def test_cache_disabled_returns_defaults(self, mock_lm):
+        """When prompt_tokens is None, returns default result."""
+        from olmlx.engine.inference import _setup_prompt_cache
+
+        gen_kwargs = {}
+        result = await _setup_prompt_cache(
+            mock_lm, "hello", gen_kwargs, prompt_tokens=None, cache_id="test"
+        )
+        assert result.cache_read_tokens == 0
+        assert result.cache_creation_tokens == 0
+        assert result.full_prompt_tokens is None
+        assert result.cache_setup_done is False
+        assert result.prompt == "hello"
+        assert "prompt_cache" not in gen_kwargs
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_creates_fresh(self, mock_lm):
+        """Cache miss creates a fresh cache and sets cache_creation_tokens."""
+        from olmlx.engine.inference import _setup_prompt_cache
+
+        mock_cache = MagicMock()
+        gen_kwargs = {}
+        prompt_tokens = [1, 2, 3, 4, 5]
+
+        with (
+            patch("olmlx.engine.inference.make_prompt_cache", return_value=mock_cache),
+            patch("olmlx.utils.memory.is_memory_pressure_high", return_value=False),
+            patch("olmlx.engine.inference._find_common_prefix", return_value=0),
+            patch(
+                "olmlx.engine.inference._get_model_for_cache", return_value=MagicMock()
+            ),
+        ):
+            result = await _setup_prompt_cache(
+                mock_lm,
+                "hello",
+                gen_kwargs,
+                prompt_tokens=prompt_tokens,
+                cache_id="test",
+            )
+
+        assert result.cache_setup_done is True
+        assert result.cache_creation_tokens == 5
+        assert result.cache_read_tokens == 0
+        assert result.prompt == prompt_tokens
+        assert gen_kwargs["prompt_cache"] is mock_cache
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_sets_read_tokens(self, mock_lm):
+        """Cache hit with prefix match sets cache_read_tokens and mutates gen_kwargs."""
+        from olmlx.engine.inference import _setup_prompt_cache
+        from olmlx.engine.model_manager import CachedPromptState
+
+        cached_state = CachedPromptState(tokens=[1, 2, 3], cache=MagicMock())
+        mock_lm.prompt_cache_store.async_get = AsyncMock(return_value=cached_state)
+
+        gen_kwargs = {}
+        prompt_tokens = [1, 2, 3, 4, 5]
+
+        with (
+            patch("olmlx.utils.memory.is_memory_pressure_high", return_value=False),
+            patch("olmlx.engine.inference._find_common_prefix", return_value=3),
+            patch("olmlx.engine.inference.trim_prompt_cache"),
+        ):
+            result = await _setup_prompt_cache(
+                mock_lm,
+                "hello",
+                gen_kwargs,
+                prompt_tokens=prompt_tokens,
+                cache_id="test",
+            )
+
+        assert result.cache_setup_done is True
+        # suffix_start = min(prefix_len=3, len(prompt_tokens)-1=4) = 3
+        assert result.cache_read_tokens == 3
+        assert result.cache_creation_tokens == 2  # suffix tokens [4, 5]
+        assert "prompt_cache" in gen_kwargs
+        mock_lm.prompt_cache_store.remove.assert_called_with("test")
+
+    @pytest.mark.asyncio
+    async def test_memory_pressure_evicts_caches(self, mock_lm):
+        """High memory pressure triggers evict_all_to_disk."""
+        from olmlx.engine.inference import _setup_prompt_cache
+
+        gen_kwargs = {}
+        prompt_tokens = [1, 2, 3]
+
+        with (
+            patch("olmlx.utils.memory.is_memory_pressure_high", return_value=True),
+            patch("olmlx.engine.inference._safe_sync"),
+            patch("olmlx.engine.inference.mx"),
+        ):
+            result = await _setup_prompt_cache(
+                mock_lm,
+                "hello",
+                gen_kwargs,
+                prompt_tokens=prompt_tokens,
+                cache_id="test",
+            )
+
+        mock_lm.prompt_cache_store.async_evict_all_to_disk.assert_awaited_once()
+        # After eviction, memory still high → no cache setup
+        assert result.cache_setup_done is False
+
+    @pytest.mark.asyncio
+    async def test_vlm_uses_input_ids(self, mock_lm):
+        """VLM path sets input_ids in gen_kwargs instead of replacing prompt."""
+        from olmlx.engine.inference import _setup_prompt_cache
+
+        mock_lm.is_vlm = True
+        mock_cache = MagicMock()
+        gen_kwargs = {}
+        prompt_tokens = [1, 2, 3]
+
+        with (
+            patch("olmlx.engine.inference.make_prompt_cache", return_value=mock_cache),
+            patch("olmlx.utils.memory.is_memory_pressure_high", return_value=False),
+            patch("olmlx.engine.inference._find_common_prefix", return_value=0),
+            patch(
+                "olmlx.engine.inference._get_model_for_cache", return_value=MagicMock()
+            ),
+        ):
+            result = await _setup_prompt_cache(
+                mock_lm,
+                "hello",
+                gen_kwargs,
+                prompt_tokens=prompt_tokens,
+                cache_id="test",
+            )
+
+        assert "input_ids" in gen_kwargs
+        assert result.prompt == "hello"  # prompt unchanged for VLM
+
+
+class TestKvCachePreflightCheckHelper:
+    """Tests for the extracted _kv_cache_preflight_check helper."""
+
+    @pytest.fixture
+    def mock_lm(self):
+        lm = MagicMock()
+        lm.is_vlm = False
+        lm.kv_cache_quant = None
+        lm.model = MagicMock()
+        lm.text_tokenizer = MagicMock()
+        lm.prompt_cache_store = MagicMock()
+        lm.prompt_cache_store.async_set = AsyncMock(return_value=None)
+        lm.prompt_cache_store.async_evict_all_to_disk = AsyncMock()
+        return lm
+
+    @pytest.mark.asyncio
+    async def test_allows_when_fits(self, mock_lm):
+        from olmlx.engine.inference import _kv_cache_preflight_check
+
+        gen_kwargs = {}
+        with (
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=24 * 1024**3,
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                return_value=5 * 1024**3,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference._estimate_kv_cache_bytes",
+                return_value=1 * 1024**3,
+            ),
+        ):
+            mock_settings.memory_limit_fraction = 0.5
+            result = await _kv_cache_preflight_check(
+                mock_lm,
+                [1, 2, 3],
+                100,
+                gen_kwargs,
+                cache_read_tokens=0,
+                cache_creation_tokens=3,
+                full_prompt_tokens=None,
+                cache_id="test",
+            )
+
+        assert result.memory_limit == 12 * 1024**3
+        assert result.prompt == [1, 2, 3]  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_rejects_when_exceeds_memory(self, mock_lm):
+        from olmlx.engine.inference import _kv_cache_preflight_check
+
+        gen_kwargs = {}
+        with (
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=24 * 1024**3,
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                return_value=10 * 1024**3,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference._estimate_kv_cache_bytes",
+                return_value=3 * 1024**3,
+            ),
+            patch("olmlx.engine.inference._safe_sync"),
+            patch("olmlx.engine.inference.mx"),
+        ):
+            mock_settings.memory_limit_fraction = 0.5
+            with pytest.raises(MemoryError, match="prompt too long"):
+                await _kv_cache_preflight_check(
+                    mock_lm,
+                    [1, 2, 3],
+                    100,
+                    gen_kwargs,
+                    cache_read_tokens=0,
+                    cache_creation_tokens=3,
+                    full_prompt_tokens=None,
+                    cache_id="test",
+                )
+
+    @pytest.mark.asyncio
+    async def test_skips_when_zero_prefill(self, mock_lm):
+        from olmlx.engine.inference import _kv_cache_preflight_check
+
+        gen_kwargs = {}
+        with (
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=24 * 1024**3,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.memory_limit_fraction = 0.5
+            result = await _kv_cache_preflight_check(
+                mock_lm,
+                "hello",
+                100,
+                gen_kwargs,
+                cache_read_tokens=0,
+                cache_creation_tokens=0,
+                full_prompt_tokens=None,
+                cache_id="test",
+            )
+
+        # cache_creation_tokens=0 and no tokenizable prompt → num_prefill_tokens=0 → skip check
+        assert result.memory_limit == 12 * 1024**3
+
+    @pytest.mark.asyncio
+    async def test_handles_estimation_error(self, mock_lm):
+        from olmlx.engine.inference import _kv_cache_preflight_check
+
+        gen_kwargs = {}
+        with (
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=24 * 1024**3,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference._estimate_kv_cache_bytes",
+                side_effect=ValueError("bad model"),
+            ),
+        ):
+            mock_settings.memory_limit_fraction = 0.5
+            # Should not raise — estimation error is caught and logged
+            result = await _kv_cache_preflight_check(
+                mock_lm,
+                [1, 2, 3],
+                100,
+                gen_kwargs,
+                cache_read_tokens=0,
+                cache_creation_tokens=3,
+                full_prompt_tokens=None,
+                cache_id="test",
+            )
+        assert result.memory_limit > 0
+
+
+class TestStorePromptCacheAfterGeneration:
+    """Tests for the extracted _store_prompt_cache_after_generation helper."""
+
+    @pytest.fixture
+    def mock_lm(self):
+        lm = MagicMock()
+        lm.prompt_cache_store = MagicMock()
+        lm.prompt_cache_store.async_set = AsyncMock(return_value=None)
+        return lm
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_cache(self, mock_lm):
+        from olmlx.engine.inference import _store_prompt_cache_after_generation
+
+        gen_kwargs = {}  # no prompt_cache key
+        await _store_prompt_cache_after_generation(
+            mock_lm, gen_kwargs, [1, 2, 3], [4, 5], 2, "test"
+        )
+        mock_lm.prompt_cache_store.async_set.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_full_prompt_tokens(self, mock_lm):
+        from olmlx.engine.inference import _store_prompt_cache_after_generation
+
+        gen_kwargs = {"prompt_cache": MagicMock()}
+        await _store_prompt_cache_after_generation(
+            mock_lm, gen_kwargs, None, [4, 5], 2, "test"
+        )
+        mock_lm.prompt_cache_store.async_set.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stores_without_trimming(self, mock_lm):
+        from olmlx.engine.inference import _store_prompt_cache_after_generation
+
+        cache = MagicMock()
+        gen_kwargs = {"prompt_cache": cache}
+        with patch("olmlx.engine.inference.settings") as mock_settings:
+            mock_settings.prompt_cache_max_tokens = None
+            mock_settings.memory_limit_fraction = 0.9
+            await _store_prompt_cache_after_generation(
+                mock_lm, gen_kwargs, [1, 2, 3], [4, 5], 2, "test"
+            )
+
+        mock_lm.prompt_cache_store.async_set.assert_awaited_once()
+        call_args = mock_lm.prompt_cache_store.async_set.call_args
+        assert call_args[0][0] == "test"
+        stored = call_args[0][1]
+        assert stored.tokens == [1, 2, 3, 4, 5]
+
+    @pytest.mark.asyncio
+    async def test_trims_when_over_max(self, mock_lm):
+        from olmlx.engine.inference import _store_prompt_cache_after_generation
+
+        cache = MagicMock()
+        gen_kwargs = {"prompt_cache": cache}
+        # trim_prompt_cache must return the amount it was asked to trim
+        # so that the trimmed != trim_amount check passes.
+        # prompt=3 + eval=2 = 5 total > max 4 → trim_amount = 1
+        with (
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference.trim_prompt_cache",
+                side_effect=lambda _cache, amount: amount,
+            ),
+        ):
+            mock_settings.prompt_cache_max_tokens = 4
+            mock_settings.memory_limit_fraction = 0.9
+            await _store_prompt_cache_after_generation(
+                mock_lm, gen_kwargs, [1, 2, 3], [4, 5], 2, "test"
+            )
+
+        mock_lm.prompt_cache_store.async_set.assert_awaited_once()
+        call_args = mock_lm.prompt_cache_store.async_set.call_args
+        stored = call_args[0][1]
+        assert len(stored.tokens) == 4
+
+    @pytest.mark.asyncio
+    async def test_trim_failure_invalidates(self, mock_lm):
+        from olmlx.engine.inference import _store_prompt_cache_after_generation
+
+        cache = MagicMock()
+        gen_kwargs = {"prompt_cache": cache}
+        with (
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference.trim_prompt_cache",
+                side_effect=RuntimeError("trim broke"),
+            ),
+            patch("olmlx.engine.inference.mx"),
+        ):
+            mock_settings.prompt_cache_max_tokens = 4
+            mock_settings.memory_limit_fraction = 0.9
+            await _store_prompt_cache_after_generation(
+                mock_lm, gen_kwargs, [1, 2, 3], [4, 5], 2, "test"
+            )
+
+        # Cache should be invalidated (removed) on trim failure
+        mock_lm.prompt_cache_store.remove.assert_called_with("test")
+        mock_lm.prompt_cache_store.async_set.assert_not_awaited()

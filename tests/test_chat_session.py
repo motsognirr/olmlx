@@ -1253,3 +1253,254 @@ class TestToolSafetyIntegration:
 
         mcp.call_tool.assert_awaited_once()
         assert not decider_called
+
+
+class TestPrepareTools:
+    """Tests for ChatSession._prepare_tools."""
+
+    def test_no_tools_returns_none(self):
+        session = _make_session()
+        assert session._prepare_tools() is None
+
+    def test_mcp_only(self):
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "read_file"}, "type": "function"}
+        ]
+        session = _make_session(mcp=mcp)
+        tools = session._prepare_tools()
+        assert len(tools) == 1
+        assert tools[0]["function"]["name"] == "read_file"
+
+    def test_builtin_only(self):
+        builtin = MagicMock()
+        builtin.get_tool_definitions.return_value = [
+            {"function": {"name": "bash"}, "type": "function"}
+        ]
+        session = _make_session()
+        session.builtin = builtin
+        tools = session._prepare_tools()
+        assert len(tools) == 1
+        assert tools[0]["function"]["name"] == "bash"
+
+    def test_mcp_plus_builtin_dedup(self):
+        """Builtin tool with same name as MCP tool is skipped."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "bash"}, "type": "function"}
+        ]
+        builtin = MagicMock()
+        builtin.get_tool_definitions.return_value = [
+            {"function": {"name": "bash"}, "type": "function"},
+            {"function": {"name": "grep"}, "type": "function"},
+        ]
+        session = _make_session(mcp=mcp)
+        session.builtin = builtin
+        tools = session._prepare_tools()
+        names = [t["function"]["name"] for t in tools]
+        assert names == ["bash", "grep"]  # MCP bash, builtin grep
+
+    def test_skills_appended(self):
+        skills = MagicMock(spec=SkillManager)
+        skills.get_tool_definition.return_value = {
+            "function": {"name": "use_skill"},
+            "type": "function",
+        }
+        skills.get_skill_index_text.return_value = None
+        session = _make_session(skills=skills)
+        tools = session._prepare_tools()
+        assert len(tools) == 1
+        assert tools[0]["function"]["name"] == "use_skill"
+
+    def test_all_three_merged(self):
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "read_file"}, "type": "function"}
+        ]
+        builtin = MagicMock()
+        builtin.get_tool_definitions.return_value = [
+            {"function": {"name": "bash"}, "type": "function"}
+        ]
+        skills = MagicMock(spec=SkillManager)
+        skills.get_tool_definition.return_value = {
+            "function": {"name": "use_skill"},
+            "type": "function",
+        }
+        skills.get_skill_index_text.return_value = None
+        session = _make_session(mcp=mcp, skills=skills)
+        session.builtin = builtin
+        tools = session._prepare_tools()
+        names = [t["function"]["name"] for t in tools]
+        assert names == ["read_file", "bash", "use_skill"]
+
+    def test_mcp_returns_empty_list(self):
+        """MCP returning empty list is treated as no MCP tools."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = []
+        session = _make_session(mcp=mcp)
+        assert session._prepare_tools() is None
+
+    def test_skills_returns_none(self):
+        """Skills returning None tool definition doesn't append anything."""
+        skills = MagicMock(spec=SkillManager)
+        skills.get_tool_definition.return_value = None
+        skills.get_skill_index_text.return_value = None
+        session = _make_session(skills=skills)
+        assert session._prepare_tools() is None
+
+
+class TestExecuteToolCalls:
+    """Tests for ChatSession._execute_tool_calls."""
+
+    def _make_tool_use(self, name="read_file", input_=None, id_="tc_1"):
+        return {"name": name, "input": input_ or {}, "id": id_}
+
+    @pytest.mark.asyncio
+    async def test_all_allowed_no_safety(self):
+        """Without safety policy, all tools execute."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "read_file"}, "type": "function"}
+        ]
+        mcp.call_tool = AsyncMock(return_value="file contents")
+        session = _make_session(mcp=mcp)
+
+        tu = self._make_tool_use()
+        events = []
+        async for event in session._execute_tool_calls([tu]):
+            events.append(event)
+
+        types = [e["type"] for e in events]
+        assert "tool_call" in types
+        assert "tool_result" in types
+        assert len(session.messages) == 1  # tool result message appended
+        assert session.messages[0]["role"] == "tool"
+
+    @pytest.mark.asyncio
+    async def test_denied_tools_yield_events(self):
+        """Denied tools yield tool_denied and append blocked message."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "rm_file"}, "type": "function"}
+        ]
+        config = ToolSafetyConfig(tool_policies={"rm_file": ToolPolicy.DENY})
+        policy = ToolSafetyPolicy(config, decider=AsyncMock(return_value=False))
+        session = _make_session(mcp=mcp, tool_safety=policy)
+
+        tu = self._make_tool_use(name="rm_file")
+        events = []
+        async for event in session._execute_tool_calls([tu]):
+            events.append(event)
+
+        denied = [e for e in events if e.get("type") == "tool_denied"]
+        assert len(denied) == 1
+        assert denied[0]["reason"] == "policy"
+        assert len(session.messages) == 1
+        assert "blocked" in session.messages[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_confirmed_approved(self):
+        """Confirmed tool that user approves gets executed."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "write_file"}, "type": "function"}
+        ]
+        mcp.call_tool = AsyncMock(return_value="ok")
+        config = ToolSafetyConfig(tool_policies={"write_file": ToolPolicy.CONFIRM})
+        policy = ToolSafetyPolicy(config, decider=AsyncMock(return_value=True))
+        session = _make_session(mcp=mcp, tool_safety=policy)
+
+        tu = self._make_tool_use(name="write_file")
+        events = []
+        async for event in session._execute_tool_calls([tu]):
+            events.append(event)
+
+        types = [e["type"] for e in events]
+        assert "tool_confirmation_needed" in types
+        assert "tool_approved" in types
+        assert "tool_result" in types
+
+    @pytest.mark.asyncio
+    async def test_confirmed_rejected_by_user(self):
+        """Confirmed tool that user rejects yields denied event."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "write_file"}, "type": "function"}
+        ]
+        config = ToolSafetyConfig(tool_policies={"write_file": ToolPolicy.CONFIRM})
+        policy = ToolSafetyPolicy(config, decider=AsyncMock(return_value=False))
+        session = _make_session(mcp=mcp, tool_safety=policy)
+
+        tu = self._make_tool_use(name="write_file")
+        events = []
+        async for event in session._execute_tool_calls([tu]):
+            events.append(event)
+
+        types = [e["type"] for e in events]
+        assert "tool_confirmation_needed" in types
+        assert "tool_denied" in types
+        denied = [e for e in events if e.get("type") == "tool_denied"]
+        assert denied[0]["reason"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_execution_error_yields_error_event(self):
+        """Tool execution error (caught by _exec_tool) yields error events."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "bad_tool"}, "type": "function"}
+        ]
+        mcp.call_tool = AsyncMock(side_effect=RuntimeError("boom"))
+        session = _make_session(mcp=mcp)
+
+        tu = self._make_tool_use(name="bad_tool")
+        events = []
+        async for event in session._execute_tool_calls([tu]):
+            events.append(event)
+
+        # _exec_tool catches Exception and returns error dict, so no raise
+        error_events = [e for e in events if e.get("type") == "tool_error"]
+        assert len(error_events) == 1
+        assert session.messages[0]["role"] == "tool"
+        assert "Error calling bad_tool" in session.messages[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_base_exception_propagates(self):
+        """BaseException (e.g. CancelledError) from gather propagates after events."""
+        import asyncio as _asyncio
+
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "bad_tool"}, "type": "function"}
+        ]
+        mcp.call_tool = AsyncMock(side_effect=_asyncio.CancelledError("cancel"))
+        session = _make_session(mcp=mcp)
+
+        tu = self._make_tool_use(name="bad_tool")
+        events = []
+        with pytest.raises(_asyncio.CancelledError):
+            async for event in session._execute_tool_calls([tu]):
+                events.append(event)
+
+        error_events = [e for e in events if e.get("type") == "tool_error"]
+        assert len(error_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_messages_in_call_order(self):
+        """Tool result messages are appended in original call order."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "tool_a"}, "type": "function"},
+            {"function": {"name": "tool_b"}, "type": "function"},
+        ]
+        mcp.call_tool = AsyncMock(side_effect=["result_a", "result_b"])
+        session = _make_session(mcp=mcp)
+
+        tu_a = self._make_tool_use(name="tool_a", id_="tc_a")
+        tu_b = self._make_tool_use(name="tool_b", id_="tc_b")
+        events = []
+        async for event in session._execute_tool_calls([tu_a, tu_b]):
+            events.append(event)
+
+        assert len(session.messages) == 2
+        assert session.messages[0]["tool_call_id"] == "tc_a"
+        assert session.messages[1]["tool_call_id"] == "tc_b"

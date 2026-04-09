@@ -174,30 +174,39 @@ class TestDrainAndJoinBlocksNewInference:
         """After KV cache eviction mx.clear_cache(), mx.synchronize() must follow."""
         import inspect
 
-        source = inspect.getsource(_inf_mod._stream_completion)
-        lines = source.split("\n")
-        # Find all evict_all_to_disk sites and verify each has _safe_sync
-        # somewhere between it and the next eviction site (or end of function).
-        eviction_indices = [
-            i
-            for i, line in enumerate(lines)
-            if "evict_all_to_disk" in line and not line.lstrip().startswith("#")
+        # Check both _stream_completion and extracted helpers for eviction sites
+        sources = [
+            ("_stream_completion", inspect.getsource(_inf_mod._stream_completion)),
+            ("_setup_prompt_cache", inspect.getsource(_inf_mod._setup_prompt_cache)),
+            (
+                "_kv_cache_preflight_check",
+                inspect.getsource(_inf_mod._kv_cache_preflight_check),
+            ),
         ]
-        assert len(eviction_indices) >= 1, (
-            "Expected at least one evict_all_to_disk call in _stream_completion"
-        )
-        for idx, start in enumerate(eviction_indices):
-            end = (
-                eviction_indices[idx + 1]
-                if idx + 1 < len(eviction_indices)
-                else len(lines)
-            )
-            block = "\n".join(lines[start:end])
-            if "clear_cache" in block:
-                assert "synchronize" in block or "_safe_sync" in block, (
-                    f"mx.synchronize() or _safe_sync() must follow mx.clear_cache() "
-                    f"in eviction path starting at source line {start} (Bug #120)"
+        total_eviction_sites = 0
+        for func_name, source in sources:
+            lines = source.split("\n")
+            eviction_indices = [
+                i
+                for i, line in enumerate(lines)
+                if "evict_all_to_disk" in line and not line.lstrip().startswith("#")
+            ]
+            total_eviction_sites += len(eviction_indices)
+            for idx, start in enumerate(eviction_indices):
+                end = (
+                    eviction_indices[idx + 1]
+                    if idx + 1 < len(eviction_indices)
+                    else len(lines)
                 )
+                block = "\n".join(lines[start:end])
+                if "clear_cache" in block:
+                    assert "synchronize" in block or "_safe_sync" in block, (
+                        f"mx.synchronize() or _safe_sync() must follow mx.clear_cache() "
+                        f"in {func_name} eviction path at source line {start} (Bug #120)"
+                    )
+        assert total_eviction_sites >= 1, (
+            "Expected at least one evict_all_to_disk call across completion functions"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +217,11 @@ class TestPromptCacheRemoveBeforeMutation:
 
     @pytest.mark.asyncio
     async def test_cache_removed_from_store_before_mutation(self):
-        """_stream_completion must remove cache from store before trimming/passing to generator."""
+        """Cache setup must remove cache from store before trimming/passing to generator."""
         import inspect
 
-        source = inspect.getsource(_inf_mod._stream_completion)
-        # The fix removes the cache from the store before mutation so the
-        # store's copy is not corrupted if the client disconnects mid-stream.
+        # Bug #123 fix now lives in _setup_prompt_cache (extracted helper)
+        source = inspect.getsource(_inf_mod._setup_prompt_cache)
         assert "prompt_cache_store.remove" in source, (
             "Prompt cache must be removed from store before mutation (Bug #123)"
         )
