@@ -191,7 +191,13 @@ def mock_mlx_primitives(monkeypatch):
     # Prompt cache
     mock_make_cache = MagicMock(return_value=[MagicMock()])
     _start("olmlx.engine.inference.make_prompt_cache", mock_make_cache)
-    _start("olmlx.engine.inference.trim_prompt_cache", MagicMock())
+    # Successful trim returns the requested amount; without this, the
+    # `trimmed != trim_amount` guard in _stream_completion would fire the
+    # non-trimmable cache fallback and skip the suffix path.
+    _start(
+        "olmlx.engine.inference.trim_prompt_cache",
+        MagicMock(side_effect=lambda c, n: n),
+    )
     # _find_common_prefix is pure Python — let it run unpatched
 
     # HuggingFace download

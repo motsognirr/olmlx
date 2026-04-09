@@ -743,6 +743,17 @@ _NATIVE_TOOL_HINT = (
     "You MUST use only the native tool call format provided by the system."
 )
 
+# Substrings that indicate the system message contains client-injected
+# tool-format instructions targeting a non-native format.  These are formats
+# clients embed as a fallback for models without native tool support, but
+# they conflict with templates that DO have native tool support and confuse
+# the model at long prompt lengths.
+_CLIENT_TOOL_FORMAT_PATTERNS = (
+    "<function=",  # Llama 3.x style — used by opencode, Claude Code
+    "[TOOL_CALLS]",  # Mistral style
+    "<|python_tag|>",  # Llama 3.x JSON style
+)
+
 
 def _add_native_tool_hint(messages: list[dict]) -> list[dict]:
     """Append a hint to the system message to use native tool call format.
@@ -756,15 +767,27 @@ def _add_native_tool_hint(messages: list[dict]) -> list[dict]:
 
     A short override at the end of the system message steers the model back
     to the native format without modifying the client's original content.
+
+    Only applied when the system message actually contains a known
+    conflicting format pattern — leaves untouched system prompts (and
+    user-authored intentional tool guidance) alone.
     """
+    if not messages or messages[0].get("role") != "system":
+        return messages
+    content = messages[0].get("content", "")
+    # Multimodal content (list of parts) is not handled — the conflict pattern
+    # is text-only and the hint targets text-only system messages.
+    if not isinstance(content, str):
+        return messages
+    if _NATIVE_TOOL_HINT in content:
+        return messages
+    if not any(p in content for p in _CLIENT_TOOL_FORMAT_PATTERNS):
+        return messages
     messages = list(messages)  # shallow copy
-    if messages and messages[0].get("role") == "system":
-        content = messages[0].get("content", "")
-        if isinstance(content, str) and _NATIVE_TOOL_HINT not in content:
-            messages[0] = {
-                **messages[0],
-                "content": content + "\n\n" + _NATIVE_TOOL_HINT,
-            }
+    messages[0] = {
+        **messages[0],
+        "content": content + "\n\n" + _NATIVE_TOOL_HINT,
+    }
     return messages
 
 
@@ -1308,16 +1331,26 @@ async def _stream_completion(
                 if trim_amount > 0:
                     trimmed = trim_prompt_cache(working_cache, trim_amount)
 
-                if trimmed == 0 and trim_amount > 0:
-                    # Cache layers are non-trimmable (e.g. Qwen3-Next hybrid
-                    # cache with ArraysCache for linear attention layers).
-                    # Fall through to create a fresh cache instead of passing
-                    # a stale, misaligned cache to stream_generate.
+                if trim_amount > 0 and trimmed != trim_amount:
+                    # Cache layers are non-trimmable or only partially
+                    # trimmable (e.g. Qwen3-Next hybrid cache with ArraysCache
+                    # for linear attention layers — trim_prompt_cache returns
+                    # 0 for any cache where some layer is non-trimmable).  A
+                    # partial trim would leave the KV state misaligned with
+                    # the prompt, so fall through to fresh-cache creation
+                    # rather than passing a stale cache to stream_generate.
                     logger.warning(
-                        "Prompt cache trim returned 0 (non-trimmable cache layers); "
-                        "discarding stale cache and creating fresh"
+                        "Prompt cache trim incomplete (asked for %d, got %d); "
+                        "discarding stale cache and creating fresh",
+                        trim_amount,
+                        trimmed,
                     )
                     del working_cache
+                    # Release the stale cache reference now so its GPU memory
+                    # can be reclaimed before the fresh cache is allocated.
+                    # `cached.cache` aliases `working_cache` and would otherwise
+                    # keep the stale KV tensors resident.
+                    cached = None
                     # Fall through to fresh-cache creation below
                 else:
                     suffix_tokens = prompt_tokens[suffix_start:]

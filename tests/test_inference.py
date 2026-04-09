@@ -271,11 +271,14 @@ class TestInjectToolsIntoSystem:
 
 
 class TestAddNativeToolHint:
-    def test_appends_hint_to_system_message(self):
+    def test_appends_hint_when_function_pattern_present(self):
         from olmlx.engine.inference import _add_native_tool_hint
 
         messages = [
-            {"role": "system", "content": "You are helpful."},
+            {
+                "role": "system",
+                "content": "Use this format: <function=Name>...</function>",
+            },
             {"role": "user", "content": "hi"},
         ]
         result = _add_native_tool_hint(messages)
@@ -283,19 +286,49 @@ class TestAddNativeToolHint:
         # Original not modified
         assert "native" not in messages[0]["content"]
 
+    def test_appends_hint_when_tool_calls_pattern_present(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "Mistral format: [TOOL_CALLS] [...]"},
+        ]
+        result = _add_native_tool_hint(messages)
+        assert "native tool call format" in result[0]["content"]
+
+    def test_appends_hint_when_python_tag_pattern_present(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "Use <|python_tag|>{...}"},
+        ]
+        result = _add_native_tool_hint(messages)
+        assert "native tool call format" in result[0]["content"]
+
+    def test_no_hint_when_no_conflict_pattern(self):
+        """Plain system prompts without conflicting format instructions are untouched."""
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "You are a helpful coding assistant."},
+            {"role": "user", "content": "hi"},
+        ]
+        result = _add_native_tool_hint(messages)
+        assert result[0]["content"] == "You are a helpful coding assistant."
+
     def test_no_system_message_is_noop(self):
         from olmlx.engine.inference import _add_native_tool_hint
 
-        messages = [{"role": "user", "content": "hi"}]
+        messages = [{"role": "user", "content": "<function=foo>bar</function>"}]
         result = _add_native_tool_hint(messages)
         assert len(result) == 1
         assert result[0]["role"] == "user"
+        assert "native tool call format" not in result[0]["content"]
 
     def test_not_duplicated(self):
         from olmlx.engine.inference import _add_native_tool_hint
 
         messages = [
-            {"role": "system", "content": "You are helpful."},
+            {"role": "system", "content": "Use <function=Name>...</function>"},
         ]
         result = _add_native_tool_hint(messages)
         result2 = _add_native_tool_hint(result)
@@ -305,10 +338,13 @@ class TestAddNativeToolHint:
         from olmlx.engine.inference import _add_native_tool_hint
 
         messages = [
-            {"role": "system", "content": [{"type": "text", "text": "hi"}]},
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": "<function=foo>"}],
+            },
         ]
         result = _add_native_tool_hint(messages)
-        assert result[0]["content"] == [{"type": "text", "text": "hi"}]
+        assert result[0]["content"] == [{"type": "text", "text": "<function=foo>"}]
 
 
 class TestConvertToolMessagesToResponses:

@@ -345,6 +345,12 @@ class TestNonTrimmableCacheFallback:
         assert prompt_cache_arg is fresh_cache
         assert prompt_cache_arg is not stale_cache
 
+        # Critical: the full prompt must be passed, not the suffix.  A
+        # regression where suffix_tokens is computed alongside the fresh
+        # cache would produce misaligned generation.
+        prompt_arg = call_args[1].get("prompt") or call_args[0][2]
+        assert prompt_arg == [10, 20, 30, 40, 50, 60, 70, 80]
+
 
 class TestCacheMissCreatesFresh:
     @pytest.mark.asyncio
@@ -828,7 +834,10 @@ class TestCacheExactMatchTrimAlignment:
         tokens = _make_stream_tokens("out", prompt_tokens=1)
         mock_stream = _make_mock_stream(tokens)
 
-        mock_trim = MagicMock()
+        # Successful trim returns the requested amount; the check
+        # `trimmed != trim_amount` would otherwise fire the non-trimmable
+        # fallback and skip the suffix path under test.
+        mock_trim = MagicMock(side_effect=lambda c, n: n)
 
         mock_mx = MagicMock()
         with (
@@ -1832,7 +1841,10 @@ class TestMultiCacheBehavior:
         tokens = _make_stream_tokens("Hello", prompt_tokens=5)
         mock_stream = _make_mock_stream(tokens)
 
-        mock_trim = MagicMock()
+        # Successful trim returns the requested amount; the check
+        # `trimmed != trim_amount` would otherwise fire the non-trimmable
+        # fallback and zero-out cache_read_tokens.
+        mock_trim = MagicMock(side_effect=lambda c, n: n)
         mock_mx = MagicMock()
         with (
             patch("olmlx.engine.inference.mx", mock_mx),
