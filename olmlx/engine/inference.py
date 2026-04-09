@@ -752,6 +752,7 @@ _CLIENT_TOOL_FORMAT_PATTERNS = (
     "<function=",  # Llama 3.x style — used by opencode, Claude Code
     "[TOOL_CALLS]",  # Mistral style
     "<|python_tag|>",  # Llama 3.x JSON style
+    "<tool_call>",  # Qwen style — clients sometimes inject this even for non-Qwen models
 )
 
 
@@ -1309,6 +1310,13 @@ async def _stream_completion(
             # Set before mutation so finally guard can clean up on error
             full_prompt_tokens = prompt_tokens
 
+            # Label for the fresh-cache log line.  Set to "trim-fallback" if
+            # we discard a stale cache because trim_prompt_cache could not
+            # align it (e.g. Qwen3-Next hybrid cache).  Otherwise the log
+            # block below picks "miss" or "init" based on whether `cached`
+            # was populated.
+            fresh_cache_label: str | None = None
+
             # stream_generate requires at least 1 token, so we must back up
             # by one position on exact-match.  If that would mean suffix_start=0
             # (single-token prompt), the cache hit is useless — trimming the
@@ -1351,6 +1359,7 @@ async def _stream_completion(
                     # `cached.cache` aliases `working_cache` and would otherwise
                     # keep the stale KV tensors resident.
                     cached = None
+                    fresh_cache_label = "trim-fallback"
                     # Fall through to fresh-cache creation below
                 else:
                     suffix_tokens = prompt_tokens[suffix_start:]
@@ -1398,9 +1407,11 @@ async def _stream_completion(
                     new_cache = make_prompt_cache(cache_model)
                 gen_kwargs["prompt_cache"] = new_cache
                 cache_creation_tokens = len(prompt_tokens)
+                if fresh_cache_label is None:
+                    fresh_cache_label = "miss" if cached is not None else "init"
                 logger.info(
                     "Prompt cache %s: creating fresh cache for %d tokens",
-                    "miss" if cached is not None else "init",
+                    fresh_cache_label,
                     len(prompt_tokens),
                 )
                 if lm.is_vlm:
