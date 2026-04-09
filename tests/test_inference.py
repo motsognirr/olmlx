@@ -270,6 +270,127 @@ class TestInjectToolsIntoSystem:
         assert "direct_tool" in result[0]["content"]
 
 
+class TestAddNativeToolHint:
+    def test_appends_hint_when_function_pattern_present(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {
+                "role": "system",
+                "content": "Use this format: <function=Name>...</function>",
+            },
+            {"role": "user", "content": "hi"},
+        ]
+        result = _add_native_tool_hint(messages)
+        assert "native tool call format" in result[0]["content"]
+        # Original not modified
+        assert "native" not in messages[0]["content"]
+
+    def test_appends_hint_when_tool_calls_pattern_present(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "Mistral format: [TOOL_CALLS] [...]"},
+        ]
+        result = _add_native_tool_hint(messages)
+        assert "native tool call format" in result[0]["content"]
+
+    def test_appends_hint_when_python_tag_pattern_present(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "Use <|python_tag|>{...}"},
+        ]
+        result = _add_native_tool_hint(messages)
+        assert "native tool call format" in result[0]["content"]
+
+    def test_no_hint_for_qwen_native_tool_call(self):
+        """`<tool_call>` is Qwen's native format — must not trigger the hint.
+
+        For Qwen models, client instructions describing `<tool_call>` match
+        the model's actual native format.  Adding the hint would tell the
+        model to "disregard" instructions that are correct for it.
+        """
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "Use <tool_call>{...}</tool_call>"},
+        ]
+        result = _add_native_tool_hint(messages)
+        assert "native tool call format" not in result[0]["content"]
+
+    def test_no_hint_when_pattern_is_in_template(self):
+        """Skip patterns that the model's own chat template uses natively.
+
+        Mistral's template literally contains `[TOOL_CALLS]`, so client
+        instructions referencing that pattern match the native format and
+        should not trigger the override.
+        """
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "Use [TOOL_CALLS] [...]"},
+        ]
+        # Mistral-style template — contains [TOOL_CALLS] natively
+        template_text = "{% if tools %}[TOOL_CALLS] {{ tools }}{% endif %}"
+        result = _add_native_tool_hint(messages, template_text)
+        assert "native tool call format" not in result[0]["content"]
+
+    def test_hint_fires_when_pattern_not_in_template(self):
+        """Pattern in system message but NOT in template → hint fires."""
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "Use <function=Name>...</function>"},
+        ]
+        # Gemma 4-style template — uses <|tool_call> tokens, not <function=
+        template_text = "{% if tools %}<|tool_call>{{ tools }}<tool_call|>{% endif %}"
+        result = _add_native_tool_hint(messages, template_text)
+        assert "native tool call format" in result[0]["content"]
+
+    def test_no_hint_when_no_conflict_pattern(self):
+        """Plain system prompts without conflicting format instructions are untouched."""
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "You are a helpful coding assistant."},
+            {"role": "user", "content": "hi"},
+        ]
+        result = _add_native_tool_hint(messages)
+        assert result[0]["content"] == "You are a helpful coding assistant."
+
+    def test_no_system_message_is_noop(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [{"role": "user", "content": "<function=foo>bar</function>"}]
+        result = _add_native_tool_hint(messages)
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert "native tool call format" not in result[0]["content"]
+
+    def test_not_duplicated(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "Use <function=Name>...</function>"},
+        ]
+        result = _add_native_tool_hint(messages)
+        result2 = _add_native_tool_hint(result)
+        assert result2[0]["content"].count("native tool call format") == 1
+
+    def test_non_string_content_is_noop(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": "<function=foo>"}],
+            },
+        ]
+        result = _add_native_tool_hint(messages)
+        assert result[0]["content"] == [{"type": "text", "text": "<function=foo>"}]
+
+
 class TestConvertToolMessagesToResponses:
     def test_no_tool_messages_unchanged(self):
         """Messages without role=tool pass through unchanged."""
@@ -2464,6 +2585,132 @@ class TestEstimateKvCacheBytes:
         naive_head_dim = 7168 // 128  # = 56
         naive_raw = 61 * 2 * 128 * naive_head_dim * 1000 * 2
         assert result < naive_raw  # MLA should be ~25x smaller
+
+    def test_gemma4_hybrid_attention_with_sliding_window(self):
+        """Gemma 4-style hybrid model: sliding-window + full attention with per-layer head_dim.
+
+        Gemma 4 31b has:
+          - 60 layers total
+          - 50 sliding-window layers (n_kv=16, head_dim=256, capped at 1024 tokens)
+          - 10 full-attention layers (n_kv=4, head_dim=512, uncapped)
+
+        Naive estimation (uniform layers, no window cap) overestimates by ~8x
+        for long prompts and triggers spurious MemoryError 503s.
+        """
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 60
+        args.num_attention_heads = 32
+        args.num_key_value_heads = 16
+        args.hidden_size = 5376
+        args.head_dim = 256
+        args.global_head_dim = 512
+        args.sliding_window = 1024
+
+        model = MagicMock(spec=[])
+        model.args = args
+
+        layers = []
+        for i in range(60):
+            layer = MagicMock()
+            attn = MagicMock()
+            # Mimic mlx-vlm gemma4: full-attention layers have larger head_dim
+            # but fewer kv_heads.  Layer types alternate (5 sliding, 1 full).
+            if i % 6 == 5:
+                attn.n_kv_heads = 4
+                attn.head_dim = 512
+                attn.is_sliding = False
+            else:
+                attn.n_kv_heads = 16
+                attn.head_dim = 256
+                attn.is_sliding = True
+            layer.self_attn = attn
+            layers.append(layer)
+        model.model = MagicMock()
+        model.model.layers = layers
+
+        num_tokens = 33181
+        # Expected per-layer:
+        #   sliding: 2 * 16 * 256 * min(33181, 1024) * 2 = 16,777,216 bytes
+        #   full:    2 * 4 * 512 * 33181 * 2 = 271,773,696 bytes
+        #   sum: 50 * 16,777,216 + 10 * 271,773,696 = 838,860,800 + 2,717,736,960
+        #      = 3,556,597,760 bytes raw (≈3.31 GB)
+        sliding_per_layer = 2 * 16 * 256 * 1024 * 2
+        full_per_layer = 2 * 4 * 512 * num_tokens * 2
+        expected_raw = 50 * sliding_per_layer + 10 * full_per_layer
+
+        result = _estimate_kv_cache_bytes(model, num_tokens)
+        assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+        # Sanity check: result should fit in 16 GB.  The naive uniform-layer
+        # formula (60 * 2 * 16 * 256 * 33181 * 2 * 1.3) ≈ 38 GB would not.
+        assert result < 16 * 1024**3, f"Expected ~4.3 GB, got {result / 1024**3:.1f} GB"
+
+    def test_per_layer_sliding_window_override(self):
+        """Per-layer self_attn.sliding_window_size takes precedence over args.sliding_window.
+
+        Defensive test: today no shipping model exposes heterogeneous
+        per-layer windows, but the introspection should honour them if a
+        future model does.
+        """
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 4
+        args.num_attention_heads = 8
+        args.num_key_value_heads = 8
+        args.hidden_size = 1024
+        args.head_dim = 128
+        args.sliding_window = 4096  # global default
+
+        model = MagicMock(spec=[])
+        model.args = args
+
+        layers = []
+        for _ in range(4):
+            layer = MagicMock()
+            attn = MagicMock()
+            attn.n_kv_heads = 8
+            attn.head_dim = 128
+            attn.is_sliding = True
+            # Per-layer window — overrides the global args.sliding_window
+            attn.sliding_window_size = 512
+            layer.self_attn = attn
+            layers.append(layer)
+        model.model = MagicMock()
+        model.model.layers = layers
+
+        # 8000 tokens, but per-layer window is 512 (not 4096)
+        result = _estimate_kv_cache_bytes(model, 8000)
+        expected_raw = 4 * 2 * 8 * 128 * 512 * 2
+        assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+    def test_sliding_window_cap_short_prompt(self):
+        """When num_tokens < sliding_window, sliding layers should NOT be capped down."""
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 4
+        args.num_attention_heads = 8
+        args.num_key_value_heads = 8
+        args.hidden_size = 1024
+        args.head_dim = 128
+        args.sliding_window = 1024
+
+        model = MagicMock(spec=[])
+        model.args = args
+
+        layers = []
+        for _ in range(4):
+            layer = MagicMock()
+            attn = MagicMock()
+            attn.n_kv_heads = 8
+            attn.head_dim = 128
+            attn.is_sliding = True
+            layer.self_attn = attn
+            layers.append(layer)
+        model.model = MagicMock()
+        model.model.layers = layers
+
+        # 500 < 1024, so sliding layers use full prompt length
+        result = _estimate_kv_cache_bytes(model, 500)
+        expected_raw = 4 * 2 * 8 * 128 * 500 * 2
+        assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_turboquant_4bit_reduces_estimate(self):
         """TurboQuant 4-bit KV cache should reduce the memory estimate.

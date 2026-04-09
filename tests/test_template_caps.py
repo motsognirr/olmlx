@@ -184,3 +184,14 @@ class TestDetectCaps:
     def test_uses_tool_responses_defaults(self):
         caps = TemplateCaps()
         assert caps.uses_tool_responses is False
+
+    def test_uses_tool_responses_bracket_notation(self):
+        """Gemma 4 template uses message['tool_responses'] (bracket notation)."""
+        tok = MagicMock()
+        tok.chat_template = (
+            "{% for msg in messages %}"
+            "{% if msg['tool_responses'] %}{{ msg['tool_responses'] }}{% endif %}"
+            "{% endfor %}"
+        )
+        caps = detect_caps(tok)
+        assert caps.uses_tool_responses is True

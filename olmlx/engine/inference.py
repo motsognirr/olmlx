@@ -454,7 +454,7 @@ def _estimate_kv_cache_bytes(
             sq_per_entry = head_dim // (8 // quant_bits) + 4
             _tq_ratio = sq_per_entry / fp16_per_entry
 
-    # Try layer introspection for NAS/variable-attention models.
+    # Try layer introspection for NAS/variable-attention/hybrid models.
     # Track which sub-model owns the args so we introspect the right layers
     # (for VLMs, args came from model.language_model — introspect that, not
     # model.model which could be a vision encoder).
@@ -467,25 +467,76 @@ def _estimate_kv_cache_bytes(
     inner = getattr(args_owner, "model", None)
     layers = getattr(inner, "layers", None) if inner is not None else None
     if isinstance(layers, (list, tuple)) and len(layers) > 0:
-        per_layer_kv_sum = 0
+        # Per-layer accounting for hybrid attention (e.g. Gemma 4): some
+        # layers may use sliding-window attention with a different
+        # n_kv_heads/head_dim and a hard cap on cache depth, while others
+        # use full attention with their own dimensions.
+        sliding_window = getattr(args, "sliding_window", None)
+        raw_total = 0
+        found_attn_layer = False
+        introspection_complete = True
         for layer in layers:
             self_attn = getattr(layer, "self_attn", None)
             if self_attn is None:
                 continue  # no-op attention layer — no KV cache
             layer_kv_heads = getattr(self_attn, "n_kv_heads", None)
-            if layer_kv_heads is None:
+            if not isinstance(layer_kv_heads, int):
                 # Standard model — fall back to args
+                introspection_complete = False
                 break
-            per_layer_kv_sum += layer_kv_heads
-        else:
-            # All layers inspected successfully — but only trust the result
-            # if we actually found some attention layers.  per_layer_kv_sum == 0
-            # likely means the attention module uses a different attribute name
-            # (e.g. "attention" instead of "self_attn"); fall through to the
-            # args-based estimate in that case.
-            if per_layer_kv_sum > 0:
-                raw = 2 * per_layer_kv_sum * head_dim * num_tokens * bytes_per_element
-                return int(raw * _tq_ratio * MEMORY_SAFETY_FACTOR)
+            found_attn_layer = True
+            # Per-layer head_dim falls back to the global head_dim if the
+            # attention module doesn't expose its own as an int (most
+            # uniform models).  isinstance check guards against test
+            # MagicMocks auto-creating non-numeric attributes.
+            attn_head_dim = getattr(self_attn, "head_dim", None)
+            layer_head_dim = (
+                attn_head_dim if isinstance(attn_head_dim, int) else head_dim
+            )
+            # Sliding-window attention: cap effective tokens at the window
+            # size.  Use `is True` to avoid being fooled by truthy MagicMocks
+            # in tests; production code sets a literal bool.  Prefer a
+            # per-layer window if exposed (defensive — Gemma 4 today shares
+            # a single window across all sliding layers via args, but a
+            # future model could expose heterogeneous windows).
+            is_sliding = getattr(self_attn, "is_sliding", None) is True
+            layer_sw: int | None = None
+            for attr in ("sliding_window_size", "sliding_window"):
+                v = getattr(self_attn, attr, None)
+                if isinstance(v, int) and v > 0:
+                    layer_sw = v
+                    break
+            if layer_sw is None and isinstance(sliding_window, int):
+                layer_sw = sliding_window
+            if is_sliding and layer_sw is None:
+                # A sliding-window layer with no resolvable window size
+                # falls through to a full-prompt estimate (safe overestimate
+                # — won't cause OOM, just a spurious 503 on long prompts).
+                # Log so the condition is diagnosable without a debugger.
+                logger.debug(
+                    "Layer %d reports is_sliding=True but no window size "
+                    "found on self_attn or args; using full token count for "
+                    "KV estimation (safe overestimate)",
+                    getattr(self_attn, "layer_idx", -1),
+                )
+            effective_tokens = (
+                min(num_tokens, layer_sw)
+                if is_sliding and layer_sw is not None
+                else num_tokens
+            )
+            raw_total += (
+                2
+                * layer_kv_heads
+                * layer_head_dim
+                * effective_tokens
+                * bytes_per_element
+            )
+        # Only trust introspection when every encountered layer reported its
+        # KV heads.  found_attn_layer == False likely means the attention
+        # module uses a different attribute name (e.g. "attention" instead of
+        # "self_attn"); fall through to the args-based estimate in that case.
+        if introspection_complete and found_attn_layer:
+            return int(raw_total * _tq_ratio * MEMORY_SAFETY_FACTOR)
 
     # Fallback: uniform estimate from args
     num_layers = args.num_hidden_layers
@@ -736,6 +787,104 @@ def _inject_tools_into_system(messages: list[dict], tools: list[dict]) -> list[d
     else:
         messages.insert(0, {"role": "system", "content": tool_block})
     return messages
+
+
+_NATIVE_TOOL_HINT = (
+    "Disregard any tool call format instructions above. "
+    "You MUST use only the native tool call format provided by the system."
+)
+
+# Substrings that indicate the system message contains client-injected
+# tool-format instructions targeting a non-native format.  These are formats
+# clients embed as a fallback for models without native tool support, but
+# they conflict with templates that DO have native tool support and confuse
+# the model at long prompt lengths.
+_CLIENT_TOOL_FORMAT_PATTERNS = (
+    "<function=",  # Llama 3.x style — used by opencode, Claude Code
+    "[TOOL_CALLS]",  # Mistral style
+    "<|python_tag|>",  # Llama 3.x JSON style
+    # NB: `<tool_call>` is intentionally absent — it's Qwen's *native* tool
+    # call format token, so it would false-positive on Qwen models where the
+    # client's instructions match the native format.  The opencode/Claude
+    # Code case is still caught by `<function=`, which appears alongside
+    # `<tool_call>` in their format examples.
+)
+
+
+def _add_native_tool_hint(
+    messages: list[dict], native_template_text: str = ""
+) -> list[dict]:
+    """Append a hint to the system message to use native tool call format.
+
+    Clients like opencode and Claude Code embed their own tool-format
+    instructions (e.g. ``<function=Name>``) in the system message.  These
+    conflict with the model's native tool call format (e.g. Gemma 4's
+    ``<|tool_call>call:Name{...}<tool_call|>``).  At long prompt lengths
+    the model follows the client's text instructions instead of using native
+    tokens, producing unparseable output.
+
+    A short override at the end of the system message steers the model back
+    to the native format without modifying the client's original content.
+
+    **Scope: this is intentionally general, not Gemma 4-specific.**
+    Any model with native tool support (Qwen3, Mistral, Llama 3.x, Gemma 4,
+    etc.) can be confused by client-injected non-native format instructions
+    at long prompt lengths.  Gemma 4 is just where the symptom was first
+    observed.  The patterns matched are the formats clients inject as a
+    fallback for models *without* native tool support — when the model DOES
+    have native support, the template format is authoritative.
+
+    Only applied when the system message contains a conflict pattern that
+    is NOT also present in the model's own chat template.  This prevents
+    false positives for models like Mistral whose template natively contains
+    ``[TOOL_CALLS]``: in that case the client's instructions match the
+    model's native format and the "Disregard" override would suppress
+    legitimate guidance.  Pass ``native_template_text`` from the call site;
+    omit it (or pass empty) to skip the suppression check.
+    """
+    if not messages or messages[0].get("role") != "system":
+        return messages
+    content = messages[0].get("content", "")
+    # Multimodal content (list of parts) is not handled — the conflict pattern
+    # is text-only and the hint targets text-only system messages.
+    if not isinstance(content, str):
+        return messages
+    if _NATIVE_TOOL_HINT in content:
+        return messages
+    # A pattern is only a "conflict" if it appears in the system message
+    # AND the model's own template doesn't use it natively.
+    triggered = [
+        p
+        for p in _CLIENT_TOOL_FORMAT_PATTERNS
+        if p in content and p not in native_template_text
+    ]
+    if not triggered:
+        return messages
+    messages = list(messages)  # shallow copy
+    messages[0] = {
+        **messages[0],
+        "content": content + "\n\n" + _NATIVE_TOOL_HINT,
+    }
+    return messages
+
+
+def _get_chat_template_text(tokenizer: Any) -> str:
+    """Extract the chat template as a single string for substring matching.
+
+    Handles both text tokenizers (chat_template directly) and VLM processors
+    (chat_template on the wrapped tokenizer).  Lists of named templates are
+    flattened into a single space-joined string.
+    """
+    tpl = getattr(tokenizer, "chat_template", None)
+    if tpl is None:
+        sub = getattr(tokenizer, "tokenizer", None)
+        if sub is not None:
+            tpl = getattr(sub, "chat_template", None)
+    if tpl is None:
+        return ""
+    if isinstance(tpl, list):
+        return " ".join(t.get("template", "") for t in tpl if isinstance(t, dict))
+    return tpl if isinstance(tpl, str) else ""
 
 
 def _apply_chat_template(
@@ -1256,6 +1405,13 @@ async def _stream_completion(
             # Set before mutation so finally guard can clean up on error
             full_prompt_tokens = prompt_tokens
 
+            # Label for the fresh-cache log line.  Set to "trim-fallback" if
+            # we discard a stale cache because trim_prompt_cache could not
+            # align it (e.g. Qwen3-Next hybrid cache).  Otherwise the log
+            # block below picks "miss" or "init" based on whether `cached`
+            # was populated.
+            fresh_cache_label: str | None = None
+
             # stream_generate requires at least 1 token, so we must back up
             # by one position on exact-match.  If that would mean suffix_start=0
             # (single-token prompt), the cache hit is useless — trimming the
@@ -1274,32 +1430,73 @@ async def _stream_completion(
                 lm.prompt_cache_store.remove(cache_id)
                 # Trim cache to suffix_start so it aligns with where we resume
                 trim_amount = len(cached.tokens) - suffix_start
+                trimmed = 0
                 if trim_amount > 0:
-                    trim_prompt_cache(working_cache, trim_amount)
+                    trimmed = trim_prompt_cache(working_cache, trim_amount)
 
-                suffix_tokens = prompt_tokens[suffix_start:]
-
-                # Report suffix_start as cache_read — the number of tokens
-                # whose KV entries are actually reused from cache.  On exact
-                # match, suffix_start = prefix_len - 1 because stream_generate
-                # re-processes the token at suffix_start (its KV is not reused).
-                cache_read_tokens = suffix_start
-                cache_creation_tokens = len(suffix_tokens)
-                logger.info(
-                    "Prompt cache hit: %d prefix tokens reused, %d new tokens to process (was %d total)",
-                    prefix_len,
-                    len(suffix_tokens),
-                    len(prompt_tokens),
-                )
-                gen_kwargs["prompt_cache"] = working_cache
-                if lm.is_vlm:
-                    # VLM stream_generate expects a string prompt; pass
-                    # pre-tokenized tokens via input_ids to bypass prepare_inputs.
-                    gen_kwargs["input_ids"] = mx.array([suffix_tokens])
+                if trim_amount > 0 and trimmed != trim_amount:
+                    # Cache layers are non-trimmable or only partially
+                    # trimmable (e.g. Qwen3-Next hybrid cache with ArraysCache
+                    # for linear attention layers — trim_prompt_cache returns
+                    # 0 for any cache where some layer is non-trimmable).  A
+                    # partial trim would leave the KV state misaligned with
+                    # the prompt, so fall through to fresh-cache creation
+                    # rather than passing a stale cache to stream_generate.
+                    logger.warning(
+                        "Prompt cache trim incomplete (asked for %d, got %d); "
+                        "discarding stale cache and creating fresh",
+                        trim_amount,
+                        trimmed,
+                    )
+                    # Release the stale cache's GPU memory before allocating
+                    # the fresh one.  Both `working_cache` (a local alias)
+                    # and `cached.cache` (via the CachedPromptState) hold
+                    # references to the same KV tensors — both must be
+                    # broken or the tensors stay resident through the
+                    # remainder of this function.  Then force GC + Metal
+                    # buffer reclamation, mirroring the memory-pressure
+                    # eviction path above: CPython's GC is non-deterministic
+                    # and Metal buffers won't be reclaimed in time for the
+                    # fresh cache allocation otherwise — for a 32B+ model
+                    # this could transiently double KV memory and trigger
+                    # the uncatchable Metal OOM the memory guards exist to
+                    # prevent.
+                    del working_cache
+                    cached = None
+                    gc.collect()
+                    mx.clear_cache()
+                    _safe_sync()
+                    fresh_cache_label = "trim-fallback"
+                    # Fall through to fresh-cache creation below
                 else:
-                    prompt = suffix_tokens
-            else:
-                # No usable prefix — free old cache and create fresh
+                    suffix_tokens = prompt_tokens[suffix_start:]
+
+                    # Report suffix_start as cache_read — the number of tokens
+                    # whose KV entries are actually reused from cache.  On exact
+                    # match, suffix_start = prefix_len - 1 because stream_generate
+                    # re-processes the token at suffix_start (its KV is not reused).
+                    cache_read_tokens = suffix_start
+                    cache_creation_tokens = len(suffix_tokens)
+                    logger.info(
+                        "Prompt cache hit: %d prefix tokens reused, %d new tokens to process (was %d total)",
+                        prefix_len,
+                        len(suffix_tokens),
+                        len(prompt_tokens),
+                    )
+                    gen_kwargs["prompt_cache"] = working_cache
+                    if lm.is_vlm:
+                        # VLM stream_generate expects a string prompt; pass
+                        # pre-tokenized tokens via input_ids to bypass prepare_inputs.
+                        gen_kwargs["input_ids"] = mx.array([suffix_tokens])
+                    else:
+                        prompt = suffix_tokens
+
+            if "prompt_cache" not in gen_kwargs:
+                # Reached on either: (a) no usable prefix in cache miss, or
+                # (b) trim-fallback above.  In the trim-fallback path the
+                # cache was already removed before the trim attempt — this
+                # remove is then a harmless no-op (PromptCacheStore.remove
+                # is idempotent).  Kept for the cache-miss path.
                 lm.prompt_cache_store.remove(cache_id)
                 kv_quant = lm.kv_cache_quant
                 if kv_quant is not None:
@@ -1321,9 +1518,11 @@ async def _stream_completion(
                     new_cache = make_prompt_cache(cache_model)
                 gen_kwargs["prompt_cache"] = new_cache
                 cache_creation_tokens = len(prompt_tokens)
+                if fresh_cache_label is None:
+                    fresh_cache_label = "miss" if cached is not None else "init"
                 logger.info(
                     "Prompt cache %s: creating fresh cache for %d tokens",
-                    "miss" if cached is not None else "init",
+                    fresh_cache_label,
                     len(prompt_tokens),
                 )
                 if lm.is_vlm:
@@ -1572,18 +1771,65 @@ async def _stream_completion(
             max_cache_tokens = settings.prompt_cache_max_tokens
             if max_cache_tokens is not None and actual_total > max_cache_tokens:
                 trim_amount = actual_total - max_cache_tokens
+                # cache_invalidated drives the post-trim flow.  Set when:
+                # (a) trim returns the wrong amount (non-trimmable hybrid
+                # cache like Qwen3-Next — expected operating condition), or
+                # (b) trim raises an unexpected exception.  In either case
+                # the storage block is skipped and the cache reference is
+                # released.  Using a flag avoids signalling a normal "this
+                # cache type can't be trimmed" outcome via an exception.
+                cache_invalidated = False
                 try:
-                    trim_prompt_cache(prompt_cache, trim_amount)
-                    if stats.eval_count != len(generated_tokens):
+                    trimmed = trim_prompt_cache(prompt_cache, trim_amount)
+                    if trimmed != trim_amount:
+                        # Hybrid/non-trimmable cache: a partial trim would
+                        # leave the stored cache misaligned with stored_tokens
+                        # metadata, so invalidate rather than carry a broken
+                        # cache forward.
+                        logger.warning(
+                            "Cache trim incomplete (asked for %d, got %d); "
+                            "invalidating cache",
+                            trim_amount,
+                            trimmed,
+                        )
+                        cache_invalidated = True
+                    elif stats.eval_count != len(generated_tokens):
                         # None-ID tokens present: can't map generated_tokens
                         # to KV cache positions. Trim KV cache down to prompt
                         # boundary so depth == len(stored_tokens).
                         extra = max_cache_tokens - len(full_prompt_tokens)
                         if extra > 0:
-                            trim_prompt_cache(prompt_cache, extra)
-                        stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
+                            trimmed_extra = trim_prompt_cache(prompt_cache, extra)
+                            if trimmed_extra != extra:
+                                logger.warning(
+                                    "Cache trim incomplete (asked for %d, got %d); "
+                                    "invalidating cache",
+                                    extra,
+                                    trimmed_extra,
+                                )
+                                cache_invalidated = True
+                        if not cache_invalidated:
+                            stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
                     else:
                         stored_tokens = stored_tokens[:max_cache_tokens]
+                except Exception:
+                    cache_invalidated = True
+                    logger.warning(
+                        "Cache trim raised; invalidating cache",
+                        exc_info=True,
+                    )
+
+                if cache_invalidated:
+                    lm.prompt_cache_store.remove(cache_id)
+                    prompt_cache = None
+                    gc.collect()
+                    mx.clear_cache()
+                    # No _safe_sync() needed here (unlike the pre-generation
+                    # trim-fallback path): no fresh cache allocation follows
+                    # immediately — the function is about to return.  The
+                    # next request's pre-generation path will sync before
+                    # its own allocation.
+                else:
                     evicted = await lm.prompt_cache_store.async_set(
                         cache_id,
                         CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
@@ -1600,15 +1846,6 @@ async def _stream_completion(
                         actual_total,
                         len(stored_tokens),
                         max_cache_tokens,
-                    )
-                except Exception:
-                    lm.prompt_cache_store.remove(cache_id)
-                    prompt_cache = None
-                    gc.collect()
-                    mx.clear_cache()
-                    logger.warning(
-                        "Cache trim failed; invalidating cache",
-                        exc_info=True,
                     )
             else:
                 evicted = await lm.prompt_cache_store.async_set(
@@ -1898,6 +2135,19 @@ async def generate_chat(
     # to the flat format chat templates expect ({name, arguments: {...}}).
     messages = _normalize_tool_calls_in_messages(messages)
 
+    # When native tools are used, clients (e.g. opencode, Claude Code) may
+    # include their own tool-format instructions in the system message that
+    # conflict with the model's native tool call format.  With long prompts,
+    # models like Gemma 4 follow the client's text instructions instead of
+    # generating native tool call tokens.  Appending a short override to the
+    # system message steers the model back to the native format.  We pass
+    # the model's own chat template so the helper can suppress patterns the
+    # template uses natively (e.g. Mistral's `[TOOL_CALLS]`).
+    caps = lm.template_caps or TemplateCaps()
+    if tools and caps.supports_tools:
+        template_text = _get_chat_template_text(lm.tokenizer)
+        messages = _add_native_tool_hint(messages, template_text)
+
     if lm.is_vlm:
         # VLM models must use the VLM generation path for tokenization.
         # Pass tools natively through the template when supported — this
@@ -1905,7 +2155,6 @@ async def generate_chat(
         # which is far more effective than injecting JSON into the system
         # message.  Fall back to system-message injection for models whose
         # template lacks tool support.
-        caps = lm.template_caps or TemplateCaps()
         # Resolve enable_thinking for templates that support it.
         vlm_thinking = enable_thinking if caps.supports_enable_thinking else None
         # Convert role="tool" messages to tool_responses format for models
