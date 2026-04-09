@@ -752,7 +752,11 @@ _CLIENT_TOOL_FORMAT_PATTERNS = (
     "<function=",  # Llama 3.x style — used by opencode, Claude Code
     "[TOOL_CALLS]",  # Mistral style
     "<|python_tag|>",  # Llama 3.x JSON style
-    "<tool_call>",  # Qwen style — clients sometimes inject this even for non-Qwen models
+    # NB: `<tool_call>` is intentionally absent — it's Qwen's *native* tool
+    # call format token, so it would false-positive on Qwen models where the
+    # client's instructions match the native format.  The opencode/Claude
+    # Code case is still caught by `<function=`, which appears alongside
+    # `<tool_call>` in their format examples.
 )
 
 
@@ -1353,11 +1357,13 @@ async def _stream_completion(
                         trim_amount,
                         trimmed,
                     )
+                    # Release the stale cache's GPU memory before allocating
+                    # the fresh one.  Both `working_cache` (a local alias)
+                    # and `cached.cache` (via the CachedPromptState) hold
+                    # references to the same KV tensors — both must be
+                    # broken or the tensors stay resident through the
+                    # remainder of this function.
                     del working_cache
-                    # Release the stale cache reference now so its GPU memory
-                    # can be reclaimed before the fresh cache is allocated.
-                    # `cached.cache` aliases `working_cache` and would otherwise
-                    # keep the stale KV tensors resident.
                     cached = None
                     fresh_cache_label = "trim-fallback"
                     # Fall through to fresh-cache creation below

@@ -304,15 +304,20 @@ class TestAddNativeToolHint:
         result = _add_native_tool_hint(messages)
         assert "native tool call format" in result[0]["content"]
 
-    def test_appends_hint_when_qwen_tool_call_pattern_present(self):
-        """Qwen-style <tool_call> instructions injected for non-Qwen models."""
+    def test_no_hint_for_qwen_native_tool_call(self):
+        """`<tool_call>` is Qwen's native format — must not trigger the hint.
+
+        For Qwen models, client instructions describing `<tool_call>` match
+        the model's actual native format.  Adding the hint would tell the
+        model to "disregard" instructions that are correct for it.
+        """
         from olmlx.engine.inference import _add_native_tool_hint
 
         messages = [
-            {"role": "system", "content": "Use <tool_call>...</tool_call>"},
+            {"role": "system", "content": "Use <tool_call>{...}</tool_call>"},
         ]
         result = _add_native_tool_hint(messages)
-        assert "native tool call format" in result[0]["content"]
+        assert "native tool call format" not in result[0]["content"]
 
     def test_no_hint_when_no_conflict_pattern(self):
         """Plain system prompts without conflicting format instructions are untouched."""
