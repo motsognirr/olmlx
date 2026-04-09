@@ -347,8 +347,14 @@ class TestNonTrimmableCacheFallback:
 
         # Critical: the full prompt must be passed, not the suffix.  A
         # regression where suffix_tokens is computed alongside the fresh
-        # cache would produce misaligned generation.
-        prompt_arg = call_args[1].get("prompt") or call_args[0][2]
+        # cache would produce misaligned generation.  `prompt` is the third
+        # positional arg to async_mlx_stream — fail loudly if the call
+        # signature changes rather than silently falling back to a wrong
+        # value.
+        assert len(call_args.args) >= 3, (
+            "async_mlx_stream call signature changed; update this test"
+        )
+        prompt_arg = call_args.args[2]
         assert prompt_arg == [10, 20, 30, 40, 50, 60, 70, 80]
 
 

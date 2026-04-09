@@ -773,6 +773,14 @@ def _add_native_tool_hint(messages: list[dict]) -> list[dict]:
     A short override at the end of the system message steers the model back
     to the native format without modifying the client's original content.
 
+    **Scope: this is intentionally general, not Gemma 4-specific.**
+    Any model with native tool support (Qwen3, Mistral, Llama 3.x, Gemma 4,
+    etc.) can be confused by client-injected non-native format instructions
+    at long prompt lengths.  Gemma 4 is just where the symptom was first
+    observed.  The patterns matched are the formats clients inject as a
+    fallback for models *without* native tool support — when the model DOES
+    have native support, the template format is authoritative.
+
     Only applied when the system message actually contains a known
     conflicting format pattern — leaves untouched system prompts (and
     user-authored intentional tool guidance) alone.
@@ -1362,9 +1370,19 @@ async def _stream_completion(
                     # and `cached.cache` (via the CachedPromptState) hold
                     # references to the same KV tensors — both must be
                     # broken or the tensors stay resident through the
-                    # remainder of this function.
+                    # remainder of this function.  Then force GC + Metal
+                    # buffer reclamation, mirroring the memory-pressure
+                    # eviction path above: CPython's GC is non-deterministic
+                    # and Metal buffers won't be reclaimed in time for the
+                    # fresh cache allocation otherwise — for a 32B+ model
+                    # this could transiently double KV memory and trigger
+                    # the uncatchable Metal OOM the memory guards exist to
+                    # prevent.
                     del working_cache
                     cached = None
+                    gc.collect()
+                    mx.clear_cache()
+                    _safe_sync()
                     fresh_cache_label = "trim-fallback"
                     # Fall through to fresh-cache creation below
                 else:
@@ -1391,7 +1409,11 @@ async def _stream_completion(
                         prompt = suffix_tokens
 
             if "prompt_cache" not in gen_kwargs:
-                # No usable prefix — free old cache and create fresh
+                # Reached on either: (a) no usable prefix in cache miss, or
+                # (b) trim-fallback above.  In the trim-fallback path the
+                # cache was already removed before the trim attempt — this
+                # remove is then a harmless no-op (PromptCacheStore.remove
+                # is idempotent).  Kept for the cache-miss path.
                 lm.prompt_cache_store.remove(cache_id)
                 kv_quant = lm.kv_cache_quant
                 if kv_quant is not None:
