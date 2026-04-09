@@ -495,11 +495,22 @@ def _estimate_kv_cache_bytes(
             )
             # Sliding-window attention: cap effective tokens at the window
             # size.  Use `is True` to avoid being fooled by truthy MagicMocks
-            # in tests; production code sets a literal bool.
+            # in tests; production code sets a literal bool.  Prefer a
+            # per-layer window if exposed (defensive — Gemma 4 today shares
+            # a single window across all sliding layers via args, but a
+            # future model could expose heterogeneous windows).
             is_sliding = getattr(self_attn, "is_sliding", None) is True
+            layer_sw: int | None = None
+            for attr in ("sliding_window_size", "sliding_window"):
+                v = getattr(self_attn, attr, None)
+                if isinstance(v, int) and v > 0:
+                    layer_sw = v
+                    break
+            if layer_sw is None and isinstance(sliding_window, int):
+                layer_sw = sliding_window
             effective_tokens = (
-                min(num_tokens, sliding_window)
-                if is_sliding and isinstance(sliding_window, int)
+                min(num_tokens, layer_sw)
+                if is_sliding and layer_sw is not None
                 else num_tokens
             )
             raw_total += (
@@ -1749,19 +1760,29 @@ async def _stream_completion(
             max_cache_tokens = settings.prompt_cache_max_tokens
             if max_cache_tokens is not None and actual_total > max_cache_tokens:
                 trim_amount = actual_total - max_cache_tokens
+                # cache_invalidated drives the post-trim flow.  Set when:
+                # (a) trim returns the wrong amount (non-trimmable hybrid
+                # cache like Qwen3-Next — expected operating condition), or
+                # (b) trim raises an unexpected exception.  In either case
+                # the storage block is skipped and the cache reference is
+                # released.  Using a flag avoids signalling a normal "this
+                # cache type can't be trimmed" outcome via an exception.
+                cache_invalidated = False
                 try:
                     trimmed = trim_prompt_cache(prompt_cache, trim_amount)
                     if trimmed != trim_amount:
-                        # Hybrid/non-trimmable cache (e.g. Qwen3-Next).  A
-                        # partial trim would leave the stored cache misaligned
-                        # with stored_tokens metadata; better to invalidate
-                        # now than carry a broken cache forward.  The except
-                        # handler below performs the actual cleanup.
-                        raise RuntimeError(
-                            f"trim_prompt_cache returned {trimmed}, "
-                            f"expected {trim_amount} (non-trimmable layers)"
+                        # Hybrid/non-trimmable cache: a partial trim would
+                        # leave the stored cache misaligned with stored_tokens
+                        # metadata, so invalidate rather than carry a broken
+                        # cache forward.
+                        logger.warning(
+                            "Cache trim incomplete (asked for %d, got %d); "
+                            "invalidating cache",
+                            trim_amount,
+                            trimmed,
                         )
-                    if stats.eval_count != len(generated_tokens):
+                        cache_invalidated = True
+                    elif stats.eval_count != len(generated_tokens):
                         # None-ID tokens present: can't map generated_tokens
                         # to KV cache positions. Trim KV cache down to prompt
                         # boundary so depth == len(stored_tokens).
@@ -1769,13 +1790,30 @@ async def _stream_completion(
                         if extra > 0:
                             trimmed_extra = trim_prompt_cache(prompt_cache, extra)
                             if trimmed_extra != extra:
-                                raise RuntimeError(
-                                    f"trim_prompt_cache returned {trimmed_extra}, "
-                                    f"expected {extra} (non-trimmable layers)"
+                                logger.warning(
+                                    "Cache trim incomplete (asked for %d, got %d); "
+                                    "invalidating cache",
+                                    extra,
+                                    trimmed_extra,
                                 )
-                        stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
+                                cache_invalidated = True
+                        if not cache_invalidated:
+                            stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
                     else:
                         stored_tokens = stored_tokens[:max_cache_tokens]
+                except Exception:
+                    cache_invalidated = True
+                    logger.warning(
+                        "Cache trim raised; invalidating cache",
+                        exc_info=True,
+                    )
+
+                if cache_invalidated:
+                    lm.prompt_cache_store.remove(cache_id)
+                    prompt_cache = None
+                    gc.collect()
+                    mx.clear_cache()
+                else:
                     evicted = await lm.prompt_cache_store.async_set(
                         cache_id,
                         CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
@@ -1792,15 +1830,6 @@ async def _stream_completion(
                         actual_total,
                         len(stored_tokens),
                         max_cache_tokens,
-                    )
-                except Exception:
-                    lm.prompt_cache_store.remove(cache_id)
-                    prompt_cache = None
-                    gc.collect()
-                    mx.clear_cache()
-                    logger.warning(
-                        "Cache trim failed; invalidating cache",
-                        exc_info=True,
                     )
             else:
                 evicted = await lm.prompt_cache_store.async_set(

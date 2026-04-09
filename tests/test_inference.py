@@ -2645,6 +2645,43 @@ class TestEstimateKvCacheBytes:
         # formula (60 * 2 * 16 * 256 * 33181 * 2 * 1.3) ≈ 38 GB would not.
         assert result < 16 * 1024**3, f"Expected ~4.3 GB, got {result / 1024**3:.1f} GB"
 
+    def test_per_layer_sliding_window_override(self):
+        """Per-layer self_attn.sliding_window_size takes precedence over args.sliding_window.
+
+        Defensive test: today no shipping model exposes heterogeneous
+        per-layer windows, but the introspection should honour them if a
+        future model does.
+        """
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 4
+        args.num_attention_heads = 8
+        args.num_key_value_heads = 8
+        args.hidden_size = 1024
+        args.head_dim = 128
+        args.sliding_window = 4096  # global default
+
+        model = MagicMock(spec=[])
+        model.args = args
+
+        layers = []
+        for _ in range(4):
+            layer = MagicMock()
+            attn = MagicMock()
+            attn.n_kv_heads = 8
+            attn.head_dim = 128
+            attn.is_sliding = True
+            # Per-layer window — overrides the global args.sliding_window
+            attn.sliding_window_size = 512
+            layer.self_attn = attn
+            layers.append(layer)
+        model.model = MagicMock()
+        model.model.layers = layers
+
+        # 8000 tokens, but per-layer window is 512 (not 4096)
+        result = _estimate_kv_cache_bytes(model, 8000)
+        expected_raw = 4 * 2 * 8 * 128 * 512 * 2
+        assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
     def test_sliding_window_cap_short_prompt(self):
         """When num_tokens < sliding_window, sliding layers should NOT be capped down."""
         args = MagicMock(spec=[])
