@@ -270,6 +270,47 @@ class TestInjectToolsIntoSystem:
         assert "direct_tool" in result[0]["content"]
 
 
+class TestAddNativeToolHint:
+    def test_appends_hint_to_system_message(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ]
+        result = _add_native_tool_hint(messages)
+        assert "native tool call format" in result[0]["content"]
+        # Original not modified
+        assert "native" not in messages[0]["content"]
+
+    def test_no_system_message_is_noop(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [{"role": "user", "content": "hi"}]
+        result = _add_native_tool_hint(messages)
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+
+    def test_not_duplicated(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+        ]
+        result = _add_native_tool_hint(messages)
+        result2 = _add_native_tool_hint(result)
+        assert result2[0]["content"].count("native tool call format") == 1
+
+    def test_non_string_content_is_noop(self):
+        from olmlx.engine.inference import _add_native_tool_hint
+
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": "hi"}]},
+        ]
+        result = _add_native_tool_hint(messages)
+        assert result[0]["content"] == [{"type": "text", "text": "hi"}]
+
+
 class TestConvertToolMessagesToResponses:
     def test_no_tool_messages_unchanged(self):
         """Messages without role=tool pass through unchanged."""

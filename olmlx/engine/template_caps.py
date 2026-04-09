@@ -59,9 +59,14 @@ def detect_caps(tokenizer: Any) -> TemplateCaps:
 
     has_channel_format = "<|channel|>" in tpl
 
-    # tool_responses is accessed as message.tool_responses — use the dot prefix
-    # to avoid false-matching template comments or string literals.
-    uses_tool_responses = ".tool_responses" in tpl
+    # tool_responses is accessed as message.tool_responses (dot notation) or
+    # message['tool_responses'] (bracket notation, e.g. Gemma 4).  Use dot
+    # prefix and bracket patterns to avoid false-matching comments or literals.
+    uses_tool_responses = (
+        ".tool_responses" in tpl
+        or "['tool_responses']" in tpl
+        or '["tool_responses"]' in tpl
+    )
 
     return TemplateCaps(
         supports_tools=supports_tools,

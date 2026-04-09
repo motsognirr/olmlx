@@ -738,6 +738,36 @@ def _inject_tools_into_system(messages: list[dict], tools: list[dict]) -> list[d
     return messages
 
 
+_NATIVE_TOOL_HINT = (
+    "Disregard any tool call format instructions above. "
+    "You MUST use only the native tool call format provided by the system."
+)
+
+
+def _add_native_tool_hint(messages: list[dict]) -> list[dict]:
+    """Append a hint to the system message to use native tool call format.
+
+    Clients like opencode and Claude Code embed their own tool-format
+    instructions (e.g. ``<function=Name>``) in the system message.  These
+    conflict with the model's native tool call format (e.g. Gemma 4's
+    ``<|tool_call>call:Name{...}<tool_call|>``).  At long prompt lengths
+    the model follows the client's text instructions instead of using native
+    tokens, producing unparseable output.
+
+    A short override at the end of the system message steers the model back
+    to the native format without modifying the client's original content.
+    """
+    messages = list(messages)  # shallow copy
+    if messages and messages[0].get("role") == "system":
+        content = messages[0].get("content", "")
+        if isinstance(content, str) and _NATIVE_TOOL_HINT not in content:
+            messages[0] = {
+                **messages[0],
+                "content": content + "\n\n" + _NATIVE_TOOL_HINT,
+            }
+    return messages
+
+
 def _apply_chat_template(
     tokenizer: Any,
     messages: list[dict],
@@ -1912,6 +1942,16 @@ async def generate_chat(
     # to the flat format chat templates expect ({name, arguments: {...}}).
     messages = _normalize_tool_calls_in_messages(messages)
 
+    # When native tools are used, clients (e.g. opencode, Claude Code) may
+    # include their own tool-format instructions in the system message that
+    # conflict with the model's native tool call format.  With long prompts,
+    # models like Gemma 4 follow the client's text instructions instead of
+    # generating native tool call tokens.  Appending a short override to the
+    # system message steers the model back to the native format.
+    caps = lm.template_caps or TemplateCaps()
+    if tools and caps.supports_tools:
+        messages = _add_native_tool_hint(messages)
+
     if lm.is_vlm:
         # VLM models must use the VLM generation path for tokenization.
         # Pass tools natively through the template when supported — this
@@ -1919,7 +1959,6 @@ async def generate_chat(
         # which is far more effective than injecting JSON into the system
         # message.  Fall back to system-message injection for models whose
         # template lacks tool support.
-        caps = lm.template_caps or TemplateCaps()
         # Resolve enable_thinking for templates that support it.
         vlm_thinking = enable_thinking if caps.supports_enable_thinking else None
         # Convert role="tool" messages to tool_responses format for models
