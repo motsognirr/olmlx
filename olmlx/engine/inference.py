@@ -508,6 +508,17 @@ def _estimate_kv_cache_bytes(
                     break
             if layer_sw is None and isinstance(sliding_window, int):
                 layer_sw = sliding_window
+            if is_sliding and layer_sw is None:
+                # A sliding-window layer with no resolvable window size
+                # falls through to a full-prompt estimate (safe overestimate
+                # — won't cause OOM, just a spurious 503 on long prompts).
+                # Log so the condition is diagnosable without a debugger.
+                logger.debug(
+                    "Layer %d reports is_sliding=True but no window size "
+                    "found on self_attn or args; using full token count for "
+                    "KV estimation (safe overestimate)",
+                    getattr(self_attn, "layer_idx", -1),
+                )
             effective_tokens = (
                 min(num_tokens, layer_sw)
                 if is_sliding and layer_sw is not None
@@ -1813,6 +1824,11 @@ async def _stream_completion(
                     prompt_cache = None
                     gc.collect()
                     mx.clear_cache()
+                    # No _safe_sync() needed here (unlike the pre-generation
+                    # trim-fallback path): no fresh cache allocation follows
+                    # immediately — the function is about to return.  The
+                    # next request's pre-generation path will sync before
+                    # its own allocation.
                 else:
                     evicted = await lm.prompt_cache_store.async_set(
                         cache_id,
