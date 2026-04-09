@@ -1037,7 +1037,10 @@ class TestSingleTokenPromptCacheEdgeCase:
         mock_stream = _make_mock_stream(tokens)
 
         mock_make_cache = MagicMock(return_value=[MagicMock()])
-        mock_trim = MagicMock()
+        # Successful trim returns the requested amount; the
+        # `trimmed != trim_amount` guard would otherwise treat the bare
+        # MagicMock return as a non-trimmable failure.
+        mock_trim = MagicMock(side_effect=lambda c, n: n)
 
         mock_mx = MagicMock()
         with (
@@ -1093,7 +1096,10 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
 
         mock_cache_obj = [MagicMock()]
         mock_make_cache = MagicMock(return_value=mock_cache_obj)
-        mock_trim = MagicMock()
+        # Successful trim returns the requested amount; the
+        # `trimmed != trim_amount` guard would otherwise treat the bare
+        # MagicMock return as a non-trimmable failure.
+        mock_trim = MagicMock(side_effect=lambda c, n: n)
 
         mock_mx = MagicMock()
         with (
@@ -1149,7 +1155,10 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
 
         mock_cache_obj = [MagicMock()]
         mock_make_cache = MagicMock(return_value=mock_cache_obj)
-        mock_trim = MagicMock()
+        # Successful trim returns the requested amount; the
+        # `trimmed != trim_amount` guard would otherwise treat the bare
+        # MagicMock return as a non-trimmable failure.
+        mock_trim = MagicMock(side_effect=lambda c, n: n)
 
         mock_mx = MagicMock()
         with (
@@ -1198,7 +1207,10 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
 
         mock_cache_obj = [MagicMock()]
         mock_make_cache = MagicMock(return_value=mock_cache_obj)
-        mock_trim = MagicMock()
+        # Successful trim returns the requested amount; the
+        # `trimmed != trim_amount` guard would otherwise treat the bare
+        # MagicMock return as a non-trimmable failure.
+        mock_trim = MagicMock(side_effect=lambda c, n: n)
 
         # First request: 5 prompt + 2 generated = 7 > limit of 5 → trimmed to 5
         tokens1 = _make_stream_tokens("Hello", " world", prompt_tokens=5)
@@ -1320,7 +1332,10 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
 
         mock_cache_obj = [MagicMock()]
         mock_make_cache = MagicMock(return_value=mock_cache_obj)
-        mock_trim = MagicMock()
+        # Successful trim returns the requested amount; the
+        # `trimmed != trim_amount` guard would otherwise treat the bare
+        # MagicMock return as a non-trimmable failure.
+        mock_trim = MagicMock(side_effect=lambda c, n: n)
 
         mock_mx = MagicMock()
         with (
@@ -1402,7 +1417,10 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
 
         mock_cache_obj = [MagicMock()]
         mock_make_cache = MagicMock(return_value=mock_cache_obj)
-        mock_trim = MagicMock()
+        # Successful trim returns the requested amount; the
+        # `trimmed != trim_amount` guard would otherwise treat the bare
+        # MagicMock return as a non-trimmable failure.
+        mock_trim = MagicMock(side_effect=lambda c, n: n)
 
         mock_mx = MagicMock()
         with (
@@ -1494,6 +1512,68 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
         # Response should complete with a final done chunk
         assert chunks[-1]["done"] is True
         # Cache should be invalidated, not left in corrupted state
+        assert lm.prompt_cache_store.get("") is None
+
+    @pytest.mark.asyncio
+    async def test_cache_invalidated_on_non_trimmable_storage(self, mock_manager):
+        """Storage path: non-trimmable cache (trim returns wrong amount) is invalidated.
+
+        Regression test for the post-generation storage path mirror of the
+        pre-generation non-trimmable fix: for hybrid caches like Qwen3-Next,
+        `trim_prompt_cache` silently returns 0 instead of the requested
+        amount, leaving the stored cache misaligned with `stored_tokens`
+        metadata.  The storage path must invalidate in that case rather
+        than store a broken cache.
+        """
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50])
+
+        tokens = _make_stream_tokens("Hello", " world", prompt_tokens=5)
+        mock_stream = _make_mock_stream(tokens)
+
+        mock_cache_obj = [MagicMock()]
+        mock_make_cache = MagicMock(return_value=mock_cache_obj)
+        # Simulates a non-trimmable hybrid cache: returns 0 regardless of
+        # the requested trim_amount.
+        mock_trim = MagicMock(return_value=0)
+
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache",
+                mock_make_cache,
+            ),
+            patch(
+                "olmlx.engine.inference.trim_prompt_cache",
+                mock_trim,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 6
+            mock_settings.default_keep_alive = "5m"
+            chunks = []
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+            async for chunk in gen:
+                chunks.append(chunk)
+
+        # Response should complete normally
+        assert chunks[-1]["done"] is True
+        # Cache must NOT be stored — it would be misaligned
         assert lm.prompt_cache_store.get("") is None
 
 

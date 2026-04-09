@@ -1689,14 +1689,29 @@ async def _stream_completion(
             if max_cache_tokens is not None and actual_total > max_cache_tokens:
                 trim_amount = actual_total - max_cache_tokens
                 try:
-                    trim_prompt_cache(prompt_cache, trim_amount)
+                    trimmed = trim_prompt_cache(prompt_cache, trim_amount)
+                    if trimmed != trim_amount:
+                        # Hybrid/non-trimmable cache (e.g. Qwen3-Next).  A
+                        # partial trim would leave the stored cache misaligned
+                        # with stored_tokens metadata; better to invalidate
+                        # now than carry a broken cache forward.  The except
+                        # handler below performs the actual cleanup.
+                        raise RuntimeError(
+                            f"trim_prompt_cache returned {trimmed}, "
+                            f"expected {trim_amount} (non-trimmable layers)"
+                        )
                     if stats.eval_count != len(generated_tokens):
                         # None-ID tokens present: can't map generated_tokens
                         # to KV cache positions. Trim KV cache down to prompt
                         # boundary so depth == len(stored_tokens).
                         extra = max_cache_tokens - len(full_prompt_tokens)
                         if extra > 0:
-                            trim_prompt_cache(prompt_cache, extra)
+                            trimmed_extra = trim_prompt_cache(prompt_cache, extra)
+                            if trimmed_extra != extra:
+                                raise RuntimeError(
+                                    f"trim_prompt_cache returned {trimmed_extra}, "
+                                    f"expected {extra} (non-trimmable layers)"
+                                )
                         stored_tokens = list(full_prompt_tokens)[:max_cache_tokens]
                     else:
                         stored_tokens = stored_tokens[:max_cache_tokens]
