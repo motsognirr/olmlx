@@ -2557,6 +2557,95 @@ class TestEstimateKvCacheBytes:
         naive_raw = 61 * 2 * 128 * naive_head_dim * 1000 * 2
         assert result < naive_raw  # MLA should be ~25x smaller
 
+    def test_gemma4_hybrid_attention_with_sliding_window(self):
+        """Gemma 4-style hybrid model: sliding-window + full attention with per-layer head_dim.
+
+        Gemma 4 31b has:
+          - 60 layers total
+          - 50 sliding-window layers (n_kv=16, head_dim=256, capped at 1024 tokens)
+          - 10 full-attention layers (n_kv=4, head_dim=512, uncapped)
+
+        Naive estimation (uniform layers, no window cap) overestimates by ~8x
+        for long prompts and triggers spurious MemoryError 503s.
+        """
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 60
+        args.num_attention_heads = 32
+        args.num_key_value_heads = 16
+        args.hidden_size = 5376
+        args.head_dim = 256
+        args.global_head_dim = 512
+        args.sliding_window = 1024
+
+        model = MagicMock(spec=[])
+        model.args = args
+
+        layers = []
+        for i in range(60):
+            layer = MagicMock()
+            attn = MagicMock()
+            # Mimic mlx-vlm gemma4: full-attention layers have larger head_dim
+            # but fewer kv_heads.  Layer types alternate (5 sliding, 1 full).
+            if i % 6 == 5:
+                attn.n_kv_heads = 4
+                attn.head_dim = 512
+                attn.is_sliding = False
+            else:
+                attn.n_kv_heads = 16
+                attn.head_dim = 256
+                attn.is_sliding = True
+            layer.self_attn = attn
+            layers.append(layer)
+        model.model = MagicMock()
+        model.model.layers = layers
+
+        num_tokens = 33181
+        # Expected per-layer:
+        #   sliding: 2 * 16 * 256 * min(33181, 1024) * 2 = 16,777,216 bytes
+        #   full:    2 * 4 * 512 * 33181 * 2 = 271,773,696 bytes
+        #   sum: 50 * 16,777,216 + 10 * 271,773,696 = 838,860,800 + 2,717,736,960
+        #      = 3,556,597,760 bytes raw (≈3.31 GB)
+        sliding_per_layer = 2 * 16 * 256 * 1024 * 2
+        full_per_layer = 2 * 4 * 512 * num_tokens * 2
+        expected_raw = 50 * sliding_per_layer + 10 * full_per_layer
+
+        result = _estimate_kv_cache_bytes(model, num_tokens)
+        assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+        # Sanity check: result should fit in 16 GB.  The naive uniform-layer
+        # formula (60 * 2 * 16 * 256 * 33181 * 2 * 1.3) ≈ 38 GB would not.
+        assert result < 16 * 1024**3, f"Expected ~4.3 GB, got {result / 1024**3:.1f} GB"
+
+    def test_sliding_window_cap_short_prompt(self):
+        """When num_tokens < sliding_window, sliding layers should NOT be capped down."""
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 4
+        args.num_attention_heads = 8
+        args.num_key_value_heads = 8
+        args.hidden_size = 1024
+        args.head_dim = 128
+        args.sliding_window = 1024
+
+        model = MagicMock(spec=[])
+        model.args = args
+
+        layers = []
+        for _ in range(4):
+            layer = MagicMock()
+            attn = MagicMock()
+            attn.n_kv_heads = 8
+            attn.head_dim = 128
+            attn.is_sliding = True
+            layer.self_attn = attn
+            layers.append(layer)
+        model.model = MagicMock()
+        model.model.layers = layers
+
+        # 500 < 1024, so sliding layers use full prompt length
+        result = _estimate_kv_cache_bytes(model, 500)
+        expected_raw = 4 * 2 * 8 * 128 * 500 * 2
+        assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
     def test_turboquant_4bit_reduces_estimate(self):
         """TurboQuant 4-bit KV cache should reduce the memory estimate.
 

@@ -454,7 +454,7 @@ def _estimate_kv_cache_bytes(
             sq_per_entry = head_dim // (8 // quant_bits) + 4
             _tq_ratio = sq_per_entry / fp16_per_entry
 
-    # Try layer introspection for NAS/variable-attention models.
+    # Try layer introspection for NAS/variable-attention/hybrid models.
     # Track which sub-model owns the args so we introspect the right layers
     # (for VLMs, args came from model.language_model — introspect that, not
     # model.model which could be a vision encoder).
@@ -467,25 +467,54 @@ def _estimate_kv_cache_bytes(
     inner = getattr(args_owner, "model", None)
     layers = getattr(inner, "layers", None) if inner is not None else None
     if isinstance(layers, (list, tuple)) and len(layers) > 0:
-        per_layer_kv_sum = 0
+        # Per-layer accounting for hybrid attention (e.g. Gemma 4): some
+        # layers may use sliding-window attention with a different
+        # n_kv_heads/head_dim and a hard cap on cache depth, while others
+        # use full attention with their own dimensions.
+        sliding_window = getattr(args, "sliding_window", None)
+        raw_total = 0
+        found_attn_layer = False
+        introspection_complete = True
         for layer in layers:
             self_attn = getattr(layer, "self_attn", None)
             if self_attn is None:
                 continue  # no-op attention layer — no KV cache
             layer_kv_heads = getattr(self_attn, "n_kv_heads", None)
-            if layer_kv_heads is None:
+            if not isinstance(layer_kv_heads, int):
                 # Standard model — fall back to args
+                introspection_complete = False
                 break
-            per_layer_kv_sum += layer_kv_heads
-        else:
-            # All layers inspected successfully — but only trust the result
-            # if we actually found some attention layers.  per_layer_kv_sum == 0
-            # likely means the attention module uses a different attribute name
-            # (e.g. "attention" instead of "self_attn"); fall through to the
-            # args-based estimate in that case.
-            if per_layer_kv_sum > 0:
-                raw = 2 * per_layer_kv_sum * head_dim * num_tokens * bytes_per_element
-                return int(raw * _tq_ratio * MEMORY_SAFETY_FACTOR)
+            found_attn_layer = True
+            # Per-layer head_dim falls back to the global head_dim if the
+            # attention module doesn't expose its own as an int (most
+            # uniform models).  isinstance check guards against test
+            # MagicMocks auto-creating non-numeric attributes.
+            attn_head_dim = getattr(self_attn, "head_dim", None)
+            layer_head_dim = (
+                attn_head_dim if isinstance(attn_head_dim, int) else head_dim
+            )
+            # Sliding-window attention: cap effective tokens at the window
+            # size.  Use `is True` to avoid being fooled by truthy MagicMocks
+            # in tests; production code sets a literal bool.
+            is_sliding = getattr(self_attn, "is_sliding", None) is True
+            effective_tokens = (
+                min(num_tokens, sliding_window)
+                if is_sliding and isinstance(sliding_window, int)
+                else num_tokens
+            )
+            raw_total += (
+                2
+                * layer_kv_heads
+                * layer_head_dim
+                * effective_tokens
+                * bytes_per_element
+            )
+        # Only trust introspection when every encountered layer reported its
+        # KV heads.  found_attn_layer == False likely means the attention
+        # module uses a different attribute name (e.g. "attention" instead of
+        # "self_attn"); fall through to the args-based estimate in that case.
+        if introspection_complete and found_attn_layer:
+            return int(raw_total * _tq_ratio * MEMORY_SAFETY_FACTOR)
 
     # Fallback: uniform estimate from args
     num_layers = args.num_hidden_layers
