@@ -159,7 +159,13 @@ class ChatSession:
         Raises the first tool execution exception after all events are yielded.
         """
         # Classify tools by safety policy.
-        # Local tools (skills, builtins) bypass the safety policy.
+        # Local tools (skills, builtins) bypass the safety policy
+        # because they run in-process and were already trusted by
+        # the user when configured. Note: tool names come from model
+        # output (not MCP directly), so a prompt injection could
+        # cause the model to emit a local tool name — but local
+        # tools are no more dangerous than the model calling them
+        # without the safety layer.
         local_tools = []
         remote_tools = []
         for tu in tool_uses:

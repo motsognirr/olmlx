@@ -1389,7 +1389,10 @@ async def _setup_prompt_cache(
     suffix_start = min(prefix_len, len(prompt_tokens) - 1) if prompt_tokens else 0
 
     if prefix_len > 0 and suffix_start > 0:
-        # Bug #123: Remove cache from store before mutation
+        # Bug #123: Remove cache from store before mutation so the
+        # store's copy is not corrupted if the client disconnects
+        # mid-stream.  The cache will be re-stored on successful
+        # completion; on disconnect the finally block is a no-op.
         working_cache = cached.cache
         lm.prompt_cache_store.remove(cache_id)
         # Trim cache to suffix_start so it aligns with where we resume
@@ -1524,6 +1527,9 @@ async def _kv_cache_preflight_check(
     elif isinstance(prompt, list):
         num_prefill_tokens = len(prompt)
     elif isinstance(prompt, str) and not lm.is_vlm:
+        # Non-cached text path — tokenize to get a count.
+        # VLMs excluded: text_tokenizer.encode() misses image patch
+        # tokens, giving a systematic undercount.
         try:
             num_prefill_tokens = len(lm.text_tokenizer.encode(prompt))
         except Exception:
