@@ -1923,17 +1923,16 @@ async def _stream_completion(
                     elif channel_filter.should_yield(token.text):
                         yield {"text": token.text, "done": False}
 
-                    if (
-                        inf_timeout is not None
-                        and time.monotonic() - inf_start > inf_timeout
-                    ):
-                        logger.warning(
-                            "Inference timeout after %.1fs (limit: %.1fs)",
-                            time.monotonic() - inf_start,
-                            inf_timeout,
-                        )
-                        timed_out = True
-                        break
+                    if inf_timeout is not None:
+                        elapsed = time.monotonic() - inf_start
+                        if elapsed > inf_timeout:
+                            logger.warning(
+                                "Inference timeout after %.1fs (limit: %.1fs)",
+                                elapsed,
+                                inf_timeout,
+                            )
+                            timed_out = True
+                            break
 
             # Fallback: yield analysis content if no final channel was produced
             if channel_filter is not None:
@@ -1949,25 +1948,26 @@ async def _stream_completion(
             gen_tps = getattr(token, "generation_tps", 0) or 0
 
         stats.total_duration = total_timer.duration_ns
-        logger.info(
-            "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
-            stats.prompt_eval_count,
-            prompt_tps,
-            stats.eval_count,
-            gen_tps,
-            total_timer.duration_ns / 1e9,
-        )
-        generation_complete = True
+        if not timed_out:
+            logger.info(
+                "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
+                stats.prompt_eval_count,
+                prompt_tps,
+                stats.eval_count,
+                gen_tps,
+                total_timer.duration_ns / 1e9,
+            )
+            generation_complete = True
 
-        # Store cache state after successful generation
-        await _store_prompt_cache_after_generation(
-            lm,
-            gen_kwargs,
-            full_prompt_tokens,
-            generated_tokens,
-            stats.eval_count,
-            cache_id,
-        )
+            # Store cache state after successful generation
+            await _store_prompt_cache_after_generation(
+                lm,
+                gen_kwargs,
+                full_prompt_tokens,
+                generated_tokens,
+                stats.eval_count,
+                cache_id,
+            )
 
         # raw_text contains the complete unfiltered output (e.g. gpt-oss channel tokens).
         # It is only present in the done chunk when gpt-oss channel format was used,
@@ -2039,33 +2039,15 @@ async def _full_completion(
     images: list[str] | None = None,
     has_tools: bool = False,
 ) -> dict:
-    inf_timeout = (
-        lm.inference_timeout
-        if lm.inference_timeout is not None
-        else settings.inference_timeout
-    )
+    # inference_timeout is not enforced for non-streaming: the GPU thread
+    # cannot be safely cancelled (releasing the lock while Metal is still
+    # running causes concurrent command buffer access).  Streaming handles
+    # this via CancellableStream.cancel() + drain_and_join().
     async with _inference_locked(lm.inference_queue_timeout):
         with _inference_ref(lm):
-            coro = _full_completion_inner(
+            return await _full_completion_inner(
                 lm, prompt, max_tokens, gen_kwargs, stats, images, has_tools=has_tools
             )
-            inf_start = time.monotonic()
-            try:
-                if inf_timeout is not None:
-                    return await asyncio.wait_for(coro, timeout=inf_timeout)
-                return await coro
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Non-streaming inference timeout after %.1fs (limit: %.1fs)",
-                    time.monotonic() - inf_start,
-                    inf_timeout,
-                )
-                return {
-                    "text": "",
-                    "done": True,
-                    "done_reason": "timeout",
-                    "stats": stats,
-                }
 
 
 async def _full_completion_inner(
