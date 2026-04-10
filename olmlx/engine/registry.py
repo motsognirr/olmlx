@@ -4,7 +4,7 @@ import difflib
 import json
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -246,7 +246,11 @@ class ModelConfig:
             result["inference_queue_timeout"] = self.inference_queue_timeout
         if self.inference_timeout is not None:
             result["inference_timeout"] = self.inference_timeout
-        result.update(self._extra)
+        # Filter known keys defensively — from_entry() already excludes them,
+        # but _extra can be set directly via ModelConfig construction.
+        result.update(
+            {k: v for k, v in self._extra.items() if k not in _KNOWN_CONFIG_KEYS}
+        )
         return result
 
 
@@ -468,10 +472,9 @@ class ModelRegistry:
                     f"hf_path mismatch: argument {hf_path!r} != "
                     f"model_config.hf_path {model_config.hf_path!r}"
                 )
-            if existing is not None and existing._extra and not model_config._extra:
-                from dataclasses import replace
-
-                mc = replace(model_config, _extra=existing._extra)
+            if existing is not None and existing._extra:
+                merged = {**existing._extra, **model_config._extra}
+                mc = replace(model_config, _extra=merged)
             else:
                 mc = model_config
         else:

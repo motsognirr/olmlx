@@ -1022,7 +1022,9 @@ class TestExtraKeysPreserved:
         assert entry["hf_path"] == "org/my-model-8bit"
         assert entry["num_ctx"] == 8192
 
-    def test_extra_keys_preserved_when_model_config_provided(self, tmp_path, monkeypatch):
+    def test_extra_keys_preserved_when_model_config_provided(
+        self, tmp_path, monkeypatch
+    ):
         """_extra keys must survive when add_mapping is called with explicit model_config."""
         config = {
             "mymodel:latest": {
