@@ -54,7 +54,7 @@ class Message(BaseModel):
 
 class Tool(BaseModel):
     type: str = "function"
-    function: ToolFunctionDict
+    function: dict[str, Any]
 
 
 class ChatRequest(BaseModel):

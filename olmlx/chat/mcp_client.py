@@ -31,7 +31,7 @@ class MCPToolDict(TypedDict):
 class MCPSessionProtocol(Protocol):
     """Protocol for MCP ClientSession (for type annotation)."""
 
-    async def initialize(self) -> None: ...
+    async def initialize(self) -> Any: ...
     async def list_tools(self) -> Any: ...
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any: ...
 
@@ -137,9 +137,7 @@ class MCPClientManager:
         self, server_name: str, session: MCPSessionProtocol
     ) -> None:
         """Discover tools from an MCP session and register them."""
-        from mcp.types import ListToolsResult
-
-        result: ListToolsResult = await session.list_tools()
+        result = await session.list_tools()
         for tool in result.tools:
             converted = self._convert_tool(
                 {
