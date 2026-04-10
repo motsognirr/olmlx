@@ -234,9 +234,8 @@ class ModelConfig:
             and not self._extra
         ):
             return self.hf_path
-        # Start with extra keys as base, then overlay known keys on top
-        result: dict[str, Any] = dict(self._extra)
-        result["hf_path"] = self.hf_path
+        # Put hf_path first for readability, then known keys, then extra
+        result: dict[str, Any] = {"hf_path": self.hf_path}
         if self.experimental:
             result["experimental"] = self.experimental
         if self.options:
@@ -247,6 +246,7 @@ class ModelConfig:
             result["inference_queue_timeout"] = self.inference_queue_timeout
         if self.inference_timeout is not None:
             result["inference_timeout"] = self.inference_timeout
+        result.update(self._extra)
         return result
 
 
@@ -473,7 +473,10 @@ class ModelRegistry:
             # No rich config supplied — preserve existing entry if hf_path matches
             if existing is not None and existing.hf_path == hf_path:
                 return
-            mc = ModelConfig(hf_path=hf_path)
+            mc = ModelConfig(
+                hf_path=hf_path,
+                _extra=existing._extra if existing is not None else {},
+            )
         if existing is not None and existing == mc:
             return  # identical, no save needed
         self._mappings[normalized] = mc

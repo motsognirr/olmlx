@@ -1001,6 +1001,27 @@ class TestExtraKeysPreserved:
         assert entry["num_ctx"] == 8192
         assert entry["system_prompt"] == "You are helpful"
 
+    def test_extra_keys_preserved_when_hf_path_changes(self, tmp_path, monkeypatch):
+        """Extra keys must survive when add_mapping re-points to a new hf_path."""
+        config = {
+            "mymodel:latest": {
+                "hf_path": "org/my-model-4bit",
+                "num_ctx": 8192,
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        # Re-point to a different quantization (no model_config supplied)
+        reg.add_mapping("mymodel", "org/my-model-8bit")
+        saved = json.loads(config_path.read_text())
+        entry = saved["mymodel:latest"]
+        assert isinstance(entry, dict)
+        assert entry["hf_path"] == "org/my-model-8bit"
+        assert entry["num_ctx"] == 8192
+
     def test_extra_keys_prevent_string_compaction(self, tmp_path, monkeypatch):
         """A dict entry with hf_path + extra keys must not compact to a string."""
         config = {
@@ -1108,6 +1129,10 @@ class TestDiskMergeOnSave:
 
         saved = json.loads(config_path.read_text())
         assert saved["modelB:latest"] == "org/model-b"
+        # modelA was loaded but never dirtied, so it's lost when the file
+        # disappears — this is expected since the disk is the source of truth
+        # for non-dirty entries.
+        assert "modelA:latest" not in saved
 
     def test_save_with_corrupt_file(self, tmp_path, monkeypatch):
         """If models.json is corrupted while running, dirty keys still get saved."""
