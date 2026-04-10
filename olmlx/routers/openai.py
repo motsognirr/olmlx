@@ -75,7 +75,7 @@ def _fill_missing_required_args(
         inp = tu.get("input") or {}
         changed = False
         for param, param_type in required_params.items():
-            if param not in inp or inp[param] is None:
+            if param not in inp or (inp[param] is None and param_type == "string"):
                 if param_type == "string":
                     logger.warning(
                         "Tool '%s' missing required string param '%s', injecting empty string",
