@@ -1,39 +1,8 @@
 from typing import Any
-from typing_extensions import TypedDict
 
 from pydantic import BaseModel, Field
 
 from olmlx.schemas.common import ModelName, ModelOptions
-
-
-class ToolCallFunctionDict(TypedDict):
-    """TypedDict for tool call function in OpenAI format."""
-
-    name: str
-    arguments: dict[str, Any]
-
-
-class ToolCallDict(TypedDict):
-    """TypedDict for tool call in OpenAI format."""
-
-    id: str
-    type: str
-    function: ToolCallFunctionDict
-
-
-class ToolFunctionDict(TypedDict, total=False):
-    """TypedDict for tool function definition in OpenAI format."""
-
-    name: str
-    description: str
-    parameters: dict[str, Any]
-
-
-class ToolDict(TypedDict):
-    """TypedDict for tool in OpenAI format."""
-
-    type: str
-    function: ToolFunctionDict
 
 
 class ToolCallFunction(BaseModel):

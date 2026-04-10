@@ -5,8 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from typing import Any, Protocol
-from typing_extensions import TypedDict
+from typing import Any, Protocol, TypedDict
 
 from olmlx.chat.config import sanitize_mcp_env
 
@@ -20,7 +19,7 @@ class MCPToolInputSchema(TypedDict, total=False):
     properties: dict[str, Any]
 
 
-class MCPToolDict(TypedDict):
+class MCPToolDict(TypedDict, total=False):
     """TypedDict for MCP tool in config format."""
 
     name: str
