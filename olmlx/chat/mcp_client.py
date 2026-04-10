@@ -58,8 +58,14 @@ class MCPClientManager:
             "type": "function",
             "function": {
                 "name": mcp_tool["name"],
-                "description": mcp_tool["description"],
-                "parameters": mcp_tool["inputSchema"],
+                "description": mcp_tool.get("description", ""),
+                "parameters": mcp_tool.get(
+                    "inputSchema",
+                    {
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
             },
         }
 
