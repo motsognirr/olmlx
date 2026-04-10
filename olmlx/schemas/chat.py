@@ -21,7 +21,7 @@ class ToolCallDict(TypedDict):
     function: ToolCallFunctionDict
 
 
-class ToolFunctionDict(TypedDict):
+class ToolFunctionDict(TypedDict, total=False):
     """TypedDict for tool function definition in OpenAI format."""
 
     name: str

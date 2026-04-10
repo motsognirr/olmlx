@@ -314,7 +314,7 @@ def _emit_content_block(
 async def _stream_buffered_with_tools(
     result: AsyncIterator[dict[str, Any]],
     declared_tools: list[dict[str, Any]] | None = None,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[str | dict[str, Any]]:
     """Buffer full output, parse tools, yield SSE strings. Yields a final dict with metadata."""
     text_chunks: list[str] = []
     raw_text = ""
