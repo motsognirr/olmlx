@@ -1022,6 +1022,29 @@ class TestExtraKeysPreserved:
         assert entry["hf_path"] == "org/my-model-8bit"
         assert entry["num_ctx"] == 8192
 
+    def test_extra_keys_preserved_when_model_config_provided(self, tmp_path, monkeypatch):
+        """_extra keys must survive when add_mapping is called with explicit model_config."""
+        config = {
+            "mymodel:latest": {
+                "hf_path": "org/my-model",
+                "num_ctx": 8192,
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+
+        mc = ModelConfig(hf_path="org/my-model", keep_alive="30m")
+        reg.add_mapping("mymodel", "org/my-model", model_config=mc)
+
+        saved = json.loads(config_path.read_text())
+        entry = saved["mymodel:latest"]
+        assert isinstance(entry, dict)
+        assert entry["num_ctx"] == 8192
+        assert entry["keep_alive"] == "30m"
+
     def test_extra_keys_prevent_string_compaction(self, tmp_path, monkeypatch):
         """A dict entry with hf_path + extra keys must not compact to a string."""
         config = {

@@ -468,7 +468,12 @@ class ModelRegistry:
                     f"hf_path mismatch: argument {hf_path!r} != "
                     f"model_config.hf_path {model_config.hf_path!r}"
                 )
-            mc = model_config
+            if existing is not None and existing._extra and not model_config._extra:
+                from dataclasses import replace
+
+                mc = replace(model_config, _extra=existing._extra)
+            else:
+                mc = model_config
         else:
             # No rich config supplied — preserve existing entry if hf_path matches
             if existing is not None and existing.hf_path == hf_path:
@@ -511,6 +516,8 @@ class ModelRegistry:
                 disk_data[k] = v
 
         _atomic_write_json(disk_data, settings.models_config)
+        self._dirty_keys.clear()
+        self._removed_keys.clear()
 
     def remove(self, name: str):
         """Remove a model alias or mapping."""
