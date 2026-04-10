@@ -2759,6 +2759,59 @@ class TestEstimateKvCacheBytes:
             model, 1000, kv_cache_quant=None
         )
 
+    def test_qwen3_next_hybrid_linear_and_full_attention(self):
+        """Qwen3-Next: only full-attention layers have KV cache, linear layers are skipped.
+
+        Qwen3-Next has 48 layers with full_attention_interval=4, meaning every
+        4th layer (12 total) uses full attention with KVCache, while the other
+        36 use Gated Delta Net (linear attention) with fixed-size ArraysCache.
+
+        The estimator must skip linear layers (no self_attn) and correctly read
+        num_key_value_heads (not n_kv_heads) from the full-attention layers.
+        Without this, the estimate is 4x too high and triggers spurious 503s.
+        """
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 48
+        args.num_attention_heads = 16
+        args.num_key_value_heads = 2
+        args.hidden_size = 2048
+        args.head_dim = 256
+
+        model = MagicMock(spec=[])
+        model.args = args
+
+        layers = []
+        for i in range(48):
+            layer = MagicMock()
+            if (i + 1) % 4 == 0:
+                # Full-attention layer — uses num_key_value_heads (not n_kv_heads)
+                attn = MagicMock(spec=[])
+                attn.num_key_value_heads = 2
+                attn.head_dim = 256
+                attn.is_sliding = False
+                layer.self_attn = attn
+            else:
+                # Linear attention layer — no self_attn
+                layer.self_attn = None
+            layers.append(layer)
+        model.model = MagicMock()
+        model.model.layers = layers
+
+        num_tokens = 86245
+        # Only 12 full-attention layers contribute to growing KV cache
+        expected_raw = 12 * 2 * 2 * 256 * num_tokens * 2
+        result = _estimate_kv_cache_bytes(model, num_tokens)
+        assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+        # Verify: ~2.6 GB, NOT ~10.3 GB
+        assert result < 4 * 1024**3, f"Expected ~2.6 GB, got {result / 1024**3:.1f} GB"
+
+        # The naive fallback (all 48 layers) would give ~10.3 GB
+        naive_raw = 48 * 2 * 2 * 256 * num_tokens * 2
+        naive = int(naive_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+        assert naive > 10 * 1024**3  # confirm the old estimate was wrong
+        assert result < naive / 3  # introspection should be at least 3x lower
+
 
 class TestKvCachePreflightCheck:
     """Tests for the pre-flight KV cache memory check in _stream_completion."""
