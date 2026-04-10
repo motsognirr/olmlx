@@ -482,6 +482,10 @@ def _estimate_kv_cache_bytes(
                 continue  # no-op attention layer — no KV cache
             layer_kv_heads = getattr(self_attn, "n_kv_heads", None)
             if not isinstance(layer_kv_heads, int):
+                # Try alternate attribute name (e.g. Qwen3-Next uses
+                # "num_key_value_heads" instead of "n_kv_heads")
+                layer_kv_heads = getattr(self_attn, "num_key_value_heads", None)
+            if not isinstance(layer_kv_heads, int):
                 # Standard model — fall back to args
                 introspection_complete = False
                 break
