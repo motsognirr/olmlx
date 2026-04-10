@@ -147,6 +147,42 @@ class TestFillMissingRequiredArgs:
 
         assert tool_uses[0]["input"]["description"] == ""
 
+    def test_case_insensitive_tool_name_match_reverse(self):
+        """Model outputs uppercase name when tool was registered lowercase."""
+        tools = [
+            _make_tool_def(
+                "bash",
+                {
+                    "command": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                ["command", "description"],
+            )
+        ]
+        tool_uses = [_make_tool_use("BASH", {"command": "ls"})]
+
+        _fill_missing_required_args(tool_uses, tools)
+
+        assert tool_uses[0]["input"]["description"] == ""
+
+    def test_fills_when_input_is_empty_dict(self):
+        """Both required params missing from empty input (exercises tu['input'] = inp reassignment)."""
+        tools = [
+            _make_tool_def(
+                "bash",
+                {
+                    "command": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                ["command", "description"],
+            )
+        ]
+        tool_uses = [_make_tool_use("bash", {})]
+
+        _fill_missing_required_args(tool_uses, tools)
+
+        assert tool_uses[0]["input"] == {"command": "", "description": ""}
+
     def test_missing_parameters_key_in_tool_def(self):
         """Gracefully handles tool defs without parameters."""
         tools = [{"type": "function", "function": {"name": "noop"}}]
