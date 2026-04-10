@@ -95,6 +95,24 @@ class TestFillMissingRequiredArgs:
 
         assert "limit" not in tool_uses[0]["input"]
 
+    def test_non_string_none_value_left_as_none(self):
+        """Required non-string param present as None: warn but don't fill."""
+        tools = [
+            _make_tool_def(
+                "search",
+                {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                ["query", "limit"],
+            )
+        ]
+        tool_uses = [_make_tool_use("search", {"query": "foo", "limit": None})]
+
+        _fill_missing_required_args(tool_uses, tools)
+
+        assert tool_uses[0]["input"]["limit"] is None
+
     def test_no_op_when_tools_none(self):
         """None declared_tools is a safe no-op."""
         tool_uses = [_make_tool_use("bash", {"command": "ls"})]
