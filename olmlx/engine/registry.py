@@ -146,6 +146,18 @@ def _validate_keep_alive(value: str) -> None:
         )
 
 
+_KNOWN_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "hf_path",
+        "experimental",
+        "options",
+        "keep_alive",
+        "inference_queue_timeout",
+        "inference_timeout",
+    }
+)
+
+
 @dataclass
 class ModelConfig:
     """Per-model configuration resolved from models.json."""
@@ -159,6 +171,8 @@ class ModelConfig:
     keep_alive: str | None = None
     inference_queue_timeout: float | None = None
     inference_timeout: float | None = None
+    #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
+    _extra: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_entry(cls, entry: str | dict) -> ModelConfig:
@@ -195,6 +209,7 @@ class ModelConfig:
                 if it_raw is not None
                 else None
             )
+            extra = {k: v for k, v in entry.items() if k not in _KNOWN_CONFIG_KEYS}
             return cls(
                 hf_path=hf_path,
                 experimental=experimental,
@@ -202,6 +217,7 @@ class ModelConfig:
                 keep_alive=keep_alive,
                 inference_queue_timeout=inference_queue_timeout,
                 inference_timeout=inference_timeout,
+                _extra=extra,
             )
         raise TypeError(
             f"Model config entry must be str or dict, got {type(entry).__name__}"
@@ -209,16 +225,18 @@ class ModelConfig:
 
     def to_entry(self) -> str | dict:
         """Serialize to models.json format. Plain models become strings."""
-        has_overrides = (
-            self.experimental
-            or self.options
-            or self.keep_alive is not None
-            or self.inference_queue_timeout is not None
-            or self.inference_timeout is not None
-        )
-        if not has_overrides:
+        if (
+            not self.experimental
+            and not self.options
+            and self.keep_alive is None
+            and self.inference_queue_timeout is None
+            and self.inference_timeout is None
+            and not self._extra
+        ):
             return self.hf_path
-        result: dict[str, Any] = {"hf_path": self.hf_path}
+        # Start with extra keys as base, then overlay known keys on top
+        result: dict[str, Any] = dict(self._extra)
+        result["hf_path"] = self.hf_path
         if self.experimental:
             result["experimental"] = self.experimental
         if self.options:
@@ -300,6 +318,8 @@ class ModelRegistry:
     def __init__(self):
         self._mappings: dict[str, ModelConfig] = {}
         self._raw_unrecognized: dict[str, Any] = {}
+        self._dirty_keys: set[str] = set()
+        self._removed_keys: set[str] = set()
         self._aliases: dict[str, str] = {}
         self._aliases_path = settings.models_config.parent / "aliases.json"
 
@@ -318,6 +338,8 @@ class ModelRegistry:
                 raw = {}
             self._mappings = {}
             self._raw_unrecognized = {}
+            self._dirty_keys = set()
+            self._removed_keys = set()
             for k, v in raw.items():
                 try:
                     self._mappings[k] = ModelConfig.from_entry(v)
@@ -456,16 +478,36 @@ class ModelRegistry:
             return  # identical, no save needed
         self._mappings[normalized] = mc
         self._raw_unrecognized.pop(normalized, None)
+        self._dirty_keys.add(normalized)
+        self._removed_keys.discard(normalized)
         self._save_mappings()
 
     def _save_mappings(self):
-        # Preserve unrecognized entries so they survive round-trips through
-        # versions that can't parse them (forward/backward compatibility).
-        serialized = {k: v.to_entry() for k, v in self._mappings.items()}
+        # Re-read disk state as base to preserve external edits (e.g. user
+        # editing models.json while the server is running).
+        disk_data: dict[str, Any] = {}
+        if settings.models_config.exists():
+            try:
+                with open(settings.models_config) as f:
+                    disk_data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass  # corrupt or unreadable — proceed with empty base
+
+        # Remove explicitly deleted keys
+        for key in self._removed_keys:
+            disk_data.pop(key, None)
+
+        # Overlay only keys that were modified in this process
+        for k in self._dirty_keys:
+            if k in self._mappings:
+                disk_data[k] = self._mappings[k].to_entry()
+
+        # Preserve unrecognized entries (forward/backward compatibility)
         for k, v in self._raw_unrecognized.items():
-            if k not in serialized:
-                serialized[k] = v
-        _atomic_write_json(serialized, settings.models_config)
+            if k not in disk_data:
+                disk_data[k] = v
+
+        _atomic_write_json(disk_data, settings.models_config)
 
     def remove(self, name: str):
         """Remove a model alias or mapping."""
@@ -474,6 +516,8 @@ class ModelRegistry:
         if self._aliases.pop(normalized, None) is not None:
             self._save_aliases()
         if self._mappings.pop(normalized, None) is not None:
+            self._removed_keys.add(normalized)
+            self._dirty_keys.discard(normalized)
             self._save_mappings()
 
     def search(self, query: str, max_results: int = 5) -> list[tuple[str, str]]:

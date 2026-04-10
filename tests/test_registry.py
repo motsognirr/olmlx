@@ -972,3 +972,157 @@ class TestCorruptedJsonFiles:
         reg = ModelRegistry()
         reg.load()
         assert reg._aliases == {}
+
+
+class TestExtraKeysPreserved:
+    """Unknown JSON keys in model config dicts must survive round-trips."""
+
+    def test_extra_keys_preserved_on_round_trip(self, tmp_path, monkeypatch):
+        """Extra keys like num_ctx should survive load → save → reload."""
+        config = {
+            "mymodel:latest": {
+                "hf_path": "org/my-model",
+                "num_ctx": 8192,
+                "system_prompt": "You are helpful",
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        # Trigger save by adding a new mapping
+        reg.add_mapping("other-model", "org/other-model")
+        # Reload and verify extra keys survived
+        saved = json.loads(config_path.read_text())
+        entry = saved["mymodel:latest"]
+        assert isinstance(entry, dict)
+        assert entry["hf_path"] == "org/my-model"
+        assert entry["num_ctx"] == 8192
+        assert entry["system_prompt"] == "You are helpful"
+
+    def test_extra_keys_prevent_string_compaction(self, tmp_path, monkeypatch):
+        """A dict entry with hf_path + extra keys must not compact to a string."""
+        config = {
+            "mymodel:latest": {
+                "hf_path": "org/my-model",
+                "custom_flag": True,
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        reg.add_mapping("trigger", "org/trigger-model")
+        saved = json.loads(config_path.read_text())
+        # Must remain a dict, not be compacted to "org/my-model"
+        assert isinstance(saved["mymodel:latest"], dict)
+        assert saved["mymodel:latest"]["custom_flag"] is True
+
+
+class TestDiskMergeOnSave:
+    """_save_mappings() must re-read disk and merge, not blindly overwrite."""
+
+    def test_save_preserves_entries_added_to_disk_externally(
+        self, tmp_path, monkeypatch
+    ):
+        """Entries added to models.json while server is running must survive."""
+        config = {"modelA:latest": "org/model-a", "modelB:latest": "org/model-b"}
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+
+        # Simulate user editing the file externally
+        disk = json.loads(config_path.read_text())
+        disk["modelC:latest"] = "org/model-c"
+        config_path.write_text(json.dumps(disk))
+
+        # Trigger save by adding a new mapping
+        reg.add_mapping("modelD", "org/model-d")
+
+        saved = json.loads(config_path.read_text())
+        assert saved["modelA:latest"] == "org/model-a"
+        assert saved["modelB:latest"] == "org/model-b"
+        assert saved["modelC:latest"] == "org/model-c"
+        assert saved["modelD:latest"] == "org/model-d"
+
+    def test_save_preserves_disk_config_modifications(self, tmp_path, monkeypatch):
+        """Config edits made on disk while server runs must not be overwritten."""
+        config = {"mymodel:latest": "org/my-model"}
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+
+        # User edits the file to add rich config
+        disk = {
+            "mymodel:latest": {
+                "hf_path": "org/my-model",
+                "options": {"temperature": 0.5},
+            }
+        }
+        config_path.write_text(json.dumps(disk))
+
+        # Trigger save (mymodel was not modified in-memory)
+        reg.add_mapping("other", "org/other-model")
+
+        saved = json.loads(config_path.read_text())
+        # Disk edit should be preserved since we didn't touch mymodel in-memory
+        assert isinstance(saved["mymodel:latest"], dict)
+        assert saved["mymodel:latest"]["options"] == {"temperature": 0.5}
+
+    def test_remove_deletes_from_disk(self, tmp_path, monkeypatch):
+        """remove() should delete entries even if they were re-added to disk."""
+        config = {"modelA:latest": "org/model-a", "modelB:latest": "org/model-b"}
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg._aliases_path = tmp_path / "aliases.json"
+        reg.load()
+
+        reg.remove("modelA")
+
+        saved = json.loads(config_path.read_text())
+        assert "modelA:latest" not in saved
+        assert saved["modelB:latest"] == "org/model-b"
+
+    def test_save_with_missing_file(self, tmp_path, monkeypatch):
+        """If models.json is deleted while running, dirty keys still get saved."""
+        config = {"modelA:latest": "org/model-a"}
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+
+        # Delete the file
+        config_path.unlink()
+
+        # Add a new mapping — should recreate the file
+        reg.add_mapping("modelB", "org/model-b")
+
+        saved = json.loads(config_path.read_text())
+        assert saved["modelB:latest"] == "org/model-b"
+
+    def test_save_with_corrupt_file(self, tmp_path, monkeypatch):
+        """If models.json is corrupted while running, dirty keys still get saved."""
+        config = {"modelA:latest": "org/model-a"}
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+
+        # Corrupt the file
+        config_path.write_text("{broken json!!!")
+
+        # Add a new mapping
+        reg.add_mapping("modelB", "org/model-b")
+
+        saved = json.loads(config_path.read_text())
+        assert saved["modelB:latest"] == "org/model-b"
