@@ -562,14 +562,21 @@ def _tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
     return tokenizer.encode(prompt_text, add_special_tokens=add_special)
 
 
-async def _acquire_inference_lock():
-    """Acquire the inference lock with optional timeout from settings.
+async def _acquire_inference_lock(timeout_override: float | None = None):
+    """Acquire the inference lock with optional timeout.
+
+    When *timeout_override* is provided it takes precedence over the global
+    ``settings.inference_queue_timeout``.
 
     Uses asyncio.wait() instead of asyncio.wait_for() to avoid a known
     Python 3.11 race where wait_for can deliver the lock and then cancel,
     leaving the lock permanently held with no owner.
     """
-    timeout = settings.inference_queue_timeout
+    timeout = (
+        timeout_override
+        if timeout_override is not None
+        else settings.inference_queue_timeout
+    )
     if isinstance(timeout, (int, float)) and timeout > 0:
         acquire_task = asyncio.create_task(_inference_lock.acquire())
         try:
@@ -601,7 +608,7 @@ async def _acquire_inference_lock():
 
 
 @contextlib.asynccontextmanager
-async def _inference_locked():
+async def _inference_locked(timeout_override: float | None = None):
     """Async context manager that acquires the inference lock with Metal sync on entry/exit."""
     global _queue_depth
     await _await_deferred_cleanup()
@@ -609,7 +616,7 @@ async def _inference_locked():
     if _queue_depth > 1:
         logger.info("Request queued for inference lock (queue depth: %d)", _queue_depth)
     try:
-        await _acquire_inference_lock()
+        await _acquire_inference_lock(timeout_override)
     except BaseException:
         _queue_depth -= 1
         raise
@@ -1749,7 +1756,7 @@ async def _stream_completion(
             _queue_depth,
         )
     try:
-        await _acquire_inference_lock()
+        await _acquire_inference_lock(lm.inference_queue_timeout)
     except BaseException:
         _queue_depth -= 1
         raise
@@ -1885,8 +1892,16 @@ async def _stream_completion(
             _GptOssChannelFilter() if lm.template_caps.has_channel_format else None
         )
 
+        inf_timeout = (
+            lm.inference_timeout
+            if lm.inference_timeout is not None
+            else settings.inference_timeout
+        )
+        timed_out = False
+
         with _inference_ref(lm), Timer() as total_timer:
             with Timer() as eval_timer:
+                inf_start = time.monotonic()
                 async for token in stream:
                     # Always accumulate for prompt cache (raw stream, not filtered)
                     stats.eval_count = token.generation_tokens
@@ -1907,6 +1922,18 @@ async def _stream_completion(
                         yield {"text": token.text, "done": False}
                     elif channel_filter.should_yield(token.text):
                         yield {"text": token.text, "done": False}
+
+                    if (
+                        inf_timeout is not None
+                        and time.monotonic() - inf_start > inf_timeout
+                    ):
+                        logger.warning(
+                            "Inference timeout after %.1fs (limit: %.1fs)",
+                            time.monotonic() - inf_start,
+                            inf_timeout,
+                        )
+                        timed_out = True
+                        break
 
             # Fallback: yield analysis content if no final channel was produced
             if channel_filter is not None:
@@ -1948,6 +1975,8 @@ async def _stream_completion(
         done_chunk: dict = {"text": "", "done": True, "stats": stats}
         if raw_text:
             done_chunk["raw_text"] = raw_text
+        if timed_out:
+            done_chunk["done_reason"] = "timeout"
         yield done_chunk
     finally:
         # Release GPU-backed references from gen_kwargs so they can be
@@ -2010,17 +2039,33 @@ async def _full_completion(
     images: list[str] | None = None,
     has_tools: bool = False,
 ) -> dict:
-    async with _inference_locked():
+    inf_timeout = (
+        lm.inference_timeout
+        if lm.inference_timeout is not None
+        else settings.inference_timeout
+    )
+    async with _inference_locked(lm.inference_queue_timeout):
         with _inference_ref(lm):
-            return await _full_completion_inner(
-                lm,
-                prompt,
-                max_tokens,
-                gen_kwargs,
-                stats,
-                images,
-                has_tools=has_tools,
+            coro = _full_completion_inner(
+                lm, prompt, max_tokens, gen_kwargs, stats, images, has_tools=has_tools
             )
+            inf_start = time.monotonic()
+            try:
+                if inf_timeout is not None:
+                    return await asyncio.wait_for(coro, timeout=inf_timeout)
+                return await coro
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Non-streaming inference timeout after %.1fs (limit: %.1fs)",
+                    time.monotonic() - inf_start,
+                    inf_timeout,
+                )
+                return {
+                    "text": "",
+                    "done": True,
+                    "done_reason": "timeout",
+                    "stats": stats,
+                }
 
 
 async def _full_completion_inner(
@@ -2340,7 +2385,7 @@ async def generate_embeddings(
     """Generate embeddings using the model's hidden states or embed_tokens layer."""
     lm = await manager.ensure_loaded(model_name, keep_alive)
 
-    async with _inference_locked():
+    async with _inference_locked(lm.inference_queue_timeout):
         with _inference_ref(lm):
             embeddings = []
 

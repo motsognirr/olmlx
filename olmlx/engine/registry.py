@@ -123,6 +123,13 @@ def _validate_options(options: dict) -> None:
             )
 
 
+def _validate_timeout(name: str, value: Any) -> float:
+    """Validate a timeout value: must be a positive number, not bool."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(f"'{name}' must be a positive number, got {value!r}")
+    return float(value)
+
+
 def _validate_keep_alive(value: str) -> None:
     """Validate keep_alive format at parse time."""
     import re
@@ -150,6 +157,8 @@ class ModelConfig:
     #: model load; changes to models.json are not picked up while the model
     #: is already loaded — an explicit unload is required.
     keep_alive: str | None = None
+    inference_queue_timeout: float | None = None
+    inference_timeout: float | None = None
 
     @classmethod
     def from_entry(cls, entry: str | dict) -> ModelConfig:
@@ -174,11 +183,25 @@ class ModelConfig:
                 _validate_keep_alive(keep_alive)
             else:
                 keep_alive = None
+            iqt_raw = entry.get("inference_queue_timeout")
+            inference_queue_timeout = (
+                _validate_timeout("inference_queue_timeout", iqt_raw)
+                if iqt_raw is not None
+                else None
+            )
+            it_raw = entry.get("inference_timeout")
+            inference_timeout = (
+                _validate_timeout("inference_timeout", it_raw)
+                if it_raw is not None
+                else None
+            )
             return cls(
                 hf_path=hf_path,
                 experimental=experimental,
                 options=options,
                 keep_alive=keep_alive,
+                inference_queue_timeout=inference_queue_timeout,
+                inference_timeout=inference_timeout,
             )
         raise TypeError(
             f"Model config entry must be str or dict, got {type(entry).__name__}"
@@ -186,7 +209,14 @@ class ModelConfig:
 
     def to_entry(self) -> str | dict:
         """Serialize to models.json format. Plain models become strings."""
-        if not self.experimental and not self.options and self.keep_alive is None:
+        has_overrides = (
+            self.experimental
+            or self.options
+            or self.keep_alive is not None
+            or self.inference_queue_timeout is not None
+            or self.inference_timeout is not None
+        )
+        if not has_overrides:
             return self.hf_path
         result: dict[str, Any] = {"hf_path": self.hf_path}
         if self.experimental:
@@ -195,6 +225,10 @@ class ModelConfig:
             result["options"] = self.options
         if self.keep_alive is not None:
             result["keep_alive"] = self.keep_alive
+        if self.inference_queue_timeout is not None:
+            result["inference_queue_timeout"] = self.inference_queue_timeout
+        if self.inference_timeout is not None:
+            result["inference_timeout"] = self.inference_timeout
         return result
 
 

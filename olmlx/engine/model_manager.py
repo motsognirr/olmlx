@@ -472,6 +472,8 @@ class LoadedModel:
     kv_cache_quant: str | None = None
     spectral_calibration_dir: Any = None  # Path | None, typed as Any to avoid import
     default_options: dict = field(default_factory=dict)
+    inference_queue_timeout: float | None = None
+    inference_timeout: float | None = None
 
     def __post_init__(self):
         if self.prompt_cache_store is None:
@@ -856,6 +858,8 @@ class ModelManager:
                             hf_path, model_exp.kv_cache_quant
                         ),
                         default_options=dict(model_config.options),
+                        inference_queue_timeout=model_config.inference_queue_timeout,
+                        inference_timeout=model_config.inference_timeout,
                     )
                     self._loaded[normalized] = lm
                     return lm
