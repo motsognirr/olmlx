@@ -62,6 +62,21 @@ class TestFillMissingRequiredArgs:
 
         assert tool_uses[0]["input"]["description"] == "List files"
 
+    def test_fills_none_value_for_required_string(self):
+        """Required string param present but None gets filled with empty string."""
+        tools = [
+            _make_tool_def(
+                "bash",
+                {"command": {"type": "string"}},
+                ["command"],
+            )
+        ]
+        tool_uses = [_make_tool_use("bash", {"command": None})]
+
+        _fill_missing_required_args(tool_uses, tools)
+
+        assert tool_uses[0]["input"]["command"] == ""
+
     def test_skips_non_string_required_fields(self):
         """Non-string required fields are left alone — don't guess defaults."""
         tools = [
