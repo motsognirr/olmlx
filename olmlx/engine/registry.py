@@ -483,9 +483,9 @@ class ModelRegistry:
                 return
             mc = ModelConfig(
                 hf_path=hf_path,
-                _extra=existing._extra if existing is not None else {},
+                _extra=dict(existing._extra) if existing is not None else {},
             )
-        if existing is not None and existing == mc:
+        if existing is not None and existing == mc and existing._extra == mc._extra:
             return  # identical, no save needed
         self._mappings[normalized] = mc
         self._raw_unrecognized.pop(normalized, None)
@@ -504,14 +504,22 @@ class ModelRegistry:
             except (json.JSONDecodeError, OSError):
                 pass  # corrupt or unreadable — proceed with empty base
 
-        # Remove explicitly deleted keys
-        for key in self._removed_keys:
-            disk_data.pop(key, None)
+        if not disk_data and self._mappings:
+            # File was missing or corrupt — write full in-memory state to
+            # avoid silently dropping live entries.
+            logger.warning(
+                "models.json missing or corrupt; writing full in-memory state"
+            )
+            disk_data = {k: v.to_entry() for k, v in self._mappings.items()}
+        else:
+            # Remove explicitly deleted keys
+            for key in self._removed_keys:
+                disk_data.pop(key, None)
 
-        # Overlay only keys that were modified in this process
-        for k in self._dirty_keys:
-            if k in self._mappings:
-                disk_data[k] = self._mappings[k].to_entry()
+            # Overlay only keys that were modified in this process
+            for k in self._dirty_keys:
+                if k in self._mappings:
+                    disk_data[k] = self._mappings[k].to_entry()
 
         # Preserve unrecognized entries (forward/backward compatibility)
         for k, v in self._raw_unrecognized.items():

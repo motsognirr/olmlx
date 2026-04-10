@@ -1138,7 +1138,7 @@ class TestDiskMergeOnSave:
         assert saved["modelB:latest"] == "org/model-b"
 
     def test_save_with_missing_file(self, tmp_path, monkeypatch):
-        """If models.json is deleted while running, dirty keys still get saved."""
+        """If models.json is deleted while running, full in-memory state is restored."""
         config = {"modelA:latest": "org/model-a"}
         config_path = tmp_path / "models.json"
         config_path.write_text(json.dumps(config))
@@ -1149,18 +1149,17 @@ class TestDiskMergeOnSave:
         # Delete the file
         config_path.unlink()
 
-        # Add a new mapping — should recreate the file
+        # Add a new mapping — should recreate the file with all entries
         reg.add_mapping("modelB", "org/model-b")
 
         saved = json.loads(config_path.read_text())
         assert saved["modelB:latest"] == "org/model-b"
-        # modelA was loaded but never dirtied, so it's lost when the file
-        # disappears — this is expected since the disk is the source of truth
-        # for non-dirty entries.
-        assert "modelA:latest" not in saved
+        # When the file is missing, all in-memory entries are written to
+        # prevent silent data loss.
+        assert saved["modelA:latest"] == "org/model-a"
 
     def test_save_with_corrupt_file(self, tmp_path, monkeypatch):
-        """If models.json is corrupted while running, dirty keys still get saved."""
+        """If models.json is corrupted while running, full in-memory state is restored."""
         config = {"modelA:latest": "org/model-a"}
         config_path = tmp_path / "models.json"
         config_path.write_text(json.dumps(config))
@@ -1171,8 +1170,9 @@ class TestDiskMergeOnSave:
         # Corrupt the file
         config_path.write_text("{broken json!!!")
 
-        # Add a new mapping
+        # Add a new mapping — should restore all entries
         reg.add_mapping("modelB", "org/model-b")
 
         saved = json.loads(config_path.read_text())
         assert saved["modelB:latest"] == "org/model-b"
+        assert saved["modelA:latest"] == "org/model-a"
