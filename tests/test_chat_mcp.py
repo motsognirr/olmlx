@@ -34,23 +34,6 @@ class TestMCPToolConversion:
             },
         }
 
-    def test_converts_tool_without_description(self):
-        mcp_tool = {
-            "name": "ping",
-            "inputSchema": {"type": "object", "properties": {}},
-        }
-        result = MCPClientManager._convert_tool(mcp_tool)
-        assert result["function"]["name"] == "ping"
-        assert result["function"]["description"] == ""
-
-    def test_converts_tool_without_input_schema(self):
-        mcp_tool = {"name": "get_time", "description": "Get current time"}
-        result = MCPClientManager._convert_tool(mcp_tool)
-        assert result["function"]["parameters"] == {
-            "type": "object",
-            "properties": {},
-        }
-
 
 class TestMCPToolRouting:
     def test_get_tools_empty_when_no_servers(self):

@@ -19,7 +19,7 @@ class MCPToolInputSchema(TypedDict, total=False):
     properties: dict[str, Any]
 
 
-class MCPToolDict(TypedDict, total=False):
+class MCPToolDict(TypedDict):
     """TypedDict for MCP tool in config format."""
 
     name: str
@@ -58,14 +58,8 @@ class MCPClientManager:
             "type": "function",
             "function": {
                 "name": mcp_tool["name"],
-                "description": mcp_tool.get("description", ""),
-                "parameters": mcp_tool.get(
-                    "inputSchema",
-                    {
-                        "type": "object",
-                        "properties": {},
-                    },
-                ),
+                "description": mcp_tool["description"],
+                "parameters": mcp_tool["inputSchema"],
             },
         }
 
