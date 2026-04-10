@@ -248,12 +248,20 @@ async def _stream_openai_sse(
                             "choices": [format_content(flushed)],
                         }
                         yield f"data: {json.dumps(data)}\n\n"
+                done_reason = chunk.get("done_reason")
+                finish_reason = (
+                    "length"
+                    if done_reason == "timeout"
+                    else format_done().get("finish_reason", "stop")
+                )
+                done_choice = format_done()
+                done_choice["finish_reason"] = finish_reason
                 data = {
                     "id": response_id,
                     "object": object_type,
                     "created": created,
                     "model": model,
-                    "choices": [format_done()],
+                    "choices": [done_choice],
                 }
                 yield f"data: {json.dumps(data)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -305,6 +313,7 @@ async def _stream_openai_sse_with_tools(
     """
     full_text = ""
     raw_text = ""
+    done_reason = None
     try:
         async for chunk in result:
             if chunk.get("cache_info"):
@@ -312,6 +321,7 @@ async def _stream_openai_sse_with_tools(
             if chunk.get("done"):
                 # Read raw_text from done chunk for gpt-oss tool call parsing
                 raw_text = chunk.get("raw_text", raw_text)
+                done_reason = chunk.get("done_reason")
                 break
             full_text += chunk.get("text", "")
 
@@ -376,7 +386,8 @@ async def _stream_openai_sse_with_tools(
             yield f"data: {_chunk({'delta': {'role': 'assistant', 'content': None}, 'finish_reason': None})}\n\n"
             if visible_text:
                 yield f"data: {_chunk({'delta': {'content': visible_text}, 'finish_reason': None})}\n\n"
-            yield f"data: {_chunk({'delta': {}, 'finish_reason': 'stop'})}\n\n"
+            fr = "length" if done_reason == "timeout" else "stop"
+            yield f"data: {_chunk({'delta': {}, 'finish_reason': fr})}\n\n"
 
         yield "data: [DONE]\n\n"
     except Exception as exc:
@@ -524,7 +535,13 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         _fill_missing_required_args(tool_uses, req.tools)
 
         tool_calls = _to_openai_tool_calls(tool_uses) if tool_uses else None
-        finish_reason = "tool_calls" if tool_uses else "stop"
+        done_reason = result.get("done_reason")
+        if tool_uses:
+            finish_reason = "tool_calls"
+        elif done_reason == "timeout":
+            finish_reason = "length"
+        else:
+            finish_reason = "stop"
         content = visible_text
         if not content:
             content = None
@@ -597,7 +614,9 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
                 OpenAICompletionChoice(
                     index=0,
                     text=result.get("text", ""),
-                    finish_reason="stop",
+                    finish_reason="length"
+                    if result.get("done_reason") == "timeout"
+                    else "stop",
                 )
             ],
             usage=usage,
