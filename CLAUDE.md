@@ -131,3 +131,19 @@ Use test-driven development: write failing tests first, then implement the code 
 
 - Remote: `git@github.com:motsognirr/olmlx.git`
 - Author: Daniel Palmqvist <daniel.u.palmqvist@gmail.com>
+
+## Type Annotations
+
+Maintain consistent type safety throughout the codebase:
+
+- **TypedDict for required fields only**: Use `TypedDict` with `total=True` (default) for required keys. Use `TypedDict, total=False` for optional keys. Never use an empty TypedDict — use `dict[str, Any]` for freeform JSON.
+
+- **Pydantic model field types**: Be careful when using TypedDict as a Pydantic field type — Pydantic v2 enforces required keys. Prefer `dict[str, Any]` for fields that should accept any shape (e.g., `Tool.function`) to avoid silently stripping extra keys.
+
+- **Protocol return types**: `__aexit__` must return `bool | None` (not `None`) so implementations can suppress exceptions. `__call__` must match actual return types (e.g., mlx-lm models return `mx.array`, not `dict`).
+
+- **AsyncIterator return types**: If a function yields both `str` and `dict`, annotate as `AsyncIterator[str | dict[str, Any]]`, not just `AsyncIterator[str]`.
+
+- **TYPE_CHECKING for annotation-only imports**: If a type is only used in annotations and the module has `from __future__ import annotations`, guard the import under `TYPE_CHECKING` or remove it entirely. Avoid runtime imports of types that are never evaluated.
+
+- **Protocol return values**: Match the real type's return value (e.g., `ClientSession.initialize()` returns `InitializeResult`, not `None`).
