@@ -17,12 +17,18 @@ class MCPToolInputSchema(TypedDict, total=False):
 
     type: str
     properties: dict[str, Any]
+    required: list[str]
 
 
-class MCPToolDict(TypedDict, total=False):
-    """TypedDict for MCP tool in config format."""
+class MCPToolDict(TypedDict):
+    """TypedDict for MCP tool in config format (required fields)."""
 
     name: str
+
+
+class MCPToolDictOpt(MCPToolDict, total=False):
+    """TypedDict for MCP tool in config format (optional fields)."""
+
     description: str
     inputSchema: MCPToolInputSchema
 

@@ -18,6 +18,21 @@ class TestMCPToolConversion:
                 "required": ["path"],
             },
         }
+        result = MCPClientManager._convert_tool(mcp_tool)
+        assert result == {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file from disk",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path"}
+                    },
+                    "required": ["path"],
+                },
+            },
+        }
 
     def test_converts_tool_without_description(self):
         mcp_tool = {
