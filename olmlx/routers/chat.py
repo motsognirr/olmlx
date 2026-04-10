@@ -48,7 +48,7 @@ async def chat(req: ChatRequest, request: Request):
                     "created_at": now,
                     "message": Message(role="assistant", content="").model_dump(),
                     "done": True,
-                    "done_reason": "stop",
+                    "done_reason": chunk.get("done_reason", "stop"),
                 }
                 if stats:
                     final.update(stats.to_dict())
@@ -97,7 +97,7 @@ async def chat(req: ChatRequest, request: Request):
                 role="assistant", content=result.get("text", "")
             ).model_dump(),
             "done": True,
-            "done_reason": "stop",
+            "done_reason": result.get("done_reason", "stop"),
         }
         if stats:
             response.update(stats.to_dict())

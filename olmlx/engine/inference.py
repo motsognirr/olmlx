@@ -1932,6 +1932,7 @@ async def _stream_completion(
                                 inf_timeout,
                             )
                             timed_out = True
+                            stream.cancel()
                             break
 
             # Fallback: yield analysis content if no final channel was produced
