@@ -19,7 +19,7 @@ class MCPToolInputSchema(TypedDict, total=False):
     properties: dict[str, Any]
 
 
-class MCPToolDict(TypedDict):
+class MCPToolDict(TypedDict, total=False):
     """TypedDict for MCP tool in config format."""
 
     name: str

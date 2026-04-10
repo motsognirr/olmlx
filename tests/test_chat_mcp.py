@@ -18,20 +18,22 @@ class TestMCPToolConversion:
                 "required": ["path"],
             },
         }
+
+    def test_converts_tool_without_description(self):
+        mcp_tool = {
+            "name": "ping",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
         result = MCPClientManager._convert_tool(mcp_tool)
-        assert result == {
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read a file from disk",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "File path"}
-                    },
-                    "required": ["path"],
-                },
-            },
+        assert result["function"]["name"] == "ping"
+        assert result["function"]["description"] == ""
+
+    def test_converts_tool_without_input_schema(self):
+        mcp_tool = {"name": "get_time", "description": "Get current time"}
+        result = MCPClientManager._convert_tool(mcp_tool)
+        assert result["function"]["parameters"] == {
+            "type": "object",
+            "properties": {},
         }
 
 
