@@ -927,23 +927,21 @@ class TestRegistryModelConfig:
         assert mc.keep_alive == "30m"
 
     def test_unrecognized_entries_survive_save(self, tmp_path, monkeypatch):
-        """Entries that fail parsing should be preserved on save."""
+        """Entries that fail parsing should be preserved on disk through saves."""
         config = {
             "good:latest": "Qwen/Qwen3-8B-MLX",
             "future-format:latest": {"hf_path": "org/model", "new_field": "value"},
+            "broken:latest": {"weird": True},  # no hf_path — fails from_entry
         }
         config_path = tmp_path / "models.json"
         config_path.write_text(json.dumps(config))
         monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
         reg = ModelRegistry()
         reg.load()
-        # "future-format" should be in _raw_unrecognized (it has unknown fields
-        # but from_entry only validates experimental/options/keep_alive, so
-        # extra keys are ignored). Force an unrecognized entry for testing:
-        reg._raw_unrecognized["broken:latest"] = {"weird": True}
+        assert "broken:latest" in reg._raw_unrecognized
         # Trigger a save
         reg.add_mapping("new-model", "org/new-model")
-        # Reload and verify unrecognized entry survived
+        # The broken entry is on disk, so re-reading preserves it
         saved = json.loads(config_path.read_text())
         assert "broken:latest" in saved
         assert saved["broken:latest"] == {"weird": True}

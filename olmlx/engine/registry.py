@@ -148,7 +148,7 @@ def _validate_keep_alive(value: str) -> None:
         )
 
 
-_KNOWN_CONFIG_KEYS: frozenset[str]  # set after ModelConfig is defined
+_KNOWN_CONFIG_KEYS: frozenset[str] = frozenset()  # set after ModelConfig is defined
 
 
 @dataclass
@@ -514,7 +514,8 @@ class ModelRegistry:
         # editing models.json while the server is running).
         disk_data: dict[str, Any] = {}
         disk_read_ok = False
-        if settings.models_config.exists():
+        file_exists = settings.models_config.exists()
+        if file_exists:
             try:
                 with open(settings.models_config) as f:
                     loaded = json.load(f)
@@ -530,9 +531,8 @@ class ModelRegistry:
             # avoid silently dropping live entries. Removed keys are already
             # absent from _mappings (remove() pops them), so they won't
             # reappear. dirty/removed snapshots are not needed here.
-            logger.warning(
-                "models.json missing or corrupt; writing full in-memory state"
-            )
+            if file_exists:
+                logger.warning("models.json corrupt; writing full in-memory state")
             disk_data = {k: v.to_entry() for k, v in self._mappings.items()}
         else:
             # Remove explicitly deleted keys
@@ -560,10 +560,13 @@ class ModelRegistry:
                     disk_data[k] = mc.to_entry()
 
         # Preserve unrecognized entries (forward/backward compatibility).
-        # These may be valid entries written by a newer version.
-        for k, v in self._raw_unrecognized.items():
-            if k not in disk_data:
-                disk_data[k] = v
+        # These may be valid entries written by a newer version. Only inject
+        # when the disk file was unreadable (recovery) — if the file was read
+        # successfully and an entry is absent, the user intentionally removed it.
+        if not disk_read_ok:
+            for k, v in self._raw_unrecognized.items():
+                if k not in disk_data:
+                    disk_data[k] = v
 
         _atomic_write_json(disk_data, settings.models_config)
         # Only clear the keys we actually flushed — concurrent additions
