@@ -1,6 +1,8 @@
 import logging
 import traceback
+import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +27,8 @@ from olmlx.routers import (
 )
 
 logger = logging.getLogger("olmlx")
+
+request_id_var: ContextVar[str] = ContextVar("request_id", default="")
 
 
 @asynccontextmanager
@@ -131,6 +135,19 @@ class ForceJSONMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """Generate and attach request IDs for log tracing."""
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = str(uuid.uuid4())
+        request.state.request_id = request_id
+        request_id_var.set(request_id)
+
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
 def _make_error_response(
     path: str,
     status_code: int,
@@ -160,6 +177,7 @@ def create_app() -> FastAPI:
     )
 
     app.add_middleware(ForceJSONMiddleware)
+    app.add_middleware(RequestIDMiddleware)
 
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError):

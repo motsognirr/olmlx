@@ -397,3 +397,34 @@ class TestErrorHandlers:
         resp = await app_client.get("/")
         assert resp.status_code == 200
         assert "running" in resp.text.lower()
+
+
+class TestRequestIDMiddleware:
+    @pytest.mark.asyncio
+    async def test_request_id_header_present(self, app_client):
+        resp = await app_client.get("/")
+        assert resp.status_code == 200
+        assert "x-request-id" in resp.headers
+        assert len(resp.headers["x-request-id"]) == 36  # UUID format
+
+    @pytest.mark.asyncio
+    async def test_request_id_different_per_request(self, app_client):
+        resp1 = await app_client.get("/")
+        resp2 = await app_client.get("/")
+        assert resp1.headers["x-request-id"] != resp2.headers["x-request-id"]
+
+    @pytest.mark.asyncio
+    async def test_request_id_on_error_response(self, app_client):
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = ValueError("test error")
+            resp = await app_client.post(
+                "/api/generate",
+                json={"model": "qwen3", "prompt": "hi", "stream": False},
+            )
+        assert resp.status_code == 400
+        assert "x-request-id" in resp.headers
+        assert len(resp.headers["x-request-id"]) == 36
