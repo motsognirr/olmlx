@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import threading
+import dataclasses
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -147,16 +148,7 @@ def _validate_keep_alive(value: str) -> None:
         )
 
 
-_KNOWN_CONFIG_KEYS: frozenset[str] = frozenset(
-    {
-        "hf_path",
-        "experimental",
-        "options",
-        "keep_alive",
-        "inference_queue_timeout",
-        "inference_timeout",
-    }
-)
+_KNOWN_CONFIG_KEYS: frozenset[str]  # set after ModelConfig is defined
 
 
 @dataclass
@@ -253,6 +245,13 @@ class ModelConfig:
             {k: v for k, v in self._extra.items() if k not in _KNOWN_CONFIG_KEYS}
         )
         return result
+
+
+# Derived from ModelConfig fields so it stays in sync automatically.
+# Used to separate known config keys from _extra in from_entry()/to_entry().
+_KNOWN_CONFIG_KEYS = frozenset(
+    f.name for f in dataclasses.fields(ModelConfig) if f.name != "_extra"
+)
 
 
 def _atomic_write_json(data: dict, path: Path) -> None:
@@ -496,17 +495,14 @@ class ModelRegistry:
         self._save_mappings()
 
     def _save_mappings(self):
-        # threading.Lock is appropriate here: callers (add_mapping, remove)
-        # are sync methods invoked under ModelManager's asyncio lock, so
-        # the event loop is already yielded before we get here.
         with self._save_lock:
             self._save_mappings_locked()
 
     def _save_mappings_locked(self):
-        # NOTE: This method reads self._mappings which is mutated outside
-        # _save_lock (in add_mapping/remove). This is safe because the lock
-        # is only contended by sync callers on the same thread. Do NOT make
-        # this method async without also locking the dict mutations.
+        # Safety: all callers run on the asyncio event loop (single-threaded),
+        # so _mappings/_dirty_keys/_removed_keys mutations in add_mapping/remove
+        # never race with reads here. The lock only serializes disk writes.
+        # Do NOT make this async without also locking the dict mutations.
         #
         # Snapshot the dirty/removed sets so concurrent add_mapping/remove
         # calls that mutate them outside the lock aren't silently cleared.
@@ -520,10 +516,13 @@ class ModelRegistry:
         if settings.models_config.exists():
             try:
                 with open(settings.models_config) as f:
-                    disk_data = json.load(f)
+                    loaded = json.load(f)
+                if not isinstance(loaded, dict):
+                    raise ValueError(f"Expected dict, got {type(loaded).__name__}")
+                disk_data = loaded
                 disk_read_ok = True
-            except (json.JSONDecodeError, OSError):
-                pass  # corrupt or unreadable
+            except (json.JSONDecodeError, ValueError, OSError):
+                pass  # corrupt, wrong type, or unreadable
 
         if not disk_read_ok and self._mappings:
             # File was missing or corrupt — write full in-memory state to
