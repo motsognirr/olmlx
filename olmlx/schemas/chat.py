@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from olmlx.schemas.common import ModelName, ModelOptions
@@ -5,7 +7,7 @@ from olmlx.schemas.common import ModelName, ModelOptions
 
 class ToolCallFunction(BaseModel):
     name: str
-    arguments: dict
+    arguments: dict[str, Any]
 
 
 class ToolCall(BaseModel):
@@ -21,7 +23,7 @@ class Message(BaseModel):
 
 class Tool(BaseModel):
     type: str = "function"
-    function: dict
+    function: dict[str, Any]
 
 
 class ChatRequest(BaseModel):
