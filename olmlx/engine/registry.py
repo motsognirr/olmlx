@@ -4,6 +4,7 @@ import difflib
 import json
 import os
 import tempfile
+import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -324,6 +325,7 @@ class ModelRegistry:
         self._raw_unrecognized: dict[str, Any] = {}
         self._dirty_keys: set[str] = set()
         self._removed_keys: set[str] = set()
+        self._save_lock = threading.Lock()
         self._aliases: dict[str, str] = {}
         self._aliases_path = settings.models_config.parent / "aliases.json"
 
@@ -481,10 +483,10 @@ class ModelRegistry:
             # No rich config supplied — preserve existing entry if hf_path matches
             if existing is not None and existing.hf_path == hf_path:
                 return
-            mc = ModelConfig(
-                hf_path=hf_path,
-                _extra=dict(existing._extra) if existing is not None else {},
-            )
+            if existing is not None:
+                mc = replace(existing, hf_path=hf_path)
+            else:
+                mc = ModelConfig(hf_path=hf_path)
         if existing is not None and existing == mc and existing._extra == mc._extra:
             return  # identical, no save needed (_extra excluded from == due to compare=False)
         self._mappings[normalized] = mc
@@ -494,6 +496,10 @@ class ModelRegistry:
         self._save_mappings()
 
     def _save_mappings(self):
+        with self._save_lock:
+            self._save_mappings_locked()
+
+    def _save_mappings_locked(self):
         # Re-read disk state as base to preserve external edits (e.g. user
         # editing models.json while the server is running).
         disk_data: dict[str, Any] = {}
@@ -538,7 +544,8 @@ class ModelRegistry:
         normalized = self.normalize_name(name)
         if self._aliases.pop(normalized, None) is not None:
             self._save_aliases()
-        if self._mappings.pop(normalized, None) is not None:
+        raw_removed = self._raw_unrecognized.pop(normalized, None)
+        if self._mappings.pop(normalized, None) is not None or raw_removed is not None:
             self._removed_keys.add(normalized)
             self._dirty_keys.discard(normalized)
             self._save_mappings()
