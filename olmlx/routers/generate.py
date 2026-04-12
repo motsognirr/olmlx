@@ -46,7 +46,7 @@ async def generate(req: GenerateRequest, request: Request):
                     "created_at": now,
                     "response": "",
                     "done": True,
-                    "done_reason": "stop",
+                    "done_reason": chunk.get("done_reason", "stop"),
                 }
                 if stats:
                     final.update(stats.to_dict())
@@ -93,7 +93,7 @@ async def generate(req: GenerateRequest, request: Request):
             "created_at": now,
             "response": result.get("text", ""),
             "done": True,
-            "done_reason": "stop",
+            "done_reason": result.get("done_reason", "stop"),
         }
         if stats:
             response.update(stats.to_dict())

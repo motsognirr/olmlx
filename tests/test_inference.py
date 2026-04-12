@@ -8,6 +8,7 @@ import pytest
 
 import olmlx.engine.inference as _inf_mod
 from olmlx.engine.inference import (
+    _acquire_inference_lock,
     _apply_seed,
     _build_generate_kwargs,
     _estimate_kv_cache_bytes,
@@ -22,6 +23,7 @@ from olmlx.engine.inference import (
     generate_chat,
     generate_completion,
     generate_embeddings,
+    ServerBusyError,
 )
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils.streaming import CancellableStream, StreamToken
@@ -2022,8 +2024,8 @@ class TestInferenceLockedWaitsDeferredCleanup:
         # is acquired but before the post-lock _await_deferred_cleanup runs.
         original_acquire = _inf_mod._acquire_inference_lock
 
-        async def acquire_then_inject():
-            await original_acquire()
+        async def acquire_then_inject(timeout_override=None):
+            await original_acquire(timeout_override)
             _inf_mod._deferred_cleanup_task = asyncio.create_task(cleanup())
 
         with patch("olmlx.engine.inference.mx"):
@@ -2036,6 +2038,51 @@ class TestInferenceLockedWaitsDeferredCleanup:
                     pass
             assert cleanup_done.is_set()
         _inf_mod._deferred_cleanup_task = None
+
+
+class TestAcquireInferenceLockTimeoutOverride:
+    @pytest.mark.asyncio
+    async def test_timeout_override_used_instead_of_global(self):
+        """timeout_override should take precedence over settings.inference_queue_timeout."""
+        fresh_lock = asyncio.Lock()
+        _inf_mod._deferred_cleanup_task = None
+        with patch("olmlx.engine.inference._inference_lock", fresh_lock):
+            # Hold the lock so acquire will block
+            await fresh_lock.acquire()
+            # Use a very short timeout override
+            with pytest.raises(ServerBusyError, match="timeout after 0.05s"):
+                await _acquire_inference_lock(timeout_override=0.05)
+            fresh_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_timeout_override_none_falls_through_to_global(self):
+        """When timeout_override is None, global setting is used."""
+        fresh_lock = asyncio.Lock()
+        _inf_mod._deferred_cleanup_task = None
+        with (
+            patch("olmlx.engine.inference._inference_lock", fresh_lock),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.inference_queue_timeout = 0.05
+            await fresh_lock.acquire()
+            with pytest.raises(ServerBusyError, match="timeout after 0.05s"):
+                await _acquire_inference_lock(timeout_override=None)
+            fresh_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_inference_locked_passes_timeout_override(self):
+        """_inference_locked() should pass timeout_override to _acquire_inference_lock."""
+        fresh_lock = asyncio.Lock()
+        _inf_mod._deferred_cleanup_task = None
+        with (
+            patch("olmlx.engine.inference._inference_lock", fresh_lock),
+            patch("olmlx.engine.inference.mx"),
+        ):
+            await fresh_lock.acquire()
+            with pytest.raises(ServerBusyError):
+                async with _inference_locked(timeout_override=0.05):
+                    pass
+            fresh_lock.release()
 
 
 class TestQueueDepth:
@@ -2840,6 +2887,8 @@ class TestKvCachePreflightCheck:
         lm.prompt_cache_store.async_set = AsyncMock(return_value=None)
         lm.prompt_cache_store.async_evict_all_to_disk = AsyncMock()
         lm.active_refs = 0
+        lm.inference_timeout = None
+        lm.inference_queue_timeout = None
         return lm
 
     @pytest.mark.asyncio
@@ -2882,6 +2931,7 @@ class TestKvCachePreflightCheck:
             ):
                 mock_settings.memory_limit_fraction = 0.5  # 12GB limit
                 mock_settings.prompt_cache = False
+                mock_settings.inference_timeout = None
 
                 gen = _inf_mod._stream_completion(
                     mock_lm, list(range(22000)), 512, {}, stats
@@ -2952,6 +3002,7 @@ class TestKvCachePreflightCheck:
                 mock_settings.memory_limit_fraction = 0.5  # 12GB limit
                 mock_settings.prompt_cache = False
                 mock_settings.default_keep_alive = "5m"
+                mock_settings.inference_timeout = None
 
                 gen = _inf_mod._stream_completion(
                     mock_lm, list(range(100)), 512, {}, stats
@@ -3419,3 +3470,184 @@ class TestStorePromptCacheAfterGeneration:
         # Cache should be invalidated (removed) on trim failure
         mock_lm.prompt_cache_store.remove.assert_called_with("test")
         mock_lm.prompt_cache_store.async_set.assert_not_awaited()
+
+
+class TestInferenceTimeout:
+    @pytest.mark.asyncio
+    async def test_streaming_stops_after_inference_timeout(self, mock_manager):
+        """Streaming generation should stop and return done_reason=timeout."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.inference_timeout = 0.1  # 100ms timeout
+
+        mock_mx = MagicMock()
+
+        # Create a slow token stream: each token takes 60ms
+        tokens = [
+            StreamToken(
+                text=f"tok{i}",
+                token=i,
+                prompt_tokens=5,
+                generation_tokens=i + 1,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            )
+            for i in range(20)  # would take 1.2s total, well past 100ms
+        ]
+
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+
+        token_iter = iter(tokens)
+
+        async def anext_impl():
+            await asyncio.sleep(0.06)  # 60ms per token
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch(
+                "olmlx.engine.inference.async_mlx_stream", return_value=mock_stream
+            ):
+                gen = await generate_completion(
+                    mock_manager,
+                    "qwen3",
+                    "Hello",
+                    stream=True,
+                )
+                chunks = []
+                async for chunk in gen:
+                    chunks.append(chunk)
+
+        done_chunk = chunks[-1]
+        assert done_chunk["done"] is True
+        assert done_chunk.get("done_reason") == "timeout"
+        # Should have produced some tokens but not all 20
+        text_chunks = [c for c in chunks if not c.get("done")]
+        assert 0 < len(text_chunks) < 20
+
+    @pytest.mark.asyncio
+    async def test_streaming_no_timeout_when_none(self, mock_manager):
+        """No timeout when inference_timeout is None — all tokens produced."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.inference_timeout = None
+
+        mock_mx = MagicMock()
+
+        tokens = [
+            StreamToken(
+                text=f"tok{i}",
+                token=i,
+                prompt_tokens=5,
+                generation_tokens=i + 1,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            )
+            for i in range(3)
+        ]
+
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+
+        token_iter = iter(tokens)
+
+        async def anext_impl():
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch("olmlx.engine.inference.async_mlx_stream", return_value=mock_stream),
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = None
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            gen = await generate_completion(
+                mock_manager,
+                "qwen3",
+                "Hello",
+                stream=True,
+            )
+            chunks = []
+            async for chunk in gen:
+                chunks.append(chunk)
+
+        done_chunk = chunks[-1]
+        assert done_chunk["done"] is True
+        assert "done_reason" not in done_chunk
+        text_chunks = [c for c in chunks if not c.get("done")]
+        assert len(text_chunks) == 3
+
+    @pytest.mark.asyncio
+    async def test_global_inference_timeout_used_when_model_none(self, mock_manager):
+        """Global settings.inference_timeout is used when model has no override."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.inference_timeout = None  # No per-model override
+
+        mock_mx = MagicMock()
+
+        tokens = [
+            StreamToken(
+                text=f"tok{i}",
+                token=i,
+                prompt_tokens=5,
+                generation_tokens=i + 1,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            )
+            for i in range(20)
+        ]
+
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+
+        token_iter = iter(tokens)
+
+        async def anext_impl():
+            await asyncio.sleep(0.06)
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch("olmlx.engine.inference.async_mlx_stream", return_value=mock_stream),
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = 0.1  # Global 100ms timeout
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            gen = await generate_completion(
+                mock_manager,
+                "qwen3",
+                "Hello",
+                stream=True,
+            )
+            chunks = []
+            async for chunk in gen:
+                chunks.append(chunk)
+
+        done_chunk = chunks[-1]
+        assert done_chunk["done"] is True
+        assert done_chunk.get("done_reason") == "timeout"
+        text_chunks = [c for c in chunks if not c.get("done")]
+        assert 0 < len(text_chunks) < 20

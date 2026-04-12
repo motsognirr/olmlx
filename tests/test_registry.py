@@ -338,6 +338,76 @@ class TestModelConfig:
         with pytest.raises(ValueError, match="hf_path"):
             ModelConfig.from_entry({"experimental": {"flash": True}})
 
+    def test_from_string_timeouts_default_none(self):
+        """String entries default timeout fields to None."""
+        mc = ModelConfig.from_entry("org/model")
+        assert mc.inference_queue_timeout is None
+        assert mc.inference_timeout is None
+
+    def test_from_dict_with_timeouts(self):
+        """Dict entries parse inference timeout fields."""
+        mc = ModelConfig.from_entry(
+            {
+                "hf_path": "org/model",
+                "inference_queue_timeout": 600,
+                "inference_timeout": 120.5,
+            }
+        )
+        assert mc.inference_queue_timeout == 600
+        assert mc.inference_timeout == 120.5
+
+    def test_from_dict_timeout_int_and_float(self):
+        """Both int and float timeout values are accepted."""
+        mc = ModelConfig.from_entry(
+            {
+                "hf_path": "org/model",
+                "inference_queue_timeout": 300,
+                "inference_timeout": 60.0,
+            }
+        )
+        assert mc.inference_queue_timeout == 300
+        assert mc.inference_timeout == 60.0
+
+    def test_from_dict_timeout_zero_rejected(self):
+        """Zero timeout is rejected (must be positive)."""
+        with pytest.raises(ValueError, match="inference_timeout"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "inference_timeout": 0,
+                }
+            )
+
+    def test_from_dict_timeout_negative_rejected(self):
+        """Negative timeout is rejected."""
+        with pytest.raises(ValueError, match="inference_queue_timeout"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "inference_queue_timeout": -1,
+                }
+            )
+
+    def test_from_dict_timeout_bool_rejected(self):
+        """Bool timeout is rejected (even though bool is subclass of int)."""
+        with pytest.raises(ValueError, match="inference_timeout"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "inference_timeout": True,
+                }
+            )
+
+    def test_from_dict_timeout_string_rejected(self):
+        """String timeout is rejected."""
+        with pytest.raises(ValueError, match="inference_queue_timeout"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "inference_queue_timeout": "300s",
+                }
+            )
+
     def test_from_invalid_type_raises(self):
         with pytest.raises(TypeError, match="str or dict"):
             ModelConfig.from_entry(42)
@@ -361,6 +431,31 @@ class TestModelConfig:
         assert entry["experimental"] == {"flash": True}
         assert entry["options"] == {"temperature": 0.5}
         assert entry["keep_alive"] == "10m"
+
+    def test_to_entry_with_timeouts(self):
+        """ModelConfig with timeouts serializes them."""
+        mc = ModelConfig(
+            hf_path="org/model",
+            inference_queue_timeout=600,
+            inference_timeout=120.5,
+        )
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["inference_queue_timeout"] == 600
+        assert entry["inference_timeout"] == 120.5
+
+    def test_to_entry_plain_with_none_timeouts(self):
+        """ModelConfig with None timeouts and no other overrides is plain string."""
+        mc = ModelConfig(hf_path="org/model")
+        assert mc.to_entry() == "org/model"
+
+    def test_to_entry_omits_none_timeouts(self):
+        """None timeout fields are omitted from dict serialization."""
+        mc = ModelConfig(hf_path="org/model", keep_alive="10m")
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert "inference_queue_timeout" not in entry
+        assert "inference_timeout" not in entry
 
     def test_to_entry_omits_empty_sections(self):
         """Only non-empty sections are included in dict serialization."""

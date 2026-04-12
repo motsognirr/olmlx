@@ -325,8 +325,11 @@ async def _stream_buffered_with_tools(result, declared_tools=None):
                 output_tokens = stats.eval_count
             # For gpt-oss channel format, raw_text is in the done chunk
             raw_text = chunk.get("raw_text", "")
+            done_reason = chunk.get("done_reason")
             break
         text_chunks.append(chunk.get("text", ""))
+    else:
+        done_reason = None
 
     full_text = "".join(text_chunks)
 
@@ -406,8 +409,14 @@ async def _stream_buffered_with_tools(result, declared_tools=None):
         )
         block_idx += 1
 
+    if tool_uses:
+        stop_reason = "tool_use"
+    elif done_reason == "timeout":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
     yield {
-        "stop_reason": "tool_use" if tool_uses else "end_turn",
+        "stop_reason": stop_reason,
         "output_tokens": output_tokens,
     }
 
@@ -515,6 +524,7 @@ async def _stream_thinking_state_machine(result):
     buffer = ""
     state = "init"  # "init", "thinking", "text"
     text_block_started = False
+    done_reason = None
 
     async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
         if chunk is _PING_SENTINEL:
@@ -527,6 +537,7 @@ async def _stream_thinking_state_machine(result):
             stats = chunk.get("stats")
             if stats:
                 output_tokens = stats.eval_count
+            done_reason = chunk.get("done_reason")
             break
 
         token_text = chunk.get("text", "")
@@ -619,7 +630,7 @@ async def _stream_thinking_state_machine(result):
         yield event
 
     yield {
-        "stop_reason": "end_turn",
+        "stop_reason": "max_tokens" if done_reason == "timeout" else "end_turn",
         "output_tokens": output_tokens,
     }
 
@@ -891,7 +902,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         if not content_blocks:
             content_blocks.append(AnthropicContentBlock(type="text", text=""))
 
-        stop_reason = "tool_use" if tool_uses else "end_turn"
+        done_reason = result.get("done_reason")
+        if tool_uses:
+            stop_reason = "tool_use"
+        elif done_reason == "timeout":
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = "end_turn"
         usage = AnthropicUsage(
             input_tokens=stats.prompt_eval_count if stats else 0,
             output_tokens=stats.eval_count if stats else 0,

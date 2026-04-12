@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     prompt_cache_disk_path: Path = Path.home() / ".olmlx" / "cache" / "kv"
     prompt_cache_disk_max_gb: Annotated[float, Field(gt=0)] = 10.0
     inference_queue_timeout: Annotated[float, Field(gt=0)] | None = 300.0
+    inference_timeout: Annotated[float, Field(gt=0)] | None = None
     max_tokens_limit: Annotated[int, Field(gt=0)] = 131072
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
     anthropic_models: dict[str, str] = {}
