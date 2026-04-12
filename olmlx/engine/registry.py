@@ -527,7 +527,9 @@ class ModelRegistry:
 
         if not disk_read_ok and self._mappings:
             # File was missing or corrupt — write full in-memory state to
-            # avoid silently dropping live entries.
+            # avoid silently dropping live entries. Removed keys are already
+            # absent from _mappings (remove() pops them), so they won't
+            # reappear. dirty/removed snapshots are not needed here.
             logger.warning(
                 "models.json missing or corrupt; writing full in-memory state"
             )
@@ -538,8 +540,10 @@ class ModelRegistry:
                 disk_data.pop(key, None)
 
             # Overlay only keys that were modified in this process.
-            # Merge any unknown keys from the current disk entry so that
-            # user-added extra keys survive even for server-touched models.
+            # For dirty keys, the in-memory state is authoritative for known
+            # fields (hf_path, experimental, options, etc.) — external edits
+            # to those fields are overwritten. Unknown extra keys from the
+            # disk entry ARE merged so user-added keys survive.
             for k in dirty_snapshot:
                 if k in self._mappings:
                     mc = self._mappings[k]
