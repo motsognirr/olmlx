@@ -173,7 +173,7 @@ class ModelConfig:
     inference_queue_timeout: float | None = None
     inference_timeout: float | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
-    _extra: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_entry(cls, entry: str | dict) -> ModelConfig:
@@ -487,8 +487,8 @@ class ModelRegistry:
                 mc = replace(existing, hf_path=hf_path)
             else:
                 mc = ModelConfig(hf_path=hf_path)
-        if existing is not None and existing == mc and existing._extra == mc._extra:
-            return  # identical, no save needed (_extra excluded from == due to compare=False)
+        if existing is not None and existing == mc:
+            return  # identical, no save needed
         self._mappings[normalized] = mc
         self._raw_unrecognized.pop(normalized, None)
         self._dirty_keys.add(normalized)
@@ -503,6 +503,11 @@ class ModelRegistry:
             self._save_mappings_locked()
 
     def _save_mappings_locked(self):
+        # NOTE: This method reads self._mappings which is mutated outside
+        # _save_lock (in add_mapping/remove). This is safe because the lock
+        # is only contended by sync callers on the same thread. Do NOT make
+        # this method async without also locking the dict mutations.
+        #
         # Snapshot the dirty/removed sets so concurrent add_mapping/remove
         # calls that mutate them outside the lock aren't silently cleared.
         dirty_snapshot = set(self._dirty_keys)
@@ -538,12 +543,10 @@ class ModelRegistry:
                     disk_data[k] = self._mappings[k].to_entry()
 
         # Preserve unrecognized entries (forward/backward compatibility).
-        # Skip in the corruption fallback path — don't re-inject previously
-        # invalid data into the recovered output.
-        if disk_read_ok:
-            for k, v in self._raw_unrecognized.items():
-                if k not in disk_data:
-                    disk_data[k] = v
+        # These may be valid entries written by a newer version.
+        for k, v in self._raw_unrecognized.items():
+            if k not in disk_data:
+                disk_data[k] = v
 
         _atomic_write_json(disk_data, settings.models_config)
         # Only clear the keys we actually flushed — concurrent additions
