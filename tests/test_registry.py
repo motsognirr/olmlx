@@ -1095,6 +1095,36 @@ class TestDiskMergeOnSave:
         assert saved["modelC:latest"] == "org/model-c"
         assert saved["modelD:latest"] == "org/model-d"
 
+    def test_save_merges_disk_extras_for_dirty_keys(self, tmp_path, monkeypatch):
+        """Extra keys added on disk for a server-touched model must survive."""
+        config = {"mymodel:latest": {"hf_path": "org/my-model"}}
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+
+        # User externally adds extra keys to the same model
+        disk = {
+            "mymodel:latest": {
+                "hf_path": "org/my-model",
+                "num_ctx": 8192,
+            }
+        }
+        config_path.write_text(json.dumps(disk))
+
+        # Server touches the same model (e.g. auto-registration with keep_alive)
+        mc = ModelConfig(hf_path="org/my-model", keep_alive="10m")
+        reg.add_mapping("mymodel", "org/my-model", model_config=mc)
+
+        saved = json.loads(config_path.read_text())
+        entry = saved["mymodel:latest"]
+        assert isinstance(entry, dict)
+        assert entry["hf_path"] == "org/my-model"
+        assert entry["keep_alive"] == "10m"
+        # User's externally-added extra key must survive
+        assert entry["num_ctx"] == 8192
+
     def test_save_preserves_disk_config_modifications(self, tmp_path, monkeypatch):
         """Config edits made on disk while server runs must not be overwritten."""
         config = {"mymodel:latest": "org/my-model"}

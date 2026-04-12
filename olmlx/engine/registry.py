@@ -499,10 +499,11 @@ class ModelRegistry:
             self._save_mappings_locked()
 
     def _save_mappings_locked(self):
-        # Safety: all callers run on the asyncio event loop (single-threaded),
-        # so _mappings/_dirty_keys/_removed_keys mutations in add_mapping/remove
-        # never race with reads here. The lock only serializes disk writes.
-        # Do NOT make this async without also locking the dict mutations.
+        # The lock is defensive — it serializes disk I/O but does not cover
+        # dict mutations in add_mapping/remove. This is safe today because
+        # all callers run on the single-threaded asyncio event loop. If
+        # multi-threaded access is ever needed, the lock must be expanded
+        # to cover all _mappings/_dirty_keys/_removed_keys mutations.
         #
         # Snapshot the dirty/removed sets so concurrent add_mapping/remove
         # calls that mutate them outside the lock aren't silently cleared.
@@ -536,10 +537,23 @@ class ModelRegistry:
             for key in removed_snapshot:
                 disk_data.pop(key, None)
 
-            # Overlay only keys that were modified in this process
+            # Overlay only keys that were modified in this process.
+            # Merge any unknown keys from the current disk entry so that
+            # user-added extra keys survive even for server-touched models.
             for k in dirty_snapshot:
                 if k in self._mappings:
-                    disk_data[k] = self._mappings[k].to_entry()
+                    mc = self._mappings[k]
+                    disk_entry = disk_data.get(k)
+                    if isinstance(disk_entry, dict):
+                        disk_extras = {
+                            ek: ev
+                            for ek, ev in disk_entry.items()
+                            if ek not in _KNOWN_CONFIG_KEYS
+                        }
+                        if disk_extras:
+                            merged = {**disk_extras, **mc._extra}
+                            mc = replace(mc, _extra=merged)
+                    disk_data[k] = mc.to_entry()
 
         # Preserve unrecognized entries (forward/backward compatibility).
         # These may be valid entries written by a newer version.
