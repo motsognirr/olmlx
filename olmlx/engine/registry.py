@@ -486,7 +486,7 @@ class ModelRegistry:
                 _extra=dict(existing._extra) if existing is not None else {},
             )
         if existing is not None and existing == mc and existing._extra == mc._extra:
-            return  # identical, no save needed
+            return  # identical, no save needed (_extra excluded from == due to compare=False)
         self._mappings[normalized] = mc
         self._raw_unrecognized.pop(normalized, None)
         self._dirty_keys.add(normalized)
@@ -497,14 +497,16 @@ class ModelRegistry:
         # Re-read disk state as base to preserve external edits (e.g. user
         # editing models.json while the server is running).
         disk_data: dict[str, Any] = {}
+        disk_read_ok = False
         if settings.models_config.exists():
             try:
                 with open(settings.models_config) as f:
                     disk_data = json.load(f)
+                disk_read_ok = True
             except (json.JSONDecodeError, OSError):
-                pass  # corrupt or unreadable — proceed with empty base
+                pass  # corrupt or unreadable
 
-        if not disk_data and self._mappings:
+        if not disk_read_ok and self._mappings:
             # File was missing or corrupt — write full in-memory state to
             # avoid silently dropping live entries.
             logger.warning(

@@ -1176,3 +1176,26 @@ class TestDiskMergeOnSave:
         saved = json.loads(config_path.read_text())
         assert saved["modelB:latest"] == "org/model-b"
         assert saved["modelA:latest"] == "org/model-a"
+
+    def test_save_with_externally_emptied_file(self, tmp_path, monkeypatch):
+        """An intentionally emptied {} file should not restore in-memory entries."""
+        config = {"modelA:latest": "org/model-a", "modelB:latest": "org/model-b"}
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg._aliases_path = tmp_path / "aliases.json"
+        reg.load()
+
+        # User externally clears the file
+        config_path.write_text("{}")
+
+        # Add a new model
+        reg.add_mapping("modelC", "org/model-c")
+
+        saved = json.loads(config_path.read_text())
+        # Only the new model should be present — the user intentionally
+        # emptied the file, so old entries must not be restored.
+        assert saved["modelC:latest"] == "org/model-c"
+        assert "modelA:latest" not in saved
+        assert "modelB:latest" not in saved
