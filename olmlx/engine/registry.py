@@ -496,10 +496,18 @@ class ModelRegistry:
         self._save_mappings()
 
     def _save_mappings(self):
+        # threading.Lock is appropriate here: callers (add_mapping, remove)
+        # are sync methods invoked under ModelManager's asyncio lock, so
+        # the event loop is already yielded before we get here.
         with self._save_lock:
             self._save_mappings_locked()
 
     def _save_mappings_locked(self):
+        # Snapshot the dirty/removed sets so concurrent add_mapping/remove
+        # calls that mutate them outside the lock aren't silently cleared.
+        dirty_snapshot = set(self._dirty_keys)
+        removed_snapshot = set(self._removed_keys)
+
         # Re-read disk state as base to preserve external edits (e.g. user
         # editing models.json while the server is running).
         disk_data: dict[str, Any] = {}
@@ -521,22 +529,27 @@ class ModelRegistry:
             disk_data = {k: v.to_entry() for k, v in self._mappings.items()}
         else:
             # Remove explicitly deleted keys
-            for key in self._removed_keys:
+            for key in removed_snapshot:
                 disk_data.pop(key, None)
 
             # Overlay only keys that were modified in this process
-            for k in self._dirty_keys:
+            for k in dirty_snapshot:
                 if k in self._mappings:
                     disk_data[k] = self._mappings[k].to_entry()
 
-        # Preserve unrecognized entries (forward/backward compatibility)
-        for k, v in self._raw_unrecognized.items():
-            if k not in disk_data:
-                disk_data[k] = v
+        # Preserve unrecognized entries (forward/backward compatibility).
+        # Skip in the corruption fallback path — don't re-inject previously
+        # invalid data into the recovered output.
+        if disk_read_ok:
+            for k, v in self._raw_unrecognized.items():
+                if k not in disk_data:
+                    disk_data[k] = v
 
         _atomic_write_json(disk_data, settings.models_config)
-        self._dirty_keys.clear()
-        self._removed_keys.clear()
+        # Only clear the keys we actually flushed — concurrent additions
+        # that arrived after the snapshot are preserved for the next save.
+        self._dirty_keys -= dirty_snapshot
+        self._removed_keys -= removed_snapshot
 
     def remove(self, name: str):
         """Remove a model alias or mapping."""
