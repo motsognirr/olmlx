@@ -265,20 +265,18 @@ def bundle_ffn_weights(
         )
 
         file_path = output_dir / f"layer_{layer_idx:02d}.flashweights"
-        gate_f16 = gate_w.astype(np.float16, copy=False)
-        up_f16 = up_w.astype(np.float16, copy=False)
-        down_f16 = down_w.astype(np.float16, copy=False)
         # Interleave rows/cols per neuron into one contiguous buffer so we
         # issue a single write(2) per layer instead of 3 per neuron.
+        # Inline the casts so each temp is freed before the next is made.
         neuron_block = np.empty((inter, hidden * 3), dtype=np.float16)
-        neuron_block[:, :hidden] = gate_f16
-        neuron_block[:, hidden : 2 * hidden] = up_f16
-        neuron_block[:, 2 * hidden :] = down_f16.T
+        neuron_block[:, :hidden] = gate_w.astype(np.float16, copy=False)
+        neuron_block[:, hidden : 2 * hidden] = up_w.astype(np.float16, copy=False)
+        neuron_block[:, 2 * hidden :] = down_w.astype(np.float16, copy=False).T
         with open(file_path, "wb") as f:
             f.write(_encode_header(inter, hidden, dtype))
             f.write(offsets.tobytes())
             f.write(neuron_block)
-        del gate_f16, up_f16, down_f16, neuron_block
+        del neuron_block
 
         layouts[layer_idx] = BundledLayerLayout(
             layer_idx=layer_idx,
