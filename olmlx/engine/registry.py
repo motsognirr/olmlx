@@ -555,7 +555,7 @@ class ModelRegistry:
                             if ek not in _KNOWN_CONFIG_KEYS
                         }
                         if disk_extras:
-                            merged = {**disk_extras, **mc._extra}
+                            merged = {**mc._extra, **disk_extras}
                             mc = replace(mc, _extra=merged)
                     disk_data[k] = mc.to_entry()
 
