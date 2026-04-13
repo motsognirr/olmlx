@@ -81,10 +81,6 @@ class DFlashDecoder:
             First generated token from target's greedy argmax.
         """
         self.reset()
-
-        if make_prompt_cache is None:
-            raise RuntimeError("mlx_lm.models.cache not available")
-
         self._cache = make_prompt_cache(self._target)
 
         logits, hidden_states, _ = self._adapter.forward_with_hidden(
@@ -134,6 +130,8 @@ class DFlashDecoder:
         accepted = verify_draft_greedy(draft_tokens, verification_logits)
         num_accepted = len(accepted)
 
+        assert num_accepted >= 1, "verify_draft_greedy must return at least 1 token"
+
         # 4. Trim cache to remove rejected tokens (like SpeculativeDecoder)
         trim_amount = self._block_size + 1 - num_accepted
         if trim_amount > 0:
@@ -169,7 +167,7 @@ class DFlashDecoder:
         last_hidden = {}
         for layer_id, h in self._last_hidden_states.items():
             last_hidden[layer_id] = h[:, -1:, :]
-        context = self._draft._build_context(last_hidden)
+        context = self._draft.build_context(last_hidden)
 
         tokens: list[int] = []
         for _ in range(self._block_size):

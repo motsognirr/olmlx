@@ -141,7 +141,7 @@ class DFlashDraftModel(nn.Module):
         Returns:
             (B, L, vocab_size) logits.
         """
-        context = self._build_context(target_hidden_states)
+        context = self.build_context(target_hidden_states)
         return self.forward_with_context(input_ids, context)
 
     def forward_with_context(
@@ -158,7 +158,7 @@ class DFlashDraftModel(nn.Module):
         h = self.norm(h)
         return self.lm_head(h)
 
-    def _build_context(
+    def build_context(
         self, target_hidden_states: dict[int, mx.array]
     ) -> mx.array | None:
         """Combine target hidden states into a context tensor."""

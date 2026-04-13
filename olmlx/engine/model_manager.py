@@ -1295,7 +1295,7 @@ class ModelManager:
                 "A pre-trained dflash draft model is required."
             )
         for wf in weight_files:
-            draft_model.load_weights(str(wf))
+            draft_model.load_weights(str(wf), strict=False)
         logger.info(
             "Loaded dflash draft weights from %s (%d file(s))",
             draft_dir,
@@ -1311,7 +1311,14 @@ class ModelManager:
             target_cfg = json.loads(target_config_file.read_text())
             model_type = target_cfg.get("model_type", "")
         else:
-            model_type = draft_cfg_dict.get("target_model_type", "qwen3")
+            model_type = draft_cfg_dict.get("target_model_type", "")
+
+        if not model_type:
+            raise ValueError(
+                "Cannot determine target model_type for dflash adapter selection. "
+                "Set 'target_model_type' in the draft model's config.json or "
+                "ensure the target model's config.json contains 'model_type'."
+            )
 
         adapter = get_adapter(model_type)
 

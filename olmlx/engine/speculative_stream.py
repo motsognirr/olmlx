@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from collections.abc import Generator
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol
 
 import mlx.core as mx
 
@@ -25,7 +25,6 @@ class TokenizerProtocol(Protocol):
     def decode(self, token_ids: list[int]) -> str: ...
 
 
-@runtime_checkable
 class SpeculativeDecoderProtocol(Protocol):
     """Structural protocol for any speculative decoder (SpeculativeDecoder, DFlashDecoder)."""
 

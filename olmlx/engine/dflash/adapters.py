@@ -47,7 +47,15 @@ class TargetAdapter(ABC):
 
 
 class Qwen3Adapter(TargetAdapter):
-    """Adapter for Qwen3 models (standard multi-head attention)."""
+    """Adapter for Qwen3 models (standard multi-head attention).
+
+    Note: forward_with_hidden iterates layers directly (bypassing the
+    model's __call__) to capture intermediate hidden states. This means
+    any mask construction done in the model's forward method is skipped.
+    For KV-cached inference this is correct because mlx-lm attention
+    layers derive causal masking from the cache offset, not from an
+    explicit mask argument.
+    """
 
     def forward_with_hidden(
         self,

@@ -92,6 +92,11 @@ class ExperimentalSettings(BaseSettings):
     speculative_draft_model: str | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
+    # DFlash block-diffusion speculative decoding
+    dflash: bool = False
+    dflash_draft_model: str | None = None
+    dflash_block_size: Annotated[int, Field(gt=0)] = 4
+
     # TurboQuant KV cache quantization (e.g. "turboquant:4", "turboquant:2")
     kv_cache_quant: str | None = None
 
@@ -114,11 +119,6 @@ class ExperimentalSettings(BaseSettings):
                 f"and bits is one of {_VALID_BITS}."
             )
         return v
-
-    # DFlash block-diffusion speculative decoding
-    dflash: bool = False
-    dflash_draft_model: str | None = None
-    dflash_block_size: Annotated[int, Field(gt=0)] = 4
 
     # Flash MoE (SSD-based expert offloading for MoE models)
     flash_moe: bool = False
