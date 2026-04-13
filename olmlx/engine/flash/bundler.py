@@ -277,7 +277,7 @@ def bundle_ffn_weights(
         with open(file_path, "wb") as f:
             f.write(_encode_header(inter, hidden, dtype))
             f.write(offsets.tobytes())
-            f.write(neuron_block.tobytes())
+            f.write(neuron_block)
         del gate_f16, up_f16, down_f16, neuron_block
 
         layouts[layer_idx] = BundledLayerLayout(
