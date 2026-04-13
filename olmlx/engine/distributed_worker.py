@@ -16,7 +16,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -229,8 +228,6 @@ def worker_main() -> None:
 
     from olmlx.config import PRE_SHARDED_DIR_ENV, experimental
 
-    model: Any = None
-    tokenizer: Any = None
     if strategy == "pipeline":
         # Pipeline mode: load model, apply pipeline partitioning
         layer_counts_str = os.environ.get(
@@ -269,9 +266,8 @@ def worker_main() -> None:
                     "falling back to full model download",
                     e,
                 )
-                pre_sharded = False
-
-        if not pre_sharded:
+                model, tokenizer = mlx_lm.load(model_path)
+        else:
             logger.info("Loading model %s (pipeline strategy)", model_path)
             model, tokenizer = mlx_lm.load(model_path)
 
@@ -284,7 +280,7 @@ def worker_main() -> None:
             worker.close()
             sys.exit(1)
         mx.eval(model.parameters())  # materialize owned weights on GPU
-    else:
+    elif strategy == "tensor":
         if experimental.flash:
             try:
                 model, tokenizer = _load_flash_tensor_worker(model_path, group)
@@ -294,6 +290,7 @@ def worker_main() -> None:
                 sys.exit(1)
         else:
             pre_shard_dir = os.environ.get(PRE_SHARDED_DIR_ENV)
+            model = tokenizer = None
             if pre_shard_dir:
                 try:
                     model, tokenizer = _load_pre_sharded(pre_shard_dir, group)
@@ -302,8 +299,7 @@ def worker_main() -> None:
                         "Pre-sharded load failed (%s), falling back to HF download",
                         e,
                     )
-                    pre_shard_dir = None
-            if not pre_shard_dir:
+            if model is None:
                 logger.info("Loading model %s", model_path)
                 model, tokenizer = mlx_lm.load(model_path)
 
@@ -318,6 +314,13 @@ def worker_main() -> None:
                 # Without this, the combined lazy eval + all_sum Metal command
                 # buffer can exceed the ~10s GPU timeout for large models (32B+).
                 mx.eval(model.parameters())
+    else:
+        logger.error(
+            "Unknown distributed strategy %r (expected 'pipeline' or 'tensor')",
+            strategy,
+        )
+        worker.close()
+        sys.exit(1)
     worker.send_ready(secret=secret)
     logger.info("Model sharded, ready signal sent, entering inference loop")
 

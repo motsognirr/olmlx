@@ -4,7 +4,18 @@
   "pythonVersion": "3.11",
   "typeCheckingMode": "basic",
   "reportMissingTypeStubs": false,
-  "reportMissingImports": "warning",
+
+  // --- Enforced as errors (CI gate fails on these) ---
+  // Real-bug detectors: missing imports and possibly-unbound locals.
+  "reportMissingImports": "error",
+  "reportPossiblyUnboundVariable": "error",
+
+  // --- Downgraded to warnings ---
+  // mlx.nn.Module defines __getattr__ with an implicit None return,
+  // so pyright sees every `model.xxx` access as Optional/None and
+  // floods the type-checking pass. Until we ship a minimal mlx stub
+  // (typed __getattr__ -> Any), keep these as warnings to avoid
+  // blocking on third-party-API noise. Tracked as follow-up.
   "reportAttributeAccessIssue": "warning",
   "reportGeneralTypeIssues": "warning",
   "reportOptionalMemberAccess": "warning",
@@ -18,6 +29,5 @@
   "reportAssignmentType": "warning",
   "reportReturnType": "warning",
   "reportIndexIssue": "warning",
-  "reportOperatorIssue": "warning",
-  "reportPossiblyUnboundVariable": "warning"
+  "reportOperatorIssue": "warning"
 }

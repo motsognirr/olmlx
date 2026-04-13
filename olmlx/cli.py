@@ -412,16 +412,12 @@ def _launch_distributed_workers() -> list[str]:
             )
 
     # Pre-compute safe model name for env var paths (used when pre-sharded)
-    PRE_SHARDED_DIR_ENV = ""
-    safe_name = ""
-    worker_shard_dir = ""
-    if pre_sharded:
-        from olmlx.config import PRE_SHARDED_DIR_ENV
-        from olmlx.models.store import _safe_dir_name
+    from olmlx.config import PRE_SHARDED_DIR_ENV
+    from olmlx.models.store import _safe_dir_name
 
-        safe_name = _safe_dir_name(model)
-        # Keep ~ as-is: the worker calls expanduser() on the received path
-        worker_shard_dir = experimental.distributed_worker_shard_dir
+    safe_name = _safe_dir_name(model) if pre_sharded else ""
+    # Keep ~ as-is: the worker calls expanduser() on the received path
+    worker_shard_dir = experimental.distributed_worker_shard_dir if pre_sharded else ""
 
     # Launch workers on remote hosts (rank 1..N)
     for rank, host in enumerate(hosts[1:], start=1):
