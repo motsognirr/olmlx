@@ -9,7 +9,7 @@ import logging
 import threading
 import time
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, Literal, overload
 
 import mlx.core as mx
 
@@ -2216,6 +2216,53 @@ async def _full_completion_inner(
     if thinking:
         result_dict["thinking"] = thinking
     return result_dict
+
+
+@overload
+async def generate_chat(
+    manager: ModelManager,
+    model_name: str,
+    messages: list[dict],
+    options: dict | None = ...,
+    tools: list[dict] | None = ...,
+    *,
+    stream: Literal[True],
+    keep_alive: str | None = ...,
+    max_tokens: int = ...,
+    cache_id: str = ...,
+    enable_thinking: bool | None = ...,
+) -> AsyncGenerator[dict, None]: ...
+
+
+@overload
+async def generate_chat(
+    manager: ModelManager,
+    model_name: str,
+    messages: list[dict],
+    options: dict | None = ...,
+    tools: list[dict] | None = ...,
+    *,
+    stream: Literal[False],
+    keep_alive: str | None = ...,
+    max_tokens: int = ...,
+    cache_id: str = ...,
+    enable_thinking: bool | None = ...,
+) -> dict: ...
+
+
+@overload
+async def generate_chat(
+    manager: ModelManager,
+    model_name: str,
+    messages: list[dict],
+    options: dict | None = ...,
+    tools: list[dict] | None = ...,
+    stream: bool = ...,
+    keep_alive: str | None = ...,
+    max_tokens: int = ...,
+    cache_id: str = ...,
+    enable_thinking: bool | None = ...,
+) -> AsyncGenerator[dict, None] | dict: ...
 
 
 async def generate_chat(

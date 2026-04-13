@@ -5,7 +5,7 @@ import time
 import traceback
 from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,8 @@ class CancellableStream:
         self._is_vlm = is_vlm
         self._cancel_event = threading.Event()
         self._stream_done = threading.Event()
-        self._queue: asyncio.Queue | None = None
+        # Queue items are one of: a StreamToken, an error dict, or _SENTINEL.
+        self._queue: asyncio.Queue[StreamToken | dict[str, Any] | object] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
 
@@ -259,6 +260,7 @@ class CancellableStream:
         return self
 
     async def __anext__(self) -> StreamToken:
+        assert self._queue is not None
         item = await self._queue.get()
         if item is _SENTINEL:
             raise StopAsyncIteration
@@ -270,7 +272,7 @@ class CancellableStream:
                     "Inference error (%s): %s\n%s", exc_type, item[_ERROR_KEY], tb
                 )
             raise RuntimeError(f"{exc_type}: {item[_ERROR_KEY]}")
-        return item  # pyright: ignore[reportReturnType]
+        return cast(StreamToken, item)
 
 
 def _make_prefill_progress(

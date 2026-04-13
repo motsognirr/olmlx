@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from olmlx.config import settings
 
@@ -781,7 +782,7 @@ def cmd_chat(args):
         print("Error: model name required. Usage: olmlx chat <model>", file=sys.stderr)
         sys.exit(1)
 
-    chat_kwargs = dict(
+    chat_kwargs: dict[str, Any] = dict(
         model_name=model_name,
         system_prompt=args.system,
         max_tokens=args.max_tokens,

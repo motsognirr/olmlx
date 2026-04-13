@@ -290,10 +290,10 @@ def worker_main() -> None:
                 sys.exit(1)
         else:
             pre_shard_dir = os.environ.get(PRE_SHARDED_DIR_ENV)
-            # `model is None` is the fallback signal: tuple unpacking is
-            # atomic in Python, so if _load_pre_sharded raises anywhere
-            # inside, `model, tokenizer = ...` never completes and `model`
-            # stays None — the second branch then runs the HF download.
+            # `model is None` is the fallback signal: if _load_pre_sharded
+            # raises before returning, the assignment never executes, so
+            # model stays None from the pre-declaration above — the second
+            # branch then runs the HF download.
             model = tokenizer = None
             if pre_shard_dir:
                 try:

@@ -1,6 +1,7 @@
 {
   "include": ["olmlx"],
   "exclude": ["**/__pycache__", "**/.venv", "tests"],
+  "stubPath": "typings",
   "pythonVersion": "3.11",
   "typeCheckingMode": "basic",
   "reportMissingTypeStubs": false,
