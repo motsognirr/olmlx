@@ -87,6 +87,16 @@ class ExperimentalSettings(BaseSettings):
     flash_speculative_draft_model: str | None = None
     flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
+    # Standalone speculative decoding (works with any model, not just Flash)
+    speculative: bool = False
+    speculative_draft_model: str | None = None
+    speculative_tokens: Annotated[int, Field(gt=0)] = 4
+
+    # DFlash block-diffusion speculative decoding
+    dflash: bool = False
+    dflash_draft_model: str | None = None
+    dflash_block_size: Annotated[int, Field(gt=0)] = 4
+
     # TurboQuant KV cache quantization (e.g. "turboquant:4", "turboquant:2")
     kv_cache_quant: str | None = None
 
