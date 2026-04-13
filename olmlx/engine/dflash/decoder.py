@@ -124,7 +124,6 @@ class DFlashDecoder:
         )
 
         verification_logits = logits[0]  # (block_size+1, vocab)
-        mx.eval(verification_logits)
 
         # 3. Verify: greedy comparison
         accepted = verify_draft_greedy(draft_tokens, verification_logits)

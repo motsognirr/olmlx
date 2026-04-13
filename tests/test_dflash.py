@@ -71,7 +71,7 @@ class Qwen3LikeLayer(nn.Module):
         super().__init__()
         self.self_attn = MockAttention(hidden_size)
 
-    def __call__(self, x, cache=None):
+    def __call__(self, x, mask=None, cache=None):
         return self.self_attn(x, cache=cache)
 
 

@@ -49,12 +49,9 @@ class TargetAdapter(ABC):
 class Qwen3Adapter(TargetAdapter):
     """Adapter for Qwen3 models (standard multi-head attention).
 
-    Note: forward_with_hidden iterates layers directly (bypassing the
-    model's __call__) to capture intermediate hidden states. This means
-    any mask construction done in the model's forward method is skipped.
-    For KV-cached inference this is correct because mlx-lm attention
-    layers derive causal masking from the cache offset, not from an
-    explicit mask argument.
+    Iterates layers directly (bypassing model.__call__) to capture
+    intermediate hidden states. Constructs a causal mask for multi-token
+    inputs (prefill, verification) so KV cache entries are correct.
     """
 
     def forward_with_hidden(
@@ -76,11 +73,23 @@ class Qwen3Adapter(TargetAdapter):
             )
         h = embed(tokens)
 
+        # Build causal mask for multi-token inputs (prefill, verification).
+        # Single-token decode steps (seq_len=1) don't need a mask.
+        seq_len = tokens.shape[1]
+        offset = cache[0].offset if cache is not None else 0
+        if seq_len > 1:
+            mask = mx.triu(
+                mx.full((seq_len, seq_len + offset), -1e9, dtype=h.dtype),
+                k=1 + offset,
+            )
+        else:
+            mask = None
+
         captured: dict[int, mx.array] = {}
         target_set = set(target_layer_ids)
 
         for i, layer in enumerate(layers):
-            h = layer(h, cache=cache[i] if cache is not None else None)
+            h = layer(h, mask=mask, cache=cache[i] if cache is not None else None)
             if i in target_set:
                 captured[i] = h
 
