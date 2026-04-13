@@ -117,6 +117,13 @@ class SpectralQuantKVCache(_BaseCache):
             nrm_shape = (B, n_heads, new_steps, 1)
 
             if self._k_sem is not None:
+                assert (
+                    self._k_tail is not None
+                    and self._k_norms is not None
+                    and self._v_sem is not None
+                    and self._v_tail is not None
+                    and self._v_norms is not None
+                )
                 if prev % self.step != 0:
                     self._k_sem = self._k_sem[..., :prev, :]
                     self._k_tail = self._k_tail[..., :prev, :]
@@ -151,6 +158,14 @@ class SpectralQuantKVCache(_BaseCache):
                 self._v_norms = mx.zeros(nrm_shape, dtype=mx.float32)
 
         # Store quantized data
+        assert (
+            self._k_sem is not None
+            and self._k_tail is not None
+            and self._k_norms is not None
+            and self._v_sem is not None
+            and self._v_tail is not None
+            and self._v_norms is not None
+        )
         self.offset += num_steps
         self._k_sem[..., prev : self.offset, :] = k_sem
         self._k_tail[..., prev : self.offset, :] = k_tail
@@ -190,6 +205,13 @@ class SpectralQuantKVCache(_BaseCache):
     def state(self):
         if self._k_sem is None:
             return []
+        assert (
+            self._k_tail is not None
+            and self._k_norms is not None
+            and self._v_sem is not None
+            and self._v_tail is not None
+            and self._v_norms is not None
+        )
         return [
             self._k_sem[..., : self.offset, :],
             self._k_tail[..., : self.offset, :],

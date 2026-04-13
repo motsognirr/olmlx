@@ -1902,6 +1902,7 @@ async def _stream_completion(
         with _inference_ref(lm), Timer() as total_timer:
             with Timer() as eval_timer:
                 inf_start = time.monotonic()
+                token = None
                 async for token in stream:
                     # Always accumulate for prompt cache (raw stream, not filtered)
                     stats.eval_count = token.generation_tokens

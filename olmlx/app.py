@@ -41,6 +41,8 @@ async def lifespan(app: FastAPI):
 
     distributed_group = None
     coordinator = None
+    distributed_strategy = "tensor"
+    distributed_layer_counts = None
     if experimental.distributed:
         from olmlx.engine.inference import set_distributed_coordinator
 
@@ -80,9 +82,6 @@ async def lifespan(app: FastAPI):
             raise
         set_distributed_coordinator(coordinator)
 
-    distributed_strategy = "tensor"
-    distributed_layer_counts = None
-    if experimental.distributed:
         distributed_strategy = _cli_distributed_strategy
         distributed_layer_counts = _cli_distributed_layer_counts
 

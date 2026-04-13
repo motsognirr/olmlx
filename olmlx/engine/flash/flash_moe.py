@@ -98,6 +98,7 @@ class FlashMoE(nn.Module):
         # Expand x for gather_mm: (B, L, 1, 1, H)
         x_expanded = mx.expand_dims(x, (-2, -3))
         gated = loaded.gate_weight is not None
+        gate_out: mx.array | None = None
 
         if loaded.is_quantized:
             qmm_kwargs = dict(

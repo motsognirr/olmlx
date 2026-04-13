@@ -36,7 +36,7 @@ _WEB_FETCH_MAX_CHARS = 10_000
 
 def _web_search_impl(query: str, max_results: int = 5) -> list[dict]:
     """Run a web search via duckduckgo-search. Raises ImportError if not installed."""
-    from duckduckgo_search import DDGS
+    from duckduckgo_search import DDGS  # type: ignore[import-not-found]
 
     with DDGS() as ddgs:
         return list(ddgs.text(query, max_results=max_results))

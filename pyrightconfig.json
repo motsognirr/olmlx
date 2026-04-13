@@ -1,0 +1,23 @@
+{
+  "include": ["olmlx"],
+  "exclude": ["**/__pycache__", "**/.venv", "tests"],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": false,
+  "reportMissingImports": "warning",
+  "reportAttributeAccessIssue": "warning",
+  "reportGeneralTypeIssues": "warning",
+  "reportOptionalMemberAccess": "warning",
+  "reportOptionalCall": "warning",
+  "reportOptionalSubscript": "warning",
+  "reportOptionalIterable": "warning",
+  "reportOptionalOperand": "warning",
+  "reportOptionalContextManager": "warning",
+  "reportArgumentType": "warning",
+  "reportCallIssue": "warning",
+  "reportAssignmentType": "warning",
+  "reportReturnType": "warning",
+  "reportIndexIssue": "warning",
+  "reportOperatorIssue": "warning",
+  "reportPossiblyUnboundVariable": "warning"
+}

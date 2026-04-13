@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +38,10 @@ def _load_pre_sharded(shard_dir_str, group):
     logger.info("Loading pre-sharded weights from %s", shard_dir)
 
     model, tokenizer = mlx_lm.load(str(shard_dir))
-    if not hasattr(model, "shard"):
+    shard_fn = getattr(model, "shard", None)
+    if shard_fn is None:
         raise RuntimeError(f"Model in {shard_dir} does not support shard()")
-    model.shard(group)
+    shard_fn(group)
 
     # Overwrite double-split weights with correct pre-sharded values
     weights_path = shard_dir / "model.safetensors"
@@ -227,6 +229,8 @@ def worker_main() -> None:
 
     from olmlx.config import PRE_SHARDED_DIR_ENV, experimental
 
+    model: Any = None
+    tokenizer: Any = None
     if strategy == "pipeline":
         # Pipeline mode: load model, apply pipeline partitioning
         layer_counts_str = os.environ.get(
@@ -303,12 +307,13 @@ def worker_main() -> None:
                 logger.info("Loading model %s", model_path)
                 model, tokenizer = mlx_lm.load(model_path)
 
-                if not hasattr(model, "shard"):
+                shard_fn = getattr(model, "shard", None)
+                if shard_fn is None:
                     logger.error("Model %s does not support shard()", model_path)
                     worker.close()
                     sys.exit(1)
 
-                model.shard(group)
+                shard_fn(group)
                 # Materialize all lazy weight slices before entering inference.
                 # Without this, the combined lazy eval + all_sum Metal command
                 # buffer can exceed the ~10s GPU timeout for large models (32B+).
