@@ -230,6 +230,42 @@ _deferred_cleanup_lock: asyncio.Lock | None = None
 _queue_depth = 0
 
 
+async def _reset_inference_state() -> None:
+    """Reset module-level state for test isolation.
+
+    Warning: Test-only. Must only be called when no coroutines are awaiting
+    _inference_lock, otherwise they will block forever.
+
+    Resets the global state variables that persist across tests. Call this in
+    test fixtures to ensure test isolation.
+
+    Cancels and awaits any in-flight deferred cleanup task to prevent
+    orphaned release calls after the task completes.
+    Force-releases _inference_lock if held to prevent test deadlocks.
+    """
+    global _deferred_cleanup_task, _deferred_cleanup_lock, _queue_depth
+    if _deferred_cleanup_task is not None and not _deferred_cleanup_task.done():
+        _deferred_cleanup_task.cancel()
+        try:
+            await _deferred_cleanup_task
+        except (asyncio.CancelledError, asyncio.InvalidStateError):
+            pass
+    _deferred_cleanup_task = None
+    _deferred_cleanup_lock = None
+    _queue_depth = 0
+    if _inference_lock.locked():
+        _inference_lock.release()
+
+
+def _get_inference_lock() -> asyncio.Lock:
+    """Return the inference lock.
+
+    Exists for API consistency with _get_deferred_cleanup_lock.
+    The lock is created at module load time.
+    """
+    return _inference_lock
+
+
 def _get_deferred_cleanup_lock() -> asyncio.Lock:
     """Lazily create the deferred cleanup lock in the current event loop (Bug #119).
 
@@ -315,6 +351,8 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
     """
     global _deferred_cleanup_task
 
+    lock = _get_inference_lock()
+
     async with _get_deferred_cleanup_lock():
         if _deferred_cleanup_task is not None and not _deferred_cleanup_task.done():
             logger.error(
@@ -355,7 +393,7 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                 # lock risks a Metal crash on the next inference (the stuck thread
                 # may still be issuing GPU commands).  Python can't kill CPU-bound
                 # threads, so this is the "least bad" option vs permanent deadlock.
-                _inference_lock.release()
+                lock.release()
                 logger.info("Deferred inference cleanup: lock released")
                 async with _get_deferred_cleanup_lock():
                     global _deferred_cleanup_task
@@ -572,45 +610,43 @@ async def _acquire_inference_lock(timeout_override: float | None = None):
     Python 3.11 race where wait_for can deliver the lock and then cancel,
     leaving the lock permanently held with no owner.
     """
+    lock = _get_inference_lock()
     timeout = (
         timeout_override
         if timeout_override is not None
         else settings.inference_queue_timeout
     )
     if isinstance(timeout, (int, float)) and timeout > 0:
-        acquire_task = asyncio.create_task(_inference_lock.acquire())
+        acquire_task = asyncio.create_task(lock.acquire())
         try:
             done, _ = await asyncio.wait({acquire_task}, timeout=timeout)
         except BaseException:
-            # Caller was cancelled (e.g. client disconnect, TaskGroup teardown).
-            # Clean up the orphaned acquire task to prevent a lock leak.
             acquire_task.cancel()
             try:
                 await acquire_task
-                _inference_lock.release()
+                lock.release()
             except asyncio.CancelledError:
                 pass
             raise
         if not done:
             acquire_task.cancel()
-            # If acquire completed between wait() returning and cancel(),
-            # we now own the lock — must release it before raising.
             try:
                 await acquire_task
-                _inference_lock.release()
+                lock.release()
             except asyncio.CancelledError:
                 pass
             raise ServerBusyError(
                 f"Server busy: inference queue timeout after {timeout}s"
             )
     else:
-        await _inference_lock.acquire()
+        await lock.acquire()
 
 
 @contextlib.asynccontextmanager
 async def _inference_locked(timeout_override: float | None = None):
     """Async context manager that acquires the inference lock with Metal sync on entry/exit."""
     global _queue_depth
+    lock = _get_inference_lock()
     await _await_deferred_cleanup()
     _queue_depth += 1
     if _queue_depth > 1:
@@ -626,7 +662,7 @@ async def _inference_locked(timeout_override: float | None = None):
     try:
         await _await_deferred_cleanup()
     except BaseException:
-        _inference_lock.release()
+        lock.release()
         raise
     # Sync the default Metal stream so any pending GPU work from the previous
     # inference completes before we start a new one.
@@ -637,7 +673,7 @@ async def _inference_locked(timeout_override: float | None = None):
         # Sync again on exit to ensure this inference's GPU work is fully
         # complete before releasing the lock to the next caller.
         _safe_sync()
-        _inference_lock.release()
+        lock.release()
 
 
 @contextlib.contextmanager
@@ -1754,6 +1790,7 @@ async def _stream_completion(
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
     global _queue_depth
+    lock = _get_inference_lock()
     await _await_deferred_cleanup()
     _queue_depth += 1
     if _queue_depth > 1:
@@ -1772,7 +1809,7 @@ async def _stream_completion(
     try:
         await _await_deferred_cleanup()
     except BaseException:
-        _inference_lock.release()
+        lock.release()
         raise
     # Sync default stream before starting — same purpose as _inference_locked entry.
     _safe_sync()
@@ -2035,7 +2072,7 @@ async def _stream_completion(
         else:
             # Normal path — thread exited, safe to sync and release.
             _safe_sync()
-            _inference_lock.release()
+            lock.release()
 
 
 async def _full_completion(
