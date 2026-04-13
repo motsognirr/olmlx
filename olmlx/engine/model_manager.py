@@ -1261,6 +1261,19 @@ class ModelManager:
             )
 
         draft_cfg_dict = json.loads(config_file.read_text())
+        _required = [
+            "hidden_size",
+            "num_attention_heads",
+            "num_layers",
+            "target_layer_ids",
+            "vocab_size",
+        ]
+        missing = [k for k in _required if k not in draft_cfg_dict]
+        if missing:
+            raise ValueError(
+                f"DFlash draft config at {config_file} is missing "
+                f"required keys: {missing}"
+            )
         target_hidden_size = getattr(
             getattr(target_model, "args", None), "hidden_size", None
         )
@@ -1274,14 +1287,20 @@ class ModelManager:
         )
 
         draft_model = DFlashDraftModel(draft_config)
-        weights_file = Path(load_path) / "model.safetensors"
-        if not weights_file.exists():
+        draft_dir = Path(load_path)
+        weight_files = sorted(draft_dir.glob("model*.safetensors"))
+        if not weight_files:
             raise FileNotFoundError(
-                f"DFlash draft model weights not found at {weights_file}. "
+                f"DFlash draft model weights not found in {draft_dir}. "
                 "A pre-trained dflash draft model is required."
             )
-        draft_model.load_weights(str(weights_file))
-        logger.info("Loaded dflash draft weights from %s", weights_file)
+        for wf in weight_files:
+            draft_model.load_weights(str(wf))
+        logger.info(
+            "Loaded dflash draft weights from %s (%d file(s))",
+            draft_dir,
+            len(weight_files),
+        )
 
         # Detect model type for adapter selection
         target_config_file = None

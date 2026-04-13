@@ -156,12 +156,12 @@ class DFlashDecoder:
     def _draft_block(self, pending_token: int) -> list[int]:
         """Use the draft model to propose a block of candidate tokens.
 
-        Unlike SpeculativeDecoder (which accumulates KV state across draft
-        steps), each draft token here is conditioned only on the target's
-        hidden states — not on previous draft tokens. This is by design:
-        the block-diffusion approach generates tokens independently given
-        the target context, trading inter-token coherence for parallelism
-        potential.
+        Each token is fed as input to the next step (autoregressive), but
+        unlike SpeculativeDecoder there is no KV cache accumulating across
+        draft steps — the draft model's self-attention sees only [context,
+        current_token] each time, not the full history of draft tokens.
+        This is by design: the block-diffusion approach relies on the
+        target's hidden states as the primary conditioning signal.
         """
         inp = mx.array([[pending_token]])
 

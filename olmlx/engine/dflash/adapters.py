@@ -62,6 +62,10 @@ class Qwen3Adapter(TargetAdapter):
         lm_head = getattr(model, "lm_head", None)
 
         embed = getattr(inner, "embed_tokens", None) or getattr(inner, "embed", None)
+        if embed is None:
+            raise RuntimeError(
+                "DFlash target model has no embed_tokens or embed attribute"
+            )
         h = embed(tokens)
 
         captured: dict[int, mx.array] = {}
