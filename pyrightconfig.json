@@ -1,0 +1,35 @@
+{
+  "include": ["olmlx"],
+  "exclude": ["**/__pycache__", "**/.venv", "tests"],
+  "stubPath": "typings",
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": false,
+
+  // --- Enforced as errors (CI gate fails on these) ---
+  // Real-bug detectors. The four broader rules are kept enforceable
+  // by `# pyright: ignore[<rule>]` at the small set of mlx/mcp SDK
+  // signature-mismatch sites that pyright cannot resolve.
+  "reportMissingImports": "error",
+  "reportPossiblyUnboundVariable": "error",
+  "reportReturnType": "error",
+  "reportAssignmentType": "error",
+  "reportCallIssue": "error",
+  "reportGeneralTypeIssues": "error",
+
+  // --- Downgraded to warnings ---
+  // mlx.nn.Module defines __getattr__ with an implicit-None return,
+  // so pyright treats every `model.xxx` access as Optional/None and
+  // floods these rules. Keep them as warnings until a typed mlx stub
+  // (`__getattr__ -> Any`) lands.
+  "reportAttributeAccessIssue": "warning",
+  "reportOptionalMemberAccess": "warning",
+  "reportOptionalCall": "warning",
+  "reportOptionalSubscript": "warning",
+  "reportOptionalIterable": "warning",
+  "reportOptionalOperand": "warning",
+  "reportOptionalContextManager": "warning",
+  "reportArgumentType": "warning",
+  "reportIndexIssue": "warning",
+  "reportOperatorIssue": "warning"
+}

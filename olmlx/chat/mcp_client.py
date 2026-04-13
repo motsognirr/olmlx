@@ -99,14 +99,14 @@ class MCPClientManager:
             args=cfg.get("args", []),
             env=safe_env,
         )
-        transport_cm: MCPTransport = stdio_client(params)
+        transport_cm: MCPTransport = stdio_client(params)  # pyright: ignore[reportAssignmentType]
         await self._connect_transport(name, transport_cm)
 
     async def _connect_sse(self, name: str, cfg: dict[str, Any]) -> None:
         """Connect to an SSE MCP server."""
         from mcp.client.sse import sse_client
 
-        transport_cm: MCPTransport = sse_client(cfg["url"])
+        transport_cm: MCPTransport = sse_client(cfg["url"])  # pyright: ignore[reportAssignmentType]
         await self._connect_transport(name, transport_cm)
 
     async def _connect_transport(self, name: str, transport_cm: MCPTransport) -> None:

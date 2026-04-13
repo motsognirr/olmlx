@@ -36,10 +36,11 @@ def _load_pre_sharded(shard_dir_str, group):
     shard_dir = Path(shard_dir_str).expanduser()
     logger.info("Loading pre-sharded weights from %s", shard_dir)
 
-    model, tokenizer = mlx_lm.load(str(shard_dir))
-    if not hasattr(model, "shard"):
+    model, tokenizer = mlx_lm.load(str(shard_dir))  # pyright: ignore[reportAssignmentType]
+    shard_fn = getattr(model, "shard", None)
+    if shard_fn is None:
         raise RuntimeError(f"Model in {shard_dir} does not support shard()")
-    model.shard(group)
+    shard_fn(group)
 
     # Overwrite double-split weights with correct pre-sharded values
     weights_path = shard_dir / "model.safetensors"
@@ -99,7 +100,7 @@ def _load_flash_tensor_worker(model_path: str, group) -> tuple:
             ) from e
 
     logger.info("Loading flash model %s from %s", model_path, flash_dir)
-    model, tokenizer = mlx_lm.load(model_path)
+    model, tokenizer = mlx_lm.load(model_path)  # pyright: ignore[reportAssignmentType]
 
     predictor_bank = PredictorBank.load(flash_dir / "predictors")
     layout_config = json.loads((flash_dir / "flash_layout.json").read_text())
@@ -257,7 +258,7 @@ def worker_main() -> None:
 
                 shard_path = Path(pre_shard_dir).expanduser()
                 logger.info("Loading pre-sharded pipeline weights from %s", shard_path)
-                model, tokenizer = mlx_lm.load(str(shard_path))
+                model, tokenizer = mlx_lm.load(str(shard_path))  # pyright: ignore[reportAssignmentType]
                 pre_sharded = True
             except Exception as e:
                 logger.warning(
@@ -265,11 +266,10 @@ def worker_main() -> None:
                     "falling back to full model download",
                     e,
                 )
-                pre_sharded = False
-
-        if not pre_sharded:
+                model, tokenizer = mlx_lm.load(model_path)  # pyright: ignore[reportAssignmentType]
+        else:
             logger.info("Loading model %s (pipeline strategy)", model_path)
-            model, tokenizer = mlx_lm.load(model_path)
+            model, tokenizer = mlx_lm.load(model_path)  # pyright: ignore[reportAssignmentType]
 
         try:
             apply_pipeline(
@@ -280,7 +280,7 @@ def worker_main() -> None:
             worker.close()
             sys.exit(1)
         mx.eval(model.parameters())  # materialize owned weights on GPU
-    else:
+    elif strategy == "tensor":
         if experimental.flash:
             try:
                 model, tokenizer = _load_flash_tensor_worker(model_path, group)
@@ -290,6 +290,11 @@ def worker_main() -> None:
                 sys.exit(1)
         else:
             pre_shard_dir = os.environ.get(PRE_SHARDED_DIR_ENV)
+            # `model is None` is the fallback signal: if _load_pre_sharded
+            # raises before returning, the assignment never executes, so
+            # model stays None from the pre-declaration above — the second
+            # branch then runs the HF download.
+            model = tokenizer = None
             if pre_shard_dir:
                 try:
                     model, tokenizer = _load_pre_sharded(pre_shard_dir, group)
@@ -298,21 +303,28 @@ def worker_main() -> None:
                         "Pre-sharded load failed (%s), falling back to HF download",
                         e,
                     )
-                    pre_shard_dir = None
-            if not pre_shard_dir:
+            if model is None:
                 logger.info("Loading model %s", model_path)
-                model, tokenizer = mlx_lm.load(model_path)
+                model, tokenizer = mlx_lm.load(model_path)  # pyright: ignore[reportAssignmentType]
 
-                if not hasattr(model, "shard"):
+                shard_fn = getattr(model, "shard", None)
+                if shard_fn is None:
                     logger.error("Model %s does not support shard()", model_path)
                     worker.close()
                     sys.exit(1)
 
-                model.shard(group)
+                shard_fn(group)
                 # Materialize all lazy weight slices before entering inference.
                 # Without this, the combined lazy eval + all_sum Metal command
                 # buffer can exceed the ~10s GPU timeout for large models (32B+).
                 mx.eval(model.parameters())
+    else:
+        logger.error(
+            "Unknown distributed strategy %r (expected 'pipeline' or 'tensor')",
+            strategy,
+        )
+        worker.close()
+        sys.exit(1)
     worker.send_ready(secret=secret)
     logger.info("Model sharded, ready signal sent, entering inference loop")
 

@@ -123,7 +123,7 @@ def pre_shard_for_rank(
 
     # Load model lazily and shard with fake group
     logger.info("Pre-sharding rank %d/%d from %s", rank, world_size, model_dir)
-    model, _tokenizer = mlx_lm.load(str(model_dir))
+    model, _tokenizer = mlx_lm.load(str(model_dir))  # pyright: ignore[reportAssignmentType]
 
     group = FakeGroup(rank=rank, size=world_size)
     model.shard(group)
@@ -160,7 +160,7 @@ def _load_safetensors_weights(
         index = json.loads(index_path.read_text())
     except (OSError, json.JSONDecodeError):
         # No index file — try single-file layout
-        return dict(mx.load(str(model_dir / "model.safetensors")))
+        return dict(mx.load(str(model_dir / "model.safetensors")))  # pyright: ignore[reportCallIssue]
 
     weight_map = index.get("weight_map")
     if weight_map is None:
@@ -184,7 +184,7 @@ def _load_safetensors_weights(
 
     weights: dict = {}
     for shard_file in needed_files:
-        weights.update(mx.load(str(model_dir / shard_file)))
+        weights.update(mx.load(str(model_dir / shard_file)))  # pyright: ignore[reportCallIssue]
     return weights
 
 

@@ -68,6 +68,11 @@ class TurboQuantKVCache(_BaseCache):
             nrm_shape = (B, n_heads, new_steps, 1)
 
             if self._key_indices is not None:
+                assert (
+                    self._key_norms is not None
+                    and self._value_indices is not None
+                    and self._value_norms is not None
+                )
                 if prev % self.step != 0:
                     self._key_indices = self._key_indices[..., :prev, :]
                     self._key_norms = self._key_norms[..., :prev, :]
@@ -92,6 +97,12 @@ class TurboQuantKVCache(_BaseCache):
                 self._value_norms = mx.zeros(nrm_shape, dtype=mx.float32)
 
         # Store quantized data
+        assert (
+            self._key_indices is not None
+            and self._key_norms is not None
+            and self._value_indices is not None
+            and self._value_norms is not None
+        )
         self.offset += num_steps
         self._key_indices[..., prev : self.offset, :] = k_idx
         self._key_norms[..., prev : self.offset, :] = k_nrm
@@ -119,6 +130,11 @@ class TurboQuantKVCache(_BaseCache):
     def state(self):
         if self._key_indices is None:
             return []
+        assert (
+            self._key_norms is not None
+            and self._value_indices is not None
+            and self._value_norms is not None
+        )
         return [
             self._key_indices[..., : self.offset, :],
             self._key_norms[..., : self.offset, :],

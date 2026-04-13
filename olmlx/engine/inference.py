@@ -9,7 +9,7 @@ import logging
 import threading
 import time
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, Literal, overload
 
 import mlx.core as mx
 
@@ -1141,9 +1141,15 @@ def _apply_chat_template_vlm(
     config = model.config if hasattr(model, "config") else {}
     num_images = len(images) if images else 0
     # Pass the full message list so the model gets proper conversation context
-    return mlx_vlm.apply_chat_template(
+    result = mlx_vlm.apply_chat_template(
         processor, config, messages, num_images=num_images
     )
+    if not isinstance(result, str):
+        raise TypeError(
+            f"mlx_vlm.apply_chat_template returned non-str ({type(result).__name__}); "
+            "expected tokenize=False default"
+        )
+    return result
 
 
 def _get_model_for_cache(model: Any, is_vlm: bool) -> Any:
@@ -1902,6 +1908,7 @@ async def _stream_completion(
         with _inference_ref(lm), Timer() as total_timer:
             with Timer() as eval_timer:
                 inf_start = time.monotonic()
+                token = None
                 async for token in stream:
                     # Always accumulate for prompt cache (raw stream, not filtered)
                     stats.eval_count = token.generation_tokens
@@ -2209,6 +2216,53 @@ async def _full_completion_inner(
     if thinking:
         result_dict["thinking"] = thinking
     return result_dict
+
+
+@overload
+async def generate_chat(
+    manager: ModelManager,
+    model_name: str,
+    messages: list[dict],
+    options: dict | None = ...,
+    tools: list[dict] | None = ...,
+    *,
+    stream: Literal[True],
+    keep_alive: str | None = ...,
+    max_tokens: int = ...,
+    cache_id: str = ...,
+    enable_thinking: bool | None = ...,
+) -> AsyncGenerator[dict, None]: ...
+
+
+@overload
+async def generate_chat(
+    manager: ModelManager,
+    model_name: str,
+    messages: list[dict],
+    options: dict | None = ...,
+    tools: list[dict] | None = ...,
+    *,
+    stream: Literal[False],
+    keep_alive: str | None = ...,
+    max_tokens: int = ...,
+    cache_id: str = ...,
+    enable_thinking: bool | None = ...,
+) -> dict: ...
+
+
+@overload
+async def generate_chat(
+    manager: ModelManager,
+    model_name: str,
+    messages: list[dict],
+    options: dict | None = ...,
+    tools: list[dict] | None = ...,
+    stream: bool = ...,
+    keep_alive: str | None = ...,
+    max_tokens: int = ...,
+    cache_id: str = ...,
+    enable_thinking: bool | None = ...,
+) -> AsyncGenerator[dict, None] | dict: ...
 
 
 async def generate_chat(

@@ -36,7 +36,7 @@ _WEB_FETCH_MAX_CHARS = 10_000
 
 def _web_search_impl(query: str, max_results: int = 5) -> list[dict]:
     """Run a web search via duckduckgo-search. Raises ImportError if not installed."""
-    from duckduckgo_search import DDGS
+    from duckduckgo_search import DDGS  # type: ignore[import-not-found]
 
     with DDGS() as ddgs:
         return list(ddgs.text(query, max_results=max_results))
@@ -227,7 +227,7 @@ async def _handle_grep(args: dict) -> str:
     # Max lines to return from search to bound output at the source
     max_count = "1000"
 
-    async def _run_search(cmd: list[str]) -> tuple[str, str, int]:
+    async def _run_search(cmd: list[str]) -> tuple[str, str, int | None]:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,

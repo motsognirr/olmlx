@@ -85,7 +85,7 @@ class FlashMoE(nn.Module):
 
         # Remap global indices to local positions in stacked arrays
         remap = mx.array(
-            [idx_map[int(i)] for i in flat_inds],
+            [idx_map[int(i)] for i in flat_inds],  # pyright: ignore[reportGeneralTypeIssues]
             dtype=mx.uint32,
         ).reshape(B, L, K)
 
@@ -98,6 +98,7 @@ class FlashMoE(nn.Module):
         # Expand x for gather_mm: (B, L, 1, 1, H)
         x_expanded = mx.expand_dims(x, (-2, -3))
         gated = loaded.gate_weight is not None
+        gate_out: mx.array | None = None
 
         if loaded.is_quantized:
             qmm_kwargs = dict(
@@ -127,11 +128,11 @@ class FlashMoE(nn.Module):
             )
             if loaded.up_bias is not None:
                 up_out = up_out + loaded.up_bias[remap][..., None, :]
-            activated = (
-                self._apply_gated_activation(up_out, gate_out)
-                if gated
-                else self._apply_ungated_activation(up_out)
-            )
+            if gated:
+                assert gate_out is not None  # set in the `if gated` branch above
+                activated = self._apply_gated_activation(up_out, gate_out)
+            else:
+                activated = self._apply_ungated_activation(up_out)
             expert_out = mx.gather_qmm(
                 activated,
                 loaded.down_weight,
@@ -144,26 +145,26 @@ class FlashMoE(nn.Module):
                 expert_out = expert_out + loaded.down_bias[remap][..., None, :]
         else:
             if gated:
-                gate_out = mx.gather_mm(
+                gate_out = mx.gather_mm(  # pyright: ignore[reportCallIssue]
                     x_expanded,
                     loaded.gate_weight.swapaxes(-1, -2),
                     rhs_indices=remap,
                 )
                 if loaded.gate_bias is not None:
                     gate_out = gate_out + loaded.gate_bias[remap][..., None, :]
-            up_out = mx.gather_mm(
+            up_out = mx.gather_mm(  # pyright: ignore[reportCallIssue]
                 x_expanded,
                 loaded.up_weight.swapaxes(-1, -2),
                 rhs_indices=remap,
             )
             if loaded.up_bias is not None:
                 up_out = up_out + loaded.up_bias[remap][..., None, :]
-            activated = (
-                self._apply_gated_activation(up_out, gate_out)
-                if gated
-                else self._apply_ungated_activation(up_out)
-            )
-            expert_out = mx.gather_mm(
+            if gated:
+                assert gate_out is not None  # set in the `if gated` branch above
+                activated = self._apply_gated_activation(up_out, gate_out)
+            else:
+                activated = self._apply_ungated_activation(up_out)
+            expert_out = mx.gather_mm(  # pyright: ignore[reportCallIssue]
                 activated,
                 loaded.down_weight.swapaxes(-1, -2),
                 rhs_indices=remap,

@@ -88,7 +88,7 @@ class _FlashMoEGptOss(_FlashMoEBase):
         part_inds = mx.argpartition(g, kth=-k, axis=-1)
         inds = part_inds[..., -k:]
         scores = mx.take_along_axis(g, inds, axis=-1)
-        scores = mx.softmax(scores, axis=-1, precise=True)
+        scores = mx.softmax(scores, axis=-1, precise=True)  # pyright: ignore[reportCallIssue]
         return inds, scores
 
 

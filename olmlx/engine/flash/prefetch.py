@@ -20,6 +20,7 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from typing import cast
 
 import mlx.core as mx
 
@@ -221,7 +222,7 @@ class Prefetcher:
             min_neurons=self._min_neurons,
             max_neurons=self._max_neurons,
         )
-        return indices.tolist()
+        return cast(list[int], indices.tolist())
 
     def _predict_lookahead(self, layer_idx: int, hidden_state: mx.array) -> list[int]:
         assert self._lookahead_bank is not None
@@ -233,7 +234,7 @@ class Prefetcher:
             min_neurons=self._min_neurons,
             max_neurons=self._max_neurons,
         )
-        return indices.tolist()
+        return cast(list[int], indices.tolist())
 
     def _enqueue_io(
         self,
