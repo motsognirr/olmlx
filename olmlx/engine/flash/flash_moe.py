@@ -128,11 +128,11 @@ class FlashMoE(nn.Module):
             )
             if loaded.up_bias is not None:
                 up_out = up_out + loaded.up_bias[remap][..., None, :]
-            activated = (
-                self._apply_gated_activation(up_out, gate_out)
-                if gated
-                else self._apply_ungated_activation(up_out)
-            )
+            if gated:
+                assert gate_out is not None  # set in the `if gated` branch above
+                activated = self._apply_gated_activation(up_out, gate_out)
+            else:
+                activated = self._apply_ungated_activation(up_out)
             expert_out = mx.gather_qmm(
                 activated,
                 loaded.down_weight,
@@ -159,11 +159,11 @@ class FlashMoE(nn.Module):
             )
             if loaded.up_bias is not None:
                 up_out = up_out + loaded.up_bias[remap][..., None, :]
-            activated = (
-                self._apply_gated_activation(up_out, gate_out)
-                if gated
-                else self._apply_ungated_activation(up_out)
-            )
+            if gated:
+                assert gate_out is not None  # set in the `if gated` branch above
+                activated = self._apply_gated_activation(up_out, gate_out)
+            else:
+                activated = self._apply_ungated_activation(up_out)
             expert_out = mx.gather_mm(  # pyright: ignore[reportCallIssue]
                 activated,
                 loaded.down_weight.swapaxes(-1, -2),
