@@ -2223,3 +2223,189 @@ class TestEvictLruIfNeeded:
         manager._loaded["old"] = old
         manager._evict_lru_if_needed()
         assert "old" not in manager._loaded
+
+
+class TestSpeculativeLoading:
+    """Tests for standalone speculative decoder loading in _load_model."""
+
+    def test_load_model_creates_speculative_decoder(self, monkeypatch):
+        """When speculative is enabled, _load_model should return a SpeculativeDecoder."""
+        from olmlx.config import ExperimentalSettings
+        from olmlx.engine.speculative import SpeculativeDecoder
+
+        target_model = MagicMock()
+        target_model.args.vocab_size = 32000
+        target_tokenizer = MagicMock()
+        caps = TemplateCaps()
+
+        draft_model = MagicMock()
+        draft_model.args.vocab_size = 32000
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-draft")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(
+            manager,
+            "_try_lm_then_vlm",
+            lambda *a, **kw: (target_model, target_tokenizer, False, caps),
+        )
+        monkeypatch.setattr(manager, "_detect_model_kind", lambda *a: "text")
+        monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
+
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.return_value = (draft_model, MagicMock())
+        monkeypatch.setitem(__import__("sys").modules, "mlx_lm", mock_mlx_lm)
+
+        model_exp = ExperimentalSettings(
+            speculative=True,
+            speculative_draft_model="test/draft-model",
+            speculative_tokens=5,
+            _env_file=None,
+        )
+
+        model, tok, is_vlm, caps_out, decoder = manager._load_model(
+            "test/target-model", model_exp=model_exp
+        )
+
+        assert isinstance(decoder, SpeculativeDecoder)
+        assert decoder._lambda == 5
+        assert model is target_model
+
+    def test_load_model_rejects_vocab_mismatch(self, monkeypatch):
+        """Should raise ValueError when draft/target vocab sizes differ."""
+        from olmlx.config import ExperimentalSettings
+
+        target_model = MagicMock()
+        target_model.args.vocab_size = 32000
+
+        draft_model = MagicMock()
+        draft_model.args.vocab_size = 64000
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-draft")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(
+            manager,
+            "_try_lm_then_vlm",
+            lambda *a, **kw: (target_model, MagicMock(), False, TemplateCaps()),
+        )
+        monkeypatch.setattr(manager, "_detect_model_kind", lambda *a: "text")
+        monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
+
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.return_value = (draft_model, MagicMock())
+        monkeypatch.setitem(__import__("sys").modules, "mlx_lm", mock_mlx_lm)
+
+        model_exp = ExperimentalSettings(
+            speculative=True,
+            speculative_draft_model="test/draft-model",
+            _env_file=None,
+        )
+
+        with pytest.raises(ValueError, match="vocab_size"):
+            manager._load_model("test/target-model", model_exp=model_exp)
+
+    def test_load_model_requires_draft_model_path(self, monkeypatch):
+        """Should raise ValueError when speculative is enabled but no draft model."""
+        from olmlx.config import ExperimentalSettings
+
+        registry = MagicMock()
+        store = MagicMock()
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(
+            manager,
+            "_try_lm_then_vlm",
+            lambda *a, **kw: (MagicMock(), MagicMock(), False, TemplateCaps()),
+        )
+        monkeypatch.setattr(manager, "_detect_model_kind", lambda *a: "text")
+        monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
+
+        model_exp = ExperimentalSettings(
+            speculative=True,
+            speculative_draft_model=None,
+            _env_file=None,
+        )
+
+        with pytest.raises(ValueError, match="speculative_draft_model"):
+            manager._load_model("test/target-model", model_exp=model_exp)
+
+
+class TestDFlashLoading:
+    """Tests for dflash decoder loading in _load_model."""
+
+    def test_load_model_requires_dflash_draft_model(self, monkeypatch):
+        """Should raise ValueError when dflash is enabled but no draft model."""
+        from olmlx.config import ExperimentalSettings
+
+        registry = MagicMock()
+        store = MagicMock()
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(
+            manager,
+            "_try_lm_then_vlm",
+            lambda *a, **kw: (MagicMock(), MagicMock(), False, TemplateCaps()),
+        )
+        monkeypatch.setattr(manager, "_detect_model_kind", lambda *a: "text")
+        monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
+
+        model_exp = ExperimentalSettings(
+            dflash=True,
+            dflash_draft_model=None,
+            _env_file=None,
+        )
+
+        with pytest.raises(ValueError, match="dflash_draft_model"):
+            manager._load_model("test/target-model", model_exp=model_exp)
+
+    def test_load_model_creates_dflash_decoder(self, monkeypatch):
+        """When dflash is enabled, _load_model should return a DFlashDecoder."""
+        from olmlx.config import ExperimentalSettings
+        from olmlx.engine.dflash.decoder import DFlashDecoder
+
+        target_model = MagicMock()
+        target_model.args.vocab_size = 32000
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-dflash-draft")
+        store.local_path.return_value = Path("/tmp/test-target")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(
+            manager,
+            "_try_lm_then_vlm",
+            lambda *a, **kw: (target_model, MagicMock(), False, TemplateCaps()),
+        )
+        monkeypatch.setattr(manager, "_detect_model_kind", lambda *a: "text")
+        monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
+
+        # Mock _load_dflash_decoder to verify it's called
+        mock_decoder = MagicMock(spec=DFlashDecoder)
+        monkeypatch.setattr(
+            manager,
+            "_load_dflash_decoder",
+            lambda *a, **kw: mock_decoder,
+        )
+
+        model_exp = ExperimentalSettings(
+            dflash=True,
+            dflash_draft_model="test/dflash-draft",
+            _env_file=None,
+        )
+
+        model, tok, is_vlm, caps_out, decoder = manager._load_model(
+            "test/target-model", model_exp=model_exp
+        )
+
+        assert decoder is mock_decoder

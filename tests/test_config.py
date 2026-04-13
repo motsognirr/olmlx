@@ -168,3 +168,70 @@ class TestResolveExperimental:
         result = resolve_experimental(base, {"flash": True})
         assert result.flash is True
         assert result.kv_cache_quant is None
+
+
+class TestSpeculativeConfig:
+    """Tests for standalone speculative decoding config fields."""
+
+    def test_speculative_defaults(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS", raising=False)
+        s = ExperimentalSettings()
+        assert s.speculative is False
+        assert s.speculative_draft_model is None
+        assert s.speculative_tokens == 4
+
+    def test_speculative_env_override(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE", "true")
+        monkeypatch.setenv(
+            "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", "Qwen/Qwen3-0.6B"
+        )
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS", "6")
+        s = ExperimentalSettings()
+        assert s.speculative is True
+        assert s.speculative_draft_model == "Qwen/Qwen3-0.6B"
+        assert s.speculative_tokens == 6
+
+    def test_speculative_tokens_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            ExperimentalSettings(speculative_tokens=0, _env_file=None)
+
+    def test_speculative_per_model_override(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE", raising=False)
+        base = ExperimentalSettings()
+        result = resolve_experimental(
+            base,
+            {"speculative": True, "speculative_draft_model": "Qwen/Qwen3-0.6B"},
+        )
+        assert result.speculative is True
+        assert result.speculative_draft_model == "Qwen/Qwen3-0.6B"
+        assert base.speculative is False
+
+
+class TestDFlashConfig:
+    """Tests for dflash config fields."""
+
+    def test_dflash_defaults(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DFLASH", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DFLASH_DRAFT_MODEL", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DFLASH_BLOCK_SIZE", raising=False)
+        s = ExperimentalSettings()
+        assert s.dflash is False
+        assert s.dflash_draft_model is None
+        assert s.dflash_block_size == 4
+
+    def test_dflash_env_override(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DFLASH", "true")
+        monkeypatch.setenv(
+            "OLMLX_EXPERIMENTAL_DFLASH_DRAFT_MODEL", "aryagm/dflash-qwen3"
+        )
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DFLASH_BLOCK_SIZE", "8")
+        s = ExperimentalSettings()
+        assert s.dflash is True
+        assert s.dflash_draft_model == "aryagm/dflash-qwen3"
+        assert s.dflash_block_size == 8
+
+    def test_dflash_block_size_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            ExperimentalSettings(dflash_block_size=0, _env_file=None)

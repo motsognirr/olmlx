@@ -1211,6 +1211,124 @@ class ModelManager:
             f"found at {spectral_path}. Run 'olmlx spectral prepare <model>' first."
         )
 
+    def _resolve_draft_path(self, hf_path: str) -> str:
+        """Download a draft model if needed and return the local path."""
+        if self.store is not None:
+            local_dir = self.store.ensure_downloaded(hf_path)
+            return str(local_dir)
+        return hf_path
+
+    @staticmethod
+    def _check_vocab_match(target: Any, draft: Any) -> None:
+        """Raise ValueError if target and draft vocab sizes differ."""
+        target_vocab = getattr(getattr(target, "args", None), "vocab_size", None)
+        draft_vocab = getattr(getattr(draft, "args", None), "vocab_size", None)
+        if (
+            target_vocab is not None
+            and draft_vocab is not None
+            and target_vocab != draft_vocab
+        ):
+            raise ValueError(
+                f"Draft model vocab_size ({draft_vocab}) does not match "
+                f"target model vocab_size ({target_vocab}). "
+                f"Speculative decoding requires matching vocabularies."
+            )
+
+    def _load_dflash_decoder(
+        self, target_model: Any, hf_path: str, model_exp: Any
+    ) -> Any:
+        """Load a dflash draft model and create a DFlashDecoder."""
+        from olmlx.engine.dflash.adapters import get_adapter
+        from olmlx.engine.dflash.decoder import DFlashDecoder
+        from olmlx.engine.dflash.draft_model import DFlashDraftModel, DraftConfig
+
+        if not model_exp.dflash_draft_model:
+            raise ValueError(
+                "dflash requires dflash_draft_model to be set "
+                "(OLMLX_EXPERIMENTAL_DFLASH_DRAFT_MODEL)"
+            )
+
+        logger.info("Loading dflash draft model %s", model_exp.dflash_draft_model)
+        load_path = self._resolve_draft_path(model_exp.dflash_draft_model)
+
+        config_file = Path(load_path) / "config.json"
+        if not config_file.exists():
+            raise FileNotFoundError(
+                f"DFlash draft model config not found at {config_file}"
+            )
+
+        draft_cfg_dict = json.loads(config_file.read_text())
+        target_hidden_size = getattr(
+            getattr(target_model, "args", None), "hidden_size", None
+        )
+        draft_config = DraftConfig(
+            hidden_size=draft_cfg_dict["hidden_size"],
+            num_attention_heads=draft_cfg_dict["num_attention_heads"],
+            num_layers=draft_cfg_dict["num_layers"],
+            target_layer_ids=draft_cfg_dict["target_layer_ids"],
+            vocab_size=draft_cfg_dict["vocab_size"],
+            target_hidden_size=target_hidden_size or draft_cfg_dict.get("hidden_size"),
+        )
+
+        draft_model = DFlashDraftModel(draft_config)
+        weights_file = Path(load_path) / "model.safetensors"
+        if weights_file.exists():
+            draft_model.load_weights(str(weights_file))
+            logger.info("Loaded dflash draft weights from %s", weights_file)
+
+        # Detect model type for adapter selection
+        target_config_file = None
+        if self.store is not None:
+            target_local = self.store.local_path(hf_path)
+            target_config_file = target_local / "config.json"
+        if target_config_file is not None and target_config_file.exists():
+            target_cfg = json.loads(target_config_file.read_text())
+            model_type = target_cfg.get("model_type", "")
+        else:
+            model_type = draft_cfg_dict.get("target_model_type", "qwen3")
+
+        adapter = get_adapter(model_type)
+
+        return DFlashDecoder(
+            target_model=target_model,
+            draft_model=draft_model,
+            adapter=adapter,
+            draft_config=draft_config,
+            block_size=model_exp.dflash_block_size,
+        )
+
+    def _load_speculative_decoder(
+        self, target_model: Any, hf_path: str, model_exp: Any
+    ) -> Any:
+        """Load a draft model and create a SpeculativeDecoder."""
+        from olmlx.engine.speculative import SpeculativeDecoder
+
+        if not model_exp.speculative_draft_model:
+            raise ValueError(
+                "speculative requires speculative_draft_model to be set "
+                "(OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL)"
+            )
+
+        logger.info(
+            "Loading draft model %s for speculative decoding",
+            model_exp.speculative_draft_model,
+        )
+        load_path = self._resolve_draft_path(model_exp.speculative_draft_model)
+
+        import mlx_lm
+
+        draft_model, _draft_tokenizer = _load_with_model_type_fallback(
+            mlx_lm, load_path, lazy=False
+        )
+
+        self._check_vocab_match(target_model, draft_model)
+
+        return SpeculativeDecoder(
+            draft_model=draft_model,
+            target_model=target_model,
+            num_speculative_tokens=model_exp.speculative_tokens,
+        )
+
     def _is_flash_enabled(self, model_exp: Any) -> bool:
         return model_exp.flash
 
@@ -1479,7 +1597,17 @@ class ModelManager:
                 )
 
         # Text or unknown — try mlx-lm first, fall back to mlx-vlm
-        return (*self._try_lm_then_vlm(load_path, hf_path), None)
+        model, tokenizer, is_vlm, caps = self._try_lm_then_vlm(load_path, hf_path)
+
+        if model_exp.dflash:
+            decoder = self._load_dflash_decoder(model, hf_path, model_exp)
+            return model, tokenizer, is_vlm, caps, decoder
+
+        if model_exp.speculative:
+            decoder = self._load_speculative_decoder(model, hf_path, model_exp)
+            return model, tokenizer, is_vlm, caps, decoder
+
+        return model, tokenizer, is_vlm, caps, None
 
     def _load_model_and_shard(
         self, hf_path: str, model_exp: Any = None

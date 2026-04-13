@@ -334,7 +334,7 @@ class TestSpeculativeKVCache:
 
     def test_prefill_raises_when_trim_prompt_cache_is_none(self):
         """prefill() should raise early when trim_prompt_cache is None."""
-        import olmlx.engine.flash.speculative as spec_mod
+        import olmlx.engine.speculative as spec_mod
 
         vocab_size, hidden_size = 32, 16
         draft = MockDraftModel(vocab_size, hidden_size)
@@ -392,7 +392,7 @@ class TestTrimPromptCacheNoneGuard:
 
     def test_init_raises_when_trim_prompt_cache_is_none(self, monkeypatch):
         """Construction must fail early when trim_prompt_cache is None."""
-        import olmlx.engine.flash.speculative as spec_mod
+        import olmlx.engine.speculative as spec_mod
 
         monkeypatch.setattr(spec_mod, "trim_prompt_cache", None)
 

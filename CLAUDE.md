@@ -32,6 +32,8 @@ olmlx/
 │   ├── inference.py    # generate_chat, generate_completion, generate_embeddings
 │   ├── model_manager.py # Model loading/unloading, keep-alive, LRU eviction
 │   ├── registry.py    # Ollama name → HuggingFace repo mapping via models.json, fuzzy search
+│   ├── speculative.py  # SpeculativeDecoder: model-agnostic draft→target verification
+│   ├── speculative_stream.py # Streaming adapter for speculative decoding
 │   ├── template_caps.py # Chat template capability detection (tools, thinking)
 │   ├── tool_parser.py  # Multi-format tool call parsing (Qwen, Mistral, Llama, DeepSeek, bare JSON)
 │   ├── spectralquant.py # SpectralQuant: eigenvector rotation, non-uniform quantization, QJL sketcher
@@ -39,6 +41,10 @@ olmlx/
 │   ├── spectralquant_calibrate.py # Eigenspectral calibration: collect KV vectors, eigendecompose, fit codebooks
 │   ├── turboquant.py   # TurboQuant_mse: rotation, Lloyd-Max codebooks, bit-packed quantize/dequantize
 │   ├── turboquant_cache.py # TurboQuantKVCache: drop-in KVCache replacement with TurboQuant compression
+│   ├── dflash/
+│   │   ├── adapters.py      # TargetAdapter ABC + Qwen3Adapter for hidden state extraction
+│   │   ├── decoder.py       # DFlashDecoder: block-diffusion speculative decoding
+│   │   └── draft_model.py   # DFlashDraftModel: cross-attention draft architecture
 │   └── flash/
 │       ├── bundler.py       # Bundle FFN weights into per-layer .flashweights files
 │       ├── flash_mlp.py     # FlashMLP: sparse FFN that loads active neurons from SSD; WindowManager
@@ -46,14 +52,14 @@ olmlx/
 │       ├── predictor.py     # SparsityPredictor, PredictorBank, LookaheadBank (cross-layer)
 │       ├── prefetch.py      # Prefetcher: background neuron prefetch with thread pool + stats
 │       ├── prepare.py       # prepare_model_for_flash pipeline, predictor training
-│       ├── speculative.py   # SpeculativeFlashDecoder: draft→target verification with prefetch
+│       ├── speculative.py   # SpeculativeFlashDecoder: extends SpeculativeDecoder with prefetch
 │       ├── weight_store.py  # FlashWeightStore: SSD I/O, NeuronCache, preallocated buffers
 │       ├── flash_moe.py     # Flash-MoE sparse expert loading
 │       ├── flash_moe_model.py # Flash-MoE model wrapper
 │       ├── moe_bundler.py   # Bundle MoE expert weights
 │       ├── moe_prepare.py   # MoE preparation pipeline
 │       ├── moe_weight_store.py # MoE weight store
-│       └── speculative_stream.py # Streaming integration for speculative decoding
+│       └── speculative_stream.py # Re-exports from engine/speculative_stream.py
 ├── models/
 │   ├── manifest.py     # Model manifest/metadata
 │   └── store.py        # Local model storage
@@ -107,6 +113,8 @@ olmlx/
   - Worker and coordinator must load the same model (all_sum requires matching tensor shapes).
   - **Flash + distributed**: When both Flash and distributed are enabled (tensor strategy), `FlashModelWrapper.shard()` shards only attention projections, leaving FlashMLP layers unsharded. Each rank independently loads active neurons from its local SSD. This is correct because `o_proj` (sharded-to-all) replicates its output via `all_sum`, so every rank feeds identical input to FlashMLP. Pre-sharding is skipped (MLP weights live on SSD). Flash env vars are forwarded to workers. Flash-MoE + distributed remains blocked (expert weights cannot be sharded).
   - Config: `OLMLX_EXPERIMENTAL_DISTRIBUTED=true`, hostfile at `~/.olmlx/hostfile.json` with `{"hosts": ["ip1", "ip2"], "model": "hf-path"}`.
+- **Speculative decoding** (experimental): Two-tier architecture. Base `SpeculativeDecoder` (`engine/speculative.py`) is model-agnostic: draft model generates λ candidates autoregressively, target verifies all in one pass. Uses greedy argmax verification, persistent KV caches, and cache trimming on rejection. `SpeculativeFlashDecoder` (`engine/flash/speculative.py`) extends the base with Flash-specific prefetcher integration (Path B: draft hidden state capture for bulk neuron prediction) and adaptive neuron window sizing. Both share the same streaming adapter (`engine/speculative_stream.py`). Config: `OLMLX_EXPERIMENTAL_SPECULATIVE=true`, `OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL=<hf-path>`, `OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS=4`.
+- **DFlash block-diffusion decoding** (experimental): Alternative speculative strategy where the draft model is conditioned on hidden states from specific target layers, using cross-attention (DFlashAttention) over concatenated target + current states. Model-specific `TargetAdapter` handles hidden state extraction and KV cache rollback. Implements the same `prefill`/`step`/`reset` interface as `SpeculativeDecoder` for seamless streaming integration. Config: `OLMLX_EXPERIMENTAL_DFLASH=true`, `OLMLX_EXPERIMENTAL_DFLASH_DRAFT_MODEL=<hf-path>`, `OLMLX_EXPERIMENTAL_DFLASH_BLOCK_SIZE=4`. Requires a pre-trained dflash draft model with `config.json` containing `target_layer_ids`.
 - **Speculative prefetch** (experimental): Predicts and pre-loads neuron weights from SSD before they're needed, hiding I/O latency during Flash inference. Three paths:
   - **Path A — Cross-layer**: While layer L computes, predicts layer L+1's active neurons using L's pre-MLP hidden state and starts background SSD reads. Optional `LookaheadBank` provides dedicated cross-layer predictors (trained with `OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true` during preparation); falls back to reusing layer L+1's sparsity predictor.
   - **Path B — Draft-informed**: During speculative decoding, captures the draft model's hidden states (pre-lm_head, via `draft.model()` + `draft.lm_head()`) and submits bulk prefetch for all target layers before verification. Maps draft positions to target layers by depth ratio so early/deep layers get appropriate signals. Deduplicates predictor calls when multiple layers share the same draft position.

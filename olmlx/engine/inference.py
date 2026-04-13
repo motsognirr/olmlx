@@ -1845,7 +1845,7 @@ async def _stream_completion(
             )
 
         if lm.is_speculative:
-            from olmlx.engine.flash.speculative_stream import async_speculative_stream
+            from olmlx.engine.speculative_stream import async_speculative_stream
 
             # Speculative decoding uses greedy argmax; sampling params are not supported.
             _sampling_keys = {
@@ -2087,7 +2087,7 @@ async def _full_completion_inner(
         elif lm.is_speculative:
             import threading
 
-            from olmlx.engine.flash.speculative_stream import (
+            from olmlx.engine.speculative_stream import (
                 speculative_stream_generate,
             )
 
