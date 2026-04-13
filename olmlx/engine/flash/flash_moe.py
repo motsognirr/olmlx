@@ -85,7 +85,7 @@ class FlashMoE(nn.Module):
 
         # Remap global indices to local positions in stacked arrays
         remap = mx.array(
-            [idx_map[int(i)] for i in flat_inds],
+            [idx_map[int(i)] for i in flat_inds],  # pyright: ignore[reportGeneralTypeIssues]
             dtype=mx.uint32,
         ).reshape(B, L, K)
 
@@ -145,14 +145,14 @@ class FlashMoE(nn.Module):
                 expert_out = expert_out + loaded.down_bias[remap][..., None, :]
         else:
             if gated:
-                gate_out = mx.gather_mm(
+                gate_out = mx.gather_mm(  # pyright: ignore[reportCallIssue]
                     x_expanded,
                     loaded.gate_weight.swapaxes(-1, -2),
                     rhs_indices=remap,
                 )
                 if loaded.gate_bias is not None:
                     gate_out = gate_out + loaded.gate_bias[remap][..., None, :]
-            up_out = mx.gather_mm(
+            up_out = mx.gather_mm(  # pyright: ignore[reportCallIssue]
                 x_expanded,
                 loaded.up_weight.swapaxes(-1, -2),
                 rhs_indices=remap,
@@ -164,7 +164,7 @@ class FlashMoE(nn.Module):
                 if gated
                 else self._apply_ungated_activation(up_out)
             )
-            expert_out = mx.gather_mm(
+            expert_out = mx.gather_mm(  # pyright: ignore[reportCallIssue]
                 activated,
                 loaded.down_weight.swapaxes(-1, -2),
                 rhs_indices=remap,

@@ -360,7 +360,7 @@ class ChatSession:
             close_pos = -1  # position of </think>, -1 = not found
             scan_pos = 0  # how far we've scanned for tags
 
-            async for chunk in await generate_chat(
+            async for chunk in await generate_chat(  # pyright: ignore[reportGeneralTypeIssues]
                 self.manager,
                 self.config.model_name,
                 self.messages,

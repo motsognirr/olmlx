@@ -36,7 +36,7 @@ def _load_pre_sharded(shard_dir_str, group):
     shard_dir = Path(shard_dir_str).expanduser()
     logger.info("Loading pre-sharded weights from %s", shard_dir)
 
-    model, tokenizer = mlx_lm.load(str(shard_dir))
+    model, tokenizer = mlx_lm.load(str(shard_dir))  # pyright: ignore[reportAssignmentType]
     shard_fn = getattr(model, "shard", None)
     if shard_fn is None:
         raise RuntimeError(f"Model in {shard_dir} does not support shard()")
@@ -100,7 +100,7 @@ def _load_flash_tensor_worker(model_path: str, group) -> tuple:
             ) from e
 
     logger.info("Loading flash model %s from %s", model_path, flash_dir)
-    model, tokenizer = mlx_lm.load(model_path)
+    model, tokenizer = mlx_lm.load(model_path)  # pyright: ignore[reportAssignmentType]
 
     predictor_bank = PredictorBank.load(flash_dir / "predictors")
     layout_config = json.loads((flash_dir / "flash_layout.json").read_text())
@@ -258,7 +258,7 @@ def worker_main() -> None:
 
                 shard_path = Path(pre_shard_dir).expanduser()
                 logger.info("Loading pre-sharded pipeline weights from %s", shard_path)
-                model, tokenizer = mlx_lm.load(str(shard_path))
+                model, tokenizer = mlx_lm.load(str(shard_path))  # pyright: ignore[reportAssignmentType]
                 pre_sharded = True
             except Exception as e:
                 logger.warning(
@@ -266,10 +266,10 @@ def worker_main() -> None:
                     "falling back to full model download",
                     e,
                 )
-                model, tokenizer = mlx_lm.load(model_path)
+                model, tokenizer = mlx_lm.load(model_path)  # pyright: ignore[reportAssignmentType]
         else:
             logger.info("Loading model %s (pipeline strategy)", model_path)
-            model, tokenizer = mlx_lm.load(model_path)
+            model, tokenizer = mlx_lm.load(model_path)  # pyright: ignore[reportAssignmentType]
 
         try:
             apply_pipeline(
@@ -290,6 +290,10 @@ def worker_main() -> None:
                 sys.exit(1)
         else:
             pre_shard_dir = os.environ.get(PRE_SHARDED_DIR_ENV)
+            # `model is None` is the fallback signal: tuple unpacking is
+            # atomic in Python, so if _load_pre_sharded raises anywhere
+            # inside, `model, tokenizer = ...` never completes and `model`
+            # stays None — the second branch then runs the HF download.
             model = tokenizer = None
             if pre_shard_dir:
                 try:
@@ -301,7 +305,7 @@ def worker_main() -> None:
                     )
             if model is None:
                 logger.info("Loading model %s", model_path)
-                model, tokenizer = mlx_lm.load(model_path)
+                model, tokenizer = mlx_lm.load(model_path)  # pyright: ignore[reportAssignmentType]
 
                 shard_fn = getattr(model, "shard", None)
                 if shard_fn is None:

@@ -146,7 +146,7 @@ class PredictorBank:
                 raise ValueError(f"Cannot parse layer index from {f.name}")
             i = int(m.group(1))
 
-            weights = dict(mx.load(str(f)))
+            weights = dict(mx.load(str(f)))  # pyright: ignore[reportCallIssue]
             down_w = weights[f"layer_{i}.down.weight"]
             up_w = weights[f"layer_{i}.up.weight"]
 
@@ -241,7 +241,7 @@ class LookaheadBank:
         loaded: list[tuple[mx.array, mx.array]] = []
         hidden_size = intermediate_size = 0
         for i in expected:
-            weights = dict(mx.load(str(parsed[i])))
+            weights = dict(mx.load(str(parsed[i])))  # pyright: ignore[reportCallIssue]
             down_w = weights[f"pair_{i}.down.weight"]
             up_w = weights[f"pair_{i}.up.weight"]
             _, hidden_size = down_w.shape

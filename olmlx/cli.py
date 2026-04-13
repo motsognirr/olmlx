@@ -262,7 +262,7 @@ def validate_remote_python(remote_python: str) -> None:
         raise ValueError(f"Invalid remote_python value: {remote_python!r}")
 
 
-def _launch_distributed_workers() -> list[str]:
+def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
     """Launch worker processes on remote hosts via SSH for distributed inference.
 
     Returns the list of hosts from the hostfile.

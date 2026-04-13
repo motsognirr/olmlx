@@ -1141,9 +1141,15 @@ def _apply_chat_template_vlm(
     config = model.config if hasattr(model, "config") else {}
     num_images = len(images) if images else 0
     # Pass the full message list so the model gets proper conversation context
-    return mlx_vlm.apply_chat_template(
+    result = mlx_vlm.apply_chat_template(
         processor, config, messages, num_images=num_images
     )
+    if not isinstance(result, str):
+        raise TypeError(
+            f"mlx_vlm.apply_chat_template returned non-str ({type(result).__name__}); "
+            "expected tokenize=False default"
+        )
+    return result
 
 
 def _get_model_for_cache(model: Any, is_vlm: bool) -> Any:

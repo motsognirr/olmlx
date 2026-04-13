@@ -227,7 +227,7 @@ async def _handle_grep(args: dict) -> str:
     # Max lines to return from search to bound output at the source
     max_count = "1000"
 
-    async def _run_search(cmd: list[str]) -> tuple[str, str, int]:
+    async def _run_search(cmd: list[str]) -> tuple[str, str, int | None]:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,

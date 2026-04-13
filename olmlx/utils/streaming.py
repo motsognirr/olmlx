@@ -270,7 +270,7 @@ class CancellableStream:
                     "Inference error (%s): %s\n%s", exc_type, item[_ERROR_KEY], tb
                 )
             raise RuntimeError(f"{exc_type}: {item[_ERROR_KEY]}")
-        return item
+        return item  # pyright: ignore[reportReturnType]
 
 
 def _make_prefill_progress(

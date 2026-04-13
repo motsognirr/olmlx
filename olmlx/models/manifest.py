@@ -44,11 +44,12 @@ class ModelManifest:
                     raise ValueError(
                         f"Required field '{k}' is null or missing in manifest {path}"
                     )
-                data[k] = (
-                    field.default
-                    if field.default is not dataclasses.MISSING
-                    else field.default_factory()
-                )
+                if field.default is not dataclasses.MISSING:
+                    data[k] = field.default
+                else:
+                    factory = field.default_factory
+                    assert factory is not dataclasses.MISSING
+                    data[k] = factory()
         # Validate types for non-null values
         hints = typing.get_type_hints(cls)
         for field in dataclasses.fields(cls):

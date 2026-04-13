@@ -14,7 +14,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 _STRICT_LOAD_ERROR = "parameters not in model"
 
 
-def _get_backbone(model: nn.Module) -> nn.Module:
+def _get_backbone(model: nn.Module) -> Any:
     """Navigate to the transformer backbone that has .layers and .embed_tokens.
 
     Handles both standard models (Model.model = backbone) and VL models
@@ -390,7 +390,7 @@ def _stream_record_activations(
             else:
                 hidden_size = gate.weight.shape[1]
             break
-    if hidden_size is None:
+    if hidden_size is None or intermediate_size is None:
         raise ValueError("No layer has gate_proj/up_proj — cannot determine dimensions")
 
     if progress_callback:
@@ -408,7 +408,7 @@ def _stream_record_activations(
 
     mx.eval(embed.parameters())
 
-    hidden_states: list[mx.array] = []
+    hidden_states: list[mx.array | None] = []
     for text in calibration_texts:
         tokens = _encode_tokens(tokenizer, text)
         input_ids = mx.array([tokens])
