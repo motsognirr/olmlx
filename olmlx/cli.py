@@ -749,15 +749,7 @@ def cmd_models_delete(args):
 
 def _configure_logging():
     """Configure logging from settings."""
-
-    class RequestIDFormatter(logging.Formatter):
-        def format(self, record):
-            from olmlx.app import request_id_var
-
-            request_id = request_id_var.get()
-            if request_id:
-                record.msg = f"[{request_id[:8]}] {record.msg}"
-            return super().format(record)
+    from olmlx.context import RequestIDFormatter
 
     handler = logging.StreamHandler()
     handler.setFormatter(
@@ -768,7 +760,9 @@ def _configure_logging():
     )
     root = logging.getLogger()
     root.setLevel(getattr(logging, settings.log_level))
-    root.handlers = [handler]
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    root.addHandler(handler)
 
 
 def cmd_chat(args):

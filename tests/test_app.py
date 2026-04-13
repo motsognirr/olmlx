@@ -83,6 +83,8 @@ class TestCreateApp:
         origins = cors_mw[0].kwargs["allow_origins"]
         assert "http://localhost:3000" in origins
         assert "*" not in origins
+        expose_headers = cors_mw[0].kwargs["expose_headers"]
+        assert "X-Request-ID" in expose_headers
 
 
 class TestLifespan:
@@ -428,3 +430,64 @@ class TestRequestIDMiddleware:
         assert resp.status_code == 400
         assert "x-request-id" in resp.headers
         assert len(resp.headers["x-request-id"]) == 36
+
+    @pytest.mark.asyncio
+    async def test_request_id_header_present_on_simple_route(self, app_client):
+        """Verify X-Request-ID header is present on all responses."""
+        resp = await app_client.get("/api/version")
+        assert resp.status_code == 200
+        assert "x-request-id" in resp.headers
+
+
+class TestRequestIDFormatter:
+    def test_formatter_adds_prefix_when_request_id_set(self):
+        import logging
+
+        from olmlx.context import RequestIDFormatter, request_id_var
+
+        formatter = RequestIDFormatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=1,
+            msg="Processing request",
+            args=(),
+            exc_info=None,
+        )
+
+        token = request_id_var.set("abc12345-1234-1234-1234-123456789abc")
+        try:
+            result = formatter.format(record)
+            assert "[abc12345] " in result
+            assert "Processing request" in result
+        finally:
+            request_id_var.reset(token)
+
+    def test_formatter_no_prefix_when_request_id_not_set(self):
+        import logging
+
+        from olmlx.context import RequestIDFormatter
+
+        formatter = RequestIDFormatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=1,
+            msg="Processing request",
+            args=(),
+            exc_info=None,
+        )
+
+        result = formatter.format(record)
+        assert "Processing request" in result
+        assert "[abc12345]" not in result

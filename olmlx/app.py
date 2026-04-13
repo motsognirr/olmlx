@@ -2,7 +2,6 @@ import logging
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +9,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from olmlx.config import settings
+from olmlx.context import request_id_var
 from olmlx.engine.inference import ServerBusyError
 from olmlx.engine.model_manager import ModelLoadTimeoutError, ModelManager
 from olmlx.engine.registry import ModelRegistry
@@ -27,8 +27,6 @@ from olmlx.routers import (
 )
 
 logger = logging.getLogger("olmlx")
-
-request_id_var: ContextVar[str] = ContextVar("request_id", default="")
 
 
 @asynccontextmanager
@@ -136,16 +134,26 @@ class ForceJSONMiddleware(BaseHTTPMiddleware):
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
-    """Generate and attach request IDs for log tracing."""
+    """Generate and attach request IDs for log tracing.
+
+    The ContextVar is reset in the finally block before the response body is fully
+    consumed. This relies on Starlette's BaseHTTPMiddleware running the inner app
+    as a sub-task that copies the current context, so request_id_var is available
+    for log messages during streaming inference.
+    """
 
     async def dispatch(self, request: Request, call_next):
         request_id = str(uuid.uuid4())
         request.state.request_id = request_id
-        request_id_var.set(request_id)
-
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request_id
-        return response
+        token = request_id_var.set(request_id)
+        response = None
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            if response is not None:
+                response.headers["X-Request-ID"] = request_id
+            request_id_var.reset(token)
 
 
 def _make_error_response(
@@ -174,6 +182,7 @@ def create_app() -> FastAPI:
         allow_origins=settings.cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Request-ID"],
     )
 
     app.add_middleware(ForceJSONMiddleware)
