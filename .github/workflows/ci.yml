@@ -8,22 +8,22 @@ permissions:
   contents: read
   statuses: write
 
-jobs:
-  lint:
-    name: Ruff Lint
-    runs-on: self-hosted
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Ruff lint
-        run: uv sync --no-editable && uv run ruff check .
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-  format:
-    name: Ruff Format
+jobs:
+  checks:
+    name: Ruff
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install dependencies
+        run: uv sync --no-editable
+      - name: Ruff lint
+        run: uv run ruff check .
       - name: Ruff format check
-        run: uv sync --no-editable && uv run ruff format --check .
+        run: uv run ruff format --check .
 
   test:
     name: Tests
