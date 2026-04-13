@@ -505,8 +505,8 @@ class ModelRegistry:
         # multi-threaded access is ever needed, the lock must be expanded
         # to cover all _mappings/_dirty_keys/_removed_keys mutations.
         #
-        # Snapshot the dirty/removed sets so concurrent add_mapping/remove
-        # calls that mutate them outside the lock aren't silently cleared.
+        # Snapshot dirty/removed sets so only keys visible at flush-start are
+        # cleared afterward; additions arriving after the snapshot survive.
         dirty_snapshot = set(self._dirty_keys)
         removed_snapshot = set(self._removed_keys)
 
