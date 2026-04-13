@@ -163,7 +163,10 @@ class DFlashDraftModel(nn.Module):
         if not target_hidden_states:
             return None
 
-        # Average hidden states from all target layers
+        # Simple mean pooling across target layers. This collapses
+        # layer-specific signals but keeps the draft model architecture
+        # simple. Pre-trained draft models are trained against this
+        # aggregation; per-layer projections can be added if needed.
         states = list(target_hidden_states.values())
         combined = states[0]
         for s in states[1:]:

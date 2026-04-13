@@ -27,12 +27,6 @@ class TestTargetAdapterInterface:
             def forward_with_hidden(self, model, tokens, cache, target_layer_ids):
                 return None, {}, None
 
-            def snapshot_cache(self, cache):
-                return cache
-
-            def restore_cache(self, cache, snapshot):
-                pass
-
             def trim_cache(self, cache, num_tokens):
                 pass
 

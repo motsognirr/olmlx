@@ -1272,9 +1272,13 @@ class ModelManager:
 
         draft_model = DFlashDraftModel(draft_config)
         weights_file = Path(load_path) / "model.safetensors"
-        if weights_file.exists():
-            draft_model.load_weights(str(weights_file))
-            logger.info("Loaded dflash draft weights from %s", weights_file)
+        if not weights_file.exists():
+            raise FileNotFoundError(
+                f"DFlash draft model weights not found at {weights_file}. "
+                "A pre-trained dflash draft model is required."
+            )
+        draft_model.load_weights(str(weights_file))
+        logger.info("Loaded dflash draft weights from %s", weights_file)
 
         # Detect model type for adapter selection
         target_config_file = None
@@ -1598,6 +1602,19 @@ class ModelManager:
 
         # Text or unknown — try mlx-lm first, fall back to mlx-vlm
         model, tokenizer, is_vlm, caps = self._try_lm_then_vlm(load_path, hf_path)
+
+        enabled = [
+            name
+            for name, flag in [
+                ("dflash", model_exp.dflash),
+                ("speculative", model_exp.speculative),
+            ]
+            if flag
+        ]
+        if len(enabled) > 1:
+            raise ValueError(
+                f"Only one speculative decoder can be active at a time; got: {enabled}"
+            )
 
         if model_exp.dflash:
             decoder = self._load_dflash_decoder(model, hf_path, model_exp)

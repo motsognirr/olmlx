@@ -10,11 +10,10 @@ import logging
 import threading
 import time
 from collections.abc import Generator
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import mlx.core as mx
 
-from olmlx.engine.speculative import SpeculativeDecoder
 from olmlx.utils.streaming import StreamToken
 
 logger = logging.getLogger(__name__)
@@ -26,8 +25,17 @@ class TokenizerProtocol(Protocol):
     def decode(self, token_ids: list[int]) -> str: ...
 
 
+@runtime_checkable
+class SpeculativeDecoderProtocol(Protocol):
+    """Structural protocol for any speculative decoder (SpeculativeDecoder, DFlashDecoder)."""
+
+    def prefill(self, prompt: mx.array) -> int: ...
+    def step(self) -> tuple[list[int], int]: ...
+    def reset(self) -> None: ...
+
+
 def speculative_stream_generate(
-    decoder: SpeculativeDecoder,
+    decoder: SpeculativeDecoderProtocol,
     prompt_tokens: list[int],
     max_tokens: int,
     cancel_event: threading.Event,
@@ -120,7 +128,7 @@ def speculative_stream_generate(
 
 
 def async_speculative_stream(
-    decoder: SpeculativeDecoder,
+    decoder: SpeculativeDecoderProtocol,
     tokenizer: Any,
     prompt: str | list[int],
     max_tokens: int,
