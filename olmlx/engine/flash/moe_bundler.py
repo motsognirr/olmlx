@@ -490,9 +490,14 @@ def bundle_moe_experts(
                 )
                 f.write(offsets.tobytes())
 
+                # Batch per-expert: cuts syscalls from N*C to N while
+                # holding only one expert's bytes in memory at a time.
                 for expert_idx in range(num_experts):
-                    for _proj, _comp, arr in all_components:
-                        f.write(arr[expert_idx].tobytes())
+                    expert_bytes = b"".join(
+                        arr[expert_idx].tobytes()
+                        for _proj, _comp, arr in all_components
+                    )
+                    f.write(expert_bytes)
 
             layouts[layer_idx] = MoeExpertLayout(
                 layer_idx=layer_idx,
