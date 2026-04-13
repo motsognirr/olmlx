@@ -1,5 +1,6 @@
 import logging
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -8,6 +9,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from olmlx.config import settings
+from olmlx.context import request_id_var
 from olmlx.engine.inference import ServerBusyError
 from olmlx.engine.model_manager import ModelLoadTimeoutError, ModelManager
 from olmlx.engine.registry import ModelRegistry
@@ -131,6 +133,29 @@ class ForceJSONMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """Generate and attach request IDs for log tracing.
+
+    The ContextVar is reset in the finally block before the response body is fully
+    consumed. This relies on Starlette's BaseHTTPMiddleware running the inner app
+    as a sub-task that copies the current context, so request_id_var is available
+    for log messages during streaming inference.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = str(uuid.uuid4())
+        request.state.request_id = request_id
+        token = request_id_var.set(request_id)
+        response = None
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            if response is not None:
+                response.headers["X-Request-ID"] = request_id
+            request_id_var.reset(token)
+
+
 def _make_error_response(
     path: str,
     status_code: int,
@@ -157,9 +182,11 @@ def create_app() -> FastAPI:
         allow_origins=settings.cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Request-ID"],
     )
 
     app.add_middleware(ForceJSONMiddleware)
+    app.add_middleware(RequestIDMiddleware)
 
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError):

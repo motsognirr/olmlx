@@ -83,6 +83,8 @@ class TestCreateApp:
         origins = cors_mw[0].kwargs["allow_origins"]
         assert "http://localhost:3000" in origins
         assert "*" not in origins
+        expose_headers = cors_mw[0].kwargs["expose_headers"]
+        assert "X-Request-ID" in expose_headers
 
 
 class TestLifespan:
@@ -397,3 +399,95 @@ class TestErrorHandlers:
         resp = await app_client.get("/")
         assert resp.status_code == 200
         assert "running" in resp.text.lower()
+
+
+class TestRequestIDMiddleware:
+    @pytest.mark.asyncio
+    async def test_request_id_header_present(self, app_client):
+        resp = await app_client.get("/")
+        assert resp.status_code == 200
+        assert "x-request-id" in resp.headers
+        assert len(resp.headers["x-request-id"]) == 36  # UUID format
+
+    @pytest.mark.asyncio
+    async def test_request_id_different_per_request(self, app_client):
+        resp1 = await app_client.get("/")
+        resp2 = await app_client.get("/")
+        assert resp1.headers["x-request-id"] != resp2.headers["x-request-id"]
+
+    @pytest.mark.asyncio
+    async def test_request_id_on_error_response(self, app_client):
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = ValueError("test error")
+            resp = await app_client.post(
+                "/api/generate",
+                json={"model": "qwen3", "prompt": "hi", "stream": False},
+            )
+        assert resp.status_code == 400
+        assert "x-request-id" in resp.headers
+        assert len(resp.headers["x-request-id"]) == 36
+
+    @pytest.mark.asyncio
+    async def test_request_id_header_present_on_simple_route(self, app_client):
+        """Verify X-Request-ID header is present on all responses."""
+        resp = await app_client.get("/api/version")
+        assert resp.status_code == 200
+        assert "x-request-id" in resp.headers
+
+
+class TestRequestIDFormatter:
+    def test_formatter_adds_prefix_when_request_id_set(self):
+        import logging
+
+        from olmlx.context import RequestIDFormatter, request_id_var
+
+        formatter = RequestIDFormatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=1,
+            msg="Processing request",
+            args=(),
+            exc_info=None,
+        )
+
+        token = request_id_var.set("abc12345-1234-1234-1234-123456789abc")
+        try:
+            result = formatter.format(record)
+            assert "[abc12345] " in result
+            assert "Processing request" in result
+        finally:
+            request_id_var.reset(token)
+
+    def test_formatter_no_prefix_when_request_id_not_set(self):
+        import logging
+
+        from olmlx.context import RequestIDFormatter
+
+        formatter = RequestIDFormatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=1,
+            msg="Processing request",
+            args=(),
+            exc_info=None,
+        )
+
+        result = formatter.format(record)
+        assert "Processing request" in result
+        assert "[abc12345]" not in result
