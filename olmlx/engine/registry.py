@@ -4,7 +4,9 @@ import difflib
 import json
 import os
 import tempfile
-from dataclasses import dataclass, field
+import threading
+import dataclasses
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -146,6 +148,9 @@ def _validate_keep_alive(value: str) -> None:
         )
 
 
+_KNOWN_CONFIG_KEYS: frozenset[str] = frozenset()  # set after ModelConfig is defined
+
+
 @dataclass
 class ModelConfig:
     """Per-model configuration resolved from models.json."""
@@ -159,6 +164,8 @@ class ModelConfig:
     keep_alive: str | None = None
     inference_queue_timeout: float | None = None
     inference_timeout: float | None = None
+    #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
+    _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_entry(cls, entry: str | dict) -> ModelConfig:
@@ -195,6 +202,7 @@ class ModelConfig:
                 if it_raw is not None
                 else None
             )
+            extra = {k: v for k, v in entry.items() if k not in _KNOWN_CONFIG_KEYS}
             return cls(
                 hf_path=hf_path,
                 experimental=experimental,
@@ -202,6 +210,7 @@ class ModelConfig:
                 keep_alive=keep_alive,
                 inference_queue_timeout=inference_queue_timeout,
                 inference_timeout=inference_timeout,
+                _extra=extra,
             )
         raise TypeError(
             f"Model config entry must be str or dict, got {type(entry).__name__}"
@@ -209,15 +218,16 @@ class ModelConfig:
 
     def to_entry(self) -> str | dict:
         """Serialize to models.json format. Plain models become strings."""
-        has_overrides = (
-            self.experimental
-            or self.options
-            or self.keep_alive is not None
-            or self.inference_queue_timeout is not None
-            or self.inference_timeout is not None
-        )
-        if not has_overrides:
+        if (
+            not self.experimental
+            and not self.options
+            and self.keep_alive is None
+            and self.inference_queue_timeout is None
+            and self.inference_timeout is None
+            and not self._extra
+        ):
             return self.hf_path
+        # Put hf_path first for readability, then known keys, then extra
         result: dict[str, Any] = {"hf_path": self.hf_path}
         if self.experimental:
             result["experimental"] = self.experimental
@@ -229,7 +239,19 @@ class ModelConfig:
             result["inference_queue_timeout"] = self.inference_queue_timeout
         if self.inference_timeout is not None:
             result["inference_timeout"] = self.inference_timeout
+        # Filter known keys defensively — from_entry() already excludes them,
+        # but _extra can be set directly via ModelConfig construction.
+        result.update(
+            {k: v for k, v in self._extra.items() if k not in _KNOWN_CONFIG_KEYS}
+        )
         return result
+
+
+# Derived from ModelConfig fields so it stays in sync automatically.
+# Used to separate known config keys from _extra in from_entry()/to_entry().
+_KNOWN_CONFIG_KEYS = frozenset(
+    f.name for f in dataclasses.fields(ModelConfig) if f.name != "_extra"
+)
 
 
 def _atomic_write_json(data: dict, path: Path) -> None:
@@ -300,6 +322,9 @@ class ModelRegistry:
     def __init__(self):
         self._mappings: dict[str, ModelConfig] = {}
         self._raw_unrecognized: dict[str, Any] = {}
+        self._dirty_keys: set[str] = set()
+        self._removed_keys: set[str] = set()
+        self._save_lock = threading.Lock()
         self._aliases: dict[str, str] = {}
         self._aliases_path = settings.models_config.parent / "aliases.json"
 
@@ -318,6 +343,8 @@ class ModelRegistry:
                 raw = {}
             self._mappings = {}
             self._raw_unrecognized = {}
+            self._dirty_keys = set()
+            self._removed_keys = set()
             for k, v in raw.items():
                 try:
                     self._mappings[k] = ModelConfig.from_entry(v)
@@ -446,26 +473,106 @@ class ModelRegistry:
                     f"hf_path mismatch: argument {hf_path!r} != "
                     f"model_config.hf_path {model_config.hf_path!r}"
                 )
-            mc = model_config
+            if existing is not None and existing._extra:
+                merged = {**existing._extra, **model_config._extra}
+                mc = replace(model_config, _extra=merged)
+            else:
+                mc = model_config
         else:
             # No rich config supplied — preserve existing entry if hf_path matches
             if existing is not None and existing.hf_path == hf_path:
                 return
-            mc = ModelConfig(hf_path=hf_path)
+            if existing is not None:
+                mc = replace(existing, hf_path=hf_path)
+            else:
+                mc = ModelConfig(hf_path=hf_path)
         if existing is not None and existing == mc:
             return  # identical, no save needed
         self._mappings[normalized] = mc
         self._raw_unrecognized.pop(normalized, None)
+        self._dirty_keys.add(normalized)
+        self._removed_keys.discard(normalized)
         self._save_mappings()
 
     def _save_mappings(self):
-        # Preserve unrecognized entries so they survive round-trips through
-        # versions that can't parse them (forward/backward compatibility).
-        serialized = {k: v.to_entry() for k, v in self._mappings.items()}
-        for k, v in self._raw_unrecognized.items():
-            if k not in serialized:
-                serialized[k] = v
-        _atomic_write_json(serialized, settings.models_config)
+        with self._save_lock:
+            self._save_mappings_locked()
+
+    def _save_mappings_locked(self):
+        # The lock is defensive — it serializes disk I/O but does not cover
+        # dict mutations in add_mapping/remove. This is safe today because
+        # all callers run on the single-threaded asyncio event loop. If
+        # multi-threaded access is ever needed, the lock must be expanded
+        # to cover all _mappings/_dirty_keys/_removed_keys mutations.
+        #
+        # Snapshot dirty/removed sets so only keys visible at flush-start are
+        # cleared afterward; additions arriving after the snapshot survive.
+        dirty_snapshot = set(self._dirty_keys)
+        removed_snapshot = set(self._removed_keys)
+
+        # Re-read disk state as base to preserve external edits (e.g. user
+        # editing models.json while the server is running).
+        disk_data: dict[str, Any] = {}
+        disk_read_ok = False
+        file_exists = settings.models_config.exists()
+        if file_exists:
+            try:
+                with open(settings.models_config) as f:
+                    loaded = json.load(f)
+                if not isinstance(loaded, dict):
+                    raise ValueError(f"Expected dict, got {type(loaded).__name__}")
+                disk_data = loaded
+                disk_read_ok = True
+            except (json.JSONDecodeError, ValueError, OSError):
+                pass  # corrupt, wrong type, or unreadable
+
+        if not disk_read_ok and self._mappings:
+            # File was missing or corrupt — write full in-memory state to
+            # avoid silently dropping live entries. Removed keys are already
+            # absent from _mappings (remove() pops them), so they won't
+            # reappear. dirty/removed snapshots are not needed here.
+            if file_exists:
+                logger.warning("models.json corrupt; writing full in-memory state")
+            disk_data = {k: v.to_entry() for k, v in self._mappings.items()}
+        else:
+            # Remove explicitly deleted keys
+            for key in removed_snapshot:
+                disk_data.pop(key, None)
+
+            # Overlay only keys that were modified in this process.
+            # For dirty keys, the in-memory state is authoritative for known
+            # fields (hf_path, experimental, options, etc.) — external edits
+            # to those fields are overwritten. Unknown extra keys from the
+            # disk entry ARE merged so user-added keys survive.
+            for k in dirty_snapshot:
+                if k in self._mappings:
+                    mc = self._mappings[k]
+                    disk_entry = disk_data.get(k)
+                    if isinstance(disk_entry, dict):
+                        disk_extras = {
+                            ek: ev
+                            for ek, ev in disk_entry.items()
+                            if ek not in _KNOWN_CONFIG_KEYS
+                        }
+                        if disk_extras:
+                            merged = {**mc._extra, **disk_extras}
+                            mc = replace(mc, _extra=merged)
+                    disk_data[k] = mc.to_entry()
+
+        # Preserve unrecognized entries (forward/backward compatibility).
+        # These may be valid entries written by a newer version. Only inject
+        # when the disk file was unreadable (recovery) — if the file was read
+        # successfully and an entry is absent, the user intentionally removed it.
+        if not disk_read_ok:
+            for k, v in self._raw_unrecognized.items():
+                if k not in disk_data:
+                    disk_data[k] = v
+
+        _atomic_write_json(disk_data, settings.models_config)
+        # Only clear the keys we actually flushed — concurrent additions
+        # that arrived after the snapshot are preserved for the next save.
+        self._dirty_keys -= dirty_snapshot
+        self._removed_keys -= removed_snapshot
 
     def remove(self, name: str):
         """Remove a model alias or mapping."""
@@ -473,7 +580,10 @@ class ModelRegistry:
         normalized = self.normalize_name(name)
         if self._aliases.pop(normalized, None) is not None:
             self._save_aliases()
-        if self._mappings.pop(normalized, None) is not None:
+        raw_removed = self._raw_unrecognized.pop(normalized, None)
+        if self._mappings.pop(normalized, None) is not None or raw_removed is not None:
+            self._removed_keys.add(normalized)
+            self._dirty_keys.discard(normalized)
             self._save_mappings()
 
     def search(self, query: str, max_results: int = 5) -> list[tuple[str, str]]:
