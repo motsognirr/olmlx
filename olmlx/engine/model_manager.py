@@ -1223,11 +1223,14 @@ class ModelManager:
         """Raise ValueError if target and draft vocab sizes differ."""
         target_vocab = getattr(getattr(target, "args", None), "vocab_size", None)
         draft_vocab = getattr(getattr(draft, "args", None), "vocab_size", None)
-        if (
-            target_vocab is not None
-            and draft_vocab is not None
-            and target_vocab != draft_vocab
-        ):
+        if target_vocab is None or draft_vocab is None:
+            logger.warning(
+                "Could not verify vocab compatibility: target_vocab=%s draft_vocab=%s",
+                target_vocab,
+                draft_vocab,
+            )
+            return
+        if target_vocab != draft_vocab:
             raise ValueError(
                 f"Draft model vocab_size ({draft_vocab}) does not match "
                 f"target model vocab_size ({target_vocab}). "
@@ -1608,6 +1611,7 @@ class ModelManager:
             for name, flag in [
                 ("dflash", model_exp.dflash),
                 ("speculative", model_exp.speculative),
+                ("flash_speculative", model_exp.flash_speculative),
             ]
             if flag
         ]

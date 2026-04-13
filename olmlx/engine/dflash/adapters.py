@@ -75,18 +75,19 @@ class Qwen3Adapter(TargetAdapter):
         if norm is not None:
             h = norm(h)
 
-        logits = lm_head(h) if lm_head is not None else h
+        if lm_head is None:
+            raise RuntimeError(
+                "DFlash target model has no lm_head attribute; "
+                "cannot compute verification logits"
+            )
+        logits = lm_head(h)
         return logits, captured, cache
 
     def trim_cache(self, cache: list, num_tokens: int) -> None:
         """Trim last num_tokens from cache using mlx-lm's trim_prompt_cache."""
-        try:
-            from mlx_lm.models.cache import trim_prompt_cache
+        from mlx_lm.models.cache import trim_prompt_cache
 
-            trim_prompt_cache(cache, num_tokens)
-        except ImportError:
-            for layer_cache in cache:
-                layer_cache.offset = max(0, layer_cache.offset - num_tokens)
+        trim_prompt_cache(cache, num_tokens)
 
 
 # Registry

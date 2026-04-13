@@ -102,8 +102,17 @@ class TestQwen3Adapter:
 
         adapter = get_adapter("qwen3")
         vocab_size, hidden_size, num_layers = 32, 16, 4
-        model = Qwen3LikeModel(vocab_size, hidden_size, num_layers)
+        inner = Qwen3LikeModel(vocab_size, hidden_size, num_layers)
 
+        # Wrap with lm_head (adapter requires it)
+        class ModelWithHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = inner
+                self.layers = inner.layers
+                self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+
+        model = ModelWithHead()
         tokens = mx.array([[1, 2, 3]])
         target_layer_ids = [1, 3]
 
@@ -111,10 +120,20 @@ class TestQwen3Adapter:
             model, tokens, cache=None, target_layer_ids=target_layer_ids
         )
 
-        # Should return hidden states for requested layers
         assert set(hidden_states.keys()) == {1, 3}
         for layer_id in target_layer_ids:
             assert hidden_states[layer_id].shape == (1, 3, hidden_size)
+        assert logits.shape == (1, 3, vocab_size)
+
+    def test_forward_with_hidden_raises_without_lm_head(self):
+        from olmlx.engine.dflash.adapters import get_adapter
+
+        adapter = get_adapter("qwen3")
+        model = Qwen3LikeModel(32, 16, 4)  # no lm_head
+        tokens = mx.array([[1, 2, 3]])
+
+        with pytest.raises(RuntimeError, match="no lm_head"):
+            adapter.forward_with_hidden(model, tokens, cache=None, target_layer_ids=[1])
 
     def test_trim_cache(self):
         from mlx_lm.models.cache import make_prompt_cache

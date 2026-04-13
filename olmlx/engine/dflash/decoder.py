@@ -45,10 +45,10 @@ class DFlashDecoder:
         draft_config: DraftConfig,
         block_size: int = 4,
     ):
-        if trim_prompt_cache is None:
+        if trim_prompt_cache is None or make_prompt_cache is None:
             raise RuntimeError(
-                "trim_prompt_cache is unavailable (mlx-lm import missing); "
-                "dflash decoding requires it for correct cache trimming"
+                "mlx_lm.models.cache (make_prompt_cache, trim_prompt_cache) "
+                "is unavailable; dflash decoding requires it"
             )
 
         self._target = target_model
@@ -154,7 +154,15 @@ class DFlashDecoder:
         return accepted, self._block_size
 
     def _draft_block(self, pending_token: int) -> list[int]:
-        """Use the draft model to propose a block of candidate tokens."""
+        """Use the draft model to propose a block of candidate tokens.
+
+        Unlike SpeculativeDecoder (which accumulates KV state across draft
+        steps), each draft token here is conditioned only on the target's
+        hidden states — not on previous draft tokens. This is by design:
+        the block-diffusion approach generates tokens independently given
+        the target context, trading inter-token coherence for parallelism
+        potential.
+        """
         inp = mx.array([[pending_token]])
 
         # Extract last-position hidden states and pre-compute context once

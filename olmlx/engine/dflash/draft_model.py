@@ -68,7 +68,9 @@ class DFlashAttention(nn.Module):
             .transpose(0, 2, 1, 3)
         )
 
-        # Scaled dot-product attention
+        # No causal mask: at inference, _draft_block passes single tokens
+        # (L=1), so masking is a no-op. The architecture is non-causal by
+        # design — queries attend bidirectionally to [context, x].
         scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
         weights = mx.softmax(scores, axis=-1)
         out = (weights @ v).transpose(0, 2, 1, 3).reshape(B, L, -1)
