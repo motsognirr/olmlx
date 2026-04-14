@@ -12,6 +12,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -288,6 +289,12 @@ class _RecordingMLP(nn.Module):
     Delegates to the original MLP for the forward result (preserving any
     custom gating or normalization), then separately computes gate/up
     projections for activation recording.
+
+    Thread-safe within a single layer: uses a per-instance lock to prevent
+    concurrent interception of down_proj. Note: mx.eval is called while holding
+    the lock, and concurrent mx.eval calls across threads can deadlock.
+    Different layers have separate locks, but parallel mlx.eval across layers
+    is unsafe. Current single-threaded calibration pipeline avoids this issue.
     """
 
     def __init__(
@@ -300,28 +307,27 @@ class _RecordingMLP(nn.Module):
         self._original = original
         self._recordings = recordings
         self._threshold = activation_threshold
+        self._lock = threading.Lock()
 
     def __call__(self, x):
         orig = self._original
         if not (hasattr(orig, "gate_proj") and hasattr(orig, "up_proj")):
             return orig(x)
 
-        # Intercept down_proj to capture the activated tensor without
-        # recomputing gate_proj and up_proj (which orig's forward already does).
-        captured = {}
-        real_down_proj = orig.down_proj
+        with self._lock:
+            captured = {}
+            real_down_proj = orig.down_proj
 
-        def intercepting_down_proj(activated):
-            captured["activated"] = activated
-            return real_down_proj(activated)
+            def intercepting_down_proj(activated):
+                captured["activated"] = activated
+                return real_down_proj(activated)
 
-        orig.down_proj = intercepting_down_proj
-        try:
-            result = orig(x)
-        finally:
-            orig.down_proj = real_down_proj
+            orig.down_proj = intercepting_down_proj
+            try:
+                result = orig(x)
+            finally:
+                orig.down_proj = real_down_proj
 
-        # Record activation pattern from intercepted tensor
         if "activated" not in captured:
             return result
         flat_input = x.reshape(-1, x.shape[-1])

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+import olmlx.engine.inference as _inf_mod
 from olmlx.engine.model_manager import LoadedModel, ModelManager
 from olmlx.engine.registry import ModelRegistry
 from olmlx.engine.template_caps import TemplateCaps
@@ -104,3 +105,11 @@ async def app_client(mock_manager, mock_store, registry):
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+
+
+@pytest.fixture(autouse=True)
+async def reset_inference_state():
+    """Reset module-level inference state between tests for isolation."""
+    await _inf_mod._reset_inference_state()
+    yield
+    await _inf_mod._reset_inference_state()

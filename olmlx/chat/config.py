@@ -48,6 +48,7 @@ class ChatConfig:
     skills_dir: Path = field(default_factory=lambda: Path.home() / ".olmlx" / "skills")
     builtin_tools_enabled: bool = True
     plans_dir: Path = field(default_factory=lambda: Path.home() / ".olmlx" / "plans")
+    sequential_tool_execution: bool = False
 
 
 def _load_json_file(path: Path) -> dict[str, Any]:

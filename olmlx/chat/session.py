@@ -236,15 +236,63 @@ class ChatSession:
                     },
                 }
 
-        # Execute allowed + approved tools concurrently
+        # Execute allowed + approved tools
         to_execute = allow + approved
         deferred_exc = None
+        pending_cancelled: asyncio.CancelledError | None = None
         if to_execute:
-            exec_results = await asyncio.gather(
-                *(self._exec_tool(tu) for tu in to_execute),
-                return_exceptions=True,
-            )
+            if self.config.sequential_tool_execution:
+                exec_results = []
+                for tu in to_execute:
+                    try:
+                        result = await self._exec_tool(tu)
+                        exec_results.append(result)
+                    except asyncio.CancelledError as e:
+                        pending_cancelled = e
+                        exec_results.append(e)
+                        break
+                    except KeyboardInterrupt:
+                        raise
+                    except SystemExit:
+                        raise
+                    except BaseException as e:
+                        exec_results.append(e)
+            else:
+                exec_results = await asyncio.gather(
+                    *(self._exec_tool(tu) for tu in to_execute),
+                    return_exceptions=True,
+                )
+                for r in exec_results:
+                    if isinstance(r, asyncio.CancelledError):
+                        pending_cancelled = r
+                        break
             for tu, r in zip(to_execute, exec_results):
+                if isinstance(r, asyncio.CancelledError):
+                    if pending_cancelled is None:
+                        pending_cancelled = r
+                    name = tu["name"]
+                    error_content = f"Error calling {name}: task cancelled"
+                    yield {
+                        "type": "tool_call",
+                        "name": name,
+                        "arguments": tu["input"],
+                        "id": tu["id"],
+                    }
+                    yield {
+                        "type": "tool_error",
+                        "name": name,
+                        "error": "task cancelled",
+                        "id": tu["id"],
+                    }
+                    results_by_id[tu["id"]] = {
+                        "message": {
+                            "role": "tool",
+                            "tool_call_id": tu["id"],
+                            "name": name,
+                            "content": error_content,
+                        },
+                    }
+                    continue
                 if isinstance(r, BaseException):
                     if deferred_exc is None:
                         deferred_exc = r
@@ -274,6 +322,14 @@ class ChatSession:
                     yield r["call_event"]
                     yield r["result_event"]
                     results_by_id[r["message"]["tool_call_id"]] = r
+
+            if pending_cancelled is not None:
+                # Append messages before raising to maintain history consistency
+                for tu in tool_uses:
+                    r = results_by_id.get(tu["id"])
+                    if r:
+                        self.messages.append(r["message"])
+                raise pending_cancelled
 
         # Append messages in original call order
         for tu in tool_uses:
