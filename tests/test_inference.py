@@ -2512,10 +2512,56 @@ class TestEstimateKvCacheBytes:
         result = _estimate_kv_cache_bytes(model, 1000)
         assert result == int(131_072_000 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
+    def test_vlm_text_config_wrapper_prefers_language_model_args(self):
+        """When model.args is a text_config wrapper (Qwen3.5 MoE pattern), prefer language_model.args.
+
+        Qwen3_5_MoE's top-level ModelArgs only has ``model_type`` and ``text_config``;
+        the real attention config lives at ``model.language_model.args``. The estimator
+        must not blindly use the wrapper, which would AttributeError on num_attention_heads.
+        """
+        model = MagicMock(spec=[])
+        # Wrapper args (mimics Qwen3_5_MoE.ModelArgs): has model_type + text_config,
+        # but NOT num_attention_heads / num_hidden_layers.
+        wrapper = MagicMock(spec=[])
+        wrapper.model_type = "qwen3_5_moe"
+        wrapper.text_config = {"num_hidden_layers": 64}
+        model.args = wrapper
+
+        model.language_model = MagicMock(spec=[])
+        model.language_model.args = self._make_model_args(
+            num_hidden_layers=64,
+            num_attention_heads=32,
+            num_key_value_heads=4,
+            hidden_size=5120,
+            head_dim=256,
+        )
+        # raw = 64 * 2 * 4 * 256 * 1000 * 2 = 262_144_000
+        result = _estimate_kv_cache_bytes(model, 1000)
+        assert result == int(262_144_000 * _inf_mod.MEMORY_SAFETY_FACTOR)
+
     def test_raises_when_no_args_found(self):
         """Raises AttributeError when model has no discoverable args or config."""
         model = MagicMock(spec=[])
         with pytest.raises(AttributeError, match="no 'args'"):
+            _estimate_kv_cache_bytes(model, 1000)
+
+    def test_wrapper_without_language_model_raises(self):
+        """Wrapper args + no language_model → explicit error (not opaque later crash)."""
+        model = MagicMock(spec=[])
+        wrapper = MagicMock(spec=[])
+        wrapper.text_config = {"num_hidden_layers": 64}
+        model.args = wrapper
+        with pytest.raises(AttributeError, match="text_config wrapper"):
+            _estimate_kv_cache_bytes(model, 1000)
+
+    def test_wrapper_with_empty_language_model_raises(self):
+        """Wrapper args + language_model without args/config → explicit error."""
+        model = MagicMock(spec=[])
+        wrapper = MagicMock(spec=[])
+        wrapper.text_config = {"num_hidden_layers": 64}
+        model.args = wrapper
+        model.language_model = MagicMock(spec=[])
+        with pytest.raises(AttributeError, match="text_config wrapper"):
             _estimate_kv_cache_bytes(model, 1000)
 
     def test_nas_model_with_per_layer_variable_attention(self):

@@ -439,12 +439,33 @@ def _estimate_kv_cache_bytes(
 
     # mlx-lm text models: model.args
     # mlx-vlm vision-language models: model.language_model.args or .config
+    # Wrapper args (e.g. Qwen3_5_MoE ModelArgs) carry only a ``text_config``
+    # dict; the real attention fields live on ``model.language_model.args``.
     args = getattr(model, "args", None)
-    if args is None:
+    args_owner: Any = model
+    is_wrapper = (
+        args is not None
+        and hasattr(args, "text_config")
+        and not hasattr(args, "num_attention_heads")
+        and not hasattr(args, "kv_lora_rank")
+    )
+    if args is None or is_wrapper:
         lang_model = getattr(model, "language_model", None)
+        inner_args = None
         if lang_model is not None:
-            args = getattr(lang_model, "args", None) or getattr(
+            inner_args = getattr(lang_model, "args", None) or getattr(
                 lang_model, "config", None
+            )
+        if inner_args is not None:
+            args = inner_args
+            args_owner = lang_model
+        elif is_wrapper:
+            # Fail loudly — otherwise we'd fall through to args.num_attention_heads
+            # on the wrapper itself and crash with an opaque AttributeError.
+            raise AttributeError(
+                "model.args is a text_config wrapper but could not resolve "
+                "inner attention config (model.language_model missing or has "
+                "no 'args'/'config')"
             )
     if args is None:
         args = getattr(model, "config", None)
@@ -494,15 +515,9 @@ def _estimate_kv_cache_bytes(
             _tq_ratio = sq_per_entry / fp16_per_entry
 
     # Try layer introspection for NAS/variable-attention/hybrid models.
-    # Track which sub-model owns the args so we introspect the right layers
-    # (for VLMs, args came from model.language_model — introspect that, not
-    # model.model which could be a vision encoder).
-    lang_model_component = getattr(model, "language_model", None)
-    args_owner = (
-        lang_model_component
-        if (lang_model_component is not None and getattr(model, "args", None) is None)
-        else model
-    )
+    # ``args_owner`` was set above to the component whose args we resolved
+    # (model.language_model for VLMs/wrappers, else model) so we introspect
+    # the correct layer tree and avoid hitting a vision encoder.
     inner = getattr(args_owner, "model", None)
     layers = getattr(inner, "layers", None) if inner is not None else None
     if isinstance(layers, (list, tuple)) and len(layers) > 0:
