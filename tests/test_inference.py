@@ -2545,6 +2545,25 @@ class TestEstimateKvCacheBytes:
         with pytest.raises(AttributeError, match="no 'args'"):
             _estimate_kv_cache_bytes(model, 1000)
 
+    def test_wrapper_without_language_model_raises(self):
+        """Wrapper args + no language_model → explicit error (not opaque later crash)."""
+        model = MagicMock(spec=[])
+        wrapper = MagicMock(spec=[])
+        wrapper.text_config = {"num_hidden_layers": 64}
+        model.args = wrapper
+        with pytest.raises(AttributeError, match="text_config wrapper"):
+            _estimate_kv_cache_bytes(model, 1000)
+
+    def test_wrapper_with_empty_language_model_raises(self):
+        """Wrapper args + language_model without args/config → explicit error."""
+        model = MagicMock(spec=[])
+        wrapper = MagicMock(spec=[])
+        wrapper.text_config = {"num_hidden_layers": 64}
+        model.args = wrapper
+        model.language_model = MagicMock(spec=[])
+        with pytest.raises(AttributeError, match="text_config wrapper"):
+            _estimate_kv_cache_bytes(model, 1000)
+
     def test_nas_model_with_per_layer_variable_attention(self):
         """NAS models (nemotron-nas) have per-layer variable attention.
 

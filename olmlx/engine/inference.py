@@ -443,15 +443,30 @@ def _estimate_kv_cache_bytes(
     # dict; the real attention fields live on ``model.language_model.args``.
     args = getattr(model, "args", None)
     args_owner: Any = model
-    if args is None or hasattr(args, "text_config"):
+    is_wrapper = (
+        args is not None
+        and hasattr(args, "text_config")
+        and not hasattr(args, "num_attention_heads")
+        and not hasattr(args, "kv_lora_rank")
+    )
+    if args is None or is_wrapper:
         lang_model = getattr(model, "language_model", None)
+        inner_args = None
         if lang_model is not None:
             inner_args = getattr(lang_model, "args", None) or getattr(
                 lang_model, "config", None
             )
-            if inner_args is not None:
-                args = inner_args
-                args_owner = lang_model
+        if inner_args is not None:
+            args = inner_args
+            args_owner = lang_model
+        elif is_wrapper:
+            # Fail loudly — otherwise we'd fall through to args.num_attention_heads
+            # on the wrapper itself and crash with an opaque AttributeError.
+            raise AttributeError(
+                "model.args is a text_config wrapper but could not resolve "
+                "inner attention config (model.language_model missing or has "
+                "no 'args'/'config')"
+            )
     if args is None:
         args = getattr(model, "config", None)
     if args is None:
