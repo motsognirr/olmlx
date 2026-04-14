@@ -163,6 +163,8 @@ class OpenAIChatAdapter:
             "temperature": 0.0,
             "seed": 42,
         }
+        if stream:
+            body["stream_options"] = {"include_usage": True}
         return "/v1/chat/completions", body, dict(_JSON_HEADERS)
 
     def parse_nonstream(self, d):
@@ -176,18 +178,25 @@ class OpenAIChatAdapter:
         )
 
     def iter_stream(self, lines):
+        usage: dict = {}
         for raw in lines:
             raw = raw.strip()
             if not raw or not raw.startswith("data:"):
                 continue
             payload = raw[len("data:") :].strip()
             if payload == "[DONE]":
-                yield StreamEvent(done=True)
+                yield StreamEvent(
+                    done=True,
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    output_tokens=usage.get("completion_tokens"),
+                )
                 return
             try:
                 d = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+            if d.get("usage"):
+                usage = d["usage"]
             choices = d.get("choices") or []
             if not choices:
                 continue
@@ -300,6 +309,7 @@ def run_single(
     max_tokens: int,
     stream: bool,
     timeout: float,
+    run_index: int,
 ) -> RunRecord:
     url_path, body, headers = adapter.build_request(prompt, model, max_tokens, stream)
     url = base_url.rstrip("/") + url_path
@@ -355,7 +365,12 @@ def run_single(
         if metrics.eval_duration_ns:
             tps = output_tokens / (metrics.eval_duration_ns / 1e9)
         else:
-            decode_ms = (total_ms - (ttft_ms or 0.0)) if stream else total_ms
+            if stream:
+                decode_ms = total_ms - (ttft_ms or 0.0)
+            elif metrics.prompt_eval_duration_ns:
+                decode_ms = ((total_ms * 1e6) - metrics.prompt_eval_duration_ns) / 1e6
+            else:
+                decode_ms = total_ms
             if decode_ms > 0:
                 tps = output_tokens / (decode_ms / 1000.0)
 
@@ -364,7 +379,7 @@ def run_single(
         mode="stream" if stream else "nostream",
         model=model,
         prompt=prompt.name,
-        run_index=-1,
+        run_index=run_index,
         ttft_ms=ttft_ms,
         total_ms=total_ms,
         prompt_tokens=metrics.prompt_tokens,
@@ -542,8 +557,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _warmup(client: httpx.Client, base_url: str, model: str, timeout: float) -> None:
-    adapter = OllamaChatAdapter()
+def _warmup(
+    client: httpx.Client,
+    base_url: str,
+    model: str,
+    timeout: float,
+    adapter: ApiAdapter,
+) -> None:
     warm = BenchPrompt(
         name="_warmup",
         category="_warmup",
@@ -582,9 +602,10 @@ def main(argv: list[str] | None = None) -> int:
 
     with httpx.Client() as client:
         for model in models:
+            warmup_adapter = adapters[0]
             for _ in range(max(0, args.warmup)):
-                print(f"[warmup] {model}", file=sys.stderr)
-                _warmup(client, args.url, model, args.timeout)
+                print(f"[warmup] {model} via {warmup_adapter.name}", file=sys.stderr)
+                _warmup(client, args.url, model, args.timeout, warmup_adapter)
             for adapter in adapters:
                 for mode in modes:
                     stream = mode == "stream"
@@ -604,8 +625,8 @@ def main(argv: list[str] | None = None) -> int:
                                 max_tokens,
                                 stream,
                                 args.timeout,
+                                run_index,
                             )
-                            rec.run_index = run_index
                             records.append(rec)
 
     summary = summarize(records)
