@@ -89,7 +89,10 @@ class OllamaChatAdapter:
             line = line.strip()
             if not line:
                 continue
-            d = json.loads(line)
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             if d.get("done"):
                 yield StreamEvent(
                     done=True,
@@ -138,7 +141,10 @@ class OllamaGenerateAdapter:
             line = line.strip()
             if not line:
                 continue
-            d = json.loads(line)
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             if d.get("done"):
                 yield StreamEvent(
                     done=True,
@@ -239,6 +245,7 @@ class AnthropicMessagesAdapter:
     def iter_stream(self, lines):
         current_event: str | None = None
         input_tokens: int | None = None
+        saw_done = False
         for raw in lines:
             raw = raw.rstrip("\n").rstrip("\r")
             if raw.startswith("event:"):
@@ -261,11 +268,17 @@ class AnthropicMessagesAdapter:
                             yield StreamEvent(text=text)
                 elif et == "message_delta":
                     usage = d.get("usage") or {}
+                    saw_done = True
                     yield StreamEvent(
                         done=True,
                         prompt_tokens=input_tokens,
                         output_tokens=usage.get("output_tokens"),
                     )
+                    return
+                elif et == "message_stop" and not saw_done:
+                    # Safety net: some responses (e.g. tool-use only) skip message_delta.
+                    yield StreamEvent(done=True, prompt_tokens=input_tokens)
+                    return
             elif raw == "":
                 current_event = None
 
@@ -296,9 +309,12 @@ class RunRecord:
 
 
 def _estimate_tokens(text: str) -> int:
-    # Whitespace split ≈ words; multiply by 1.3 for sub-word tokens.
     words = len(text.split())
-    return int(words * 1.3) if words else max(len(text) // 4, 0)
+    if words == 0:
+        return 0
+    # Use char/4 as a floor so long whitespace-free continuations don't under-count.
+    char_estimate = max(len(text) // 4, 1)
+    return max(int(words * 1.3), char_estimate)
 
 
 def run_single(
@@ -615,12 +631,10 @@ def main(argv: list[str] | None = None) -> int:
 
     with httpx.Client() as client:
         for model in models:
-            for warmup_adapter in adapters:
-                for _ in range(max(0, args.warmup)):
-                    print(
-                        f"[warmup] {model} via {warmup_adapter.name}", file=sys.stderr
-                    )
-                    _warmup(client, args.url, model, args.timeout, warmup_adapter)
+            # One request suffices to load the model into memory; any adapter works.
+            for _ in range(max(0, args.warmup)):
+                print(f"[warmup] {model} via {adapters[0].name}", file=sys.stderr)
+                _warmup(client, args.url, model, args.timeout, adapters[0])
             for adapter in adapters:
                 for mode in modes:
                     stream = mode == "stream"
@@ -667,7 +681,7 @@ def main(argv: list[str] | None = None) -> int:
         out_path.write_text(json.dumps(payload, indent=2))
         print(f"[saved] {out_path}", file=sys.stderr)
 
-    return 1 if records and len(errors) == len(records) else 0
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
