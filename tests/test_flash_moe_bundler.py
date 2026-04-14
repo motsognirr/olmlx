@@ -332,6 +332,43 @@ class TestBundleMoeExperts:
         ).reshape(gate_biases_orig.shape)
         np.testing.assert_array_equal(gate_biases_read, gate_biases_orig)
 
+    def test_bundle_quantization_with_text_config_wrapper(self, tmp_path):
+        """Models with a top-level `text_config` (e.g. Qwen3.5-35B-A3B-4bit) keep
+        `quantization` at the root. The bundler must still pick up bits/group_size.
+        """
+        hidden, inter, experts = 64, 32, 4
+        model_dir = _make_synthetic_moe_weights(
+            hidden, inter, experts, 1, 0, tmp_path, quantized=True
+        )
+
+        # Rewrite config: move architecture fields under `text_config`,
+        # leave `quantization` at the top level (mlx-community layout).
+        cfg_path = model_dir / "config.json"
+        flat = json.loads(cfg_path.read_text())
+        quantization = flat.pop("quantization")
+        wrapped = {"text_config": flat, "quantization": quantization}
+        cfg_path.write_text(json.dumps(wrapped))
+
+        output_dir = tmp_path / "flash_moe"
+
+        from olmlx.engine.flash.moe_bundler import (
+            MOE_HEADER_SIZE,
+            bundle_moe_experts,
+            parse_moe_header,
+        )
+
+        layouts = bundle_moe_experts(model_dir, output_dir)
+        layout = layouts[0]
+
+        with open(layout.file_path, "rb") as f:
+            header = parse_moe_header(f.read(MOE_HEADER_SIZE))
+
+        assert header["is_quantized"] is True
+        assert header["bits"] == 4
+        assert header["group_size"] == 32
+        assert layout.bits == 4
+        assert layout.group_size == 32
+
     def test_bundle_offset_table_sequential(self, tmp_path):
         """Offsets should be sequential, each expert_byte_size apart."""
         hidden, inter, experts = 64, 32, 8

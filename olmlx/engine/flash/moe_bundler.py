@@ -417,8 +417,10 @@ def bundle_moe_experts(
     index_path = model_dir / "model.safetensors.index.json"
     index = json.loads(index_path.read_text()) if index_path.exists() else None
 
-    # Detect quantization from config
-    quant_config = config.get("quantization")
+    # Detect quantization from config. mlx-community checkpoints with a
+    # `text_config` wrapper (e.g. Qwen3.5-35B-A3B-4bit) keep `quantization`
+    # at the top level, not under `text_config`, so check both.
+    quant_config = config.get("quantization") or raw_config.get("quantization")
 
     moe_layers = _detect_moe_layers(config)
     if not moe_layers:
