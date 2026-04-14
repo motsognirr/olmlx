@@ -291,6 +291,7 @@ class RunRecord:
     output_tokens: int | None
     tokens_per_sec: float | None
     tokens_estimated: bool
+    tps_source: str | None
     error: str | None
 
 
@@ -325,12 +326,14 @@ def run_single(
             ) as resp:
                 resp.raise_for_status()
                 agg_text: list[str] = []
+                got_done = False
                 for ev in adapter.iter_stream(resp.iter_lines()):
                     if ev.text and ttft_ns is None:
                         ttft_ns = time.perf_counter_ns() - t_request
                     if ev.text:
                         agg_text.append(ev.text)
                     if ev.done:
+                        got_done = True
                         if ev.prompt_tokens is not None:
                             metrics.prompt_tokens = ev.prompt_tokens
                         if ev.output_tokens is not None:
@@ -341,6 +344,8 @@ def run_single(
                             metrics.eval_duration_ns = ev.eval_duration_ns
                 metrics.text = "".join(agg_text)
             t_end = time.perf_counter_ns()
+            if not got_done:
+                error = "stream ended without done event (truncated?)"
         else:
             resp = client.post(url, json=body, headers=headers, timeout=timeout)
             resp.raise_for_status()
@@ -361,18 +366,25 @@ def run_single(
         estimated = True
 
     tps: float | None = None
-    if output_tokens:
+    tps_source: str | None = None
+    if output_tokens is not None and output_tokens > 0:
         if metrics.eval_duration_ns:
             tps = output_tokens / (metrics.eval_duration_ns / 1e9)
+            tps_source = "eval_duration"
         else:
             if stream:
                 decode_ms = total_ms - (ttft_ms or 0.0)
+                tps_source = "decode_estimate"
             elif metrics.prompt_eval_duration_ns:
                 decode_ms = ((total_ms * 1e6) - metrics.prompt_eval_duration_ns) / 1e6
+                tps_source = "decode_estimate"
             else:
                 decode_ms = total_ms
+                tps_source = "rtt_fallback"
             if decode_ms > 0:
                 tps = output_tokens / (decode_ms / 1000.0)
+            else:
+                tps_source = None
 
     return RunRecord(
         api=adapter.name,
@@ -386,6 +398,7 @@ def run_single(
         output_tokens=output_tokens,
         tokens_per_sec=tps,
         tokens_estimated=estimated,
+        tps_source=tps_source,
         error=error,
     )
 
@@ -602,10 +615,12 @@ def main(argv: list[str] | None = None) -> int:
 
     with httpx.Client() as client:
         for model in models:
-            warmup_adapter = adapters[0]
-            for _ in range(max(0, args.warmup)):
-                print(f"[warmup] {model} via {warmup_adapter.name}", file=sys.stderr)
-                _warmup(client, args.url, model, args.timeout, warmup_adapter)
+            for warmup_adapter in adapters:
+                for _ in range(max(0, args.warmup)):
+                    print(
+                        f"[warmup] {model} via {warmup_adapter.name}", file=sys.stderr
+                    )
+                    _warmup(client, args.url, model, args.timeout, warmup_adapter)
             for adapter in adapters:
                 for mode in modes:
                     stream = mode == "stream"

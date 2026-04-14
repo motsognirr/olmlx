@@ -306,6 +306,7 @@ class TestSummarize:
             output_tokens=20,
             tokens_per_sec=tps,
             tokens_estimated=False,
+            tps_source="eval_duration",
             error=error,
         )
 
