@@ -66,6 +66,28 @@ class TestStripThinkingStreaming:
         assert "thinking" not in full
         assert "visible" in full
 
+    def test_passthrough_partial_think_prefix_does_not_hang(self):
+        """Regression: a buffer equal to a prefix of ``<think>`` must not loop.
+
+        In passthrough phase, when the buffered tail is itself a prefix of
+        ``<think>`` (e.g. just ``"<"``), the function used to retain the
+        tail in ``buf`` without shrinking, causing the inner ``while buf:``
+        loop to spin forever and wedge the server.
+        """
+        # First chunk long enough to exit detect phase into passthrough.
+        long_chunk = "x" * 250
+        state: dict = {}
+        _strip_thinking_streaming(long_chunk, state)
+        # Now feed a bare "<" — a legitimate prefix of "<think>".
+        out = _strip_thinking_streaming("<", state)
+        # Must return without hanging; the "<" is held for the next chunk.
+        assert out == ""
+        assert state["buffer"] == "<"
+        # Follow-up chunk that is NOT a think tag must flush cleanly.
+        out2 = _strip_thinking_streaming(" hello", state)
+        assert out2 == "< hello"
+        assert state["buffer"] == ""
+
 
 class TestOpenAIRouter:
     @pytest.mark.asyncio

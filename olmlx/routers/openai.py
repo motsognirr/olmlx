@@ -188,6 +188,7 @@ def _strip_thinking_streaming(text: str, state: dict) -> str:
                 if longest_partial:
                     out_parts.append(buf[:-longest_partial])
                     buf = buf[-longest_partial:]
+                    break
                 else:
                     out_parts.append(buf)
                     buf = ""
