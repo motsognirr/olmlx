@@ -31,6 +31,14 @@ logger = logging.getLogger("olmlx")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # SIGUSR1 dumps Python stacks of all threads to stderr — use
+    # `kill -USR1 <pid>` to diagnose hangs without needing sudo/py-spy.
+    import faulthandler
+    import signal
+    import sys
+
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
+
     # Startup
     registry = ModelRegistry()
     registry.load()
