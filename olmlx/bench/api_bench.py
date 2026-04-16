@@ -608,6 +608,24 @@ def _warmup(
         print(f"[warmup] ignored error: {exc}", file=sys.stderr)
 
 
+def _unload(client: httpx.Client, base_url: str, model: str, timeout: float) -> None:
+    """Free server VRAM between models so a long sweep doesn't OOM."""
+    try:
+        resp = client.post(
+            base_url.rstrip("/") + "/api/unload",
+            json={"model": model},
+            headers=_JSON_HEADERS,
+            timeout=timeout,
+        )
+        if resp.status_code >= 400:
+            print(
+                f"[unload] {model}: HTTP {resp.status_code} {resp.text[:200]}",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001 - unload best-effort
+        print(f"[unload] ignored error: {exc}", file=sys.stderr)
+
+
 def _get_olmlx_version() -> str:
     try:
         from importlib.metadata import version
@@ -657,6 +675,14 @@ def main(argv: list[str] | None = None) -> int:
                                 run_index,
                             )
                             records.append(rec)
+            model_recs = [r for r in records if r.model == model]
+            model_summary = summarize(model_recs)
+            model_errors = [r for r in model_recs if r.error]
+            print(f"\n=== per-model results: {model} ===", file=sys.stderr)
+            _print_table(model_summary, model_errors)
+            print("=== end per-model ===\n", file=sys.stderr)
+            print(f"[unload] {model}", file=sys.stderr)
+            _unload(client, args.url, model, args.timeout)
 
     summary = summarize(records)
     errors = [r for r in records if r.error]
