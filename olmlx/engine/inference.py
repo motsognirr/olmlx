@@ -501,8 +501,7 @@ def _estimate_kv_cache_bytes(
     bytes_per_element = 2  # float16/bfloat16
 
     if kv_cache_quant is not None:
-        method, bits_str = kv_cache_quant.split(":")
-        quant_bits = int(bits_str)
+        method, quant_bits = _parse_kv_cache_quant(kv_cache_quant)
         fp16_per_entry = head_dim * bytes_per_element
         if method == "turboquant":
             # TurboQuant: packed indices + float32 norm
@@ -1232,6 +1231,28 @@ def _make_spectral_prompt_cache(
     return make_spectral_cache(cache_model, calibration_dir, avg_bits=bits)
 
 
+def _parse_kv_cache_quant(spec: str) -> tuple[str, int]:
+    """Split an `OLMLX_EXPERIMENTAL_KV_CACHE_QUANT` value like `"spectral:4"`
+    into `(method, bits)`.  Format is validated at config load time."""
+    method, bits_str = spec.split(":")
+    return method, int(bits_str)
+
+
+def _make_prompt_cache_for_lm(lm: LoadedModel) -> list:
+    """Create a fresh prompt cache for `lm` using the configured factory
+    (plain mlx-lm, TurboQuant, or SpectralQuant).  Single source of truth
+    for cache creation — used by the request path and the load-time probe."""
+    if lm.kv_cache_quant is not None:
+        method, bits = _parse_kv_cache_quant(lm.kv_cache_quant)
+        if method == "spectral":
+            return _make_spectral_prompt_cache(
+                lm.model, bits, lm.spectral_calibration_dir, is_vlm=lm.is_vlm
+            )
+        return _make_turboquant_prompt_cache(lm.model, bits, is_vlm=lm.is_vlm)
+    cache_model = _get_model_for_cache(lm.model, lm.is_vlm)
+    return make_prompt_cache(cache_model)
+
+
 def _extract_images(messages: list[dict]) -> list[str] | None:
     """Extract image URLs/paths from message content."""
     images = []
@@ -1466,10 +1487,24 @@ async def _setup_prompt_cache(
         # Trim cache to suffix_start so it aligns with where we resume
         trim_amount = len(cached.tokens) - suffix_start
         trimmed = 0
-        if trim_amount > 0:
+        if trim_amount > 0 and lm.supports_cache_trim:
             trimmed = trim_prompt_cache(working_cache, trim_amount)
 
-        if trim_amount > 0 and trimmed != trim_amount:
+        if trim_amount > 0 and not lm.supports_cache_trim:
+            # Hybrid sliding-window models (RotatingKVCache layers) cannot
+            # be trimmed back; trim_prompt_cache would silently return 0.
+            logger.debug(
+                "Skipping trim on non-trimmable hybrid cache "
+                "(would-be trim=%d); discarding and creating fresh",
+                trim_amount,
+            )
+            del working_cache
+            cached = None
+            gc.collect()
+            mx.clear_cache()
+            _safe_sync()
+            fresh_cache_label = "non-trimmable-hybrid"
+        elif trim_amount > 0 and trimmed != trim_amount:
             # Cache layers are non-trimmable or only partially
             # trimmable (e.g. Qwen3-Next hybrid cache with ArraysCache
             # for linear attention layers — trim_prompt_cache returns
@@ -1523,24 +1558,7 @@ async def _setup_prompt_cache(
         # remove is then a harmless no-op (PromptCacheStore.remove
         # is idempotent).  Kept for the cache-miss path.
         lm.prompt_cache_store.remove(cache_id)
-        kv_quant = lm.kv_cache_quant
-        if kv_quant is not None:
-            method, bits_str = kv_quant.split(":")
-            bits = int(bits_str)
-            if method == "spectral":
-                new_cache = _make_spectral_prompt_cache(
-                    lm.model,
-                    bits,
-                    lm.spectral_calibration_dir,
-                    is_vlm=lm.is_vlm,
-                )
-            else:
-                new_cache = _make_turboquant_prompt_cache(
-                    lm.model, bits, is_vlm=lm.is_vlm
-                )
-        else:
-            cache_model = _get_model_for_cache(lm.model, lm.is_vlm)
-            new_cache = make_prompt_cache(cache_model)
+        new_cache = _make_prompt_cache_for_lm(lm)
         gen_kwargs["prompt_cache"] = new_cache
         result.cache_creation_tokens = len(prompt_tokens)
         if fresh_cache_label is None:

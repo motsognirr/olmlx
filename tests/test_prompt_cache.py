@@ -361,6 +361,183 @@ class TestNonTrimmableCacheFallback:
         assert prompt_arg == [10, 20, 30, 40, 50, 60, 70, 80]
 
 
+class _FakeRotatingKVCache:
+    """Stand-in for mlx-lm's RotatingKVCache (matched by class name)."""
+
+    def is_trimmable(self) -> bool:  # noqa: D401 — fake matches real API
+        return True  # offset==0 fresh; real cache returns False once full
+
+
+class _FakeKVCache:
+    def is_trimmable(self) -> bool:
+        return True
+
+
+_FakeKVCache.__name__ = "KVCache"
+_FakeRotatingKVCache.__name__ = "RotatingKVCache"
+
+
+class TestCacheTrimProbe:
+    def test_probe_detects_pure_kvcache_as_trimmable(self):
+        from olmlx.engine.model_manager import _cache_supports_trim
+
+        assert _cache_supports_trim([_FakeKVCache(), _FakeKVCache()]) is True
+
+    def test_probe_detects_rotating_kv_cache_as_non_trimmable(self):
+        from olmlx.engine.model_manager import _cache_supports_trim
+
+        # Hybrid: KVCache for full-attn layers, RotatingKVCache for SWA layers
+        assert _cache_supports_trim([_FakeKVCache(), _FakeRotatingKVCache()]) is False
+
+    def test_probe_detects_turboquant_hybrid_as_non_trimmable(self):
+        from olmlx.engine.model_manager import _cache_supports_trim
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        # TurboQuant only replaces KVCache layers; RotatingKVCache layers
+        # are left untouched, so a hybrid model still fails trim.
+        tq = TurboQuantKVCache.__new__(TurboQuantKVCache)
+        assert _cache_supports_trim([tq, _FakeRotatingKVCache()]) is False
+
+    def test_probe_detects_unknown_cache_class_as_non_trimmable(self):
+        from olmlx.engine.model_manager import _cache_supports_trim
+
+        class _UnknownCache:
+            def is_trimmable(self) -> bool:
+                return True
+
+        # Unknown classes are conservatively treated as non-trimmable —
+        # the allowlist is authoritative.
+        assert _cache_supports_trim([_FakeKVCache(), _UnknownCache()]) is False
+
+
+class TestNonTrimmableModelSkipsTrim:
+    @pytest.mark.asyncio
+    async def test_non_trimmable_skips_trim_call(self, mock_manager):
+        """When lm.supports_cache_trim is False and trim would be needed,
+        skip trim_prompt_cache entirely and create a fresh cache."""
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.supports_cache_trim = False
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt v2")
+        lm.tokenizer.bos_token = None
+
+        stale_cache = [MagicMock()]
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50, 100, 101],
+                cache=stale_cache,
+            ),
+        )
+        # Divergent: shares 5, then differs
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50, 60, 70, 80])
+
+        tokens = _make_stream_tokens("New", " output", prompt_tokens=3)
+        mock_stream = _make_mock_stream(tokens)
+        mock_trim = MagicMock(return_value=0)
+        fresh_cache = [MagicMock()]
+        mock_make_cache = MagicMock(return_value=fresh_cache)
+
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ) as mock_async_stream,
+            patch("olmlx.engine.inference.trim_prompt_cache", mock_trim),
+            patch("olmlx.engine.inference.make_prompt_cache", mock_make_cache),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi again"}],
+                stream=True,
+            )
+            async for _chunk in gen:
+                pass
+
+        # Critical: trim_prompt_cache must NOT be called for non-trimmable models
+        mock_trim.assert_not_called()
+        # Fresh cache was created and used
+        mock_make_cache.assert_called_once_with(lm.model)
+        call_args = mock_async_stream.call_args
+        assert call_args[1].get("prompt_cache") is fresh_cache
+        # Full prompt passed
+        assert call_args.args[2] == [10, 20, 30, 40, 50, 60, 70, 80]
+
+    @pytest.mark.asyncio
+    async def test_strict_extension_reuses_hybrid_cache(self, mock_manager):
+        """Even with supports_cache_trim=False, a strict-extension turn
+        (new prompt = cached prompt + suffix, trim_amount==0) reuses the
+        cache. RotatingKVCache supports appending; only trimming back fails."""
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.supports_cache_trim = False
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        lm.tokenizer.bos_token = None
+
+        existing_cache = [MagicMock()]
+        # Cached: 7 tokens (5 prompt + 2 generated)
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50, 100, 101],
+                cache=existing_cache,
+            ),
+        )
+        # Strict extension: cached tokens + 2 new
+        lm.tokenizer.encode = MagicMock(
+            return_value=[10, 20, 30, 40, 50, 100, 101, 200, 201]
+        )
+
+        tokens = _make_stream_tokens("More", prompt_tokens=2)
+        mock_stream = _make_mock_stream(tokens)
+        mock_trim = MagicMock(return_value=0)
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ) as mock_async_stream,
+            patch("olmlx.engine.inference.trim_prompt_cache", mock_trim),
+            patch("olmlx.engine.inference.make_prompt_cache", mock_make_cache),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi again"}],
+                stream=True,
+            )
+            async for _chunk in gen:
+                pass
+
+        # Strict extension: trim not called, fresh cache not made, existing cache reused
+        mock_trim.assert_not_called()
+        mock_make_cache.assert_not_called()
+        call_args = mock_async_stream.call_args
+        assert call_args[1].get("prompt_cache") is existing_cache
+        # Only the suffix is fed to stream_generate
+        assert call_args.args[2] == [200, 201]
+
+
 class TestCacheMissCreatesFresh:
     @pytest.mark.asyncio
     async def test_no_common_prefix_creates_fresh_cache(self, mock_manager):
