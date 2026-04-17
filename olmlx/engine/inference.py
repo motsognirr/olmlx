@@ -2598,7 +2598,11 @@ async def generate_embeddings(
 
                 embeddings.append(embedding.tolist())
 
-            # Defensive sync — _inference_locked exit also syncs, but this
-            # ensures embedding tensors are fully evaluated before .tolist().
+            # Load-bearing when sync_mode="none": this function runs
+            # synchronously under _inference_locked with no worker thread,
+            # so the lock-boundary exit sync may be skipped. This
+            # mx.synchronize() is then the only Metal sync before the lock
+            # is released — do not remove without providing an equivalent
+            # barrier.
             mx.synchronize()
             return embeddings

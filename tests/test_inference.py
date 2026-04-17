@@ -2016,11 +2016,18 @@ class TestLockBoundarySync:
             assert mock_mx.synchronize.call_count == 1
 
     def test_suppresses_exceptions(self):
-        """Exceptions from mx.synchronize must not propagate."""
-        with patch("olmlx.engine.inference.mx") as mock_mx:
+        """Exceptions from mx.synchronize must not propagate — covers both the
+        default-stream and generation-stream suppression paths."""
+        mock_stream = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx") as mock_mx,
+            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
+        ):
             mock_mx.synchronize.side_effect = RuntimeError("Metal error")
-            _lock_boundary_sync("full")  # should not raise
-            _lock_boundary_sync("minimal")  # should not raise
+            _lock_boundary_sync("full")  # exercises default + generation stream loop
+            _lock_boundary_sync("minimal")  # exercises default only
+            # Exactly: 1 default + 1 generation (full) + 1 default (minimal) = 3
+            assert mock_mx.synchronize.call_count == 3
 
     def test_unknown_mode_raises(self):
         """Unknown modes must raise ValueError instead of silently falling
