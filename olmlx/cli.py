@@ -1086,6 +1086,13 @@ def cmd_bench_list(_args):
         )
 
 
+def _positive_int(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
+
+
 def cmd_bench_leaderboard(args):
     """Show the model leaderboard derived from saved bench runs."""
     from olmlx.bench.results import build_leaderboard, format_leaderboard
@@ -1497,9 +1504,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bench_lb.add_argument(
         "--limit",
-        type=int,
+        type=_positive_int,
         default=None,
-        help="Limit rows (default: all)",
+        help="Limit rows (default: all); must be >= 1",
     )
 
     cfg = sub.add_parser("config", help="Show configuration")

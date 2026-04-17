@@ -807,3 +807,20 @@ class TestModelsPullSuggestion:
         assert exc_info.value.code == 1
         err = capsys.readouterr().err
         assert "olmlx models search" in err
+
+
+class TestBenchLeaderboardArgs:
+    def test_limit_rejects_zero(self):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["bench", "leaderboard", "--limit", "0"])
+
+    def test_limit_rejects_negative(self):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["bench", "leaderboard", "--limit", "-3"])
+
+    def test_limit_accepts_positive(self):
+        parser = build_parser()
+        args = parser.parse_args(["bench", "leaderboard", "--limit", "5"])
+        assert args.limit == 5

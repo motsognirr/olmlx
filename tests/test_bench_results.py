@@ -580,3 +580,26 @@ class TestFormatLeaderboard:
         # Header, separator, and data row must share the same width so columns
         # stay aligned.
         assert len(lines[0]) == len(lines[1]) == len(lines[2])
+
+    def test_long_scenario_name_does_not_break_alignment(self):
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        long_scenario = "a-really-long-scenario-name-that-overflows"
+        entries = [
+            LeaderboardEntry(
+                model="model-a",
+                best_tps=45.2,
+                best_scenario=long_scenario,
+                timestamp="20260101T000000Z",
+                git_sha="abc1234",
+                failed_scenarios=0,
+                total_scenarios=1,
+                run_dir=Path("/tmp/x"),
+            ),
+        ]
+        out = format_leaderboard(entries)
+        lines = out.split("\n")
+        assert long_scenario in out
+        assert len(lines[0]) == len(lines[1]) == len(lines[2])

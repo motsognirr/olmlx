@@ -394,20 +394,23 @@ def format_leaderboard(
 ) -> str:
     """Format leaderboard entries as a plain-text table.
 
-    The Model column grows to fit the longest name so rows stay aligned even
-    for long HF repo paths.
+    The Model and Scenario columns grow to fit their longest value so rows
+    stay aligned even for long HF repo paths or scenario names.
     """
     rows = entries if limit is None else entries[:limit]
     model_w = max(45, max((len(e.model) for e in rows), default=45))
+    scenario_w = max(14, max((len(e.best_scenario) for e in rows), default=14))
     header = (
-        f"{'#':>3} {'Model':<{model_w}} {'Best tok/s':>10} {'Scenario':<14} "
-        f"{'Timestamp':<18} {'Git':<10} {'Fails/Total':>11}"
+        f"{'#':>3} {'Model':<{model_w}} {'Best tok/s':>10} "
+        f"{'Scenario':<{scenario_w}} {'Timestamp':<18} {'Git':<10} "
+        f"{'Fails/Total':>11}"
     )
     lines = [header, "-" * len(header)]
     for i, e in enumerate(rows, 1):
         lines.append(
-            f"{i:>3} {e.model:<{model_w}} {e.best_tps:>10.1f} {e.best_scenario:<14} "
-            f"{e.timestamp:<18} {(e.git_sha or '—'):<10} "
+            f"{i:>3} {e.model:<{model_w}} {e.best_tps:>10.1f} "
+            f"{e.best_scenario:<{scenario_w}} {e.timestamp:<18} "
+            f"{(e.git_sha or '—'):<10} "
             f"{f'{e.failed_scenarios}/{e.total_scenarios}':>11}"
         )
     return "\n".join(lines)
