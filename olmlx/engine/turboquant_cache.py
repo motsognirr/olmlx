@@ -164,16 +164,19 @@ class TurboQuantKVCache(_BaseCache):
         self._value_norms[..., prev : self.offset, :] = v_nrm
 
         # Dequantize only the newly appended slice and splice into the side buffer.
+        # We reuse the local ``k_idx/v_idx/k_nrm/v_nrm`` (just written into the
+        # persisted buffers on the lines above) instead of re-slicing them back out —
+        # the slice would add a gather op per step per layer for identical data.
         k_new = turboquant_dequantize(
-            self._key_indices[..., prev : self.offset, :],
-            self._key_norms[..., prev : self.offset, :],
+            k_idx,
+            k_nrm,
             self.rotation_key,
             self._bits,
             dtype=input_dtype,
         )
         v_new = turboquant_dequantize(
-            self._value_indices[..., prev : self.offset, :],
-            self._value_norms[..., prev : self.offset, :],
+            v_idx,
+            v_nrm,
             self.rotation_value,
             self._bits,
             dtype=input_dtype,
@@ -229,6 +232,11 @@ class TurboQuantKVCache(_BaseCache):
         # values at ``[..., self.offset:, :]``.  That's safe: ``update_and_fetch``
         # always overwrites ``[prev:new_offset]`` before returning
         # ``[..., :new_offset, :]``, so no stale position is ever exposed.
+        # TODO(perf/capacity-cap): after a large partial trim the side buffer
+        # stays at peak capacity for the session (~input_dtype bytes per token
+        # per layer). A capacity cap that shrinks the buffer when offset drops
+        # well below capacity would bound memory for long sessions with heavy
+        # trimming (tool-call reshape, speculative rejection).
         return n
 
     def make_mask(self, *args, **kwargs):
