@@ -494,6 +494,35 @@ class TestBuildLeaderboard:
         monkeypatch.setattr(Path, "iterdir", fake_iterdir)
         assert build_leaderboard(tmp_path) == []
 
+    def test_results_json_exists_permission_error_is_skipped(
+        self, tmp_path, monkeypatch
+    ):
+        # Python 3.12+: Path.exists() propagates non-FileNotFoundError OSErrors.
+        # A subdirectory the process can stat but not inspect must skip that
+        # run, not abort the whole build.
+        from pathlib import Path
+
+        _save_fake_run(
+            tmp_path,
+            model="good",
+            timestamp="20260101T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(42.0)])],
+        )
+        bad_run_dir = tmp_path / "20260101T010000Z-restricted"
+        bad_run_dir.mkdir()
+
+        real_exists = Path.exists
+
+        def fake_exists(self):
+            if self == bad_run_dir / "results.json":
+                raise PermissionError("stat denied")
+            return real_exists(self)
+
+        monkeypatch.setattr(Path, "exists", fake_exists)
+
+        entries = build_leaderboard(tmp_path)
+        assert [e.model for e in entries] == ["good"]
+
     def test_entry_equality_ignores_run_dir(self):
         from pathlib import Path
 
@@ -637,6 +666,29 @@ class TestFormatLeaderboard:
         lines = out.split("\n")
         assert long_scenario in out
         assert len(lines[0]) == len(lines[1]) == len(lines[2])
+
+    def test_missing_git_sha_uses_ascii_placeholder(self):
+        # The em dash (U+2014) is 1 Python character but can render as 2
+        # visual columns in East_Asian_Width=Ambiguous terminals, silently
+        # widening the Git column past the ':<10' header pad.
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        entries = [
+            LeaderboardEntry(
+                model="model-a",
+                best_tps=45.2,
+                best_scenario="baseline",
+                timestamp="20260101T000000Z",
+                git_sha=None,
+                failed_scenarios=0,
+                total_scenarios=1,
+                run_dir=Path("/tmp/x"),
+            ),
+        ]
+        out = format_leaderboard(entries)
+        assert "—" not in out
 
     def test_full_length_git_sha_does_not_break_alignment(self):
         from pathlib import Path

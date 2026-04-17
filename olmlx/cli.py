@@ -1035,7 +1035,7 @@ def cmd_bench_run(args):
         if args.scenarios
         else None
     )
-    bench_dir = Path(args.output_dir) if args.output_dir else DEFAULT_BENCH_DIR
+    bench_dir = Path(args.bench_dir) if args.bench_dir else DEFAULT_BENCH_DIR
 
     run_bench(
         model=args.model,
@@ -1492,8 +1492,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated scenario names (default: all)",
     )
     bench_run.add_argument(
-        "--output-dir",
         "--bench-dir",
+        "--output-dir",
+        dest="bench_dir",
         type=str,
         default=None,
         help="Directory to save the run in (default: ~/.olmlx/bench/runs)",

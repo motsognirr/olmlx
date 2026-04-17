@@ -840,19 +840,21 @@ class TestBenchLeaderboardArgs:
         args = parser.parse_args(["bench", "list", "--bench-dir", "/tmp/foo"])
         assert args.bench_dir == "/tmp/foo"
 
-    def test_run_bench_dir_alias_maps_to_output_dir(self):
+    def test_run_bench_dir_stores_on_bench_dir(self):
         parser = build_parser()
         args = parser.parse_args(
             ["bench", "run", "--model", "m", "--bench-dir", "/tmp/foo"]
         )
-        assert args.output_dir == "/tmp/foo"
+        assert args.bench_dir == "/tmp/foo"
+        # dest must be consistent with list/leaderboard, not output_dir
+        assert not hasattr(args, "output_dir")
 
-    def test_run_output_dir_still_works(self):
+    def test_run_output_dir_alias_still_works(self):
         parser = build_parser()
         args = parser.parse_args(
             ["bench", "run", "--model", "m", "--output-dir", "/tmp/foo"]
         )
-        assert args.output_dir == "/tmp/foo"
+        assert args.bench_dir == "/tmp/foo"
 
 
 class TestBenchLeaderboardCmd:

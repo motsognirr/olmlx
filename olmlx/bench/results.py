@@ -333,7 +333,11 @@ def build_leaderboard(
         return []
     entries: list[LeaderboardEntry] = []
     for run_dir in run_dirs:
-        if not (run_dir / "results.json").exists():
+        try:
+            has_results = (run_dir / "results.json").exists()
+        except OSError:
+            continue
+        if not has_results:
             continue
         try:
             run = load_run(run_dir)
@@ -418,7 +422,7 @@ def format_leaderboard(
         lines.append(
             f"{i:>3} {e.model:<{model_w}} {e.best_tps:>10.1f} "
             f"{e.best_scenario:<{scenario_w}} {e.timestamp:<18} "
-            f"{(e.git_sha[:10] if e.git_sha else '—'):<10} "
+            f"{(e.git_sha[:10] if e.git_sha else '-' * 7):<10} "
             f"{f'{e.failed_scenarios}/{e.total_scenarios}':>11}"
         )
     return "\n".join(lines)
