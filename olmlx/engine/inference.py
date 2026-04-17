@@ -321,10 +321,24 @@ def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
       loop. Safe because ``_generate_sync`` and mlx_lm's ``stream_generate``
       already synchronize the generation stream from inside the worker thread
       before it exits.
-    - ``"none"``: skip lock-boundary sync entirely. Only safe when the
-      inference paths relied upon (``_generate_sync`` → ``asyncio.to_thread``
-      return, or streaming ``drain_and_join``) have produced their own
-      per-request sync.
+    - ``"none"``: skip lock-boundary sync entirely. Safety depends on
+      per-path guarantees that Metal work is complete before the lock
+      releases:
+
+      * ``_full_completion`` has ``_generate_sync`` → ``asyncio.to_thread``
+        which blocks until the worker thread returns, and the thread
+        calls ``mx.synchronize(generation_stream)`` before exit (see
+        ``_generate_sync`` body below).
+      * ``_stream_completion`` waits for ``drain_and_join``; mlx_lm's
+        ``stream_generate`` synchronizes the generation stream inside
+        its worker thread before exit. **This is an assumption about
+        mlx_lm internals** — if that guarantee ever changes upstream,
+        streaming under ``sync_mode="none"`` can reintroduce the
+        "command encoder already encoding" Metal crash that the
+        lock-boundary sync was added to prevent.
+      * ``generate_embeddings`` runs synchronously with no worker thread
+        and has its own load-bearing ``mx.synchronize()`` fallback
+        specifically because the above assumption doesn't apply there.
 
     Cache-eviction and deferred-cleanup paths keep calling ``_safe_sync``
     directly — they are not lock-boundary calls and must always synchronize.
@@ -732,6 +746,12 @@ async def _inference_locked(
     try:
         _lock_boundary_sync(sync_mode)
     except BaseException:
+        # BaseException (not ValueError): this handler re-raises, so
+        # KeyboardInterrupt / SystemExit from mx.synchronize must be
+        # caught here long enough to release the lock before they
+        # propagate. Asymmetric with the exit handler below, which
+        # narrows to ValueError because it suppresses (the broader catch
+        # there would silently swallow shutdown signals).
         lock.release()
         raise
     try:
@@ -1913,6 +1933,10 @@ async def _stream_completion(
     try:
         _lock_boundary_sync(lm.sync_mode)
     except BaseException:
+        # BaseException (re-raise path): see _inference_locked entry for
+        # the rationale. Summary: must release the lock on any exception,
+        # including KeyboardInterrupt / SystemExit, so the shutdown
+        # signal can propagate without leaving the lock held.
         lock.release()
         raise
 

@@ -264,6 +264,91 @@ class TestDrainAndJoinBlocksNewInference:
                 f"the Metal sync needed here"
             )
 
+    @pytest.mark.asyncio
+    async def test_eviction_still_syncs_under_sync_mode_none(self, mock_manager):
+        """Integration guard: under lm.sync_mode='none' (where lock-boundary
+        syncs are skipped), the memory-pressure eviction path must still
+        call mx.synchronize() via _safe_sync. This complements the static
+        bytecode test by exercising the code path functionally — catches
+        regressions like aliasing or indirect dispatch that bytecode
+        introspection would miss.
+        """
+        from unittest.mock import AsyncMock, patch
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.sync_mode = "none"
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30])
+        lm.prompt_cache_store.set(
+            "", CachedPromptState(tokens=[10, 20, 30], cache=[MagicMock()])
+        )
+
+        # Minimal stream so generate_chat returns.
+        from olmlx.utils.streaming import CancellableStream, StreamToken
+
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+        token_iter = iter(
+            [
+                StreamToken(
+                    text="hi",
+                    token=1,
+                    prompt_tokens=3,
+                    generation_tokens=1,
+                    prompt_tps=100.0,
+                    generation_tps=50.0,
+                )
+            ]
+        )
+
+        async def anext_impl():
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.async_mlx_stream", return_value=mock_stream),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache",
+                MagicMock(return_value=[MagicMock()]),
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch("olmlx.utils.memory.is_memory_pressure_high", return_value=True),
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"  # per-model "none" still wins
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+            async for _ in gen:
+                pass
+
+        # Eviction must have run (memory pressure → clear_cache call)
+        mock_mx.clear_cache.assert_called()
+        # And despite sync_mode="none" skipping the lock-boundary sync, the
+        # eviction path's _safe_sync() must still have produced a
+        # synchronize() call.
+        assert mock_mx.synchronize.call_count >= 1, (
+            "eviction path under sync_mode='none' must still sync (Bug #120)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Bug #123: Prompt cache state corruption on mid-stream disconnect
