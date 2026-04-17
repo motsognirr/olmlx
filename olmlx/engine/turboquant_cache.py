@@ -107,7 +107,8 @@ class TurboQuantKVCache(_BaseCache):
                     [self._key_dequant, mx.zeros(deq_shape, dtype=input_dtype)], axis=2
                 )
                 self._value_dequant = mx.concatenate(
-                    [self._value_dequant, mx.zeros(deq_shape, dtype=input_dtype)], axis=2
+                    [self._value_dequant, mx.zeros(deq_shape, dtype=input_dtype)],
+                    axis=2,
                 )
             else:
                 self._key_indices = mx.zeros(idx_shape, dtype=mx.uint8)

@@ -165,9 +165,9 @@ class TestFlashMoE:
         unique = sorted(set(flat))
         loaded = store.load_experts(layer_idx=0, expert_indices=unique)
         idx_map = loaded.expert_index_map
-        remap_py = mx.array(
-            [idx_map[int(i)] for i in flat], dtype=mx.uint32
-        ).reshape(B, L, K)
+        remap_py = mx.array([idx_map[int(i)] for i in flat], dtype=mx.uint32).reshape(
+            B, L, K
+        )
 
         x_expanded = mx.expand_dims(x, (-2, -3))
         if loaded.is_quantized:
@@ -178,17 +178,29 @@ class TestFlashMoE:
                 mode=loaded.quant_mode,
             )
             g = mx.gather_qmm(
-                x_expanded, loaded.gate_weight, loaded.gate_scales, loaded.gate_biases,
-                rhs_indices=remap_py, **qkw,
+                x_expanded,
+                loaded.gate_weight,
+                loaded.gate_scales,
+                loaded.gate_biases,
+                rhs_indices=remap_py,
+                **qkw,
             )
             u = mx.gather_qmm(
-                x_expanded, loaded.up_weight, loaded.up_scales, loaded.up_biases,
-                rhs_indices=remap_py, **qkw,
+                x_expanded,
+                loaded.up_weight,
+                loaded.up_scales,
+                loaded.up_biases,
+                rhs_indices=remap_py,
+                **qkw,
             )
             act = nn.silu(g) * u
             e = mx.gather_qmm(
-                act, loaded.down_weight, loaded.down_scales, loaded.down_biases,
-                rhs_indices=remap_py, **qkw,
+                act,
+                loaded.down_weight,
+                loaded.down_scales,
+                loaded.down_biases,
+                rhs_indices=remap_py,
+                **qkw,
             )
         else:
             g = mx.gather_mm(  # pyright: ignore[reportCallIssue]

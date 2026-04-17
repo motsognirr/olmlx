@@ -422,8 +422,12 @@ class TestTurboQuantKVCache:
 
         B, H, D = 1, 2, 32
         mx.random.seed(42)
-        keys = [mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(n_steps)]
-        values = [mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(n_steps)]
+        keys = [
+            mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(n_steps)
+        ]
+        values = [
+            mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(n_steps)
+        ]
 
         rk = TurboQuantRotation(head_dim=D, seed=7)
         rv = TurboQuantRotation(head_dim=D, seed=8)

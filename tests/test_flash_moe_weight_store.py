@@ -253,7 +253,9 @@ class TestFlashMoeWeightStore:
 
             # Stacked tensors must be identical in input order regardless of completion order.
             assert mx.allclose(reordered.up_weight, baseline.up_weight, atol=0, rtol=0)
-            assert mx.allclose(reordered.down_weight, baseline.down_weight, atol=0, rtol=0)
+            assert mx.allclose(
+                reordered.down_weight, baseline.down_weight, atol=0, rtol=0
+            )
             assert baseline.expert_index_map == reordered.expert_index_map
         finally:
             cold.close()
