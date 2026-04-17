@@ -1238,16 +1238,10 @@ def _parse_kv_cache_quant(spec: str) -> tuple[str, int]:
     return method, int(bits_str)
 
 
-def make_prompt_cache_for_lm(lm: LoadedModel) -> list:
+def _make_prompt_cache_for_lm(lm: LoadedModel) -> list:
     """Create a fresh prompt cache for `lm` using the configured factory
     (plain mlx-lm, TurboQuant, or SpectralQuant).  Single source of truth
-    for cache creation — used by the request path and the load-time probe.
-
-    Cross-module contract: imported by `model_manager._probe_cache_trim_support`
-    via a deferred import (to break the import cycle).  A rename here without
-    updating that call site would fail at model-load time only — no static
-    analysis catches it, so keep the name stable.
-    """
+    for cache creation."""
     if lm.kv_cache_quant is not None:
         method, bits = _parse_kv_cache_quant(lm.kv_cache_quant)
         if method == "spectral":
@@ -1565,7 +1559,7 @@ async def _setup_prompt_cache(
         # remove is then a harmless no-op (PromptCacheStore.remove
         # is idempotent).  Kept for the cache-miss path.
         lm.prompt_cache_store.remove(cache_id)
-        new_cache = make_prompt_cache_for_lm(lm)
+        new_cache = _make_prompt_cache_for_lm(lm)
         gen_kwargs["prompt_cache"] = new_cache
         result.cache_creation_tokens = len(prompt_tokens)
         if fresh_cache_label is None:

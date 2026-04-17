@@ -389,15 +389,6 @@ class TestCacheTrimProbe:
         # Hybrid: KVCache for full-attn layers, RotatingKVCache for SWA layers
         assert _cache_supports_trim([_FakeKVCache(), _FakeRotatingKVCache()]) is False
 
-    def test_probe_detects_turboquant_hybrid_as_non_trimmable(self):
-        from olmlx.engine.model_manager import _cache_supports_trim
-        from olmlx.engine.turboquant_cache import TurboQuantKVCache
-
-        # TurboQuant only replaces KVCache layers; RotatingKVCache layers
-        # are left untouched, so a hybrid model still fails trim.
-        tq = TurboQuantKVCache.__new__(TurboQuantKVCache)
-        assert _cache_supports_trim([tq, _FakeRotatingKVCache()]) is False
-
     def test_probe_detects_unknown_cache_class_as_non_trimmable(self):
         from olmlx.engine.model_manager import _cache_supports_trim
 
@@ -443,6 +434,15 @@ class TestCacheTrimProbe:
             f"{sorted(unclassified)}.  Add each to _TRIMMABLE_CACHE_CLASSES in "
             f"olmlx/engine/model_manager.py (if trim(n) removes exactly n at "
             f"any offset) or to `known_non_trimmable` in this test."
+        )
+        # Reverse direction: every allowlist entry must be a real class in the
+        # installed mlx-lm — catches preemptive entries or typos where the
+        # probe would silently misclassify an unknown class as trimmable.
+        missing = _TRIMMABLE_CACHE_CLASSES - mlx_lm_cache_classes
+        assert not missing, (
+            f"Allowlist entries not found in mlx_lm.models.cache: "
+            f"{sorted(missing)}.  Either remove them or confirm the class "
+            f"exists in the installed mlx-lm version."
         )
 
 

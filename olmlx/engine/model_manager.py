@@ -114,10 +114,15 @@ def _is_serializable_cache(cache: list) -> bool:
     )
 
 
-# Cache classes whose `trim(n)` reliably removes exactly n tokens from any
-# offset (no silent under-delivery).  Class-name allowlist is authoritative
+# mlx-lm cache classes whose `trim(n)` reliably removes exactly n tokens from
+# any offset (no silent under-delivery).  Class-name allowlist is authoritative
 # because `is_trimmable()` on a fresh (offset==0) cache cannot detect rotate
 # or chunk problems that only manifest once the buffer fills.
+#
+# Verified trim behaviour against mlx-lm's cache.py:
+# - KVCache.trim(n) → min(offset, n); trims back to 0 cleanly (line 378).
+# - QuantizedKVCache.trim(n) → same clamping (line 309).
+# - ConcatenateKVCache.trim(n) → same clamping (line 214); used by afm7.
 #
 # Deliberately excluded:
 # - RotatingKVCache: is_trimmable() returns False once the ring buffer fills.
@@ -126,16 +131,15 @@ def _is_serializable_cache(cache: list) -> bool:
 # - ArraysCache / CacheList: no usable trim semantics for our purposes.
 # - BatchKVCache / BatchRotatingKVCache: batch path; untested here.
 #
-# New mlx-lm releases may add classes.  tests/test_prompt_cache.py enforces
-# that any `*KVCache`-named class is classified either here or in the
-# documented non-trimmable set — see ml-explore/mlx-lm#980 for upstream work.
+# Probe always inspects bare mlx-lm classes (not quantization wrappers like
+# TurboQuant/Spectral), so those wrappers do not need to appear here even
+# though they implement trim correctly — they're simply never the layer
+# types we see.  See ml-explore/mlx-lm#980 for upstream hybrid-trim work.
 _TRIMMABLE_CACHE_CLASSES = frozenset(
     {
         "KVCache",
         "QuantizedKVCache",
         "ConcatenateKVCache",
-        "TurboQuantKVCache",
-        "SpectralQuantKVCache",
     }
 )
 
@@ -1246,14 +1250,23 @@ class ModelManager:
         rotating buffer fills.  Detecting this once at load time lets the
         request path skip a doomed `trim_prompt_cache()` call (which
         would silently return 0 and force a full prefill).
-        """
-        # Deferred import: inference.py already imports LoadedModel from this
-        # module, so a top-level import here would form a cycle.
-        from olmlx.engine.inference import make_prompt_cache_for_lm
 
+        Always probes the bare mlx-lm cache — trim behaviour is determined
+        by the underlying layer classes, not the quantization wrapper, and
+        TurboQuant/Spectral factories would otherwise pull calibration data
+        off disk on every model load only to throw the result away.
+        """
+        try:
+            from mlx_lm.models.cache import make_prompt_cache
+        except ImportError:
+            return  # mlx-lm prompt cache unavailable; nothing to probe
+
+        cache_model = (
+            getattr(lm.model, "language_model", lm.model) if lm.is_vlm else lm.model
+        )
         probe_cache: list | None = None
         try:
-            probe_cache = make_prompt_cache_for_lm(lm)
+            probe_cache = make_prompt_cache(cache_model)
             lm.supports_cache_trim = _cache_supports_trim(probe_cache)
         except Exception:
             # Best-effort probe; on failure assume trim works so the
