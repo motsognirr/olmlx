@@ -409,6 +409,42 @@ class TestCacheTrimProbe:
         # the allowlist is authoritative.
         assert _cache_supports_trim([_FakeKVCache(), _UnknownCache()]) is False
 
+    def test_allowlist_covers_all_mlx_lm_cache_types(self):
+        """Regression fence: every `*KVCache` class shipped by the installed
+        mlx-lm must be explicitly classified as trimmable or non-trimmable.
+
+        When mlx-lm ships a new cache type, it lands here by default.  Adding
+        it silently to the non-trimmable bucket would hide a perf regression;
+        this test forces a reviewer to classify it.  See ml-explore/mlx-lm#980.
+        """
+        import inspect
+
+        import mlx_lm.models.cache as mlx_cache
+
+        from olmlx.engine.model_manager import _TRIMMABLE_CACHE_CLASSES
+
+        # Known non-trimmable; document reason next to each name.
+        known_non_trimmable = {
+            "RotatingKVCache",  # is_trimmable() False once ring buffer full
+            "ChunkedKVCache",  # trim() clamps to (offset - start_position)
+            "BatchKVCache",  # batch path untested in this probe
+            "BatchRotatingKVCache",  # same ring-buffer issue
+        }
+
+        mlx_lm_cache_classes = {
+            name
+            for name, obj in inspect.getmembers(mlx_cache, inspect.isclass)
+            if obj.__module__ == mlx_cache.__name__ and name.endswith("KVCache")
+        }
+        classified = _TRIMMABLE_CACHE_CLASSES | known_non_trimmable
+        unclassified = mlx_lm_cache_classes - classified
+        assert not unclassified, (
+            f"mlx-lm shipped new cache classes that olmlx has not classified: "
+            f"{sorted(unclassified)}.  Add each to _TRIMMABLE_CACHE_CLASSES in "
+            f"olmlx/engine/model_manager.py (if trim(n) removes exactly n at "
+            f"any offset) or to `known_non_trimmable` in this test."
+        )
+
 
 class TestNonTrimmableModelSkipsTrim:
     @pytest.mark.asyncio
@@ -536,6 +572,71 @@ class TestNonTrimmableModelSkipsTrim:
         assert call_args[1].get("prompt_cache") is existing_cache
         # Only the suffix is fed to stream_generate
         assert call_args.args[2] == [200, 201]
+
+
+class TestAdvanceCacheToPrefix:
+    def test_extension_appends_boundary_tokens(self):
+        from olmlx.engine.inference import _advance_cache_to_prefix
+
+        lm = MagicMock()
+        lm.is_vlm = False
+        lm.model = MagicMock()
+        lm.model.return_value = None  # model() call result is ignored
+        prompt_cache = [MagicMock(state=object())]
+
+        with patch("olmlx.engine.inference.mx") as mock_mx:
+            mock_mx.array = MagicMock(side_effect=lambda x: x)
+            mock_mx.eval = MagicMock()
+            out = _advance_cache_to_prefix(
+                lm,
+                prompt_cache,
+                current_tokens=[1, 2, 3],
+                target_tokens=[1, 2, 3, 4, 5],
+            )
+
+        assert out == [1, 2, 3, 4, 5]
+        lm.model.assert_called_once()
+        # Verify only the delta tokens were fed
+        call_args = lm.model.call_args
+        assert call_args.args[0] == [[4, 5]]
+
+    def test_no_delta_is_noop(self):
+        from olmlx.engine.inference import _advance_cache_to_prefix
+
+        lm = MagicMock()
+        lm.is_vlm = False
+        out = _advance_cache_to_prefix(
+            lm, [MagicMock()], current_tokens=[1, 2, 3], target_tokens=[1, 2, 3]
+        )
+        assert out == [1, 2, 3]
+        lm.model.assert_not_called()
+
+    def test_diverging_prefix_rejected(self):
+        from olmlx.engine.inference import _advance_cache_to_prefix
+
+        lm = MagicMock()
+        lm.is_vlm = False
+        out = _advance_cache_to_prefix(
+            lm,
+            [MagicMock()],
+            current_tokens=[1, 2, 3],
+            target_tokens=[1, 2, 99, 4],  # mismatch at position 2
+        )
+        assert out is None
+        lm.model.assert_not_called()
+
+    def test_forward_pass_failure_falls_back(self):
+        from olmlx.engine.inference import _advance_cache_to_prefix
+
+        lm = MagicMock()
+        lm.is_vlm = False
+        lm.model = MagicMock(side_effect=RuntimeError("boom"))
+        with patch("olmlx.engine.inference.mx") as mock_mx:
+            mock_mx.array = MagicMock(side_effect=lambda x: x)
+            out = _advance_cache_to_prefix(
+                lm, [MagicMock()], current_tokens=[1, 2], target_tokens=[1, 2, 3]
+            )
+        assert out is None
 
 
 class TestCacheMissCreatesFresh:

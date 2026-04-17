@@ -114,17 +114,26 @@ def _is_serializable_cache(cache: list) -> bool:
     )
 
 
-# Cache classes whose `is_trimmable()` reliably returns True for any offset.
-# `RotatingKVCache.is_trimmable()` returns False once the buffer is full
-# (offset >= max_size), which makes mlx-lm's `trim_prompt_cache()` short-circuit
-# to 0 for the whole layer list.  The class-name allowlist is authoritative;
-# probing `is_trimmable()` on a fresh (offset==0) RotatingKVCache cannot detect
-# the issue.  Unknown cache classes are conservatively treated as non-trimmable.
+# Cache classes whose `trim(n)` reliably removes exactly n tokens from any
+# offset (no silent under-delivery).  Class-name allowlist is authoritative
+# because `is_trimmable()` on a fresh (offset==0) cache cannot detect rotate
+# or chunk problems that only manifest once the buffer fills.
+#
+# Deliberately excluded:
+# - RotatingKVCache: is_trimmable() returns False once the ring buffer fills.
+# - ChunkedKVCache: trim() silently clamps to (offset - start_position);
+#   once prompt > chunk_size, trims beyond the current chunk under-deliver.
+# - ArraysCache / CacheList: no usable trim semantics for our purposes.
+# - BatchKVCache / BatchRotatingKVCache: batch path; untested here.
+#
+# New mlx-lm releases may add classes.  tests/test_prompt_cache.py enforces
+# that any `*KVCache`-named class is classified either here or in the
+# documented non-trimmable set — see ml-explore/mlx-lm#980 for upstream work.
 _TRIMMABLE_CACHE_CLASSES = frozenset(
     {
         "KVCache",
         "QuantizedKVCache",
-        "ChunkedKVCache",
+        "ConcatenateKVCache",
         "TurboQuantKVCache",
         "SpectralQuantKVCache",
     }
@@ -1238,11 +1247,13 @@ class ModelManager:
         request path skip a doomed `trim_prompt_cache()` call (which
         would silently return 0 and force a full prefill).
         """
-        from olmlx.engine.inference import _make_prompt_cache_for_lm
+        # Deferred import: inference.py already imports LoadedModel from this
+        # module, so a top-level import here would form a cycle.
+        from olmlx.engine.inference import make_prompt_cache_for_lm
 
         probe_cache: list | None = None
         try:
-            probe_cache = _make_prompt_cache_for_lm(lm)
+            probe_cache = make_prompt_cache_for_lm(lm)
             lm.supports_cache_trim = _cache_supports_trim(probe_cache)
         except Exception:
             # Best-effort probe; on failure assume trim works so the
@@ -1256,8 +1267,8 @@ class ModelManager:
         finally:
             if probe_cache is not None:
                 del probe_cache
-            gc.collect()
-            mx.clear_cache()
+                gc.collect()
+                mx.clear_cache()
 
         if not lm.supports_cache_trim:
             logger.info(
