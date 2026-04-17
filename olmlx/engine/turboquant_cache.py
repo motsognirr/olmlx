@@ -25,9 +25,10 @@ logger = logging.getLogger(__name__)
 class TurboQuantKVCache(_BaseCache):
     """KV cache with TurboQuant compression.
 
-    Stores only bit-packed indices and float32 norms. Dequantizes the
-    full cache on each ``update_and_fetch`` call — O(n · head_dim²) per
-    step due to the rotation matrix multiply.
+    Stores bit-packed indices and float32 norms for the persisted state,
+    plus a side buffer of dequantized K/V so each ``update_and_fetch`` only
+    dequantizes the newly appended slice (``O(num_steps · head_dim²)`` per
+    call) instead of the full history.
     """
 
     step = 256
@@ -45,12 +46,19 @@ class TurboQuantKVCache(_BaseCache):
         self._key_norms: mx.array | None = None
         self._value_indices: mx.array | None = None
         self._value_norms: mx.array | None = None
+        # Side buffer holding dequantized K/V so we only dequantize new tokens.
+        # Preserved by trim and resize; not included in ``state`` (recoverable
+        # from indices + norms).
+        self._key_dequant: mx.array | None = None
+        self._value_dequant: mx.array | None = None
         self.offset = 0
 
     def update_and_fetch(
         self, keys: mx.array, values: mx.array
     ) -> tuple[mx.array, mx.array]:
-        """Quantize new K/V, append to store, dequantize all and return."""
+        """Quantize new K/V, store bit-packed, dequantize only the new slice,
+        splice into the side buffer, and return views over the whole history.
+        """
         B, n_heads, num_steps, head_dim = keys.shape
         input_dtype = keys.dtype
         prev = self.offset
@@ -61,23 +69,28 @@ class TurboQuantKVCache(_BaseCache):
 
         packed_dim = k_idx.shape[-1]  # head_dim // (8 // bits)
 
-        # Allocate or expand buffers
+        # Allocate or expand buffers in lockstep (indices, norms, dequant side buffer)
         if self._key_indices is None or (prev + num_steps) > self._key_indices.shape[2]:
             new_steps = (num_steps + self.step - 1) // self.step * self.step
             idx_shape = (B, n_heads, new_steps, packed_dim)
             nrm_shape = (B, n_heads, new_steps, 1)
+            deq_shape = (B, n_heads, new_steps, head_dim)
 
             if self._key_indices is not None:
                 assert (
                     self._key_norms is not None
                     and self._value_indices is not None
                     and self._value_norms is not None
+                    and self._key_dequant is not None
+                    and self._value_dequant is not None
                 )
                 if prev % self.step != 0:
                     self._key_indices = self._key_indices[..., :prev, :]
                     self._key_norms = self._key_norms[..., :prev, :]
                     self._value_indices = self._value_indices[..., :prev, :]
                     self._value_norms = self._value_norms[..., :prev, :]
+                    self._key_dequant = self._key_dequant[..., :prev, :]
+                    self._value_dequant = self._value_dequant[..., :prev, :]
                 self._key_indices = mx.concatenate(
                     [self._key_indices, mx.zeros(idx_shape, dtype=mx.uint8)], axis=2
                 )
@@ -90,11 +103,19 @@ class TurboQuantKVCache(_BaseCache):
                 self._value_norms = mx.concatenate(
                     [self._value_norms, mx.zeros(nrm_shape, dtype=mx.float32)], axis=2
                 )
+                self._key_dequant = mx.concatenate(
+                    [self._key_dequant, mx.zeros(deq_shape, dtype=input_dtype)], axis=2
+                )
+                self._value_dequant = mx.concatenate(
+                    [self._value_dequant, mx.zeros(deq_shape, dtype=input_dtype)], axis=2
+                )
             else:
                 self._key_indices = mx.zeros(idx_shape, dtype=mx.uint8)
                 self._key_norms = mx.zeros(nrm_shape, dtype=mx.float32)
                 self._value_indices = mx.zeros(idx_shape, dtype=mx.uint8)
                 self._value_norms = mx.zeros(nrm_shape, dtype=mx.float32)
+                self._key_dequant = mx.zeros(deq_shape, dtype=input_dtype)
+                self._value_dequant = mx.zeros(deq_shape, dtype=input_dtype)
 
         # Store quantized data
         assert (
@@ -102,6 +123,8 @@ class TurboQuantKVCache(_BaseCache):
             and self._key_norms is not None
             and self._value_indices is not None
             and self._value_norms is not None
+            and self._key_dequant is not None
+            and self._value_dequant is not None
         )
         self.offset += num_steps
         self._key_indices[..., prev : self.offset, :] = k_idx
@@ -109,22 +132,28 @@ class TurboQuantKVCache(_BaseCache):
         self._value_indices[..., prev : self.offset, :] = v_idx
         self._value_norms[..., prev : self.offset, :] = v_nrm
 
-        # Dequantize full cache and return in the original dtype
-        k_out = turboquant_dequantize(
-            self._key_indices[..., : self.offset, :],
-            self._key_norms[..., : self.offset, :],
+        # Dequantize only the newly appended slice and splice into the side buffer.
+        k_new = turboquant_dequantize(
+            self._key_indices[..., prev : self.offset, :],
+            self._key_norms[..., prev : self.offset, :],
             self.rotation_key,
             self._bits,
             dtype=input_dtype,
         )
-        v_out = turboquant_dequantize(
-            self._value_indices[..., : self.offset, :],
-            self._value_norms[..., : self.offset, :],
+        v_new = turboquant_dequantize(
+            self._value_indices[..., prev : self.offset, :],
+            self._value_norms[..., prev : self.offset, :],
             self.rotation_value,
             self._bits,
             dtype=input_dtype,
         )
-        return k_out, v_out
+        self._key_dequant[..., prev : self.offset, :] = k_new
+        self._value_dequant[..., prev : self.offset, :] = v_new
+
+        return (
+            self._key_dequant[..., : self.offset, :],
+            self._value_dequant[..., : self.offset, :],
+        )
 
     @property
     def state(self):
@@ -162,6 +191,8 @@ class TurboQuantKVCache(_BaseCache):
             self._key_norms = None
             self._value_indices = None
             self._value_norms = None
+            self._key_dequant = None
+            self._value_dequant = None
         return n
 
     def make_mask(self, *args, **kwargs):
