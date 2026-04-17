@@ -226,7 +226,14 @@ class TestDrainAndJoinBlocksNewInference:
 
         def names_referenced(fn):
             """Return the set of names referenced in fn's bytecode, including
-            any nested (closure / inner-function) code objects."""
+            any nested (closure / inner-function) code objects.
+
+            Note: CPython-specific. ``co_names`` contains names used by
+            LOAD_GLOBAL / LOAD_ATTR bytecode instructions — it catches
+            direct references like ``_safe_sync(...)`` but not aliases
+            (e.g. ``sync_fn = _safe_sync; sync_fn(...)``). Good enough
+            for the patterns this guard is intended to catch.
+            """
             seen = set()
             stack = [fn.__code__]
             while stack:

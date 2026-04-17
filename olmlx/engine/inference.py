@@ -2600,9 +2600,11 @@ async def generate_embeddings(
 
             # Load-bearing when sync_mode="none": this function runs
             # synchronously under _inference_locked with no worker thread,
-            # so the lock-boundary exit sync may be skipped. This
-            # mx.synchronize() is then the only Metal sync before the lock
-            # is released — do not remove without providing an equivalent
-            # barrier.
-            mx.synchronize()
+            # so the lock-boundary exit sync may be skipped. This sync is
+            # then the only Metal barrier before the lock is released —
+            # do not remove without providing an equivalent barrier. Use
+            # _sync_default_stream() so a Metal exception is suppressed
+            # and logged rather than surfaced as a 500 after the
+            # embeddings have already been computed and .tolist()'d.
+            _sync_default_stream()
             return embeddings
