@@ -6,7 +6,7 @@ import json
 import os
 import threading
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -335,13 +335,15 @@ class FlashMoeWeightStore:
         cached = self._cache.get_batch(layer_idx, expert_indices)
         missing = [idx for idx in expert_indices if idx not in cached]
 
-        # Load missing experts via parallel I/O
+        # Load missing experts via parallel I/O; consume in completion order so
+        # slow readers do not block fast ones.
         if missing:
-            futures = {
-                idx: self._executor.submit(self._read_expert, layer_idx, idx)
+            future_to_idx = {
+                self._executor.submit(self._read_expert, layer_idx, idx): idx
                 for idx in missing
             }
-            for idx, future in futures.items():
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
                 data = future.result()
                 cached[idx] = data
                 self._cache.put(layer_idx, idx, data)
