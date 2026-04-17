@@ -3825,3 +3825,102 @@ class TestInferenceTimeout:
         assert done_chunk.get("done_reason") == "timeout"
         text_chunks = [c for c in chunks if not c.get("done")]
         assert 0 < len(text_chunks) < 20
+
+
+class TestStreamCompletionLockLeakOnSyncFailure:
+    """_stream_completion must release the inference lock even if a
+    _lock_boundary_sync call raises. Mirrors the _inference_locked lock-leak
+    regression tests."""
+
+    def _mock_stream(self, n_tokens: int = 3):
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+        tokens = [
+            StreamToken(
+                text=f"tok{i}",
+                token=i,
+                prompt_tokens=5,
+                generation_tokens=i + 1,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            )
+            for i in range(n_tokens)
+        ]
+        token_iter = iter(tokens)
+
+        async def anext_impl():
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+        return mock_stream
+
+    @pytest.mark.asyncio
+    async def test_lock_released_if_entry_sync_raises(self, mock_manager):
+        """If _lock_boundary_sync raises on stream entry, the inference lock
+        must not leak."""
+        assert not _inference_lock.locked()
+        with (
+            patch("olmlx.engine.inference.mx"),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=self._mock_stream(),
+            ),
+            patch(
+                "olmlx.engine.inference._lock_boundary_sync",
+                side_effect=ValueError("entry boom"),
+            ),
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = None
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
+            gen = await generate_completion(mock_manager, "qwen3", "Hello", stream=True)
+            with pytest.raises(ValueError, match="entry boom"):
+                async for _ in gen:
+                    pass
+        assert not _inference_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_lock_released_if_exit_sync_raises(self, mock_manager):
+        """If _lock_boundary_sync raises during the normal-cleanup path after
+        the stream drains, the inference lock must still be released via the
+        inner try/finally."""
+        assert not _inference_lock.locked()
+        call_count = {"n": 0}
+
+        def side_effect(*_a, **_kw):
+            call_count["n"] += 1
+            # Let entry sync pass; raise only on exit sync (second call).
+            if call_count["n"] >= 2:
+                raise ValueError("exit boom")
+
+        with (
+            patch("olmlx.engine.inference.mx"),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=self._mock_stream(),
+            ),
+            patch(
+                "olmlx.engine.inference._lock_boundary_sync", side_effect=side_effect
+            ),
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = None
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
+            gen = await generate_completion(mock_manager, "qwen3", "Hello", stream=True)
+            with pytest.raises(ValueError, match="exit boom"):
+                async for _ in gen:
+                    pass
+        assert not _inference_lock.locked()
+        # Entry + exit = exactly 2 lock_boundary_sync calls in the success path.
+        assert call_count["n"] == 2
