@@ -409,6 +409,241 @@ class TestTurboQuantKVCache:
         assert k_out.shape == (1, 4, 18, 64)
         assert cache.offset == 18
 
+    @pytest.mark.parametrize("bits", [2, 4])
+    @pytest.mark.parametrize("n_steps", [1, 8, 64, 256, 257, 513])
+    def test_incremental_dequant_matches_full_dequant(self, bits, n_steps):
+        """Per-step incremental dequant must be bit-equal to full-cache dequant."""
+        from olmlx.engine.turboquant import (
+            TurboQuantRotation,
+            turboquant_quantize,
+            turboquant_dequantize,
+        )
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        B, H, D = 1, 2, 32
+        mx.random.seed(42)
+        keys = [
+            mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(n_steps)
+        ]
+        values = [
+            mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(n_steps)
+        ]
+
+        rk = TurboQuantRotation(head_dim=D, seed=7)
+        rv = TurboQuantRotation(head_dim=D, seed=8)
+        cache = TurboQuantKVCache(bits=bits, rotation_key=rk, rotation_value=rv)
+        k_out = v_out = None
+        for k, v in zip(keys, values):
+            k_out, v_out = cache.update_and_fetch(k, v)
+
+        # Oracle: quantize+dequantize the concatenated tensor in one shot.
+        # turboquant_quantize is row-wise (per-token norms, rotation matmul with
+        # no cross-row state), so concatenating then quantizing is equivalent to
+        # quantizing each row then stacking — which is what the cache does
+        # internally during prefill, decode, and now the side-buffer splice.
+        rk_ref = TurboQuantRotation(head_dim=D, seed=7)
+        rv_ref = TurboQuantRotation(head_dim=D, seed=8)
+        K = mx.concatenate(keys, axis=2)
+        V = mx.concatenate(values, axis=2)
+        k_idx, k_nrm = turboquant_quantize(K, rk_ref, bits)
+        v_idx, v_nrm = turboquant_quantize(V, rv_ref, bits)
+        k_ref = turboquant_dequantize(k_idx, k_nrm, rk_ref, bits, dtype=mx.float16)
+        v_ref = turboquant_dequantize(v_idx, v_nrm, rv_ref, bits, dtype=mx.float16)
+
+        assert mx.allclose(k_out, k_ref, atol=0, rtol=0)
+        assert mx.allclose(v_out, v_ref, atol=0, rtol=0)
+
+    def test_trim_preserves_incremental_side_buffer(self):
+        """After trim+resume, fetched tensors must match a fresh cache fed the
+        equivalent sequence from scratch."""
+        from olmlx.engine.turboquant import TurboQuantRotation
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        B, H, D, bits = 1, 2, 32, 4
+        mx.random.seed(123)
+        keys = [mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(20)]
+        values = [mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(20)]
+
+        rk = TurboQuantRotation(head_dim=D, seed=9)
+        rv = TurboQuantRotation(head_dim=D, seed=10)
+        cache = TurboQuantKVCache(bits=bits, rotation_key=rk, rotation_value=rv)
+        for k, v in zip(keys, values):
+            cache.update_and_fetch(k, v)
+        cache.trim(5)
+        # Feed three more tokens from the start of the sequence.
+        for k, v in zip(keys[:3], values[:3]):
+            cache.update_and_fetch(k, v)
+        k_out, v_out = cache.update_and_fetch(keys[10], values[10])
+
+        # Oracle: fresh cache fed the equivalent sequence (first 15, then first 3, then #10).
+        rk2 = TurboQuantRotation(head_dim=D, seed=9)
+        rv2 = TurboQuantRotation(head_dim=D, seed=10)
+        oracle = TurboQuantKVCache(bits=bits, rotation_key=rk2, rotation_value=rv2)
+        seq = (
+            list(zip(keys[:15], values[:15]))
+            + list(zip(keys[:3], values[:3]))
+            + [(keys[10], values[10])]
+        )
+        k_ref = v_ref = None
+        for k, v in seq:
+            k_ref, v_ref = oracle.update_and_fetch(k, v)
+        assert mx.allclose(k_out, k_ref, atol=0, rtol=0)
+        assert mx.allclose(v_out, v_ref, atol=0, rtol=0)
+
+    def test_resize_after_filling_to_step_boundary(self):
+        """Fill exactly to a step boundary, then append one more.
+
+        Exercises the ``prev % self.step == 0`` branch of the resize path
+        (where the old code's ``prev % self.step != 0`` truncation fallback
+        does **not** apply); the side buffer must still splice correctly.
+        """
+        from olmlx.engine.turboquant import TurboQuantRotation
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        B, H, D, bits = 1, 2, 32, 4
+        mx.random.seed(321)
+        # Fill exactly 256 tokens (one step worth), then append one.
+        keys = [mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(257)]
+        values = [mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(257)]
+
+        rk = TurboQuantRotation(head_dim=D, seed=33)
+        rv = TurboQuantRotation(head_dim=D, seed=34)
+        cache = TurboQuantKVCache(bits=bits, rotation_key=rk, rotation_value=rv)
+        k_out = v_out = None
+        for i, (k, v) in enumerate(zip(keys, values)):
+            if i == 256:
+                # Before appending the 257th token, the resize must grow the
+                # buffers from 256 -> 512 with prev % self.step == 0.
+                assert cache.offset == 256
+            k_out, v_out = cache.update_and_fetch(k, v)
+        assert cache.offset == 257
+
+        # Oracle: fresh cache fed the same 257-token sequence.
+        rk2 = TurboQuantRotation(head_dim=D, seed=33)
+        rv2 = TurboQuantRotation(head_dim=D, seed=34)
+        oracle = TurboQuantKVCache(bits=bits, rotation_key=rk2, rotation_value=rv2)
+        k_ref = v_ref = None
+        for k, v in zip(keys, values):
+            k_ref, v_ref = oracle.update_and_fetch(k, v)
+        assert mx.allclose(k_out, k_ref, atol=0, rtol=0)
+        assert mx.allclose(v_out, v_ref, atol=0, rtol=0)
+
+    def test_trim_to_step_boundary_overwrites_stale_tail(self):
+        """Fill 2·step, trim back to step, then append new tokens that
+        partially overlap the stale second step-block in the side buffer.
+
+        After ``trim(step)`` the dequant side buffer still holds the original
+        second-step-block values at ``[step : 2·step, :]``.  When
+        ``update_and_fetch`` appends new tokens starting at ``step``, it must
+        overwrite that stale range before returning it.
+        """
+        from olmlx.engine.turboquant import TurboQuantRotation
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        B, H, D, bits = 1, 2, 32, 4
+        step = TurboQuantKVCache.step  # 256
+        mx.random.seed(444)
+        keys = [
+            mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(2 * step)
+        ]
+        values = [
+            mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(2 * step)
+        ]
+        # New tokens fed after trim — different samples so a stale readback
+        # would diverge from the oracle.
+        new_keys = [
+            mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(10)
+        ]
+        new_values = [
+            mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(10)
+        ]
+
+        rk = TurboQuantRotation(head_dim=D, seed=77)
+        rv = TurboQuantRotation(head_dim=D, seed=78)
+        cache = TurboQuantKVCache(bits=bits, rotation_key=rk, rotation_value=rv)
+        for k, v in zip(keys, values):
+            cache.update_and_fetch(k, v)
+        assert cache.offset == 2 * step
+        cache.trim(step)
+        assert cache.offset == step
+        k_out = v_out = None
+        for k, v in zip(new_keys, new_values):
+            k_out, v_out = cache.update_and_fetch(k, v)
+        assert cache.offset == step + 10
+
+        # Oracle: fresh cache fed prefix + new tokens (skipping the trimmed block).
+        rk2 = TurboQuantRotation(head_dim=D, seed=77)
+        rv2 = TurboQuantRotation(head_dim=D, seed=78)
+        oracle = TurboQuantKVCache(bits=bits, rotation_key=rk2, rotation_value=rv2)
+        for k, v in zip(keys[:step], values[:step]):
+            oracle.update_and_fetch(k, v)
+        k_ref = v_ref = None
+        for k, v in zip(new_keys, new_values):
+            k_ref, v_ref = oracle.update_and_fetch(k, v)
+        assert mx.allclose(k_out, k_ref, atol=0, rtol=0)
+        assert mx.allclose(v_out, v_ref, atol=0, rtol=0)
+
+    def test_dtype_change_is_rejected(self):
+        """Changing keys.dtype across update_and_fetch must raise, not mix
+        dtypes in the side-buffer grow path."""
+        from olmlx.engine.turboquant import TurboQuantRotation
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        B, H, D = 1, 2, 32
+        rk = TurboQuantRotation(head_dim=D, seed=55)
+        rv = TurboQuantRotation(head_dim=D, seed=56)
+        cache = TurboQuantKVCache(bits=4, rotation_key=rk, rotation_value=rv)
+        k1 = mx.random.normal((B, H, 1, D)).astype(mx.float16)
+        v1 = mx.random.normal((B, H, 1, D)).astype(mx.float16)
+        cache.update_and_fetch(k1, v1)
+
+        k2 = mx.random.normal((B, H, 1, D)).astype(mx.float32)
+        v2 = mx.random.normal((B, H, 1, D)).astype(mx.float32)
+        with pytest.raises(ValueError, match="dtype"):
+            cache.update_and_fetch(k2, v2)
+
+    def test_full_trim_allows_dtype_change(self):
+        """A full trim resets ``_dequant_dtype``; a subsequent update with a
+        different dtype must succeed (the lock is per cache lifetime, not per
+        cache instance)."""
+        from olmlx.engine.turboquant import TurboQuantRotation
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        B, H, D = 1, 2, 32
+        rk = TurboQuantRotation(head_dim=D, seed=57)
+        rv = TurboQuantRotation(head_dim=D, seed=58)
+        cache = TurboQuantKVCache(bits=4, rotation_key=rk, rotation_value=rv)
+
+        k1 = mx.random.normal((B, H, 1, D)).astype(mx.float16)
+        v1 = mx.random.normal((B, H, 1, D)).astype(mx.float16)
+        cache.update_and_fetch(k1, v1)
+        assert cache._dequant_dtype == mx.float16
+
+        cache.trim(cache.offset)
+        assert cache._dequant_dtype is None
+        assert cache._key_dequant is None
+        assert cache._value_dequant is None
+
+        k2 = mx.random.normal((B, H, 1, D)).astype(mx.float32)
+        v2 = mx.random.normal((B, H, 1, D)).astype(mx.float32)
+        k_out, v_out = cache.update_and_fetch(k2, v2)
+        assert k_out.dtype == mx.float32
+        assert v_out.dtype == mx.float32
+        assert cache._dequant_dtype == mx.float32
+
+    def test_state_getter_excludes_side_buffer(self):
+        """state must still be [key_indices, key_norms, value_indices, value_norms]."""
+        cache = self._make_cache(bits=4, head_dim=32)
+        k = mx.random.normal((1, 2, 4, 32)).astype(mx.float16)
+        v = mx.random.normal((1, 2, 4, 32)).astype(mx.float16)
+        cache.update_and_fetch(k, v)
+        state = cache.state
+        assert len(state) == 4
+        # Indices: (B, H, offset, packed_dim)
+        assert state[0].shape[2] == 4
+        # Norms: (B, H, offset, 1)
+        assert state[1].shape[-1] == 1
+
 
 # ---------------------------------------------------------------------------
 # make_turboquant_cache tests
