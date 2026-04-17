@@ -741,6 +741,12 @@ async def _inference_locked(
         # complete before releasing the lock to the next caller.
         try:
             _lock_boundary_sync(sync_mode)
+        except BaseException:
+            # Do NOT re-raise: that would mask any exception propagating
+            # from the yield body. Fall back to _safe_sync() so unknown
+            # modes fail-safe (sync anyway) instead of fail-open (no sync).
+            logger.error("exit _lock_boundary_sync failed", exc_info=True)
+            _safe_sync()
         finally:
             lock.release()
 
@@ -2166,6 +2172,17 @@ async def _stream_completion(
             # Normal path — thread exited, safe to sync and release.
             try:
                 _lock_boundary_sync(lm.sync_mode)
+            except BaseException:
+                # Don't re-raise: a stream-body exception is already mid-
+                # propagation through the outer finally, and masking it
+                # with an unknown-mode ValueError would erase the cause.
+                # Fall back to _safe_sync() so we still sync before
+                # releasing the lock.
+                logger.error(
+                    "exit _lock_boundary_sync failed in _stream_completion",
+                    exc_info=True,
+                )
+                _safe_sync()
             finally:
                 lock.release()
 
@@ -2609,5 +2626,12 @@ async def generate_embeddings(
             try:
                 mx.synchronize()
             except Exception:
-                logger.debug("embeddings post-compute sync failed", exc_info=True)
+                # WARNING, not DEBUG: under sync_mode="none" this is the
+                # only Metal barrier in the path; a silent failure here
+                # typically surfaces as an uncatchable Metal crash on the
+                # next inference. Operators need to see it now, not after.
+                logger.warning(
+                    "embeddings post-compute sync failed — next inference may crash",
+                    exc_info=True,
+                )
             return embeddings

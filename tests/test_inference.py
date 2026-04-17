@@ -2128,9 +2128,11 @@ class TestInferenceLocked:
         assert not _inference_lock.locked()
 
     @pytest.mark.asyncio
-    async def test_lock_released_if_exit_sync_raises(self):
-        """If exit _lock_boundary_sync raises in the finally block, lock must
-        still be released (inner try/finally)."""
+    async def test_exit_sync_raise_is_suppressed_and_safe_sync_runs(self):
+        """If exit _lock_boundary_sync raises (unknown mode), the error must
+        be caught, _safe_sync() must run as a fail-safe fallback, and the
+        lock must be released. No exception should propagate from an
+        otherwise-successful body."""
         assert not _inference_lock.locked()
         calls = {"n": 0}
 
@@ -2139,12 +2141,44 @@ class TestInferenceLocked:
             if calls["n"] == 2:  # only raise on exit sync
                 raise ValueError("exit boom")
 
-        with patch(
-            "olmlx.engine.inference._lock_boundary_sync", side_effect=side_effect
+        with (
+            patch(
+                "olmlx.engine.inference._lock_boundary_sync", side_effect=side_effect
+            ),
+            patch("olmlx.engine.inference._safe_sync") as mock_safe_sync,
         ):
-            with pytest.raises(ValueError, match="exit boom"):
+            # No exception should escape — the exit-sync raise is caught.
+            async with _inference_locked():
+                pass
+        assert not _inference_lock.locked()
+        mock_safe_sync.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_exit_sync_raise_does_not_mask_body_exception(self):
+        """If both the body and exit _lock_boundary_sync raise, the body's
+        exception must propagate (not the sync ValueError). Python's
+        default finally-semantics would replace the body exception with
+        the sync one — this test guards against that regression."""
+        assert not _inference_lock.locked()
+        calls = {"n": 0}
+
+        def side_effect(*_a, **_kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise ValueError("exit boom")
+
+        class BodyError(RuntimeError):
+            pass
+
+        with (
+            patch(
+                "olmlx.engine.inference._lock_boundary_sync", side_effect=side_effect
+            ),
+            patch("olmlx.engine.inference._safe_sync"),
+        ):
+            with pytest.raises(BodyError, match="body failed"):
                 async with _inference_locked():
-                    pass
+                    raise BodyError("body failed")
         assert not _inference_lock.locked()
 
 
@@ -3920,10 +3954,11 @@ class TestStreamCompletionLockLeakOnSyncFailure:
         assert not _inference_lock.locked()
 
     @pytest.mark.asyncio
-    async def test_lock_released_if_exit_sync_raises(self, mock_manager):
-        """If _lock_boundary_sync raises during the normal-cleanup path after
-        the stream drains, the inference lock must still be released via the
-        inner try/finally."""
+    async def test_exit_sync_raise_is_suppressed_and_safe_sync_runs(self, mock_manager):
+        """If exit _lock_boundary_sync raises during normal cleanup, the
+        streaming path must catch it, run _safe_sync() as a fail-safe
+        fallback, and release the lock. No exception should propagate
+        from a successful stream body."""
         assert not _inference_lock.locked()
         call_count = {"n": 0}
 
@@ -3943,6 +3978,7 @@ class TestStreamCompletionLockLeakOnSyncFailure:
             patch(
                 "olmlx.engine.inference._lock_boundary_sync", side_effect=side_effect
             ),
+            patch("olmlx.engine.inference._safe_sync") as mock_safe_sync,
         ):
             mock_settings.inference_queue_timeout = None
             mock_settings.inference_timeout = None
@@ -3950,12 +3986,13 @@ class TestStreamCompletionLockLeakOnSyncFailure:
             mock_settings.memory_limit_fraction = 0.9
             mock_settings.sync_mode = "full"
             gen = await generate_completion(mock_manager, "qwen3", "Hello", stream=True)
-            with pytest.raises(ValueError, match="exit boom"):
-                async for _ in gen:
-                    pass
+            # No exception should escape — the exit-sync raise is caught.
+            async for _ in gen:
+                pass
         assert not _inference_lock.locked()
         # Entry + exit = exactly 2 lock_boundary_sync calls in the success path.
         assert call_count["n"] == 2
+        mock_safe_sync.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_sync_mode_none_skips_lock_boundary_sync(self, mock_manager):
