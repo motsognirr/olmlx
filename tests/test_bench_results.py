@@ -462,6 +462,41 @@ class TestBuildLeaderboard:
         not_a_dir.write_text("{}")
         assert build_leaderboard(not_a_dir) == []
 
+    def test_invalid_shape_results_json_is_skipped(self, tmp_path):
+        # Valid JSON but not a dict — load_run's from_dict raises TypeError,
+        # which must not abort the whole leaderboard build.
+        bad = tmp_path / "broken"
+        bad.mkdir()
+        (bad / "results.json").write_text("null")
+
+        _save_fake_run(
+            tmp_path,
+            model="good",
+            timestamp="20260101T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+
+        entries = build_leaderboard(tmp_path)
+        assert [e.model for e in entries] == ["good"]
+
+    def test_tiebreaker_handles_double_digit_collision_counter(self, tmp_path):
+        # 11 runs share one timestamp; save_run writes them to ...Z, ...Z-1,
+        # ..., ...Z-10. The last (counter=10) must win — naive string order
+        # would rank it below ...Z-9.
+        for i in range(11):
+            run = RunResult(
+                model="model-a",
+                timestamp="20260101T000000Z",
+                git_sha=f"rev{i:02d}",
+                scenarios=[_scenario("baseline", [_prompt(10.0 + i)])],
+            )
+            save_run(run, tmp_path)
+
+        entries = build_leaderboard(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].git_sha == "rev10"
+        assert entries[0].best_tps == pytest.approx(20.0, rel=1e-6)
+
     def test_same_timestamp_tiebreaker_is_deterministic(self, tmp_path):
         # save_run appends a -N suffix to the directory on sub-second collisions
         # but leaves the timestamp field untouched. The later (higher-suffix)

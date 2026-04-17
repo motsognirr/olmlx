@@ -291,6 +291,16 @@ class LeaderboardEntry:
     run_dir: Path
 
 
+def _run_dir_sort_key(name: str) -> tuple[str, int]:
+    # save_run appends "-<n>" (n ≥ 1) on timestamp collisions. Split on the
+    # last dash so the numeric suffix sorts numerically; bare timestamps get
+    # counter 0 and rank before any suffixed siblings.
+    base, _, suffix = name.rpartition("-")
+    if base and suffix.isdigit():
+        return (base, int(suffix))
+    return (name, 0)
+
+
 def _scenario_avg_tps(scenario: ScenarioResult) -> float:
     valid = [
         p.tokens_per_second
@@ -319,7 +329,7 @@ def build_leaderboard(
             continue
         try:
             run = load_run(run_dir)
-        except (json.JSONDecodeError, OSError, KeyError):
+        except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
             continue
 
         best_tps = 0.0
@@ -358,14 +368,16 @@ def build_leaderboard(
         by_model: dict[str, LeaderboardEntry] = {}
         for e in entries:
             existing = by_model.get(e.model)
-            # Break timestamp ties on run_dir name: save_run appends -1, -2, ...
-            # to sub-second collisions, so the higher suffix is the later run.
+            # Break timestamp ties on the numeric collision counter in the
+            # directory name so -10 sorts after -9 (plain string order would
+            # put -10 before -2).
             if (
                 existing is None
                 or e.timestamp > existing.timestamp
                 or (
                     e.timestamp == existing.timestamp
-                    and e.run_dir.name > existing.run_dir.name
+                    and _run_dir_sort_key(e.run_dir.name)
+                    > _run_dir_sort_key(existing.run_dir.name)
                 )
             ):
                 by_model[e.model] = e
