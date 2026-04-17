@@ -12,11 +12,11 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
-from olmlx.config import experimental as global_experimental
+from olmlx.config import SyncMode, experimental as global_experimental
 from olmlx.config import resolve_experimental, settings
 from olmlx.engine.registry import ModelRegistry
 from olmlx.utils import memory as memory_utils
@@ -520,7 +520,7 @@ class LoadedModel:
     default_options: dict = field(default_factory=dict)
     inference_queue_timeout: float | None = None
     inference_timeout: float | None = None
-    sync_mode: Literal["full", "minimal", "none"] | None = None
+    sync_mode: SyncMode | None = None
 
     def __post_init__(self):
         if self.prompt_cache_store is None:

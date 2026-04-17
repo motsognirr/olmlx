@@ -8,11 +8,11 @@ import threading
 import dataclasses
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, get_args
 
 import logging
 
-from olmlx.config import settings
+from olmlx.config import SyncMode, settings
 
 logger = logging.getLogger(__name__)
 
@@ -132,15 +132,15 @@ def _validate_timeout(name: str, value: Any) -> float:
     return float(value)
 
 
-_VALID_SYNC_MODES: frozenset[str] = frozenset({"full", "minimal", "none"})
+_VALID_SYNC_MODES: frozenset[str] = frozenset(get_args(SyncMode))
 
 
-def _validate_sync_mode(value: Any) -> str:
+def _validate_sync_mode(value: Any) -> SyncMode:
     if not isinstance(value, str) or value not in _VALID_SYNC_MODES:
         raise ValueError(
             f"'sync_mode' must be one of {sorted(_VALID_SYNC_MODES)}, got {value!r}"
         )
-    return value
+    return value  # type: ignore[return-value]
 
 
 def _validate_keep_alive(value: str) -> None:
@@ -179,7 +179,7 @@ class ModelConfig:
     #: "minimal" (skip mlx_lm/mlx_vlm generation-stream sync), or "none"
     #: (skip lock-boundary sync entirely). None means use the global
     #: ``settings.sync_mode``.
-    sync_mode: Literal["full", "minimal", "none"] | None = None
+    sync_mode: SyncMode | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 

@@ -4,6 +4,11 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
+#: Metal sync behavior at inference-lock boundaries. Single source of truth
+#: shared by ``Settings.sync_mode``, ``ModelConfig.sync_mode``, and
+#: ``_lock_boundary_sync`` — keep them in lockstep.
+SyncMode = Literal["full", "minimal", "none"]
+
 
 class Settings(BaseSettings):
     model_config = {"env_prefix": "OLMLX_", "env_file": ".env", "extra": "ignore"}
@@ -25,7 +30,7 @@ class Settings(BaseSettings):
     prompt_cache_disk_max_gb: Annotated[float, Field(gt=0)] = 10.0
     inference_queue_timeout: Annotated[float, Field(gt=0)] | None = 300.0
     inference_timeout: Annotated[float, Field(gt=0)] | None = None
-    sync_mode: Literal["full", "minimal", "none"] = "full"
+    sync_mode: SyncMode = "full"
     max_tokens_limit: Annotated[int, Field(gt=0)] = 131072
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
     anthropic_models: dict[str, str] = {}

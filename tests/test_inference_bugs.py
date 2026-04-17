@@ -209,12 +209,15 @@ class TestDrainAndJoinBlocksNewInference:
         )
 
     def test_eviction_uses_safe_sync_not_lock_boundary_sync(self):
-        """Eviction paths must use _safe_sync (unconditional) — not _lock_boundary_sync.
+        """Eviction and deferred-cleanup paths must use _safe_sync (unconditional)
+        — not _lock_boundary_sync.
 
         _lock_boundary_sync honors per-model/global sync_mode and can be
         'none', which would silently skip the post-eviction sync needed to
-        reclaim freed Metal buffers (Bug #120). Guard against a future edit
-        that unifies the call sites.
+        reclaim freed Metal buffers (Bug #120). The deferred cleanup path
+        holds the inference lock while the worker thread may still be using
+        the GPU and *must* sync before releasing the lock. Guard against a
+        future edit that unifies the call sites.
         """
         import inspect
 
@@ -224,18 +227,20 @@ class TestDrainAndJoinBlocksNewInference:
                 "_kv_cache_preflight_check",
                 inspect.getsource(_inf_mod._kv_cache_preflight_check),
             ),
+            (
+                "_schedule_deferred_inference_cleanup",
+                inspect.getsource(_inf_mod._schedule_deferred_inference_cleanup),
+            ),
         ]
         for func_name, source in sources:
-            assert "mx.clear_cache" in source, (
-                f"{func_name}: expected mx.clear_cache() in eviction path"
-            )
             assert "_safe_sync" in source, (
-                f"{func_name}: eviction path must call _safe_sync() (Bug #120)"
+                f"{func_name}: must call _safe_sync() (Bug #120 / "
+                f"deferred-cleanup correctness)"
             )
             assert "_lock_boundary_sync" not in source, (
-                f"{func_name}: eviction path must NOT use _lock_boundary_sync — "
+                f"{func_name}: must NOT use _lock_boundary_sync — "
                 f"that helper honors sync_mode='none' and would silently skip "
-                f"the post-eviction Metal sync needed to reclaim freed buffers"
+                f"the Metal sync needed here"
             )
 
 

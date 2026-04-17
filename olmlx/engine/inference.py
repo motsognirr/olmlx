@@ -19,7 +19,7 @@ from olmlx.engine.model_manager import (
     ModelManager,
     parse_keep_alive,
 )
-from olmlx.config import settings
+from olmlx.config import SyncMode, settings
 from olmlx.utils import memory as memory_utils
 
 try:
@@ -309,9 +309,6 @@ def _safe_sync():
     _sync_generation_streams()
 
 
-SyncMode = Literal["full", "minimal", "none"]
-
-
 def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
     """Sync Metal GPU state at inference-lock entry/exit with configurable scope.
 
@@ -335,9 +332,14 @@ def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
     effective = mode if mode is not None else settings.sync_mode
     if effective == "none":
         return
-    _sync_default_stream()
+    if effective == "minimal":
+        _sync_default_stream()
+        return
     if effective == "full":
+        _sync_default_stream()
         _sync_generation_streams()
+        return
+    raise ValueError(f"Unknown sync_mode: {effective!r}")
 
 
 class ServerBusyError(RuntimeError):

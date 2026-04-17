@@ -2022,6 +2022,14 @@ class TestLockBoundarySync:
             _lock_boundary_sync("full")  # should not raise
             _lock_boundary_sync("minimal")  # should not raise
 
+    def test_unknown_mode_raises(self):
+        """Unknown modes must raise ValueError instead of silently falling
+        through to a default — prevents silent drift if a new mode is added
+        to SyncMode without updating this helper."""
+        with patch("olmlx.engine.inference.mx"):
+            with pytest.raises(ValueError, match="Unknown sync_mode"):
+                _lock_boundary_sync("sometimes")  # type: ignore[arg-type]
+
 
 class TestInferenceLocked:
     @pytest.mark.asyncio
@@ -3017,6 +3025,7 @@ class TestKvCachePreflightCheck:
         lm.active_refs = 0
         lm.inference_timeout = None
         lm.inference_queue_timeout = None
+        lm.sync_mode = None
         return lm
 
     @pytest.mark.asyncio
@@ -3060,6 +3069,7 @@ class TestKvCachePreflightCheck:
                 mock_settings.memory_limit_fraction = 0.5  # 12GB limit
                 mock_settings.prompt_cache = False
                 mock_settings.inference_timeout = None
+                mock_settings.sync_mode = "full"
 
                 gen = _inf_mod._stream_completion(
                     mock_lm, list(range(22000)), 512, {}, stats
@@ -3131,6 +3141,7 @@ class TestKvCachePreflightCheck:
                 mock_settings.prompt_cache = False
                 mock_settings.default_keep_alive = "5m"
                 mock_settings.inference_timeout = None
+                mock_settings.sync_mode = "full"
 
                 gen = _inf_mod._stream_completion(
                     mock_lm, list(range(100)), 512, {}, stats
@@ -3703,6 +3714,7 @@ class TestInferenceTimeout:
             mock_settings.inference_timeout = None
             mock_settings.prompt_cache = False
             mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
             gen = await generate_completion(
                 mock_manager,
                 "qwen3",
@@ -3764,6 +3776,7 @@ class TestInferenceTimeout:
             mock_settings.inference_timeout = 0.1  # Global 100ms timeout
             mock_settings.prompt_cache = False
             mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
             gen = await generate_completion(
                 mock_manager,
                 "qwen3",
