@@ -62,6 +62,7 @@ class LoadedExperts:
     group_size: int
     quant_mode: str = "affine"
     expert_index_map: dict[int, int] = field(default_factory=dict)
+    remap_lut: mx.array | None = None
 
 
 class ExpertCache:
@@ -377,6 +378,14 @@ class FlashMoeWeightStore:
         def _stack_or_none(lst):
             return mx.stack(lst) if lst else None
 
+        # Build device-side expert remap LUT: global expert idx -> local stack pos.
+        # Sentinel 0xFFFFFFFF marks unused entries (never dereferenced in practice
+        # because the dispatch gathers only indices present in expert_index_map).
+        lut = np.full(layout.num_experts, 0xFFFFFFFF, dtype=np.uint32)
+        for eidx, pos in expert_index_map.items():
+            lut[eidx] = pos
+        remap_lut = mx.array(lut)
+
         return LoadedExperts(
             gate_weight=_stack_or_none(components["gate_weight"]),
             gate_scales=_stack_or_none(components["gate_scales"]),
@@ -395,6 +404,7 @@ class FlashMoeWeightStore:
             group_size=layout.group_size,
             quant_mode=layout.quant_mode,
             expert_index_map=expert_index_map,
+            remap_lut=remap_lut,
         )
 
     def close(self) -> None:

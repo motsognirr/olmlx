@@ -193,6 +193,26 @@ class TestFlashMoeWeightStore:
 
         assert loaded.expert_index_map == {3: 0, 7: 1, 1: 2}
 
+    def test_load_experts_provides_remap_lut(self, store_with_model):
+        """LoadedExperts.remap_lut maps global expert indices to local stack positions."""
+        store, _, _, _, num_experts = store_with_model
+        expert_indices = [5, 2, 7]
+        loaded = store.load_experts(1, expert_indices)
+
+        assert loaded.remap_lut is not None
+        assert loaded.remap_lut.shape == (num_experts,)
+        assert loaded.remap_lut.dtype == mx.uint32
+
+        lut = loaded.remap_lut.tolist()
+        assert lut[5] == 0  # first requested global maps to stack pos 0
+        assert lut[2] == 1
+        assert lut[7] == 2
+        # Unrequested entries carry the sentinel
+        requested = set(expert_indices)
+        for i in range(num_experts):
+            if i not in requested:
+                assert lut[i] == 0xFFFFFFFF
+
     def test_load_experts_empty_indices_raises(self, store_with_model):
         """load_experts with empty indices should raise ValueError, not mx.stack crash."""
         store, _, _, _, _ = store_with_model
