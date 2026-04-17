@@ -336,17 +336,24 @@ class FlashMoeWeightStore:
         missing = [idx for idx in expert_indices if idx not in cached]
 
         # Load missing experts via parallel I/O; consume in completion order so
-        # slow readers do not block fast ones.
+        # slow readers do not block fast ones. On error cancel any queued-but-
+        # not-started futures (already-running reads run to completion anyway,
+        # but we avoid piling more work on the executor).
         if missing:
             future_to_idx = {
                 self._executor.submit(self._read_expert, layer_idx, idx): idx
                 for idx in missing
             }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                data = future.result()
-                cached[idx] = data
-                self._cache.put(layer_idx, idx, data)
+            try:
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    data = future.result()
+                    cached[idx] = data
+                    self._cache.put(layer_idx, idx, data)
+            except BaseException:
+                for f in future_to_idx:
+                    f.cancel()
+                raise
 
         # Build index map and stack arrays in input order
         expert_index_map = {eidx: i for i, eidx in enumerate(expert_indices)}

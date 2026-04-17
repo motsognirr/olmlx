@@ -80,9 +80,13 @@ class FlashMoE(nn.Module):
         loaded = self.weight_store.load_experts(self.layer_idx, unique_experts)
 
         # Vectorized device-side remap: lut[inds] gives local positions.
-        assert (
-            loaded.remap_lut is not None
-        )  # populated by FlashMoeWeightStore.load_experts
+        if loaded.remap_lut is None:
+            # load_experts must always populate this; an explicit raise gives a
+            # useful error if a future refactor breaks the invariant (assert
+            # would be stripped under python -O).
+            raise RuntimeError(
+                "FlashMoeWeightStore.load_experts must populate remap_lut; got None"
+            )
         remap = mx.take(loaded.remap_lut, inds.astype(mx.uint32))
 
         # Compute expert outputs using loaded weights.

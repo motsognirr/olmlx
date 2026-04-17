@@ -437,8 +437,10 @@ class TestTurboQuantKVCache:
             k_out, v_out = cache.update_and_fetch(k, v)
 
         # Oracle: quantize+dequantize the concatenated tensor in one shot.
-        # turboquant_quantize is row-wise (per-token norms/rotation), so concatenating
-        # then quantizing is equivalent to quantizing each row then stacking.
+        # turboquant_quantize is row-wise (per-token norms, rotation matmul with
+        # no cross-row state), so concatenating then quantizing is equivalent to
+        # quantizing each row then stacking — which is what the cache does
+        # internally during prefill, decode, and now the side-buffer splice.
         rk_ref = TurboQuantRotation(head_dim=D, seed=7)
         rv_ref = TurboQuantRotation(head_dim=D, seed=8)
         K = mx.concatenate(keys, axis=2)
@@ -484,6 +486,45 @@ class TestTurboQuantKVCache:
         )
         k_ref = v_ref = None
         for k, v in seq:
+            k_ref, v_ref = oracle.update_and_fetch(k, v)
+        assert mx.allclose(k_out, k_ref, atol=0, rtol=0)
+        assert mx.allclose(v_out, v_ref, atol=0, rtol=0)
+
+    def test_trim_resume_at_step_boundary(self):
+        """Fill exactly to a step boundary, trim=0 (no-op), then add one more.
+
+        Exercises the ``prev % self.step == 0`` branch of the resize path where
+        the old path truncated; the side buffer must still splice correctly.
+        """
+        from olmlx.engine.turboquant import TurboQuantRotation
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        B, H, D, bits = 1, 2, 32, 4
+        mx.random.seed(321)
+        # Fill exactly 256 tokens (one step worth), then append one.
+        keys = [mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(257)]
+        values = [mx.random.normal((B, H, 1, D)).astype(mx.float16) for _ in range(257)]
+
+        rk = TurboQuantRotation(head_dim=D, seed=33)
+        rv = TurboQuantRotation(head_dim=D, seed=34)
+        cache = TurboQuantKVCache(bits=bits, rotation_key=rk, rotation_value=rv)
+        k_out = v_out = None
+        for i, (k, v) in enumerate(zip(keys, values)):
+            if i == 256:
+                # At the boundary: trim=0 is a no-op, then the next update hits
+                # the resize branch with prev == self.step.
+                assert cache.offset == 256
+                cache.trim(0)
+            k_out, v_out = cache.update_and_fetch(k, v)
+
+        assert cache.offset == 257
+
+        # Oracle: fresh cache fed the same 257-token sequence.
+        rk2 = TurboQuantRotation(head_dim=D, seed=33)
+        rv2 = TurboQuantRotation(head_dim=D, seed=34)
+        oracle = TurboQuantKVCache(bits=bits, rotation_key=rk2, rotation_value=rv2)
+        k_ref = v_ref = None
+        for k, v in zip(keys, values):
             k_ref, v_ref = oracle.update_and_fetch(k, v)
         assert mx.allclose(k_out, k_ref, atol=0, rtol=0)
         assert mx.allclose(v_out, v_ref, atol=0, rtol=0)
