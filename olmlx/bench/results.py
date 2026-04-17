@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -288,7 +288,11 @@ class LeaderboardEntry:
     git_sha: str | None
     failed_scenarios: int
     total_scenarios: int
-    run_dir: Path
+    # Internal: used only as the same-timestamp tiebreaker key in
+    # build_leaderboard. Excluded from __eq__/__hash__/__repr__ so two
+    # entries with identical presentable fields compare equal regardless
+    # of where on disk they were loaded from.
+    run_dir: Path = field(compare=False, repr=False)
 
 
 def _run_dir_sort_key(name: str) -> tuple[str, int]:
@@ -323,8 +327,12 @@ def build_leaderboard(
     """
     if not bench_dir.is_dir():
         return []
+    try:
+        run_dirs = list(bench_dir.iterdir())
+    except OSError:
+        return []
     entries: list[LeaderboardEntry] = []
-    for run_dir in bench_dir.iterdir():
+    for run_dir in run_dirs:
         if not (run_dir / "results.json").exists():
             continue
         try:

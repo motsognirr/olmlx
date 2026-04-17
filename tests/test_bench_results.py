@@ -479,6 +479,40 @@ class TestBuildLeaderboard:
         entries = build_leaderboard(tmp_path)
         assert [e.model for e in entries] == ["good"]
 
+    def test_iterdir_oserror_returns_empty(self, tmp_path, monkeypatch):
+        # Simulate a bench_dir we can stat() but not iterate (e.g. wrong
+        # ownership). The function must not propagate the OSError.
+        from pathlib import Path
+
+        real_iterdir = Path.iterdir
+
+        def fake_iterdir(self):
+            if self == tmp_path:
+                raise PermissionError("denied")
+            yield from real_iterdir(self)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+        assert build_leaderboard(tmp_path) == []
+
+    def test_entry_equality_ignores_run_dir(self):
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        common = dict(
+            model="m",
+            best_tps=10.0,
+            best_scenario="s",
+            timestamp="t",
+            git_sha="g",
+            failed_scenarios=0,
+            total_scenarios=1,
+        )
+        a = LeaderboardEntry(**common, run_dir=Path("/a"))
+        b = LeaderboardEntry(**common, run_dir=Path("/b"))
+        assert a == b
+        assert hash(a) == hash(b)
+
     def test_tiebreaker_handles_double_digit_collision_counter(self, tmp_path):
         # 11 runs share one timestamp; save_run writes them to ...Z, ...Z-1,
         # ..., ...Z-10. The last (counter=10) must win — naive string order

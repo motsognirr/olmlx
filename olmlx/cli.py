@@ -1493,9 +1493,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bench_run.add_argument(
         "--output-dir",
+        "--bench-dir",
         type=str,
         default=None,
-        help="Output directory (default: ~/.olmlx/bench/runs)",
+        help="Directory to save the run in (default: ~/.olmlx/bench/runs)",
     )
 
     bench_compare = bench_sub.add_parser("compare", help="Compare two benchmark runs")
