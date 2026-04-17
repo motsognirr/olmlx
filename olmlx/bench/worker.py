@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -135,11 +136,13 @@ def main():
     prompts = json.loads(args.prompts_json.read_text())
 
     # Start olmlx serve inside this subprocess (inherits env vars set by runner)
-    cmd = [sys.executable, "-m", "olmlx", "serve", "--port", str(args.port)]
+    cmd = [sys.executable, "-m", "olmlx", "serve"]
+    env = {**os.environ, "OLMLX_PORT": str(args.port)}
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
         stderr=sys.stderr,
+        env=env,
     )
 
     try:
