@@ -19,7 +19,7 @@ from olmlx.engine.model_manager import (
     ModelManager,
     parse_keep_alive,
 )
-from olmlx.config import settings
+from olmlx.config import SyncMode, settings
 from olmlx.utils import memory as memory_utils
 
 try:
@@ -282,24 +282,81 @@ def _get_deferred_cleanup_lock() -> asyncio.Lock:
     return _deferred_cleanup_lock
 
 
-def _safe_sync():
-    """Synchronize Metal GPU state, suppressing and logging any errors.
-
-    Also syncs the generation stream (mlx_lm/mlx_vlm use a separate stream
-    from the default stream). This is critical to prevent 'command encoder
-    already encoding' errors when the background inference thread is still
-    writing to the GPU while a new request tries to start.
-    """
+def _sync_default_stream() -> None:
     try:
         mx.synchronize()
     except Exception:
         logger.debug("mx.synchronize() failed", exc_info=True)
 
+
+def _sync_generation_streams() -> None:
     for stream in _generation_streams:
         try:
             mx.synchronize(stream)
         except Exception:
             logger.debug("generation_stream sync failed", exc_info=True)
+
+
+def _safe_sync():
+    """Synchronize Metal GPU state unconditionally, suppressing and logging errors.
+
+    Syncs both the default stream and the generation stream (mlx_lm/mlx_vlm
+    use a separate stream from the default). Callers rely on this being
+    unconditional — notably cache-eviction and deferred-cleanup paths,
+    which must sync regardless of ``settings.sync_mode``.
+    """
+    _sync_default_stream()
+    _sync_generation_streams()
+
+
+def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
+    """Sync Metal GPU state at inference-lock entry/exit with configurable scope.
+
+    ``mode`` resolves per call (not cached) so a per-model override wins over
+    the global default. Values:
+
+    - ``"full"`` (default): identical to ``_safe_sync`` — sync default + all
+      generation streams.
+    - ``"minimal"``: sync the default stream only; skip the generation-stream
+      loop. Safe because ``_generate_sync`` and mlx_lm's ``stream_generate``
+      already synchronize the generation stream from inside the worker thread
+      before it exits. **Same mlx_lm-internals assumption as ``"none"`` for
+      the generation stream** — if mlx_lm ever drops that guarantee,
+      ``"minimal"`` streaming is as unsafe as ``"none"`` for the
+      generation-stream part (the default stream is still synced here).
+    - ``"none"``: skip lock-boundary sync entirely. Safety depends on
+      per-path guarantees that Metal work is complete before the lock
+      releases:
+
+      * ``_full_completion`` has ``_generate_sync`` → ``asyncio.to_thread``
+        which blocks until the worker thread returns, and the thread
+        calls ``mx.synchronize(generation_stream)`` before exit (see
+        ``_generate_sync`` body below).
+      * ``_stream_completion`` waits for ``drain_and_join``; mlx_lm's
+        ``stream_generate`` synchronizes the generation stream inside
+        its worker thread before exit. **This is an assumption about
+        mlx_lm internals** — if that guarantee ever changes upstream,
+        streaming under ``sync_mode="none"`` can reintroduce the
+        "command encoder already encoding" Metal crash that the
+        lock-boundary sync was added to prevent.
+      * ``generate_embeddings`` runs synchronously with no worker thread
+        and has its own load-bearing ``mx.synchronize()`` fallback
+        specifically because the above assumption doesn't apply there.
+
+    Cache-eviction and deferred-cleanup paths keep calling ``_safe_sync``
+    directly — they are not lock-boundary calls and must always synchronize.
+    """
+    effective = mode if mode is not None else settings.sync_mode
+    if effective == "none":
+        return
+    if effective == "minimal":
+        _sync_default_stream()
+        return
+    if effective == "full":
+        _sync_default_stream()
+        _sync_generation_streams()
+        return
+    raise ValueError(f"Unknown sync_mode: {effective!r}")
 
 
 class ServerBusyError(RuntimeError):
@@ -657,8 +714,17 @@ async def _acquire_inference_lock(timeout_override: float | None = None):
 
 
 @contextlib.asynccontextmanager
-async def _inference_locked(timeout_override: float | None = None):
-    """Async context manager that acquires the inference lock with Metal sync on entry/exit."""
+async def _inference_locked(
+    timeout_override: float | None = None,
+    *,
+    sync_mode: SyncMode | None = None,
+):
+    """Async context manager that acquires the inference lock with Metal sync on entry/exit.
+
+    ``sync_mode`` controls lock-boundary sync behavior (see
+    ``_lock_boundary_sync``). ``None`` defers to the global
+    ``settings.sync_mode``.
+    """
     global _queue_depth
     lock = _get_inference_lock()
     await _await_deferred_cleanup()
@@ -680,14 +746,35 @@ async def _inference_locked(timeout_override: float | None = None):
         raise
     # Sync the default Metal stream so any pending GPU work from the previous
     # inference completes before we start a new one.
-    _safe_sync()
+    try:
+        _lock_boundary_sync(sync_mode)
+    except BaseException:
+        # BaseException (not ValueError): this handler re-raises, so
+        # KeyboardInterrupt / SystemExit from mx.synchronize must be
+        # caught here long enough to release the lock before they
+        # propagate. Asymmetric with the exit handler below, which
+        # narrows to ValueError because it suppresses (the broader catch
+        # there would silently swallow shutdown signals).
+        lock.release()
+        raise
     try:
         yield
     finally:
         # Sync again on exit to ensure this inference's GPU work is fully
         # complete before releasing the lock to the next caller.
-        _safe_sync()
-        lock.release()
+        try:
+            _lock_boundary_sync(sync_mode)
+        except ValueError:
+            # Do NOT re-raise: that would mask any exception propagating
+            # from the yield body. Fall back to _safe_sync() so unknown
+            # modes fail-safe (sync anyway) instead of fail-open (no sync).
+            # Narrow to ValueError (not BaseException) so KeyboardInterrupt /
+            # SystemExit from mx.synchronize still propagate — those must
+            # not be silently swallowed during shutdown.
+            logger.error("exit _lock_boundary_sync failed", exc_info=True)
+            _safe_sync()
+        finally:
+            lock.release()
 
 
 @contextlib.contextmanager
@@ -1846,7 +1933,15 @@ async def _stream_completion(
         lock.release()
         raise
     # Sync default stream before starting — same purpose as _inference_locked entry.
-    _safe_sync()
+    try:
+        _lock_boundary_sync(lm.sync_mode)
+    except BaseException:
+        # BaseException (re-raise path): see _inference_locked entry for
+        # the rationale. Summary: must release the lock on any exception,
+        # including KeyboardInterrupt / SystemExit, so the shutdown
+        # signal can propagate without leaving the lock held.
+        lock.release()
+        raise
 
     # Everything after lock acquisition must be in try/finally so the lock is
     # always released — even if the generator is closed at a yield point
@@ -2105,8 +2200,23 @@ async def _stream_completion(
             await _schedule_deferred_inference_cleanup(stream)
         else:
             # Normal path — thread exited, safe to sync and release.
-            _safe_sync()
-            lock.release()
+            try:
+                _lock_boundary_sync(lm.sync_mode)
+            except ValueError:
+                # Don't re-raise: a stream-body exception is already mid-
+                # propagation through the outer finally, and masking it
+                # with an unknown-mode ValueError would erase the cause.
+                # Fall back to _safe_sync() so we still sync before
+                # releasing the lock. Narrow to ValueError so interrupt
+                # signals (KeyboardInterrupt / SystemExit) from
+                # mx.synchronize propagate instead of being swallowed.
+                logger.error(
+                    "exit _lock_boundary_sync failed in _stream_completion",
+                    exc_info=True,
+                )
+                _safe_sync()
+            finally:
+                lock.release()
 
 
 async def _full_completion(
@@ -2122,7 +2232,7 @@ async def _full_completion(
     # cannot be safely cancelled (releasing the lock while Metal is still
     # running causes concurrent command buffer access).  Streaming handles
     # this via CancellableStream.cancel() + drain_and_join().
-    async with _inference_locked(lm.inference_queue_timeout):
+    async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
         with _inference_ref(lm):
             return await _full_completion_inner(
                 lm, prompt, max_tokens, gen_kwargs, stats, images, has_tools=has_tools
@@ -2493,7 +2603,7 @@ async def generate_embeddings(
     """Generate embeddings using the model's hidden states or embed_tokens layer."""
     lm = await manager.ensure_loaded(model_name, keep_alive)
 
-    async with _inference_locked(lm.inference_queue_timeout):
+    async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
         with _inference_ref(lm):
             embeddings = []
 
@@ -2537,7 +2647,23 @@ async def generate_embeddings(
 
                 embeddings.append(embedding.tolist())
 
-            # Defensive sync — _inference_locked exit also syncs, but this
-            # ensures embedding tensors are fully evaluated before .tolist().
-            mx.synchronize()
+            # Load-bearing when sync_mode="none": this function runs
+            # synchronously under _inference_locked with no worker thread,
+            # so the lock-boundary exit sync may be skipped. This sync is
+            # then the only Metal barrier before the lock is released —
+            # do not remove without providing an equivalent barrier.
+            # Suppress+log rather than raise: the embeddings have already
+            # been .tolist()'d so the caller should still get the result;
+            # a Metal error here will surface on the next request.
+            try:
+                mx.synchronize()
+            except Exception:
+                # WARNING, not DEBUG: under sync_mode="none" this is the
+                # only Metal barrier in the path; a silent failure here
+                # typically surfaces as an uncatchable Metal crash on the
+                # next inference. Operators need to see it now, not after.
+                logger.warning(
+                    "embeddings post-compute sync failed — next inference will crash",
+                    exc_info=True,
+                )
             return embeddings

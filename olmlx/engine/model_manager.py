@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
-from olmlx.config import experimental as global_experimental
+from olmlx.config import SyncMode, experimental as global_experimental
 from olmlx.config import resolve_experimental, settings
 from olmlx.engine.registry import ModelRegistry
 from olmlx.utils import memory as memory_utils
@@ -520,6 +520,7 @@ class LoadedModel:
     default_options: dict = field(default_factory=dict)
     inference_queue_timeout: float | None = None
     inference_timeout: float | None = None
+    sync_mode: SyncMode | None = None
 
     def __post_init__(self):
         if self.prompt_cache_store is None:
@@ -906,6 +907,7 @@ class ModelManager:
                         default_options=dict(model_config.options),
                         inference_queue_timeout=model_config.inference_queue_timeout,
                         inference_timeout=model_config.inference_timeout,
+                        sync_mode=model_config.sync_mode,
                     )
                     self._probe_cache_trim_support(lm)
                     self._loaded[normalized] = lm
