@@ -320,7 +320,10 @@ def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
     - ``"minimal"``: sync the default stream only; skip the generation-stream
       loop. Safe because ``_generate_sync`` and mlx_lm's ``stream_generate``
       already synchronize the generation stream from inside the worker thread
-      before it exits.
+      before it exits. **Same mlx_lm-internals assumption as ``"none"`` for
+      the generation stream** — if mlx_lm ever drops that guarantee,
+      ``"minimal"`` streaming is as unsafe as ``"none"`` for the
+      generation-stream part (the default stream is still synced here).
     - ``"none"``: skip lock-boundary sync entirely. Safety depends on
       per-path guarantees that Metal work is complete before the lock
       releases:
@@ -2660,7 +2663,7 @@ async def generate_embeddings(
                 # typically surfaces as an uncatchable Metal crash on the
                 # next inference. Operators need to see it now, not after.
                 logger.warning(
-                    "embeddings post-compute sync failed — next inference may crash",
+                    "embeddings post-compute sync failed — next inference will crash",
                     exc_info=True,
                 )
             return embeddings

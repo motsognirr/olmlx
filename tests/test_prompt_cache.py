@@ -494,6 +494,7 @@ class TestNonTrimmableModelSkipsTrim:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -559,6 +560,7 @@ class TestNonTrimmableModelSkipsTrim:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
