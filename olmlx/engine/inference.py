@@ -741,10 +741,13 @@ async def _inference_locked(
         # complete before releasing the lock to the next caller.
         try:
             _lock_boundary_sync(sync_mode)
-        except BaseException:
+        except ValueError:
             # Do NOT re-raise: that would mask any exception propagating
             # from the yield body. Fall back to _safe_sync() so unknown
             # modes fail-safe (sync anyway) instead of fail-open (no sync).
+            # Narrow to ValueError (not BaseException) so KeyboardInterrupt /
+            # SystemExit from mx.synchronize still propagate — those must
+            # not be silently swallowed during shutdown.
             logger.error("exit _lock_boundary_sync failed", exc_info=True)
             _safe_sync()
         finally:
@@ -2172,12 +2175,14 @@ async def _stream_completion(
             # Normal path — thread exited, safe to sync and release.
             try:
                 _lock_boundary_sync(lm.sync_mode)
-            except BaseException:
+            except ValueError:
                 # Don't re-raise: a stream-body exception is already mid-
                 # propagation through the outer finally, and masking it
                 # with an unknown-mode ValueError would erase the cause.
                 # Fall back to _safe_sync() so we still sync before
-                # releasing the lock.
+                # releasing the lock. Narrow to ValueError so interrupt
+                # signals (KeyboardInterrupt / SystemExit) from
+                # mx.synchronize propagate instead of being swallowed.
                 logger.error(
                     "exit _lock_boundary_sync failed in _stream_completion",
                     exc_info=True,

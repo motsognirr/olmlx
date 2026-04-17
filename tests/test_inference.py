@@ -2023,8 +2023,10 @@ class TestLockBoundarySync:
             _lock_boundary_sync("none")
             assert mock_mx.synchronize.call_count == 0
 
-    def test_none_mode_falls_back_to_global_setting(self):
-        """mode=None should resolve to settings.sync_mode."""
+    def test_null_mode_falls_back_to_global_setting(self):
+        """mode=None (Python None sentinel, not the "none" SyncMode string)
+        should resolve to settings.sync_mode. The two are opposite: None
+        inherits the global, "none" skips all sync."""
         mock_stream = MagicMock()
         with (
             patch("olmlx.engine.inference.mx") as mock_mx,
