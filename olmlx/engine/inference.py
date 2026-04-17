@@ -729,14 +729,20 @@ async def _inference_locked(
         raise
     # Sync the default Metal stream so any pending GPU work from the previous
     # inference completes before we start a new one.
-    _lock_boundary_sync(sync_mode)
+    try:
+        _lock_boundary_sync(sync_mode)
+    except BaseException:
+        lock.release()
+        raise
     try:
         yield
     finally:
         # Sync again on exit to ensure this inference's GPU work is fully
         # complete before releasing the lock to the next caller.
-        _lock_boundary_sync(sync_mode)
-        lock.release()
+        try:
+            _lock_boundary_sync(sync_mode)
+        finally:
+            lock.release()
 
 
 @contextlib.contextmanager
@@ -1895,7 +1901,11 @@ async def _stream_completion(
         lock.release()
         raise
     # Sync default stream before starting — same purpose as _inference_locked entry.
-    _lock_boundary_sync(lm.sync_mode)
+    try:
+        _lock_boundary_sync(lm.sync_mode)
+    except BaseException:
+        lock.release()
+        raise
 
     # Everything after lock acquisition must be in try/finally so the lock is
     # always released — even if the generator is closed at a yield point
@@ -2154,8 +2164,10 @@ async def _stream_completion(
             await _schedule_deferred_inference_cleanup(stream)
         else:
             # Normal path — thread exited, safe to sync and release.
-            _lock_boundary_sync(lm.sync_mode)
-            lock.release()
+            try:
+                _lock_boundary_sync(lm.sync_mode)
+            finally:
+                lock.release()
 
 
 async def _full_completion(

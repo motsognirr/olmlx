@@ -2082,6 +2082,39 @@ class TestInferenceLocked:
             for call in mock_mx.synchronize.call_args_list:
                 assert call.args == ()
 
+    @pytest.mark.asyncio
+    async def test_lock_released_if_entry_sync_raises(self):
+        """If entry _lock_boundary_sync raises, the inference lock must be released."""
+        assert not _inference_lock.locked()
+        with patch(
+            "olmlx.engine.inference._lock_boundary_sync",
+            side_effect=ValueError("boom"),
+        ):
+            with pytest.raises(ValueError, match="boom"):
+                async with _inference_locked():
+                    pass
+        assert not _inference_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_lock_released_if_exit_sync_raises(self):
+        """If exit _lock_boundary_sync raises in the finally block, lock must
+        still be released (inner try/finally)."""
+        assert not _inference_lock.locked()
+        calls = {"n": 0}
+
+        def side_effect(*_a, **_kw):
+            calls["n"] += 1
+            if calls["n"] == 2:  # only raise on exit sync
+                raise ValueError("exit boom")
+
+        with patch(
+            "olmlx.engine.inference._lock_boundary_sync", side_effect=side_effect
+        ):
+            with pytest.raises(ValueError, match="exit boom"):
+                async with _inference_locked():
+                    pass
+        assert not _inference_lock.locked()
+
 
 class TestInferenceLockedWaitsDeferredCleanup:
     @pytest.mark.asyncio

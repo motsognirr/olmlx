@@ -218,27 +218,41 @@ class TestDrainAndJoinBlocksNewInference:
         holds the inference lock while the worker thread may still be using
         the GPU and *must* sync before releasing the lock. Guard against a
         future edit that unifies the call sites.
-        """
-        import inspect
 
-        sources = [
-            ("_setup_prompt_cache", inspect.getsource(_inf_mod._setup_prompt_cache)),
-            (
-                "_kv_cache_preflight_check",
-                inspect.getsource(_inf_mod._kv_cache_preflight_check),
-            ),
+        Uses bytecode-level name introspection rather than source text so
+        nested helpers, refactors, or docstring references to the names
+        don't produce false positives/negatives.
+        """
+
+        def names_referenced(fn):
+            """Return the set of names referenced in fn's bytecode, including
+            any nested (closure / inner-function) code objects."""
+            seen = set()
+            stack = [fn.__code__]
+            while stack:
+                code = stack.pop()
+                seen.update(code.co_names)
+                for const in code.co_consts:
+                    if hasattr(const, "co_names"):
+                        stack.append(const)
+            return seen
+
+        funcs = [
+            ("_setup_prompt_cache", _inf_mod._setup_prompt_cache),
+            ("_kv_cache_preflight_check", _inf_mod._kv_cache_preflight_check),
             (
                 "_schedule_deferred_inference_cleanup",
-                inspect.getsource(_inf_mod._schedule_deferred_inference_cleanup),
+                _inf_mod._schedule_deferred_inference_cleanup,
             ),
         ]
-        for func_name, source in sources:
-            assert "_safe_sync" in source, (
-                f"{func_name}: must call _safe_sync() (Bug #120 / "
+        for func_name, fn in funcs:
+            names = names_referenced(fn)
+            assert "_safe_sync" in names, (
+                f"{func_name}: must reference _safe_sync (Bug #120 / "
                 f"deferred-cleanup correctness)"
             )
-            assert "_lock_boundary_sync" not in source, (
-                f"{func_name}: must NOT use _lock_boundary_sync — "
+            assert "_lock_boundary_sync" not in names, (
+                f"{func_name}: must NOT reference _lock_boundary_sync — "
                 f"that helper honors sync_mode='none' and would silently skip "
                 f"the Metal sync needed here"
             )
