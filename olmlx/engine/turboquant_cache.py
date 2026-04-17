@@ -39,7 +39,10 @@ class TurboQuantKVCache(_BaseCache):
       overlaps the returned slice is overwritten first.
     - The side buffer is allocated once per cache with a fixed dtype derived
       from the first ``keys`` seen. Subsequent calls with a different dtype
-      raise ``ValueError`` rather than silently mixing types on grow.
+      raise ``ValueError`` rather than silently mixing types on grow. A full
+      ``trim`` (``offset == 0``) clears the lock — the next ``update_and_fetch``
+      may use a new dtype. A partial trim preserves the lock (the retained
+      ``[0:offset)`` slice is still valid in the original dtype).
     """
 
     step = 256
@@ -107,6 +110,10 @@ class TurboQuantKVCache(_BaseCache):
                     and self._key_dequant is not None
                     and self._value_dequant is not None
                 )
+                # When ``prev % step == 0`` we skip truncation. Safe because
+                # resize only triggers when ``prev + num_steps > capacity``, so
+                # the ``[prev:prev+num_steps]`` write below covers the full stale
+                # range ``[prev:old_capacity]``.
                 if prev % self.step != 0:
                     self._key_indices = self._key_indices[..., :prev, :]
                     self._key_norms = self._key_norms[..., :prev, :]
