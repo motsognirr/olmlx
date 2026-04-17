@@ -138,6 +138,74 @@ class TestFlashMoE:
         output = flash_moe(x, inds, scores)
         assert output.shape == (batch_size, seq_len, hidden)
 
+    def test_output_matches_python_remap_reference(self, tmp_path):
+        """mx.take-based remap must produce bit-identical output to a Python-list remap."""
+        hidden, inter, experts = 32, 16, 8
+        flash_moe, store, _ = _setup_flash_moe(
+            tmp_path, hidden, inter, experts, num_experts_per_tok=2
+        )
+
+        x = mx.random.normal((2, 4, hidden))
+        # Mix of repeated and distinct experts to exercise the remap fully
+        inds = mx.array(
+            [
+                [[0, 3], [1, 5], [0, 3], [2, 7]],
+                [[4, 6], [1, 5], [2, 7], [0, 3]],
+            ]
+        )
+        scores = mx.softmax(mx.random.normal(inds.shape).astype(mx.float32), axis=-1)
+
+        out_new = flash_moe(x, inds, scores)
+        mx.eval(out_new)
+
+        # Reference: reconstruct output using a pure-Python remap on the same cached
+        # weights. Pull them back via store.load_experts (deterministic for the same set).
+        B, L, K = inds.shape
+        flat = inds.reshape(-1).tolist()
+        unique = sorted(set(flat))
+        loaded = store.load_experts(layer_idx=0, expert_indices=unique)
+        idx_map = loaded.expert_index_map
+        remap_py = mx.array(
+            [idx_map[int(i)] for i in flat], dtype=mx.uint32
+        ).reshape(B, L, K)
+
+        x_expanded = mx.expand_dims(x, (-2, -3))
+        if loaded.is_quantized:
+            qkw = dict(
+                transpose=True,
+                group_size=loaded.group_size,
+                bits=loaded.bits,
+                mode=loaded.quant_mode,
+            )
+            g = mx.gather_qmm(
+                x_expanded, loaded.gate_weight, loaded.gate_scales, loaded.gate_biases,
+                rhs_indices=remap_py, **qkw,
+            )
+            u = mx.gather_qmm(
+                x_expanded, loaded.up_weight, loaded.up_scales, loaded.up_biases,
+                rhs_indices=remap_py, **qkw,
+            )
+            act = nn.silu(g) * u
+            e = mx.gather_qmm(
+                act, loaded.down_weight, loaded.down_scales, loaded.down_biases,
+                rhs_indices=remap_py, **qkw,
+            )
+        else:
+            g = mx.gather_mm(  # pyright: ignore[reportCallIssue]
+                x_expanded, loaded.gate_weight.swapaxes(-1, -2), rhs_indices=remap_py
+            )
+            u = mx.gather_mm(  # pyright: ignore[reportCallIssue]
+                x_expanded, loaded.up_weight.swapaxes(-1, -2), rhs_indices=remap_py
+            )
+            act = nn.silu(g) * u
+            e = mx.gather_mm(  # pyright: ignore[reportCallIssue]
+                act, loaded.down_weight.swapaxes(-1, -2), rhs_indices=remap_py
+            )
+        e = e.squeeze(-2)
+        out_ref = (e * scores[..., None]).sum(axis=-2).astype(x.dtype)
+
+        assert mx.allclose(out_new, out_ref, atol=0, rtol=0)
+
 
 def _setup_nemotron_flash_moe(
     tmp_path, hidden=64, inter=32, experts=8, num_experts_per_tok=2
