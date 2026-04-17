@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator
 from typing import Any, Literal, overload
 
 import mlx.core as mx
@@ -957,23 +957,16 @@ def _apply_chat_template(
     *,
     tokenize: bool = False,
     enable_thinking: bool | None = None,
-    add_generation_prompt: bool = True,
 ) -> Any:
     """Core chat template application.
 
     Uses TemplateCaps to decide which kwargs to pass, avoiding blind try/except.
     Returns str when tokenize=False, token list/dict when tokenize=True.
-
-    `add_generation_prompt=False` is used when re-rendering history including
-    the completed assistant turn (for hybrid-cache stable-prefix storage).
     """
     if caps is None:
         caps = TemplateCaps()
 
-    kwargs: dict[str, Any] = {
-        "tokenize": tokenize,
-        "add_generation_prompt": add_generation_prompt,
-    }
+    kwargs: dict[str, Any] = {"tokenize": tokenize, "add_generation_prompt": True}
 
     if tools and caps.supports_tools:
         kwargs["tools"] = tools
@@ -1021,7 +1014,6 @@ def _apply_chat_template_text(
     caps: TemplateCaps | None = None,
     *,
     enable_thinking: bool | None = None,
-    add_generation_prompt: bool = True,
 ) -> str:
     """Apply chat template for text-only models (mlx-lm), returning prompt text."""
     return _apply_chat_template(
@@ -1031,7 +1023,6 @@ def _apply_chat_template_text(
         caps,
         tokenize=False,
         enable_thinking=enable_thinking,
-        add_generation_prompt=add_generation_prompt,
     )
 
 
@@ -1708,46 +1699,6 @@ async def _kv_cache_preflight_check(
     return result
 
 
-def _advance_cache_to_prefix(
-    lm: LoadedModel,
-    prompt_cache: list,
-    current_tokens: list[int],
-    target_tokens: list[int],
-) -> list[int] | None:
-    """Feed the trailing delta between `current_tokens` and `target_tokens`
-    through the model so the KV cache offset advances to len(target_tokens).
-
-    Used on hybrid (non-trimmable) models to store a `cached.tokens` that
-    matches the next turn's re-rendered prefix exactly, unlocking strict-
-    extension reuse.  Returns `target_tokens` on success, None on failure
-    (caller should fall back to the raw prompt+generated sequence).
-    """
-    n = len(current_tokens)
-    if target_tokens[:n] != current_tokens:
-        logger.debug(
-            "Stable-prefix rejected: tokenizer output diverges from cached "
-            "sequence at %d tokens",
-            _find_common_prefix(current_tokens, target_tokens)
-            if _find_common_prefix
-            else -1,
-        )
-        return None
-    extra = target_tokens[n:]
-    if not extra:
-        return list(target_tokens)
-    try:
-        model = _get_model_for_cache(lm.model, lm.is_vlm)
-        x = mx.array([extra])
-        _ = model(x, cache=prompt_cache)
-        # Force KV materialisation before we store the cache reference
-        # (mlx is lazy).  Mirrors mlx-lm's own prefill eval pattern.
-        mx.eval([c.state for c in prompt_cache])
-        return list(target_tokens)
-    except Exception:
-        logger.debug("Stable-prefix cache extension failed", exc_info=True)
-        return None
-
-
 async def _store_prompt_cache_after_generation(
     lm: LoadedModel,
     gen_kwargs: dict,
@@ -1755,57 +1706,18 @@ async def _store_prompt_cache_after_generation(
     generated_tokens: list[int],
     eval_count: int,
     cache_id: str,
-    stable_prefix_builder: Callable[[list[int]], list[int] | None] | None = None,
 ) -> None:
     """Store prompt cache state after successful generation.
 
     Handles trimming to max_cache_tokens, eviction pressure cleanup,
     and cache invalidation on trim failure.
-
-    `stable_prefix_builder` is used for hybrid (non-trimmable) models:
-    given the generated token IDs, it returns the token sequence the next
-    turn's prompt will start with (via re-rendering the chat template with
-    the completed assistant turn).  The KV cache is then advanced to that
-    length so a strict-extension next turn hits the cache.
     """
     prompt_cache = gen_kwargs.get("prompt_cache")
     if prompt_cache is None or full_prompt_tokens is None:
         return
 
-    raw_sequence = list(full_prompt_tokens) + generated_tokens
-    stored_tokens: list[int] = raw_sequence
-    used_stable_prefix = False
-    # Only attempt stable-prefix extension when the raw sequence is
-    # consistent (eval_count matches generated_tokens length — no tokens
-    # dropped due to None IDs).
-    if (
-        stable_prefix_builder is not None
-        and eval_count == len(generated_tokens)
-        and generated_tokens
-    ):
-        try:
-            target = stable_prefix_builder(generated_tokens)
-        except Exception:
-            logger.debug(
-                "Stable-prefix builder failed; falling back to raw sequence",
-                exc_info=True,
-            )
-            target = None
-        if target is not None:
-            advanced = _advance_cache_to_prefix(lm, prompt_cache, raw_sequence, target)
-            if advanced is not None:
-                stored_tokens = advanced
-                used_stable_prefix = True
-                logger.debug(
-                    "Stable-prefix cache: stored %d tokens (raw=%d + boundary=%d)",
-                    len(stored_tokens),
-                    len(raw_sequence),
-                    len(stored_tokens) - len(raw_sequence),
-                )
-    # KV cache depth: stable path = len(stored_tokens) (we advanced the cache
-    # by the boundary delta); raw path = prompt + model-reported eval_count.
-    raw_depth = len(full_prompt_tokens) + eval_count
-    actual_total = len(stored_tokens) if used_stable_prefix else raw_depth
+    stored_tokens = list(full_prompt_tokens) + generated_tokens
+    actual_total = len(full_prompt_tokens) + eval_count
     max_cache_tokens = settings.prompt_cache_max_tokens
     if max_cache_tokens is not None and actual_total > max_cache_tokens:
         trim_amount = actual_total - max_cache_tokens
@@ -1914,7 +1826,6 @@ async def _stream_completion(
     use_prompt_cache: bool = False,
     prompt_tokens: list[int] | None = None,
     cache_id: str = "",
-    stable_prefix_builder: Callable[[list[int]], list[int] | None] | None = None,
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
@@ -2141,7 +2052,6 @@ async def _stream_completion(
                 generated_tokens,
                 stats.eval_count,
                 cache_id,
-                stable_prefix_builder=stable_prefix_builder,
             )
 
         # raw_text contains the complete unfiltered output (e.g. gpt-oss channel tokens).
@@ -2562,60 +2472,6 @@ async def generate_chat(
             make_prompt_cache is not None,
         )
 
-    # Hybrid sliding-window models (Gemma 4, Qwen3-Next) can't be trimmed,
-    # so storing `prompt + raw_generated` produces cache.tokens that diverge
-    # from the next turn's chat-template rendering at the assistant-turn
-    # boundary.  Build a closure that, after generation, re-renders the
-    # chat template with the completed assistant turn (add_generation_prompt=
-    # False) and tokenizes it; `_store_prompt_cache_after_generation` then
-    # extends the KV cache forward to match, so a strict-extension next
-    # turn hits the cache.
-    # Skipped for image requests: re-rendering pure-text history wouldn't
-    # reproduce the image placeholder tokens emitted by the VLM processor.
-    # Must use the SAME chat-template applier that produced `prompt` above
-    # (mlx_vlm's vs mlx-lm's), otherwise the re-rendered tokens won't match
-    # the original prompt tokens even at position 0.
-    stable_prefix_builder: Callable[[list[int]], list[int] | None] | None = None
-    if use_prompt_cache and not lm.supports_cache_trim and not images:
-        # Per-message shallow copy so a caller mutating message dicts after
-        # the generator returns (e.g. in-place content edits) can't race
-        # with the deferred re-render inside the closure.
-        _messages_snapshot = [dict(m) for m in messages]
-        _enable_thinking = enable_thinking
-        _tools = tools
-        _is_vlm = lm.is_vlm
-
-        def _build_stable_prefix(generated_ids: list[int]) -> list[int] | None:
-            gen_text = lm.text_tokenizer.decode(generated_ids)
-            extended = _messages_snapshot + [{"role": "assistant", "content": gen_text}]
-            if _is_vlm:
-                import mlx_vlm
-
-                vlm_config = lm.model.config if hasattr(lm.model, "config") else {}
-                rendered = mlx_vlm.apply_chat_template(
-                    lm.tokenizer,
-                    vlm_config,
-                    extended,
-                    add_generation_prompt=False,
-                    num_images=0,
-                )
-                if not isinstance(rendered, str):
-                    # Signal rejection; empty list would silently pass the
-                    # `target is not None` gate in the store path.
-                    return None
-            else:
-                rendered = _apply_chat_template_text(
-                    lm.text_tokenizer,
-                    extended,
-                    _tools,
-                    caps=lm.template_caps,
-                    enable_thinking=_enable_thinking,
-                    add_generation_prompt=False,
-                )
-            return _tokenize_for_cache(lm.text_tokenizer, rendered)
-
-        stable_prefix_builder = _build_stable_prefix
-
     if stream:
         return _stream_completion(
             lm,
@@ -2627,7 +2483,6 @@ async def generate_chat(
             use_prompt_cache=use_prompt_cache,
             prompt_tokens=prompt_tokens,
             cache_id=cache_id,
-            stable_prefix_builder=stable_prefix_builder,
         )
     else:
         return await _full_completion(
