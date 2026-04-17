@@ -1856,6 +1856,31 @@ class TestGenerateEmbeddings:
         result = await generate_embeddings(mock_manager, "qwen3", ["hello", "world"])
         assert len(result) == 2
 
+    @pytest.mark.asyncio
+    async def test_sync_mode_none_still_syncs_metal(self, mock_manager):
+        """With lm.sync_mode='none', the lock-boundary sync is skipped, but
+        the inline load-bearing mx.synchronize() at the tail of
+        generate_embeddings must still run — it's the only Metal barrier
+        before the inference lock is released. Guards against a future
+        refactor that wraps that call in a `sync_mode != "none"` check.
+        """
+        import mlx.core as mx
+
+        self._setup_tokenizer(mock_manager)
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.sync_mode = "none"
+        model = lm.model
+        model.model = MagicMock()
+        model.model.embed_tokens = MagicMock(return_value=mx.zeros((1, 3, 4)))
+
+        with patch.object(_inf_mod.mx, "synchronize") as mock_sync:
+            result = await generate_embeddings(mock_manager, "qwen3", ["hello"])
+        assert len(result) == 1
+        # sync_mode="none" skips entry + exit _lock_boundary_sync, so the
+        # only synchronize() call should be the inline load-bearing one.
+        assert mock_sync.call_count == 1
+
 
 class TestStreamCancellationHoldsLock:
     @pytest.mark.asyncio
@@ -3954,7 +3979,7 @@ class TestStreamCompletionLockLeakOnSyncFailure:
             mock_settings.inference_timeout = None
             mock_settings.prompt_cache = False
             mock_settings.memory_limit_fraction = 0.9
-            mock_settings.sync_mode = "full"  # per-model None override wins
+            mock_settings.sync_mode = "full"  # per-model "none" wins over global "full"
             gen = await generate_completion(mock_manager, "qwen3", "Hello", stream=True)
             async for _ in gen:
                 pass
