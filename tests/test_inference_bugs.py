@@ -208,6 +208,36 @@ class TestDrainAndJoinBlocksNewInference:
             "Expected at least one evict_all_to_disk call across completion functions"
         )
 
+    def test_eviction_uses_safe_sync_not_lock_boundary_sync(self):
+        """Eviction paths must use _safe_sync (unconditional) — not _lock_boundary_sync.
+
+        _lock_boundary_sync honors per-model/global sync_mode and can be
+        'none', which would silently skip the post-eviction sync needed to
+        reclaim freed Metal buffers (Bug #120). Guard against a future edit
+        that unifies the call sites.
+        """
+        import inspect
+
+        sources = [
+            ("_setup_prompt_cache", inspect.getsource(_inf_mod._setup_prompt_cache)),
+            (
+                "_kv_cache_preflight_check",
+                inspect.getsource(_inf_mod._kv_cache_preflight_check),
+            ),
+        ]
+        for func_name, source in sources:
+            assert "mx.clear_cache" in source, (
+                f"{func_name}: expected mx.clear_cache() in eviction path"
+            )
+            assert "_safe_sync" in source, (
+                f"{func_name}: eviction path must call _safe_sync() (Bug #120)"
+            )
+            assert "_lock_boundary_sync" not in source, (
+                f"{func_name}: eviction path must NOT use _lock_boundary_sync — "
+                f"that helper honors sync_mode='none' and would silently skip "
+                f"the post-eviction Metal sync needed to reclaim freed buffers"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Bug #123: Prompt cache state corruption on mid-stream disconnect

@@ -282,24 +282,62 @@ def _get_deferred_cleanup_lock() -> asyncio.Lock:
     return _deferred_cleanup_lock
 
 
-def _safe_sync():
-    """Synchronize Metal GPU state, suppressing and logging any errors.
-
-    Also syncs the generation stream (mlx_lm/mlx_vlm use a separate stream
-    from the default stream). This is critical to prevent 'command encoder
-    already encoding' errors when the background inference thread is still
-    writing to the GPU while a new request tries to start.
-    """
+def _sync_default_stream() -> None:
     try:
         mx.synchronize()
     except Exception:
         logger.debug("mx.synchronize() failed", exc_info=True)
 
+
+def _sync_generation_streams() -> None:
     for stream in _generation_streams:
         try:
             mx.synchronize(stream)
         except Exception:
             logger.debug("generation_stream sync failed", exc_info=True)
+
+
+def _safe_sync():
+    """Synchronize Metal GPU state unconditionally, suppressing and logging errors.
+
+    Syncs both the default stream and the generation stream (mlx_lm/mlx_vlm
+    use a separate stream from the default). Callers rely on this being
+    unconditional — notably cache-eviction and deferred-cleanup paths,
+    which must sync regardless of ``settings.sync_mode``.
+    """
+    _sync_default_stream()
+    _sync_generation_streams()
+
+
+SyncMode = Literal["full", "minimal", "none"]
+
+
+def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
+    """Sync Metal GPU state at inference-lock entry/exit with configurable scope.
+
+    ``mode`` resolves per call (not cached) so a per-model override wins over
+    the global default. Values:
+
+    - ``"full"`` (default): identical to ``_safe_sync`` — sync default + all
+      generation streams.
+    - ``"minimal"``: sync the default stream only; skip the generation-stream
+      loop. Safe because ``_generate_sync`` and mlx_lm's ``stream_generate``
+      already synchronize the generation stream from inside the worker thread
+      before it exits.
+    - ``"none"``: skip lock-boundary sync entirely. Only safe when the
+      inference paths relied upon (``_generate_sync`` → ``asyncio.to_thread``
+      return, or streaming ``drain_and_join``) have produced their own
+      per-request sync.
+
+    Cache-eviction and deferred-cleanup paths keep calling ``_safe_sync``
+    directly — they are not lock-boundary calls and must always synchronize.
+    """
+    effective = mode if mode is not None else settings.sync_mode
+    if effective == "none":
+        return
+    _sync_default_stream()
+    if effective == "full":
+        _sync_generation_streams()
 
 
 class ServerBusyError(RuntimeError):
@@ -657,8 +695,17 @@ async def _acquire_inference_lock(timeout_override: float | None = None):
 
 
 @contextlib.asynccontextmanager
-async def _inference_locked(timeout_override: float | None = None):
-    """Async context manager that acquires the inference lock with Metal sync on entry/exit."""
+async def _inference_locked(
+    timeout_override: float | None = None,
+    *,
+    sync_mode: SyncMode | None = None,
+):
+    """Async context manager that acquires the inference lock with Metal sync on entry/exit.
+
+    ``sync_mode`` controls lock-boundary sync behavior (see
+    ``_lock_boundary_sync``). ``None`` defers to the global
+    ``settings.sync_mode``.
+    """
     global _queue_depth
     lock = _get_inference_lock()
     await _await_deferred_cleanup()
@@ -680,13 +727,13 @@ async def _inference_locked(timeout_override: float | None = None):
         raise
     # Sync the default Metal stream so any pending GPU work from the previous
     # inference completes before we start a new one.
-    _safe_sync()
+    _lock_boundary_sync(sync_mode)
     try:
         yield
     finally:
         # Sync again on exit to ensure this inference's GPU work is fully
         # complete before releasing the lock to the next caller.
-        _safe_sync()
+        _lock_boundary_sync(sync_mode)
         lock.release()
 
 
@@ -1846,7 +1893,7 @@ async def _stream_completion(
         lock.release()
         raise
     # Sync default stream before starting — same purpose as _inference_locked entry.
-    _safe_sync()
+    _lock_boundary_sync(lm.sync_mode)
 
     # Everything after lock acquisition must be in try/finally so the lock is
     # always released — even if the generator is closed at a yield point
@@ -2105,7 +2152,7 @@ async def _stream_completion(
             await _schedule_deferred_inference_cleanup(stream)
         else:
             # Normal path — thread exited, safe to sync and release.
-            _safe_sync()
+            _lock_boundary_sync(lm.sync_mode)
             lock.release()
 
 
@@ -2122,7 +2169,7 @@ async def _full_completion(
     # cannot be safely cancelled (releasing the lock while Metal is still
     # running causes concurrent command buffer access).  Streaming handles
     # this via CancellableStream.cancel() + drain_and_join().
-    async with _inference_locked(lm.inference_queue_timeout):
+    async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
         with _inference_ref(lm):
             return await _full_completion_inner(
                 lm, prompt, max_tokens, gen_kwargs, stats, images, has_tools=has_tools
@@ -2493,7 +2540,7 @@ async def generate_embeddings(
     """Generate embeddings using the model's hidden states or embed_tokens layer."""
     lm = await manager.ensure_loaded(model_name, keep_alive)
 
-    async with _inference_locked(lm.inference_queue_timeout):
+    async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
         with _inference_ref(lm):
             embeddings = []
 
