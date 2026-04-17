@@ -602,6 +602,35 @@ class TestTurboQuantKVCache:
         with pytest.raises(ValueError, match="dtype"):
             cache.update_and_fetch(k2, v2)
 
+    def test_full_trim_allows_dtype_change(self):
+        """A full trim resets ``_dequant_dtype``; a subsequent update with a
+        different dtype must succeed (the lock is per cache lifetime, not per
+        cache instance)."""
+        from olmlx.engine.turboquant import TurboQuantRotation
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        B, H, D = 1, 2, 32
+        rk = TurboQuantRotation(head_dim=D, seed=57)
+        rv = TurboQuantRotation(head_dim=D, seed=58)
+        cache = TurboQuantKVCache(bits=4, rotation_key=rk, rotation_value=rv)
+
+        k1 = mx.random.normal((B, H, 1, D)).astype(mx.float16)
+        v1 = mx.random.normal((B, H, 1, D)).astype(mx.float16)
+        cache.update_and_fetch(k1, v1)
+        assert cache._dequant_dtype == mx.float16
+
+        cache.trim(cache.offset)
+        assert cache._dequant_dtype is None
+        assert cache._key_dequant is None
+        assert cache._value_dequant is None
+
+        k2 = mx.random.normal((B, H, 1, D)).astype(mx.float32)
+        v2 = mx.random.normal((B, H, 1, D)).astype(mx.float32)
+        k_out, v_out = cache.update_and_fetch(k2, v2)
+        assert k_out.dtype == mx.float32
+        assert v_out.dtype == mx.float32
+        assert cache._dequant_dtype == mx.float32
+
     def test_state_getter_excludes_side_buffer(self):
         """state must still be [key_indices, key_norms, value_indices, value_norms]."""
         cache = self._make_cache(bits=4, head_dim=32)

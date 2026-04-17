@@ -71,6 +71,9 @@ class FlashMoE(nn.Module):
             Output hidden states, shape (B, L, hidden_size).
         """
         # Collect unique expert indices for the SSD read list (Python-side, one eval per layer).
+        # Invariant: ``unique_experts`` must contain every value in ``inds`` so the remap LUT
+        # has a valid entry for each routed token. ``mx.take`` would silently return the
+        # sentinel 0xFFFFFFFF otherwise — keep these two derivations from the same ``inds``.
         mx.eval(inds)
         flat_inds = inds.reshape(-1).tolist()
         unique_experts = sorted(set(flat_inds))
