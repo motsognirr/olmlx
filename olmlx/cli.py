@@ -1066,11 +1066,14 @@ def cmd_bench_compare(args):
     print(compare_runs(run1, run2))
 
 
-def cmd_bench_list(_args):
+def cmd_bench_list(args):
     """List past benchmark runs."""
-    from olmlx.bench.results import list_runs
+    from pathlib import Path
 
-    runs = list_runs()
+    from olmlx.bench.results import DEFAULT_BENCH_DIR, list_runs
+
+    bench_dir = Path(args.bench_dir) if args.bench_dir else DEFAULT_BENCH_DIR
+    runs = list_runs(bench_dir)
     if not runs:
         print("No benchmark runs found.")
         return
@@ -1095,9 +1098,16 @@ def _positive_int(value: str) -> int:
 
 def cmd_bench_leaderboard(args):
     """Show the model leaderboard derived from saved bench runs."""
-    from olmlx.bench.results import build_leaderboard, format_leaderboard
+    from pathlib import Path
 
-    entries = build_leaderboard(latest_per_model=not args.all_runs)
+    from olmlx.bench.results import (
+        DEFAULT_BENCH_DIR,
+        build_leaderboard,
+        format_leaderboard,
+    )
+
+    bench_dir = Path(args.bench_dir) if args.bench_dir else DEFAULT_BENCH_DIR
+    entries = build_leaderboard(bench_dir, latest_per_model=not args.all_runs)
     if not entries:
         print("No bench runs with valid measurements found.")
         return
@@ -1492,7 +1502,13 @@ def build_parser() -> argparse.ArgumentParser:
     bench_compare.add_argument("run1", help="First run (timestamp or path)")
     bench_compare.add_argument("run2", help="Second run (timestamp or path)")
 
-    bench_sub.add_parser("list", help="List past benchmark runs")
+    bench_list = bench_sub.add_parser("list", help="List past benchmark runs")
+    bench_list.add_argument(
+        "--bench-dir",
+        type=str,
+        default=None,
+        help="Directory to read runs from (default: ~/.olmlx/bench/runs)",
+    )
 
     bench_lb = bench_sub.add_parser(
         "leaderboard", help="Show model leaderboard derived from past runs"
@@ -1507,6 +1523,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=None,
         help="Limit rows (default: all); must be >= 1",
+    )
+    bench_lb.add_argument(
+        "--bench-dir",
+        type=str,
+        default=None,
+        help="Directory to read runs from (default: ~/.olmlx/bench/runs)",
     )
 
     cfg = sub.add_parser("config", help="Show configuration")

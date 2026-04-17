@@ -410,7 +410,7 @@ def format_leaderboard(
         lines.append(
             f"{i:>3} {e.model:<{model_w}} {e.best_tps:>10.1f} "
             f"{e.best_scenario:<{scenario_w}} {e.timestamp:<18} "
-            f"{(e.git_sha or '—'):<10} "
+            f"{(e.git_sha[:10] if e.git_sha else '—'):<10} "
             f"{f'{e.failed_scenarios}/{e.total_scenarios}':>11}"
         )
     return "\n".join(lines)

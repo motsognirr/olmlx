@@ -603,3 +603,25 @@ class TestFormatLeaderboard:
         lines = out.split("\n")
         assert long_scenario in out
         assert len(lines[0]) == len(lines[1]) == len(lines[2])
+
+    def test_full_length_git_sha_does_not_break_alignment(self):
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        full_sha = "a" * 40
+        entries = [
+            LeaderboardEntry(
+                model="model-a",
+                best_tps=45.2,
+                best_scenario="baseline",
+                timestamp="20260101T000000Z",
+                git_sha=full_sha,
+                failed_scenarios=0,
+                total_scenarios=1,
+                run_dir=Path("/tmp/x"),
+            ),
+        ]
+        out = format_leaderboard(entries)
+        lines = out.split("\n")
+        assert len(lines[0]) == len(lines[1]) == len(lines[2])
