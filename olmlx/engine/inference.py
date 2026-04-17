@@ -1250,7 +1250,13 @@ def _parse_kv_cache_quant(spec: str) -> tuple[str, int]:
 def make_prompt_cache_for_lm(lm: LoadedModel) -> list:
     """Create a fresh prompt cache for `lm` using the configured factory
     (plain mlx-lm, TurboQuant, or SpectralQuant).  Single source of truth
-    for cache creation — used by the request path and the load-time probe."""
+    for cache creation — used by the request path and the load-time probe.
+
+    Cross-module contract: imported by `model_manager._probe_cache_trim_support`
+    via a deferred import (to break the import cycle).  A rename here without
+    updating that call site would fail at model-load time only — no static
+    analysis catches it, so keep the name stable.
+    """
     if lm.kv_cache_quant is not None:
         method, bits = _parse_kv_cache_quant(lm.kv_cache_quant)
         if method == "spectral":
@@ -1514,13 +1520,14 @@ async def _setup_prompt_cache(
             _safe_sync()
             fresh_cache_label = "non-trimmable-hybrid"
         elif trim_amount > 0 and trimmed != trim_amount:
-            # Cache layers are non-trimmable or only partially
-            # trimmable (e.g. Qwen3-Next hybrid cache with ArraysCache
-            # for linear attention layers — trim_prompt_cache returns
-            # 0 for any cache where some layer is non-trimmable).  A
-            # partial trim would leave the KV state misaligned with
-            # the prompt, so fall through to fresh-cache creation
-            # rather than passing a stale cache to stream_generate.
+            # Defensive path: only reachable for models where
+            # supports_cache_trim is True but trim_prompt_cache still
+            # under-delivers (e.g. a custom cache type whose trim()
+            # silently clamps, or a class the probe allowlist missed).
+            # Known-hybrid caches (RotatingKVCache, ChunkedKVCache) are
+            # flagged at load time and hit the skip-trim branch above.
+            # A partial trim would leave the KV state misaligned with
+            # the prompt, so fall through to fresh-cache creation.
             logger.warning(
                 "Prompt cache trim incomplete (asked for %d, got %d); "
                 "discarding stale cache and creating fresh",
@@ -2570,7 +2577,10 @@ async def generate_chat(
     # the original prompt tokens even at position 0.
     stable_prefix_builder: Callable[[list[int]], list[int] | None] | None = None
     if use_prompt_cache and not lm.supports_cache_trim and not images:
-        _messages_snapshot = list(messages)
+        # Per-message shallow copy so a caller mutating message dicts after
+        # the generator returns (e.g. in-place content edits) can't race
+        # with the deferred re-render inside the closure.
+        _messages_snapshot = [dict(m) for m in messages]
         _enable_thinking = enable_thinking
         _tools = tools
         _is_vlm = lm.is_vlm
