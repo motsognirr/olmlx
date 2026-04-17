@@ -277,3 +277,112 @@ def create_run_result(
         scenarios=scenarios,
         max_tokens_override=max_tokens_override,
     )
+
+
+@dataclass(frozen=True)
+class LeaderboardEntry:
+    model: str
+    best_tps: float
+    best_scenario: str
+    timestamp: str
+    git_sha: str | None
+    failed_scenarios: int
+    total_scenarios: int
+    run_dir: Path
+
+
+def _scenario_avg_tps(scenario: ScenarioResult) -> float:
+    valid = [
+        p.tokens_per_second
+        for p in scenario.prompt_results
+        if p.status_code == 200 and p.tokens_per_second > 0
+    ]
+    return sum(valid) / len(valid) if valid else 0.0
+
+
+def build_leaderboard(
+    bench_dir: Path = DEFAULT_BENCH_DIR,
+    *,
+    latest_per_model: bool = True,
+) -> list[LeaderboardEntry]:
+    """Aggregate saved runs into ranked leaderboard entries.
+
+    Skipped scenarios are excluded from both failure and total counts. Runs
+    where every non-skipped scenario has zero valid prompts are dropped
+    (they'd rank meaninglessly at the bottom).
+    """
+    if not bench_dir.exists():
+        return []
+    entries: list[LeaderboardEntry] = []
+    for run_dir in bench_dir.iterdir():
+        if not (run_dir / "results.json").exists():
+            continue
+        try:
+            run = load_run(run_dir)
+        except (json.JSONDecodeError, OSError, KeyError):
+            continue
+
+        best_tps = 0.0
+        best_scenario = ""
+        failed = 0
+        total = 0
+        for sc in run.scenarios:
+            if sc.skipped:
+                continue
+            total += 1
+            avg = _scenario_avg_tps(sc)
+            if avg <= 0:
+                failed += 1
+                continue
+            if avg > best_tps:
+                best_tps = avg
+                best_scenario = sc.scenario_name
+
+        if best_tps <= 0:
+            continue
+
+        entries.append(
+            LeaderboardEntry(
+                model=run.model,
+                best_tps=best_tps,
+                best_scenario=best_scenario,
+                timestamp=run.timestamp,
+                git_sha=run.git_sha,
+                failed_scenarios=failed,
+                total_scenarios=total,
+                run_dir=run_dir,
+            )
+        )
+
+    if latest_per_model:
+        by_model: dict[str, LeaderboardEntry] = {}
+        for e in entries:
+            existing = by_model.get(e.model)
+            if existing is None or e.timestamp > existing.timestamp:
+                by_model[e.model] = e
+        entries = list(by_model.values())
+
+    entries.sort(key=lambda e: e.best_tps, reverse=True)
+    return entries
+
+
+def format_leaderboard(
+    entries: list[LeaderboardEntry],
+    *,
+    limit: int | None = None,
+) -> str:
+    """Format leaderboard entries as a plain-text table."""
+    rows = entries if limit is None else entries[:limit]
+    lines: list[str] = []
+    lines.append(
+        f"{'#':>3} {'Model':<45} {'Best tok/s':>10} {'Scenario':<14} "
+        f"{'Timestamp':<18} {'Git':<10} {'Fails/Total':>11}"
+    )
+    lines.append("-" * 116)
+    for i, e in enumerate(rows, 1):
+        lines.append(
+            f"{i:>3} {e.model:<45} {e.best_tps:>10.1f} {e.best_scenario:<14} "
+            f"{e.timestamp:<18} {(e.git_sha or '—'):<10} "
+            f"{f'{e.failed_scenarios}/{e.total_scenarios}':>11}"
+        )
+    return "\n".join(lines)

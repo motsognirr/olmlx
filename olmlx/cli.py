@@ -1086,6 +1086,17 @@ def cmd_bench_list(_args):
         )
 
 
+def cmd_bench_leaderboard(args):
+    """Show the model leaderboard derived from saved bench runs."""
+    from olmlx.bench.results import build_leaderboard, format_leaderboard
+
+    entries = build_leaderboard(latest_per_model=not args.all_runs)
+    if not entries:
+        print("No bench runs with valid measurements found.")
+        return
+    print(format_leaderboard(entries, limit=args.limit))
+
+
 def _flash_progress(desc, frac):
     bar_len = 30
     filled = int(bar_len * frac)
@@ -1476,6 +1487,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     bench_sub.add_parser("list", help="List past benchmark runs")
 
+    bench_lb = bench_sub.add_parser(
+        "leaderboard", help="Show model leaderboard derived from past runs"
+    )
+    bench_lb.add_argument(
+        "--all-runs",
+        action="store_true",
+        help="Show every run instead of latest per model",
+    )
+    bench_lb.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit rows (default: all)",
+    )
+
     cfg = sub.add_parser("config", help="Show configuration")
     cfg_sub = cfg.add_subparsers(dest="config_command")
     cfg_sub.add_parser("show", help="Show current configuration")
@@ -1532,6 +1558,8 @@ def cli_main():
             cmd_bench_compare(args)
         elif args.bench_command == "list":
             cmd_bench_list(args)
+        elif args.bench_command == "leaderboard":
+            cmd_bench_leaderboard(args)
         else:
             parser.parse_args(["bench", "--help"])
     elif args.command == "config":

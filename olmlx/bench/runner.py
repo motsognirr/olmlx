@@ -123,6 +123,17 @@ def run_bench(
     )
     run_dir = save_run(run, bench_dir)
     print(f"\nResults saved to {run_dir}", file=sys.stderr)
+
+    try:
+        from olmlx.bench.results import build_leaderboard, format_leaderboard
+
+        entries = build_leaderboard(bench_dir)
+        if entries:
+            print("\nLeaderboard (top 5):", file=sys.stderr)
+            print(format_leaderboard(entries, limit=5), file=sys.stderr)
+    except Exception as e:
+        logger.warning("Could not build leaderboard: %s", e)
+
     return run
 
 
