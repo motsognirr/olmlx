@@ -350,7 +350,7 @@ class FlashMoeWeightStore:
                     data = future.result()
                     cached[idx] = data
                     self._cache.put(layer_idx, idx, data)
-            except BaseException:
+            except Exception:
                 for f in future_to_idx:
                     f.cancel()
                 raise
