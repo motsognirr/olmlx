@@ -1732,15 +1732,9 @@ def _advance_cache_to_prefix(
         model = _get_model_for_cache(lm.model, lm.is_vlm)
         x = mx.array([extra])
         _ = model(x, cache=prompt_cache)
-        # Force materialisation so the KV tensors are populated before we
-        # store the cache reference (mlx is lazy).
-        mx.eval(
-            [
-                getattr(layer, "state", None)
-                for layer in prompt_cache
-                if getattr(layer, "state", None) is not None
-            ]
-        )
+        # Force KV materialisation before we store the cache reference
+        # (mlx is lazy).  Mirrors mlx-lm's own prefill eval pattern.
+        mx.eval([c.state for c in prompt_cache])
         return list(target_tokens)
     except Exception:
         logger.debug("Stable-prefix cache extension failed", exc_info=True)
@@ -1754,7 +1748,7 @@ async def _store_prompt_cache_after_generation(
     generated_tokens: list[int],
     eval_count: int,
     cache_id: str,
-    stable_prefix_builder: Callable[[list[int]], list[int]] | None = None,
+    stable_prefix_builder: Callable[[list[int]], list[int] | None] | None = None,
 ) -> None:
     """Store prompt cache state after successful generation.
 
@@ -1773,6 +1767,7 @@ async def _store_prompt_cache_after_generation(
 
     raw_sequence = list(full_prompt_tokens) + generated_tokens
     stored_tokens: list[int] = raw_sequence
+    used_stable_prefix = False
     # Only attempt stable-prefix extension when the raw sequence is
     # consistent (eval_count matches generated_tokens length — no tokens
     # dropped due to None IDs).
@@ -1793,18 +1788,17 @@ async def _store_prompt_cache_after_generation(
             advanced = _advance_cache_to_prefix(lm, prompt_cache, raw_sequence, target)
             if advanced is not None:
                 stored_tokens = advanced
+                used_stable_prefix = True
                 logger.debug(
                     "Stable-prefix cache: stored %d tokens (raw=%d + boundary=%d)",
                     len(stored_tokens),
                     len(raw_sequence),
                     len(stored_tokens) - len(raw_sequence),
                 )
-    # KV cache depth: raw path = prompt + model-reported eval_count; stable
-    # path = same + the boundary tokens just extended through the model.
+    # KV cache depth: stable path = len(stored_tokens) (we advanced the cache
+    # by the boundary delta); raw path = prompt + model-reported eval_count.
     raw_depth = len(full_prompt_tokens) + eval_count
-    actual_total = (
-        len(stored_tokens) if stored_tokens is not raw_sequence else raw_depth
-    )
+    actual_total = len(stored_tokens) if used_stable_prefix else raw_depth
     max_cache_tokens = settings.prompt_cache_max_tokens
     if max_cache_tokens is not None and actual_total > max_cache_tokens:
         trim_amount = actual_total - max_cache_tokens
@@ -1913,7 +1907,7 @@ async def _stream_completion(
     use_prompt_cache: bool = False,
     prompt_tokens: list[int] | None = None,
     cache_id: str = "",
-    stable_prefix_builder: Callable[[list[int]], list[int]] | None = None,
+    stable_prefix_builder: Callable[[list[int]], list[int] | None] | None = None,
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
@@ -2574,14 +2568,14 @@ async def generate_chat(
     # Must use the SAME chat-template applier that produced `prompt` above
     # (mlx_vlm's vs mlx-lm's), otherwise the re-rendered tokens won't match
     # the original prompt tokens even at position 0.
-    stable_prefix_builder: Callable[[list[int]], list[int]] | None = None
+    stable_prefix_builder: Callable[[list[int]], list[int] | None] | None = None
     if use_prompt_cache and not lm.supports_cache_trim and not images:
         _messages_snapshot = list(messages)
         _enable_thinking = enable_thinking
         _tools = tools
         _is_vlm = lm.is_vlm
 
-        def stable_prefix_builder(generated_ids: list[int]) -> list[int]:
+        def _build_stable_prefix(generated_ids: list[int]) -> list[int] | None:
             gen_text = lm.text_tokenizer.decode(generated_ids)
             extended = _messages_snapshot + [{"role": "assistant", "content": gen_text}]
             if _is_vlm:
@@ -2596,7 +2590,9 @@ async def generate_chat(
                     num_images=0,
                 )
                 if not isinstance(rendered, str):
-                    return []  # rejected by downstream check
+                    # Signal rejection; empty list would silently pass the
+                    # `target is not None` gate in the store path.
+                    return None
             else:
                 rendered = _apply_chat_template_text(
                     lm.text_tokenizer,
@@ -2607,6 +2603,8 @@ async def generate_chat(
                     add_generation_prompt=False,
                 )
             return _tokenize_for_cache(lm.text_tokenizer, rendered)
+
+        stable_prefix_builder = _build_stable_prefix
 
     if stream:
         return _stream_completion(
