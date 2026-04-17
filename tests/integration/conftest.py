@@ -191,6 +191,14 @@ def mock_mlx_primitives(monkeypatch):
     # Prompt cache
     mock_make_cache = MagicMock(return_value=[MagicMock()])
     _start("olmlx.engine.inference.make_prompt_cache", mock_make_cache)
+    # The load-time probe checks cache-layer class names against an allowlist;
+    # MagicMock fails that check and would mark every test model non-trimmable,
+    # silently disabling cache reuse in the integration tests.  Short-circuit
+    # the probe so models behave like standard KVCache-only architectures.
+    _start(
+        "olmlx.engine.model_manager._cache_supports_trim",
+        MagicMock(return_value=True),
+    )
     # Successful trim returns the requested amount; without this, the
     # `trimmed != trim_amount` guard in _stream_completion would fire the
     # non-trimmable cache fallback and skip the suffix path.

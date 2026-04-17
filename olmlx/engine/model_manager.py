@@ -114,6 +114,48 @@ def _is_serializable_cache(cache: list) -> bool:
     )
 
 
+# mlx-lm cache classes whose `trim(n)` reliably removes exactly n tokens from
+# any offset (no silent under-delivery).  Class-name allowlist is authoritative
+# because `is_trimmable()` on a fresh (offset==0) cache cannot detect rotate
+# or chunk problems that only manifest once the buffer fills.
+#
+# Verified trim behaviour against mlx-lm's cache.py:
+# - KVCache.trim(n) → min(offset, n); trims back to 0 cleanly (line 378).
+# - QuantizedKVCache.trim(n) → same clamping (line 309).
+# - ConcatenateKVCache.trim(n) → same clamping (line 214); used by afm7.
+#
+# Deliberately excluded:
+# - RotatingKVCache: is_trimmable() returns False once the ring buffer fills.
+# - ChunkedKVCache: trim() silently clamps to (offset - start_position);
+#   once prompt > chunk_size, trims beyond the current chunk under-deliver.
+# - ArraysCache / CacheList: no usable trim semantics for our purposes.
+# - BatchKVCache / BatchRotatingKVCache: batch path; untested here.
+#
+# Probe always inspects bare mlx-lm classes (not quantization wrappers like
+# TurboQuant/Spectral), so those wrappers do not need to appear here even
+# though they implement trim correctly — they're simply never the layer
+# types we see.  See ml-explore/mlx-lm#980 for upstream hybrid-trim work.
+_TRIMMABLE_CACHE_CLASSES = frozenset(
+    {
+        "KVCache",
+        "QuantizedKVCache",
+        "ConcatenateKVCache",
+    }
+)
+
+
+def _cache_supports_trim(cache_list: list) -> bool:
+    """True iff every layer is in the known-trimmable allowlist.
+
+    Used at model load time to decide whether `trim_prompt_cache()` is worth
+    attempting on this model.  Hybrid sliding-window models (Gemma 4,
+    Qwen3-Next, etc.) include `RotatingKVCache` layers and return False —
+    such models still benefit from strict-extension cache reuse but cannot
+    be trimmed back on prompt divergence.
+    """
+    return all(type(layer).__name__ in _TRIMMABLE_CACHE_CLASSES for layer in cache_list)
+
+
 class ModelLoadTimeoutError(TimeoutError):
     """Raised when model loading exceeds OLMLX_MODEL_LOAD_TIMEOUT."""
 
@@ -471,6 +513,9 @@ class LoadedModel:
     )
     prompt_cache_store: PromptCacheStore = field(default=None)  # type: ignore[assignment]
     kv_cache_quant: str | None = None
+    # False for hybrid sliding-window models (RotatingKVCache layers).
+    # Set by the loader; default True covers direct construction in tests.
+    supports_cache_trim: bool = True
     spectral_calibration_dir: Any = None  # Path | None, typed as Any to avoid import
     default_options: dict = field(default_factory=dict)
     inference_queue_timeout: float | None = None
@@ -862,6 +907,7 @@ class ModelManager:
                         inference_queue_timeout=model_config.inference_queue_timeout,
                         inference_timeout=model_config.inference_timeout,
                     )
+                    self._probe_cache_trim_support(lm)
                     self._loaded[normalized] = lm
                     return lm
                 except BaseException:
@@ -1194,6 +1240,55 @@ class ModelManager:
         if flash_path.exists() and (flash_path / "flash_layout.json").exists():
             return flash_path
         return None
+
+    def _probe_cache_trim_support(self, lm: LoadedModel) -> None:
+        """Probe whether `trim_prompt_cache` will work on this model and
+        record the result on `lm.supports_cache_trim`.
+
+        Hybrid sliding-window models (Gemma 4, Qwen3-Next) include
+        `RotatingKVCache` layers which become non-trimmable once the
+        rotating buffer fills.  Detecting this once at load time lets the
+        request path skip a doomed `trim_prompt_cache()` call (which
+        would silently return 0 and force a full prefill).
+
+        Always probes the bare mlx-lm cache — trim behaviour is determined
+        by the underlying layer classes, not the quantization wrapper, and
+        TurboQuant/Spectral factories would otherwise pull calibration data
+        off disk on every model load only to throw the result away.
+        """
+        try:
+            from mlx_lm.models.cache import make_prompt_cache
+        except ImportError:
+            return  # mlx-lm prompt cache unavailable; nothing to probe
+
+        cache_model = (
+            getattr(lm.model, "language_model", lm.model) if lm.is_vlm else lm.model
+        )
+        probe_cache: list | None = None
+        try:
+            probe_cache = make_prompt_cache(cache_model)
+            lm.supports_cache_trim = _cache_supports_trim(probe_cache)
+        except Exception:
+            # Best-effort probe; on failure assume trim works so the
+            # request path's existing partial-trim fallback handles it.
+            logger.debug(
+                "Cache-trim probe failed for %s; assuming trimmable",
+                lm.name,
+                exc_info=True,
+            )
+            lm.supports_cache_trim = True
+        finally:
+            if probe_cache is not None:
+                del probe_cache
+                gc.collect()
+                mx.clear_cache()
+
+        if not lm.supports_cache_trim:
+            logger.info(
+                "Model %s uses a non-trimmable hybrid cache (e.g. RotatingKVCache); "
+                "prompt cache will only be reused for strict-extension turns.",
+                lm.name,
+            )
 
     def _find_spectral_dir(
         self, hf_path: str, kv_cache_quant: str | None
