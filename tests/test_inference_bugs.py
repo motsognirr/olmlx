@@ -208,6 +208,147 @@ class TestDrainAndJoinBlocksNewInference:
             "Expected at least one evict_all_to_disk call across completion functions"
         )
 
+    def test_eviction_uses_safe_sync_not_lock_boundary_sync(self):
+        """Eviction and deferred-cleanup paths must use _safe_sync (unconditional)
+        — not _lock_boundary_sync.
+
+        _lock_boundary_sync honors per-model/global sync_mode and can be
+        'none', which would silently skip the post-eviction sync needed to
+        reclaim freed Metal buffers (Bug #120). The deferred cleanup path
+        holds the inference lock while the worker thread may still be using
+        the GPU and *must* sync before releasing the lock. Guard against a
+        future edit that unifies the call sites.
+
+        Uses bytecode-level name introspection rather than source text so
+        nested helpers, refactors, or docstring references to the names
+        don't produce false positives/negatives.
+        """
+
+        def names_referenced(fn):
+            """Return the set of names referenced in fn's bytecode, including
+            any nested (closure / inner-function) code objects.
+
+            Note: CPython-specific. ``co_names`` contains names used by
+            LOAD_GLOBAL / LOAD_ATTR bytecode instructions — it catches
+            direct references like ``_safe_sync(...)`` but not aliases
+            (e.g. ``sync_fn = _safe_sync; sync_fn(...)``). Good enough
+            for the patterns this guard is intended to catch.
+            """
+            seen = set()
+            stack = [fn.__code__]
+            while stack:
+                code = stack.pop()
+                seen.update(code.co_names)
+                for const in code.co_consts:
+                    if hasattr(const, "co_names"):
+                        stack.append(const)
+            return seen
+
+        funcs = [
+            ("_setup_prompt_cache", _inf_mod._setup_prompt_cache),
+            ("_kv_cache_preflight_check", _inf_mod._kv_cache_preflight_check),
+            (
+                "_schedule_deferred_inference_cleanup",
+                _inf_mod._schedule_deferred_inference_cleanup,
+            ),
+        ]
+        for func_name, fn in funcs:
+            names = names_referenced(fn)
+            assert "_safe_sync" in names, (
+                f"{func_name}: must reference _safe_sync (Bug #120 / "
+                f"deferred-cleanup correctness)"
+            )
+            assert "_lock_boundary_sync" not in names, (
+                f"{func_name}: must NOT reference _lock_boundary_sync — "
+                f"that helper honors sync_mode='none' and would silently skip "
+                f"the Metal sync needed here"
+            )
+
+    @pytest.mark.asyncio
+    async def test_eviction_still_syncs_under_sync_mode_none(self, mock_manager):
+        """Integration guard: under lm.sync_mode='none' (where lock-boundary
+        syncs are skipped), the memory-pressure eviction path must still
+        call mx.synchronize() via _safe_sync. This complements the static
+        bytecode test by exercising the code path functionally — catches
+        regressions like aliasing or indirect dispatch that bytecode
+        introspection would miss.
+        """
+        from unittest.mock import AsyncMock, patch
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.sync_mode = "none"
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30])
+        lm.prompt_cache_store.set(
+            "", CachedPromptState(tokens=[10, 20, 30], cache=[MagicMock()])
+        )
+
+        # Minimal stream so generate_chat returns.
+        from olmlx.utils.streaming import CancellableStream, StreamToken
+
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+        token_iter = iter(
+            [
+                StreamToken(
+                    text="hi",
+                    token=1,
+                    prompt_tokens=3,
+                    generation_tokens=1,
+                    prompt_tps=100.0,
+                    generation_tps=50.0,
+                )
+            ]
+        )
+
+        async def anext_impl():
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.async_mlx_stream", return_value=mock_stream),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache",
+                MagicMock(return_value=[MagicMock()]),
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch("olmlx.utils.memory.is_memory_pressure_high", return_value=True),
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"  # per-model "none" still wins
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+            async for _ in gen:
+                pass
+
+        # Eviction must have run (memory pressure → clear_cache call)
+        mock_mx.clear_cache.assert_called()
+        # And despite sync_mode="none" skipping the lock-boundary sync, the
+        # eviction path's _safe_sync() must still have produced a
+        # synchronize() call.
+        assert mock_mx.synchronize.call_count >= 1, (
+            "eviction path under sync_mode='none' must still sync (Bug #120)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Bug #123: Prompt cache state corruption on mid-stream disconnect

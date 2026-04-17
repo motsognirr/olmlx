@@ -8,11 +8,11 @@ import threading
 import dataclasses
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import logging
 
-from olmlx.config import settings
+from olmlx.config import SyncMode, settings
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +132,17 @@ def _validate_timeout(name: str, value: Any) -> float:
     return float(value)
 
 
+_VALID_SYNC_MODES: frozenset[str] = frozenset(get_args(SyncMode))
+
+
+def _validate_sync_mode(value: Any) -> SyncMode:
+    if not isinstance(value, str) or value not in _VALID_SYNC_MODES:
+        raise ValueError(
+            f"'sync_mode' must be one of {sorted(_VALID_SYNC_MODES)}, got {value!r}"
+        )
+    return value  # type: ignore[return-value]
+
+
 def _validate_keep_alive(value: str) -> None:
     """Validate keep_alive format at parse time."""
     import re
@@ -164,6 +175,11 @@ class ModelConfig:
     keep_alive: str | None = None
     inference_queue_timeout: float | None = None
     inference_timeout: float | None = None
+    #: Metal sync behavior at inference lock boundaries: "full" (default),
+    #: "minimal" (skip mlx_lm/mlx_vlm generation-stream sync), or "none"
+    #: (skip lock-boundary sync entirely). None means use the global
+    #: ``settings.sync_mode``.
+    sync_mode: SyncMode | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -202,6 +218,12 @@ class ModelConfig:
                 if it_raw is not None
                 else None
             )
+            sync_mode_raw = entry.get("sync_mode")
+            sync_mode = (
+                _validate_sync_mode(sync_mode_raw)
+                if sync_mode_raw is not None
+                else None
+            )
             extra = {k: v for k, v in entry.items() if k not in _KNOWN_CONFIG_KEYS}
             return cls(
                 hf_path=hf_path,
@@ -210,6 +232,7 @@ class ModelConfig:
                 keep_alive=keep_alive,
                 inference_queue_timeout=inference_queue_timeout,
                 inference_timeout=inference_timeout,
+                sync_mode=sync_mode,
                 _extra=extra,
             )
         raise TypeError(
@@ -224,6 +247,7 @@ class ModelConfig:
             and self.keep_alive is None
             and self.inference_queue_timeout is None
             and self.inference_timeout is None
+            and self.sync_mode is None
             and not self._extra
         ):
             return self.hf_path
@@ -239,6 +263,8 @@ class ModelConfig:
             result["inference_queue_timeout"] = self.inference_queue_timeout
         if self.inference_timeout is not None:
             result["inference_timeout"] = self.inference_timeout
+        if self.sync_mode is not None:
+            result["sync_mode"] = self.sync_mode
         # Filter known keys defensively — from_entry() already excludes them,
         # but _extra can be set directly via ModelConfig construction.
         result.update(

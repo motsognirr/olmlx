@@ -169,6 +169,7 @@ class TestCacheCreatedOnFirstRequest:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -235,6 +236,7 @@ class TestCacheReusedOnPrefixMatch:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -325,6 +327,7 @@ class TestNonTrimmableCacheFallback:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -491,6 +494,7 @@ class TestNonTrimmableModelSkipsTrim:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -556,6 +560,7 @@ class TestNonTrimmableModelSkipsTrim:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -621,6 +626,7 @@ class TestCacheMissCreatesFresh:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -691,6 +697,7 @@ class TestCacheInvalidatedOnCancel:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -751,6 +758,7 @@ class TestCacheDisabledViaConfig:
             mock_settings.prompt_cache = False
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -816,6 +824,7 @@ class TestVlmUsesCache:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -866,6 +875,7 @@ class TestVlmUsesCache:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -935,6 +945,7 @@ class TestCacheTokenCountLogging:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -996,6 +1007,7 @@ class TestCacheStatsInCacheInfoChunk:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1085,6 +1097,7 @@ class TestCacheExactMatchTrimAlignment:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1148,6 +1161,7 @@ class TestLockReleasedOnCacheInfoDisconnect:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1217,6 +1231,7 @@ class TestNoneTokenWarning:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1289,6 +1304,7 @@ class TestSingleTokenPromptCacheEdgeCase:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1349,6 +1365,7 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
             mock_settings.prompt_cache_max_tokens = 6
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1409,6 +1426,7 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
             mock_settings.prompt_cache_max_tokens = 4
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1466,6 +1484,7 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
             mock_settings.prompt_cache_max_tokens = 5
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1507,6 +1526,7 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
             mock_settings.prompt_cache_max_tokens = 20
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1589,6 +1609,7 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
             mock_settings.prompt_cache_max_tokens = 4
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1675,6 +1696,7 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
             mock_settings.prompt_cache_max_tokens = 3
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1731,6 +1753,7 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
             mock_settings.prompt_cache_max_tokens = 6
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             # Trim failure is post-generation bookkeeping — should not kill
             # the response. Generation completes, final done chunk emitted.
             chunks = []
@@ -1796,6 +1819,7 @@ class TestCacheTrimmedWhenExceedsTokenLimit:
             mock_settings.prompt_cache_max_tokens = 6
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             chunks = []
             gen = await generate_chat(
                 mock_manager,
@@ -1847,6 +1871,7 @@ class TestCacheStoredWhenWithinTokenLimit:
             mock_settings.prompt_cache_max_tokens = 20
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1897,6 +1922,7 @@ class TestCacheStoredWhenLimitDisabled:
             mock_settings.prompt_cache_max_tokens = None
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -1954,6 +1980,7 @@ class TestCacheSkippedOnMemoryPressure:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -2019,6 +2046,7 @@ class TestCacheRebuiltAfterPressureResolves:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -2127,6 +2155,7 @@ class TestMultiCacheBehavior:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -2192,6 +2221,7 @@ class TestMultiCacheBehavior:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -2248,6 +2278,7 @@ class TestMultiCacheBehavior:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
@@ -2307,6 +2338,7 @@ class TestMultiCacheBehavior:
             mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",

@@ -18,6 +18,7 @@ from olmlx.engine.inference import (
     _inject_tools_into_system,
     _normalize_tool_calls_in_messages,
     _apply_chat_template_text,
+    _lock_boundary_sync,
     _safe_sync,
     _schedule_deferred_inference_cleanup,
     generate_chat,
@@ -1855,6 +1856,36 @@ class TestGenerateEmbeddings:
         result = await generate_embeddings(mock_manager, "qwen3", ["hello", "world"])
         assert len(result) == 2
 
+    @pytest.mark.asyncio
+    async def test_sync_mode_none_still_syncs_metal(self, mock_manager):
+        """With lm.sync_mode='none', the lock-boundary sync is skipped, but
+        the inline load-bearing mx.synchronize() at the tail of
+        generate_embeddings must still run — it's the only Metal barrier
+        before the inference lock is released. Guards against a future
+        refactor that wraps that call in a `sync_mode != "none"` check.
+        """
+        import mlx.core as mx
+
+        self._setup_tokenizer(mock_manager)
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.sync_mode = "none"
+        model = lm.model
+        model.model = MagicMock()
+        model.model.embed_tokens = MagicMock(return_value=mx.zeros((1, 3, 4)))
+
+        with patch.object(_inf_mod.mx, "synchronize") as mock_sync:
+            result = await generate_embeddings(mock_manager, "qwen3", ["hello"])
+        assert len(result) == 1
+        # Under sync_mode="none" the lock-boundary _lock_boundary_sync() calls
+        # are no-ops (they return before calling mx.synchronize), so any
+        # synchronize() we observe here must come from the inline
+        # load-bearing fallback at the tail of generate_embeddings. Use
+        # >= 1 rather than == N — the meaningful invariant is "at least one
+        # Metal barrier fired", not an exact count that future defensive
+        # syncs added elsewhere in the call chain would silently break.
+        assert mock_sync.call_count >= 1
+
 
 class TestStreamCancellationHoldsLock:
     @pytest.mark.asyncio
@@ -1964,6 +1995,81 @@ class TestSafeSync:
             _safe_sync()  # should not raise
 
 
+class TestLockBoundarySync:
+    def test_full_matches_safe_sync(self):
+        """'full' mode: sync default + every generation stream."""
+        mock_stream = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx") as mock_mx,
+            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
+        ):
+            _lock_boundary_sync("full")
+            assert mock_mx.synchronize.call_count == 2
+            mock_mx.synchronize.assert_any_call(mock_stream)
+
+    def test_minimal_skips_generation_streams(self):
+        """'minimal' mode: sync default stream only, skip generation streams."""
+        mock_stream = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx") as mock_mx,
+            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
+        ):
+            _lock_boundary_sync("minimal")
+            assert mock_mx.synchronize.call_count == 1
+            mock_mx.synchronize.assert_called_once_with()
+
+    def test_none_skips_all_sync(self):
+        """'none' mode: skip sync entirely at lock boundaries."""
+        mock_stream = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx") as mock_mx,
+            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
+        ):
+            _lock_boundary_sync("none")
+            assert mock_mx.synchronize.call_count == 0
+
+    def test_null_mode_falls_back_to_global_setting(self):
+        """mode=None (Python None sentinel, not the "none" SyncMode string)
+        should resolve to settings.sync_mode. The two are opposite: None
+        inherits the global, "none" skips all sync."""
+        mock_stream = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx") as mock_mx,
+            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.sync_mode = "none"
+            _lock_boundary_sync(None)
+            assert mock_mx.synchronize.call_count == 0
+
+            mock_mx.reset_mock()
+            mock_settings.sync_mode = "minimal"
+            _lock_boundary_sync(None)
+            assert mock_mx.synchronize.call_count == 1
+
+    def test_suppresses_exceptions(self):
+        """Exceptions from mx.synchronize must not propagate — covers both the
+        default-stream and generation-stream suppression paths."""
+        mock_stream = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx") as mock_mx,
+            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
+        ):
+            mock_mx.synchronize.side_effect = RuntimeError("Metal error")
+            _lock_boundary_sync("full")  # exercises default + generation stream loop
+            _lock_boundary_sync("minimal")  # exercises default only
+            # Exactly: 1 default + 1 generation (full) + 1 default (minimal) = 3
+            assert mock_mx.synchronize.call_count == 3
+
+    def test_unknown_mode_raises(self):
+        """Unknown modes must raise ValueError instead of silently falling
+        through to a default — prevents silent drift if a new mode is added
+        to SyncMode without updating this helper."""
+        with patch("olmlx.engine.inference.mx"):
+            with pytest.raises(ValueError, match="Unknown sync_mode"):
+                _lock_boundary_sync("sometimes")  # type: ignore[arg-type]
+
+
 class TestInferenceLocked:
     @pytest.mark.asyncio
     async def test_acquires_and_releases_lock(self):
@@ -1991,6 +2097,96 @@ class TestInferenceLocked:
                 pass
             # Called at least twice: entry sync + exit sync
             assert mock_mx.synchronize.call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_sync_mode_none_skips_lock_boundary_sync(self):
+        """sync_mode='none' should skip both entry and exit lock-boundary syncs."""
+        with patch("olmlx.engine.inference.mx") as mock_mx:
+            async with _inference_locked(sync_mode="none"):
+                pass
+            assert mock_mx.synchronize.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_sync_mode_minimal_syncs_default_only(self):
+        """sync_mode='minimal' should sync default stream only on entry+exit."""
+        mock_stream = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx") as mock_mx,
+            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
+        ):
+            async with _inference_locked(sync_mode="minimal"):
+                pass
+            # 1 default sync on entry + 1 default sync on exit, no generation streams
+            assert mock_mx.synchronize.call_count == 2
+            for call in mock_mx.synchronize.call_args_list:
+                assert call.args == ()
+
+    @pytest.mark.asyncio
+    async def test_lock_released_if_entry_sync_raises(self):
+        """If entry _lock_boundary_sync raises, the inference lock must be released."""
+        assert not _inference_lock.locked()
+        with patch(
+            "olmlx.engine.inference._lock_boundary_sync",
+            side_effect=ValueError("boom"),
+        ):
+            with pytest.raises(ValueError, match="boom"):
+                async with _inference_locked():
+                    pass
+        assert not _inference_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_exit_sync_raise_is_suppressed_and_safe_sync_runs(self):
+        """If exit _lock_boundary_sync raises (unknown mode), the error must
+        be caught, _safe_sync() must run as a fail-safe fallback, and the
+        lock must be released. No exception should propagate from an
+        otherwise-successful body."""
+        assert not _inference_lock.locked()
+        calls = {"n": 0}
+
+        def side_effect(*_a, **_kw):
+            calls["n"] += 1
+            if calls["n"] == 2:  # only raise on exit sync
+                raise ValueError("exit boom")
+
+        with (
+            patch(
+                "olmlx.engine.inference._lock_boundary_sync", side_effect=side_effect
+            ),
+            patch("olmlx.engine.inference._safe_sync") as mock_safe_sync,
+        ):
+            # No exception should escape — the exit-sync raise is caught.
+            async with _inference_locked():
+                pass
+        assert not _inference_lock.locked()
+        mock_safe_sync.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_exit_sync_raise_does_not_mask_body_exception(self):
+        """If both the body and exit _lock_boundary_sync raise, the body's
+        exception must propagate (not the sync ValueError). Python's
+        default finally-semantics would replace the body exception with
+        the sync one — this test guards against that regression."""
+        assert not _inference_lock.locked()
+        calls = {"n": 0}
+
+        def side_effect(*_a, **_kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise ValueError("exit boom")
+
+        class BodyError(RuntimeError):
+            pass
+
+        with (
+            patch(
+                "olmlx.engine.inference._lock_boundary_sync", side_effect=side_effect
+            ),
+            patch("olmlx.engine.inference._safe_sync"),
+        ):
+            with pytest.raises(BodyError, match="body failed"):
+                async with _inference_locked():
+                    raise BodyError("body failed")
+        assert not _inference_lock.locked()
 
 
 class TestInferenceLockedWaitsDeferredCleanup:
@@ -2935,6 +3131,7 @@ class TestKvCachePreflightCheck:
         lm.active_refs = 0
         lm.inference_timeout = None
         lm.inference_queue_timeout = None
+        lm.sync_mode = None
         return lm
 
     @pytest.mark.asyncio
@@ -2978,6 +3175,7 @@ class TestKvCachePreflightCheck:
                 mock_settings.memory_limit_fraction = 0.5  # 12GB limit
                 mock_settings.prompt_cache = False
                 mock_settings.inference_timeout = None
+                mock_settings.sync_mode = "full"
 
                 gen = _inf_mod._stream_completion(
                     mock_lm, list(range(22000)), 512, {}, stats
@@ -3049,6 +3247,7 @@ class TestKvCachePreflightCheck:
                 mock_settings.prompt_cache = False
                 mock_settings.default_keep_alive = "5m"
                 mock_settings.inference_timeout = None
+                mock_settings.sync_mode = "full"
 
                 gen = _inf_mod._stream_completion(
                     mock_lm, list(range(100)), 512, {}, stats
@@ -3621,6 +3820,7 @@ class TestInferenceTimeout:
             mock_settings.inference_timeout = None
             mock_settings.prompt_cache = False
             mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
             gen = await generate_completion(
                 mock_manager,
                 "qwen3",
@@ -3682,6 +3882,7 @@ class TestInferenceTimeout:
             mock_settings.inference_timeout = 0.1  # Global 100ms timeout
             mock_settings.prompt_cache = False
             mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
             gen = await generate_completion(
                 mock_manager,
                 "qwen3",
@@ -3697,3 +3898,134 @@ class TestInferenceTimeout:
         assert done_chunk.get("done_reason") == "timeout"
         text_chunks = [c for c in chunks if not c.get("done")]
         assert 0 < len(text_chunks) < 20
+
+
+class TestStreamCompletionLockLeakOnSyncFailure:
+    """_stream_completion must release the inference lock even if a
+    _lock_boundary_sync call raises. Mirrors the _inference_locked lock-leak
+    regression tests."""
+
+    def _mock_stream(self, n_tokens: int = 3):
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+        tokens = [
+            StreamToken(
+                text=f"tok{i}",
+                token=i,
+                prompt_tokens=5,
+                generation_tokens=i + 1,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            )
+            for i in range(n_tokens)
+        ]
+        token_iter = iter(tokens)
+
+        async def anext_impl():
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+        return mock_stream
+
+    @pytest.mark.asyncio
+    async def test_lock_released_if_entry_sync_raises(self, mock_manager):
+        """If _lock_boundary_sync raises on stream entry, the inference lock
+        must not leak."""
+        assert not _inference_lock.locked()
+        with (
+            patch("olmlx.engine.inference.mx"),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=self._mock_stream(),
+            ),
+            patch(
+                "olmlx.engine.inference._lock_boundary_sync",
+                side_effect=ValueError("entry boom"),
+            ),
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = None
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
+            gen = await generate_completion(mock_manager, "qwen3", "Hello", stream=True)
+            with pytest.raises(ValueError, match="entry boom"):
+                async for _ in gen:
+                    pass
+        assert not _inference_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_exit_sync_raise_is_suppressed_and_safe_sync_runs(self, mock_manager):
+        """If exit _lock_boundary_sync raises during normal cleanup, the
+        streaming path must catch it, run _safe_sync() as a fail-safe
+        fallback, and release the lock. No exception should propagate
+        from a successful stream body."""
+        assert not _inference_lock.locked()
+        call_count = {"n": 0}
+
+        def side_effect(*_a, **_kw):
+            call_count["n"] += 1
+            # Let entry sync pass; raise only on exit sync (second call).
+            if call_count["n"] >= 2:
+                raise ValueError("exit boom")
+
+        with (
+            patch("olmlx.engine.inference.mx"),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=self._mock_stream(),
+            ),
+            patch(
+                "olmlx.engine.inference._lock_boundary_sync", side_effect=side_effect
+            ),
+            patch("olmlx.engine.inference._safe_sync") as mock_safe_sync,
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = None
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
+            gen = await generate_completion(mock_manager, "qwen3", "Hello", stream=True)
+            # No exception should escape — the exit-sync raise is caught.
+            async for _ in gen:
+                pass
+        assert not _inference_lock.locked()
+        # Entry + exit = exactly 2 lock_boundary_sync calls in the success path.
+        assert call_count["n"] == 2
+        mock_safe_sync.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sync_mode_none_skips_lock_boundary_sync(self, mock_manager):
+        """With lm.sync_mode='none', the streaming path must not call
+        mx.synchronize at either lock-boundary site. Independent of the
+        equivalent _inference_locked test because _stream_completion
+        manages its own lock entry/exit.
+        """
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.sync_mode = "none"
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=self._mock_stream(),
+            ),
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = None
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"  # per-model "none" wins over global "full"
+            gen = await generate_completion(mock_manager, "qwen3", "Hello", stream=True)
+            async for _ in gen:
+                pass
+        assert not _inference_lock.locked()
+        assert mock_mx.synchronize.call_count == 0

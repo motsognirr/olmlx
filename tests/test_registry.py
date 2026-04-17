@@ -412,6 +412,46 @@ class TestModelConfig:
         with pytest.raises(TypeError, match="str or dict"):
             ModelConfig.from_entry(42)
 
+    def test_from_string_sync_mode_default_none(self):
+        """String entries default sync_mode to None (inherit global)."""
+        mc = ModelConfig.from_entry("org/model")
+        assert mc.sync_mode is None
+
+    def test_from_dict_with_sync_mode(self):
+        """sync_mode is parsed from dict entries."""
+        for value in ("full", "minimal", "none"):
+            mc = ModelConfig.from_entry({"hf_path": "org/model", "sync_mode": value})
+            assert mc.sync_mode == value
+
+    def test_from_dict_invalid_sync_mode_rejected(self):
+        """Unknown sync_mode values are rejected."""
+        with pytest.raises(ValueError, match="sync_mode"):
+            ModelConfig.from_entry({"hf_path": "org/model", "sync_mode": "sometimes"})
+
+    def test_from_dict_non_string_sync_mode_rejected(self):
+        """Non-string sync_mode values are rejected."""
+        with pytest.raises(ValueError, match="sync_mode"):
+            ModelConfig.from_entry({"hf_path": "org/model", "sync_mode": 1})
+
+    def test_to_entry_with_sync_mode(self):
+        """sync_mode is serialized when set."""
+        mc = ModelConfig(hf_path="org/model", sync_mode="minimal")
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["sync_mode"] == "minimal"
+
+    def test_to_entry_omits_none_sync_mode(self):
+        """sync_mode=None and no other overrides → plain string."""
+        mc = ModelConfig(hf_path="org/model")
+        assert mc.to_entry() == "org/model"
+
+    def test_sync_mode_round_trip(self):
+        """from_entry → to_entry → from_entry preserves sync_mode."""
+        entry_in = {"hf_path": "org/model", "sync_mode": "none"}
+        mc1 = ModelConfig.from_entry(entry_in)
+        mc2 = ModelConfig.from_entry(mc1.to_entry())
+        assert mc2.sync_mode == "none"
+
     def test_to_entry_plain(self):
         """ModelConfig with no overrides serializes to plain string."""
         mc = ModelConfig(hf_path="org/model")
