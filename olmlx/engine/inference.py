@@ -2602,9 +2602,12 @@ async def generate_embeddings(
             # synchronously under _inference_locked with no worker thread,
             # so the lock-boundary exit sync may be skipped. This sync is
             # then the only Metal barrier before the lock is released —
-            # do not remove without providing an equivalent barrier. Use
-            # _sync_default_stream() so a Metal exception is suppressed
-            # and logged rather than surfaced as a 500 after the
-            # embeddings have already been computed and .tolist()'d.
-            _sync_default_stream()
+            # do not remove without providing an equivalent barrier.
+            # Suppress+log rather than raise: the embeddings have already
+            # been .tolist()'d so the caller should still get the result;
+            # a Metal error here will surface on the next request.
+            try:
+                mx.synchronize()
+            except Exception:
+                logger.debug("embeddings post-compute sync failed", exc_info=True)
             return embeddings

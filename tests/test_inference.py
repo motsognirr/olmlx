@@ -3931,3 +3931,32 @@ class TestStreamCompletionLockLeakOnSyncFailure:
         assert not _inference_lock.locked()
         # Entry + exit = exactly 2 lock_boundary_sync calls in the success path.
         assert call_count["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_sync_mode_none_skips_lock_boundary_sync(self, mock_manager):
+        """With lm.sync_mode='none', the streaming path must not call
+        mx.synchronize at either lock-boundary site. Independent of the
+        equivalent _inference_locked test because _stream_completion
+        manages its own lock entry/exit.
+        """
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.sync_mode = "none"
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=self._mock_stream(),
+            ),
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = None
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"  # per-model None override wins
+            gen = await generate_completion(mock_manager, "qwen3", "Hello", stream=True)
+            async for _ in gen:
+                pass
+        assert not _inference_lock.locked()
+        assert mock_mx.synchronize.call_count == 0
