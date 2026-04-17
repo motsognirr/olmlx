@@ -29,6 +29,17 @@ class TurboQuantKVCache(_BaseCache):
     plus a side buffer of dequantized K/V so each ``update_and_fetch`` only
     dequantizes the newly appended slice (``O(num_steps · head_dim²)`` per
     call) instead of the full history.
+
+    Side-buffer invariants:
+
+    - Only ``[..., :self.offset, :]`` is valid data. Positions
+      ``[self.offset:]`` may contain stale values left over after ``trim`` and
+      must not be read. ``update_and_fetch`` writes ``[prev:self.offset]``
+      before returning ``[..., :self.offset, :]``, so any stale range that
+      overlaps the returned slice is overwritten first.
+    - The side buffer is allocated once per cache with a fixed dtype derived
+      from the first ``keys`` seen. Subsequent calls with a different dtype
+      raise ``ValueError`` rather than silently mixing types on grow.
     """
 
     step = 256
@@ -48,9 +59,10 @@ class TurboQuantKVCache(_BaseCache):
         self._value_norms: mx.array | None = None
         # Side buffer holding dequantized K/V so we only dequantize new tokens.
         # Preserved by trim and resize; not included in ``state`` (recoverable
-        # from indices + norms).
+        # from indices + norms).  ``_dequant_dtype`` is locked on first update.
         self._key_dequant: mx.array | None = None
         self._value_dequant: mx.array | None = None
+        self._dequant_dtype: mx.Dtype | None = None
         self.offset = 0
 
     def update_and_fetch(
@@ -62,6 +74,17 @@ class TurboQuantKVCache(_BaseCache):
         B, n_heads, num_steps, head_dim = keys.shape
         input_dtype = keys.dtype
         prev = self.offset
+
+        # Lock the side-buffer dtype on first update; reject mismatches on
+        # subsequent calls so the concatenate-on-grow path can't mix dtypes.
+        if self._dequant_dtype is None:
+            self._dequant_dtype = input_dtype
+        elif self._dequant_dtype != input_dtype:
+            raise ValueError(
+                f"TurboQuantKVCache: side-buffer dtype is {self._dequant_dtype}, "
+                f"got {input_dtype}. The cache does not support dtype changes "
+                f"across update_and_fetch calls."
+            )
 
         # Quantize incoming tokens (returns bit-packed indices)
         k_idx, k_nrm = turboquant_quantize(keys, self.rotation_key, self._bits)
@@ -104,10 +127,17 @@ class TurboQuantKVCache(_BaseCache):
                     [self._value_norms, mx.zeros(nrm_shape, dtype=mx.float32)], axis=2
                 )
                 self._key_dequant = mx.concatenate(
-                    [self._key_dequant, mx.zeros(deq_shape, dtype=input_dtype)], axis=2
+                    [
+                        self._key_dequant,
+                        mx.zeros(deq_shape, dtype=self._dequant_dtype),
+                    ],
+                    axis=2,
                 )
                 self._value_dequant = mx.concatenate(
-                    [self._value_dequant, mx.zeros(deq_shape, dtype=input_dtype)],
+                    [
+                        self._value_dequant,
+                        mx.zeros(deq_shape, dtype=self._dequant_dtype),
+                    ],
                     axis=2,
                 )
             else:
@@ -115,8 +145,8 @@ class TurboQuantKVCache(_BaseCache):
                 self._key_norms = mx.zeros(nrm_shape, dtype=mx.float32)
                 self._value_indices = mx.zeros(idx_shape, dtype=mx.uint8)
                 self._value_norms = mx.zeros(nrm_shape, dtype=mx.float32)
-                self._key_dequant = mx.zeros(deq_shape, dtype=input_dtype)
-                self._value_dequant = mx.zeros(deq_shape, dtype=input_dtype)
+                self._key_dequant = mx.zeros(deq_shape, dtype=self._dequant_dtype)
+                self._value_dequant = mx.zeros(deq_shape, dtype=self._dequant_dtype)
 
         # Store quantized data
         assert (
@@ -194,6 +224,11 @@ class TurboQuantKVCache(_BaseCache):
             self._value_norms = None
             self._key_dequant = None
             self._value_dequant = None
+            self._dequant_dtype = None
+        # For partial trims (offset > 0) the side buffer retains stale dequant
+        # values at ``[..., self.offset:, :]``.  That's safe: ``update_and_fetch``
+        # always overwrites ``[prev:new_offset]`` before returning
+        # ``[..., :new_offset, :]``, so no stale position is ever exposed.
         return n
 
     def make_mask(self, *args, **kwargs):
