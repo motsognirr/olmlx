@@ -311,7 +311,7 @@ def build_leaderboard(
     where every non-skipped scenario has zero valid prompts are dropped
     (they'd rank meaninglessly at the bottom).
     """
-    if not bench_dir.exists():
+    if not bench_dir.is_dir():
         return []
     entries: list[LeaderboardEntry] = []
     for run_dir in bench_dir.iterdir():
@@ -358,7 +358,16 @@ def build_leaderboard(
         by_model: dict[str, LeaderboardEntry] = {}
         for e in entries:
             existing = by_model.get(e.model)
-            if existing is None or e.timestamp > existing.timestamp:
+            # Break timestamp ties on run_dir name: save_run appends -1, -2, ...
+            # to sub-second collisions, so the higher suffix is the later run.
+            if (
+                existing is None
+                or e.timestamp > existing.timestamp
+                or (
+                    e.timestamp == existing.timestamp
+                    and e.run_dir.name > existing.run_dir.name
+                )
+            ):
                 by_model[e.model] = e
         entries = list(by_model.values())
 
@@ -371,17 +380,21 @@ def format_leaderboard(
     *,
     limit: int | None = None,
 ) -> str:
-    """Format leaderboard entries as a plain-text table."""
+    """Format leaderboard entries as a plain-text table.
+
+    The Model column grows to fit the longest name so rows stay aligned even
+    for long HF repo paths.
+    """
     rows = entries if limit is None else entries[:limit]
-    lines: list[str] = []
-    lines.append(
-        f"{'#':>3} {'Model':<45} {'Best tok/s':>10} {'Scenario':<14} "
+    model_w = max(45, max((len(e.model) for e in rows), default=45))
+    header = (
+        f"{'#':>3} {'Model':<{model_w}} {'Best tok/s':>10} {'Scenario':<14} "
         f"{'Timestamp':<18} {'Git':<10} {'Fails/Total':>11}"
     )
-    lines.append("-" * 116)
+    lines = [header, "-" * len(header)]
     for i, e in enumerate(rows, 1):
         lines.append(
-            f"{i:>3} {e.model:<45} {e.best_tps:>10.1f} {e.best_scenario:<14} "
+            f"{i:>3} {e.model:<{model_w}} {e.best_tps:>10.1f} {e.best_scenario:<14} "
             f"{e.timestamp:<18} {(e.git_sha or '—'):<10} "
             f"{f'{e.failed_scenarios}/{e.total_scenarios}':>11}"
         )

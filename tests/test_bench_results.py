@@ -457,6 +457,35 @@ class TestBuildLeaderboard:
     def test_nonexistent_dir_returns_empty(self, tmp_path):
         assert build_leaderboard(tmp_path / "nope") == []
 
+    def test_bench_path_is_file_returns_empty(self, tmp_path):
+        not_a_dir = tmp_path / "oops"
+        not_a_dir.write_text("{}")
+        assert build_leaderboard(not_a_dir) == []
+
+    def test_same_timestamp_tiebreaker_is_deterministic(self, tmp_path):
+        # save_run appends a -N suffix to the directory on sub-second collisions
+        # but leaves the timestamp field untouched. The later (higher-suffix)
+        # directory should win deterministically.
+        run_early = RunResult(
+            model="model-a",
+            timestamp="20260101T000000Z",
+            git_sha="early",
+            scenarios=[_scenario("baseline", [_prompt(30.0)])],
+        )
+        run_late = RunResult(
+            model="model-a",
+            timestamp="20260101T000000Z",
+            git_sha="late",
+            scenarios=[_scenario("baseline", [_prompt(90.0)])],
+        )
+        save_run(run_early, tmp_path)
+        save_run(run_late, tmp_path)
+
+        entries = build_leaderboard(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].git_sha == "late"
+        assert entries[0].best_tps == pytest.approx(90.0, rel=1e-6)
+
 
 class TestFormatLeaderboard:
     def _entries(self, n: int):
@@ -491,3 +520,28 @@ class TestFormatLeaderboard:
         out = format_leaderboard(self._entries(1))
         assert "Best tok/s" in out
         assert "Model" in out
+
+    def test_long_model_name_does_not_break_alignment(self):
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        long_name = "mlx-community/Meta-Llama-3.1-70B-Instruct-8bit-some-suffix"
+        entries = [
+            LeaderboardEntry(
+                model=long_name,
+                best_tps=45.2,
+                best_scenario="baseline",
+                timestamp="20260101T000000Z",
+                git_sha="abc1234",
+                failed_scenarios=0,
+                total_scenarios=1,
+                run_dir=Path("/tmp/x"),
+            ),
+        ]
+        out = format_leaderboard(entries)
+        lines = out.split("\n")
+        assert long_name in out
+        # Header, separator, and data row must share the same width so columns
+        # stay aligned.
+        assert len(lines[0]) == len(lines[1]) == len(lines[2])
