@@ -20,7 +20,9 @@ from olmlx.bench.results import (
     PromptResult,
     RunResult,
     ScenarioResult,
+    build_leaderboard,
     create_run_result,
+    format_leaderboard,
     save_run,
 )
 from olmlx.bench.scenarios import Scenario, get_scenarios
@@ -123,6 +125,19 @@ def run_bench(
     )
     run_dir = save_run(run, bench_dir)
     print(f"\nResults saved to {run_dir}", file=sys.stderr)
+
+    try:
+        entries = build_leaderboard(bench_dir)
+        if entries:
+            print("\nLeaderboard (top 5):", file=sys.stderr)
+            print(format_leaderboard(entries, limit=5), file=sys.stderr)
+            print(
+                "  (run 'olmlx bench leaderboard --all-runs' for full history)",
+                file=sys.stderr,
+            )
+    except Exception:
+        logger.warning("Could not build leaderboard", exc_info=True)
+
     return run
 
 

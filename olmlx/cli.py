@@ -1035,7 +1035,7 @@ def cmd_bench_run(args):
         if args.scenarios
         else None
     )
-    bench_dir = Path(args.output_dir) if args.output_dir else DEFAULT_BENCH_DIR
+    bench_dir = Path(args.bench_dir) if args.bench_dir else DEFAULT_BENCH_DIR
 
     run_bench(
         model=args.model,
@@ -1066,11 +1066,14 @@ def cmd_bench_compare(args):
     print(compare_runs(run1, run2))
 
 
-def cmd_bench_list(_args):
+def cmd_bench_list(args):
     """List past benchmark runs."""
-    from olmlx.bench.results import list_runs
+    from pathlib import Path
 
-    runs = list_runs()
+    from olmlx.bench.results import DEFAULT_BENCH_DIR, list_runs
+
+    bench_dir = Path(args.bench_dir) if args.bench_dir else DEFAULT_BENCH_DIR
+    runs = list_runs(bench_dir)
     if not runs:
         print("No benchmark runs found.")
         return
@@ -1084,6 +1087,34 @@ def cmd_bench_list(_args):
             f"{r['timestamp']:<22} {r['model']:<45} {r['git_sha'] or '—':<10} "
             f"{r['scenarios']:>9} {r['skipped']:>7}"
         )
+
+
+def _positive_int(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
+
+
+def cmd_bench_leaderboard(args):
+    """Show the model leaderboard derived from saved bench runs."""
+    from pathlib import Path
+
+    from olmlx.bench.results import (
+        DEFAULT_BENCH_DIR,
+        build_leaderboard,
+        format_leaderboard,
+    )
+
+    bench_dir = Path(args.bench_dir) if args.bench_dir else DEFAULT_BENCH_DIR
+    entries = build_leaderboard(bench_dir, latest_per_model=not args.all_runs)
+    if not entries:
+        print("No bench runs with valid measurements found.")
+        return
+    print(format_leaderboard(entries, limit=args.limit))
 
 
 def _flash_progress(desc, frac):
@@ -1464,17 +1495,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated scenario names (default: all)",
     )
     bench_run.add_argument(
+        "--bench-dir",
         "--output-dir",
+        dest="bench_dir",
         type=str,
         default=None,
-        help="Output directory (default: ~/.olmlx/bench/runs)",
+        help="Directory to save the run in (default: ~/.olmlx/bench/runs)",
     )
 
     bench_compare = bench_sub.add_parser("compare", help="Compare two benchmark runs")
     bench_compare.add_argument("run1", help="First run (timestamp or path)")
     bench_compare.add_argument("run2", help="Second run (timestamp or path)")
 
-    bench_sub.add_parser("list", help="List past benchmark runs")
+    bench_list = bench_sub.add_parser("list", help="List past benchmark runs")
+    bench_list.add_argument(
+        "--bench-dir",
+        type=str,
+        default=None,
+        help="Directory to read runs from (default: ~/.olmlx/bench/runs)",
+    )
+
+    bench_lb = bench_sub.add_parser(
+        "leaderboard", help="Show model leaderboard derived from past runs"
+    )
+    bench_lb.add_argument(
+        "--all-runs",
+        action="store_true",
+        help=(
+            "Show every run instead of latest per model. Use this if a "
+            "recent regression run has displaced an earlier faster result."
+        ),
+    )
+    bench_lb.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        help="Limit rows (default: all); must be >= 1",
+    )
+    bench_lb.add_argument(
+        "--bench-dir",
+        type=str,
+        default=None,
+        help="Directory to read runs from (default: ~/.olmlx/bench/runs)",
+    )
 
     cfg = sub.add_parser("config", help="Show configuration")
     cfg_sub = cfg.add_subparsers(dest="config_command")
@@ -1532,6 +1595,8 @@ def cli_main():
             cmd_bench_compare(args)
         elif args.bench_command == "list":
             cmd_bench_list(args)
+        elif args.bench_command == "leaderboard":
+            cmd_bench_leaderboard(args)
         else:
             parser.parse_args(["bench", "--help"])
     elif args.command == "config":

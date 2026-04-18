@@ -807,3 +807,101 @@ class TestModelsPullSuggestion:
         assert exc_info.value.code == 1
         err = capsys.readouterr().err
         assert "olmlx models search" in err
+
+
+class TestBenchLeaderboardArgs:
+    def test_limit_rejects_zero(self):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["bench", "leaderboard", "--limit", "0"])
+
+    def test_limit_rejects_negative(self):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["bench", "leaderboard", "--limit", "-3"])
+
+    def test_limit_accepts_positive(self):
+        parser = build_parser()
+        args = parser.parse_args(["bench", "leaderboard", "--limit", "5"])
+        assert args.limit == 5
+
+    def test_bench_dir_parsed(self):
+        parser = build_parser()
+        args = parser.parse_args(["bench", "leaderboard", "--bench-dir", "/tmp/foo"])
+        assert args.bench_dir == "/tmp/foo"
+
+    def test_bench_dir_defaults_to_none(self):
+        parser = build_parser()
+        args = parser.parse_args(["bench", "leaderboard"])
+        assert args.bench_dir is None
+
+    def test_list_bench_dir_parsed(self):
+        parser = build_parser()
+        args = parser.parse_args(["bench", "list", "--bench-dir", "/tmp/foo"])
+        assert args.bench_dir == "/tmp/foo"
+
+    def test_run_bench_dir_stores_on_bench_dir(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["bench", "run", "--model", "m", "--bench-dir", "/tmp/foo"]
+        )
+        assert args.bench_dir == "/tmp/foo"
+        # dest must be consistent with list/leaderboard, not output_dir
+        assert not hasattr(args, "output_dir")
+
+    def test_run_output_dir_alias_still_works(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["bench", "run", "--model", "m", "--output-dir", "/tmp/foo"]
+        )
+        assert args.bench_dir == "/tmp/foo"
+
+
+class TestBenchLeaderboardCmd:
+    def test_reads_from_custom_bench_dir(self, tmp_path, capsys):
+        from olmlx.bench.results import (
+            PromptResult,
+            RunResult,
+            ScenarioResult,
+            save_run,
+        )
+        from olmlx.cli import cmd_bench_leaderboard
+
+        save_run(
+            RunResult(
+                model="custom-model",
+                timestamp="20260101T000000Z",
+                git_sha="abc1234",
+                scenarios=[
+                    ScenarioResult(
+                        scenario_name="baseline",
+                        scenario_description="d",
+                        env_overrides={},
+                        prompt_results=[
+                            PromptResult(
+                                prompt_name="p",
+                                category="c",
+                                output_text="",
+                                status_code=200,
+                                eval_count=100,
+                                eval_duration_ns=1_000_000_000,
+                            )
+                        ],
+                    )
+                ],
+            ),
+            tmp_path,
+        )
+        args = MagicMock(bench_dir=str(tmp_path), all_runs=False, limit=None)
+        cmd_bench_leaderboard(args)
+        out = capsys.readouterr().out
+        assert "custom-model" in out
+
+    def test_default_bench_dir_does_not_see_custom(self, tmp_path, capsys):
+        from olmlx.cli import cmd_bench_leaderboard
+
+        # No runs in the custom dir, command reports no runs.
+        args = MagicMock(bench_dir=str(tmp_path), all_runs=False, limit=None)
+        cmd_bench_leaderboard(args)
+        out = capsys.readouterr().out
+        assert "No bench runs" in out

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BENCH_DIR = Path.home() / ".olmlx" / "bench" / "runs"
 
@@ -277,3 +280,185 @@ def create_run_result(
         scenarios=scenarios,
         max_tokens_override=max_tokens_override,
     )
+
+
+@dataclass(frozen=True)
+class LeaderboardEntry:
+    model: str
+    best_tps: float
+    best_scenario: str
+    timestamp: str
+    git_sha: str | None
+    empty_scenarios: int
+    total_scenarios: int
+    # Internal: used only as the same-timestamp tiebreaker key in
+    # build_leaderboard. Excluded from __eq__/__hash__/__repr__ so two
+    # entries with identical presentable fields compare equal regardless
+    # of where on disk they were loaded from.
+    run_dir: Path = field(compare=False, repr=False)
+
+
+def _run_dir_sort_key(name: str) -> tuple[str, int]:
+    # save_run appends "-<n>" (n ≥ 1) on timestamp collisions. Split on the
+    # last dash so the numeric suffix sorts numerically; bare timestamps get
+    # counter 0 and rank before any suffixed siblings.
+    base, _, suffix = name.rpartition("-")
+    if base and suffix.isdigit():
+        return (base, int(suffix))
+    return (name, 0)
+
+
+def _scenario_avg_tps(scenario: ScenarioResult) -> float:
+    valid = [
+        p.tokens_per_second
+        for p in scenario.prompt_results
+        if p.status_code == 200 and p.tokens_per_second > 0
+    ]
+    return sum(valid) / len(valid) if valid else 0.0
+
+
+def build_leaderboard(
+    bench_dir: Path = DEFAULT_BENCH_DIR,
+    *,
+    latest_per_model: bool = True,
+) -> list[LeaderboardEntry]:
+    """Aggregate saved runs into ranked leaderboard entries.
+
+    With latest_per_model=True (the default) the most recent run per model
+    is kept — the leaderboard shows the current state of each model, not
+    its historical peak. Pass latest_per_model=False to keep every run
+    (e.g. for a full history view).
+
+    A scenario counts as "empty" (contributes to the Empty/Total column)
+    when it produced zero usable measurements — every prompt either
+    returned non-200 or had zero tps. A scenario with at least one valid
+    prompt still contributes to best_tps even if other prompts failed;
+    per-prompt details live in results.json. Skipped scenarios are
+    excluded from both empty and total counts. Runs where no non-skipped
+    scenario has a usable best_tps are dropped (they'd rank meaninglessly
+    at the bottom).
+    """
+    if not bench_dir.is_dir():
+        return []
+    try:
+        run_dirs = list(bench_dir.iterdir())
+    except OSError:
+        return []
+    entries: list[LeaderboardEntry] = []
+    for run_dir in run_dirs:
+        if not run_dir.is_dir():
+            continue
+        try:
+            has_results = (run_dir / "results.json").exists()
+        except OSError:
+            continue
+        if not has_results:
+            continue
+        try:
+            run = load_run(run_dir)
+        except (
+            json.JSONDecodeError,
+            OSError,
+            IndexError,
+            KeyError,
+            TypeError,
+            ValueError,
+            AttributeError,
+        ) as exc:
+            logger.debug("Skipping %s: %r", run_dir, exc, exc_info=True)
+            continue
+
+        best_tps = 0.0
+        best_scenario = ""
+        empty = 0
+        total = 0
+        for sc in run.scenarios:
+            if sc.skipped:
+                continue
+            total += 1
+            avg = _scenario_avg_tps(sc)
+            if avg <= 0:
+                empty += 1
+                continue
+            if avg > best_tps:
+                best_tps = avg
+                best_scenario = sc.scenario_name
+
+        if best_tps <= 0:
+            continue
+
+        entries.append(
+            LeaderboardEntry(
+                model=run.model,
+                best_tps=best_tps,
+                best_scenario=best_scenario,
+                timestamp=run.timestamp,
+                git_sha=run.git_sha,
+                empty_scenarios=empty,
+                total_scenarios=total,
+                run_dir=run_dir,
+            )
+        )
+
+    if latest_per_model:
+        by_model: dict[str, LeaderboardEntry] = {}
+        for e in entries:
+            existing = by_model.get(e.model)
+            # Pick the most recent run, breaking sub-second ties on the
+            # numeric collision counter in the directory name so -10 sorts
+            # after -9 (plain string order would put -10 before -2).
+            if (
+                existing is None
+                or e.timestamp > existing.timestamp
+                or (
+                    e.timestamp == existing.timestamp
+                    and _run_dir_sort_key(e.run_dir.name)
+                    > _run_dir_sort_key(existing.run_dir.name)
+                )
+            ):
+                by_model[e.model] = e
+        entries = list(by_model.values())
+
+    # Compound sort key: `-best_tps` descending, then model + dir ascending.
+    # Using a single key (rather than two stable sorts) makes the precedence
+    # explicit and resistant to accidental reordering. Recency is not used
+    # as a tiebreaker — it would conflate "more recent" with "better".
+    entries.sort(
+        key=lambda e: (-e.best_tps, e.model, _run_dir_sort_key(e.run_dir.name))
+    )
+    return entries
+
+
+def format_leaderboard(
+    entries: list[LeaderboardEntry],
+    *,
+    limit: int | None = None,
+) -> str:
+    """Format leaderboard entries as a plain-text table.
+
+    The Model and Scenario columns grow to fit their longest value so rows
+    stay aligned even for long HF repo paths or scenario names.
+    """
+    rows = entries if limit is None else entries[:limit]
+    if not rows:
+        return ""
+    rank_w = max(3, len(str(len(rows))))
+    model_w = max(45, max(len(e.model) for e in rows))
+    scenario_w = max(14, max(len(e.best_scenario) for e in rows))
+    empty_w = max(
+        11, max(len(f"{e.empty_scenarios}/{e.total_scenarios}") for e in rows)
+    )
+    header = (
+        f"{'#':>{rank_w}} {'Model':<{model_w}} {'Best tok/s':>10} "
+        f"{'Scenario':<{scenario_w}} {'Timestamp':<18} {'Git':<10} "
+        f"{'Empty/Total':>{empty_w}}"
+    )
+    lines = [header, "-" * len(header)]
+    for i, e in enumerate(rows, 1):
+        lines.append(
+            f"{i:>{rank_w}} {e.model:<{model_w}} {e.best_tps:>10.1f} "
+            f"{e.best_scenario:<{scenario_w}} {e.timestamp:<18} "
+            f"{(e.git_sha[:10] if e.git_sha else '-' * 10):<10} "
+            f"{f'{e.empty_scenarios}/{e.total_scenarios}':>{empty_w}}"
+        )
+    return "\n".join(lines)

@@ -186,6 +186,65 @@ class TestRunBench:
         run_dir = bench_dir / result.timestamp
         assert (run_dir / "results.json").exists()
 
+    def test_post_run_leaderboard_printed(self, tmp_path, monkeypatch, capsys):
+        """A successful run prints the Leaderboard block to stderr."""
+        monkeypatch.setattr(
+            "olmlx.bench.runner._resolve_model_path",
+            lambda m: tmp_path / "model",
+        )
+
+        fake_entry = MagicMock()
+        monkeypatch.setattr(
+            "olmlx.bench.runner.build_leaderboard",
+            lambda _bench_dir: [fake_entry],
+        )
+        monkeypatch.setattr(
+            "olmlx.bench.runner.format_leaderboard",
+            lambda _entries, limit: "<leaderboard body>",
+        )
+
+        always_skip = Scenario(
+            name="baseline",
+            description="Baseline",
+            should_skip=lambda p: "skipped for test",
+        )
+        with patch("olmlx.bench.runner.get_scenarios", return_value=[always_skip]):
+            run_bench("model", bench_dir=tmp_path / "bench")
+
+        err = capsys.readouterr().err
+        assert "Leaderboard (top 5):" in err
+        assert "<leaderboard body>" in err
+
+    def test_post_run_leaderboard_failure_is_swallowed(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A broken build_leaderboard must not break a saved run."""
+        import logging
+
+        monkeypatch.setattr(
+            "olmlx.bench.runner._resolve_model_path",
+            lambda m: tmp_path / "model",
+        )
+
+        def _boom(_bench_dir):
+            raise RuntimeError("synthetic")
+
+        monkeypatch.setattr("olmlx.bench.runner.build_leaderboard", _boom)
+
+        always_skip = Scenario(
+            name="baseline",
+            description="Baseline",
+            should_skip=lambda p: "skipped for test",
+        )
+        with (
+            patch("olmlx.bench.runner.get_scenarios", return_value=[always_skip]),
+            caplog.at_level(logging.WARNING, logger="olmlx.bench.runner"),
+        ):
+            result = run_bench("model", bench_dir=tmp_path / "bench")
+
+        assert result is not None
+        assert any("Could not build leaderboard" in r.message for r in caplog.records)
+
     def test_server_mode_dispatched(self, tmp_path, monkeypatch):
         """Server-mode scenarios call _run_server_scenario, not _run_worker."""
         monkeypatch.setattr(

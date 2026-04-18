@@ -1,11 +1,15 @@
 """Tests for olmlx.bench.results."""
 
+import pytest
+
 from olmlx.bench.results import (
     PromptResult,
     RunResult,
     ScenarioResult,
+    build_leaderboard,
     compare_runs,
     create_run_result,
+    format_leaderboard,
     list_runs,
     load_run,
     save_run,
@@ -280,3 +284,522 @@ class TestCompareRuns:
         )
         output = compare_runs(run1, run2)
         assert "No output differences found." in output
+
+
+def _prompt(tps: float, *, status_code: int = 200) -> PromptResult:
+    """Build a PromptResult whose tokens_per_second equals `tps`."""
+    if tps <= 0:
+        return PromptResult(
+            prompt_name="p",
+            category="c",
+            output_text="",
+            status_code=status_code,
+        )
+    eval_count = 100
+    eval_duration_ns = int(eval_count / tps * 1e9)
+    return PromptResult(
+        prompt_name="p",
+        category="c",
+        output_text="",
+        status_code=status_code,
+        eval_count=eval_count,
+        eval_duration_ns=eval_duration_ns,
+    )
+
+
+def _scenario(name: str, prompts: list[PromptResult], *, skipped: bool = False):
+    return ScenarioResult(
+        scenario_name=name,
+        scenario_description=name,
+        env_overrides={},
+        prompt_results=prompts,
+        skipped=skipped,
+    )
+
+
+def _save_fake_run(
+    tmp_path, *, model: str, timestamp: str, scenarios: list[ScenarioResult]
+):
+    run = RunResult(
+        model=model,
+        timestamp=timestamp,
+        git_sha="abc1234",
+        scenarios=scenarios,
+    )
+    save_run(run, tmp_path)
+
+
+class TestBuildLeaderboard:
+    def test_latest_per_model_ranks_by_best_tps(self, tmp_path):
+        # model-a older run (slow), newer run (fast) — newer should win and rank first
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260101T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(20.0)])],
+        )
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260102T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(80.0)])],
+        )
+        # model-b single run in the middle
+        _save_fake_run(
+            tmp_path,
+            model="model-b",
+            timestamp="20260102T120000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+
+        entries = build_leaderboard(tmp_path)
+
+        assert [e.model for e in entries] == ["model-a", "model-b"]
+        assert entries[0].best_tps == 80.0
+        assert entries[0].timestamp == "20260102T000000Z"
+        assert entries[1].best_tps == 50.0
+
+    def test_all_runs_keeps_history(self, tmp_path):
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260101T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(20.0)])],
+        )
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260102T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(80.0)])],
+        )
+        _save_fake_run(
+            tmp_path,
+            model="model-b",
+            timestamp="20260102T120000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+
+        entries = build_leaderboard(tmp_path, latest_per_model=False)
+        assert len(entries) == 3
+        assert [e.best_tps for e in entries] == [80.0, 50.0, 20.0]
+
+    def test_equal_tps_ties_break_by_model_then_run_dir(self, tmp_path):
+        # Three runs with identical best_tps across two models; the
+        # deterministic ordering is model name asc, then numeric-aware
+        # dir sort (so -10 comes after -9, not before -2). Timestamps
+        # intentionally move backwards in wall-clock time so a
+        # timestamp-based tiebreaker would give a different answer.
+        _save_fake_run(
+            tmp_path,
+            model="zebra",
+            timestamp="20260103T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+        _save_fake_run(
+            tmp_path,
+            model="alpha",
+            timestamp="20260101T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+        _save_fake_run(
+            tmp_path,
+            model="alpha",
+            timestamp="20260102T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+
+        entries = build_leaderboard(tmp_path, latest_per_model=False)
+        assert [e.model for e in entries] == ["alpha", "alpha", "zebra"]
+        # Both alpha entries use the same dir base 20260101T000000Z /
+        # 20260102T000000Z; numeric dir-name ordering puts the older one
+        # (lexicographically smaller timestamp) first.
+        assert entries[0].timestamp == "20260101T000000Z"
+        assert entries[1].timestamp == "20260102T000000Z"
+
+    def test_best_scenario_is_max_across_scenarios(self, tmp_path):
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260101T000000Z",
+            scenarios=[
+                _scenario("baseline", [_prompt(40.0), _prompt(60.0)]),  # avg 50
+                _scenario("turboquant-4", [_prompt(70.0), _prompt(90.0)]),  # avg 80
+            ],
+        )
+
+        entries = build_leaderboard(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].best_tps == pytest.approx(80.0, rel=1e-6)
+        assert entries[0].best_scenario == "turboquant-4"
+
+    def test_skips_runs_with_no_valid_prompts(self, tmp_path):
+        # One run has all-zero prompts (simulating server failures)
+        _save_fake_run(
+            tmp_path,
+            model="broken",
+            timestamp="20260101T000000Z",
+            scenarios=[
+                _scenario("baseline", [_prompt(0.0, status_code=0)]),
+            ],
+        )
+        _save_fake_run(
+            tmp_path,
+            model="working",
+            timestamp="20260102T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+
+        entries = build_leaderboard(tmp_path)
+        assert [e.model for e in entries] == ["working"]
+
+    def test_skipped_scenarios_excluded_from_counts(self, tmp_path):
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260101T000000Z",
+            scenarios=[
+                _scenario("flash", [], skipped=True),
+                _scenario("baseline", [_prompt(50.0)]),
+            ],
+        )
+
+        entries = build_leaderboard(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].empty_scenarios == 0
+        assert entries[0].total_scenarios == 1
+
+    def test_empty_scenarios_counted(self, tmp_path):
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260101T000000Z",
+            scenarios=[
+                _scenario("baseline", [_prompt(50.0)]),
+                _scenario("turboquant-4", [_prompt(0.0, status_code=0)]),
+            ],
+        )
+
+        entries = build_leaderboard(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].empty_scenarios == 1
+        assert entries[0].total_scenarios == 2
+
+    def test_empty_scenario_is_not_the_full_failure_story(self, tmp_path):
+        # Empty/Total counts scenarios with zero usable measurements, not
+        # scenarios with some failed prompts. A 1-valid / 4-failed scenario
+        # is not "empty" — its valid sample still contributes to best_tps.
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260101T000000Z",
+            scenarios=[
+                _scenario(
+                    "flash",
+                    [
+                        _prompt(50.0),
+                        _prompt(0.0, status_code=500),
+                        _prompt(0.0, status_code=500),
+                        _prompt(0.0, status_code=500),
+                        _prompt(0.0, status_code=500),
+                    ],
+                )
+            ],
+        )
+        entries = build_leaderboard(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].empty_scenarios == 0
+        assert entries[0].total_scenarios == 1
+        assert entries[0].best_tps == pytest.approx(50.0, rel=1e-6)
+
+    def test_stray_files_in_bench_dir_ignored(self, tmp_path):
+        (tmp_path / "stray.txt").write_text("junk")
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260101T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+        entries = build_leaderboard(tmp_path)
+        assert [e.model for e in entries] == ["model-a"]
+
+    def test_empty_dir_returns_empty(self, tmp_path):
+        assert build_leaderboard(tmp_path) == []
+
+    def test_nonexistent_dir_returns_empty(self, tmp_path):
+        assert build_leaderboard(tmp_path / "nope") == []
+
+    def test_bench_path_is_file_returns_empty(self, tmp_path):
+        not_a_dir = tmp_path / "oops"
+        not_a_dir.write_text("{}")
+        assert build_leaderboard(not_a_dir) == []
+
+    def test_invalid_shape_results_json_is_skipped(self, tmp_path):
+        # Valid JSON but not a dict — load_run's from_dict raises TypeError,
+        # which must not abort the whole leaderboard build.
+        bad = tmp_path / "broken"
+        bad.mkdir()
+        (bad / "results.json").write_text("null")
+
+        _save_fake_run(
+            tmp_path,
+            model="good",
+            timestamp="20260101T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+
+        entries = build_leaderboard(tmp_path)
+        assert [e.model for e in entries] == ["good"]
+
+    def test_iterdir_oserror_returns_empty(self, tmp_path, monkeypatch):
+        # Simulate a bench_dir we can stat() but not iterate (e.g. wrong
+        # ownership). The function must not propagate the OSError.
+        from pathlib import Path
+
+        real_iterdir = Path.iterdir
+
+        def fake_iterdir(self):
+            if self == tmp_path:
+                raise PermissionError("denied")
+            yield from real_iterdir(self)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+        assert build_leaderboard(tmp_path) == []
+
+    def test_results_json_exists_permission_error_is_skipped(
+        self, tmp_path, monkeypatch
+    ):
+        # Python 3.12+: Path.exists() propagates non-FileNotFoundError OSErrors.
+        # A subdirectory the process can stat but not inspect must skip that
+        # run, not abort the whole build.
+        from pathlib import Path
+
+        _save_fake_run(
+            tmp_path,
+            model="good",
+            timestamp="20260101T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(42.0)])],
+        )
+        bad_run_dir = tmp_path / "20260101T010000Z-restricted"
+        bad_run_dir.mkdir()
+
+        real_exists = Path.exists
+
+        def fake_exists(self):
+            if self == bad_run_dir / "results.json":
+                raise PermissionError("stat denied")
+            return real_exists(self)
+
+        monkeypatch.setattr(Path, "exists", fake_exists)
+
+        entries = build_leaderboard(tmp_path)
+        assert [e.model for e in entries] == ["good"]
+
+    def test_entry_equality_ignores_run_dir(self):
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        common = dict(
+            model="m",
+            best_tps=10.0,
+            best_scenario="s",
+            timestamp="t",
+            git_sha="g",
+            empty_scenarios=0,
+            total_scenarios=1,
+        )
+        a = LeaderboardEntry(**common, run_dir=Path("/a"))
+        b = LeaderboardEntry(**common, run_dir=Path("/b"))
+        assert a == b
+        assert hash(a) == hash(b)
+
+    def test_tiebreaker_handles_double_digit_collision_counter(self, tmp_path):
+        # 11 runs share one timestamp and identical best_tps; save_run writes
+        # them to ...Z, ...Z-1, ..., ...Z-10. With best_tps tied, the
+        # collision counter must decide — the last (counter=10) must win,
+        # which naive string order would rank below ...Z-9.
+        for i in range(11):
+            run = RunResult(
+                model="model-a",
+                timestamp="20260101T000000Z",
+                git_sha=f"rev{i:02d}",
+                scenarios=[_scenario("baseline", [_prompt(50.0)])],
+            )
+            save_run(run, tmp_path)
+
+        entries = build_leaderboard(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].git_sha == "rev10"
+        assert entries[0].best_tps == pytest.approx(50.0, rel=1e-6)
+
+    def test_same_timestamp_tiebreaker_is_deterministic(self, tmp_path):
+        # save_run appends a -N suffix on sub-second collisions. When best_tps
+        # and timestamp both tie, the higher-suffix directory must win so the
+        # picked entry is deterministic regardless of iterdir() ordering.
+        run_early = RunResult(
+            model="model-a",
+            timestamp="20260101T000000Z",
+            git_sha="early",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+        run_late = RunResult(
+            model="model-a",
+            timestamp="20260101T000000Z",
+            git_sha="late",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+        save_run(run_early, tmp_path)
+        save_run(run_late, tmp_path)
+
+        entries = build_leaderboard(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].git_sha == "late"
+
+
+class TestFormatLeaderboard:
+    def _entries(self, n: int):
+        from olmlx.bench.results import LeaderboardEntry
+
+        return [
+            LeaderboardEntry(
+                model=f"model-{i}",
+                best_tps=100.0 - i,
+                best_scenario="baseline",
+                timestamp="20260101T000000Z",
+                git_sha="abc1234",
+                empty_scenarios=0,
+                total_scenarios=1,
+                run_dir=__import__("pathlib").Path("/tmp/x"),
+            )
+            for i in range(n)
+        ]
+
+    def test_limit_truncates_rows(self):
+        out = format_leaderboard(self._entries(5), limit=2)
+        assert "model-0" in out
+        assert "model-1" in out
+        assert "model-2" not in out
+
+    def test_no_limit_shows_all(self):
+        out = format_leaderboard(self._entries(3))
+        assert "model-0" in out
+        assert "model-2" in out
+
+    def test_header_present(self):
+        out = format_leaderboard(self._entries(1))
+        assert "Best tok/s" in out
+        assert "Model" in out
+
+    def test_long_model_name_does_not_break_alignment(self):
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        long_name = "mlx-community/Meta-Llama-3.1-70B-Instruct-8bit-some-suffix"
+        entries = [
+            LeaderboardEntry(
+                model=long_name,
+                best_tps=45.2,
+                best_scenario="baseline",
+                timestamp="20260101T000000Z",
+                git_sha="abc1234",
+                empty_scenarios=0,
+                total_scenarios=1,
+                run_dir=Path("/tmp/x"),
+            ),
+        ]
+        out = format_leaderboard(entries)
+        lines = out.split("\n")
+        assert long_name in out
+        # Header, separator, and data row must share the same width so columns
+        # stay aligned.
+        assert len(lines[0]) == len(lines[1]) == len(lines[2])
+
+    def test_long_scenario_name_does_not_break_alignment(self):
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        long_scenario = "a-really-long-scenario-name-that-overflows"
+        entries = [
+            LeaderboardEntry(
+                model="model-a",
+                best_tps=45.2,
+                best_scenario=long_scenario,
+                timestamp="20260101T000000Z",
+                git_sha="abc1234",
+                empty_scenarios=0,
+                total_scenarios=1,
+                run_dir=Path("/tmp/x"),
+            ),
+        ]
+        out = format_leaderboard(entries)
+        lines = out.split("\n")
+        assert long_scenario in out
+        assert len(lines[0]) == len(lines[1]) == len(lines[2])
+
+    def test_missing_git_sha_uses_ascii_placeholder(self):
+        # The em dash (U+2014) is 1 Python character but can render as 2
+        # visual columns in East_Asian_Width=Ambiguous terminals, silently
+        # widening the Git column past the ':<10' header pad.
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        entries = [
+            LeaderboardEntry(
+                model="model-a",
+                best_tps=45.2,
+                best_scenario="baseline",
+                timestamp="20260101T000000Z",
+                git_sha=None,
+                empty_scenarios=0,
+                total_scenarios=1,
+                run_dir=Path("/tmp/x"),
+            ),
+        ]
+        out = format_leaderboard(entries)
+        assert "—" not in out
+
+    def test_large_fails_total_does_not_break_alignment(self):
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        entries = [
+            LeaderboardEntry(
+                model="model-a",
+                best_tps=10.0,
+                best_scenario="baseline",
+                timestamp="20260101T000000Z",
+                git_sha="abc1234",
+                empty_scenarios=999_999,
+                total_scenarios=9_999_999,
+                run_dir=Path("/tmp/x"),
+            ),
+        ]
+        out = format_leaderboard(entries)
+        lines = out.split("\n")
+        assert len(lines[0]) == len(lines[1]) == len(lines[2])
+
+    def test_full_length_git_sha_does_not_break_alignment(self):
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        full_sha = "a" * 40
+        entries = [
+            LeaderboardEntry(
+                model="model-a",
+                best_tps=45.2,
+                best_scenario="baseline",
+                timestamp="20260101T000000Z",
+                git_sha=full_sha,
+                empty_scenarios=0,
+                total_scenarios=1,
+                run_dir=Path("/tmp/x"),
+            ),
+        ]
+        out = format_leaderboard(entries)
+        lines = out.split("\n")
+        assert len(lines[0]) == len(lines[1]) == len(lines[2])
