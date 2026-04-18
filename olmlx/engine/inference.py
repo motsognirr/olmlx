@@ -435,6 +435,13 @@ async def _await_deferred_cleanup():
         raise ServerBusyError(
             f"Server busy: deferred GPU cleanup did not complete within {_DEFERRED_WAIT_TIMEOUT}s"
         )
+    # ``asyncio.wait`` returns completed tasks regardless of whether they raised;
+    # surface any exception so it isn't silently dropped on the return path.
+    (finished_task,) = done
+    if not finished_task.cancelled():
+        exc = finished_task.exception()
+        if exc is not None:
+            logger.error("Deferred inference cleanup raised: %s", exc, exc_info=exc)
 
 
 async def _schedule_deferred_inference_cleanup(stream) -> None:
@@ -504,9 +511,14 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                 logger.info("Deferred inference cleanup: lock released")
                 # If this task is cancelled while ``_get_deferred_cleanup_lock().__aenter__``
                 # awaits the lock, ``CancelledError`` propagates before the body
-                # runs and the pop below is skipped.  ``_reset_inference_state()``
-                # covers that case with its own explicit ``pop`` of both the task
-                # and lock dicts — do not drop those fallback pops.
+                # runs and the pop below is skipped.  In production that leaves a
+                # stale done/cancelled entry in ``_deferred_cleanup_tasks``, which
+                # is harmless: ``_inference_lock`` was already released above so a
+                # new inference can proceed; ``_await_deferred_cleanup`` returns
+                # immediately for ``task.done() == True``; and the next
+                # ``_schedule_deferred_inference_cleanup`` overwrites the entry.
+                # In tests, ``_reset_inference_state`` pops both dicts explicitly
+                # to keep per-test state clean — do not drop those fallback pops.
                 async with _get_deferred_cleanup_lock():
                     # Use the task's own running loop rather than closing over
                     # ``loop`` from the outer scope — ``_cleanup`` runs as a
