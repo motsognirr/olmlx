@@ -92,12 +92,12 @@ def speculative_stream_generate(
         s = stats_fn()
         logger.info(
             "speculative stats: steps=%d proposed=%d accepted_draft=%d "
-            "acceptance_rate=%.3f avg_accepted_per_step=%.3f ema=%.3f lambda=%d",
+            "acceptance_rate=%.3f avg_tokens_per_step=%.3f ema=%.3f lambda=%d",
             s.get("steps", 0),
             s.get("proposed", 0),
             s.get("accepted_draft", 0),
             s.get("acceptance_rate", 0.0),
-            s.get("avg_accepted_per_step", 0.0),
+            s.get("avg_tokens_per_step", 0.0),
             s.get("ema_acceptance_rate", 0.0),
             s.get("lambda", 0),
         )

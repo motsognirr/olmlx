@@ -137,13 +137,15 @@ class SpeculativeDecoder:
         proposed = self._stats_proposed
         accepted_draft = self._stats_accepted_draft
         acceptance_rate = accepted_draft / proposed if proposed else 0.0
-        avg_accepted_per_step = (accepted_draft + steps) / steps if steps else 0.0
+        # Mean accepted length: accepted drafts plus one guaranteed target
+        # token per step, i.e. total new tokens emitted per verification pass.
+        avg_tokens_per_step = (accepted_draft + steps) / steps if steps else 0.0
         return {
             "steps": steps,
             "proposed": proposed,
             "accepted_draft": accepted_draft,
             "acceptance_rate": acceptance_rate,
-            "avg_accepted_per_step": avg_accepted_per_step,
+            "avg_tokens_per_step": avg_tokens_per_step,
             "ema_acceptance_rate": self._alpha,
             "lambda": self._lambda,
         }
@@ -359,5 +361,8 @@ class SpeculativeDecoder:
 
         accepted = self._verify(draft_tokens, target_logits)
 
-        self._update_acceptance_rate(len(accepted))
+        num_accepted_draft = self._update_acceptance_rate(len(accepted))
+        self._stats_steps += 1
+        self._stats_proposed += self._lambda
+        self._stats_accepted_draft += num_accepted_draft
         return accepted, self._lambda
