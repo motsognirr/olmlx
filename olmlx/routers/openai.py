@@ -13,6 +13,7 @@ from olmlx.engine.inference import (
     generate_embeddings,
 )
 from olmlx.engine.tool_parser import parse_model_output, resolve_tool_names
+from olmlx.routers.common import build_inference_options
 from olmlx.schemas.openai import (
     OpenAIChatMessage,
     OpenAIChatRequest,
