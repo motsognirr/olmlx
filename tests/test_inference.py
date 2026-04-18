@@ -2427,7 +2427,9 @@ class TestStreamCompletionFallbackJoinLogging:
             "deferring Metal sync" in record.message for record in caplog.records
         )
         # Wait for deferred cleanup task to complete and release the lock
-        await _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
+        task = _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
+        assert task is not None, "expected a running cleanup task"
+        await task
         assert not _inference_lock.locked(), (
             "_inference_lock must be released by deferred cleanup task"
         )
@@ -2449,7 +2451,9 @@ class TestDeferredInferenceCleanup:
 
         with patch("olmlx.engine.inference._safe_sync") as mock_safe_sync:
             await _schedule_deferred_inference_cleanup(mock_stream)
-            await _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
+            task = _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
+            assert task is not None, "expected a running cleanup task"
+            await task
 
         # _safe_sync should have been called (after thread exited)
         mock_safe_sync.assert_called_once()
@@ -2473,7 +2477,9 @@ class TestDeferredInferenceCleanup:
             # Task is running — lock should still be held initially
             assert _inference_lock.locked()
             # Wait for deferred task to complete
-            await _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
+            task = _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
+            assert task is not None, "expected a running cleanup task"
+            await task
 
         assert not _inference_lock.locked()
 
