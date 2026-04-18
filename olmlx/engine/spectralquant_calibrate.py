@@ -26,9 +26,15 @@ def _resolve_config_holder(inner: Any, model: Any) -> Any:
     # the top-level model, not on the backbone returned by `_get_backbone`.
     # mlx-lm models expose it as `.args`; some mlx-vlm LanguageModel wrappers
     # expose it as `.config`. Accept either so the guard is no stricter than
-    # the `_detect_head_dim` fallback that follows.
+    # the `_detect_head_dim` fallback that follows. Use `is not None` rather
+    # than `hasattr`: partially-constructed wrappers may set `self.args = None`
+    # as a class attribute, which would pass `hasattr` but yield a `None`
+    # namespace downstream and silently miscalibrate.
     for obj in (inner, model):
-        if hasattr(obj, "args") or hasattr(obj, "config"):
+        if (
+            getattr(obj, "args", None) is not None
+            or getattr(obj, "config", None) is not None
+        ):
             return obj
     raise RuntimeError(
         "Cannot detect model configuration: neither the backbone nor the "
@@ -331,6 +337,7 @@ def calibrate_model(
     cfg_holder = _resolve_config_holder(inner, model)
     cfg_ns = _config_namespace(cfg_holder)
     head_dim = _detect_head_dim(cfg_holder, layers_hint=inner)
+    logger.debug("calibrate_model: resolved head_dim=%d", head_dim)
 
     # Determine number of KV heads
     n_kv_heads = getattr(cfg_ns, "num_key_value_heads", None)
