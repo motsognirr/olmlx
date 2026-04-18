@@ -30,6 +30,10 @@ def _resolve_config_holder(inner: Any, model: Any) -> Any:
 def _is_attention_cache_state(state: Any) -> bool:
     # Hybrid models (e.g. Qwen3Next) mix attention caches with SSM caches.
     # Only the attention layers hold 4D KV tensors we can calibrate on.
+    # Note: this is a shape-based heuristic keyed on state[0]. For Qwen3Next,
+    # SSM entries expose the 3D conv state at index 0, so they are correctly
+    # rejected; a future hybrid architecture whose non-attention cache puts a
+    # 4D tensor first would bypass this guard.
     if not state or len(state) < 2:
         return False
     keys = state[0]
@@ -37,11 +41,11 @@ def _is_attention_cache_state(state: Any) -> bool:
 
 
 def _resolve_cache_owner(inner: Any, model: Any) -> Any:
-    # `make_prompt_cache` defers to `make_cache()` on the passed object.  For
+    # `make_prompt_cache` defers to `make_cache()` on the passed object. For
     # hybrid models (e.g. Qwen3Next SSM+attention), only the top-level model
-    # knows the correct per-layer cache types — the bare backbone would yield
-    # uniform KVCaches and break SSM layers.
-    if hasattr(model, "make_cache") or hasattr(model, "layers"):
+    # exposes `make_cache` with the correct per-layer cache types — the bare
+    # backbone would yield uniform KVCaches and break SSM layers.
+    if hasattr(model, "make_cache"):
         return model
     return inner
 

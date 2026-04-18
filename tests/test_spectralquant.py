@@ -750,7 +750,7 @@ class TestSpectralConfig:
         assert _is_attention_cache_state([ok_keys, ok_vals]) is True
 
     def test_is_attention_cache_state_ssm_3d(self):
-        """Qwen3Next SSM caches yield 3D state; must be skipped."""
+        """Qwen3Next SSM cache: conv state (index 0) is 3D, so the entry is skipped."""
         from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
 
         ssm_conv = mx.zeros((1, 3, 8192))  # conv state
@@ -758,13 +758,23 @@ class TestSpectralConfig:
         assert _is_attention_cache_state([ssm_conv, ssm_hid]) is False
 
     def test_resolve_cache_owner_falls_back_to_inner(self):
-        """When top-level model has neither make_cache nor layers, use the backbone."""
+        """When top-level model has no make_cache, use the backbone."""
         from unittest.mock import MagicMock
 
         from olmlx.engine.spectralquant_calibrate import _resolve_cache_owner
 
         inner = MagicMock(spec=["layers"])
         model = MagicMock(spec=[])
+        assert _resolve_cache_owner(inner, model) is inner
+
+    def test_resolve_cache_owner_ignores_layers_without_make_cache(self):
+        """Model exposing only .layers (no make_cache) should still route to backbone."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_cache_owner
+
+        inner = MagicMock(spec=["layers"])
+        model = MagicMock(spec=["layers"])
         assert _resolve_cache_owner(inner, model) is inner
 
     def test_resolve_config_holder_falls_back_to_model(self):
