@@ -435,7 +435,7 @@ def calibrate_model(
             # shape (e.g. Mamba2 with d_state == head_dim).
             if not isinstance(cache_entry, KVCache):
                 continue
-            state = cache_entry.state if hasattr(cache_entry, "state") else None
+            state = cache_entry.state
             if not _is_attention_cache_state(state, head_dim):
                 continue
             # KVCache.state returns [keys, values] with shape

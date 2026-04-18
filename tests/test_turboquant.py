@@ -730,6 +730,40 @@ class TestMakeTurboQuantCache:
         r1 = np.array(cache[1].rotation_key.matrix)
         assert not np.allclose(r0, r1)
 
+    def test_head_dim_iterates_past_ssm_layer_via_hint(self):
+        """Hybrid models: _detect_head_dim must iterate past SSM layers to find k_proj.
+
+        Qwen3Next-style layout: layer 0 is an SSM layer (no self_attn), layer 1
+        is an attention layer with k_proj. `layers_hint` lets the weight-shape
+        fallback walk the backbone rather than the hybrid wrapper.
+        """
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.turboquant_cache import _detect_head_dim
+
+        class FakeArgs:
+            num_key_value_heads = 4
+            # Intentionally omit head_dim so the k_proj fallback is required.
+
+        # SSM layer: explicitly has no self_attn attribute
+        ssm_layer = MagicMock(spec=["linear_attn"])
+        # Attention layer with a valid k_proj weight
+        attn_layer = MagicMock()
+        attn_layer.self_attn = MagicMock(spec=[])
+        attn_layer.self_attn.k_proj = MagicMock()
+        # k_proj output dim = num_kv_heads * head_dim = 4 * 128 = 512
+        attn_layer.self_attn.k_proj.weight = mx.zeros((512, 2048))
+
+        backbone = MagicMock()
+        backbone.layers = [ssm_layer, attn_layer]
+
+        # Config holder (top-level model) has args but no .layers
+        cfg_holder = MagicMock(spec=[])
+        cfg_holder.args = FakeArgs()
+
+        head_dim = _detect_head_dim(cfg_holder, layers_hint=backbone)
+        assert head_dim == 128
+
     def test_head_dim_fallback_from_k_proj(self):
         """When model.args.head_dim is missing, derive from k_proj weight shape."""
         from unittest.mock import MagicMock
