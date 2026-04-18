@@ -137,9 +137,7 @@ class SpeculativeDecoder:
         proposed = self._stats_proposed
         accepted_draft = self._stats_accepted_draft
         acceptance_rate = accepted_draft / proposed if proposed else 0.0
-        avg_accepted_per_step = (
-            (accepted_draft + steps) / steps if steps else 0.0
-        )
+        avg_accepted_per_step = (accepted_draft + steps) / steps if steps else 0.0
         return {
             "steps": steps,
             "proposed": proposed,
