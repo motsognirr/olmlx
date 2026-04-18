@@ -287,8 +287,8 @@ def _detect_head_dim(model: Any, layers_hint: Any = None) -> int:
         src_layers = getattr(src, "layers", None)
         if src_layers is None:
             continue
-        try:
-            for layer in src_layers:
+        for layer in src_layers:
+            try:
                 k_proj = getattr(getattr(layer, "self_attn", None), "k_proj", None)
                 weight = getattr(k_proj, "weight", None)
                 if isinstance(weight, mx.array):
@@ -296,8 +296,8 @@ def _detect_head_dim(model: Any, layers_hint: Any = None) -> int:
                     n_kv_heads = getattr(model_cfg, "num_key_value_heads", None)
                     if n_kv_heads:
                         return kv_out_dim // n_kv_heads
-        except (AttributeError, IndexError, TypeError):
-            continue
+            except (AttributeError, IndexError, TypeError):
+                continue
 
     # Derive from text_config hidden_size // num_attention_heads
     if isinstance(text_config, dict):
