@@ -1090,7 +1090,10 @@ def cmd_bench_list(args):
 
 
 def _positive_int(value: str) -> int:
-    n = int(value)
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value!r}") from None
     if n < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
     return n

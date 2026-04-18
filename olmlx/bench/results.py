@@ -353,12 +353,19 @@ def build_leaderboard(
             continue
         try:
             run = load_run(run_dir)
-        except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
+        except (
+            json.JSONDecodeError,
+            OSError,
+            KeyError,
+            TypeError,
+            ValueError,
+            AttributeError,
+        ):
             continue
 
         best_tps = 0.0
         best_scenario = ""
-        failed = 0
+        empty = 0
         total = 0
         for sc in run.scenarios:
             if sc.skipped:
@@ -366,7 +373,7 @@ def build_leaderboard(
             total += 1
             avg = _scenario_avg_tps(sc)
             if avg <= 0:
-                failed += 1
+                empty += 1
                 continue
             if avg > best_tps:
                 best_tps = avg
@@ -382,7 +389,7 @@ def build_leaderboard(
                 best_scenario=best_scenario,
                 timestamp=run.timestamp,
                 git_sha=run.git_sha,
-                empty_scenarios=failed,
+                empty_scenarios=empty,
                 total_scenarios=total,
                 run_dir=run_dir,
             )
