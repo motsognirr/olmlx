@@ -167,13 +167,25 @@ class TestDeferredCleanupLock:
 # Bug #243: _deferred_cleanup_lock cached globally — breaks across event loops
 # ---------------------------------------------------------------------------
 class TestDeferredCleanupLockPerLoop:
-    """_get_deferred_cleanup_lock must return a lock bound to the running loop."""
+    """_get_deferred_cleanup_lock must return a lock bound to the running loop.
+
+    The multi-loop test is deliberately ``def``, not ``async def`` — its whole
+    point is to exercise two separate ``asyncio.new_event_loop()`` instances,
+    which cannot be done from inside a single running loop.  The autouse
+    fixture below guarantees a clean ``_deferred_cleanup_locks`` dict even
+    for sync tests (pytest-asyncio doesn't drive async autouse fixtures for
+    non-async tests).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_lock_state(self):
+        _inf_mod._deferred_cleanup_locks.clear()
+        yield
+        _inf_mod._deferred_cleanup_locks.clear()
 
     def test_separate_locks_for_separate_loops(self):
         """A fresh event loop must receive a lock bound to itself, not a stale one."""
         import asyncio
-
-        _inf_mod._deferred_cleanup_locks.clear()
 
         loop_a = asyncio.new_event_loop()
         try:
@@ -206,7 +218,6 @@ class TestDeferredCleanupLockPerLoop:
     @pytest.mark.asyncio
     async def test_same_loop_returns_same_lock(self):
         """Within a single event loop, repeated calls must return the same lock."""
-        _inf_mod._deferred_cleanup_locks.clear()
         lock1 = _inf_mod._get_deferred_cleanup_lock()
         lock2 = _inf_mod._get_deferred_cleanup_lock()
         assert lock1 is lock2, (
