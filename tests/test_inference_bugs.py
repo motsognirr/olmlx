@@ -185,6 +185,11 @@ class TestDeferredCleanupLockPerLoop:
         try:
             lock_a = loop_a.run_until_complete(self._get_lock())
         finally:
+            # Explicit pop matches ``test_stale_locked_lock_not_inherited``
+            # and ``test_separate_tasks_for_separate_loops``; ``lock_a``
+            # keeps the lock alive so WeakKeyDictionary would hold the
+            # entry for the rest of this test otherwise.
+            _inf_mod._deferred_cleanup_locks.pop(loop_a, None)
             loop_a.close()
 
         loop_b = asyncio.new_event_loop()

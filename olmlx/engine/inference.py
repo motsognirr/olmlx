@@ -274,6 +274,11 @@ async def _reset_inference_state() -> None:
             await task
         except (asyncio.CancelledError, asyncio.InvalidStateError):
             pass
+    elif task is not None and not task.cancelled():
+        # Consume any stored exception so asyncio doesn't log
+        # "Task exception was never retrieved" to stderr.
+        with contextlib.suppress(asyncio.InvalidStateError, Exception):
+            task.exception()
     # Also cleans up any lock entry ``_cleanup``'s finally block may have
     # created: the ``task.done()`` path above skips ``await task``, but the
     # task may already have run ``_get_deferred_cleanup_lock()`` and left
@@ -504,6 +509,13 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                     # ``_cleanup`` self-contained.
                     _deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
 
+        # IMPORTANT: ``create_task`` must remain the last statement inside
+        # this ``async with``.  ``_cleanup``'s finally re-acquires the same
+        # lock to pop its dict entry; this works today because tasks don't
+        # preempt — the outer ``async with`` exits and releases the lock
+        # before ``_cleanup`` is first scheduled.  Any ``await`` inserted
+        # after this line while the lock is still held would let the event
+        # loop schedule ``_cleanup`` into a deadlock on the same lock.
         _deferred_cleanup_tasks[loop] = asyncio.create_task(_cleanup())
 
 
