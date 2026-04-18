@@ -1462,7 +1462,15 @@ class ModelManager:
             mlx_lm, load_path, lazy=False
         )
 
-        spec_target = target_model.language_model if is_vlm else target_model
+        if is_vlm:
+            spec_target = getattr(target_model, "language_model", None)
+            if spec_target is None:
+                raise ValueError(
+                    "VLM model does not expose .language_model; speculative "
+                    "decoding requires direct access to the text decoder"
+                )
+        else:
+            spec_target = target_model
         self._check_vocab_match(spec_target, draft_model)
 
         return SpeculativeDecoder(

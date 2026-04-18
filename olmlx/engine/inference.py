@@ -2278,7 +2278,9 @@ async def _full_completion_inner(
                 max_tokens=max_tokens,
                 **gen_kwargs,
             )
-            from mlx_vlm.generate import generation_stream
+            from mlx_vlm.generate import (
+                generation_stream,
+            )  # used by mx.synchronize below
         elif lm.is_speculative:
             import threading
 
@@ -2322,7 +2324,9 @@ async def _full_completion_inner(
                 max_tokens=max_tokens,
                 **gen_kwargs,
             )
-            from mlx_vlm.generate import generation_stream
+            from mlx_vlm.generate import (
+                generation_stream,
+            )  # used by mx.synchronize below
         else:
             import mlx_lm
 
@@ -2342,7 +2346,9 @@ async def _full_completion_inner(
             # Store full text on the result for downstream extraction
             if result is not None:
                 result = (result, "".join(text_parts))
-            from mlx_lm.generate import generation_stream
+            from mlx_lm.generate import (
+                generation_stream,
+            )  # used by mx.synchronize below
 
         # Sync the generation_stream specifically — mlx_lm/mlx_vlm run GPU
         # work on this module-level stream, not the default stream.  Without
