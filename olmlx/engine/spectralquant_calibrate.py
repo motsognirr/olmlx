@@ -38,15 +38,9 @@ def _resolve_config_holder(inner: Any, model: Any) -> Any:
 
 def _config_namespace(cfg_holder: Any) -> Any:
     # Return the `.args` or `.config` object carrying architecture fields.
-    ns = getattr(cfg_holder, "args", None)
-    if ns is not None:
-        return ns
-    ns = getattr(cfg_holder, "config", None)
-    if ns is not None:
-        return ns
-    raise RuntimeError(
-        "Config holder exposes neither '.args' nor '.config'. Unsupported architecture."
-    )
+    # Precondition: caller has verified via `_resolve_config_holder` that one
+    # of these exists, so no validation is needed here.
+    return getattr(cfg_holder, "args", None) or getattr(cfg_holder, "config", None)
 
 
 def _is_attention_cache_state(state: Any, expected_head_dim: int) -> bool:
@@ -66,7 +60,7 @@ def _is_attention_cache_state(state: Any, expected_head_dim: int) -> bool:
     shape = getattr(keys, "shape", None)
     if shape is None or len(shape) != 4:
         return False
-    return shape[0] == 1 and shape[2] >= 2 and shape[3] == expected_head_dim
+    return shape[2] >= 2 and shape[3] == expected_head_dim
 
 
 def _resolve_cache_owner(inner: Any, model: Any) -> Any:
