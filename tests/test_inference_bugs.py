@@ -171,17 +171,11 @@ class TestDeferredCleanupLockPerLoop:
 
     The multi-loop test is deliberately ``def``, not ``async def`` — its whole
     point is to exercise two separate ``asyncio.new_event_loop()`` instances,
-    which cannot be done from inside a single running loop.  The autouse
-    fixture below guarantees a clean ``_deferred_cleanup_locks`` dict even
-    for sync tests (pytest-asyncio doesn't drive async autouse fixtures for
-    non-async tests).
+    which cannot be done from inside a single running loop.  No fixture
+    teardown is needed: both loops are freshly constructed objects, so they
+    cannot have pre-existing entries in the WeakKeyDictionary, and the loops
+    are closed at the end of the test so their entries are eligible for GC.
     """
-
-    @pytest.fixture(autouse=True)
-    def _clean_lock_state(self):
-        _inf_mod._deferred_cleanup_locks.clear()
-        yield
-        _inf_mod._deferred_cleanup_locks.clear()
 
     def test_separate_locks_for_separate_loops(self):
         """A fresh event loop must receive a lock bound to itself, not a stale one."""
