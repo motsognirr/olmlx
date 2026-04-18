@@ -718,6 +718,70 @@ class TestSpectralConfig:
         s = ExperimentalSettings(kv_cache_quant="turboquant:4")
         assert s.kv_cache_quant == "turboquant:4"
 
+    def test_resolve_config_holder_prefers_inner_when_it_has_args(self):
+        """When backbone (inner) has .args, use it — matches pre-existing behavior."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_config_holder
+
+        inner = MagicMock(spec=[])
+        inner.args = MagicMock(spec=[])
+        model = MagicMock(spec=[])
+        model.args = MagicMock(spec=[])
+
+        assert _resolve_config_holder(inner, model) is inner
+
+    def test_resolve_cache_owner_prefers_model_with_make_cache(self):
+        """Qwen3Next: top-level has hybrid make_cache(); backbone only has layers."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_cache_owner
+
+        inner = MagicMock(spec=["layers"])
+        model = MagicMock(spec=["layers", "make_cache"])
+        assert _resolve_cache_owner(inner, model) is model
+
+    def test_is_attention_cache_state_4d(self):
+        """Only 4D (B, n_kv, seq, head_dim) states are attention caches we calibrate."""
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
+
+        ok_keys = mx.zeros((1, 2, 16, 256))
+        ok_vals = mx.zeros((1, 2, 16, 256))
+        assert _is_attention_cache_state([ok_keys, ok_vals]) is True
+
+    def test_is_attention_cache_state_ssm_3d(self):
+        """Qwen3Next SSM caches yield 3D state; must be skipped."""
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
+
+        ssm_conv = mx.zeros((1, 3, 8192))  # conv state
+        ssm_hid = mx.zeros((1, 32, 128, 128))
+        assert _is_attention_cache_state([ssm_conv, ssm_hid]) is False
+
+    def test_resolve_cache_owner_falls_back_to_inner(self):
+        """When top-level model has neither make_cache nor layers, use the backbone."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_cache_owner
+
+        inner = MagicMock(spec=["layers"])
+        model = MagicMock(spec=[])
+        assert _resolve_cache_owner(inner, model) is inner
+
+    def test_resolve_config_holder_falls_back_to_model(self):
+        """Qwen3Next regression: backbone has no .args, so calibrate must use model.args."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_config_holder
+
+        inner = MagicMock(spec=["layers"])  # no .args
+        model = MagicMock(spec=[])
+        model.args = MagicMock(spec=[])
+        model.args.head_dim = 256
+
+        holder = _resolve_config_holder(inner, model)
+        assert holder is model
+        assert holder.args.head_dim == 256
+
     def test_disk_cache_guard(self):
         """SpectralQuantKVCache should block disk serialization."""
         from olmlx.engine.model_manager import _is_serializable_cache

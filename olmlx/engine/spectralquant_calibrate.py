@@ -21,6 +21,31 @@ from olmlx.engine.spectralquant import allocate_bits, fit_codebook
 logger = logging.getLogger(__name__)
 
 
+def _resolve_config_holder(inner: Any, model: Any) -> Any:
+    # Some architectures (e.g. Qwen3Next) expose `.args` only on the top-level
+    # model, not on the backbone returned by `_get_backbone`.
+    return inner if hasattr(inner, "args") else model
+
+
+def _is_attention_cache_state(state: Any) -> bool:
+    # Hybrid models (e.g. Qwen3Next) mix attention caches with SSM caches.
+    # Only the attention layers hold 4D KV tensors we can calibrate on.
+    if not state or len(state) < 2:
+        return False
+    keys = state[0]
+    return hasattr(keys, "ndim") and keys.ndim == 4
+
+
+def _resolve_cache_owner(inner: Any, model: Any) -> Any:
+    # `make_prompt_cache` defers to `make_cache()` on the passed object.  For
+    # hybrid models (e.g. Qwen3Next SSM+attention), only the top-level model
+    # knows the correct per-layer cache types — the bare backbone would yield
+    # uniform KVCaches and break SSM layers.
+    if hasattr(model, "make_cache") or hasattr(model, "layers"):
+        return model
+    return inner
+
+
 def compute_covariance(data: mx.array) -> mx.array:
     """Compute centered sample covariance matrix.
 
@@ -275,20 +300,13 @@ def calibrate_model(
     inner = _get_backbone(model)
     layers = inner.layers
     num_layers = len(layers)
-    head_dim = _detect_head_dim(inner)
+    cfg_holder = _resolve_config_holder(inner, model)
+    head_dim = _detect_head_dim(cfg_holder)
 
     # Determine number of KV heads
-    n_kv_heads = getattr(
-        inner.args if hasattr(inner, "args") else model.args,
-        "num_key_value_heads",
-        None,
-    )
+    n_kv_heads = getattr(cfg_holder.args, "num_key_value_heads", None)
     if n_kv_heads is None:
-        n_kv_heads = getattr(
-            inner.args if hasattr(inner, "args") else model.args,
-            "num_attention_heads",
-            1,
-        )
+        n_kv_heads = getattr(cfg_holder.args, "num_attention_heads", 1)
 
     if progress_callback:
         progress_callback("Generating calibration data", 0.05)
@@ -323,7 +341,8 @@ def calibrate_model(
     # that gets stored in the KV cache at inference time.
     from mlx_lm.models.cache import make_prompt_cache
 
-    cache_model = inner if hasattr(inner, "layers") else model
+    cache_model = _resolve_cache_owner(inner, model)
+    first_exc: Exception | None = None
     for sample_idx, text in enumerate(texts):
         tokens = _encode_tokens(tokenizer, text)
         if len(tokens) > 512:
@@ -335,6 +354,8 @@ def calibrate_model(
         try:
             model(input_ids, cache=prompt_cache)
         except Exception as exc:
+            if first_exc is None:
+                first_exc = exc
             logger.debug("Skipping sample %d: %s", sample_idx, exc)
             continue
         mx.eval([c.state for c in prompt_cache if hasattr(c, "state")])
@@ -343,7 +364,7 @@ def calibrate_model(
         for layer_idx in range(min(num_layers, len(prompt_cache))):
             cache_entry = prompt_cache[layer_idx]
             state = cache_entry.state if hasattr(cache_entry, "state") else None
-            if not state or len(state) < 2:
+            if not _is_attention_cache_state(state):
                 continue
             # KVCache.state returns [keys, values] with shape
             # (1, n_kv_heads, seq_len, head_dim)
@@ -377,9 +398,14 @@ def calibrate_model(
     # Guard: if no KV vectors were collected, fail early with a clear message
     total_collected = sum(tokens_collected.values())
     if total_collected == 0:
+        detail = (
+            f" First forward-pass error: {type(first_exc).__name__}: {first_exc}"
+            if first_exc
+            else ""
+        )
         raise RuntimeError(
             "No KV vectors were collected during calibration. "
-            "All forward passes failed — check that the model loads correctly."
+            "All forward passes failed — check that the model loads correctly." + detail
         )
 
     if progress_callback:
