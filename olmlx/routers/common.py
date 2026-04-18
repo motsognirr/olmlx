@@ -45,10 +45,11 @@ def build_inference_options(
         opts["top_k"] = top_k
     if seed is not None:
         opts["seed"] = seed
-    if stop is not None:
+    if stop:
         opts["stop"] = stop if isinstance(stop, list) else [stop]
     if frequency_penalty is not None:
         opts["frequency_penalty"] = frequency_penalty
     if presence_penalty is not None:
         opts["presence_penalty"] = presence_penalty
+
     return opts
