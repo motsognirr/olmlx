@@ -276,9 +276,20 @@ async def _reset_inference_state() -> None:
             pass
     elif task is not None and not task.cancelled():
         # Consume any stored exception so asyncio doesn't log
-        # "Task exception was never retrieved" to stderr.
-        with contextlib.suppress(asyncio.InvalidStateError, Exception):
-            task.exception()
+        # "Task exception was never retrieved" to stderr.  Also log it
+        # ourselves at warning level so fixture-level failures aren't
+        # invisible (``_await_deferred_cleanup`` logs on its own path,
+        # but reset is the only path for tests that aborted earlier).
+        try:
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(
+                    "Deferred cleanup task raised during reset: %s",
+                    exc,
+                    exc_info=exc,
+                )
+        except (asyncio.InvalidStateError, asyncio.CancelledError):
+            pass
     # Also cleans up any lock entry ``_cleanup``'s finally block may have
     # created.  Both branches above can leave one behind:
     #   - ``if`` (cancel + await): ``_cleanup``'s finally runs during
@@ -479,9 +490,19 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
         if existing is not None and not existing.cancelled():
             # ``existing`` is done — replacing the dict entry below drops the
             # last reference.  Consume any stored exception so asyncio doesn't
-            # log "Task exception was never retrieved" when it's GC'd.
-            with contextlib.suppress(asyncio.InvalidStateError, Exception):
-                existing.exception()
+            # log "Task exception was never retrieved" when it's GC'd.  Log it
+            # ourselves as a safety net in case the prior ``_await_deferred_cleanup``
+            # log was missed (it normally fires first on the happy path).
+            try:
+                exc = existing.exception()
+                if exc is not None:
+                    logger.warning(
+                        "Replaced done cleanup task had raised: %s",
+                        exc,
+                        exc_info=exc,
+                    )
+            except (asyncio.InvalidStateError, asyncio.CancelledError):
+                pass
 
         async def _cleanup():
             thread = stream._thread
