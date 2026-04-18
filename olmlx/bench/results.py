@@ -286,7 +286,7 @@ class LeaderboardEntry:
     best_scenario: str
     timestamp: str
     git_sha: str | None
-    failed_scenarios: int
+    empty_scenarios: int
     total_scenarios: int
     # Internal: used only as the same-timestamp tiebreaker key in
     # build_leaderboard. Excluded from __eq__/__hash__/__repr__ so two
@@ -314,21 +314,6 @@ def _scenario_avg_tps(scenario: ScenarioResult) -> float:
     return sum(valid) / len(valid) if valid else 0.0
 
 
-def _scenario_is_failed(scenario: ScenarioResult) -> bool:
-    """Scenario is failed if fewer than 50% of its prompts produced valid
-    measurements (status 200 and tps > 0). Empty prompt lists also count.
-    """
-    total = len(scenario.prompt_results)
-    if total == 0:
-        return True
-    valid = sum(
-        1
-        for p in scenario.prompt_results
-        if p.status_code == 200 and p.tokens_per_second > 0
-    )
-    return valid < total * 0.5
-
-
 def build_leaderboard(
     bench_dir: Path = DEFAULT_BENCH_DIR,
     *,
@@ -341,10 +326,14 @@ def build_leaderboard(
     its historical peak. Pass latest_per_model=False to keep every run
     (e.g. for a full history view).
 
-    A scenario counts as failed when fewer than 50% of its prompts
-    produced valid measurements. Skipped scenarios are excluded from both
-    failure and total counts. Runs where no non-skipped scenario has a
-    usable best_tps are dropped (they'd rank meaninglessly at the bottom).
+    A scenario counts as "empty" (contributes to the Empty/Total column)
+    when it produced zero usable measurements — every prompt either
+    returned non-200 or had zero tps. A scenario with at least one valid
+    prompt still contributes to best_tps even if other prompts failed;
+    per-prompt details live in results.json. Skipped scenarios are
+    excluded from both empty and total counts. Runs where no non-skipped
+    scenario has a usable best_tps are dropped (they'd rank meaninglessly
+    at the bottom).
     """
     if not bench_dir.is_dir():
         return []
@@ -375,10 +364,10 @@ def build_leaderboard(
             if sc.skipped:
                 continue
             total += 1
-            if _scenario_is_failed(sc):
+            avg = _scenario_avg_tps(sc)
+            if avg <= 0:
                 failed += 1
                 continue
-            avg = _scenario_avg_tps(sc)
             if avg > best_tps:
                 best_tps = avg
                 best_scenario = sc.scenario_name
@@ -393,7 +382,7 @@ def build_leaderboard(
                 best_scenario=best_scenario,
                 timestamp=run.timestamp,
                 git_sha=run.git_sha,
-                failed_scenarios=failed,
+                empty_scenarios=failed,
                 total_scenarios=total,
                 run_dir=run_dir,
             )
@@ -435,17 +424,17 @@ def format_leaderboard(
     rows = entries if limit is None else entries[:limit]
     model_w = max(45, max((len(e.model) for e in rows), default=45))
     scenario_w = max(14, max((len(e.best_scenario) for e in rows), default=14))
-    fails_w = max(
+    empty_w = max(
         11,
         max(
-            (len(f"{e.failed_scenarios}/{e.total_scenarios}") for e in rows),
+            (len(f"{e.empty_scenarios}/{e.total_scenarios}") for e in rows),
             default=11,
         ),
     )
     header = (
         f"{'#':>3} {'Model':<{model_w}} {'Best tok/s':>10} "
         f"{'Scenario':<{scenario_w}} {'Timestamp':<18} {'Git':<10} "
-        f"{'Fails/Total':>{fails_w}}"
+        f"{'Empty/Total':>{empty_w}}"
     )
     lines = [header, "-" * len(header)]
     for i, e in enumerate(rows, 1):
@@ -453,6 +442,6 @@ def format_leaderboard(
             f"{i:>3} {e.model:<{model_w}} {e.best_tps:>10.1f} "
             f"{e.best_scenario:<{scenario_w}} {e.timestamp:<18} "
             f"{(e.git_sha[:10] if e.git_sha else '-' * 7):<10} "
-            f"{f'{e.failed_scenarios}/{e.total_scenarios}':>{fails_w}}"
+            f"{f'{e.empty_scenarios}/{e.total_scenarios}':>{empty_w}}"
         )
     return "\n".join(lines)
