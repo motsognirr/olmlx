@@ -383,6 +383,39 @@ class TestBuildLeaderboard:
         assert len(entries) == 3
         assert [e.best_tps for e in entries] == [80.0, 50.0, 20.0]
 
+    def test_equal_tps_ties_break_by_model_then_run_dir(self, tmp_path):
+        # Three runs with identical best_tps across two models; the
+        # deterministic ordering is model name asc, then numeric-aware
+        # dir sort (so -10 comes after -9, not before -2). Timestamps
+        # intentionally move backwards in wall-clock time so a
+        # timestamp-based tiebreaker would give a different answer.
+        _save_fake_run(
+            tmp_path,
+            model="zebra",
+            timestamp="20260103T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+        _save_fake_run(
+            tmp_path,
+            model="alpha",
+            timestamp="20260101T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+        _save_fake_run(
+            tmp_path,
+            model="alpha",
+            timestamp="20260102T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+
+        entries = build_leaderboard(tmp_path, latest_per_model=False)
+        assert [e.model for e in entries] == ["alpha", "alpha", "zebra"]
+        # Both alpha entries use the same dir base 20260101T000000Z /
+        # 20260102T000000Z; numeric dir-name ordering puts the older one
+        # (lexicographically smaller timestamp) first.
+        assert entries[0].timestamp == "20260101T000000Z"
+        assert entries[1].timestamp == "20260102T000000Z"
+
     def test_best_scenario_is_max_across_scenarios(self, tmp_path):
         _save_fake_run(
             tmp_path,

@@ -419,12 +419,13 @@ def build_leaderboard(
                 by_model[e.model] = e
         entries = list(by_model.values())
 
-    # Neutral tiebreakers: model name (asc) then numeric-aware directory
-    # sort. Avoids ranking equal-tps runs by timestamp (which would
-    # conflate "more recent" with "better") and avoids plain lexicographic
-    # dir comparison (which would sort "-10" before "-2").
-    entries.sort(key=lambda e: (e.model, _run_dir_sort_key(e.run_dir.name)))
-    entries.sort(key=lambda e: e.best_tps, reverse=True)
+    # Compound sort key: `-best_tps` descending, then model + dir ascending.
+    # Using a single key (rather than two stable sorts) makes the precedence
+    # explicit and resistant to accidental reordering. Recency is not used
+    # as a tiebreaker — it would conflate "more recent" with "better".
+    entries.sort(
+        key=lambda e: (-e.best_tps, e.model, _run_dir_sort_key(e.run_dir.name))
+    )
     return entries
 
 
@@ -461,7 +462,7 @@ def format_leaderboard(
         lines.append(
             f"{i:>{rank_w}} {e.model:<{model_w}} {e.best_tps:>10.1f} "
             f"{e.best_scenario:<{scenario_w}} {e.timestamp:<18} "
-            f"{(e.git_sha[:10] if e.git_sha else '-' * 7):<10} "
+            f"{(e.git_sha[:10] if e.git_sha else '-' * 10):<10} "
             f"{f'{e.empty_scenarios}/{e.total_scenarios}':>{empty_w}}"
         )
     return "\n".join(lines)
