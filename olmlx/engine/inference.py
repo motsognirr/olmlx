@@ -456,7 +456,7 @@ async def _await_deferred_cleanup():
     # the inference lock is always released and the next request can proceed.
     # Callers have no need to reject the following inference — the lock state
     # is correct regardless of cleanup outcome.  The log is the signal.
-    (finished_task,) = done
+    finished_task = done.pop()
     if not finished_task.cancelled():
         exc = finished_task.exception()
         if exc is not None:
@@ -479,6 +479,15 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
     lock = _get_inference_lock()
     loop = asyncio.get_running_loop()
 
+    # IMPORTANT: ``create_task(_cleanup())`` must be the last statement in the
+    # ``async with _get_deferred_cleanup_lock()`` block below.  ``_cleanup``'s
+    # finally re-acquires the same lock to pop its dict entry; this works
+    # today because tasks don't preempt — the outer ``async with`` exits and
+    # releases the lock before ``_cleanup`` is first scheduled.  Any ``await``
+    # (even an innocent log call that happens to yield) inserted between
+    # ``create_task`` and the end of the ``async with`` would let the event
+    # loop schedule ``_cleanup`` into a deadlock on the same lock.  Adding
+    # new code here?  Put it *before* the ``async with`` or *after* its exit.
     async with _get_deferred_cleanup_lock():
         existing = _deferred_cleanup_tasks.get(loop)
         if existing is not None and not existing.done():
@@ -556,13 +565,7 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                     # ``_cleanup`` self-contained.
                     _deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
 
-        # IMPORTANT: ``create_task`` must remain the last statement inside
-        # this ``async with``.  ``_cleanup``'s finally re-acquires the same
-        # lock to pop its dict entry; this works today because tasks don't
-        # preempt — the outer ``async with`` exits and releases the lock
-        # before ``_cleanup`` is first scheduled.  Any ``await`` inserted
-        # after this line while the lock is still held would let the event
-        # loop schedule ``_cleanup`` into a deadlock on the same lock.
+        # See IMPORTANT note at the top of the ``async with`` block.
         _deferred_cleanup_tasks[loop] = asyncio.create_task(_cleanup())
 
 

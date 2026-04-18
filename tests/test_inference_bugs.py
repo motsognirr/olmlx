@@ -279,6 +279,10 @@ class TestDeferredCleanupLockPerLoop:
                 asyncio.wait_for(await_cleanup_on_fresh_loop(), timeout=0.5)
             )
         finally:
+            # ``_await_deferred_cleanup`` called ``_get_deferred_cleanup_lock``
+            # which created an entry for loop_b.  Pop explicitly to keep the
+            # class-wide cleanup pattern uniform.
+            _inf_mod._deferred_cleanup_locks.pop(loop_b, None)
             loop_b.close()
 
     def test_stale_locked_lock_not_inherited(self):
