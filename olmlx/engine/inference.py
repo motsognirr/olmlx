@@ -279,6 +279,9 @@ async def _reset_inference_state() -> None:
     # task may already have run ``_get_deferred_cleanup_lock()`` and left
     # a fresh entry in ``_deferred_cleanup_locks``.
     _deferred_cleanup_locks.pop(loop, None)
+    # ``_queue_depth`` is intentionally global: it tracks waiters on the
+    # global ``_inference_lock``, not per-loop cleanup state, so a per-loop
+    # scope would make no sense here.
     _queue_depth = 0
     if _inference_lock.locked():
         _inference_lock.release()
@@ -488,6 +491,11 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                 # threads, so this is the "least bad" option vs permanent deadlock.
                 lock.release()
                 logger.info("Deferred inference cleanup: lock released")
+                # If this task is cancelled while ``_get_deferred_cleanup_lock().__aenter__``
+                # awaits the lock, ``CancelledError`` propagates before the body
+                # runs and the pop below is skipped.  ``_reset_inference_state()``
+                # covers that case with its own explicit ``pop`` of both the task
+                # and lock dicts — do not drop those fallback pops.
                 async with _get_deferred_cleanup_lock():
                     # Use the task's own running loop rather than closing over
                     # ``loop`` from the outer scope — ``_cleanup`` runs as a

@@ -285,6 +285,11 @@ class TestDeferredCleanupLockPerLoop:
         try:
             loop_a.run_until_complete(acquire_no_release())
         finally:
+            # Explicit pop for consistency with
+            # ``test_separate_tasks_for_separate_loops``; WeakKeyDictionary
+            # would also GC the entry when loop_a is collected, but being
+            # explicit avoids a latent dependency on GC timing.
+            _inf_mod._deferred_cleanup_locks.pop(loop_a, None)
             loop_a.close()  # closed with the lock still "held"
 
         async def acquire_with_timeout():
