@@ -50,15 +50,37 @@ def _config_namespace(cfg_holder: Any) -> Any:
     return args if args is not None else getattr(cfg_holder, "config", None)
 
 
+def _build_empty_collection_error(first_exc: Exception | None) -> RuntimeError:
+    """Build the error raised when calibration collected zero KV vectors.
+
+    Chains `first_exc` via `__cause__` (equivalent to `raise ... from first_exc`)
+    so the full traceback is preserved when a forward-pass failure is the
+    root cause. When no forward-pass errors occurred, reports that no
+    attention-layer cache entries were found.
+    """
+    if first_exc is not None:
+        err = RuntimeError(
+            "No KV vectors were collected during calibration. "
+            f"First forward-pass error: {type(first_exc).__name__}: {first_exc}"
+        )
+        err.__cause__ = first_exc
+        return err
+    return RuntimeError(
+        "No KV vectors were collected during calibration. "
+        "No attention-layer cache entries were found — the model may have no "
+        "attention layers, or all attention layers fell outside the "
+        "calibration window."
+    )
+
+
 def _is_attention_cache_state(state: Any, expected_head_dim: int) -> bool:
-    # Shape sanity check: attention caches hold 4D (B, n_kv_heads, seq, head_dim)
-    # tensors. After prefill the real seq axis is ≥ 2 (the `len(tokens) < 2`
-    # guard in `calibrate_model` enforces this), so per-step SSM recurrent
-    # states with seq==1 are rejected. A last-axis match against the expected
-    # head_dim filters most SSM shapes. This is a secondary guard only — the
-    # call site additionally checks `isinstance(cache_entry, KVCache)` to
-    # catch the residual case where a 4D SSM state happens to match both
-    # constraints (e.g. a Mamba2 variant with d_state == head_dim).
+    # Secondary shape check for confirmed KVCache entries (primary filter is
+    # `isinstance(cache_entry, KVCache)` at the call site). Guards against:
+    # - empty caches not yet populated (len(state) < 2)
+    # - non-4D tensors (should not happen in practice)
+    # - caches seeded with < 2 tokens (seq < 2; already excluded by the
+    #   `len(tokens) < 2` guard above, but kept as a defensive check)
+    # - head_dim mismatch (e.g. model weights loaded with a mismatched config)
     if not state or len(state) < 2:
         return False
     keys = state[0]
@@ -448,17 +470,7 @@ def calibrate_model(
     # Guard: if no KV vectors were collected, fail early with a clear message
     total_collected = sum(tokens_collected.values())
     if total_collected == 0:
-        if first_exc:
-            raise RuntimeError(
-                "No KV vectors were collected during calibration. "
-                f"First forward-pass error: {type(first_exc).__name__}: {first_exc}"
-            ) from first_exc
-        raise RuntimeError(
-            "No KV vectors were collected during calibration. "
-            "No attention-layer cache entries were found — the model may have no "
-            "attention layers, or all attention layers fell outside the "
-            "calibration window."
-        )
+        raise _build_empty_collection_error(first_exc)
 
     if progress_callback:
         progress_callback("Running eigenspectral analysis", 0.5)

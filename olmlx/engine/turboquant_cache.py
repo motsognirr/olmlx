@@ -282,10 +282,14 @@ def _detect_head_dim(model: Any, layers_hint: Any = None) -> int:
 
     # Derive from K projection weight shape: k_proj.weight is (n_kv_heads * head_dim, hidden_size).
     # For hybrid backbones the first layer may be SSM; iterate to find an attention layer.
-    # Deduplicate: when `layers_hint is model` (common legacy path), avoid scanning layers twice.
-    layer_sources = list(
-        dict.fromkeys(s for s in (layers_hint, model) if s is not None)
-    )
+    # Deduplicate by identity: when `layers_hint is model` (common legacy path), avoid
+    # scanning layers twice. Uses `is` rather than a set so custom `__eq__`/`__hash__`
+    # on wrapper classes can't trip the check.
+    layer_sources: list[Any] = []
+    if layers_hint is not None:
+        layer_sources.append(layers_hint)
+    if model is not layers_hint:
+        layer_sources.append(model)
     for src in layer_sources:
         src_layers = getattr(src, "layers", None)
         if src_layers is None:

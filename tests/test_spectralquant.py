@@ -807,6 +807,26 @@ class TestSpectralConfig:
         holder.config = "config-ns"
         assert _config_namespace(holder) == "config-ns"
 
+    def test_build_empty_collection_error_chains_first_exc(self):
+        """First forward-pass exception must be chained via __cause__ so the traceback survives."""
+        from olmlx.engine.spectralquant_calibrate import _build_empty_collection_error
+
+        original = ValueError("synthetic forward-pass failure")
+        err = _build_empty_collection_error(original)
+        assert isinstance(err, RuntimeError)
+        assert err.__cause__ is original
+        assert "ValueError" in str(err)
+        assert "synthetic forward-pass failure" in str(err)
+
+    def test_build_empty_collection_error_no_exc(self):
+        """Without a forward-pass error, the message reports no attention caches found."""
+        from olmlx.engine.spectralquant_calibrate import _build_empty_collection_error
+
+        err = _build_empty_collection_error(None)
+        assert isinstance(err, RuntimeError)
+        assert err.__cause__ is None
+        assert "No attention-layer cache entries" in str(err)
+
     def test_resolve_cache_owner_ignores_layers_without_make_cache(self):
         """Without make_cache on the top-level model, route to backbone regardless of .layers."""
         from unittest.mock import MagicMock
