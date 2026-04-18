@@ -218,6 +218,40 @@ class TestDeferredCleanupLockPerLoop:
             "Repeated calls on the same loop must return the same lock"
         )
 
+    def test_stale_locked_lock_not_inherited(self):
+        """A lock acquired on a closed loop must not block a fresh loop.
+
+        This is the actual Bug #243 failure mode: if loop A acquires the
+        deferred cleanup lock and closes without releasing it, a pre-fix
+        module would cache that locked instance and loop B would deadlock
+        on its next acquire.  The fix keys locks by loop, so loop B gets
+        a fresh, unlocked lock.
+        """
+        import asyncio
+
+        async def acquire_no_release():
+            lock = _inf_mod._get_deferred_cleanup_lock()
+            await lock.acquire()  # intentionally never released
+
+        loop_a = asyncio.new_event_loop()
+        try:
+            loop_a.run_until_complete(acquire_no_release())
+        finally:
+            loop_a.close()  # closed with the lock still "held"
+
+        async def acquire_with_timeout():
+            lock = _inf_mod._get_deferred_cleanup_lock()
+            # Pre-fix: inherits loop A's locked instance → times out.
+            # Post-fix: loop B gets a fresh unlocked lock → returns immediately.
+            await asyncio.wait_for(lock.acquire(), timeout=0.5)
+            lock.release()
+
+        loop_b = asyncio.new_event_loop()
+        try:
+            loop_b.run_until_complete(acquire_with_timeout())
+        finally:
+            loop_b.close()
+
 
 # ---------------------------------------------------------------------------
 # Bug #120: GPU memory not freed on client disconnect during long prefill

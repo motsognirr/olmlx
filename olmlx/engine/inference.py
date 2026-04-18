@@ -299,9 +299,11 @@ def _get_deferred_cleanup_lock() -> asyncio.Lock:
     Keying by the running loop keeps each loop's lock isolated; the weak
     dict lets closed test loops get garbage-collected.
 
-    Safe: asyncio is single-threaded; no await between the lookup and the
+    Safe within a single event loop: no await between the lookup and the
     assignment, so no two coroutines on the same loop can both observe
-    ``None`` simultaneously.
+    ``None`` simultaneously.  WeakKeyDictionary is not thread-safe for
+    concurrent writes from multiple OS threads each running their own
+    loop — this server runs on one thread, so that case doesn't apply.
     """
     loop = asyncio.get_running_loop()
     lock = _deferred_cleanup_locks.get(loop)
@@ -485,6 +487,11 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                 async with _get_deferred_cleanup_lock():
                     _deferred_cleanup_tasks.pop(loop, None)
 
+        # ``_cleanup`` closes over ``loop``; ``create_task`` binds the task to
+        # the loop it's created on, so ``asyncio.get_running_loop()`` inside
+        # ``_cleanup`` (via ``_get_deferred_cleanup_lock``) equals this ``loop``
+        # at execution time.  Hoisting ``_cleanup`` to module level would break
+        # that invariant.
         _deferred_cleanup_tasks[loop] = asyncio.create_task(_cleanup())
 
 
