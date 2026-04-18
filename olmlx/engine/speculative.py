@@ -132,7 +132,7 @@ class SpeculativeDecoder:
         self._stats_proposed = 0
         self._stats_accepted_draft = 0
 
-    def stats_summary(self) -> dict:
+    def stats_summary(self) -> dict[str, Any]:
         steps = self._stats_steps
         proposed = self._stats_proposed
         accepted_draft = self._stats_accepted_draft

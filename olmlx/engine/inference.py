@@ -2268,6 +2268,9 @@ async def _full_completion_inner(
                 logger.debug("speculative decoding skipped: request includes images")
             import mlx_vlm
 
+            # mlx_vlm.generate returns a plain str; prompt/generation token
+            # counts are not exposed, so stats.prompt_eval_count /
+            # stats.eval_count stay 0 on this path.
             result = mlx_vlm.generate(
                 lm.model,
                 lm.tokenizer,
