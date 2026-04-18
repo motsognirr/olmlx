@@ -131,8 +131,8 @@ def run_bench(
         if entries:
             print("\nLeaderboard (top 5):", file=sys.stderr)
             print(format_leaderboard(entries, limit=5), file=sys.stderr)
-    except Exception as e:
-        logger.warning("Could not build leaderboard: %s", e)
+    except Exception:
+        logger.warning("Could not build leaderboard", exc_info=True)
 
     return run
 

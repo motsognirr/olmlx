@@ -451,6 +451,57 @@ class TestBuildLeaderboard:
         assert entries[0].failed_scenarios == 1
         assert entries[0].total_scenarios == 2
 
+    def test_partial_failure_threshold(self, tmp_path):
+        # 2 of 5 prompts valid (40%) — below the 50% bar, so the scenario
+        # counts as failed and its valid samples don't contribute best_tps.
+        mostly_broken = _scenario(
+            "flash",
+            [
+                _prompt(50.0),
+                _prompt(60.0),
+                _prompt(0.0, status_code=500),
+                _prompt(0.0, status_code=500),
+                _prompt(0.0, status_code=500),
+            ],
+        )
+        # 3 of 5 valid (60%) — above the bar, scenario contributes.
+        mostly_ok = _scenario(
+            "baseline",
+            [
+                _prompt(30.0),
+                _prompt(40.0),
+                _prompt(20.0),
+                _prompt(0.0, status_code=500),
+                _prompt(0.0, status_code=500),
+            ],
+        )
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260101T000000Z",
+            scenarios=[mostly_broken, mostly_ok],
+        )
+
+        entries = build_leaderboard(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].failed_scenarios == 1
+        assert entries[0].total_scenarios == 2
+        assert entries[0].best_scenario == "baseline"
+        # best_tps = avg(30, 40, 20) = 30.0; the faster mostly_broken
+        # scenario must not count because it's below the validity bar.
+        assert entries[0].best_tps == pytest.approx(30.0, rel=1e-6)
+
+    def test_stray_files_in_bench_dir_ignored(self, tmp_path):
+        (tmp_path / "stray.txt").write_text("junk")
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260101T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
+        )
+        entries = build_leaderboard(tmp_path)
+        assert [e.model for e in entries] == ["model-a"]
+
     def test_empty_dir_returns_empty(self, tmp_path):
         assert build_leaderboard(tmp_path) == []
 

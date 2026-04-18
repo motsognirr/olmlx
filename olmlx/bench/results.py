@@ -314,6 +314,21 @@ def _scenario_avg_tps(scenario: ScenarioResult) -> float:
     return sum(valid) / len(valid) if valid else 0.0
 
 
+def _scenario_is_failed(scenario: ScenarioResult) -> bool:
+    """Scenario is failed if fewer than 50% of its prompts produced valid
+    measurements (status 200 and tps > 0). Empty prompt lists also count.
+    """
+    total = len(scenario.prompt_results)
+    if total == 0:
+        return True
+    valid = sum(
+        1
+        for p in scenario.prompt_results
+        if p.status_code == 200 and p.tokens_per_second > 0
+    )
+    return valid < total * 0.5
+
+
 def build_leaderboard(
     bench_dir: Path = DEFAULT_BENCH_DIR,
     *,
@@ -326,9 +341,10 @@ def build_leaderboard(
     its historical peak. Pass latest_per_model=False to keep every run
     (e.g. for a full history view).
 
-    Skipped scenarios are excluded from both failure and total counts. Runs
-    where every non-skipped scenario has zero valid prompts are dropped
-    (they'd rank meaninglessly at the bottom).
+    A scenario counts as failed when fewer than 50% of its prompts
+    produced valid measurements. Skipped scenarios are excluded from both
+    failure and total counts. Runs where no non-skipped scenario has a
+    usable best_tps are dropped (they'd rank meaninglessly at the bottom).
     """
     if not bench_dir.is_dir():
         return []
@@ -338,6 +354,8 @@ def build_leaderboard(
         return []
     entries: list[LeaderboardEntry] = []
     for run_dir in run_dirs:
+        if not run_dir.is_dir():
+            continue
         try:
             has_results = (run_dir / "results.json").exists()
         except OSError:
@@ -357,10 +375,10 @@ def build_leaderboard(
             if sc.skipped:
                 continue
             total += 1
-            avg = _scenario_avg_tps(sc)
-            if avg <= 0:
+            if _scenario_is_failed(sc):
                 failed += 1
                 continue
+            avg = _scenario_avg_tps(sc)
             if avg > best_tps:
                 best_tps = avg
                 best_scenario = sc.scenario_name

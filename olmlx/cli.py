@@ -1518,7 +1518,10 @@ def build_parser() -> argparse.ArgumentParser:
     bench_lb.add_argument(
         "--all-runs",
         action="store_true",
-        help="Show every run instead of latest per model",
+        help=(
+            "Show every run instead of latest per model. Use this if a "
+            "recent regression run has displaced an earlier faster result."
+        ),
     )
     bench_lb.add_argument(
         "--limit",
