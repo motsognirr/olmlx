@@ -48,10 +48,12 @@ def _is_attention_cache_state(state: Any) -> bool:
 
 
 def _resolve_cache_owner(inner: Any, model: Any) -> Any:
-    # `make_prompt_cache` defers to `make_cache()` on the passed object. For
-    # hybrid models (e.g. Qwen3Next SSM+attention), only the top-level model
-    # exposes `make_cache` with the correct per-layer cache types — the bare
-    # backbone would yield uniform KVCaches and break SSM layers.
+    # `make_prompt_cache` defers to `make_cache()` on the passed object. When
+    # the top-level model defines `make_cache`, it's always the authoritative
+    # source for per-layer cache types — required for hybrid SSM+attention
+    # architectures (Qwen3Next) and harmless for homogeneous ones. Falling back
+    # to the backbone preserves legacy behavior for models that don't define
+    # `make_cache` at the top level.
     if hasattr(model, "make_cache"):
         return model
     return inner
@@ -409,14 +411,16 @@ def calibrate_model(
     # Guard: if no KV vectors were collected, fail early with a clear message
     total_collected = sum(tokens_collected.values())
     if total_collected == 0:
-        detail = (
-            f" First forward-pass error: {type(first_exc).__name__}: {first_exc}"
-            if first_exc
-            else ""
-        )
+        if first_exc:
+            raise RuntimeError(
+                "No KV vectors were collected during calibration. "
+                f"First forward-pass error: {type(first_exc).__name__}: {first_exc}"
+            )
         raise RuntimeError(
             "No KV vectors were collected during calibration. "
-            "All forward passes failed — check that the model loads correctly." + detail
+            "No attention-layer cache entries were found — the model may have no "
+            "attention layers, or all attention layers fell outside the "
+            "calibration window."
         )
 
     if progress_callback:

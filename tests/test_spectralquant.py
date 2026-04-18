@@ -757,18 +757,8 @@ class TestSpectralConfig:
         ssm_hid = mx.zeros((1, 32, 128, 128))
         assert _is_attention_cache_state([ssm_conv, ssm_hid]) is False
 
-    def test_resolve_cache_owner_falls_back_to_inner(self):
-        """When top-level model has no make_cache, use the backbone."""
-        from unittest.mock import MagicMock
-
-        from olmlx.engine.spectralquant_calibrate import _resolve_cache_owner
-
-        inner = MagicMock(spec=["layers"])
-        model = MagicMock(spec=[])
-        assert _resolve_cache_owner(inner, model) is inner
-
     def test_resolve_cache_owner_ignores_layers_without_make_cache(self):
-        """Model exposing only .layers (no make_cache) should still route to backbone."""
+        """Without make_cache on the top-level model, route to backbone regardless of .layers."""
         from unittest.mock import MagicMock
 
         from olmlx.engine.spectralquant_calibrate import _resolve_cache_owner
