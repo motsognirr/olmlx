@@ -193,11 +193,72 @@ class TestFlashMoeWeightStore:
 
         assert loaded.expert_index_map == {3: 0, 7: 1, 1: 2}
 
+    def test_load_experts_provides_remap_lut(self, store_with_model):
+        """LoadedExperts.remap_lut maps global expert indices to local stack positions."""
+        store, _, _, _, num_experts = store_with_model
+        expert_indices = [5, 2, 7]
+        loaded = store.load_experts(1, expert_indices)
+
+        assert loaded.remap_lut is not None
+        assert loaded.remap_lut.shape == (num_experts,)
+        assert loaded.remap_lut.dtype == mx.uint32
+
+        lut = loaded.remap_lut.tolist()
+        assert lut[5] == 0  # first requested global maps to stack pos 0
+        assert lut[2] == 1
+        assert lut[7] == 2
+        # Unrequested entries carry the sentinel
+        requested = set(expert_indices)
+        for i in range(num_experts):
+            if i not in requested:
+                assert lut[i] == 0xFFFFFFFF
+
     def test_load_experts_empty_indices_raises(self, store_with_model):
         """load_experts with empty indices should raise ValueError, not mx.stack crash."""
         store, _, _, _, _ = store_with_model
         with pytest.raises(ValueError, match="expert_indices"):
             store.load_experts(1, [])
+
+    def test_load_experts_tolerates_out_of_order_completion(
+        self, store_with_model, monkeypatch
+    ):
+        """load_experts must return correct stacked weights even if futures complete
+        in a different order than submission."""
+        import time
+
+        store, _, _, _, _ = store_with_model
+
+        # Baseline with warm cache (deterministic order).
+        baseline = store.load_experts(1, [5, 2, 7, 1])
+        mx.eval(baseline.up_weight, baseline.down_weight)
+
+        # Build a fresh cold store so the next call actually issues I/O.
+        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+        cold = FlashMoeWeightStore(
+            store._flash_dir, num_io_threads=4, cache_budget_experts=0
+        )
+        try:
+            original = cold._read_expert
+            delay_target = 5
+
+            def delayed(layer_idx, expert_idx):
+                if expert_idx == delay_target:
+                    time.sleep(0.05)
+                return original(layer_idx, expert_idx)
+
+            monkeypatch.setattr(cold, "_read_expert", delayed)
+            reordered = cold.load_experts(1, [5, 2, 7, 1])
+            mx.eval(reordered.up_weight, reordered.down_weight)
+
+            # Stacked tensors must be identical in input order regardless of completion order.
+            assert mx.allclose(reordered.up_weight, baseline.up_weight, atol=0, rtol=0)
+            assert mx.allclose(
+                reordered.down_weight, baseline.down_weight, atol=0, rtol=0
+            )
+            assert baseline.expert_index_map == reordered.expert_index_map
+        finally:
+            cold.close()
 
 
 class TestFlashMoeWeightStoreQuantized:

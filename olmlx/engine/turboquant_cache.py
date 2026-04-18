@@ -25,9 +25,24 @@ logger = logging.getLogger(__name__)
 class TurboQuantKVCache(_BaseCache):
     """KV cache with TurboQuant compression.
 
-    Stores only bit-packed indices and float32 norms. Dequantizes the
-    full cache on each ``update_and_fetch`` call — O(n · head_dim²) per
-    step due to the rotation matrix multiply.
+    Stores bit-packed indices and float32 norms for the persisted state,
+    plus a side buffer of dequantized K/V so each ``update_and_fetch`` only
+    dequantizes the newly appended slice (``O(num_steps · head_dim²)`` per
+    call) instead of the full history.
+
+    Side-buffer invariants:
+
+    - Only ``[..., :self.offset, :]`` is valid data. Positions
+      ``[self.offset:]`` may contain stale values left over after ``trim`` and
+      must not be read. ``update_and_fetch`` writes ``[prev:self.offset]``
+      before returning ``[..., :self.offset, :]``, so any stale range that
+      overlaps the returned slice is overwritten first.
+    - The side buffer is allocated once per cache with a fixed dtype derived
+      from the first ``keys`` seen. Subsequent calls with a different dtype
+      raise ``ValueError`` rather than silently mixing types on grow. A full
+      ``trim`` (``offset == 0``) clears the lock — the next ``update_and_fetch``
+      may use a new dtype. A partial trim preserves the lock (the retained
+      ``[0:offset)`` slice is still valid in the original dtype).
     """
 
     step = 256
@@ -45,15 +60,34 @@ class TurboQuantKVCache(_BaseCache):
         self._key_norms: mx.array | None = None
         self._value_indices: mx.array | None = None
         self._value_norms: mx.array | None = None
+        # Side buffer holding dequantized K/V so we only dequantize new tokens.
+        # Preserved by trim and resize; not included in ``state`` (recoverable
+        # from indices + norms).  ``_dequant_dtype`` is locked on first update.
+        self._key_dequant: mx.array | None = None
+        self._value_dequant: mx.array | None = None
+        self._dequant_dtype: mx.Dtype | None = None
         self.offset = 0
 
     def update_and_fetch(
         self, keys: mx.array, values: mx.array
     ) -> tuple[mx.array, mx.array]:
-        """Quantize new K/V, append to store, dequantize all and return."""
+        """Quantize new K/V, store bit-packed, dequantize only the new slice,
+        splice into the side buffer, and return views over the whole history.
+        """
         B, n_heads, num_steps, head_dim = keys.shape
         input_dtype = keys.dtype
         prev = self.offset
+
+        # Lock the side-buffer dtype on first update; reject mismatches on
+        # subsequent calls so the concatenate-on-grow path can't mix dtypes.
+        if self._dequant_dtype is None:
+            self._dequant_dtype = input_dtype
+        elif self._dequant_dtype != input_dtype:
+            raise ValueError(
+                f"TurboQuantKVCache: side-buffer dtype is {self._dequant_dtype}, "
+                f"got {input_dtype}. The cache does not support dtype changes "
+                f"across update_and_fetch calls."
+            )
 
         # Quantize incoming tokens (returns bit-packed indices)
         k_idx, k_nrm = turboquant_quantize(keys, self.rotation_key, self._bits)
@@ -61,23 +95,32 @@ class TurboQuantKVCache(_BaseCache):
 
         packed_dim = k_idx.shape[-1]  # head_dim // (8 // bits)
 
-        # Allocate or expand buffers
+        # Allocate or expand buffers in lockstep (indices, norms, dequant side buffer)
         if self._key_indices is None or (prev + num_steps) > self._key_indices.shape[2]:
             new_steps = (num_steps + self.step - 1) // self.step * self.step
             idx_shape = (B, n_heads, new_steps, packed_dim)
             nrm_shape = (B, n_heads, new_steps, 1)
+            deq_shape = (B, n_heads, new_steps, head_dim)
 
             if self._key_indices is not None:
                 assert (
                     self._key_norms is not None
                     and self._value_indices is not None
                     and self._value_norms is not None
+                    and self._key_dequant is not None
+                    and self._value_dequant is not None
                 )
+                # When ``prev % step == 0`` we skip truncation. Safe because
+                # resize only triggers when ``prev + num_steps > capacity``, so
+                # the ``[prev:prev+num_steps]`` write below covers the full stale
+                # range ``[prev:old_capacity]``.
                 if prev % self.step != 0:
                     self._key_indices = self._key_indices[..., :prev, :]
                     self._key_norms = self._key_norms[..., :prev, :]
                     self._value_indices = self._value_indices[..., :prev, :]
                     self._value_norms = self._value_norms[..., :prev, :]
+                    self._key_dequant = self._key_dequant[..., :prev, :]
+                    self._value_dequant = self._value_dequant[..., :prev, :]
                 self._key_indices = mx.concatenate(
                     [self._key_indices, mx.zeros(idx_shape, dtype=mx.uint8)], axis=2
                 )
@@ -90,11 +133,27 @@ class TurboQuantKVCache(_BaseCache):
                 self._value_norms = mx.concatenate(
                     [self._value_norms, mx.zeros(nrm_shape, dtype=mx.float32)], axis=2
                 )
+                self._key_dequant = mx.concatenate(
+                    [
+                        self._key_dequant,
+                        mx.zeros(deq_shape, dtype=self._dequant_dtype),
+                    ],
+                    axis=2,
+                )
+                self._value_dequant = mx.concatenate(
+                    [
+                        self._value_dequant,
+                        mx.zeros(deq_shape, dtype=self._dequant_dtype),
+                    ],
+                    axis=2,
+                )
             else:
                 self._key_indices = mx.zeros(idx_shape, dtype=mx.uint8)
                 self._key_norms = mx.zeros(nrm_shape, dtype=mx.float32)
                 self._value_indices = mx.zeros(idx_shape, dtype=mx.uint8)
                 self._value_norms = mx.zeros(nrm_shape, dtype=mx.float32)
+                self._key_dequant = mx.zeros(deq_shape, dtype=self._dequant_dtype)
+                self._value_dequant = mx.zeros(deq_shape, dtype=self._dequant_dtype)
 
         # Store quantized data
         assert (
@@ -102,6 +161,8 @@ class TurboQuantKVCache(_BaseCache):
             and self._key_norms is not None
             and self._value_indices is not None
             and self._value_norms is not None
+            and self._key_dequant is not None
+            and self._value_dequant is not None
         )
         self.offset += num_steps
         self._key_indices[..., prev : self.offset, :] = k_idx
@@ -109,22 +170,31 @@ class TurboQuantKVCache(_BaseCache):
         self._value_indices[..., prev : self.offset, :] = v_idx
         self._value_norms[..., prev : self.offset, :] = v_nrm
 
-        # Dequantize full cache and return in the original dtype
-        k_out = turboquant_dequantize(
-            self._key_indices[..., : self.offset, :],
-            self._key_norms[..., : self.offset, :],
+        # Dequantize only the newly appended slice and splice into the side buffer.
+        # We reuse the local ``k_idx/v_idx/k_nrm/v_nrm`` (just written into the
+        # persisted buffers on the lines above) instead of re-slicing them back out —
+        # the slice would add a gather op per step per layer for identical data.
+        k_new = turboquant_dequantize(
+            k_idx,
+            k_nrm,
             self.rotation_key,
             self._bits,
             dtype=input_dtype,
         )
-        v_out = turboquant_dequantize(
-            self._value_indices[..., : self.offset, :],
-            self._value_norms[..., : self.offset, :],
+        v_new = turboquant_dequantize(
+            v_idx,
+            v_nrm,
             self.rotation_value,
             self._bits,
             dtype=input_dtype,
         )
-        return k_out, v_out
+        self._key_dequant[..., prev : self.offset, :] = k_new
+        self._value_dequant[..., prev : self.offset, :] = v_new
+
+        return (
+            self._key_dequant[..., : self.offset, :],
+            self._value_dequant[..., : self.offset, :],
+        )
 
     @property
     def state(self):
@@ -162,6 +232,18 @@ class TurboQuantKVCache(_BaseCache):
             self._key_norms = None
             self._value_indices = None
             self._value_norms = None
+            self._key_dequant = None
+            self._value_dequant = None
+            self._dequant_dtype = None
+        # For partial trims (offset > 0) the side buffer retains stale dequant
+        # values at ``[..., self.offset:, :]``.  That's safe: ``update_and_fetch``
+        # always overwrites ``[prev:new_offset]`` before returning
+        # ``[..., :new_offset, :]``, so no stale position is ever exposed.
+        # TODO(perf/capacity-cap): after a large partial trim the side buffer
+        # stays at peak capacity for the session (~input_dtype bytes per token
+        # per layer). A capacity cap that shrinks the buffer when offset drops
+        # well below capacity would bound memory for long sessions with heavy
+        # trimming (tool-call reshape, speculative rejection).
         return n
 
     def make_mask(self, *args, **kwargs):

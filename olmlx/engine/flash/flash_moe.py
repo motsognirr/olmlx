@@ -70,24 +70,27 @@ class FlashMoE(nn.Module):
         Returns:
             Output hidden states, shape (B, L, hidden_size).
         """
-        orig_shape = x.shape
-        B, L, H = orig_shape
-        K = inds.shape[-1]
-
-        # Collect unique expert indices across entire batch
+        # Collect unique expert indices for the SSD read list (Python-side, one eval per layer).
+        # Invariant: ``unique_experts`` must contain every value in ``inds`` so the remap LUT
+        # has a valid entry for each routed token. ``mx.take`` would silently return the
+        # sentinel 0xFFFFFFFF otherwise — keep these two derivations from the same ``inds``.
         mx.eval(inds)
         flat_inds = inds.reshape(-1).tolist()
         unique_experts = sorted(set(flat_inds))
 
-        # Load only needed experts from SSD
+        # Load experts from SSD (or RAM cache); LoadedExperts includes a device-side
+        # remap LUT that maps global expert idx -> local stack position.
         loaded = self.weight_store.load_experts(self.layer_idx, unique_experts)
-        idx_map = loaded.expert_index_map  # global -> local
 
-        # Remap global indices to local positions in stacked arrays
-        remap = mx.array(
-            [idx_map[int(i)] for i in flat_inds],  # pyright: ignore[reportGeneralTypeIssues]
-            dtype=mx.uint32,
-        ).reshape(B, L, K)
+        # Vectorized device-side remap: lut[inds] gives local positions.
+        if loaded.remap_lut is None:
+            # load_experts must always populate this; an explicit raise gives a
+            # useful error if a future refactor breaks the invariant (assert
+            # would be stripped under python -O).
+            raise RuntimeError(
+                "FlashMoeWeightStore.load_experts must populate remap_lut; got None"
+            )
+        remap = mx.take(loaded.remap_lut, inds.astype(mx.uint32))
 
         # Compute expert outputs using loaded weights.
         # Gated (gate_proj+up_proj+down_proj): gate_out, up_out → silu(gate)*up → down
