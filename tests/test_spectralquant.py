@@ -742,12 +742,12 @@ class TestSpectralConfig:
         assert _resolve_cache_owner(inner, model) is model
 
     def test_is_attention_cache_state_4d(self):
-        """Only 4D (B, n_kv, seq, head_dim) states are attention caches we calibrate."""
+        """Only 4D (B, n_kv, seq, head_dim) states matching head_dim are attention caches."""
         from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
 
         ok_keys = mx.zeros((1, 2, 16, 256))
         ok_vals = mx.zeros((1, 2, 16, 256))
-        assert _is_attention_cache_state([ok_keys, ok_vals]) is True
+        assert _is_attention_cache_state([ok_keys, ok_vals], 256) is True
 
     def test_is_attention_cache_state_ssm_3d(self):
         """Qwen3Next SSM cache: conv state (index 0) is 3D, so the entry is skipped."""
@@ -755,20 +755,57 @@ class TestSpectralConfig:
 
         ssm_conv = mx.zeros((1, 3, 8192))  # conv state
         ssm_hid = mx.zeros((1, 32, 128, 128))
-        assert _is_attention_cache_state([ssm_conv, ssm_hid]) is False
+        assert _is_attention_cache_state([ssm_conv, ssm_hid], 256) is False
 
     def test_is_attention_cache_state_mamba2_4d_rejected(self):
-        """Mamba2 recurrent state (B, n_heads, d_head, d_state) is 4D but has seq=d_head.
-
-        For Mamba2 hybrids the "seq" axis is actually d_head (small), so the
-        shape discriminant rejects the entry. We simulate a per-step state with
-        seq==1 to ensure the shape-based filter catches it.
-        """
+        """Mamba2 per-step recurrent state (B, n_heads, 1, d_state) is 4D but seq==1."""
         from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
 
-        mamba_state = mx.zeros((1, 8, 1, 128))  # per-step state, seq-like axis == 1
+        mamba_state = mx.zeros((1, 8, 1, 128))
         mamba_extra = mx.zeros((1, 8, 1, 128))
-        assert _is_attention_cache_state([mamba_state, mamba_extra]) is False
+        # d_state=128 coincides with head_dim=128, so seq==1 is what rejects it.
+        assert _is_attention_cache_state([mamba_state, mamba_extra], 128) is False
+
+    def test_is_attention_cache_state_mamba2_chunked_scan_rejected(self):
+        """Chunked-scan Mamba2 state may have seq>1, but d_state mismatches head_dim."""
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
+
+        # Chunked SSM state: d_state is typically 16-64, not the attention head_dim.
+        ssm_chunked = mx.zeros((1, 8, 32, 64))  # seq==32 (chunk), d_state==64
+        ssm_extra = mx.zeros((1, 8, 32, 64))
+        assert _is_attention_cache_state([ssm_chunked, ssm_extra], 256) is False
+
+    def test_resolve_config_holder_accepts_config_attribute(self):
+        """VL LanguageModel wrappers may expose `.config` instead of `.args`."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_config_holder
+
+        inner = MagicMock(spec=["layers"])  # no .args, no .config
+        model = MagicMock(spec=[])
+        model.config = MagicMock(spec=[])
+        assert _resolve_config_holder(inner, model) is model
+
+    def test_config_namespace_prefers_args(self):
+        """When both .args and .config exist, prefer .args (mlx-lm idiom)."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _config_namespace
+
+        holder = MagicMock(spec=[])
+        holder.args = "args-ns"
+        holder.config = "config-ns"
+        assert _config_namespace(holder) == "args-ns"
+
+    def test_config_namespace_falls_back_to_config(self):
+        """When only .config exists, return it."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _config_namespace
+
+        holder = MagicMock(spec=[])
+        holder.config = "config-ns"
+        assert _config_namespace(holder) == "config-ns"
 
     def test_resolve_cache_owner_ignores_layers_without_make_cache(self):
         """Without make_cache on the top-level model, route to backbone regardless of .layers."""

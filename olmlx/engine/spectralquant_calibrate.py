@@ -22,27 +22,42 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_config_holder(inner: Any, model: Any) -> Any:
-    # Some architectures (e.g. Qwen3Next) expose `.args` only on the top-level
-    # model, not on the backbone returned by `_get_backbone`.
-    if hasattr(inner, "args"):
-        return inner
-    if hasattr(model, "args"):
-        return model
+    # Some architectures (e.g. Qwen3Next) expose the config namespace only on
+    # the top-level model, not on the backbone returned by `_get_backbone`.
+    # mlx-lm models expose it as `.args`; some mlx-vlm LanguageModel wrappers
+    # expose it as `.config`. Accept either so the guard is no stricter than
+    # the `_detect_head_dim` fallback that follows.
+    for obj in (inner, model):
+        if hasattr(obj, "args") or hasattr(obj, "config"):
+            return obj
     raise RuntimeError(
         "Cannot detect model configuration: neither the backbone nor the "
-        "top-level model exposes '.args'. Unsupported architecture."
+        "top-level model exposes '.args' or '.config'. Unsupported architecture."
     )
 
 
-def _is_attention_cache_state(state: Any) -> bool:
+def _config_namespace(cfg_holder: Any) -> Any:
+    # Return the `.args` or `.config` object carrying architecture fields.
+    ns = getattr(cfg_holder, "args", None)
+    if ns is not None:
+        return ns
+    ns = getattr(cfg_holder, "config", None)
+    if ns is not None:
+        return ns
+    raise RuntimeError(
+        "Config holder exposes neither '.args' nor '.config'. Unsupported architecture."
+    )
+
+
+def _is_attention_cache_state(state: Any, expected_head_dim: int) -> bool:
     # Hybrid models (e.g. Qwen3Next) mix attention caches with SSM caches.
     # Attention caches hold 4D (B, n_kv_heads, seq, head_dim) tensors.
     # For Qwen3Next the SSM conv state is 3D at index 0 and rejected directly,
     # but Mamba2-family hybrids (Falcon-H1, Zamba2) expose 4D recurrent states
-    # (B, n_heads, d_head, d_state) which would pass a pure ndim check. The
-    # secondary shape discriminant below rejects them: calibration always runs
-    # with batch size 1, and the real seq axis is > 1 after prefill, while
-    # Mamba2 per-step states have a short "seq" slot.
+    # (B, n_heads, d_head, d_state) which would pass a pure ndim check — and
+    # chunked-scan Mamba2 variants can even have a non-trivial chunk axis in
+    # slot 2. We additionally require the last axis to match the expected
+    # attention head dimension, which SSM states won't satisfy.
     if not state or len(state) < 2:
         return False
     keys = state[0]
@@ -51,7 +66,7 @@ def _is_attention_cache_state(state: Any) -> bool:
     shape = getattr(keys, "shape", None)
     if shape is None or len(shape) != 4:
         return False
-    return shape[0] == 1 and shape[2] > 1
+    return shape[0] == 1 and shape[2] >= 1 and shape[3] == expected_head_dim
 
 
 def _resolve_cache_owner(inner: Any, model: Any) -> Any:
@@ -321,12 +336,13 @@ def calibrate_model(
     layers = inner.layers
     num_layers = len(layers)
     cfg_holder = _resolve_config_holder(inner, model)
+    cfg_ns = _config_namespace(cfg_holder)
     head_dim = _detect_head_dim(cfg_holder, layers_hint=inner)
 
     # Determine number of KV heads
-    n_kv_heads = getattr(cfg_holder.args, "num_key_value_heads", None)
+    n_kv_heads = getattr(cfg_ns, "num_key_value_heads", None)
     if n_kv_heads is None:
-        n_kv_heads = getattr(cfg_holder.args, "num_attention_heads", 1)
+        n_kv_heads = getattr(cfg_ns, "num_attention_heads", 1)
 
     if progress_callback:
         progress_callback("Generating calibration data", 0.05)
@@ -365,6 +381,14 @@ def calibrate_model(
     first_exc: Exception | None = None
     for sample_idx, text in enumerate(texts):
         tokens = _encode_tokens(tokenizer, text)
+        if len(tokens) < 2:
+            # Single-token prefills produce (1, n_kv, 1, head_dim) caches that
+            # are easy to confuse with per-step SSM states, and carry no
+            # meaningful KV statistics anyway. Skip them.
+            logger.debug(
+                "Skipping sample %d: too short (%d tokens)", sample_idx, len(tokens)
+            )
+            continue
         if len(tokens) > 512:
             tokens = tokens[:512]
         input_ids = mx.array([tokens])
@@ -384,7 +408,7 @@ def calibrate_model(
         for layer_idx in range(min(num_layers, len(prompt_cache))):
             cache_entry = prompt_cache[layer_idx]
             state = cache_entry.state if hasattr(cache_entry, "state") else None
-            if not _is_attention_cache_state(state):
+            if not _is_attention_cache_state(state, head_dim):
                 continue
             # KVCache.state returns [keys, values] with shape
             # (1, n_kv_heads, seq_len, head_dim)
