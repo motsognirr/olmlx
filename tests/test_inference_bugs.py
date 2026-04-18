@@ -240,6 +240,16 @@ class TestDeferredCleanupLockPerLoop:
         try:
             loop_a.run_until_complete(register_task_and_abandon())
         finally:
+            # Drain the pending ``never()`` task to avoid leaking it on a
+            # closed loop (ResourceWarning under Py 3.12+ filterwarnings=error).
+            pending = asyncio.all_tasks(loop_a)
+            for t in pending:
+                t.cancel()
+            if pending:
+                loop_a.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            _inf_mod._deferred_cleanup_tasks.pop(loop_a, None)
             loop_a.close()
 
         async def await_cleanup_on_fresh_loop():
