@@ -461,6 +461,12 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                 "this should not happen while the inference lock is held"
             )
             return  # do not create a second task; the existing one will release the lock
+        if existing is not None and not existing.cancelled():
+            # ``existing`` is done — replacing the dict entry below drops the
+            # last reference.  Consume any stored exception so asyncio doesn't
+            # log "Task exception was never retrieved" when it's GC'd.
+            with contextlib.suppress(asyncio.InvalidStateError, Exception):
+                existing.exception()
 
         async def _cleanup():
             thread = stream._thread

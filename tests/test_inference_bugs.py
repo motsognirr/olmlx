@@ -217,11 +217,19 @@ class TestDeferredCleanupLockPerLoop:
     @pytest.mark.asyncio
     async def test_same_loop_returns_same_lock(self):
         """Within a single event loop, repeated calls must return the same lock."""
-        lock1 = _inf_mod._get_deferred_cleanup_lock()
-        lock2 = _inf_mod._get_deferred_cleanup_lock()
-        assert lock1 is lock2, (
-            "Repeated calls on the same loop must return the same lock"
-        )
+        import asyncio
+
+        try:
+            lock1 = _inf_mod._get_deferred_cleanup_lock()
+            lock2 = _inf_mod._get_deferred_cleanup_lock()
+            assert lock1 is lock2, (
+                "Repeated calls on the same loop must return the same lock"
+            )
+        finally:
+            # Explicit cleanup matches the sibling tests in this class;
+            # the autouse ``_reset_inference_state`` fixture would also
+            # handle this, but being explicit keeps the pattern uniform.
+            _inf_mod._deferred_cleanup_locks.pop(asyncio.get_running_loop(), None)
 
     def test_separate_tasks_for_separate_loops(self):
         """A task registered on loop A must be invisible to loop B.
