@@ -53,10 +53,11 @@ def _config_namespace(cfg_holder: Any) -> Any:
 def _build_empty_collection_error(first_exc: Exception | None) -> RuntimeError:
     """Build the error raised when calibration collected zero KV vectors.
 
-    Chains `first_exc` via `__cause__` (equivalent to `raise ... from first_exc`)
-    so the full traceback is preserved when a forward-pass failure is the
-    root cause. When no forward-pass errors occurred, reports that no
-    attention-layer cache entries were found.
+    Chains `first_exc` via `__cause__` and sets `__suppress_context__=True` so
+    the behavior matches `raise ... from first_exc`: the traceback shows the
+    forward-pass cause and nothing else. Without suppression, raising this
+    from inside an `except` block in the future would also surface the
+    unrelated implicit `__context__`.
     """
     if first_exc is not None:
         err = RuntimeError(
@@ -64,6 +65,7 @@ def _build_empty_collection_error(first_exc: Exception | None) -> RuntimeError:
             f"First forward-pass error: {type(first_exc).__name__}: {first_exc}"
         )
         err.__cause__ = first_exc
+        err.__suppress_context__ = True
         return err
     return RuntimeError(
         "No KV vectors were collected during calibration. "

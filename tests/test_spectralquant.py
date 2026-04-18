@@ -775,6 +775,19 @@ class TestSpectralConfig:
         ssm_extra = mx.zeros((1, 8, 32, 64))
         assert _is_attention_cache_state([ssm_chunked, ssm_extra], 256) is False
 
+    def test_is_attention_cache_state_shape_filter_cannot_reject_matching_d_state(self):
+        """Document the shape-filter gap: a chunked SSM state where `d_state == head_dim`
+        and `seq >= 2` passes the shape check. Safety relies entirely on the
+        `isinstance(cache_entry, KVCache)` primary filter at the call site. This
+        test locks the contract so a future refactor that calls
+        `_is_attention_cache_state` without the isinstance guard fails loudly.
+        """
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
+
+        # Hypothetical chunked SSM with d_state=128 colliding with head_dim=128.
+        chunked = mx.zeros((1, 8, 32, 128))
+        assert _is_attention_cache_state([chunked, chunked], 128) is True
+
     def test_resolve_config_holder_accepts_config_attribute(self):
         """VL LanguageModel wrappers may expose `.config` instead of `.args`."""
         from unittest.mock import MagicMock
@@ -808,13 +821,15 @@ class TestSpectralConfig:
         assert _config_namespace(holder) == "config-ns"
 
     def test_build_empty_collection_error_chains_first_exc(self):
-        """First forward-pass exception must be chained via __cause__ so the traceback survives."""
+        """First forward-pass exception must be chained via __cause__ (and suppress
+        context) so the behavior matches `raise ... from first_exc`."""
         from olmlx.engine.spectralquant_calibrate import _build_empty_collection_error
 
         original = ValueError("synthetic forward-pass failure")
         err = _build_empty_collection_error(original)
         assert isinstance(err, RuntimeError)
         assert err.__cause__ is original
+        assert err.__suppress_context__ is True
         assert "ValueError" in str(err)
         assert "synthetic forward-pass failure" in str(err)
 
