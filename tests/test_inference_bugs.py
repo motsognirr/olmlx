@@ -322,6 +322,7 @@ class TestDeferredCleanupLockPerLoop:
         try:
             loop_b.run_until_complete(acquire_with_timeout())
         finally:
+            _inf_mod._deferred_cleanup_locks.pop(loop_b, None)
             loop_b.close()
 
 
