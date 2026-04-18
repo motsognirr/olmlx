@@ -792,6 +792,17 @@ class TestSpectralConfig:
         assert holder is model
         assert holder.args.head_dim == 256
 
+    def test_resolve_config_holder_raises_when_neither_has_args(self):
+        """Unsupported architecture: surface a clear error instead of a cryptic AttributeError."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_config_holder
+
+        inner = MagicMock(spec=["layers"])
+        model = MagicMock(spec=[])
+        with pytest.raises(RuntimeError, match="Unsupported architecture"):
+            _resolve_config_holder(inner, model)
+
     def test_disk_cache_guard(self):
         """SpectralQuantKVCache should block disk serialization."""
         from olmlx.engine.model_manager import _is_serializable_cache

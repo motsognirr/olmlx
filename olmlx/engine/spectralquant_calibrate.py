@@ -24,7 +24,14 @@ logger = logging.getLogger(__name__)
 def _resolve_config_holder(inner: Any, model: Any) -> Any:
     # Some architectures (e.g. Qwen3Next) expose `.args` only on the top-level
     # model, not on the backbone returned by `_get_backbone`.
-    return inner if hasattr(inner, "args") else model
+    if hasattr(inner, "args"):
+        return inner
+    if hasattr(model, "args"):
+        return model
+    raise RuntimeError(
+        "Cannot detect model configuration: neither the backbone nor the "
+        "top-level model exposes '.args'. Unsupported architecture."
+    )
 
 
 def _is_attention_cache_state(state: Any) -> bool:
