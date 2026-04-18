@@ -11,6 +11,7 @@ subclass that adds prefetching and neuron window sizing.
 from __future__ import annotations
 
 import logging
+from typing import Any, cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -24,10 +25,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def _logits(out: mx.array | object) -> mx.array:
+def _logits(out: Any) -> mx.array:
     # mlx-vlm's language_model returns LanguageModelOutput(logits=...);
     # mlx-lm models return a raw mx.array.
-    return getattr(out, "logits", out)
+    return cast(mx.array, getattr(out, "logits", out))
 
 
 def verify_draft_greedy(
