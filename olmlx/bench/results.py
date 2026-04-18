@@ -356,6 +356,7 @@ def build_leaderboard(
         except (
             json.JSONDecodeError,
             OSError,
+            IndexError,
             KeyError,
             TypeError,
             ValueError,
@@ -414,14 +415,11 @@ def build_leaderboard(
                 by_model[e.model] = e
         entries = list(by_model.values())
 
-    entries.sort(
-        key=lambda e: (
-            e.best_tps,
-            e.timestamp,
-            _run_dir_sort_key(e.run_dir.name),
-        ),
-        reverse=True,
-    )
+    # Neutral tiebreakers: model name (asc) then directory name (asc).
+    # Avoids ranking equal-tps runs by timestamp, which would conflate
+    # "more recent" with "better".
+    entries.sort(key=lambda e: (e.model, e.run_dir.name))
+    entries.sort(key=lambda e: e.best_tps, reverse=True)
     return entries
 
 
