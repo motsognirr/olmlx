@@ -265,8 +265,13 @@ def _detect_head_dim(model: Any, layers_hint: Any = None) -> int:
     fallback when `model` itself is a wrapper whose first layer isn't an
     attention layer (e.g. hybrid SSM+attention backbones).
     """
-    # Prefer explicit head_dim from model args or config
-    model_cfg = getattr(model, "args", None) or getattr(model, "config", None)
+    # Prefer explicit head_dim from model args or config. Use `is not None`
+    # rather than `or` so a falsy-but-present `.args` isn't silently skipped;
+    # this matches `_resolve_config_holder` / `_config_namespace` in the
+    # spectralquant calibrator.
+    model_cfg = getattr(model, "args", None)
+    if model_cfg is None:
+        model_cfg = getattr(model, "config", None)
     if model_cfg is None:
         raise RuntimeError("TurboQuant: model has no 'args' or 'config' attribute")
 

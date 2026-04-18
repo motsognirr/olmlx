@@ -423,6 +423,7 @@ def calibrate_model(
             if first_exc is None:
                 first_exc = exc
             logger.debug("Skipping sample %d: %s", sample_idx, exc)
+            del prompt_cache
             continue
         mx.eval([c.state for c in prompt_cache if hasattr(c, "state")])
 
