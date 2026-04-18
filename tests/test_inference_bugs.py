@@ -171,10 +171,10 @@ class TestDeferredCleanupLockPerLoop:
 
     The multi-loop test is deliberately ``def``, not ``async def`` — its whole
     point is to exercise two separate ``asyncio.new_event_loop()`` instances,
-    which cannot be done from inside a single running loop.  No fixture
-    teardown is needed: both loops are freshly constructed objects, so they
-    cannot have pre-existing entries in the WeakKeyDictionary, and the loops
-    are closed at the end of the test so their entries are eligible for GC.
+    which cannot be done from inside a single running loop.  Each test pops
+    its own entries from the module dicts explicitly: the loop locals stay
+    alive until the test returns, and WeakKeyDictionary only collects entries
+    once the key goes out of scope, so ``loop.close()`` alone isn't sufficient.
     """
 
     def test_separate_locks_for_separate_loops(self):
@@ -185,10 +185,11 @@ class TestDeferredCleanupLockPerLoop:
         try:
             lock_a = loop_a.run_until_complete(self._get_lock())
         finally:
-            # Explicit pop matches ``test_stale_locked_lock_not_inherited``
-            # and ``test_separate_tasks_for_separate_loops``; ``lock_a``
-            # keeps the lock alive so WeakKeyDictionary would hold the
-            # entry for the rest of this test otherwise.
+            # Explicit pop so loop_a's entry doesn't persist for the rest of
+            # this test while ``loop_a`` is still in scope (WeakKeyDictionary
+            # holds weak refs to *keys*; a live local variable keeps the key
+            # alive).  Matches ``test_stale_locked_lock_not_inherited`` and
+            # ``test_separate_tasks_for_separate_loops``.
             _inf_mod._deferred_cleanup_locks.pop(loop_a, None)
             loop_a.close()
 
@@ -199,6 +200,7 @@ class TestDeferredCleanupLockPerLoop:
             # loop A's lock, this would raise "attached to a different loop".
             loop_b.run_until_complete(self._acquire_and_release(lock_b))
         finally:
+            _inf_mod._deferred_cleanup_locks.pop(loop_b, None)
             loop_b.close()
 
         assert lock_a is not lock_b, (

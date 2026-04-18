@@ -280,9 +280,12 @@ async def _reset_inference_state() -> None:
         with contextlib.suppress(asyncio.InvalidStateError, Exception):
             task.exception()
     # Also cleans up any lock entry ``_cleanup``'s finally block may have
-    # created: the ``task.done()`` path above skips ``await task``, but the
-    # task may already have run ``_get_deferred_cleanup_lock()`` and left
-    # a fresh entry in ``_deferred_cleanup_locks``.
+    # created.  Both branches above can leave one behind:
+    #   - ``if`` (cancel + await): ``_cleanup``'s finally runs during
+    #     ``await task`` and calls ``_get_deferred_cleanup_lock()``, which
+    #     creates a fresh lock entry before popping the task entry.
+    #   - ``elif`` (already-done): we skip ``await task``, but the task
+    #     may already have run its finally and left the same fresh entry.
     _deferred_cleanup_locks.pop(loop, None)
     # ``_queue_depth`` is intentionally global: it tracks waiters on the
     # global ``_inference_lock``, not per-loop cleanup state, so a per-loop
@@ -437,6 +440,11 @@ async def _await_deferred_cleanup():
         )
     # ``asyncio.wait`` returns completed tasks regardless of whether they raised;
     # surface any exception so it isn't silently dropped on the return path.
+    # Log-and-proceed is intentional: ``_cleanup``'s finally runs
+    # ``lock.release()`` unconditionally before any return from this task, so
+    # the inference lock is always released and the next request can proceed.
+    # Callers have no need to reject the following inference — the lock state
+    # is correct regardless of cleanup outcome.  The log is the signal.
     (finished_task,) = done
     if not finished_task.cancelled():
         exc = finished_task.exception()
