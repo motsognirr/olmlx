@@ -415,7 +415,7 @@ def calibrate_model(
             raise RuntimeError(
                 "No KV vectors were collected during calibration. "
                 f"First forward-pass error: {type(first_exc).__name__}: {first_exc}"
-            )
+            ) from first_exc
         raise RuntimeError(
             "No KV vectors were collected during calibration. "
             "No attention-layer cache entries were found — the model may have no "
