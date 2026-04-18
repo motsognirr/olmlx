@@ -50,14 +50,14 @@ def _config_namespace(cfg_holder: Any) -> Any:
 
 
 def _is_attention_cache_state(state: Any, expected_head_dim: int) -> bool:
-    # Hybrid models (e.g. Qwen3Next) mix attention caches with SSM caches.
-    # Attention caches hold 4D (B, n_kv_heads, seq, head_dim) tensors.
-    # For Qwen3Next the SSM conv state is 3D at index 0 and rejected directly,
-    # but Mamba2-family hybrids (Falcon-H1, Zamba2) expose 4D recurrent states
-    # (B, n_heads, d_head, d_state) which would pass a pure ndim check — and
-    # chunked-scan Mamba2 variants can even have a non-trivial chunk axis in
-    # slot 2. We additionally require the last axis to match the expected
-    # attention head dimension, which SSM states won't satisfy.
+    # Shape sanity check: attention caches hold 4D (B, n_kv_heads, seq, head_dim)
+    # tensors. After prefill the real seq axis is ≥ 2 (the `len(tokens) < 2`
+    # guard in `calibrate_model` enforces this), so per-step SSM recurrent
+    # states with seq==1 are rejected. A last-axis match against the expected
+    # head_dim filters most SSM shapes. This is a secondary guard only — the
+    # call site additionally checks `isinstance(cache_entry, KVCache)` to
+    # catch the residual case where a 4D SSM state happens to match both
+    # constraints (e.g. a Mamba2 variant with d_state == head_dim).
     if not state or len(state) < 2:
         return False
     keys = state[0]
@@ -66,7 +66,7 @@ def _is_attention_cache_state(state: Any, expected_head_dim: int) -> bool:
     shape = getattr(keys, "shape", None)
     if shape is None or len(shape) != 4:
         return False
-    return shape[0] == 1 and shape[2] >= 1 and shape[3] == expected_head_dim
+    return shape[0] == 1 and shape[2] >= 2 and shape[3] == expected_head_dim
 
 
 def _resolve_cache_owner(inner: Any, model: Any) -> Any:
@@ -375,7 +375,7 @@ def calibrate_model(
     # KV cache, then extracting the cached tensors.  This captures keys and
     # values *after* rotary positional embeddings — the actual distribution
     # that gets stored in the KV cache at inference time.
-    from mlx_lm.models.cache import make_prompt_cache
+    from mlx_lm.models.cache import KVCache, make_prompt_cache
 
     cache_model = _resolve_cache_owner(inner, model)
     first_exc: Exception | None = None
@@ -407,6 +407,12 @@ def calibrate_model(
         # Extract K/V from each layer's cache
         for layer_idx in range(min(num_layers, len(prompt_cache))):
             cache_entry = prompt_cache[layer_idx]
+            # Primary filter: must be a standard attention KV cache. Hybrid
+            # models (Qwen3Next, Falcon-H1, Zamba2) mix these with SSM cache
+            # types whose `.state` may coincidentally match the attention
+            # shape (e.g. Mamba2 with d_state == head_dim).
+            if not isinstance(cache_entry, KVCache):
+                continue
             state = cache_entry.state if hasattr(cache_entry, "state") else None
             if not _is_attention_cache_state(state, head_dim):
                 continue
