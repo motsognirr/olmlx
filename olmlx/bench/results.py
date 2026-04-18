@@ -414,7 +414,14 @@ def build_leaderboard(
                 by_model[e.model] = e
         entries = list(by_model.values())
 
-    entries.sort(key=lambda e: e.best_tps, reverse=True)
+    entries.sort(
+        key=lambda e: (
+            e.best_tps,
+            e.timestamp,
+            _run_dir_sort_key(e.run_dir.name),
+        ),
+        reverse=True,
+    )
     return entries
 
 
@@ -431,6 +438,7 @@ def format_leaderboard(
     rows = entries if limit is None else entries[:limit]
     if not rows:
         return ""
+    rank_w = max(3, len(str(len(rows))))
     model_w = max(45, max((len(e.model) for e in rows), default=45))
     scenario_w = max(14, max((len(e.best_scenario) for e in rows), default=14))
     empty_w = max(
@@ -441,14 +449,14 @@ def format_leaderboard(
         ),
     )
     header = (
-        f"{'#':>3} {'Model':<{model_w}} {'Best tok/s':>10} "
+        f"{'#':>{rank_w}} {'Model':<{model_w}} {'Best tok/s':>10} "
         f"{'Scenario':<{scenario_w}} {'Timestamp':<18} {'Git':<10} "
         f"{'Empty/Total':>{empty_w}}"
     )
     lines = [header, "-" * len(header)]
     for i, e in enumerate(rows, 1):
         lines.append(
-            f"{i:>3} {e.model:<{model_w}} {e.best_tps:>10.1f} "
+            f"{i:>{rank_w}} {e.model:<{model_w}} {e.best_tps:>10.1f} "
             f"{e.best_scenario:<{scenario_w}} {e.timestamp:<18} "
             f"{(e.git_sha[:10] if e.git_sha else '-' * 7):<10} "
             f"{f'{e.empty_scenarios}/{e.total_scenarios}':>{empty_w}}"
