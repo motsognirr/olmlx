@@ -225,13 +225,13 @@ _generation_streams = _resolve_generation_streams()
 # crashes or corruption.  A single global lock is an intentional trade-off:
 # we sacrifice parallelism for stability on Apple Silicon.
 #
-# On Python 3.11+ asyncio.Lock binds to a loop lazily (at first acquire), so
-# the same instance can be shared across loops as long as it is never acquired
-# on one while still held by another.  Test isolation relies on
-# ``_reset_inference_state()`` force-releasing it between tests, not on
-# recreating it per-loop like ``_deferred_cleanup_locks`` below.
+# On Python 3.10+ asyncio.Lock binds to a loop lazily (at first acquire, via
+# get_running_loop() — see bpo-39529), so the same instance can be shared
+# across loops as long as it is never acquired on one while still held by
+# another.  Test isolation relies on ``_reset_inference_state()``
+# force-releasing it between tests, not on recreating it per-loop like
+# ``_deferred_cleanup_locks`` below.
 _inference_lock = asyncio.Lock()
-_deferred_cleanup_task: asyncio.Task | None = None
 # A lock that was acquired on loop A (e.g. a test that crashed without
 # releasing it) causes deadlock or "Future attached to a different loop"
 # errors when another loop inherits it.  Per-loop keys ensure each test loop
@@ -239,6 +239,12 @@ _deferred_cleanup_task: asyncio.Task | None = None
 # loops get garbage-collected without leaking.
 _deferred_cleanup_locks: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Lock
+] = weakref.WeakKeyDictionary()
+# Tasks are also keyed per-loop: a task bound to loop A cannot be cancelled or
+# awaited from loop B (RuntimeError on Python 3.10+).  Keeping this per-loop
+# keeps the reset path consistent with the lock scoping.
+_deferred_cleanup_tasks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Task
 ] = weakref.WeakKeyDictionary()
 # Tracks requests waiting for _inference_lock (not the _await_deferred_cleanup wait).
 _queue_depth = 0
@@ -257,17 +263,18 @@ async def _reset_inference_state() -> None:
     orphaned release calls after the task completes.
     Force-releases _inference_lock if held to prevent test deadlocks.
     """
-    global _deferred_cleanup_task, _queue_depth
-    if _deferred_cleanup_task is not None and not _deferred_cleanup_task.done():
-        _deferred_cleanup_task.cancel()
+    global _queue_depth
+    # Scope the reset to the calling loop so we don't wipe locks/tasks in use
+    # by other loops (e.g. concurrent async test classes under loop_scope=session).
+    loop = asyncio.get_running_loop()
+    task = _deferred_cleanup_tasks.pop(loop, None)
+    if task is not None and not task.done():
+        task.cancel()
         try:
-            await _deferred_cleanup_task
+            await task
         except (asyncio.CancelledError, asyncio.InvalidStateError):
             pass
-    _deferred_cleanup_task = None
-    # Scope the reset to the calling loop so we don't wipe locks in use by
-    # other loops (e.g. concurrent async test classes under loop_scope=session).
-    _deferred_cleanup_locks.pop(asyncio.get_running_loop(), None)
+    _deferred_cleanup_locks.pop(loop, None)
     _queue_depth = 0
     if _inference_lock.locked():
         _inference_lock.release()
@@ -396,17 +403,18 @@ async def _await_deferred_cleanup():
 
     Raises ServerBusyError if cleanup doesn't finish within _DEFERRED_WAIT_TIMEOUT.
     Uses asyncio.wait() to avoid Python 3.11 wait_for race conditions.
-    Uses _deferred_cleanup_lock to prevent TOCTOU races on _deferred_cleanup_task (Bug #119).
+    Uses _deferred_cleanup_lock to prevent TOCTOU races on _deferred_cleanup_tasks (Bug #119).
     """
+    loop = asyncio.get_running_loop()
     async with _get_deferred_cleanup_lock():
-        task = _deferred_cleanup_task
+        task = _deferred_cleanup_tasks.get(loop)
         if task is None or task.done():
             return
     # Wait outside the lock so _cleanup() can acquire it in its finally block
-    # to set _deferred_cleanup_task = None.  Holding the lock here would deadlock.
-    # Race safety: a concurrent _schedule_deferred_inference_cleanup cannot replace
-    # _deferred_cleanup_task while we wait because _inference_lock is held by the
-    # existing cleanup — no new inference (and thus no new cleanup) can be scheduled.
+    # to remove the entry from _deferred_cleanup_tasks.  Holding the lock here
+    # would deadlock.  Race safety: a concurrent _schedule_deferred_inference_cleanup
+    # cannot replace the entry while we wait because _inference_lock is held by
+    # the existing cleanup — no new inference (and thus no new cleanup) can be scheduled.
     logger.info("Waiting for deferred GPU cleanup to complete")
     done, _ = await asyncio.wait({task}, timeout=_DEFERRED_WAIT_TIMEOUT)
     if not done:
@@ -426,14 +434,14 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
     releases the lock anyway (risk of Metal crash on next inference, but
     better than permanent deadlock).
 
-    Uses _deferred_cleanup_lock to prevent TOCTOU races on _deferred_cleanup_task (Bug #119).
+    Uses _deferred_cleanup_lock to prevent TOCTOU races on _deferred_cleanup_tasks (Bug #119).
     """
-    global _deferred_cleanup_task
-
     lock = _get_inference_lock()
+    loop = asyncio.get_running_loop()
 
     async with _get_deferred_cleanup_lock():
-        if _deferred_cleanup_task is not None and not _deferred_cleanup_task.done():
+        existing = _deferred_cleanup_tasks.get(loop)
+        if existing is not None and not existing.done():
             logger.error(
                 "Deferred inference cleanup already in progress — "
                 "this should not happen while the inference lock is held"
@@ -475,10 +483,9 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                 lock.release()
                 logger.info("Deferred inference cleanup: lock released")
                 async with _get_deferred_cleanup_lock():
-                    global _deferred_cleanup_task
-                    _deferred_cleanup_task = None
+                    _deferred_cleanup_tasks.pop(loop, None)
 
-        _deferred_cleanup_task = asyncio.create_task(_cleanup())
+        _deferred_cleanup_tasks[loop] = asyncio.create_task(_cleanup())
 
 
 MEMORY_SAFETY_FACTOR = 1.3

@@ -2200,12 +2200,14 @@ class TestInferenceLockedWaitsDeferredCleanup:
             await asyncio.sleep(0.05)
             completed = True
 
-        _inf_mod._deferred_cleanup_task = asyncio.create_task(cleanup())
+        _inf_mod._deferred_cleanup_tasks[asyncio.get_running_loop()] = (
+            asyncio.create_task(cleanup())
+        )
         with patch("olmlx.engine.inference.mx"):
             async with _inference_locked():
                 pass
         assert completed
-        _inf_mod._deferred_cleanup_task = None
+        _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
 
     @pytest.mark.asyncio
     async def test_waits_for_deferred_cleanup_post_lock(self):
@@ -2222,10 +2224,12 @@ class TestInferenceLockedWaitsDeferredCleanup:
 
         async def acquire_then_inject(timeout_override=None):
             await original_acquire(timeout_override)
-            _inf_mod._deferred_cleanup_task = asyncio.create_task(cleanup())
+            _inf_mod._deferred_cleanup_tasks[asyncio.get_running_loop()] = (
+                asyncio.create_task(cleanup())
+            )
 
         with patch("olmlx.engine.inference.mx"):
-            _inf_mod._deferred_cleanup_task = None
+            _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
             with patch(
                 "olmlx.engine.inference._acquire_inference_lock",
                 side_effect=acquire_then_inject,
@@ -2233,7 +2237,7 @@ class TestInferenceLockedWaitsDeferredCleanup:
                 async with _inference_locked():
                     pass
             assert cleanup_done.is_set()
-        _inf_mod._deferred_cleanup_task = None
+        _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
 
 
 class TestAcquireInferenceLockTimeoutOverride:
@@ -2241,7 +2245,7 @@ class TestAcquireInferenceLockTimeoutOverride:
     async def test_timeout_override_used_instead_of_global(self):
         """timeout_override should take precedence over settings.inference_queue_timeout."""
         fresh_lock = asyncio.Lock()
-        _inf_mod._deferred_cleanup_task = None
+        _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
         with patch("olmlx.engine.inference._inference_lock", fresh_lock):
             # Hold the lock so acquire will block
             await fresh_lock.acquire()
@@ -2254,7 +2258,7 @@ class TestAcquireInferenceLockTimeoutOverride:
     async def test_timeout_override_none_falls_through_to_global(self):
         """When timeout_override is None, global setting is used."""
         fresh_lock = asyncio.Lock()
-        _inf_mod._deferred_cleanup_task = None
+        _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
         with (
             patch("olmlx.engine.inference._inference_lock", fresh_lock),
             patch("olmlx.engine.inference.settings") as mock_settings,
@@ -2269,7 +2273,7 @@ class TestAcquireInferenceLockTimeoutOverride:
     async def test_inference_locked_passes_timeout_override(self):
         """_inference_locked() should pass timeout_override to _acquire_inference_lock."""
         fresh_lock = asyncio.Lock()
-        _inf_mod._deferred_cleanup_task = None
+        _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
         with (
             patch("olmlx.engine.inference._inference_lock", fresh_lock),
             patch("olmlx.engine.inference.mx"),
@@ -2288,7 +2292,7 @@ class TestQueueDepth:
         # Use a fresh lock to avoid event loop binding issues
         fresh_lock = asyncio.Lock()
         _inf_mod._queue_depth = 0
-        _inf_mod._deferred_cleanup_task = None
+        _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
         with (
             patch("olmlx.engine.inference.mx"),
             patch("olmlx.engine.inference._inference_lock", fresh_lock),
@@ -2317,7 +2321,7 @@ class TestInferenceQueueTimeout:
 
         fresh_lock = asyncio.Lock()
         _inf_mod._queue_depth = 0
-        _inf_mod._deferred_cleanup_task = None
+        _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
         with (
             patch("olmlx.engine.inference.mx"),
             patch("olmlx.engine.inference._inference_lock", fresh_lock),
@@ -2340,7 +2344,7 @@ class TestStreamCompletionQueueTimeout:
 
         fresh_lock = asyncio.Lock()
         _inf_mod._queue_depth = 0
-        _inf_mod._deferred_cleanup_task = None
+        _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
         with (
             patch("olmlx.engine.inference.mx"),
             patch("olmlx.engine.inference._inference_lock", fresh_lock),
@@ -2423,7 +2427,7 @@ class TestStreamCompletionFallbackJoinLogging:
             "deferring Metal sync" in record.message for record in caplog.records
         )
         # Wait for deferred cleanup task to complete and release the lock
-        await _inf_mod._deferred_cleanup_task
+        await _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
         assert not _inference_lock.locked(), (
             "_inference_lock must be released by deferred cleanup task"
         )
@@ -2445,7 +2449,7 @@ class TestDeferredInferenceCleanup:
 
         with patch("olmlx.engine.inference._safe_sync") as mock_safe_sync:
             await _schedule_deferred_inference_cleanup(mock_stream)
-            await _inf_mod._deferred_cleanup_task
+            await _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
 
         # _safe_sync should have been called (after thread exited)
         mock_safe_sync.assert_called_once()
@@ -2469,7 +2473,7 @@ class TestDeferredInferenceCleanup:
             # Task is running — lock should still be held initially
             assert _inference_lock.locked()
             # Wait for deferred task to complete
-            await _inf_mod._deferred_cleanup_task
+            await _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
 
         assert not _inference_lock.locked()
 
@@ -2480,7 +2484,7 @@ class TestAwaitDeferredCleanup:
         """Should return immediately when no deferred cleanup task exists."""
         from olmlx.engine.inference import _await_deferred_cleanup
 
-        _inf_mod._deferred_cleanup_task = None
+        _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
         await _await_deferred_cleanup()  # should not raise
 
     @pytest.mark.asyncio
@@ -2490,9 +2494,9 @@ class TestAwaitDeferredCleanup:
 
         done_task = asyncio.create_task(asyncio.sleep(0))
         await done_task  # let it finish
-        _inf_mod._deferred_cleanup_task = done_task
+        _inf_mod._deferred_cleanup_tasks[asyncio.get_running_loop()] = done_task
         await _await_deferred_cleanup()  # should not raise
-        _inf_mod._deferred_cleanup_task = None
+        _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
 
     @pytest.mark.asyncio
     async def test_waits_for_running_task(self):
@@ -2506,10 +2510,12 @@ class TestAwaitDeferredCleanup:
             await asyncio.sleep(0.05)
             completed = True
 
-        _inf_mod._deferred_cleanup_task = asyncio.create_task(slow_cleanup())
+        _inf_mod._deferred_cleanup_tasks[asyncio.get_running_loop()] = (
+            asyncio.create_task(slow_cleanup())
+        )
         await _await_deferred_cleanup()
         assert completed
-        _inf_mod._deferred_cleanup_task = None
+        _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
 
     @pytest.mark.asyncio
     async def test_raises_on_timeout(self):
@@ -2524,16 +2530,18 @@ class TestAwaitDeferredCleanup:
         async def stuck_cleanup():
             await asyncio.sleep(999)
 
-        _inf_mod._deferred_cleanup_task = asyncio.create_task(stuck_cleanup())
+        _inf_mod._deferred_cleanup_tasks[asyncio.get_running_loop()] = (
+            asyncio.create_task(stuck_cleanup())
+        )
         try:
             with patch("olmlx.engine.inference._DEFERRED_WAIT_TIMEOUT", 0.05):
                 with pytest.raises(ServerBusyError, match="did not complete"):
                     await _await_deferred_cleanup()
         finally:
-            _inf_mod._deferred_cleanup_task.cancel()
+            _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop()).cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await _inf_mod._deferred_cleanup_task
-            _inf_mod._deferred_cleanup_task = None
+                await _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
+            _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
 
     @pytest.mark.asyncio
     async def test_does_not_cancel_cleanup_task(self):
@@ -2552,7 +2560,9 @@ class TestAwaitDeferredCleanup:
                 task_was_cancelled = True
                 raise
 
-        _inf_mod._deferred_cleanup_task = asyncio.create_task(slow_cleanup())
+        _inf_mod._deferred_cleanup_tasks[asyncio.get_running_loop()] = (
+            asyncio.create_task(slow_cleanup())
+        )
         try:
             with patch("olmlx.engine.inference._DEFERRED_WAIT_TIMEOUT", 0.05):
                 with pytest.raises(Exception):
@@ -2560,10 +2570,10 @@ class TestAwaitDeferredCleanup:
             # The task should NOT have been cancelled by shield
             assert not task_was_cancelled
         finally:
-            _inf_mod._deferred_cleanup_task.cancel()
+            _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop()).cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await _inf_mod._deferred_cleanup_task
-            _inf_mod._deferred_cleanup_task = None
+                await _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
+            _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
 
 
 class TestEstimateKvCacheBytes:
