@@ -124,8 +124,11 @@ def turboquant_quantize(
 
     # Compute norms in float32 to avoid overflow (float16 max ~65504)
     norms = mx.sqrt(mx.sum(x.astype(mx.float32) ** 2, axis=-1, keepdims=True))
-    # Normalize to unit sphere (avoid division by zero)
-    x_norm = x / mx.maximum(norms.astype(x.dtype), mx.array(1e-8, dtype=x.dtype))
+    # Normalize in float32 — 1e-8 underflows to 0.0 in float16, so the
+    # clamp would vanish and zero-norm rows would produce NaN via 0/0.
+    x_norm = (
+        x.astype(mx.float32) / mx.maximum(norms, mx.array(1e-8, dtype=mx.float32))
+    ).astype(x.dtype)
 
     # Rotate: y = x_norm @ Πᵀ  (equivalent to Π @ x_norm per vector)
     y = x_norm @ rotation.matrix.T

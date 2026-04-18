@@ -219,6 +219,39 @@ class TestQuantizeDequantize:
 
         assert x_hat.shape == x.shape
 
+    def test_zero_norm_float16_quantizes_to_center(self):
+        """Zero-norm float16 input must quantize to center codebook indices.
+
+        Regression for #241. The normalization epsilon was expressed in the
+        input dtype: ``mx.array(1e-8, dtype=float16)`` underflows to 0, so
+        the clamp ``mx.maximum(norms, 0) = norms`` does nothing for zero-norm
+        rows. Division becomes 0/0 = NaN, and ``NaN < inf`` is False, so the
+        quantization loop's ``best_idx`` stays at its default 0 for every
+        coordinate instead of the centroid closest to 0.
+
+        Fix: do normalization in float32 where 1e-8 is representable.
+        """
+        from olmlx.engine.turboquant import (
+            TurboQuantRotation,
+            turboquant_quantize,
+            unpack_indices,
+        )
+
+        rot = TurboQuantRotation(head_dim=64, seed=0)
+        x = mx.zeros((1, 1, 1, 64), dtype=mx.float16)
+
+        # Gaussian codebooks are symmetric around 0 and sorted ascending, so
+        # zero input (after rotation → still zero) should quantize to the two
+        # centroids straddling 0: indices 7/8 for 4-bit, 1/2 for 2-bit.
+        for bits, center in [(4, {7, 8}), (2, {1, 2})]:
+            indices, _ = turboquant_quantize(x, rot, bits=bits)
+            unpacked = np.array(unpack_indices(indices, bits=bits, head_dim=64))
+            assert set(np.unique(unpacked).tolist()) <= center, (
+                f"{bits}-bit: expected center indices {center}, "
+                f"got unique={np.unique(unpacked)}. "
+                "All-zero indices indicate NaN propagation in normalization."
+            )
+
     def test_norm_preservation(self):
         """Dequantized vectors should approximately preserve input norms."""
         from olmlx.engine.turboquant import (
