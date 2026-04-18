@@ -2016,9 +2016,6 @@ async def _stream_completion(
                 lm, tokens, original_prompt, max_tokens, broadcast_kwargs
             )
 
-        if lm.is_speculative and images:
-            logger.debug("speculative decoding skipped: request includes images")
-
         if lm.is_speculative and not images:
             from olmlx.engine.speculative_stream import async_speculative_stream
 
@@ -2051,6 +2048,8 @@ async def _stream_completion(
                 max_tokens=max_tokens,
             )
         else:
+            if lm.is_speculative:
+                logger.debug("speculative decoding skipped: request includes images")
             stream = async_mlx_stream(
                 lm.model,
                 lm.tokenizer,
