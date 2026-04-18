@@ -75,17 +75,17 @@ class TestPackUnpack:
 
     @pytest.mark.parametrize("bits", [1, 2, 4, 8])
     @pytest.mark.parametrize("dim", [8, 15, 16, 31, 32, 127, 128])
-    def test_roundtrip(self, bits, dim):
+    @pytest.mark.parametrize("dtype", [np.uint8, np.int32])
+    def test_roundtrip(self, bits, dim, dtype):
         """unpack(pack(x)) should reproduce x for any dim — including
         odd/non-multiple-of-factor tail sizes that SpectralQuant produces
-        when d_eff lands on an odd number."""
+        when d_eff lands on an odd number. Also covers int32 input since
+        spectral_quantize feeds `mx.argmin` output (int32) into pack_indices."""
         from olmlx.engine.spectralquant import pack_indices, unpack_indices
 
         max_val = (1 << bits) - 1
         rng = np.random.RandomState(bits * 100 + dim)
-        indices = mx.array(
-            rng.randint(0, max_val + 1, size=(2, 3, dim)).astype(np.uint8)
-        )
+        indices = mx.array(rng.randint(0, max_val + 1, size=(2, 3, dim)).astype(dtype))
         packed = pack_indices(indices, bits)
         restored = unpack_indices(packed, bits, dim)
         assert restored.shape == indices.shape

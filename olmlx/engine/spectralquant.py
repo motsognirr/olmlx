@@ -44,7 +44,7 @@ def pack_indices(indices: mx.array, bits: int) -> mx.array:
     pad = (-dim) % factor
     if pad:
         indices = mx.concatenate(
-            [indices, mx.zeros(indices.shape[:-1] + (pad,), dtype=mx.uint8)],
+            [indices, mx.zeros(indices.shape[:-1] + (pad,), dtype=indices.dtype)],
             axis=-1,
         )
     return _tq_pack(indices, bits)
