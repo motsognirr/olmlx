@@ -1107,7 +1107,7 @@ def cmd_bench_leaderboard(args):
     )
 
     bench_dir = Path(args.bench_dir) if args.bench_dir else DEFAULT_BENCH_DIR
-    entries = build_leaderboard(bench_dir, latest_per_model=not args.all_runs)
+    entries = build_leaderboard(bench_dir, best_per_model=not args.all_runs)
     if not entries:
         print("No bench runs with valid measurements found.")
         return

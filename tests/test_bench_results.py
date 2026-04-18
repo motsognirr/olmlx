@@ -330,8 +330,9 @@ def _save_fake_run(
 
 
 class TestBuildLeaderboard:
-    def test_latest_per_model_ranks_by_best_tps(self, tmp_path):
-        # model-a older run (slow), newer run (fast) — newer should win and rank first
+    def test_best_per_model_ranks_by_best_tps(self, tmp_path):
+        # model-a older run (slow), newer run (fast) — the fastest per-model
+        # run should win and rank first.
         _save_fake_run(
             tmp_path,
             model="model-a",
@@ -359,6 +360,27 @@ class TestBuildLeaderboard:
         assert entries[0].timestamp == "20260102T000000Z"
         assert entries[1].best_tps == 50.0
 
+    def test_best_per_model_prefers_peak_over_recent_regression(self, tmp_path):
+        # Older run is fast; newer run is a regression. Default leaderboard
+        # semantics rank by peak best_tps, so the older (faster) run must win.
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260101T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(80.0)])],
+        )
+        _save_fake_run(
+            tmp_path,
+            model="model-a",
+            timestamp="20260102T000000Z",
+            scenarios=[_scenario("baseline", [_prompt(30.0)])],
+        )
+
+        entries = build_leaderboard(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].best_tps == pytest.approx(80.0, rel=1e-6)
+        assert entries[0].timestamp == "20260101T000000Z"
+
     def test_all_runs_keeps_history(self, tmp_path):
         _save_fake_run(
             tmp_path,
@@ -379,7 +401,7 @@ class TestBuildLeaderboard:
             scenarios=[_scenario("baseline", [_prompt(50.0)])],
         )
 
-        entries = build_leaderboard(tmp_path, latest_per_model=False)
+        entries = build_leaderboard(tmp_path, best_per_model=False)
         assert len(entries) == 3
         assert [e.best_tps for e in entries] == [80.0, 50.0, 20.0]
 
@@ -543,38 +565,39 @@ class TestBuildLeaderboard:
         assert hash(a) == hash(b)
 
     def test_tiebreaker_handles_double_digit_collision_counter(self, tmp_path):
-        # 11 runs share one timestamp; save_run writes them to ...Z, ...Z-1,
-        # ..., ...Z-10. The last (counter=10) must win — naive string order
-        # would rank it below ...Z-9.
+        # 11 runs share one timestamp and identical best_tps; save_run writes
+        # them to ...Z, ...Z-1, ..., ...Z-10. With best_tps tied, the
+        # collision counter must decide — the last (counter=10) must win,
+        # which naive string order would rank below ...Z-9.
         for i in range(11):
             run = RunResult(
                 model="model-a",
                 timestamp="20260101T000000Z",
                 git_sha=f"rev{i:02d}",
-                scenarios=[_scenario("baseline", [_prompt(10.0 + i)])],
+                scenarios=[_scenario("baseline", [_prompt(50.0)])],
             )
             save_run(run, tmp_path)
 
         entries = build_leaderboard(tmp_path)
         assert len(entries) == 1
         assert entries[0].git_sha == "rev10"
-        assert entries[0].best_tps == pytest.approx(20.0, rel=1e-6)
+        assert entries[0].best_tps == pytest.approx(50.0, rel=1e-6)
 
     def test_same_timestamp_tiebreaker_is_deterministic(self, tmp_path):
-        # save_run appends a -N suffix to the directory on sub-second collisions
-        # but leaves the timestamp field untouched. The later (higher-suffix)
-        # directory should win deterministically.
+        # save_run appends a -N suffix on sub-second collisions. When best_tps
+        # and timestamp both tie, the higher-suffix directory must win so the
+        # picked entry is deterministic regardless of iterdir() ordering.
         run_early = RunResult(
             model="model-a",
             timestamp="20260101T000000Z",
             git_sha="early",
-            scenarios=[_scenario("baseline", [_prompt(30.0)])],
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
         )
         run_late = RunResult(
             model="model-a",
             timestamp="20260101T000000Z",
             git_sha="late",
-            scenarios=[_scenario("baseline", [_prompt(90.0)])],
+            scenarios=[_scenario("baseline", [_prompt(50.0)])],
         )
         save_run(run_early, tmp_path)
         save_run(run_late, tmp_path)
@@ -582,7 +605,6 @@ class TestBuildLeaderboard:
         entries = build_leaderboard(tmp_path)
         assert len(entries) == 1
         assert entries[0].git_sha == "late"
-        assert entries[0].best_tps == pytest.approx(90.0, rel=1e-6)
 
 
 class TestFormatLeaderboard:
@@ -689,6 +711,27 @@ class TestFormatLeaderboard:
         ]
         out = format_leaderboard(entries)
         assert "—" not in out
+
+    def test_large_fails_total_does_not_break_alignment(self):
+        from pathlib import Path
+
+        from olmlx.bench.results import LeaderboardEntry
+
+        entries = [
+            LeaderboardEntry(
+                model="model-a",
+                best_tps=10.0,
+                best_scenario="baseline",
+                timestamp="20260101T000000Z",
+                git_sha="abc1234",
+                failed_scenarios=999_999,
+                total_scenarios=9_999_999,
+                run_dir=Path("/tmp/x"),
+            ),
+        ]
+        out = format_leaderboard(entries)
+        lines = out.split("\n")
+        assert len(lines[0]) == len(lines[1]) == len(lines[2])
 
     def test_full_length_git_sha_does_not_break_alignment(self):
         from pathlib import Path

@@ -317,9 +317,14 @@ def _scenario_avg_tps(scenario: ScenarioResult) -> float:
 def build_leaderboard(
     bench_dir: Path = DEFAULT_BENCH_DIR,
     *,
-    latest_per_model: bool = True,
+    best_per_model: bool = True,
 ) -> list[LeaderboardEntry]:
     """Aggregate saved runs into ranked leaderboard entries.
+
+    With best_per_model=True (the default), only the highest-scoring run per
+    model is kept — a leaderboard shows peaks, so a later regression does
+    not displace an earlier faster run. Pass best_per_model=False to keep
+    every run (e.g. for a full history view).
 
     Skipped scenarios are excluded from both failure and total counts. Runs
     where every non-skipped scenario has zero valid prompts are dropped
@@ -376,21 +381,22 @@ def build_leaderboard(
             )
         )
 
-    if latest_per_model:
+    if best_per_model:
         by_model: dict[str, LeaderboardEntry] = {}
         for e in entries:
             existing = by_model.get(e.model)
-            # Break timestamp ties on the numeric collision counter in the
-            # directory name so -10 sorts after -9 (plain string order would
-            # put -10 before -2).
-            if (
-                existing is None
-                or e.timestamp > existing.timestamp
-                or (
-                    e.timestamp == existing.timestamp
-                    and _run_dir_sort_key(e.run_dir.name)
-                    > _run_dir_sort_key(existing.run_dir.name)
-                )
+            # Prefer higher best_tps. On exact ties, pick the more recent
+            # run, breaking final ties on the numeric collision counter so
+            # -10 sorts after -9 (plain string order would put -10 before
+            # -2). This guarantees a deterministic winner.
+            if existing is None or (
+                e.best_tps,
+                e.timestamp,
+                _run_dir_sort_key(e.run_dir.name),
+            ) > (
+                existing.best_tps,
+                existing.timestamp,
+                _run_dir_sort_key(existing.run_dir.name),
             ):
                 by_model[e.model] = e
         entries = list(by_model.values())
@@ -412,10 +418,17 @@ def format_leaderboard(
     rows = entries if limit is None else entries[:limit]
     model_w = max(45, max((len(e.model) for e in rows), default=45))
     scenario_w = max(14, max((len(e.best_scenario) for e in rows), default=14))
+    fails_w = max(
+        11,
+        max(
+            (len(f"{e.failed_scenarios}/{e.total_scenarios}") for e in rows),
+            default=11,
+        ),
+    )
     header = (
         f"{'#':>3} {'Model':<{model_w}} {'Best tok/s':>10} "
         f"{'Scenario':<{scenario_w}} {'Timestamp':<18} {'Git':<10} "
-        f"{'Fails/Total':>11}"
+        f"{'Fails/Total':>{fails_w}}"
     )
     lines = [header, "-" * len(header)]
     for i, e in enumerate(rows, 1):
@@ -423,6 +436,6 @@ def format_leaderboard(
             f"{i:>3} {e.model:<{model_w}} {e.best_tps:>10.1f} "
             f"{e.best_scenario:<{scenario_w}} {e.timestamp:<18} "
             f"{(e.git_sha[:10] if e.git_sha else '-' * 7):<10} "
-            f"{f'{e.failed_scenarios}/{e.total_scenarios}':>11}"
+            f"{f'{e.failed_scenarios}/{e.total_scenarios}':>{fails_w}}"
         )
     return "\n".join(lines)
