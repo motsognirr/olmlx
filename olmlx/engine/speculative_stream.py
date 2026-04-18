@@ -104,7 +104,6 @@ def speculative_stream_generate(
 
     while gen_count < max_tokens:
         if cancel_event.is_set():
-            _log_stats()
             break
 
         accepted, _ = decoder.step()

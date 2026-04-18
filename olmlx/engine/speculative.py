@@ -166,10 +166,12 @@ class SpeculativeDecoder:
         self._target_cache = make_prompt_cache(self._target)
         self._draft_cache = make_prompt_cache(self._draft)
 
-        # Some VLM language models (e.g. mlx-vlm Qwen3_5) cache position_ids
-        # and rope_deltas as attributes across calls.  Left over from a prior
-        # request they produce broadcast mismatches when a new prompt has a
-        # different length.  Reset them at the start of each prefill.
+        # Observed on mlx-vlm 0.4.4 with Qwen3_5: the language model caches
+        # `_position_ids` and `_rope_deltas` on the module instance across
+        # calls.  Left over from a prior request they produce broadcast
+        # mismatches when a new prompt has a different length.  Reset them
+        # at the start of each prefill.  If a future VLM caches analogous
+        # state under a different attribute name, add it here.
         for attr in ("_position_ids", "_rope_deltas"):
             if hasattr(self._target, attr):
                 setattr(self._target, attr, None)
