@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BENCH_DIR = Path.home() / ".olmlx" / "bench" / "runs"
 
@@ -361,7 +364,8 @@ def build_leaderboard(
             TypeError,
             ValueError,
             AttributeError,
-        ):
+        ) as exc:
+            logger.debug("Skipping %s: %r", run_dir, exc, exc_info=True)
             continue
 
         best_tps = 0.0
@@ -415,10 +419,11 @@ def build_leaderboard(
                 by_model[e.model] = e
         entries = list(by_model.values())
 
-    # Neutral tiebreakers: model name (asc) then directory name (asc).
-    # Avoids ranking equal-tps runs by timestamp, which would conflate
-    # "more recent" with "better".
-    entries.sort(key=lambda e: (e.model, e.run_dir.name))
+    # Neutral tiebreakers: model name (asc) then numeric-aware directory
+    # sort. Avoids ranking equal-tps runs by timestamp (which would
+    # conflate "more recent" with "better") and avoids plain lexicographic
+    # dir comparison (which would sort "-10" before "-2").
+    entries.sort(key=lambda e: (e.model, _run_dir_sort_key(e.run_dir.name)))
     entries.sort(key=lambda e: e.best_tps, reverse=True)
     return entries
 
