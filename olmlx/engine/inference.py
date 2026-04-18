@@ -244,7 +244,7 @@ _deferred_cleanup_locks: weakref.WeakKeyDictionary[
 # awaited from loop B (RuntimeError on Python 3.10+).  Keeping this per-loop
 # keeps the reset path consistent with the lock scoping.
 _deferred_cleanup_tasks: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, asyncio.Task
+    asyncio.AbstractEventLoop, asyncio.Task[None]
 ] = weakref.WeakKeyDictionary()
 # Tracks requests waiting for _inference_lock (not the _await_deferred_cleanup wait).
 _queue_depth = 0
@@ -274,6 +274,10 @@ async def _reset_inference_state() -> None:
             await task
         except (asyncio.CancelledError, asyncio.InvalidStateError):
             pass
+    # Also cleans up any lock entry ``_cleanup``'s finally block may have
+    # created: the ``task.done()`` path above skips ``await task``, but the
+    # task may already have run ``_get_deferred_cleanup_lock()`` and left
+    # a fresh entry in ``_deferred_cleanup_locks``.
     _deferred_cleanup_locks.pop(loop, None)
     _queue_depth = 0
     if _inference_lock.locked():
@@ -485,13 +489,13 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                 lock.release()
                 logger.info("Deferred inference cleanup: lock released")
                 async with _get_deferred_cleanup_lock():
-                    _deferred_cleanup_tasks.pop(loop, None)
+                    # Use the task's own running loop rather than closing over
+                    # ``loop`` from the outer scope — ``_cleanup`` runs as a
+                    # task on the same loop it was created on, so these are
+                    # always equal, but using ``get_running_loop`` keeps
+                    # ``_cleanup`` self-contained.
+                    _deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
 
-        # ``_cleanup`` closes over ``loop``; ``create_task`` binds the task to
-        # the loop it's created on, so ``asyncio.get_running_loop()`` inside
-        # ``_cleanup`` (via ``_get_deferred_cleanup_lock``) equals this ``loop``
-        # at execution time.  Hoisting ``_cleanup`` to module level would break
-        # that invariant.
         _deferred_cleanup_tasks[loop] = asyncio.create_task(_cleanup())
 
 

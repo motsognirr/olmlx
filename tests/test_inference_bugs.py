@@ -218,6 +218,44 @@ class TestDeferredCleanupLockPerLoop:
             "Repeated calls on the same loop must return the same lock"
         )
 
+    def test_separate_tasks_for_separate_loops(self):
+        """A task registered on loop A must be invisible to loop B.
+
+        ``_await_deferred_cleanup`` only observes the calling loop's task.
+        If ``_deferred_cleanup_tasks`` were a single global like pre-fix,
+        loop B would try to ``asyncio.wait`` on loop A's foreign task and
+        raise ``RuntimeError: Task is attached to a different loop``.
+        """
+        import asyncio
+
+        async def register_task_and_abandon():
+            async def never():
+                await asyncio.sleep(999)
+
+            _inf_mod._deferred_cleanup_tasks[asyncio.get_running_loop()] = (
+                asyncio.create_task(never())
+            )
+
+        loop_a = asyncio.new_event_loop()
+        try:
+            loop_a.run_until_complete(register_task_and_abandon())
+        finally:
+            loop_a.close()
+
+        async def await_cleanup_on_fresh_loop():
+            # Loop B has no task registered.  _await_deferred_cleanup must
+            # return immediately (task for this loop is None) rather than
+            # touching loop A's orphaned task.
+            await _inf_mod._await_deferred_cleanup()
+
+        loop_b = asyncio.new_event_loop()
+        try:
+            loop_b.run_until_complete(
+                asyncio.wait_for(await_cleanup_on_fresh_loop(), timeout=0.5)
+            )
+        finally:
+            loop_b.close()
+
     def test_stale_locked_lock_not_inherited(self):
         """A lock acquired on a closed loop must not block a fresh loop.
 
