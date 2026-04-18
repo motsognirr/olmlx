@@ -288,7 +288,7 @@ async def _reset_inference_state() -> None:
                     exc,
                     exc_info=exc,
                 )
-        except (asyncio.InvalidStateError, asyncio.CancelledError):
+        except asyncio.InvalidStateError:
             pass
     # Also cleans up any lock entry ``_cleanup``'s finally block may have
     # created.  Both branches above can leave one behind:
@@ -484,10 +484,11 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
     # finally re-acquires the same lock to pop its dict entry; this works
     # today because tasks don't preempt — the outer ``async with`` exits and
     # releases the lock before ``_cleanup`` is first scheduled.  Any ``await``
-    # (even an innocent log call that happens to yield) inserted between
-    # ``create_task`` and the end of the ``async with`` would let the event
-    # loop schedule ``_cleanup`` into a deadlock on the same lock.  Adding
-    # new code here?  Put it *before* the ``async with`` or *after* its exit.
+    # inserted between ``create_task`` and the end of the ``async with``
+    # would let the event loop schedule ``_cleanup`` into a deadlock on the
+    # same lock.  Adding new code here?  Put it *before* the ``async with``
+    # or *after* its exit.  (Synchronous calls like ``logger.debug`` are
+    # fine — only ``await`` hands control back to the event loop.)
     async with _get_deferred_cleanup_lock():
         existing = _deferred_cleanup_tasks.get(loop)
         if existing is not None and not existing.done():
@@ -510,7 +511,7 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                         exc,
                         exc_info=exc,
                     )
-            except (asyncio.InvalidStateError, asyncio.CancelledError):
+            except asyncio.InvalidStateError:
                 pass
 
         async def _cleanup():
