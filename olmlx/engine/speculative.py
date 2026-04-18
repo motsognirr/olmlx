@@ -24,7 +24,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def _logits(out):
+def _logits(out: mx.array | object) -> mx.array:
     # mlx-vlm's language_model returns LanguageModelOutput(logits=...);
     # mlx-lm models return a raw mx.array.
     return getattr(out, "logits", out)
@@ -346,6 +346,10 @@ class SpeculativeDecoder:
 
         draft_ids = mx.array([draft_tokens])
         combined = mx.concatenate([prompt, draft_ids], axis=1)
+        # See prefill() for why this reset is needed (mlx-vlm 0.4.4 VLMs).
+        for attr in ("_position_ids", "_rope_deltas"):
+            if hasattr(self._target, attr):
+                setattr(self._target, attr, None)
         target_out = _logits(self._target(combined))
         mx.eval(target_out)
 
