@@ -3,7 +3,6 @@
 Improves on TurboQuant by using eigenvector rotations (from calibration)
 instead of random rotations, enabling non-uniform bit allocation across
 semantic (high-variance) and tail (low-variance) coordinate regimes.
-Includes selective QJL (Johnson-Lindenstrauss) for attention score correction.
 """
 
 import mlx.core as mx
@@ -18,13 +17,14 @@ from olmlx.engine.turboquant import (
 def pack_indices(indices: mx.array, bits: int) -> mx.array:
     """Pack quantized indices into bytes, supporting 1-8 bit widths.
 
-    Extends turboquant's pack_indices with 1-bit and 8-bit support.
+    Extends turboquant's pack_indices with 1-bit and 8-bit support, and
+    pads odd tail dimensions (which arise when SpectralQuant allocates an
+    odd ``head_dim - d_eff``) so 4-bit and 2-bit packing don't trip over
+    the even/multiple-of-4 assumption baked into turboquant's packer.
     """
     if bits == 8:
         return indices.astype(mx.uint8)
     if bits == 1:
-        # Pack 8 indices per byte — pad to next multiple of 8 first so
-        # indices[..., i::8] always has shape (..., n_bytes) for every i.
         dim = indices.shape[-1]
         n_bytes = (dim + 7) // 8
         pad = n_bytes * 8 - dim
@@ -37,6 +37,16 @@ def pack_indices(indices: mx.array, bits: int) -> mx.array:
         for i in range(8):
             result = result | ((indices[..., i::8] & 0x1) << i).astype(mx.uint8)
         return result
+    # 2- and 4-bit delegate to turboquant's packer, but pad to the factor
+    # (4 for 2-bit, 2 for 4-bit) so odd tail dimensions work.
+    factor = 8 // bits
+    dim = indices.shape[-1]
+    pad = (-dim) % factor
+    if pad:
+        indices = mx.concatenate(
+            [indices, mx.zeros(indices.shape[:-1] + (pad,), dtype=mx.uint8)],
+            axis=-1,
+        )
     return _tq_pack(indices, bits)
 
 
@@ -48,12 +58,18 @@ def unpack_indices(packed: mx.array, bits: int, dim: int) -> mx.array:
         parts = []
         for i in range(8):
             parts.append((packed >> i) & 0x1)
-        # Stack gives (packed_dim, 8), flatten to (packed_dim * 8), truncate to dim
         interleaved = mx.stack(parts, axis=-1)
         flat_dim = packed.shape[-1] * 8
         flat = interleaved.reshape(packed.shape[:-1] + (flat_dim,))
         return flat[..., :dim].astype(mx.uint8)
-    return _tq_unpack(packed, bits, dim)
+    # Match the padding applied in pack_indices — unpack the padded dim then
+    # slice off the trailing padding so callers see the original dim.
+    factor = 8 // bits
+    padded_dim = ((dim + factor - 1) // factor) * factor
+    unpadded = _tq_unpack(packed, bits, padded_dim)
+    if padded_dim != dim:
+        unpadded = unpadded[..., :dim]
+    return unpadded
 
 
 class SpectralRotation:
@@ -248,82 +264,3 @@ def spectral_dequantize(
     # Rescale by original norms
     result = x_hat * norms.astype(x_hat.dtype)
     return result.astype(dtype) if dtype is not None else result
-
-
-# TODO: Wire QJLSketcher into SpectralQuantKVCache for attention score
-# correction.  Currently unused — scores are computed on raw dequantized keys.
-
-
-class QJLSketcher:
-    """Selective Johnson-Lindenstrauss sketcher for attention score correction.
-
-    Maintains a random sign matrix S for projecting semantic-regime residuals.
-    Used to improve attention score accuracy for compressed keys.
-    """
-
-    def __init__(self, d_eff: int, n_projections: int, seed: int):
-        """Initialize with random sign matrix.
-
-        Args:
-            d_eff: Effective dimensionality (semantic regime size).
-            n_projections: Number of random projections.
-            seed: Random seed for reproducibility.
-        """
-        self.d_eff = d_eff
-        self.n_projections = n_projections
-        rng = np.random.RandomState(seed)
-        # Rademacher ±1 random matrix
-        signs = rng.choice([-1.0, 1.0], size=(n_projections, d_eff)).astype(np.float32)
-        self.S: mx.array = mx.array(signs)
-
-    def compute_signs(self, residual: mx.array) -> mx.array:
-        """Compute packed sign bits from semantic residuals.
-
-        Args:
-            residual: (..., d_eff) semantic-regime residuals.
-
-        Returns:
-            Packed uint8 signs of shape (..., ceil(n_projections/8)).
-        """
-        # Project: (..., d_eff) @ (d_eff, n_proj) → (..., n_proj)
-        projected = residual @ self.S.T
-        # Convert to binary: positive → 1, negative/zero → 0
-        bits = (projected > 0).astype(mx.uint8)
-
-        # Pack 8 bits per byte
-        n_bytes = (self.n_projections + 7) // 8
-        batch_shape = bits.shape[:-1]
-        packed = mx.zeros(batch_shape + (n_bytes,), dtype=mx.uint8)
-        for i in range(self.n_projections):
-            byte_idx = i // 8
-            bit_idx = i % 8
-            packed = packed.at[..., byte_idx].add(bits[..., i] << bit_idx)
-        return packed
-
-    def correct_scores(self, q_semantic: mx.array, packed_signs: mx.array) -> mx.array:
-        """Compute attention score correction from QJL signs.
-
-        Args:
-            q_semantic: (..., n_queries, d_eff) query semantic coordinates.
-            packed_signs: (..., seq_len, ceil(n_proj/8)) packed key signs.
-
-        Returns:
-            Correction of shape (..., n_queries, seq_len).
-        """
-        # Unpack signs to ±1 floats
-        sign_parts = []
-        for i in range(self.n_projections):
-            byte_idx = i // 8
-            bit_idx = i % 8
-            bit_val = (packed_signs[..., byte_idx] >> bit_idx) & 1
-            sign_parts.append(bit_val.astype(mx.float32) * 2.0 - 1.0)
-        # (..., seq_len, n_projections)
-        signs_float = mx.stack(sign_parts, axis=-1)
-
-        # Sketch queries: (..., n_queries, d_eff) @ (d_eff, n_proj)
-        q_sketch = q_semantic @ self.S.T  # (..., n_queries, n_proj)
-
-        # Score correction: (..., n_queries, n_proj) @ (..., n_proj, seq_len)
-        scale = float(self.d_eff) / float(self.n_projections)
-        correction = scale * (q_sketch @ mx.swapaxes(signs_float, -2, -1))
-        return correction

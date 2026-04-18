@@ -28,6 +28,17 @@ def _requires_flash(model_path: Path) -> str | None:
     return None
 
 
+def _requires_spectral(model_path: Path) -> str | None:
+    """Skip if model has no spectral calibration."""
+    spectral_dir = model_path / "spectral"
+    if (
+        not spectral_dir.exists()
+        or not (spectral_dir / "spectral_config.json").exists()
+    ):
+        return f"No spectral calibration found at {spectral_dir}"
+    return None
+
+
 def _requires_moe(model_path: Path) -> str | None:
     """Skip if model is not a MoE architecture."""
     config_path = model_path / "config.json"
@@ -128,6 +139,18 @@ SCENARIOS: list[Scenario] = [
         name="turboquant-2",
         description="TurboQuant 2-bit KV cache quantization",
         env_overrides={"OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "turboquant:2"},
+    ),
+    Scenario(
+        name="spectral-4",
+        description="SpectralQuant 4-bit KV cache quantization",
+        env_overrides={"OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "spectral:4"},
+        should_skip=_requires_spectral,
+    ),
+    Scenario(
+        name="spectral-2",
+        description="SpectralQuant 2-bit KV cache quantization",
+        env_overrides={"OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "spectral:2"},
+        should_skip=_requires_spectral,
     ),
     Scenario(
         name="cache+tq4",
