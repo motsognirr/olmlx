@@ -20,7 +20,9 @@ from olmlx.bench.results import (
     PromptResult,
     RunResult,
     ScenarioResult,
+    build_leaderboard,
     create_run_result,
+    format_leaderboard,
     save_run,
 )
 from olmlx.bench.scenarios import Scenario, get_scenarios
@@ -125,8 +127,6 @@ def run_bench(
     print(f"\nResults saved to {run_dir}", file=sys.stderr)
 
     try:
-        from olmlx.bench.results import build_leaderboard, format_leaderboard
-
         entries = build_leaderboard(bench_dir)
         if entries:
             print("\nLeaderboard (top 5):", file=sys.stderr)

@@ -429,6 +429,8 @@ def format_leaderboard(
     stay aligned even for long HF repo paths or scenario names.
     """
     rows = entries if limit is None else entries[:limit]
+    if not rows:
+        return ""
     model_w = max(45, max((len(e.model) for e in rows), default=45))
     scenario_w = max(14, max((len(e.best_scenario) for e in rows), default=14))
     empty_w = max(
