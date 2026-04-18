@@ -40,7 +40,8 @@ def _config_namespace(cfg_holder: Any) -> Any:
     # Return the `.args` or `.config` object carrying architecture fields.
     # Precondition: caller has verified via `_resolve_config_holder` that one
     # of these exists, so no validation is needed here.
-    return getattr(cfg_holder, "args", None) or getattr(cfg_holder, "config", None)
+    args = getattr(cfg_holder, "args", None)
+    return args if args is not None else getattr(cfg_holder, "config", None)
 
 
 def _is_attention_cache_state(state: Any, expected_head_dim: int) -> bool:
@@ -57,9 +58,7 @@ def _is_attention_cache_state(state: Any, expected_head_dim: int) -> bool:
     keys = state[0]
     if not (hasattr(keys, "ndim") and keys.ndim == 4):
         return False
-    shape = getattr(keys, "shape", None)
-    if shape is None or len(shape) != 4:
-        return False
+    shape = keys.shape
     return shape[2] >= 2 and shape[3] == expected_head_dim
 
 
