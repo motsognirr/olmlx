@@ -113,6 +113,9 @@ class SpeculativeDecoder:
 
     def _update_acceptance_rate(self, num_accepted: int) -> int:
         """Update the rolling acceptance rate via EMA and return accepted-draft count."""
+        assert num_accepted >= 1, (
+            "_update_acceptance_rate: _verify() must return at least 1 token"
+        )
         num_accepted_draft = min(num_accepted - 1, self._lambda)
         acceptance = num_accepted_draft / max(self._lambda, 1)
         self._alpha = self._alpha_ema * self._alpha + (1 - self._alpha_ema) * acceptance
