@@ -443,14 +443,10 @@ def format_leaderboard(
     if not rows:
         return ""
     rank_w = max(3, len(str(len(rows))))
-    model_w = max(45, max((len(e.model) for e in rows), default=45))
-    scenario_w = max(14, max((len(e.best_scenario) for e in rows), default=14))
+    model_w = max(45, max(len(e.model) for e in rows))
+    scenario_w = max(14, max(len(e.best_scenario) for e in rows))
     empty_w = max(
-        11,
-        max(
-            (len(f"{e.empty_scenarios}/{e.total_scenarios}") for e in rows),
-            default=11,
-        ),
+        11, max(len(f"{e.empty_scenarios}/{e.total_scenarios}") for e in rows)
     )
     header = (
         f"{'#':>{rank_w}} {'Model':<{model_w}} {'Best tok/s':>10} "
