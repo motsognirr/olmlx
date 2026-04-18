@@ -110,13 +110,12 @@ class SpeculativeDecoder:
         self._stats_proposed: int = 0
         self._stats_accepted_draft: int = 0
 
-    def _update_acceptance_rate(self, num_accepted: int) -> None:
-        """Update the rolling acceptance rate via EMA."""
-        num_accepted_draft = (
-            min(num_accepted - 1, self._lambda) if num_accepted > 0 else 0
-        )
+    def _update_acceptance_rate(self, num_accepted: int) -> int:
+        """Update the rolling acceptance rate via EMA and return accepted-draft count."""
+        num_accepted_draft = min(num_accepted - 1, self._lambda)
         acceptance = num_accepted_draft / max(self._lambda, 1)
         self._alpha = self._alpha_ema * self._alpha + (1 - self._alpha_ema) * acceptance
+        return num_accepted_draft
 
     # ------------------------------------------------------------------
     # Cached API: prefill() + step()
@@ -144,7 +143,7 @@ class SpeculativeDecoder:
             "accepted_draft": accepted_draft,
             "acceptance_rate": acceptance_rate,
             "avg_accepted_per_step": avg_accepted_per_step,
-            "ema_alpha": self._alpha,
+            "ema_acceptance_rate": self._alpha,
             "lambda": self._lambda,
         }
 
@@ -174,8 +173,6 @@ class SpeculativeDecoder:
         for attr in ("_position_ids", "_rope_deltas"):
             if hasattr(self._target, attr):
                 setattr(self._target, attr, None)
-            if hasattr(self._draft, attr):
-                setattr(self._draft, attr, None)
 
         target_out = _logits(self._target(prompt, cache=self._target_cache))
         self._last_target_logit = target_out[0, -1, :]
@@ -249,13 +246,10 @@ class SpeculativeDecoder:
         mx.eval(self._last_target_logit)
         self._pending_token = int(mx.argmax(self._last_target_logit).item())
 
-        self._update_acceptance_rate(num_accepted)
+        num_accepted_draft = self._update_acceptance_rate(num_accepted)
 
         self._stats_steps += 1
         self._stats_proposed += self._lambda
-        num_accepted_draft = (
-            min(num_accepted - 1, self._lambda) if num_accepted > 0 else 0
-        )
         self._stats_accepted_draft += num_accepted_draft
 
         return accepted, self._lambda

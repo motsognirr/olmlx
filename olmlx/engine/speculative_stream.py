@@ -98,7 +98,7 @@ def speculative_stream_generate(
             s.get("accepted_draft", 0),
             s.get("acceptance_rate", 0.0),
             s.get("avg_accepted_per_step", 0.0),
-            s.get("ema_alpha", 0.0),
+            s.get("ema_acceptance_rate", 0.0),
             s.get("lambda", 0),
         )
 

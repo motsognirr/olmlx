@@ -1735,6 +1735,11 @@ class ModelManager:
                         "dflash is not supported on VLM targets; "
                         "disable OLMLX_EXPERIMENTAL_DFLASH for this model"
                     )
+                if model_exp.flash_speculative:
+                    raise ValueError(
+                        "flash_speculative is not supported on VLM targets; "
+                        "use speculative instead"
+                    )
                 if model_exp.speculative:
                     decoder = self._load_speculative_decoder(
                         model, hf_path, model_exp, is_vlm=True
