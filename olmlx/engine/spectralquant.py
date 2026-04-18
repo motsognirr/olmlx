@@ -25,6 +25,8 @@ def pack_indices(indices: mx.array, bits: int) -> mx.array:
     if bits == 8:
         return indices.astype(mx.uint8)
     if bits == 1:
+        # Pad to next multiple of 8 so every i::8 stride produces the
+        # same length; otherwise the bitwise accumulation broadcasts wrongly.
         dim = indices.shape[-1]
         n_bytes = (dim + 7) // 8
         pad = n_bytes * 8 - dim
