@@ -380,6 +380,48 @@ class TestSpectralQuantizeDequantize:
         )
         assert result.dtype == mx.float16
 
+    def test_roundtrip_d_eff_1_tail_127(self):
+        """Regression: Qwen3-4B layer 0 calibrates to d_eff=1, so tail_dim=127
+        (odd) and bits_low=2 — the exact path that broke before the odd-dim
+        packing fix."""
+        from olmlx.engine.spectralquant import (
+            SpectralRotation,
+            fit_codebook,
+            spectral_dequantize,
+            spectral_quantize,
+        )
+
+        head_dim = 128
+        d_eff = 1
+        bits_high = 4
+        bits_low = 2
+        rng = np.random.RandomState(0)
+        q, _ = np.linalg.qr(rng.randn(head_dim, head_dim).astype(np.float32))
+        rotation = SpectralRotation(mx.array(q))
+
+        x = mx.random.normal((200, head_dim))
+        norms = mx.linalg.norm(x, axis=-1, keepdims=True)
+        rotated = rotation.rotate(x / mx.maximum(norms, mx.array(1e-8)))
+        codebook_sem = fit_codebook(rotated[..., :d_eff].reshape(-1), bits=bits_high)
+        codebook_tail = fit_codebook(rotated[..., d_eff:].reshape(-1), bits=bits_low)
+
+        y = mx.random.normal((2, 3, 5, head_dim))
+        packed_sem, packed_tail, y_norms = spectral_quantize(
+            y, rotation, codebook_sem, codebook_tail, d_eff, bits_high, bits_low
+        )
+        reconstructed = spectral_dequantize(
+            packed_sem,
+            packed_tail,
+            y_norms,
+            rotation,
+            codebook_sem,
+            codebook_tail,
+            d_eff,
+            bits_high,
+            bits_low,
+        )
+        assert reconstructed.shape == y.shape
+
 
 # ---------------------------------------------------------------------------
 # Calibration tests
