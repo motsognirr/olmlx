@@ -79,9 +79,9 @@ class TestPackUnpack:
     def test_roundtrip(self, bits, dim, dtype):
         """unpack(pack(x)) should reproduce x for any dim — including
         odd/non-multiple-of-factor tail sizes that SpectralQuant produces
-        when d_eff lands on an odd number. Also covers non-uint8 input for
-        defensive coverage, since argmin returns int32 and callers could skip
-        the uint8 cast."""
+        when d_eff lands on an odd number. The int32 dtype is defensive
+        coverage: today's only caller (`_quantize_regime`) casts to uint8
+        before calling `pack_indices`, but this keeps the packer honest."""
         from olmlx.engine.spectralquant import pack_indices, unpack_indices
 
         max_val = (1 << bits) - 1

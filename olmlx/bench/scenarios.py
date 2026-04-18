@@ -34,6 +34,7 @@ def _requires_spectral(model_path: Path) -> str | None:
     if (
         not spectral_dir.exists()
         or not (spectral_dir / "spectral_config.json").exists()
+        or not (spectral_dir / "calibration.safetensors").exists()
     ):
         return f"No spectral calibration found at {spectral_dir}"
     return None
