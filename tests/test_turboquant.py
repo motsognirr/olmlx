@@ -240,17 +240,17 @@ class TestQuantizeDequantize:
         rot = TurboQuantRotation(head_dim=64, seed=0)
         x = mx.zeros((1, 1, 1, 64), dtype=mx.float16)
 
-        indices, _ = turboquant_quantize(x, rot, bits=4)
-        unpacked = np.array(unpack_indices(indices, bits=4, head_dim=64))
-
-        # 4-bit Gaussian codebook is symmetric around 0 and sorted ascending.
-        # Zero input (after rotation → still zero) should quantize to the two
-        # centroids straddling 0, i.e. indices 7 and 8.
-        assert np.all((unpacked == 7) | (unpacked == 8)), (
-            "Expected zero-norm float16 input to quantize to center "
-            f"indices 7/8, got unique={np.unique(unpacked)}. "
-            "All-zero indices indicate NaN propagation in normalization."
-        )
+        # Gaussian codebooks are symmetric around 0 and sorted ascending, so
+        # zero input (after rotation → still zero) should quantize to the two
+        # centroids straddling 0: indices 7/8 for 4-bit, 1/2 for 2-bit.
+        for bits, center in [(4, {7, 8}), (2, {1, 2})]:
+            indices, _ = turboquant_quantize(x, rot, bits=bits)
+            unpacked = np.array(unpack_indices(indices, bits=bits, head_dim=64))
+            assert set(np.unique(unpacked).tolist()) <= center, (
+                f"{bits}-bit: expected center indices {center}, "
+                f"got unique={np.unique(unpacked)}. "
+                "All-zero indices indicate NaN propagation in normalization."
+            )
 
     def test_norm_preservation(self):
         """Dequantized vectors should approximately preserve input norms."""
