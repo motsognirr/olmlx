@@ -757,6 +757,19 @@ class TestSpectralConfig:
         ssm_hid = mx.zeros((1, 32, 128, 128))
         assert _is_attention_cache_state([ssm_conv, ssm_hid]) is False
 
+    def test_is_attention_cache_state_mamba2_4d_rejected(self):
+        """Mamba2 recurrent state (B, n_heads, d_head, d_state) is 4D but has seq=d_head.
+
+        For Mamba2 hybrids the "seq" axis is actually d_head (small), so the
+        shape discriminant rejects the entry. We simulate a per-step state with
+        seq==1 to ensure the shape-based filter catches it.
+        """
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
+
+        mamba_state = mx.zeros((1, 8, 1, 128))  # per-step state, seq-like axis == 1
+        mamba_extra = mx.zeros((1, 8, 1, 128))
+        assert _is_attention_cache_state([mamba_state, mamba_extra]) is False
+
     def test_resolve_cache_owner_ignores_layers_without_make_cache(self):
         """Without make_cache on the top-level model, route to backbone regardless of .layers."""
         from unittest.mock import MagicMock

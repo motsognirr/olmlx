@@ -36,15 +36,22 @@ def _resolve_config_holder(inner: Any, model: Any) -> Any:
 
 def _is_attention_cache_state(state: Any) -> bool:
     # Hybrid models (e.g. Qwen3Next) mix attention caches with SSM caches.
-    # Only the attention layers hold 4D KV tensors we can calibrate on.
-    # Note: this is a shape-based heuristic keyed on state[0]. For Qwen3Next,
-    # SSM entries expose the 3D conv state at index 0, so they are correctly
-    # rejected; a future hybrid architecture whose non-attention cache puts a
-    # 4D tensor first would bypass this guard.
+    # Attention caches hold 4D (B, n_kv_heads, seq, head_dim) tensors.
+    # For Qwen3Next the SSM conv state is 3D at index 0 and rejected directly,
+    # but Mamba2-family hybrids (Falcon-H1, Zamba2) expose 4D recurrent states
+    # (B, n_heads, d_head, d_state) which would pass a pure ndim check. The
+    # secondary shape discriminant below rejects them: calibration always runs
+    # with batch size 1, and the real seq axis is > 1 after prefill, while
+    # Mamba2 per-step states have a short "seq" slot.
     if not state or len(state) < 2:
         return False
     keys = state[0]
-    return hasattr(keys, "ndim") and keys.ndim == 4
+    if not (hasattr(keys, "ndim") and keys.ndim == 4):
+        return False
+    shape = getattr(keys, "shape", None)
+    if shape is None or len(shape) != 4:
+        return False
+    return shape[0] == 1 and shape[2] > 1
 
 
 def _resolve_cache_owner(inner: Any, model: Any) -> Any:
@@ -314,7 +321,7 @@ def calibrate_model(
     layers = inner.layers
     num_layers = len(layers)
     cfg_holder = _resolve_config_holder(inner, model)
-    head_dim = _detect_head_dim(cfg_holder)
+    head_dim = _detect_head_dim(cfg_holder, layers_hint=inner)
 
     # Determine number of KV heads
     n_kv_heads = getattr(cfg_holder.args, "num_key_value_heads", None)

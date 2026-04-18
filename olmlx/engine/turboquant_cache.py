@@ -254,12 +254,16 @@ class TurboQuantKVCache(_BaseCache):
         return self._key_indices is None or self.offset == 0
 
 
-def _detect_head_dim(model: Any) -> int:
+def _detect_head_dim(model: Any, layers_hint: Any = None) -> int:
     """Detect head_dim from model args/config or K projection layer shape.
 
     Handles models where head_dim != hidden_size // num_attention_heads
     (e.g. Gemma 3, Phi-3/4).  Falls back to model.config when model.args
     is missing (e.g. mlx-vlm gemma4 LanguageModel).
+
+    `layers_hint`: optional object exposing `.layers` to use for the weight-shape
+    fallback when `model` itself is a wrapper whose first layer isn't an
+    attention layer (e.g. hybrid SSM+attention backbones).
     """
     # Prefer explicit head_dim from model args or config
     model_cfg = getattr(model, "args", None) or getattr(model, "config", None)
@@ -276,18 +280,24 @@ def _detect_head_dim(model: Any) -> int:
         if "head_dim" in text_config:
             return text_config["head_dim"]
 
-    # Derive from K projection weight shape: k_proj.weight is (n_kv_heads * head_dim, hidden_size)
-    try:
-        layer = model.layers[0]
-        k_proj = layer.self_attn.k_proj
-        weight = k_proj.weight
-        if isinstance(weight, mx.array):
-            kv_out_dim = weight.shape[0]
-            n_kv_heads = getattr(model_cfg, "num_key_value_heads", None)
-            if n_kv_heads:
-                return kv_out_dim // n_kv_heads
-    except (AttributeError, IndexError):
-        pass
+    # Derive from K projection weight shape: k_proj.weight is (n_kv_heads * head_dim, hidden_size).
+    # For hybrid backbones the first layer may be SSM; iterate to find an attention layer.
+    layer_sources = [s for s in (layers_hint, model) if s is not None]
+    for src in layer_sources:
+        src_layers = getattr(src, "layers", None)
+        if src_layers is None:
+            continue
+        try:
+            for layer in src_layers:
+                k_proj = getattr(getattr(layer, "self_attn", None), "k_proj", None)
+                weight = getattr(k_proj, "weight", None)
+                if isinstance(weight, mx.array):
+                    kv_out_dim = weight.shape[0]
+                    n_kv_heads = getattr(model_cfg, "num_key_value_heads", None)
+                    if n_kv_heads:
+                        return kv_out_dim // n_kv_heads
+        except (AttributeError, IndexError, TypeError):
+            continue
 
     # Derive from text_config hidden_size // num_attention_heads
     if isinstance(text_config, dict):
