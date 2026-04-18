@@ -684,6 +684,11 @@ class TestProtocolViolation:
                 "Already-ready worker socket leaked: coordinator did not close "
                 "it when a later worker failed Phase-2 handshake"
             )
+            # Also verify bad_sock (closed via pending[i:] cleanup path) sees EOF
+            bad_sock.settimeout(2.0)
+            assert bad_sock.recv(4) == b"", (
+                "Failing worker socket leaked: coordinator did not close it via pending[i:] cleanup"
+            )
             # And self._workers must be cleared so coordinator.close() is a no-op
             # on those sockets (which would have been a double-close otherwise).
             assert coordinator._workers == []
