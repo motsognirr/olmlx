@@ -8,6 +8,7 @@ import json
 import logging
 import threading
 import time
+import weakref
 from collections.abc import AsyncGenerator
 from typing import Any, Literal, overload
 
@@ -225,7 +226,10 @@ _generation_streams = _resolve_generation_streams()
 # we sacrifice parallelism for stability on Apple Silicon.
 _inference_lock = asyncio.Lock()
 _deferred_cleanup_task: asyncio.Task | None = None
-_deferred_cleanup_lock: asyncio.Lock | None = None
+# asyncio.Lock binds to the loop at creation time, so tests that create
+# fresh event loops (pytest-asyncio) need a separate lock per loop.
+# WeakKeyDictionary lets closed loops get garbage-collected without leaking.
+_deferred_cleanup_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
 # Tracks requests waiting for _inference_lock (not the _await_deferred_cleanup wait).
 _queue_depth = 0
 
@@ -243,7 +247,7 @@ async def _reset_inference_state() -> None:
     orphaned release calls after the task completes.
     Force-releases _inference_lock if held to prevent test deadlocks.
     """
-    global _deferred_cleanup_task, _deferred_cleanup_lock, _queue_depth
+    global _deferred_cleanup_task, _queue_depth
     if _deferred_cleanup_task is not None and not _deferred_cleanup_task.done():
         _deferred_cleanup_task.cancel()
         try:
@@ -251,7 +255,7 @@ async def _reset_inference_state() -> None:
         except (asyncio.CancelledError, asyncio.InvalidStateError):
             pass
     _deferred_cleanup_task = None
-    _deferred_cleanup_lock = None
+    _deferred_cleanup_locks.clear()
     _queue_depth = 0
     if _inference_lock.locked():
         _inference_lock.release()
@@ -267,19 +271,25 @@ def _get_inference_lock() -> asyncio.Lock:
 
 
 def _get_deferred_cleanup_lock() -> asyncio.Lock:
-    """Lazily create the deferred cleanup lock in the current event loop (Bug #119).
+    """Lazily create a deferred cleanup lock keyed by the running event loop
+    (Bug #119, Bug #243).
 
-    Module-level asyncio.Lock() binds to the loop at creation time, which
-    breaks in tests that create fresh event loops.
+    asyncio.Lock binds to the loop at creation time.  A single cached lock
+    breaks across event loops — once loop A creates it, loop B reuses a lock
+    bound to loop A and fails with "got Future attached to a different loop".
+    Keying by the running loop keeps each loop's lock isolated; the weak
+    dict lets closed test loops get garbage-collected.
 
-    Safe: asyncio is single-threaded; no await between the ``is None`` check
-    and the assignment, so no two coroutines can both observe ``None``
-    simultaneously.
+    Safe: asyncio is single-threaded; no await between the lookup and the
+    assignment, so no two coroutines on the same loop can both observe
+    ``None`` simultaneously.
     """
-    global _deferred_cleanup_lock
-    if _deferred_cleanup_lock is None:
-        _deferred_cleanup_lock = asyncio.Lock()
-    return _deferred_cleanup_lock
+    loop = asyncio.get_running_loop()
+    lock = _deferred_cleanup_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _deferred_cleanup_locks[loop] = lock
+    return lock
 
 
 def _sync_default_stream() -> None:

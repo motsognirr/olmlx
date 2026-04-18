@@ -164,6 +164,57 @@ class TestDeferredCleanupLock:
 
 
 # ---------------------------------------------------------------------------
+# Bug #243: _deferred_cleanup_lock cached globally — breaks across event loops
+# ---------------------------------------------------------------------------
+class TestDeferredCleanupLockPerLoop:
+    """_get_deferred_cleanup_lock must return a lock bound to the running loop."""
+
+    def test_separate_locks_for_separate_loops(self):
+        """A fresh event loop must receive a lock bound to itself, not a stale one."""
+        import asyncio
+
+        _inf_mod._deferred_cleanup_locks.clear()
+
+        loop_a = asyncio.new_event_loop()
+        try:
+            lock_a = loop_a.run_until_complete(self._get_lock())
+        finally:
+            loop_a.close()
+
+        loop_b = asyncio.new_event_loop()
+        try:
+            lock_b = loop_b.run_until_complete(self._get_lock())
+            # The acquire must succeed on loop B's own lock; if we leaked
+            # loop A's lock, this would raise "attached to a different loop".
+            loop_b.run_until_complete(self._acquire_and_release(lock_b))
+        finally:
+            loop_b.close()
+
+        assert lock_a is not lock_b, (
+            "Each event loop must receive its own lock (Bug #243)"
+        )
+
+    @staticmethod
+    async def _get_lock():
+        return _inf_mod._get_deferred_cleanup_lock()
+
+    @staticmethod
+    async def _acquire_and_release(lock):
+        async with lock:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_same_loop_returns_same_lock(self):
+        """Within a single event loop, repeated calls must return the same lock."""
+        _inf_mod._deferred_cleanup_locks.clear()
+        lock1 = _inf_mod._get_deferred_cleanup_lock()
+        lock2 = _inf_mod._get_deferred_cleanup_lock()
+        assert lock1 is lock2, (
+            "Repeated calls on the same loop must return the same lock"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Bug #120: GPU memory not freed on client disconnect during long prefill
 # ---------------------------------------------------------------------------
 class TestDrainAndJoinBlocksNewInference:

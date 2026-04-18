@@ -2440,9 +2440,6 @@ class TestDeferredInferenceCleanup:
         mock_thread.join = MagicMock()
         mock_stream._thread = mock_thread
 
-        # Reset lazy lock for this test's event loop
-        _inf_mod._deferred_cleanup_lock = None
-
         # Manually acquire the lock to simulate _stream_completion holding it
         await _inference_lock.acquire()
 
@@ -2463,9 +2460,6 @@ class TestDeferredInferenceCleanup:
         mock_thread.is_alive.side_effect = [True, False, False]
         mock_thread.join = MagicMock()
         mock_stream._thread = mock_thread
-
-        # Reset lazy lock for this test's event loop
-        _inf_mod._deferred_cleanup_lock = None
 
         await _inference_lock.acquire()
         assert _inference_lock.locked()
