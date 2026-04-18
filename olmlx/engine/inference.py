@@ -2016,7 +2016,7 @@ async def _stream_completion(
                 lm, tokens, original_prompt, max_tokens, broadcast_kwargs
             )
 
-        if lm.is_speculative:
+        if lm.is_speculative and not images:
             from olmlx.engine.speculative_stream import async_speculative_stream
 
             # Speculative decoding uses greedy argmax; sampling params are not supported.
@@ -2043,7 +2043,7 @@ async def _stream_completion(
                 )
             stream = async_speculative_stream(
                 lm.speculative_decoder,
-                lm.tokenizer,
+                lm.text_tokenizer,
                 prompt,
                 max_tokens=max_tokens,
             )
@@ -2260,7 +2260,7 @@ async def _full_completion_inner(
 
         _apply_seed(gen_kwargs, consume=not lm.is_vlm)
 
-        if lm.is_vlm:
+        if lm.is_vlm and images:
             import mlx_vlm
 
             result = mlx_vlm.generate(
@@ -2304,6 +2304,18 @@ async def _full_completion_inner(
             # so sync the default stream only.
             mx.synchronize()
             return result
+        elif lm.is_vlm:
+            import mlx_vlm
+
+            result = mlx_vlm.generate(
+                lm.model,
+                lm.tokenizer,
+                prompt=prompt,
+                image=images,
+                max_tokens=max_tokens,
+                **gen_kwargs,
+            )
+            from mlx_vlm.generate import generation_stream
         else:
             import mlx_lm
 
