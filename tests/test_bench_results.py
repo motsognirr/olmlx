@@ -330,9 +330,8 @@ def _save_fake_run(
 
 
 class TestBuildLeaderboard:
-    def test_best_per_model_ranks_by_best_tps(self, tmp_path):
-        # model-a older run (slow), newer run (fast) — the fastest per-model
-        # run should win and rank first.
+    def test_latest_per_model_ranks_by_best_tps(self, tmp_path):
+        # model-a older run (slow), newer run (fast) — newer should win and rank first
         _save_fake_run(
             tmp_path,
             model="model-a",
@@ -360,27 +359,6 @@ class TestBuildLeaderboard:
         assert entries[0].timestamp == "20260102T000000Z"
         assert entries[1].best_tps == 50.0
 
-    def test_best_per_model_prefers_peak_over_recent_regression(self, tmp_path):
-        # Older run is fast; newer run is a regression. Default leaderboard
-        # semantics rank by peak best_tps, so the older (faster) run must win.
-        _save_fake_run(
-            tmp_path,
-            model="model-a",
-            timestamp="20260101T000000Z",
-            scenarios=[_scenario("baseline", [_prompt(80.0)])],
-        )
-        _save_fake_run(
-            tmp_path,
-            model="model-a",
-            timestamp="20260102T000000Z",
-            scenarios=[_scenario("baseline", [_prompt(30.0)])],
-        )
-
-        entries = build_leaderboard(tmp_path)
-        assert len(entries) == 1
-        assert entries[0].best_tps == pytest.approx(80.0, rel=1e-6)
-        assert entries[0].timestamp == "20260101T000000Z"
-
     def test_all_runs_keeps_history(self, tmp_path):
         _save_fake_run(
             tmp_path,
@@ -401,7 +379,7 @@ class TestBuildLeaderboard:
             scenarios=[_scenario("baseline", [_prompt(50.0)])],
         )
 
-        entries = build_leaderboard(tmp_path, best_per_model=False)
+        entries = build_leaderboard(tmp_path, latest_per_model=False)
         assert len(entries) == 3
         assert [e.best_tps for e in entries] == [80.0, 50.0, 20.0]
 

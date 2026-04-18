@@ -317,14 +317,14 @@ def _scenario_avg_tps(scenario: ScenarioResult) -> float:
 def build_leaderboard(
     bench_dir: Path = DEFAULT_BENCH_DIR,
     *,
-    best_per_model: bool = True,
+    latest_per_model: bool = True,
 ) -> list[LeaderboardEntry]:
     """Aggregate saved runs into ranked leaderboard entries.
 
-    With best_per_model=True (the default), only the highest-scoring run per
-    model is kept — a leaderboard shows peaks, so a later regression does
-    not displace an earlier faster run. Pass best_per_model=False to keep
-    every run (e.g. for a full history view).
+    With latest_per_model=True (the default) the most recent run per model
+    is kept — the leaderboard shows the current state of each model, not
+    its historical peak. Pass latest_per_model=False to keep every run
+    (e.g. for a full history view).
 
     Skipped scenarios are excluded from both failure and total counts. Runs
     where every non-skipped scenario has zero valid prompts are dropped
@@ -381,22 +381,21 @@ def build_leaderboard(
             )
         )
 
-    if best_per_model:
+    if latest_per_model:
         by_model: dict[str, LeaderboardEntry] = {}
         for e in entries:
             existing = by_model.get(e.model)
-            # Prefer higher best_tps. On exact ties, pick the more recent
-            # run, breaking final ties on the numeric collision counter so
-            # -10 sorts after -9 (plain string order would put -10 before
-            # -2). This guarantees a deterministic winner.
-            if existing is None or (
-                e.best_tps,
-                e.timestamp,
-                _run_dir_sort_key(e.run_dir.name),
-            ) > (
-                existing.best_tps,
-                existing.timestamp,
-                _run_dir_sort_key(existing.run_dir.name),
+            # Pick the most recent run, breaking sub-second ties on the
+            # numeric collision counter in the directory name so -10 sorts
+            # after -9 (plain string order would put -10 before -2).
+            if (
+                existing is None
+                or e.timestamp > existing.timestamp
+                or (
+                    e.timestamp == existing.timestamp
+                    and _run_dir_sort_key(e.run_dir.name)
+                    > _run_dir_sort_key(existing.run_dir.name)
+                )
             ):
                 by_model[e.model] = e
         entries = list(by_model.values())
