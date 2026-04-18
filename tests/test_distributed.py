@@ -653,6 +653,45 @@ class TestProtocolViolation:
             coordinator.close()
             t.join(timeout=5.0)
 
+    def test_already_ready_workers_closed_on_late_failure(self):
+        """Issue #240: Phase-2 failure on a later worker must close sockets of
+        workers that already reported ready. Otherwise FDs leak locally and the
+        peer worker stays connected-but-idle until its own timeout fires.
+        """
+        from olmlx.engine.distributed import DistributedCoordinator, _send_message
+
+        coordinator = DistributedCoordinator(world_size=3, port=0)
+        actual_port = coordinator.port
+
+        # Connect both workers synchronously before wait_for_workers so accept
+        # order (which determines pending[] order in Phase 2) is deterministic:
+        # ready_sock is pending[0], bad_sock is pending[1].
+        ready_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        bad_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ready_sock.connect(("127.0.0.1", actual_port))
+        _send_message(ready_sock, {"action": "ready"})
+        bad_sock.connect(("127.0.0.1", actual_port))
+        _send_message(bad_sock, {"action": "wrong"})
+
+        try:
+            with pytest.raises(RuntimeError, match="unexpected message"):
+                coordinator.wait_for_workers(timeout=5.0)
+
+            # The coordinator must have closed ready_sock — recv on the peer
+            # end returns b"" once the FIN arrives.
+            ready_sock.settimeout(2.0)
+            assert ready_sock.recv(4) == b"", (
+                "Already-ready worker socket leaked: coordinator did not close "
+                "it when a later worker failed Phase-2 handshake"
+            )
+            # And self._workers must be cleared so coordinator.close() is a no-op
+            # on those sockets (which would have been a double-close otherwise).
+            assert coordinator._workers == []
+        finally:
+            ready_sock.close()
+            bad_sock.close()
+            coordinator.close()
+
 
 class TestServerSocketClose:
     """Issue 12: Server socket closed after wait_for_workers."""

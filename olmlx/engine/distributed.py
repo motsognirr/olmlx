@@ -181,34 +181,37 @@ class DistributedCoordinator:
                     f"({len(pending)}/{expected} connected)"
                 )
 
-        # Phase 2: wait for "ready" message from each worker
-        for i, conn in enumerate(pending):
-            remaining = timeout - (time.monotonic() - start)
-            if remaining <= 0:
-                for s in pending[i:]:
-                    s.close()
-                raise TimeoutError(
-                    f"Timed out waiting for workers to report ready "
-                    f"({len(self._workers)}/{expected} ready)"
-                )
-            conn.settimeout(remaining)
-            try:
-                msg = _recv_message(conn)
+        # Phase 2: wait for "ready" message from each worker.
+        # On any failure we must close BOTH the not-yet-processed sockets in
+        # pending[i:] AND the already-ready sockets accumulated in self._workers
+        # — otherwise FDs leak locally and the peer worker stays connected-but-
+        # idle until its own timeout fires (Issue #240).
+        i = 0
+        try:
+            for i, conn in enumerate(pending):
+                remaining = timeout - (time.monotonic() - start)
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Timed out waiting for workers to report ready "
+                        f"({len(self._workers)}/{expected} ready)"
+                    )
+                conn.settimeout(remaining)
+                try:
+                    msg = _recv_message(conn)
+                except socket.timeout:
+                    raise TimeoutError(
+                        f"Timed out waiting for workers to report ready "
+                        f"({len(self._workers)}/{expected} ready)"
+                    )
                 if msg is None or msg.get("action") != "ready":
-                    for s in pending[i:]:
-                        s.close()
                     raise RuntimeError(
                         f"Worker {i + 1} sent unexpected message instead of ready: {msg}"
                     )
                 # Validate shared secret if configured
-                if self._secret is not None:
-                    if msg.get("secret") != self._secret:
-                        for s in pending[i:]:
-                            s.close()
-                        raise RuntimeError(
-                            f"Worker {i + 1} provided invalid secret — "
-                            f"rejecting connection"
-                        )
+                if self._secret is not None and msg.get("secret") != self._secret:
+                    raise RuntimeError(
+                        f"Worker {i + 1} provided invalid secret — rejecting connection"
+                    )
                 self._workers.append(conn)
                 conn.settimeout(None)  # blocking recv for inference loop
                 logger.info(
@@ -216,13 +219,19 @@ class DistributedCoordinator:
                     len(self._workers),
                     expected,
                 )
-            except socket.timeout:
-                for s in pending[i:]:
+        except BaseException:
+            for s in pending[i:]:
+                try:
                     s.close()
-                raise TimeoutError(
-                    f"Timed out waiting for workers to report ready "
-                    f"({len(self._workers)}/{expected} ready)"
-                )
+                except Exception:
+                    pass
+            for w in self._workers:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+            self._workers.clear()
+            raise
         # Issue 12: Close server socket — no more connections expected
         self._server.close()
         logger.info("All workers connected, server socket closed")
