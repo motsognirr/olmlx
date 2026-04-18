@@ -2530,18 +2530,18 @@ class TestAwaitDeferredCleanup:
         async def stuck_cleanup():
             await asyncio.sleep(999)
 
-        _inf_mod._deferred_cleanup_tasks[asyncio.get_running_loop()] = (
-            asyncio.create_task(stuck_cleanup())
-        )
+        loop = asyncio.get_running_loop()
+        stuck_task = asyncio.create_task(stuck_cleanup())
+        _inf_mod._deferred_cleanup_tasks[loop] = stuck_task
         try:
             with patch("olmlx.engine.inference._DEFERRED_WAIT_TIMEOUT", 0.05):
                 with pytest.raises(ServerBusyError, match="did not complete"):
                     await _await_deferred_cleanup()
         finally:
-            _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop()).cancel()
+            stuck_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
-            _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
+                await stuck_task
+            _inf_mod._deferred_cleanup_tasks.pop(loop, None)
 
     @pytest.mark.asyncio
     async def test_does_not_cancel_cleanup_task(self):
@@ -2560,9 +2560,9 @@ class TestAwaitDeferredCleanup:
                 task_was_cancelled = True
                 raise
 
-        _inf_mod._deferred_cleanup_tasks[asyncio.get_running_loop()] = (
-            asyncio.create_task(slow_cleanup())
-        )
+        loop = asyncio.get_running_loop()
+        slow_task = asyncio.create_task(slow_cleanup())
+        _inf_mod._deferred_cleanup_tasks[loop] = slow_task
         try:
             with patch("olmlx.engine.inference._DEFERRED_WAIT_TIMEOUT", 0.05):
                 with pytest.raises(Exception):
@@ -2570,10 +2570,10 @@ class TestAwaitDeferredCleanup:
             # The task should NOT have been cancelled by shield
             assert not task_was_cancelled
         finally:
-            _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop()).cancel()
+            slow_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await _inf_mod._deferred_cleanup_tasks.get(asyncio.get_running_loop())
-            _inf_mod._deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
+                await slow_task
+            _inf_mod._deferred_cleanup_tasks.pop(loop, None)
 
 
 class TestEstimateKvCacheBytes:
