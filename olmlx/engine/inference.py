@@ -270,27 +270,28 @@ async def _reset_inference_state() -> None:
     # by other loops (e.g. concurrent async test classes under loop_scope=session).
     loop = asyncio.get_running_loop()
     task = _deferred_cleanup_tasks.pop(loop, None)
-    if task is not None and not task.done():
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, asyncio.InvalidStateError):
-            pass
-    elif task is not None and not task.cancelled():
-        # Consume any stored exception so asyncio doesn't log
-        # "Task exception was never retrieved" to stderr.  Also log it
-        # ourselves at warning level so fixture-level failures aren't
-        # invisible (``_await_deferred_cleanup`` logs on its own path,
-        # but reset is the only path for tests that aborted earlier).
-        # ``task.exception()`` is safe here — the task is done and not
-        # cancelled, so it can't raise ``InvalidStateError`` or ``CancelledError``.
-        exc = task.exception()
-        if exc is not None:
-            logger.warning(
-                "Deferred cleanup task raised during reset: %s",
-                exc,
-                exc_info=exc,
-            )
+    if task is not None:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                pass
+        elif not task.cancelled():
+            # Consume any stored exception so asyncio doesn't log
+            # "Task exception was never retrieved" to stderr.  Also log it
+            # ourselves at warning level so fixture-level failures aren't
+            # invisible (``_await_deferred_cleanup`` logs on its own path,
+            # but reset is the only path for tests that aborted earlier).
+            # ``task.exception()`` is safe here — the task is done and not
+            # cancelled, so it can't raise ``InvalidStateError`` or ``CancelledError``.
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(
+                    "Deferred cleanup task raised during reset: %s",
+                    exc,
+                    exc_info=exc,
+                )
     # Also cleans up any lock entry ``_cleanup``'s finally block may have
     # created.  Both branches above can leave one behind:
     #   - ``if`` (cancel + await): ``_cleanup``'s finally runs during
@@ -505,10 +506,15 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
             # log was missed (it normally fires first on the happy path).
             # ``existing.exception()`` is safe here — the task is done and not
             # cancelled, so it can't raise ``InvalidStateError`` or ``CancelledError``.
+            # Note: if ``_await_deferred_cleanup`` already ran, this is the
+            # second log of the same exception (ERROR there, WARNING here);
+            # the "previously reported above" hint helps operators correlate.
             exc = existing.exception()
             if exc is not None:
                 logger.warning(
-                    "Replaced done cleanup task had raised: %s",
+                    "Replaced done cleanup task had raised "
+                    "(may have been previously reported at ERROR by "
+                    "_await_deferred_cleanup): %s",
                     exc,
                     exc_info=exc,
                 )

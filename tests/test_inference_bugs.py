@@ -1,5 +1,6 @@
 """Tests for inference engine bug fixes (#118, #119, #120, #123, #124, #125)."""
 
+import contextlib
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -324,6 +325,43 @@ class TestDeferredCleanupLockPerLoop:
         finally:
             _inf_mod._deferred_cleanup_locks.pop(loop_b, None)
             loop_b.close()
+
+    @pytest.mark.asyncio
+    async def test_reset_consumes_and_logs_done_task_exception(self, caplog):
+        """``_reset_inference_state`` must consume + log a stored exception
+        on the ``done and not cancelled`` branch.
+
+        Covers the ``elif task.done() and not task.cancelled()`` path that
+        otherwise leaks "Task exception was never retrieved" warnings to
+        stderr at GC time and silently swallows fixture-level failures.
+        """
+        import asyncio
+        import logging
+
+        loop = asyncio.get_running_loop()
+
+        async def boom():
+            raise RuntimeError("synthetic cleanup failure")
+
+        task = asyncio.create_task(boom())
+        # Let it run + transition to done with a stored exception.
+        with contextlib.suppress(RuntimeError):
+            await task
+        assert task.done() and not task.cancelled()
+
+        _inf_mod._deferred_cleanup_tasks[loop] = task
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
+            await _inf_mod._reset_inference_state()
+
+        assert _inf_mod._deferred_cleanup_tasks.get(loop) is None, (
+            "reset must remove the loop's entry"
+        )
+        assert any(
+            "Deferred cleanup task raised during reset" in r.message
+            and "synthetic cleanup failure" in str(r.exc_info[1])
+            for r in caplog.records
+            if r.exc_info is not None
+        ), "reset must log the stored exception with exc_info"
 
 
 # ---------------------------------------------------------------------------
