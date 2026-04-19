@@ -491,7 +491,16 @@ async def _await_deferred_cleanup():
     if not task.cancelled():
         exc = task.exception()
         if exc is not None:
-            logger.error("Deferred inference cleanup raised: %s", exc, exc_info=exc)
+            # ``task.get_name()`` lets operators correlate this entry with the
+            # WARNING fired on the next request from
+            # ``_schedule_deferred_inference_cleanup`` (same task name).
+            logger.error(
+                "Deferred inference cleanup [%s] raised; server state may be "
+                "dirty, consider restart if this persists: %s",
+                task.get_name(),
+                exc,
+                exc_info=exc,
+            )
 
 
 async def _schedule_deferred_inference_cleanup(stream) -> None:
@@ -538,13 +547,15 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
             # cancelled, so it can't raise ``InvalidStateError`` or ``CancelledError``.
             # Note: if ``_await_deferred_cleanup`` already ran, this is the
             # second log of the same exception (ERROR there, WARNING here);
-            # the "previously reported above" hint helps operators correlate.
+            # the matching ``[task name]`` prefix lets operators grep both
+            # entries with one identifier.
             exc = existing.exception()
             if exc is not None:
                 logger.warning(
-                    "Replaced done cleanup task had raised "
+                    "Replaced done cleanup task [%s] had raised "
                     "(may have been previously reported at ERROR by "
                     "_await_deferred_cleanup): %s",
+                    existing.get_name(),
                     exc,
                     exc_info=exc,
                 )
@@ -605,7 +616,13 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                     _deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
 
         # See IMPORTANT note at the top of the ``async with`` block.
-        _deferred_cleanup_tasks[loop] = asyncio.create_task(_cleanup())
+        # Name the task explicitly so the operator-facing log entries
+        # (ERROR from ``_await_deferred_cleanup``, WARNING from the
+        # next request) share a stable identifier instead of the
+        # auto-generated ``Task-N``.
+        _deferred_cleanup_tasks[loop] = asyncio.create_task(
+            _cleanup(), name=f"deferred-cleanup-{id(stream):x}"
+        )
 
 
 MEMORY_SAFETY_FACTOR = 1.3
