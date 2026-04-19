@@ -254,15 +254,24 @@ class TurboQuantKVCache(_BaseCache):
         return self._key_indices is None or self.offset == 0
 
 
-def _detect_head_dim(model: Any) -> int:
+def _detect_head_dim(model: Any, layers_hint: Any = None) -> int:
     """Detect head_dim from model args/config or K projection layer shape.
 
     Handles models where head_dim != hidden_size // num_attention_heads
     (e.g. Gemma 3, Phi-3/4).  Falls back to model.config when model.args
     is missing (e.g. mlx-vlm gemma4 LanguageModel).
+
+    `layers_hint`: optional object exposing `.layers` to use for the weight-shape
+    fallback when `model` itself is a wrapper whose first layer isn't an
+    attention layer (e.g. hybrid SSM+attention backbones).
     """
-    # Prefer explicit head_dim from model args or config
-    model_cfg = getattr(model, "args", None) or getattr(model, "config", None)
+    # Prefer explicit head_dim from model args or config. Use `is not None`
+    # rather than `or` so a falsy-but-present `.args` isn't silently skipped;
+    # this matches `_resolve_config_holder` / `_config_namespace` in the
+    # spectralquant calibrator.
+    model_cfg = getattr(model, "args", None)
+    if model_cfg is None:
+        model_cfg = getattr(model, "config", None)
     if model_cfg is None:
         raise RuntimeError("TurboQuant: model has no 'args' or 'config' attribute")
 
@@ -276,18 +285,31 @@ def _detect_head_dim(model: Any) -> int:
         if "head_dim" in text_config:
             return text_config["head_dim"]
 
-    # Derive from K projection weight shape: k_proj.weight is (n_kv_heads * head_dim, hidden_size)
-    try:
-        layer = model.layers[0]
-        k_proj = layer.self_attn.k_proj
-        weight = k_proj.weight
-        if isinstance(weight, mx.array):
-            kv_out_dim = weight.shape[0]
-            n_kv_heads = getattr(model_cfg, "num_key_value_heads", None)
-            if n_kv_heads:
-                return kv_out_dim // n_kv_heads
-    except (AttributeError, IndexError):
-        pass
+    # Derive from K projection weight shape: k_proj.weight is (n_kv_heads * head_dim, hidden_size).
+    # For hybrid backbones the first layer may be SSM; iterate to find an attention layer.
+    # Deduplicate by identity: when `layers_hint is model` (common legacy path), avoid
+    # scanning layers twice. Uses `is` rather than a set so custom `__eq__`/`__hash__`
+    # on wrapper classes can't trip the check.
+    layer_sources: list[Any] = []
+    if layers_hint is not None:
+        layer_sources.append(layers_hint)
+    if model is not layers_hint:
+        layer_sources.append(model)
+    for src in layer_sources:
+        src_layers = getattr(src, "layers", None)
+        if src_layers is None:
+            continue
+        for layer in src_layers:
+            try:
+                k_proj = getattr(getattr(layer, "self_attn", None), "k_proj", None)
+                weight = getattr(k_proj, "weight", None)
+                if isinstance(weight, mx.array):
+                    kv_out_dim = weight.shape[0]
+                    n_kv_heads = getattr(model_cfg, "num_key_value_heads", None)
+                    if n_kv_heads:
+                        return kv_out_dim // n_kv_heads
+            except (AttributeError, IndexError, TypeError):
+                continue
 
     # Derive from text_config hidden_size // num_attention_heads
     if isinstance(text_config, dict):

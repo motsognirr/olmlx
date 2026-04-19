@@ -15,10 +15,109 @@ from typing import Any
 
 import mlx.core as mx
 import numpy as np
+from mlx_lm.models.cache import KVCache
 
 from olmlx.engine.spectralquant import allocate_bits, fit_codebook
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_config_holder(inner: Any, model: Any) -> Any:
+    # Some architectures (e.g. Qwen3Next) expose the config namespace only on
+    # the top-level model, not on the backbone returned by `_get_backbone`.
+    # mlx-lm models expose it as `.args`; some mlx-vlm LanguageModel wrappers
+    # expose it as `.config`. Prefer `.args` across both holders before falling
+    # back to `.config` — otherwise an unrelated `.config` on `inner` (e.g.
+    # inherited from a framework mixin) could shadow the real `.args` on
+    # `model`, defeating the Qwen3Next fix. Use `is not None` rather than
+    # `hasattr`: partially-constructed wrappers may set `self.args = None` as
+    # a class attribute, which would pass `hasattr` but yield a `None`
+    # namespace downstream and silently miscalibrate.
+    for obj in (inner, model):
+        if getattr(obj, "args", None) is not None:
+            return obj
+    for obj in (inner, model):
+        if getattr(obj, "config", None) is not None:
+            return obj
+    raise RuntimeError(
+        "Cannot detect model configuration: neither the backbone nor the "
+        "top-level model exposes '.args' or '.config'. Unsupported architecture."
+    )
+
+
+def _config_namespace(cfg_holder: Any) -> Any:
+    # Return the `.args` or `.config` object carrying architecture fields.
+    # `_resolve_config_holder` normally enforces that one of these is present,
+    # but raise explicitly here so the function's contract is enforceable in
+    # isolation (matches the `_detect_head_dim` pattern in turboquant_cache).
+    args = getattr(cfg_holder, "args", None)
+    result = args if args is not None else getattr(cfg_holder, "config", None)
+    if result is None:
+        raise RuntimeError(
+            f"_config_namespace: {type(cfg_holder).__name__} has neither "
+            "'.args' nor '.config'"
+        )
+    return result
+
+
+def _build_empty_collection_error(first_exc: Exception | None) -> RuntimeError:
+    """Build the error raised when calibration collected zero KV vectors.
+
+    Chains `first_exc` via `__cause__` and sets `__suppress_context__=True` so
+    the behavior matches `raise ... from first_exc`: the traceback shows the
+    forward-pass cause and nothing else. Without suppression, raising this
+    from inside an `except` block in the future would also surface the
+    unrelated implicit `__context__`.
+    """
+    if first_exc is not None:
+        err = RuntimeError(
+            "No KV vectors were collected during calibration — "
+            "see cause above for the forward-pass error."
+        )
+        err.__cause__ = first_exc
+        err.__suppress_context__ = True
+        return err
+    return RuntimeError(
+        "No KV vectors were collected during calibration. "
+        "No attention-layer cache entries were found — the model may have no "
+        "attention layers, or all attention layers fell outside the "
+        "calibration window."
+    )
+
+
+def _is_attention_cache(cache_entry: Any, expected_head_dim: int) -> bool:
+    # Combined filter: must be a standard KVCache (not an SSM cache type such
+    # as ArraysCache) AND expose a plausible 4D attention state. The isinstance
+    # guard is load-bearing — shape alone cannot reject Mamba2 states where
+    # `d_state == head_dim`. Keeping both checks inside this function means
+    # the signature enforces the full contract and a future refactor can't
+    # accidentally drop the type guard. Also guards against:
+    # - empty caches not yet populated (len(state) < 2)
+    # - caches seeded with < 2 tokens (seq < 2; already excluded by the
+    #   `len(tokens) < 2` guard in `calibrate_model`, but kept as defense)
+    # - head_dim mismatch (e.g. model weights loaded with a mismatched config)
+    if not isinstance(cache_entry, KVCache):
+        return False
+    state: Any = cache_entry.state
+    if not state or len(state) < 2:
+        return False
+    keys = state[0]
+    if not (hasattr(keys, "ndim") and keys.ndim == 4):
+        return False
+    shape = keys.shape
+    return shape[2] >= 2 and shape[3] == expected_head_dim
+
+
+def _resolve_cache_owner(inner: Any, model: Any) -> Any:
+    # `make_prompt_cache` defers to `make_cache()` on the passed object. When
+    # the top-level model defines `make_cache`, it's always the authoritative
+    # source for per-layer cache types — required for hybrid SSM+attention
+    # architectures (Qwen3Next) and harmless for homogeneous ones. Falling back
+    # to the backbone preserves legacy behavior for models that don't define
+    # `make_cache` at the top level.
+    if hasattr(model, "make_cache"):
+        return model
+    return inner
 
 
 def compute_covariance(data: mx.array) -> mx.array:
@@ -275,20 +374,15 @@ def calibrate_model(
     inner = _get_backbone(model)
     layers = inner.layers
     num_layers = len(layers)
-    head_dim = _detect_head_dim(inner)
+    cfg_holder = _resolve_config_holder(inner, model)
+    cfg_ns = _config_namespace(cfg_holder)
+    head_dim = _detect_head_dim(cfg_holder, layers_hint=inner)
+    logger.debug("calibrate_model: resolved head_dim=%d", head_dim)
 
     # Determine number of KV heads
-    n_kv_heads = getattr(
-        inner.args if hasattr(inner, "args") else model.args,
-        "num_key_value_heads",
-        None,
-    )
+    n_kv_heads = getattr(cfg_ns, "num_key_value_heads", None)
     if n_kv_heads is None:
-        n_kv_heads = getattr(
-            inner.args if hasattr(inner, "args") else model.args,
-            "num_attention_heads",
-            1,
-        )
+        n_kv_heads = getattr(cfg_ns, "num_attention_heads", 1)
 
     if progress_callback:
         progress_callback("Generating calibration data", 0.05)
@@ -323,9 +417,18 @@ def calibrate_model(
     # that gets stored in the KV cache at inference time.
     from mlx_lm.models.cache import make_prompt_cache
 
-    cache_model = inner if hasattr(inner, "layers") else model
+    cache_model = _resolve_cache_owner(inner, model)
+    first_exc: Exception | None = None
     for sample_idx, text in enumerate(texts):
         tokens = _encode_tokens(tokenizer, text)
+        if len(tokens) < 2:
+            # Single-token prefills produce (1, n_kv, 1, head_dim) caches that
+            # are easy to confuse with per-step SSM states, and carry no
+            # meaningful KV statistics anyway. Skip them.
+            logger.debug(
+                "Skipping sample %d: too short (%d tokens)", sample_idx, len(tokens)
+            )
+            continue
         if len(tokens) > 512:
             tokens = tokens[:512]
         input_ids = mx.array([tokens])
@@ -335,16 +438,21 @@ def calibrate_model(
         try:
             model(input_ids, cache=prompt_cache)
         except Exception as exc:
+            if first_exc is None:
+                first_exc = exc
             logger.debug("Skipping sample %d: %s", sample_idx, exc)
+            del prompt_cache
             continue
         mx.eval([c.state for c in prompt_cache if hasattr(c, "state")])
 
         # Extract K/V from each layer's cache
         for layer_idx in range(min(num_layers, len(prompt_cache))):
             cache_entry = prompt_cache[layer_idx]
-            state = cache_entry.state if hasattr(cache_entry, "state") else None
-            if not state or len(state) < 2:
+            # Combined type + shape filter. Rejects SSM cache types (ArraysCache,
+            # etc.) and KVCaches whose state doesn't match attention shape.
+            if not _is_attention_cache(cache_entry, head_dim):
                 continue
+            state = cache_entry.state
             # KVCache.state returns [keys, values] with shape
             # (1, n_kv_heads, seq_len, head_dim)
             cached_keys = state[0]  # (1, n_kv_heads, seq, head_dim)
@@ -377,10 +485,7 @@ def calibrate_model(
     # Guard: if no KV vectors were collected, fail early with a clear message
     total_collected = sum(tokens_collected.values())
     if total_collected == 0:
-        raise RuntimeError(
-            "No KV vectors were collected during calibration. "
-            "All forward passes failed — check that the model loads correctly."
-        )
+        raise _build_empty_collection_error(first_exc)
 
     if progress_callback:
         progress_callback("Running eigenspectral analysis", 0.5)
@@ -401,7 +506,7 @@ def calibrate_model(
             for head_idx in range(n_kv_heads):
                 all_chunks.extend(kv_collectors[layer_idx][head_idx][kind])
             if not all_chunks:
-                logger.warning(
+                logger.debug(
                     "No KV data for layer %d %s, skipping",
                     layer_idx,
                     kind,

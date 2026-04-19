@@ -718,6 +718,204 @@ class TestSpectralConfig:
         s = ExperimentalSettings(kv_cache_quant="turboquant:4")
         assert s.kv_cache_quant == "turboquant:4"
 
+    def test_resolve_config_holder_prefers_inner_when_it_has_args(self):
+        """When backbone (inner) has .args, use it — matches pre-existing behavior."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_config_holder
+
+        inner = MagicMock(spec=[])
+        inner.args = MagicMock(spec=[])
+        model = MagicMock(spec=[])
+        model.args = MagicMock(spec=[])
+
+        assert _resolve_config_holder(inner, model) is inner
+
+    def test_resolve_cache_owner_prefers_model_with_make_cache(self):
+        """Qwen3Next: top-level has hybrid make_cache(); backbone only has layers."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_cache_owner
+
+        inner = MagicMock(spec=["layers"])
+        model = MagicMock(spec=["layers", "make_cache"])
+        assert _resolve_cache_owner(inner, model) is model
+
+    def test_is_attention_cache_accepts_kvcache_with_valid_state(self):
+        """A KVCache with 4D state matching head_dim is accepted."""
+        from unittest.mock import MagicMock
+
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache
+
+        ok_keys = mx.zeros((1, 2, 16, 256))
+        ok_vals = mx.zeros((1, 2, 16, 256))
+        cache = MagicMock(spec=KVCache)
+        cache.state = [ok_keys, ok_vals]
+        assert _is_attention_cache(cache, 256) is True
+
+    def test_is_attention_cache_rejects_non_kvcache_type(self):
+        """An SSM-style cache (e.g. ArraysCache) is rejected regardless of shape."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache
+
+        ok_keys = mx.zeros((1, 2, 16, 256))
+        ok_vals = mx.zeros((1, 2, 16, 256))
+        # Not a KVCache — simulates ArraysCache or similar SSM cache type.
+        cache = MagicMock(spec=[])
+        cache.state = [ok_keys, ok_vals]
+        assert _is_attention_cache(cache, 256) is False
+
+    def test_is_attention_cache_rejects_kvcache_ssm_3d_state(self):
+        """Qwen3Next-like 3D first-element state is rejected even on a KVCache."""
+        from unittest.mock import MagicMock
+
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache
+
+        ssm_conv = mx.zeros((1, 3, 8192))  # conv state (3D)
+        ssm_hid = mx.zeros((1, 32, 128, 128))
+        cache = MagicMock(spec=KVCache)
+        cache.state = [ssm_conv, ssm_hid]
+        assert _is_attention_cache(cache, 256) is False
+
+    def test_is_attention_cache_rejects_per_step_seq_equals_one(self):
+        """A per-step state with seq==1 is rejected by the shape check."""
+        from unittest.mock import MagicMock
+
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache
+
+        per_step = mx.zeros((1, 8, 1, 128))
+        cache = MagicMock(spec=KVCache)
+        cache.state = [per_step, per_step]
+        assert _is_attention_cache(cache, 128) is False
+
+    def test_is_attention_cache_rejects_head_dim_mismatch(self):
+        """A KVCache whose last-axis size doesn't match head_dim is rejected."""
+        from unittest.mock import MagicMock
+
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache
+
+        mismatched = mx.zeros((1, 8, 32, 64))  # head_dim=64 in the state
+        cache = MagicMock(spec=KVCache)
+        cache.state = [mismatched, mismatched]
+        assert _is_attention_cache(cache, 256) is False  # expect 256, got 64
+
+    def test_resolve_config_holder_accepts_config_attribute(self):
+        """VL LanguageModel wrappers may expose `.config` instead of `.args`."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_config_holder
+
+        inner = MagicMock(spec=["layers"])  # no .args, no .config
+        model = MagicMock(spec=[])
+        model.config = MagicMock(spec=[])
+        assert _resolve_config_holder(inner, model) is model
+
+    def test_resolve_config_holder_prefers_args_over_inner_config(self):
+        """If inner has only `.config` and model has `.args`, prefer model — `.args`
+        wins across both holders before `.config` is considered. Otherwise an
+        unrelated `.config` on the backbone (framework mixin, etc.) would shadow
+        the real config namespace and defeat the Qwen3Next fix."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_config_holder
+
+        inner = MagicMock(spec=[])
+        inner.config = MagicMock(spec=[])  # noisy, unrelated config attribute
+        model = MagicMock(spec=[])
+        model.args = MagicMock(spec=[])  # the real config lives here
+        assert _resolve_config_holder(inner, model) is model
+
+    def test_config_namespace_prefers_args(self):
+        """When both .args and .config exist, prefer .args (mlx-lm idiom)."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _config_namespace
+
+        holder = MagicMock(spec=[])
+        holder.args = "args-ns"
+        holder.config = "config-ns"
+        assert _config_namespace(holder) == "args-ns"
+
+    def test_config_namespace_falls_back_to_config(self):
+        """When only .config exists, return it."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _config_namespace
+
+        holder = MagicMock(spec=[])
+        holder.config = "config-ns"
+        assert _config_namespace(holder) == "config-ns"
+
+    def test_build_empty_collection_error_chains_first_exc(self):
+        """First forward-pass exception must be chained via __cause__ (and suppress
+        context) so the behavior matches `raise ... from first_exc`. The message
+        body refers to the cause rather than duplicating its text — Python's
+        traceback format already prints both."""
+        from olmlx.engine.spectralquant_calibrate import _build_empty_collection_error
+
+        original = ValueError("synthetic forward-pass failure")
+        err = _build_empty_collection_error(original)
+        assert isinstance(err, RuntimeError)
+        assert err.__cause__ is original
+        assert err.__suppress_context__ is True
+        # The message references the cause rather than embedding its text.
+        assert "see cause" in str(err)
+        assert "synthetic forward-pass failure" not in str(err)
+
+    def test_build_empty_collection_error_no_exc(self):
+        """Without a forward-pass error, the message reports no attention caches found."""
+        from olmlx.engine.spectralquant_calibrate import _build_empty_collection_error
+
+        err = _build_empty_collection_error(None)
+        assert isinstance(err, RuntimeError)
+        assert err.__cause__ is None
+        assert "No attention-layer cache entries" in str(err)
+
+    def test_resolve_cache_owner_ignores_layers_without_make_cache(self):
+        """Without make_cache on the top-level model, route to backbone regardless of .layers."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_cache_owner
+
+        inner = MagicMock(spec=["layers"])
+        model = MagicMock(spec=["layers"])
+        assert _resolve_cache_owner(inner, model) is inner
+
+    def test_resolve_config_holder_falls_back_to_model(self):
+        """Qwen3Next regression: backbone has no .args, so calibrate must use model.args."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_config_holder
+
+        inner = MagicMock(spec=["layers"])  # no .args
+        model = MagicMock(spec=[])
+        model.args = MagicMock(spec=[])
+        model.args.head_dim = 256
+
+        holder = _resolve_config_holder(inner, model)
+        assert holder is model
+        assert holder.args.head_dim == 256
+
+    def test_resolve_config_holder_raises_when_neither_has_args(self):
+        """Unsupported architecture: surface a clear error instead of a cryptic AttributeError."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_config_holder
+
+        inner = MagicMock(spec=["layers"])
+        model = MagicMock(spec=[])
+        with pytest.raises(RuntimeError, match="Unsupported architecture"):
+            _resolve_config_holder(inner, model)
+
     def test_disk_cache_guard(self):
         """SpectralQuantKVCache should block disk serialization."""
         from olmlx.engine.model_manager import _is_serializable_cache
