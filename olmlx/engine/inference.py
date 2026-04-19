@@ -457,9 +457,8 @@ async def _await_deferred_cleanup():
     # the inference lock is always released and the next request can proceed.
     # Callers have no need to reject the following inference — the lock state
     # is correct regardless of cleanup outcome.  The log is the signal.
-    finished_task = next(iter(done))
-    if not finished_task.cancelled():
-        exc = finished_task.exception()
+    if not task.cancelled():
+        exc = task.exception()
         if exc is not None:
             logger.error("Deferred inference cleanup raised: %s", exc, exc_info=exc)
 
