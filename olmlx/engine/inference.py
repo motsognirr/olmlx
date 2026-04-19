@@ -277,6 +277,17 @@ async def _reset_inference_state() -> None:
                 await task
             except (asyncio.CancelledError, asyncio.InvalidStateError):
                 pass
+            except Exception as exc:
+                # Race: the task was about to finish with a non-cancellation
+                # exception when we called ``cancel()``, so ``await task``
+                # re-raises the stored exception instead of ``CancelledError``.
+                # Log and swallow — reset must not propagate user-code
+                # exceptions up to the test teardown fixture.
+                logger.warning(
+                    "Cleanup task raised while being cancelled during reset: %s",
+                    exc,
+                    exc_info=exc,
+                )
         elif not task.cancelled():
             # Consume any stored exception so asyncio doesn't log
             # "Task exception was never retrieved" to stderr.  Also log it
