@@ -287,7 +287,7 @@ class TestOpenAISchemas:
         )
         assert req.stream is False
         assert req.n == 1
-        assert req.frequency_penalty == 0.0
+        assert req.frequency_penalty is None
 
     def test_chat_response(self):
         resp = OpenAIChatResponse(

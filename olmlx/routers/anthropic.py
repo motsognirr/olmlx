@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 
 from olmlx.config import settings
 from olmlx.engine.inference import _inference_ref, count_chat_tokens, generate_chat
+from olmlx.routers.common import build_inference_options
 from olmlx.engine.tool_parser import (
     _make_tool_use_id,
     parse_model_output,
@@ -218,16 +219,12 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
 
 
 def _build_options(req: AnthropicMessagesRequest) -> dict:
-    opts = {}
-    if req.temperature is not None:
-        opts["temperature"] = req.temperature
-    if req.top_p is not None:
-        opts["top_p"] = req.top_p
-    if req.top_k is not None:
-        opts["top_k"] = req.top_k
-    if req.stop_sequences:
-        opts["stop"] = req.stop_sequences
-    return opts
+    return build_inference_options(
+        temperature=req.temperature,
+        top_p=req.top_p,
+        top_k=req.top_k,
+        stop=req.stop_sequences,
+    )
 
 
 # --- SSE helpers ---

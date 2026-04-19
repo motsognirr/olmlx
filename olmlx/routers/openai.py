@@ -13,6 +13,7 @@ from olmlx.engine.inference import (
     generate_embeddings,
 )
 from olmlx.engine.tool_parser import parse_model_output, resolve_tool_names
+from olmlx.routers.common import build_inference_options
 from olmlx.schemas.openai import (
     OpenAIChatMessage,
     OpenAIChatRequest,
@@ -409,20 +410,14 @@ async def _stream_openai_sse_with_tools(
 
 
 def _build_options(req) -> dict:
-    opts = {}
-    if req.temperature is not None:
-        opts["temperature"] = req.temperature
-    if req.top_p is not None:
-        opts["top_p"] = req.top_p
-    if req.seed is not None:
-        opts["seed"] = req.seed
-    if req.stop is not None:
-        opts["stop"] = req.stop if isinstance(req.stop, list) else [req.stop]
-    if req.frequency_penalty:
-        opts["frequency_penalty"] = req.frequency_penalty
-    if req.presence_penalty:
-        opts["presence_penalty"] = req.presence_penalty
-    return opts
+    return build_inference_options(
+        temperature=req.temperature,
+        top_p=req.top_p,
+        seed=req.seed,
+        stop=req.stop,
+        frequency_penalty=req.frequency_penalty,
+        presence_penalty=req.presence_penalty,
+    )
 
 
 @router.post("/v1/chat/completions")
