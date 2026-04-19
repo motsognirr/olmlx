@@ -32,7 +32,7 @@ def pack_indices(indices: mx.array, bits: int) -> mx.array:
         pad = n_bytes * 8 - dim
         if pad > 0:
             indices = mx.concatenate(
-                [indices, mx.zeros(indices.shape[:-1] + (pad,), dtype=mx.uint8)],
+                [indices, mx.zeros(indices.shape[:-1] + (pad,), dtype=indices.dtype)],
                 axis=-1,
             )
         result = mx.zeros(indices.shape[:-1] + (n_bytes,), dtype=mx.uint8)
