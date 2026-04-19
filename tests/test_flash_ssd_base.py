@@ -16,6 +16,7 @@ from olmlx.engine.flash._ssd_base import (
     LayerLruCache,
     encode_header,
     full_pread,
+    open_fds,
     parse_header,
 )
 
@@ -283,3 +284,51 @@ class TestFullPread:
             assert call_count[0] > 1
         finally:
             os.close(fd)
+
+
+class TestOpenFds:
+    def test_closes_already_opened_fds_when_fcntl_fails(self, tmp_path):
+        """If F_NOCACHE setup fails mid-loop, every fd opened so far must be closed."""
+        import os
+        import sys
+        from unittest.mock import patch
+
+        paths = {}
+        for i in range(3):
+            p = tmp_path / f"layer_{i}.bin"
+            p.write_bytes(b"x")
+            paths[i] = p
+
+        opened: list[int] = []
+        closed: list[int] = []
+        real_open = os.open
+        real_close = os.close
+
+        def tracking_open(path, flags):
+            fd = real_open(path, flags)
+            opened.append(fd)
+            return fd
+
+        def tracking_close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        # Force the darwin branch and make fcntl.fcntl raise on the second file.
+        def fail_fcntl(fd, cmd, arg):
+            if len(opened) >= 2:
+                raise OSError("simulated F_NOCACHE failure")
+
+        fake_fcntl = type("FakeFcntl", (), {"fcntl": staticmethod(fail_fcntl)})
+
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.dict("sys.modules", {"fcntl": fake_fcntl}),
+            patch("os.open", side_effect=tracking_open),
+            patch("os.close", side_effect=tracking_close),
+        ):
+            with pytest.raises(OSError, match="simulated F_NOCACHE"):
+                open_fds(paths, bypass_cache=True)
+
+        # Every fd handed out by os.open must have been closed by the cleanup path.
+        assert opened, "test setup should have opened at least one fd"
+        assert set(closed) == set(opened), f"fd leak: opened={opened}, closed={closed}"

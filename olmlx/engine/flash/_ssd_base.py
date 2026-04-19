@@ -60,21 +60,25 @@ def open_fds(
 
     On error, any fds already opened are closed before the exception propagates.
     """
-    if bypass_cache and sys.platform != "darwin":
+    apply_nocache = bypass_cache and sys.platform == "darwin"
+    if bypass_cache and not apply_nocache:
         logger.warning(
             "bypass_cache is only supported on macOS (F_NOCACHE); "
             "OS page cache will not be bypassed on %s",
             sys.platform,
         )
+    if apply_nocache:
+        import fcntl
+
     fds: dict[int, int] = {}
     try:
         for layer_idx, path in layer_paths.items():
             fd = os.open(str(path), os.O_RDONLY)
-            if bypass_cache and sys.platform == "darwin":
-                import fcntl
-
-                fcntl.fcntl(fd, F_NOCACHE, 1)
+            # Register the fd before any further call that might raise, so the
+            # except-block cleanup below is guaranteed to close it.
             fds[layer_idx] = fd
+            if apply_nocache:
+                fcntl.fcntl(fd, F_NOCACHE, 1)
     except Exception:
         for fd in fds.values():
             try:
@@ -119,7 +123,7 @@ class HeaderSpec:
     body_format: str
 
     def __post_init__(self) -> None:
-        # struct.Struct(fmt) is not internally cached — compile once per spec.
+        # Compile once; HeaderSpec is frozen, so body_struct is a constant property.
         object.__setattr__(self, "_body_struct", struct.Struct(self.body_format))
 
     @property
