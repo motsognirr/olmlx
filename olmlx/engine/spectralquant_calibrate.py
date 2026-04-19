@@ -506,7 +506,7 @@ def calibrate_model(
             for head_idx in range(n_kv_heads):
                 all_chunks.extend(kv_collectors[layer_idx][head_idx][kind])
             if not all_chunks:
-                logger.warning(
+                logger.debug(
                     "No KV data for layer %d %s, skipping",
                     layer_idx,
                     kind,
