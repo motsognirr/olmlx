@@ -41,6 +41,14 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
         "flash_speculative",
         "flash_speculative_draft_model",
         "flash_speculative_tokens",
+        # Standalone speculative decoding
+        "speculative",
+        "speculative_draft_model",
+        "speculative_tokens",
+        # DFlash block-diffusion speculative decoding
+        "dflash",
+        "dflash_draft_model",
+        "dflash_block_size",
         # KV cache quantization
         "kv_cache_quant",
         # Flash MoE

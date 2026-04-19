@@ -2016,7 +2016,7 @@ async def _stream_completion(
                 lm, tokens, original_prompt, max_tokens, broadcast_kwargs
             )
 
-        if lm.is_speculative:
+        if lm.is_speculative and not images:
             from olmlx.engine.speculative_stream import async_speculative_stream
 
             # Speculative decoding uses greedy argmax; sampling params are not supported.
@@ -2043,11 +2043,13 @@ async def _stream_completion(
                 )
             stream = async_speculative_stream(
                 lm.speculative_decoder,
-                lm.tokenizer,
+                lm.text_tokenizer,
                 prompt,
                 max_tokens=max_tokens,
             )
         else:
+            if lm.is_speculative:
+                logger.debug("speculative decoding skipped: request includes images")
             stream = async_mlx_stream(
                 lm.model,
                 lm.tokenizer,
@@ -2260,9 +2262,14 @@ async def _full_completion_inner(
 
         _apply_seed(gen_kwargs, consume=not lm.is_vlm)
 
-        if lm.is_vlm:
+        if lm.is_vlm and images:
+            if lm.is_speculative:
+                logger.debug("speculative decoding skipped: request includes images")
             import mlx_vlm
 
+            # mlx_vlm.generate returns a plain str; prompt/generation token
+            # counts are not exposed, so stats.prompt_eval_count /
+            # stats.eval_count stay 0 on this path.
             result = mlx_vlm.generate(
                 lm.model,
                 lm.tokenizer,
@@ -2271,7 +2278,9 @@ async def _full_completion_inner(
                 max_tokens=max_tokens,
                 **gen_kwargs,
             )
-            from mlx_vlm.generate import generation_stream
+            from mlx_vlm.generate import (
+                generation_stream,
+            )  # used by mx.synchronize below
         elif lm.is_speculative:
             import threading
 
@@ -2304,6 +2313,20 @@ async def _full_completion_inner(
             # so sync the default stream only.
             mx.synchronize()
             return result
+        elif lm.is_vlm:
+            import mlx_vlm
+
+            result = mlx_vlm.generate(
+                lm.model,
+                lm.tokenizer,
+                prompt=prompt,
+                image=images,
+                max_tokens=max_tokens,
+                **gen_kwargs,
+            )
+            from mlx_vlm.generate import (
+                generation_stream,
+            )  # used by mx.synchronize below
         else:
             import mlx_lm
 
@@ -2323,7 +2346,9 @@ async def _full_completion_inner(
             # Store full text on the result for downstream extraction
             if result is not None:
                 result = (result, "".join(text_parts))
-            from mlx_lm.generate import generation_stream
+            from mlx_lm.generate import (
+                generation_stream,
+            )  # used by mx.synchronize below
 
         # Sync the generation_stream specifically — mlx_lm/mlx_vlm run GPU
         # work on this module-level stream, not the default stream.  Without

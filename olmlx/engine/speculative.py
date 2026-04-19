@@ -11,6 +11,7 @@ subclass that adds prefetching and neuron window sizing.
 from __future__ import annotations
 
 import logging
+from typing import Any, cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -22,6 +23,12 @@ except ImportError:
     trim_prompt_cache = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+def _logits(out: Any) -> mx.array:
+    # mlx-vlm's language_model returns LanguageModelOutput(logits=...);
+    # mlx-lm models return a raw mx.array.
+    return cast(mx.array, getattr(out, "logits", out))
 
 
 def verify_draft_greedy(
@@ -99,13 +106,20 @@ class SpeculativeDecoder:
         self._last_target_logit: mx.array | None = None
         self._pending_token: int | None = None
 
-    def _update_acceptance_rate(self, num_accepted: int) -> None:
-        """Update the rolling acceptance rate via EMA."""
-        num_accepted_draft = (
-            min(num_accepted - 1, self._lambda) if num_accepted > 0 else 0
+        # Diagnostic counters (reset on prefill)
+        self._stats_steps: int = 0
+        self._stats_proposed: int = 0
+        self._stats_accepted_draft: int = 0
+
+    def _update_acceptance_rate(self, num_accepted: int) -> int:
+        """Update the rolling acceptance rate via EMA and return accepted-draft count."""
+        assert num_accepted >= 1, (
+            "_update_acceptance_rate: _verify() must return at least 1 token"
         )
+        num_accepted_draft = min(num_accepted - 1, self._lambda)
         acceptance = num_accepted_draft / max(self._lambda, 1)
         self._alpha = self._alpha_ema * self._alpha + (1 - self._alpha_ema) * acceptance
+        return num_accepted_draft
 
     # ------------------------------------------------------------------
     # Cached API: prefill() + step()
@@ -117,6 +131,27 @@ class SpeculativeDecoder:
         self._cache_seq_len = 0
         self._last_target_logit = None
         self._pending_token = None
+        self._stats_steps = 0
+        self._stats_proposed = 0
+        self._stats_accepted_draft = 0
+
+    def stats_summary(self) -> dict[str, Any]:
+        steps = self._stats_steps
+        proposed = self._stats_proposed
+        accepted_draft = self._stats_accepted_draft
+        acceptance_rate = accepted_draft / proposed if proposed else 0.0
+        # Mean accepted length: accepted drafts plus one guaranteed target
+        # token per step, i.e. total new tokens emitted per verification pass.
+        avg_tokens_per_step = (accepted_draft + steps) / steps if steps else 0.0
+        return {
+            "steps": steps,
+            "proposed": proposed,
+            "accepted_draft": accepted_draft,
+            "acceptance_rate": acceptance_rate,
+            "avg_tokens_per_step": avg_tokens_per_step,
+            "ema_acceptance_rate": self._alpha,
+            "lambda": self._lambda,
+        }
 
     def prefill(self, prompt: mx.array) -> int:
         """Process the prompt through both models, populating KV caches.
@@ -137,12 +172,22 @@ class SpeculativeDecoder:
         self._target_cache = make_prompt_cache(self._target)
         self._draft_cache = make_prompt_cache(self._draft)
 
-        target_out = self._target(prompt, cache=self._target_cache)
+        # Observed on mlx-vlm 0.4.4 with Qwen3_5: the language model caches
+        # `_position_ids` and `_rope_deltas` on the module instance across
+        # calls.  Left over from a prior request they produce broadcast
+        # mismatches when a new prompt has a different length.  Reset them
+        # at the start of each prefill.  If a future VLM caches analogous
+        # state under a different attribute name, add it here.
+        for attr in ("_position_ids", "_rope_deltas"):
+            if hasattr(self._target, attr):
+                setattr(self._target, attr, None)
+
+        target_out = _logits(self._target(prompt, cache=self._target_cache))
         self._last_target_logit = target_out[0, -1, :]
         mx.eval(self._last_target_logit)
 
         # Populate draft cache (logits discarded — only cache state needed).
-        draft_logits = self._draft(prompt, cache=self._draft_cache)
+        draft_logits = _logits(self._draft(prompt, cache=self._draft_cache))
         mx.eval(draft_logits)
 
         self._cache_seq_len = prompt.shape[1]
@@ -175,7 +220,7 @@ class SpeculativeDecoder:
 
         # 2. Target: feed [pending, D1, ..., D_lambda] in one pass.
         all_tokens = mx.array([[pending_token] + draft_tokens])
-        target_out = self._target(all_tokens, cache=self._target_cache)
+        target_out = _logits(self._target(all_tokens, cache=self._target_cache))
         mx.eval(target_out)
 
         verification_logits = target_out[0]  # (lambda+1, vocab)
@@ -199,7 +244,7 @@ class SpeculativeDecoder:
         # On full acceptance, align draft cache with target cache.
         if num_accepted > self._lambda:
             last_draft = mx.array([[draft_tokens[-1]]])
-            align_logits = self._draft(last_draft, cache=self._draft_cache)
+            align_logits = _logits(self._draft(last_draft, cache=self._draft_cache))
             mx.eval(align_logits)
 
         # 5. Update state
@@ -209,7 +254,12 @@ class SpeculativeDecoder:
         mx.eval(self._last_target_logit)
         self._pending_token = int(mx.argmax(self._last_target_logit).item())
 
-        self._update_acceptance_rate(num_accepted)
+        num_accepted_draft = self._update_acceptance_rate(num_accepted)
+
+        self._stats_steps += 1
+        self._stats_proposed += self._lambda
+        self._stats_accepted_draft += num_accepted_draft
+
         return accepted, self._lambda
 
     def _draft_generate_cached(
@@ -228,7 +278,7 @@ class SpeculativeDecoder:
 
         for _ in range(n):
             inp = mx.array([[next_token]])
-            logits = self._draft(inp, cache=self._draft_cache)
+            logits = _logits(self._draft(inp, cache=self._draft_cache))
             next_logits = logits[:, -1, :]
             mx.eval(next_logits)
             next_token = int(mx.argmax(next_logits, axis=-1).item())
@@ -258,7 +308,7 @@ class SpeculativeDecoder:
                 pass
 
         if cache is not None:
-            logits = self._draft(prompt, cache=cache)
+            logits = _logits(self._draft(prompt, cache=cache))
             next_logits = logits[:, -1, :]
             mx.eval(next_logits)
             next_token = int(mx.argmax(next_logits, axis=-1).item())
@@ -266,7 +316,7 @@ class SpeculativeDecoder:
 
             for _ in range(n - 1):
                 inp = mx.array([[next_token]])
-                logits = self._draft(inp, cache=cache)
+                logits = _logits(self._draft(inp, cache=cache))
                 next_logits = logits[:, -1, :]
                 mx.eval(next_logits)
                 next_token = int(mx.argmax(next_logits, axis=-1).item())
@@ -277,7 +327,7 @@ class SpeculativeDecoder:
                     current = mx.concatenate([prompt, mx.array([tokens])], axis=1)
                 else:
                     current = prompt
-                logits = self._draft(current)
+                logits = _logits(self._draft(current))
                 next_logits = logits[:, -1, :]
                 mx.eval(next_logits)
                 next_token = int(mx.argmax(next_logits, axis=-1).item())
@@ -302,7 +352,11 @@ class SpeculativeDecoder:
 
         draft_ids = mx.array([draft_tokens])
         combined = mx.concatenate([prompt, draft_ids], axis=1)
-        target_out = self._target(combined)
+        # See prefill() for why this reset is needed (mlx-vlm 0.4.4 VLMs).
+        for attr in ("_position_ids", "_rope_deltas"):
+            if hasattr(self._target, attr):
+                setattr(self._target, attr, None)
+        target_out = _logits(self._target(combined))
         mx.eval(target_out)
 
         seq_len = prompt.shape[1]
@@ -310,5 +364,8 @@ class SpeculativeDecoder:
 
         accepted = self._verify(draft_tokens, target_logits)
 
-        self._update_acceptance_rate(len(accepted))
+        num_accepted_draft = self._update_acceptance_rate(len(accepted))
+        self._stats_steps += 1
+        self._stats_proposed += self._lambda
+        self._stats_accepted_draft += num_accepted_draft
         return accepted, self._lambda

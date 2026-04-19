@@ -1428,9 +1428,20 @@ class ModelManager:
         )
 
     def _load_speculative_decoder(
-        self, target_model: Any, hf_path: str, model_exp: Any
+        self,
+        target_model: Any,
+        hf_path: str,
+        model_exp: Any,
+        *,
+        is_vlm: bool = False,
     ) -> Any:
-        """Load a draft model and create a SpeculativeDecoder."""
+        """Load a draft model and create a SpeculativeDecoder.
+
+        For VLM targets (``is_vlm=True``), the decoder runs on the unwrapped
+        language model (``target_model.language_model``) so the draft only
+        needs to match the text decoder's vocabulary and the speculative loop
+        can call the language model directly with token inputs and a KV cache.
+        """
         from olmlx.engine.speculative import SpeculativeDecoder
 
         if not model_exp.speculative_draft_model:
@@ -1451,11 +1462,20 @@ class ModelManager:
             mlx_lm, load_path, lazy=False
         )
 
-        self._check_vocab_match(target_model, draft_model)
+        if is_vlm:
+            spec_target = getattr(target_model, "language_model", None)
+            if spec_target is None:
+                raise ValueError(
+                    "VLM model does not expose .language_model; speculative "
+                    "decoding requires direct access to the text decoder"
+                )
+        else:
+            spec_target = target_model
+        self._check_vocab_match(spec_target, draft_model)
 
         return SpeculativeDecoder(
             draft_model=draft_model,
-            target_model=target_model,
+            target_model=spec_target,
             num_speculative_tokens=model_exp.speculative_tokens,
         )
 
@@ -1718,6 +1738,24 @@ class ModelManager:
                 )
                 self._load_chat_template(tok, load_path, hf_path)
                 caps = detect_caps(tok)
+                if model_exp.dflash:
+                    raise ValueError(
+                        "dflash is not supported on VLM targets; "
+                        "remove dflash from models.json or unset "
+                        "OLMLX_EXPERIMENTAL_DFLASH"
+                    )
+                if model_exp.flash_speculative:
+                    raise ValueError(
+                        "flash_speculative is not supported on VLM targets; "
+                        "remove flash_speculative from models.json (or unset "
+                        "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE) and use "
+                        "speculative instead"
+                    )
+                if model_exp.speculative:
+                    decoder = self._load_speculative_decoder(
+                        model, hf_path, model_exp, is_vlm=True
+                    )
+                    return model, processor, True, caps, decoder
                 return model, processor, True, caps, None
             except OSError as exc:
                 # AutoProcessor may fail (e.g. missing preprocessor_config.json

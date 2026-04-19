@@ -85,6 +85,23 @@ def speculative_stream_generate(
     ) or cancel_event.is_set():
         return
 
+    def _log_stats():
+        stats_fn = getattr(decoder, "stats_summary", None)
+        if stats_fn is None:
+            return
+        s = stats_fn()
+        logger.info(
+            "speculative stats: steps=%d proposed=%d accepted_draft=%d "
+            "acceptance_rate=%.3f avg_tokens_per_step=%.3f ema=%.3f lambda=%d",
+            s.get("steps", 0),
+            s.get("proposed", 0),
+            s.get("accepted_draft", 0),
+            s.get("acceptance_rate", 0.0),
+            s.get("avg_tokens_per_step", 0.0),
+            s.get("ema_acceptance_rate", 0.0),
+            s.get("lambda", 0),
+        )
+
     while gen_count < max_tokens:
         if cancel_event.is_set():
             break
@@ -123,7 +140,10 @@ def speculative_stream_generate(
             )
 
             if finish is not None:
+                _log_stats()
                 return
+
+    _log_stats()
 
 
 def async_speculative_stream(
