@@ -401,6 +401,37 @@ class TestDeferredCleanupLockPerLoop:
             if r.exc_info is not None
         ), "reset must surface the __context__ exception under cancellation"
 
+    @pytest.mark.asyncio
+    async def test_await_deferred_cleanup_logs_task_exception(self, caplog):
+        """``_await_deferred_cleanup`` must log the stored exception of a
+        task that finished with a non-cancel error.  Without the log, the
+        exception is silently dropped after ``asyncio.wait`` returns and
+        the next request runs on potentially dirty Metal state with no
+        operator signal.
+        """
+        import asyncio
+        import logging
+
+        async def boom():
+            raise RuntimeError("cleanup exploded")
+
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(boom())
+        _inf_mod._deferred_cleanup_tasks[loop] = task
+        try:
+            with caplog.at_level(logging.ERROR, logger="olmlx.engine.inference"):
+                await _inf_mod._await_deferred_cleanup()
+
+            assert any(
+                "Deferred inference cleanup" in r.message
+                and "cleanup exploded" in str(r.exc_info[1])
+                for r in caplog.records
+                if r.exc_info is not None
+            ), "_await_deferred_cleanup must log the task's exception at ERROR"
+        finally:
+            _inf_mod._deferred_cleanup_tasks.pop(loop, None)
+            _inf_mod._deferred_cleanup_locks.pop(loop, None)
+
 
 # ---------------------------------------------------------------------------
 # Bug #120: GPU memory not freed on client disconnect during long prefill

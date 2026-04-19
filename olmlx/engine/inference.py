@@ -279,8 +279,12 @@ async def _reset_inference_state() -> None:
                 # If ``_cleanup`` raised in its body and the cancellation
                 # arrived in its finally (e.g. at ``await lock.acquire()``),
                 # the original exception lives on as ``__context__`` of the
-                # ``CancelledError``.  Surface it so it isn't lost.
-                if cancel_exc.__context__ is not None:
+                # ``CancelledError``.  Surface it so it isn't lost.  Nested
+                # cancellation (``__context__`` is itself a ``CancelledError``)
+                # is not an application error and shouldn't trigger this log.
+                if cancel_exc.__context__ is not None and not isinstance(
+                    cancel_exc.__context__, asyncio.CancelledError
+                ):
                     logger.warning(
                         "Cleanup exception masked by cancellation during reset: %s",
                         cancel_exc.__context__,
