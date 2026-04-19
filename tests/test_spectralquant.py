@@ -741,52 +741,72 @@ class TestSpectralConfig:
         model = MagicMock(spec=["layers", "make_cache"])
         assert _resolve_cache_owner(inner, model) is model
 
-    def test_is_attention_cache_state_4d(self):
-        """Only 4D (B, n_kv, seq, head_dim) states matching head_dim are attention caches."""
-        from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
+    def test_is_attention_cache_accepts_kvcache_with_valid_state(self):
+        """A KVCache with 4D state matching head_dim is accepted."""
+        from unittest.mock import MagicMock
+
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache
 
         ok_keys = mx.zeros((1, 2, 16, 256))
         ok_vals = mx.zeros((1, 2, 16, 256))
-        assert _is_attention_cache_state([ok_keys, ok_vals], 256) is True
+        cache = MagicMock(spec=KVCache)
+        cache.state = [ok_keys, ok_vals]
+        assert _is_attention_cache(cache, 256) is True
 
-    def test_is_attention_cache_state_ssm_3d(self):
-        """Qwen3Next SSM cache: conv state (index 0) is 3D, so the entry is skipped."""
-        from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
+    def test_is_attention_cache_rejects_non_kvcache_type(self):
+        """An SSM-style cache (e.g. ArraysCache) is rejected regardless of shape."""
+        from unittest.mock import MagicMock
 
-        ssm_conv = mx.zeros((1, 3, 8192))  # conv state
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache
+
+        ok_keys = mx.zeros((1, 2, 16, 256))
+        ok_vals = mx.zeros((1, 2, 16, 256))
+        # Not a KVCache — simulates ArraysCache or similar SSM cache type.
+        cache = MagicMock(spec=[])
+        cache.state = [ok_keys, ok_vals]
+        assert _is_attention_cache(cache, 256) is False
+
+    def test_is_attention_cache_rejects_kvcache_ssm_3d_state(self):
+        """Qwen3Next-like 3D first-element state is rejected even on a KVCache."""
+        from unittest.mock import MagicMock
+
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache
+
+        ssm_conv = mx.zeros((1, 3, 8192))  # conv state (3D)
         ssm_hid = mx.zeros((1, 32, 128, 128))
-        assert _is_attention_cache_state([ssm_conv, ssm_hid], 256) is False
+        cache = MagicMock(spec=KVCache)
+        cache.state = [ssm_conv, ssm_hid]
+        assert _is_attention_cache(cache, 256) is False
 
-    def test_is_attention_cache_state_mamba2_4d_rejected(self):
-        """Mamba2 per-step recurrent state (B, n_heads, 1, d_state) is 4D but seq==1."""
-        from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
+    def test_is_attention_cache_rejects_per_step_seq_equals_one(self):
+        """A per-step state with seq==1 is rejected by the shape check."""
+        from unittest.mock import MagicMock
 
-        mamba_state = mx.zeros((1, 8, 1, 128))
-        mamba_extra = mx.zeros((1, 8, 1, 128))
-        # d_state=128 coincides with head_dim=128, so seq==1 is what rejects it.
-        assert _is_attention_cache_state([mamba_state, mamba_extra], 128) is False
+        from mlx_lm.models.cache import KVCache
 
-    def test_is_attention_cache_state_mamba2_chunked_scan_rejected(self):
-        """Chunked-scan Mamba2 state may have seq>1, but d_state mismatches head_dim."""
-        from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache
 
-        # Chunked SSM state: d_state is typically 16-64, not the attention head_dim.
-        ssm_chunked = mx.zeros((1, 8, 32, 64))  # seq==32 (chunk), d_state==64
-        ssm_extra = mx.zeros((1, 8, 32, 64))
-        assert _is_attention_cache_state([ssm_chunked, ssm_extra], 256) is False
+        per_step = mx.zeros((1, 8, 1, 128))
+        cache = MagicMock(spec=KVCache)
+        cache.state = [per_step, per_step]
+        assert _is_attention_cache(cache, 128) is False
 
-    def test_is_attention_cache_state_shape_filter_cannot_reject_matching_d_state(self):
-        """Document the shape-filter gap: a chunked SSM state where `d_state == head_dim`
-        and `seq >= 2` passes the shape check. Safety relies entirely on the
-        `isinstance(cache_entry, KVCache)` primary filter at the call site. This
-        test locks the contract so a future refactor that calls
-        `_is_attention_cache_state` without the isinstance guard fails loudly.
-        """
-        from olmlx.engine.spectralquant_calibrate import _is_attention_cache_state
+    def test_is_attention_cache_rejects_head_dim_mismatch(self):
+        """A KVCache whose last-axis size doesn't match head_dim is rejected."""
+        from unittest.mock import MagicMock
 
-        # Hypothetical chunked SSM with d_state=128 colliding with head_dim=128.
-        chunked = mx.zeros((1, 8, 32, 128))
-        assert _is_attention_cache_state([chunked, chunked], 128) is True
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine.spectralquant_calibrate import _is_attention_cache
+
+        mismatched = mx.zeros((1, 8, 32, 64))  # head_dim=64 in the state
+        cache = MagicMock(spec=KVCache)
+        cache.state = [mismatched, mismatched]
+        assert _is_attention_cache(cache, 256) is False  # expect 256, got 64
 
     def test_resolve_config_holder_accepts_config_attribute(self):
         """VL LanguageModel wrappers may expose `.config` instead of `.args`."""

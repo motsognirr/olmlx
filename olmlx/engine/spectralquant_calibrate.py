@@ -15,6 +15,7 @@ from typing import Any
 
 import mlx.core as mx
 import numpy as np
+from mlx_lm.models.cache import KVCache
 
 from olmlx.engine.spectralquant import allocate_bits, fit_codebook
 
@@ -44,10 +45,17 @@ def _resolve_config_holder(inner: Any, model: Any) -> Any:
 
 def _config_namespace(cfg_holder: Any) -> Any:
     # Return the `.args` or `.config` object carrying architecture fields.
-    # Precondition: caller has verified via `_resolve_config_holder` that one
-    # of these exists, so no validation is needed here.
+    # `_resolve_config_holder` normally enforces that one of these is present,
+    # but raise explicitly here so the function's contract is enforceable in
+    # isolation (matches the `_detect_head_dim` pattern in turboquant_cache).
     args = getattr(cfg_holder, "args", None)
-    return args if args is not None else getattr(cfg_holder, "config", None)
+    result = args if args is not None else getattr(cfg_holder, "config", None)
+    if result is None:
+        raise RuntimeError(
+            f"_config_namespace: {type(cfg_holder).__name__} has neither "
+            "'.args' nor '.config'"
+        )
+    return result
 
 
 def _build_empty_collection_error(first_exc: Exception | None) -> RuntimeError:
@@ -75,14 +83,20 @@ def _build_empty_collection_error(first_exc: Exception | None) -> RuntimeError:
     )
 
 
-def _is_attention_cache_state(state: Any, expected_head_dim: int) -> bool:
-    # Secondary shape check for confirmed KVCache entries (primary filter is
-    # `isinstance(cache_entry, KVCache)` at the call site). Guards against:
+def _is_attention_cache(cache_entry: Any, expected_head_dim: int) -> bool:
+    # Combined filter: must be a standard KVCache (not an SSM cache type such
+    # as ArraysCache) AND expose a plausible 4D attention state. The isinstance
+    # guard is load-bearing — shape alone cannot reject Mamba2 states where
+    # `d_state == head_dim`. Keeping both checks inside this function means
+    # the signature enforces the full contract and a future refactor can't
+    # accidentally drop the type guard. Also guards against:
     # - empty caches not yet populated (len(state) < 2)
-    # - non-4D tensors (should not happen in practice)
     # - caches seeded with < 2 tokens (seq < 2; already excluded by the
-    #   `len(tokens) < 2` guard above, but kept as a defensive check)
+    #   `len(tokens) < 2` guard in `calibrate_model`, but kept as defense)
     # - head_dim mismatch (e.g. model weights loaded with a mismatched config)
+    if not isinstance(cache_entry, KVCache):
+        return False
+    state: Any = cache_entry.state
     if not state or len(state) < 2:
         return False
     keys = state[0]
@@ -399,7 +413,7 @@ def calibrate_model(
     # KV cache, then extracting the cached tensors.  This captures keys and
     # values *after* rotary positional embeddings — the actual distribution
     # that gets stored in the KV cache at inference time.
-    from mlx_lm.models.cache import KVCache, make_prompt_cache
+    from mlx_lm.models.cache import make_prompt_cache
 
     cache_model = _resolve_cache_owner(inner, model)
     first_exc: Exception | None = None
@@ -432,15 +446,11 @@ def calibrate_model(
         # Extract K/V from each layer's cache
         for layer_idx in range(min(num_layers, len(prompt_cache))):
             cache_entry = prompt_cache[layer_idx]
-            # Primary filter: must be a standard attention KV cache. Hybrid
-            # models (Qwen3Next, Falcon-H1, Zamba2) mix these with SSM cache
-            # types whose `.state` may coincidentally match the attention
-            # shape (e.g. Mamba2 with d_state == head_dim).
-            if not isinstance(cache_entry, KVCache):
+            # Combined type + shape filter. Rejects SSM cache types (ArraysCache,
+            # etc.) and KVCaches whose state doesn't match attention shape.
+            if not _is_attention_cache(cache_entry, head_dim):
                 continue
             state = cache_entry.state
-            if not _is_attention_cache_state(state, head_dim):
-                continue
             # KVCache.state returns [keys, values] with shape
             # (1, n_kv_heads, seq_len, head_dim)
             cached_keys = state[0]  # (1, n_kv_heads, seq, head_dim)
