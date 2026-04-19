@@ -363,6 +363,44 @@ class TestDeferredCleanupLockPerLoop:
             if r.exc_info is not None
         ), "reset must log the stored exception with exc_info"
 
+    @pytest.mark.asyncio
+    async def test_reset_surfaces_cancel_masked_exception(self, caplog):
+        """When ``_reset_inference_state`` cancels a task whose body raised
+        and whose finally block awaits, ``CancelledError`` carries the
+        original exception as ``__context__``.  The reset path must surface
+        that masked exception so it isn't silently lost.
+        """
+        import asyncio
+        import logging
+
+        loop = asyncio.get_running_loop()
+        body_started = asyncio.Event()
+        finally_blocker = asyncio.Event()
+
+        async def cleanup_with_masked_error():
+            try:
+                body_started.set()
+                raise RuntimeError("real cleanup failure")
+            finally:
+                # Block here so reset can deliver CancelledError into the
+                # finally — the original RuntimeError becomes __context__.
+                await finally_blocker.wait()
+
+        task = asyncio.create_task(cleanup_with_masked_error())
+        _inf_mod._deferred_cleanup_tasks[loop] = task
+        await body_started.wait()
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
+            await _inf_mod._reset_inference_state()
+
+        assert _inf_mod._deferred_cleanup_tasks.get(loop) is None
+        assert any(
+            "masked by cancellation" in r.message
+            and "real cleanup failure" in str(r.exc_info[1])
+            for r in caplog.records
+            if r.exc_info is not None
+        ), "reset must surface the __context__ exception under cancellation"
+
 
 # ---------------------------------------------------------------------------
 # Bug #120: GPU memory not freed on client disconnect during long prefill

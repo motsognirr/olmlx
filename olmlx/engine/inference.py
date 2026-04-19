@@ -275,8 +275,17 @@ async def _reset_inference_state() -> None:
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, asyncio.InvalidStateError):
-                pass
+            except (asyncio.CancelledError, asyncio.InvalidStateError) as cancel_exc:
+                # If ``_cleanup`` raised in its body and the cancellation
+                # arrived in its finally (e.g. at ``await lock.acquire()``),
+                # the original exception lives on as ``__context__`` of the
+                # ``CancelledError``.  Surface it so it isn't lost.
+                if cancel_exc.__context__ is not None:
+                    logger.warning(
+                        "Cleanup exception masked by cancellation during reset: %s",
+                        cancel_exc.__context__,
+                        exc_info=cancel_exc.__context__,
+                    )
             except Exception as exc:
                 # Race: the task was about to finish with a non-cancellation
                 # exception when we called ``cancel()``, so ``await task``
@@ -464,11 +473,14 @@ async def _await_deferred_cleanup():
         )
     # ``asyncio.wait`` returns completed tasks regardless of whether they raised;
     # surface any exception so it isn't silently dropped on the return path.
-    # Log-and-proceed is intentional: ``_cleanup``'s finally runs
-    # ``lock.release()`` unconditionally before any return from this task, so
-    # the inference lock is always released and the next request can proceed.
-    # Callers have no need to reject the following inference — the lock state
-    # is correct regardless of cleanup outcome.  The log is the signal.
+    # Log-and-proceed is the same trade-off as the force-release in
+    # ``_reset_inference_state``: if ``_cleanup`` raised, ``_safe_sync`` may
+    # not have completed, so the next inference can run on top of dirty Metal
+    # state (risking a Metal crash on the next request).  We accept that risk
+    # because the alternative — refusing the next request — is also lose:
+    # ``_inference_lock`` is already released and recovery would require
+    # restarting the server.  The ERROR log is the only signal to the operator
+    # that the cleanup failed; the request stream itself shows no failure.
     if not task.cancelled():
         exc = task.exception()
         if exc is not None:
