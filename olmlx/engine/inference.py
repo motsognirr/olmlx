@@ -560,8 +560,23 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
             else:
                 logger.info("Deferred inference cleanup: thread exited cleanly")
         finally:
-            if thread is None or not thread.is_alive():
-                _safe_sync()
+            # ``_safe_sync`` already suppresses errors from its own
+            # ``mx.synchronize`` calls, but wrap defensively so
+            # ``lock.release()`` is truly unconditional — a future refactor
+            # could change ``_safe_sync``'s error handling, and a failure
+            # to release the inference lock would silently deadlock every
+            # subsequent inference.
+            try:
+                if thread is None or not thread.is_alive():
+                    _safe_sync()
+            except Exception as sync_exc:
+                logger.error(
+                    "Deferred inference cleanup: _safe_sync raised; "
+                    "Metal state may be dirty, consider restart if this "
+                    "persists: %s",
+                    sync_exc,
+                    exc_info=sync_exc,
+                )
             # Note: on timeout/abort with thread still alive, releasing the
             # lock risks a Metal crash on the next inference (the stuck thread
             # may still be issuing GPU commands).  Python can't kill CPU-bound
