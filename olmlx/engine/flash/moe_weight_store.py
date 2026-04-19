@@ -6,6 +6,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import mlx.core as mx
 import numpy as np
@@ -68,7 +69,7 @@ class LoadedExperts:
     remap_lut: mx.array | None = None
 
 
-_ExpertCache = LayerLruCache[int, dict]
+_ExpertCache = LayerLruCache[int, dict[str, Any]]
 
 
 class FlashMoeWeightStore:

@@ -25,7 +25,7 @@ import sys
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Generic, Hashable, Sequence, TypeVar
+from typing import Any, Generic, Hashable, Sequence, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,11 @@ def open_fds(
 
 
 def close_fds(fds: dict[int, int]) -> None:
-    """Close all file descriptors in the mapping, ignoring close errors."""
+    """Close all file descriptors in the mapping and clear it.
+
+    Clearing the mapping prevents a second close attempt when ``close()`` is
+    followed by ``__del__`` on the same store.
+    """
     for fd in fds.values():
         try:
             os.close(fd)
@@ -114,16 +118,20 @@ class HeaderSpec:
     size: int
     body_format: str
 
+    def __post_init__(self) -> None:
+        # struct.Struct(fmt) is not internally cached — compile once per spec.
+        object.__setattr__(self, "_body_struct", struct.Struct(self.body_format))
+
     @property
     def body_struct(self) -> struct.Struct:
-        return struct.Struct(self.body_format)
+        return self._body_struct  # type: ignore[attr-defined]
 
 
 # Magic + version are always little-endian uint32s at the head of the buffer.
 _PREFIX = struct.Struct("<II")
 
 
-def encode_header(spec: HeaderSpec, *values: object) -> bytes:
+def encode_header(spec: HeaderSpec, *values: Any) -> bytes:
     """Pack magic + version + *values*, then zero-pad to ``spec.size``."""
     body = spec.body_struct.pack(*values)
     head = _PREFIX.pack(spec.magic, spec.version) + body
@@ -134,7 +142,7 @@ def encode_header(spec: HeaderSpec, *values: object) -> bytes:
     return head + b"\x00" * (spec.size - len(head))
 
 
-def parse_header(spec: HeaderSpec, data: bytes) -> tuple[object, ...]:
+def parse_header(spec: HeaderSpec, data: bytes) -> tuple[Any, ...]:
     """Verify magic + version and unpack the body. Returns the body tuple."""
     if len(data) < spec.size:
         raise ValueError(

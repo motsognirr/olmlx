@@ -126,7 +126,7 @@ class TestLayerLruCache:
         for t in threads:
             t.join()
 
-        # All entries fit (max 512 > 8 * 64 = 512); every value must be readable
+        # All entries fit (max_per_layer=512 == 8×64); no eviction, every key must be readable.
         for tid in range(num_threads):
             for i in range(per_thread):
                 key = tid * per_thread + i
