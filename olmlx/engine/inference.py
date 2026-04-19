@@ -352,6 +352,13 @@ def _get_deferred_cleanup_lock() -> asyncio.Lock:
     ``None`` simultaneously.  WeakKeyDictionary is not thread-safe for
     concurrent writes from multiple OS threads each running their own
     loop — this server runs on one thread, so that case doesn't apply.
+
+    Must be called from within a running event loop — uses
+    ``asyncio.get_running_loop()``, which raises ``RuntimeError`` if invoked
+    from synchronous code.  All callers (``_await_deferred_cleanup``,
+    ``_schedule_deferred_inference_cleanup``, ``_cleanup``'s finally) run
+    inside running loops.  Test code accessing this directly must do so
+    from an ``async def`` test or via ``loop.run_until_complete``.
     """
     loop = asyncio.get_running_loop()
     lock = _deferred_cleanup_locks.get(loop)
