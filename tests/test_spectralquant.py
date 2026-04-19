@@ -66,6 +66,34 @@ class TestSpectralRotation:
 
 
 # ---------------------------------------------------------------------------
+# pack_indices / unpack_indices tests
+# ---------------------------------------------------------------------------
+
+
+class TestPackUnpack:
+    """Round-trip tests for the variable-bit index packers."""
+
+    @pytest.mark.parametrize("bits", [1, 2, 4, 8])
+    @pytest.mark.parametrize("dim", [8, 15, 16, 31, 32, 127, 128])
+    @pytest.mark.parametrize("dtype", [np.uint8, np.int32])
+    def test_roundtrip(self, bits, dim, dtype):
+        """unpack(pack(x)) should reproduce x for any dim — including
+        odd/non-multiple-of-factor tail sizes that SpectralQuant produces
+        when d_eff lands on an odd number. The int32 dtype is defensive
+        coverage: today's only caller (`_quantize_regime`) casts to uint8
+        before calling `pack_indices`, but this keeps the packer honest."""
+        from olmlx.engine.spectralquant import pack_indices, unpack_indices
+
+        max_val = (1 << bits) - 1
+        rng = np.random.RandomState(bits * 100 + dim)
+        indices = mx.array(rng.randint(0, max_val + 1, size=(2, 3, dim)).astype(dtype))
+        packed = pack_indices(indices, bits)
+        restored = unpack_indices(packed, bits, dim)
+        assert restored.shape == indices.shape
+        np.testing.assert_array_equal(np.array(restored), np.array(indices))
+
+
+# ---------------------------------------------------------------------------
 # Bit allocation tests
 # ---------------------------------------------------------------------------
 
@@ -352,69 +380,47 @@ class TestSpectralQuantizeDequantize:
         )
         assert result.dtype == mx.float16
 
+    def test_roundtrip_d_eff_1_tail_127(self):
+        """Regression: Qwen3-4B layer 0 calibrates to d_eff=1, so tail_dim=127
+        (odd) and bits_low=2 — the exact path that broke before the odd-dim
+        packing fix."""
+        from olmlx.engine.spectralquant import (
+            SpectralRotation,
+            fit_codebook,
+            spectral_dequantize,
+            spectral_quantize,
+        )
 
-# ---------------------------------------------------------------------------
-# QJL Sketcher tests
-# ---------------------------------------------------------------------------
+        head_dim = 128
+        d_eff = 1
+        bits_high = 4
+        bits_low = 2
+        rng = np.random.RandomState(0)
+        q, _ = np.linalg.qr(rng.randn(head_dim, head_dim).astype(np.float32))
+        rotation = SpectralRotation(mx.array(q))
 
+        x = mx.random.normal((200, head_dim))
+        norms = mx.linalg.norm(x, axis=-1, keepdims=True)
+        rotated = rotation.rotate(x / mx.maximum(norms, mx.array(1e-8)))
+        codebook_sem = fit_codebook(rotated[..., :d_eff].reshape(-1), bits=bits_high)
+        codebook_tail = fit_codebook(rotated[..., d_eff:].reshape(-1), bits=bits_low)
 
-class TestQJLSketcher:
-    """Tests for Quantization Johnson-Lindenstrauss sketcher."""
-
-    def test_sign_matrix_entries(self):
-        """Sign matrix should contain only +1 and -1."""
-        from olmlx.engine.spectralquant import QJLSketcher
-
-        sketcher = QJLSketcher(d_eff=10, n_projections=32, seed=42)
-        S_np = np.array(sketcher.S)
-        assert set(S_np.flatten().tolist()) == {-1.0, 1.0}
-
-    def test_sign_matrix_shape(self):
-        """Sign matrix should be (n_projections, d_eff)."""
-        from olmlx.engine.spectralquant import QJLSketcher
-
-        sketcher = QJLSketcher(d_eff=8, n_projections=64, seed=0)
-        assert sketcher.S.shape == (64, 8)
-
-    def test_compute_signs_output_is_binary(self):
-        """compute_signs should return packed bits."""
-        from olmlx.engine.spectralquant import QJLSketcher
-
-        sketcher = QJLSketcher(d_eff=8, n_projections=32, seed=42)
-        residual = mx.random.normal((2, 4, 10, 8))  # (B, heads, seq, d_eff)
-        signs = sketcher.compute_signs(residual)
-        # Packed into uint8, so shape last dim = ceil(n_projections / 8)
-        assert signs.shape[-1] == 4  # 32 projections / 8 bits per byte
-
-    def test_deterministic_with_same_seed(self):
-        """Same seed should produce same sign matrix."""
-        from olmlx.engine.spectralquant import QJLSketcher
-
-        s1 = QJLSketcher(d_eff=16, n_projections=64, seed=7)
-        s2 = QJLSketcher(d_eff=16, n_projections=64, seed=7)
-        np.testing.assert_array_equal(np.array(s1.S), np.array(s2.S))
-
-    def test_different_seeds_differ(self):
-        """Different seeds should produce different sign matrices."""
-        from olmlx.engine.spectralquant import QJLSketcher
-
-        s1 = QJLSketcher(d_eff=16, n_projections=64, seed=0)
-        s2 = QJLSketcher(d_eff=16, n_projections=64, seed=1)
-        assert not np.array_equal(np.array(s1.S), np.array(s2.S))
-
-    def test_score_correction_shape(self):
-        """correct_scores should return (B, heads, n_queries, seq_len)."""
-        from olmlx.engine.spectralquant import QJLSketcher
-
-        d_eff = 8
-        n_proj = 32
-        sketcher = QJLSketcher(d_eff=d_eff, n_projections=n_proj, seed=42)
-
-        q_semantic = mx.random.normal((1, 2, 3, d_eff))  # 3 queries
-        # Packed signs for 10 key positions
-        signs = mx.zeros((1, 2, 10, n_proj // 8), dtype=mx.uint8)
-        correction = sketcher.correct_scores(q_semantic, signs)
-        assert correction.shape == (1, 2, 3, 10)
+        y = mx.random.normal((2, 3, 5, head_dim))
+        packed_sem, packed_tail, y_norms = spectral_quantize(
+            y, rotation, codebook_sem, codebook_tail, d_eff, bits_high, bits_low
+        )
+        reconstructed = spectral_dequantize(
+            packed_sem,
+            packed_tail,
+            y_norms,
+            rotation,
+            codebook_sem,
+            codebook_tail,
+            d_eff,
+            bits_high,
+            bits_low,
+        )
+        assert reconstructed.shape == y.shape
 
 
 # ---------------------------------------------------------------------------
