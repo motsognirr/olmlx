@@ -53,7 +53,8 @@ olmlx/
 │       ├── prefetch.py      # Prefetcher: background neuron prefetch with thread pool + stats
 │       ├── prepare.py       # prepare_model_for_flash pipeline, predictor training
 │       ├── speculative.py   # SpeculativeFlashDecoder: extends SpeculativeDecoder with prefetch
-│       ├── weight_store.py  # FlashWeightStore: SSD I/O, NeuronCache, preallocated buffers
+│       ├── _ssd_base.py     # LayerLruCache, HeaderSpec codec, full_pread — shared by dense + MoE stores
+│       ├── weight_store.py  # FlashWeightStore: SSD I/O + LayerLruCache + preallocated buffers
 │       ├── flash_moe.py     # Flash-MoE sparse expert loading
 │       ├── flash_moe_model.py # Flash-MoE model wrapper
 │       ├── moe_bundler.py   # Bundle MoE expert weights

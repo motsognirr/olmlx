@@ -15,7 +15,7 @@ from olmlx.engine.flash.predictor import (
     PredictorBank,
     SparsityPredictor,
 )
-from olmlx.engine.flash.weight_store import FlashWeightStore, NeuronCache
+from olmlx.engine.flash.weight_store import FlashWeightStore
 
 
 # ---------------------------------------------------------------------------
@@ -49,42 +49,6 @@ def _make_bundled_model(tmp_path, hidden=16, inter=8, num_layers=2):
     flash_dir = tmp_path / "flash"
     bundle_ffn_weights(model_dir, flash_dir)
     return flash_dir, model_dir, tensors
-
-
-# ---------------------------------------------------------------------------
-# NeuronCache.get_cached_indices tests
-# ---------------------------------------------------------------------------
-
-
-class TestNeuronCacheGetCachedIndices:
-    def test_empty_cache(self):
-        cache = NeuronCache(max_neurons_per_layer=64)
-        cached, missing = cache.get_cached_indices(0, [0, 1, 2])
-        assert cached == []
-        assert missing == [0, 1, 2]
-
-    def test_all_cached(self):
-        cache = NeuronCache(max_neurons_per_layer=64)
-        for i in range(3):
-            cache.put(0, i, (mx.zeros(4), mx.zeros(4), mx.zeros(4)))
-        cached, missing = cache.get_cached_indices(0, [0, 1, 2])
-        assert cached == [0, 1, 2]
-        assert missing == []
-
-    def test_partial_cache(self):
-        cache = NeuronCache(max_neurons_per_layer=64)
-        cache.put(0, 0, (mx.zeros(4), mx.zeros(4), mx.zeros(4)))
-        cache.put(0, 2, (mx.zeros(4), mx.zeros(4), mx.zeros(4)))
-        cached, missing = cache.get_cached_indices(0, [0, 1, 2])
-        assert cached == [0, 2]
-        assert missing == [1]
-
-    def test_wrong_layer(self):
-        cache = NeuronCache(max_neurons_per_layer=64)
-        cache.put(0, 0, (mx.zeros(4), mx.zeros(4), mx.zeros(4)))
-        cached, missing = cache.get_cached_indices(1, [0])
-        assert cached == []
-        assert missing == [0]
 
 
 # ---------------------------------------------------------------------------

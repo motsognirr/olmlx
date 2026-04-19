@@ -13,12 +13,14 @@ from __future__ import annotations
 import json
 import logging
 import re
-import struct
 from dataclasses import dataclass
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+
+from olmlx.engine.flash import _ssd_base
+from olmlx.engine.flash._ssd_base import HeaderSpec
 
 logger = logging.getLogger(__name__)
 
@@ -33,33 +35,35 @@ _DTYPE_BYTES = {
     "bfloat16": 2,
 }
 
-# Header format: magic(4) version(4) num_neurons(4) hidden_size(4)
-# dtype_len(4) dtype(16) padding(28) = 64 bytes
-_HEADER_STRUCT = struct.Struct("<IIII4s16s28s")
+# Body: num_neurons(4) hidden_size(4) dtype_len(4) dtype(16) = 28 bytes.
+# Prefix (magic+version) is 8 bytes; padding to 64 bytes is handled by the codec.
+_HEADER_SPEC = HeaderSpec(
+    magic=HEADER_MAGIC,
+    version=HEADER_VERSION,
+    size=HEADER_SIZE,
+    body_format="<III16s",
+)
 
 
 def _encode_header(num_neurons: int, hidden_size: int, dtype: str) -> bytes:
     dtype_bytes = dtype.encode("ascii")
-    return _HEADER_STRUCT.pack(
-        HEADER_MAGIC,
-        HEADER_VERSION,
+    return _ssd_base.encode_header(
+        _HEADER_SPEC,
         num_neurons,
         hidden_size,
-        struct.pack("<I", len(dtype_bytes)),
+        len(dtype_bytes),
         dtype_bytes.ljust(16, b"\x00"),
-        b"\x00" * 28,
     )
 
 
 def parse_header(data: bytes) -> dict:
-    magic, version, num_neurons, hidden_size, dtype_len_bytes, dtype_raw, _ = (
-        _HEADER_STRUCT.unpack(data[:HEADER_SIZE])
+    num_neurons, hidden_size, dtype_len, dtype_raw = _ssd_base.parse_header(
+        _HEADER_SPEC, data
     )
-    dtype_len = struct.unpack("<I", dtype_len_bytes)[0]
     dtype = dtype_raw[:dtype_len].decode("ascii")
     return {
-        "magic": magic,
-        "version": version,
+        "magic": HEADER_MAGIC,
+        "version": HEADER_VERSION,
         "num_neurons": num_neurons,
         "hidden_size": hidden_size,
         "dtype": dtype,

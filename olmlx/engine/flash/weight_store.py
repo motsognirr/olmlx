@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import sys
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +12,12 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+from olmlx.engine.flash._ssd_base import (
+    LayerLruCache,
+    close_fds,
+    full_pread,
+    open_fds,
+)
 from olmlx.engine.flash.bundler import (
     HEADER_SIZE,
     BundledLayerLayout,
@@ -28,76 +32,10 @@ _NP_DTYPE = {"float16": np.float16, "float32": np.float32, "bfloat16": np.uint16
 # MLX dtype for reinterpreting uint16 storage back to bfloat16
 _MX_DTYPE = {"float16": mx.float16, "float32": mx.float32, "bfloat16": mx.bfloat16}
 
-# macOS fcntl command to bypass OS page cache for accurate flash benchmarks
-_F_NOCACHE = 48
 
-
-class NeuronCache:
-    """Thread-safe per-layer LRU cache for loaded neuron weight chunks."""
-
-    def __init__(self, max_neurons_per_layer: int):
-        self._max = max_neurons_per_layer
-        self._lock = threading.Lock()
-        # layer_idx -> OrderedDict[neuron_idx -> (gate, up, down)]
-        self._cache: dict[
-            int, OrderedDict[int, tuple[mx.array, mx.array, mx.array]]
-        ] = {}
-
-    def get(
-        self, layer_idx: int, neuron_idx: int
-    ) -> tuple[mx.array, mx.array, mx.array] | None:
-        with self._lock:
-            layer_cache = self._cache.get(layer_idx)
-            if layer_cache is None:
-                return None
-            if neuron_idx not in layer_cache:
-                return None
-            layer_cache.move_to_end(neuron_idx)
-            return layer_cache[neuron_idx]
-
-    def put(
-        self,
-        layer_idx: int,
-        neuron_idx: int,
-        data: tuple[mx.array, mx.array, mx.array],
-    ) -> None:
-        if self._max <= 0:
-            return
-        with self._lock:
-            if layer_idx not in self._cache:
-                self._cache[layer_idx] = OrderedDict()
-            layer_cache = self._cache[layer_idx]
-            layer_cache[neuron_idx] = data
-            layer_cache.move_to_end(neuron_idx)
-            while len(layer_cache) > self._max:
-                layer_cache.popitem(last=False)
-
-    def get_batch(
-        self, layer_idx: int, indices: list[int]
-    ) -> dict[int, tuple[mx.array, mx.array, mx.array]]:
-        """Return dict mapping neuron_idx -> data for cached neurons."""
-        with self._lock:
-            result = {}
-            layer_cache = self._cache.get(layer_idx)
-            if layer_cache is None:
-                return result
-            for idx in indices:
-                if idx in layer_cache:
-                    layer_cache.move_to_end(idx)
-                    result[idx] = layer_cache[idx]
-            return result
-
-    def get_cached_indices(
-        self, layer_idx: int, neuron_indices: list[int]
-    ) -> tuple[list[int], list[int]]:
-        """Return (cached_indices, missing_indices)."""
-        with self._lock:
-            layer_cache = self._cache.get(layer_idx)
-            if layer_cache is None:
-                return [], list(neuron_indices)
-            cached = [idx for idx in neuron_indices if idx in layer_cache]
-            missing = [idx for idx in neuron_indices if idx not in layer_cache]
-            return cached, missing
+# NeuronCache[int, tuple[mx.array, mx.array, mx.array]] — kept as a named alias
+# so the cache's value type is obvious at call sites.
+_NeuronCache = LayerLruCache[int, tuple[mx.array, mx.array, mx.array]]
 
 
 class PreallocatedNeuronBuffer:
@@ -220,11 +158,11 @@ class FlashWeightStore:
         use_preallocated_buffer: bool = False,
     ):
         self._flash_dir = flash_dir
-        self._bypass_cache = bypass_cache
         self._use_preallocated = use_preallocated_buffer
         self._executor = ThreadPoolExecutor(max_workers=num_io_threads)
-        self._cache: NeuronCache | None = None
+        self._cache: _NeuronCache | None = None
         self._buffers: dict[int, PreallocatedNeuronBuffer] = {}
+        self._fds: dict[int, int] = {}
         self._layouts = self._load_layouts()
 
         if use_preallocated_buffer:
@@ -240,22 +178,13 @@ class FlashWeightStore:
                     mx_dtype=_MX_DTYPE[layout.dtype] if needs_reinterpret else None,
                 )
         else:
-            self._cache = NeuronCache(max_neurons_per_layer=cache_budget_neurons)
-        if bypass_cache and sys.platform != "darwin":
-            logger.warning(
-                "bypass_cache is only supported on macOS (F_NOCACHE); "
-                "OS page cache will not be bypassed on %s",
-                sys.platform,
-            )
-        self._fds: dict[int, int] = {}
-        try:
-            for layer_idx, layout in self._layouts.items():
-                fd = os.open(str(layout.file_path), os.O_RDONLY)
-                if bypass_cache and sys.platform == "darwin":
-                    import fcntl
+            self._cache = LayerLruCache(max_per_layer=cache_budget_neurons)
 
-                    fcntl.fcntl(fd, _F_NOCACHE, 1)
-                self._fds[layer_idx] = fd
+        try:
+            self._fds = open_fds(
+                {idx: layout.file_path for idx, layout in self._layouts.items()},
+                bypass_cache=bypass_cache,
+            )
         except Exception:
             self.close()
             raise
@@ -295,21 +224,6 @@ class FlashWeightStore:
 
         return layouts
 
-    @staticmethod
-    def _full_pread(fd: int, size: int, offset: int) -> bytes:
-        """Read exactly *size* bytes via pread, retrying on short reads."""
-        buf = bytearray()
-        pos = offset
-        remaining = size
-        while remaining > 0:
-            chunk = os.pread(fd, remaining, pos)
-            if not chunk:
-                raise OSError(f"Unexpected EOF: wanted {size} bytes at offset {offset}")
-            buf.extend(chunk)
-            pos += len(chunk)
-            remaining -= len(chunk)
-        return bytes(buf)
-
     def _read_neuron_raw(
         self, layer_idx: int, neuron_idx: int
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -317,7 +231,7 @@ class FlashWeightStore:
         layout = self._layouts[layer_idx]
         fd = self._fds[layer_idx]
         offset = int(layout.offsets[neuron_idx])
-        raw = self._full_pread(fd, layout.neuron_byte_size, offset)
+        raw = full_pread(fd, layout.neuron_byte_size, offset)
 
         hidden = layout.hidden_size
         np_dtype = _NP_DTYPE[layout.dtype]
@@ -401,7 +315,8 @@ class FlashWeightStore:
     def _load_neurons_cache(
         self, layer_idx: int, neuron_indices: list[int]
     ) -> tuple[mx.array, mx.array, mx.array]:
-        """Load neurons using the NeuronCache path (original)."""
+        """Load neurons via the per-layer LRU cache, fetching missing from SSD."""
+        assert self._cache is not None
         cached = self._cache.get_batch(layer_idx, neuron_indices)
         missing = [idx for idx in neuron_indices if idx not in cached]
 
@@ -489,12 +404,7 @@ class FlashWeightStore:
     def close(self) -> None:
         """Release file descriptors and shut down the I/O thread pool."""
         self._executor.shutdown(wait=True)
-        for fd in self._fds.values():
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        self._fds.clear()
+        close_fds(self._fds)
 
     def __enter__(self):
         return self

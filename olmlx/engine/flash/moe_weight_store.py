@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import threading
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +10,12 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+from olmlx.engine.flash._ssd_base import (
+    LayerLruCache,
+    close_fds,
+    full_pread,
+    open_fds,
+)
 from olmlx.engine.flash.moe_bundler import (
     MOE_HEADER_SIZE,
     MoeExpertLayout,
@@ -65,45 +68,7 @@ class LoadedExperts:
     remap_lut: mx.array | None = None
 
 
-class ExpertCache:
-    """Thread-safe per-layer LRU cache for loaded expert data."""
-
-    def __init__(self, max_experts_per_layer: int):
-        self._max = max_experts_per_layer
-        self._lock = threading.Lock()
-        self._cache: dict[int, OrderedDict[int, dict]] = {}
-
-    def get(self, layer_idx: int, expert_idx: int) -> dict | None:
-        with self._lock:
-            layer_cache = self._cache.get(layer_idx)
-            if layer_cache is None or expert_idx not in layer_cache:
-                return None
-            layer_cache.move_to_end(expert_idx)
-            return layer_cache[expert_idx]
-
-    def put(self, layer_idx: int, expert_idx: int, data: dict) -> None:
-        if self._max <= 0:
-            return
-        with self._lock:
-            if layer_idx not in self._cache:
-                self._cache[layer_idx] = OrderedDict()
-            layer_cache = self._cache[layer_idx]
-            layer_cache[expert_idx] = data
-            layer_cache.move_to_end(expert_idx)
-            while len(layer_cache) > self._max:
-                layer_cache.popitem(last=False)
-
-    def get_batch(self, layer_idx: int, indices: list[int]) -> dict[int, dict]:
-        with self._lock:
-            result = {}
-            layer_cache = self._cache.get(layer_idx)
-            if layer_cache is None:
-                return result
-            for idx in indices:
-                if idx in layer_cache:
-                    layer_cache.move_to_end(idx)
-                    result[idx] = layer_cache[idx]
-            return result
+_ExpertCache = LayerLruCache[int, dict]
 
 
 class FlashMoeWeightStore:
@@ -117,7 +82,7 @@ class FlashMoeWeightStore:
     ):
         self._flash_dir = flash_dir
         self._executor = ThreadPoolExecutor(max_workers=num_io_threads)
-        self._cache = ExpertCache(max_experts_per_layer=cache_budget_experts)
+        self._cache: _ExpertCache = LayerLruCache(max_per_layer=cache_budget_experts)
         self._layout_config = json.loads(
             (flash_dir / "flash_moe_layout.json").read_text()
         )
@@ -126,8 +91,10 @@ class FlashMoeWeightStore:
         self._layouts = self._load_layouts()
         self._fds: dict[int, int] = {}
         try:
-            for layer_idx, layout in self._layouts.items():
-                self._fds[layer_idx] = os.open(str(layout.file_path), os.O_RDONLY)
+            self._fds = open_fds(
+                {idx: layout.file_path for idx, layout in self._layouts.items()},
+                bypass_cache=False,
+            )
         except Exception:
             self.close()
             raise
@@ -163,27 +130,12 @@ class FlashMoeWeightStore:
 
         return layouts
 
-    @staticmethod
-    def _full_pread(fd: int, size: int, offset: int) -> bytes:
-        """Read exactly *size* bytes via pread, retrying on short reads."""
-        buf = bytearray()
-        pos = offset
-        remaining = size
-        while remaining > 0:
-            chunk = os.pread(fd, remaining, pos)
-            if not chunk:
-                raise OSError(f"Unexpected EOF: wanted {size} bytes at offset {offset}")
-            buf.extend(chunk)
-            pos += len(chunk)
-            remaining -= len(chunk)
-        return bytes(buf)
-
     def _read_expert(self, layer_idx: int, expert_idx: int) -> dict:
         """Read a single expert's weights from SSD."""
         layout = self._layouts[layer_idx]
         fd = self._fds[layer_idx]
         offset = int(layout.offsets[expert_idx])
-        raw = self._full_pread(fd, layout.expert_byte_size, offset)
+        raw = full_pread(fd, layout.expert_byte_size, offset)
 
         if self._manifest:
             return self._parse_expert_with_manifest(raw, self._manifest)
@@ -419,22 +371,12 @@ class FlashMoeWeightStore:
     def close(self) -> None:
         """Release file descriptors and shut down the I/O thread pool."""
         self._executor.shutdown(wait=True)
-        for fd in self._fds.values():
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        self._fds.clear()
+        close_fds(self._fds)
 
     def __del__(self) -> None:
         # Use wait=False to avoid deadlock during interpreter shutdown
         self._executor.shutdown(wait=False)
-        for fd in self._fds.values():
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        self._fds.clear()
+        close_fds(self._fds)
 
     def __enter__(self):
         return self

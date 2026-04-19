@@ -11,65 +11,6 @@ from tests.test_flash_moe_bundler import (
 
 
 # ---------------------------------------------------------------------------
-# ExpertCache tests
-# ---------------------------------------------------------------------------
-
-
-class TestExpertCache:
-    def test_put_and_get(self):
-        from olmlx.engine.flash.moe_weight_store import ExpertCache
-
-        cache = ExpertCache(max_experts_per_layer=10)
-        data = {"gate_proj": mx.ones((4, 8)), "up_proj": mx.ones((4, 8))}
-        cache.put(0, 5, data)
-        result = cache.get(0, 5)
-        assert result is not None
-        assert mx.array_equal(result["gate_proj"], data["gate_proj"])
-
-    def test_get_missing_returns_none(self):
-        from olmlx.engine.flash.moe_weight_store import ExpertCache
-
-        cache = ExpertCache(max_experts_per_layer=10)
-        assert cache.get(0, 99) is None
-
-    def test_lru_eviction(self):
-        from olmlx.engine.flash.moe_weight_store import ExpertCache
-
-        cache = ExpertCache(max_experts_per_layer=3)
-        for i in range(4):
-            cache.put(0, i, {"w": mx.array([float(i)])})
-
-        # Expert 0 should have been evicted (oldest)
-        assert cache.get(0, 0) is None
-        assert cache.get(0, 1) is not None
-        assert cache.get(0, 2) is not None
-        assert cache.get(0, 3) is not None
-
-    def test_get_batch(self):
-        from olmlx.engine.flash.moe_weight_store import ExpertCache
-
-        cache = ExpertCache(max_experts_per_layer=10)
-        cache.put(0, 1, {"w": mx.array([1.0])})
-        cache.put(0, 3, {"w": mx.array([3.0])})
-
-        cached = cache.get_batch(0, [1, 2, 3, 4])
-        assert 1 in cached and 3 in cached
-        assert 2 not in cached and 4 not in cached
-
-    def test_layers_are_independent(self):
-        from olmlx.engine.flash.moe_weight_store import ExpertCache
-
-        cache = ExpertCache(max_experts_per_layer=5)
-        cache.put(0, 1, {"w": mx.array([0.0])})
-        cache.put(1, 1, {"w": mx.array([1.0])})
-
-        r0 = cache.get(0, 1)
-        r1 = cache.get(1, 1)
-        assert r0 is not None and r1 is not None
-        assert not mx.array_equal(r0["w"], r1["w"])
-
-
-# ---------------------------------------------------------------------------
 # FlashMoeWeightStore tests
 # ---------------------------------------------------------------------------
 
