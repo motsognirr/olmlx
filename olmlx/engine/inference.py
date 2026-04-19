@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import gc
 import importlib
+import itertools
 import json
 import logging
 import threading
@@ -252,6 +253,10 @@ _deferred_cleanup_locks: weakref.WeakKeyDictionary[
 _deferred_cleanup_tasks: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Task[None]
 ] = weakref.WeakKeyDictionary()
+# Monotonic counter for cleanup-task names so the ERROR/WARNING log entries
+# that key on ``task.get_name()`` have a collision-free identifier even when
+# successive stream objects happen to reuse the same memory address.
+_cleanup_counter = itertools.count()
 # Tracks requests waiting for _inference_lock (not the _await_deferred_cleanup wait).
 _queue_depth = 0
 
@@ -529,16 +534,67 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
     lock = _get_inference_lock()
     loop = asyncio.get_running_loop()
 
-    # IMPORTANT: ``create_task(_cleanup())`` must be the last statement in the
-    # ``async with _get_deferred_cleanup_lock()`` block below.  ``_cleanup``'s
-    # finally re-acquires the same lock to pop its dict entry; this works
-    # today because tasks don't preempt — the outer ``async with`` exits and
-    # releases the lock before ``_cleanup`` is first scheduled.  Any ``await``
-    # inserted between ``create_task`` and the end of the ``async with``
-    # would let the event loop schedule ``_cleanup`` into a deadlock on the
-    # same lock.  Adding new code here?  Put it *before* the ``async with``
-    # or *after* its exit.  (Synchronous calls like ``logger.debug`` are
-    # fine — only ``await`` hands control back to the event loop.)
+    async def _cleanup():
+        thread = stream._thread
+        deadline = time.monotonic() + _DEFERRED_CLEANUP_TIMEOUT
+        try:
+            while thread is not None and thread.is_alive():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.error(
+                        "Deferred inference cleanup: thread still alive after %ds — "
+                        "releasing lock anyway (risk of Metal crash on next inference)",
+                        _DEFERRED_CLEANUP_TIMEOUT,
+                    )
+                    break
+                try:
+                    wait = min(30, remaining)
+                    await asyncio.to_thread(thread.join, wait)
+                except BaseException as exc:
+                    logger.warning(
+                        "Deferred inference cleanup: poll loop aborted (%s) — "
+                        "releasing lock (thread may still be alive)",
+                        type(exc).__name__,
+                    )
+                    break  # finally will release the lock
+            else:
+                logger.info("Deferred inference cleanup: thread exited cleanly")
+        finally:
+            if thread is None or not thread.is_alive():
+                _safe_sync()
+            # Note: on timeout/abort with thread still alive, releasing the
+            # lock risks a Metal crash on the next inference (the stuck thread
+            # may still be issuing GPU commands).  Python can't kill CPU-bound
+            # threads, so this is the "least bad" option vs permanent deadlock.
+            lock.release()
+            logger.info("Deferred inference cleanup: lock released")
+            # Any ``CancelledError`` delivered at the ``__aenter__`` ``await``
+            # below (cancellation during the acquire, or re-cancellation while
+            # this finally is running) skips the pop.  In production that
+            # leaves a stale done/cancelled entry in ``_deferred_cleanup_tasks``,
+            # which is harmless: ``_inference_lock`` was already released
+            # above so a new inference can proceed; ``_await_deferred_cleanup``
+            # returns immediately for ``task.done() == True``; and the next
+            # ``_schedule_deferred_inference_cleanup`` overwrites the entry.
+            # In tests, ``_reset_inference_state`` pops both dicts explicitly
+            # to keep per-test state clean — do not drop those fallback pops.
+            # We deliberately do *not* wrap this with ``asyncio.shield`` —
+            # the stale-entry path is benign, shielding would complicate
+            # cancellation semantics, and the pop is not load-bearing.
+            async with _get_deferred_cleanup_lock():
+                # Use the task's own running loop; ``_cleanup`` runs as a
+                # task on the same loop it was created on, so this equals
+                # the outer ``loop``, but ``get_running_loop`` keeps
+                # ``_cleanup`` self-contained.
+                _deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
+
+    # IMPORTANT: ``create_task(_cleanup())`` must remain the last statement
+    # in the ``async with _get_deferred_cleanup_lock()`` block below.
+    # ``_cleanup``'s finally re-acquires the same lock to pop its dict entry;
+    # this works because tasks don't preempt — the outer ``async with`` exits
+    # and releases the lock before ``_cleanup`` is first scheduled.  Any
+    # ``await`` inserted between ``create_task`` and end-of-block would let
+    # the event loop schedule ``_cleanup`` into a deadlock on the same lock.
     async with _get_deferred_cleanup_lock():
         existing = _deferred_cleanup_tasks.get(loop)
         if existing is not None and not existing.done():
@@ -570,68 +626,13 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                     exc_info=exc,
                 )
 
-        async def _cleanup():
-            thread = stream._thread
-            deadline = time.monotonic() + _DEFERRED_CLEANUP_TIMEOUT
-            try:
-                while thread is not None and thread.is_alive():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        logger.error(
-                            "Deferred inference cleanup: thread still alive after %ds — "
-                            "releasing lock anyway (risk of Metal crash on next inference)",
-                            _DEFERRED_CLEANUP_TIMEOUT,
-                        )
-                        break
-                    try:
-                        wait = min(30, remaining)
-                        await asyncio.to_thread(thread.join, wait)
-                    except BaseException as exc:
-                        logger.warning(
-                            "Deferred inference cleanup: poll loop aborted (%s) — "
-                            "releasing lock (thread may still be alive)",
-                            type(exc).__name__,
-                        )
-                        break  # finally will release the lock
-                else:
-                    logger.info("Deferred inference cleanup: thread exited cleanly")
-            finally:
-                if thread is None or not thread.is_alive():
-                    _safe_sync()
-                # Note: on timeout/abort with thread still alive, releasing the
-                # lock risks a Metal crash on the next inference (the stuck thread
-                # may still be issuing GPU commands).  Python can't kill CPU-bound
-                # threads, so this is the "least bad" option vs permanent deadlock.
-                lock.release()
-                logger.info("Deferred inference cleanup: lock released")
-                # Any ``CancelledError`` delivered at the ``__aenter__`` ``await``
-                # below (cancellation during the acquire, or re-cancellation while
-                # this finally is running) skips the pop.  In production that
-                # leaves a stale done/cancelled entry in ``_deferred_cleanup_tasks``,
-                # which is harmless: ``_inference_lock`` was already released
-                # above so a new inference can proceed; ``_await_deferred_cleanup``
-                # returns immediately for ``task.done() == True``; and the next
-                # ``_schedule_deferred_inference_cleanup`` overwrites the entry.
-                # In tests, ``_reset_inference_state`` pops both dicts explicitly
-                # to keep per-test state clean — do not drop those fallback pops.
-                # We deliberately do *not* wrap this with ``asyncio.shield`` —
-                # the stale-entry path is benign, shielding would complicate
-                # cancellation semantics, and the pop is not load-bearing.
-                async with _get_deferred_cleanup_lock():
-                    # Use the task's own running loop rather than closing over
-                    # ``loop`` from the outer scope — ``_cleanup`` runs as a
-                    # task on the same loop it was created on, so these are
-                    # always equal, but using ``get_running_loop`` keeps
-                    # ``_cleanup`` self-contained.
-                    _deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
-
-        # See IMPORTANT note at the top of the ``async with`` block.
-        # Name the task explicitly so the operator-facing log entries
-        # (ERROR from ``_await_deferred_cleanup``, WARNING from the
-        # next request) share a stable identifier instead of the
-        # auto-generated ``Task-N``.
+        # Name the task from a module-level monotonic counter so the
+        # operator-facing log entries (ERROR from ``_await_deferred_cleanup``,
+        # WARNING from the next request) share a collision-free identifier.
+        # ``id(stream)`` would be reused after GC and could collide between
+        # successive requests.
         _deferred_cleanup_tasks[loop] = asyncio.create_task(
-            _cleanup(), name=f"deferred-cleanup-{id(stream):x}"
+            _cleanup(), name=f"deferred-cleanup-{next(_cleanup_counter)}"
         )
 
 
