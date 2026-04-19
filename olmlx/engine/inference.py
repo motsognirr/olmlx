@@ -280,16 +280,15 @@ async def _reset_inference_state() -> None:
         # ourselves at warning level so fixture-level failures aren't
         # invisible (``_await_deferred_cleanup`` logs on its own path,
         # but reset is the only path for tests that aborted earlier).
-        try:
-            exc = task.exception()
-            if exc is not None:
-                logger.warning(
-                    "Deferred cleanup task raised during reset: %s",
-                    exc,
-                    exc_info=exc,
-                )
-        except asyncio.InvalidStateError:
-            pass
+        # ``task.exception()`` is safe here — the task is done and not
+        # cancelled, so it can't raise ``InvalidStateError`` or ``CancelledError``.
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(
+                "Deferred cleanup task raised during reset: %s",
+                exc,
+                exc_info=exc,
+            )
     # Also cleans up any lock entry ``_cleanup``'s finally block may have
     # created.  Both branches above can leave one behind:
     #   - ``if`` (cancel + await): ``_cleanup``'s finally runs during
@@ -503,16 +502,15 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
             # log "Task exception was never retrieved" when it's GC'd.  Log it
             # ourselves as a safety net in case the prior ``_await_deferred_cleanup``
             # log was missed (it normally fires first on the happy path).
-            try:
-                exc = existing.exception()
-                if exc is not None:
-                    logger.warning(
-                        "Replaced done cleanup task had raised: %s",
-                        exc,
-                        exc_info=exc,
-                    )
-            except asyncio.InvalidStateError:
-                pass
+            # ``existing.exception()`` is safe here — the task is done and not
+            # cancelled, so it can't raise ``InvalidStateError`` or ``CancelledError``.
+            exc = existing.exception()
+            if exc is not None:
+                logger.warning(
+                    "Replaced done cleanup task had raised: %s",
+                    exc,
+                    exc_info=exc,
+                )
 
         async def _cleanup():
             thread = stream._thread
