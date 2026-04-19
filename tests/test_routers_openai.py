@@ -294,6 +294,29 @@ class TestOpenAIRouter:
         assert options["stop"] == ["END"]
 
     @pytest.mark.asyncio
+    async def test_chat_default_penalties_not_forwarded(self, app_client):
+        """Unset frequency/presence_penalty must not be forwarded to the engine
+        (otherwise mlx-lm logs an 'unsupported' warning on every request)."""
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+
+        assert resp.status_code == 200
+        options = mock_gen.call_args[0][3]
+        assert "frequency_penalty" not in options
+        assert "presence_penalty" not in options
+
+    @pytest.mark.asyncio
     async def test_chat_streaming_error_mid_stream(self, app_client):
         """Error during streaming emits an SSE error event instead of crashing."""
 
