@@ -275,7 +275,7 @@ async def _reset_inference_state() -> None:
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, asyncio.InvalidStateError) as cancel_exc:
+            except asyncio.CancelledError as cancel_exc:
                 # If ``_cleanup`` raised in its body and the cancellation
                 # arrived in its finally (e.g. at ``await lock.acquire()``),
                 # the original exception lives on as ``__context__`` of the
