@@ -1,6 +1,5 @@
 """Tests for inference engine bug fixes (#118, #119, #120, #123, #124, #125)."""
 
-import contextlib
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -345,8 +344,12 @@ class TestDeferredCleanupLockPerLoop:
 
         task = asyncio.create_task(boom())
         # Let it run + transition to done with a stored exception.
-        with contextlib.suppress(RuntimeError):
+        try:
             await task
+        except RuntimeError as exc:
+            assert str(exc) == "synthetic cleanup failure", (
+                f"unexpected error from test fixture: {exc}"
+            )
         assert task.done() and not task.cancelled()
 
         _inf_mod._deferred_cleanup_tasks[loop] = task

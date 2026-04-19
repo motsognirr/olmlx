@@ -582,11 +582,11 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
             # the stale-entry path is benign, shielding would complicate
             # cancellation semantics, and the pop is not load-bearing.
             async with _get_deferred_cleanup_lock():
-                # Use the task's own running loop; ``_cleanup`` runs as a
-                # task on the same loop it was created on, so this equals
-                # the outer ``loop``, but ``get_running_loop`` keeps
-                # ``_cleanup`` self-contained.
-                _deferred_cleanup_tasks.pop(asyncio.get_running_loop(), None)
+                # ``loop`` is captured from the enclosing function;
+                # ``create_task`` binds the task to that loop, so using the
+                # captured value is equivalent to ``asyncio.get_running_loop()``
+                # here and avoids depending on that asyncio invariant.
+                _deferred_cleanup_tasks.pop(loop, None)
 
     # IMPORTANT: ``create_task(_cleanup())`` must remain the last statement
     # in the ``async with _get_deferred_cleanup_lock()`` block below.
