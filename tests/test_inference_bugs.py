@@ -432,6 +432,39 @@ class TestDeferredCleanupLockPerLoop:
             _inf_mod._deferred_cleanup_tasks.pop(loop, None)
             _inf_mod._deferred_cleanup_locks.pop(loop, None)
 
+    @pytest.mark.asyncio
+    async def test_reset_cleans_up_after_cleanup_finally_recancelled(self):
+        """If ``_cleanup``'s ``async with _get_deferred_cleanup_lock()`` in
+        the finally block is itself interrupted by a second cancel, the
+        task entry is left behind and the cleanup's own pop is skipped.
+        ``_reset_inference_state`` must still leave both module dicts clean.
+        """
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+
+        # Simulate ``_cleanup``'s state at the point its finally is about to
+        # run: the dict has the task entry, and the lock dict has an entry
+        # (because the finally would have called ``_get_deferred_cleanup_lock``).
+        # We insert a "task" that's already done, then a stale lock entry,
+        # then call reset and assert both are cleared.
+        async def already_done():
+            return None
+
+        task = asyncio.create_task(already_done())
+        await task  # let it transition to done
+        _inf_mod._deferred_cleanup_tasks[loop] = task
+        _ = _inf_mod._get_deferred_cleanup_lock()  # populates _deferred_cleanup_locks
+
+        await _inf_mod._reset_inference_state()
+
+        assert _inf_mod._deferred_cleanup_tasks.get(loop) is None, (
+            "reset must remove the task entry"
+        )
+        assert _inf_mod._deferred_cleanup_locks.get(loop) is None, (
+            "reset must remove the lock entry even if cleanup's own pop was skipped"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Bug #120: GPU memory not freed on client disconnect during long prefill

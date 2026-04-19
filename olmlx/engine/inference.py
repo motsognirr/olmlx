@@ -229,10 +229,14 @@ _generation_streams = _resolve_generation_streams()
 # to acquire — its own waiter Future is queued behind a Future whose
 # ``set_result`` would need to run on loop A's (now-gone) scheduler.
 # Test isolation relies on ``_reset_inference_state()`` force-releasing
-# ``_inference_lock`` between tests, which clears both ``_locked`` and the
-# waiter queue, so loop B starts clean.  ``_deferred_cleanup_locks`` below
-# uses a different strategy (per-loop WeakKeyDictionary) because force-
-# releasing a lock held mid-cleanup would be unsafe.
+# ``_inference_lock`` between tests.  Note: ``release()`` only clears
+# ``_locked`` and wakes one pending waiter — it does NOT drain the
+# ``_waiters`` deque.  Stale waiters there are normally cleaned up by the
+# ``finally: self._waiters.remove(fut)`` clause inside cancelled
+# ``acquire()`` calls; tests that need a truly fresh lock instance patch
+# ``_inference_lock`` with ``asyncio.Lock()``.  ``_deferred_cleanup_locks``
+# below uses a different strategy (per-loop WeakKeyDictionary) because
+# force-releasing a lock held mid-cleanup would be unsafe.
 _inference_lock = asyncio.Lock()
 # A lock that was acquired on loop A (e.g. a test that crashed without
 # releasing it) causes deadlock or "Future attached to a different loop"
@@ -353,9 +357,11 @@ def _get_deferred_cleanup_lock() -> asyncio.Lock:
 
     Safe within a single event loop: no await between the lookup and the
     assignment, so no two coroutines on the same loop can both observe
-    ``None`` simultaneously.  WeakKeyDictionary is not thread-safe for
-    concurrent writes from multiple OS threads each running their own
-    loop — this server runs on one thread, so that case doesn't apply.
+    ``None`` simultaneously.  WeakKeyDictionary is not thread-safe in the
+    general case — GC-triggered key-removal callbacks can interleave with
+    ``.get()`` / ``__setitem__`` from another thread.  Safe here because
+    (a) asyncio is single-threaded and (b) on CPython the GIL serialises
+    the GC callback against the dict operations.
 
     Must be called from within a running event loop — uses
     ``asyncio.get_running_loop()``, which raises ``RuntimeError`` if invoked
