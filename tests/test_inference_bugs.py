@@ -164,6 +164,312 @@ class TestDeferredCleanupLock:
 
 
 # ---------------------------------------------------------------------------
+# Bug #243: _deferred_cleanup_lock cached globally — breaks across event loops
+# ---------------------------------------------------------------------------
+class TestDeferredCleanupLockPerLoop:
+    """_get_deferred_cleanup_lock must return a lock bound to the running loop.
+
+    The multi-loop test is deliberately ``def``, not ``async def`` — its whole
+    point is to exercise two separate ``asyncio.new_event_loop()`` instances,
+    which cannot be done from inside a single running loop.  Each test pops
+    its own entries from the module dicts explicitly: the loop locals stay
+    alive until the test returns, and WeakKeyDictionary only collects entries
+    once the key goes out of scope, so ``loop.close()`` alone isn't sufficient.
+    """
+
+    def test_separate_locks_for_separate_loops(self):
+        """A fresh event loop must receive a lock bound to itself, not a stale one."""
+        import asyncio
+
+        loop_a = asyncio.new_event_loop()
+        try:
+            lock_a = loop_a.run_until_complete(self._get_lock())
+        finally:
+            # Explicit pop so loop_a's entry doesn't persist for the rest of
+            # this test while ``loop_a`` is still in scope (WeakKeyDictionary
+            # holds weak refs to *keys*; a live local variable keeps the key
+            # alive).  Matches ``test_stale_locked_lock_not_inherited`` and
+            # ``test_separate_tasks_for_separate_loops``.
+            _inf_mod._deferred_cleanup_locks.pop(loop_a, None)
+            loop_a.close()
+
+        loop_b = asyncio.new_event_loop()
+        try:
+            lock_b = loop_b.run_until_complete(self._get_lock())
+            # The acquire must succeed on loop B's own lock; if we leaked
+            # loop A's lock, this would raise "attached to a different loop".
+            loop_b.run_until_complete(self._acquire_and_release(lock_b))
+        finally:
+            _inf_mod._deferred_cleanup_locks.pop(loop_b, None)
+            loop_b.close()
+
+        assert lock_a is not lock_b, (
+            "Each event loop must receive its own lock (Bug #243)"
+        )
+
+    @staticmethod
+    async def _get_lock():
+        return _inf_mod._get_deferred_cleanup_lock()
+
+    @staticmethod
+    async def _acquire_and_release(lock):
+        async with lock:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_same_loop_returns_same_lock(self):
+        """Within a single event loop, repeated calls must return the same lock."""
+        import asyncio
+
+        try:
+            lock1 = _inf_mod._get_deferred_cleanup_lock()
+            lock2 = _inf_mod._get_deferred_cleanup_lock()
+            assert lock1 is lock2, (
+                "Repeated calls on the same loop must return the same lock"
+            )
+        finally:
+            # Explicit cleanup matches the sibling tests in this class;
+            # the autouse ``_reset_inference_state`` fixture would also
+            # handle this, but being explicit keeps the pattern uniform.
+            _inf_mod._deferred_cleanup_locks.pop(asyncio.get_running_loop(), None)
+
+    def test_separate_tasks_for_separate_loops(self):
+        """A task registered on loop A must be invisible to loop B.
+
+        ``_await_deferred_cleanup`` only observes the calling loop's task.
+        If ``_deferred_cleanup_tasks`` were a single global like pre-fix,
+        loop B would try to ``asyncio.wait`` on loop A's foreign task and
+        raise ``RuntimeError: Task is attached to a different loop``.
+        """
+        import asyncio
+
+        async def register_task_and_abandon():
+            async def never():
+                await asyncio.sleep(999)
+
+            _inf_mod._deferred_cleanup_tasks[asyncio.get_running_loop()] = (
+                asyncio.create_task(never())
+            )
+
+        loop_a = asyncio.new_event_loop()
+        try:
+            loop_a.run_until_complete(register_task_and_abandon())
+        finally:
+            # Drain the pending ``never()`` task to avoid leaking it on a
+            # closed loop (ResourceWarning under Py 3.12+ filterwarnings=error).
+            pending = asyncio.all_tasks(loop_a)
+            for t in pending:
+                t.cancel()
+            if pending:
+                loop_a.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            _inf_mod._deferred_cleanup_tasks.pop(loop_a, None)
+            loop_a.close()
+
+        async def await_cleanup_on_fresh_loop():
+            # Loop B has no task registered.  _await_deferred_cleanup must
+            # return immediately (task for this loop is None) rather than
+            # touching loop A's orphaned task.
+            await _inf_mod._await_deferred_cleanup()
+
+        loop_b = asyncio.new_event_loop()
+        try:
+            loop_b.run_until_complete(
+                asyncio.wait_for(await_cleanup_on_fresh_loop(), timeout=0.5)
+            )
+        finally:
+            # ``_await_deferred_cleanup`` called ``_get_deferred_cleanup_lock``
+            # which created an entry for loop_b.  Pop explicitly to keep the
+            # class-wide cleanup pattern uniform.
+            _inf_mod._deferred_cleanup_locks.pop(loop_b, None)
+            loop_b.close()
+
+    def test_stale_locked_lock_not_inherited(self):
+        """A lock acquired on a closed loop must not block a fresh loop.
+
+        This is the actual Bug #243 failure mode: if loop A acquires the
+        deferred cleanup lock and closes without releasing it, a pre-fix
+        module would cache that locked instance and loop B would deadlock
+        on its next acquire.  The fix keys locks by loop, so loop B gets
+        a fresh, unlocked lock.
+        """
+        import asyncio
+
+        async def acquire_no_release():
+            lock = _inf_mod._get_deferred_cleanup_lock()
+            await lock.acquire()  # intentionally never released
+
+        loop_a = asyncio.new_event_loop()
+        try:
+            loop_a.run_until_complete(acquire_no_release())
+        finally:
+            # Explicit pop for consistency with
+            # ``test_separate_tasks_for_separate_loops``; WeakKeyDictionary
+            # would also GC the entry when loop_a is collected, but being
+            # explicit avoids a latent dependency on GC timing.
+            _inf_mod._deferred_cleanup_locks.pop(loop_a, None)
+            loop_a.close()  # closed with the lock still "held"
+
+        async def acquire_with_timeout():
+            lock = _inf_mod._get_deferred_cleanup_lock()
+            # Pre-fix: inherits loop A's locked instance → times out.
+            # Post-fix: loop B gets a fresh unlocked lock → returns immediately.
+            await asyncio.wait_for(lock.acquire(), timeout=0.5)
+            lock.release()
+
+        loop_b = asyncio.new_event_loop()
+        try:
+            loop_b.run_until_complete(acquire_with_timeout())
+        finally:
+            _inf_mod._deferred_cleanup_locks.pop(loop_b, None)
+            loop_b.close()
+
+    @pytest.mark.asyncio
+    async def test_reset_consumes_and_logs_done_task_exception(self, caplog):
+        """``_reset_inference_state`` must consume + log a stored exception
+        on the ``done and not cancelled`` branch.
+
+        Covers the ``elif task.done() and not task.cancelled()`` path that
+        otherwise leaks "Task exception was never retrieved" warnings to
+        stderr at GC time and silently swallows fixture-level failures.
+        """
+        import asyncio
+        import logging
+
+        loop = asyncio.get_running_loop()
+
+        async def boom():
+            raise RuntimeError("synthetic cleanup failure")
+
+        task = asyncio.create_task(boom())
+        # Let it run + transition to done with a stored exception.
+        try:
+            await task
+        except RuntimeError as exc:
+            assert str(exc) == "synthetic cleanup failure", (
+                f"unexpected error from test fixture: {exc}"
+            )
+        assert task.done() and not task.cancelled()
+
+        _inf_mod._deferred_cleanup_tasks[loop] = task
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
+            await _inf_mod._reset_inference_state()
+
+        assert _inf_mod._deferred_cleanup_tasks.get(loop) is None, (
+            "reset must remove the loop's entry"
+        )
+        assert any(
+            "Deferred cleanup task raised during reset" in r.message
+            and "synthetic cleanup failure" in str(r.exc_info[1])
+            for r in caplog.records
+            if r.exc_info is not None
+        ), "reset must log the stored exception with exc_info"
+
+    @pytest.mark.asyncio
+    async def test_reset_surfaces_cancel_masked_exception(self, caplog):
+        """When ``_reset_inference_state`` cancels a task whose body raised
+        and whose finally block awaits, ``CancelledError`` carries the
+        original exception as ``__context__``.  The reset path must surface
+        that masked exception so it isn't silently lost.
+        """
+        import asyncio
+        import logging
+
+        loop = asyncio.get_running_loop()
+        body_started = asyncio.Event()
+        finally_blocker = asyncio.Event()
+
+        async def cleanup_with_masked_error():
+            try:
+                body_started.set()
+                raise RuntimeError("real cleanup failure")
+            finally:
+                # Block here so reset can deliver CancelledError into the
+                # finally — the original RuntimeError becomes __context__.
+                await finally_blocker.wait()
+
+        task = asyncio.create_task(cleanup_with_masked_error())
+        _inf_mod._deferred_cleanup_tasks[loop] = task
+        await body_started.wait()
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
+            await _inf_mod._reset_inference_state()
+
+        assert _inf_mod._deferred_cleanup_tasks.get(loop) is None
+        assert any(
+            "masked by cancellation" in r.message
+            and "real cleanup failure" in str(r.exc_info[1])
+            for r in caplog.records
+            if r.exc_info is not None
+        ), "reset must surface the __context__ exception under cancellation"
+
+    @pytest.mark.asyncio
+    async def test_await_deferred_cleanup_logs_task_exception(self, caplog):
+        """``_await_deferred_cleanup`` must log the stored exception of a
+        task that finished with a non-cancel error.  Without the log, the
+        exception is silently dropped after ``asyncio.wait`` returns and
+        the next request runs on potentially dirty Metal state with no
+        operator signal.
+        """
+        import asyncio
+        import logging
+
+        async def boom():
+            raise RuntimeError("cleanup exploded")
+
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(boom())
+        _inf_mod._deferred_cleanup_tasks[loop] = task
+        try:
+            with caplog.at_level(logging.ERROR, logger="olmlx.engine.inference"):
+                await _inf_mod._await_deferred_cleanup()
+
+            assert any(
+                "Deferred inference cleanup" in r.message
+                and "cleanup exploded" in str(r.exc_info[1])
+                for r in caplog.records
+                if r.exc_info is not None
+            ), "_await_deferred_cleanup must log the task's exception at ERROR"
+        finally:
+            _inf_mod._deferred_cleanup_tasks.pop(loop, None)
+            _inf_mod._deferred_cleanup_locks.pop(loop, None)
+
+    @pytest.mark.asyncio
+    async def test_reset_cleans_up_after_cleanup_finally_recancelled(self):
+        """If ``_cleanup``'s ``async with _get_deferred_cleanup_lock()`` in
+        the finally block is itself interrupted by a second cancel, the
+        task entry is left behind and the cleanup's own pop is skipped.
+        ``_reset_inference_state`` must still leave both module dicts clean.
+        """
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+
+        # Simulate ``_cleanup``'s state at the point its finally is about to
+        # run: the dict has the task entry, and the lock dict has an entry
+        # (because the finally would have called ``_get_deferred_cleanup_lock``).
+        # We insert a "task" that's already done, then a stale lock entry,
+        # then call reset and assert both are cleared.
+        async def already_done():
+            return None
+
+        task = asyncio.create_task(already_done())
+        await task  # let it transition to done
+        _inf_mod._deferred_cleanup_tasks[loop] = task
+        _ = _inf_mod._get_deferred_cleanup_lock()  # populates _deferred_cleanup_locks
+
+        await _inf_mod._reset_inference_state()
+
+        assert _inf_mod._deferred_cleanup_tasks.get(loop) is None, (
+            "reset must remove the task entry"
+        )
+        assert _inf_mod._deferred_cleanup_locks.get(loop) is None, (
+            "reset must remove the lock entry even if cleanup's own pop was skipped"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Bug #120: GPU memory not freed on client disconnect during long prefill
 # ---------------------------------------------------------------------------
 class TestDrainAndJoinBlocksNewInference:
