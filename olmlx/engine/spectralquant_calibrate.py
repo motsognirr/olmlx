@@ -26,16 +26,18 @@ def _resolve_config_holder(inner: Any, model: Any) -> Any:
     # Some architectures (e.g. Qwen3Next) expose the config namespace only on
     # the top-level model, not on the backbone returned by `_get_backbone`.
     # mlx-lm models expose it as `.args`; some mlx-vlm LanguageModel wrappers
-    # expose it as `.config`. Accept either so the guard is no stricter than
-    # the `_detect_head_dim` fallback that follows. Use `is not None` rather
-    # than `hasattr`: partially-constructed wrappers may set `self.args = None`
-    # as a class attribute, which would pass `hasattr` but yield a `None`
+    # expose it as `.config`. Prefer `.args` across both holders before falling
+    # back to `.config` — otherwise an unrelated `.config` on `inner` (e.g.
+    # inherited from a framework mixin) could shadow the real `.args` on
+    # `model`, defeating the Qwen3Next fix. Use `is not None` rather than
+    # `hasattr`: partially-constructed wrappers may set `self.args = None` as
+    # a class attribute, which would pass `hasattr` but yield a `None`
     # namespace downstream and silently miscalibrate.
     for obj in (inner, model):
-        if (
-            getattr(obj, "args", None) is not None
-            or getattr(obj, "config", None) is not None
-        ):
+        if getattr(obj, "args", None) is not None:
+            return obj
+    for obj in (inner, model):
+        if getattr(obj, "config", None) is not None:
             return obj
     raise RuntimeError(
         "Cannot detect model configuration: neither the backbone nor the "
@@ -69,8 +71,8 @@ def _build_empty_collection_error(first_exc: Exception | None) -> RuntimeError:
     """
     if first_exc is not None:
         err = RuntimeError(
-            "No KV vectors were collected during calibration. "
-            f"First forward-pass error: {type(first_exc).__name__}: {first_exc}"
+            "No KV vectors were collected during calibration — "
+            "see cause above for the forward-pass error."
         )
         err.__cause__ = first_exc
         err.__suppress_context__ = True

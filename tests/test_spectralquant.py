@@ -819,6 +819,21 @@ class TestSpectralConfig:
         model.config = MagicMock(spec=[])
         assert _resolve_config_holder(inner, model) is model
 
+    def test_resolve_config_holder_prefers_args_over_inner_config(self):
+        """If inner has only `.config` and model has `.args`, prefer model — `.args`
+        wins across both holders before `.config` is considered. Otherwise an
+        unrelated `.config` on the backbone (framework mixin, etc.) would shadow
+        the real config namespace and defeat the Qwen3Next fix."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.spectralquant_calibrate import _resolve_config_holder
+
+        inner = MagicMock(spec=[])
+        inner.config = MagicMock(spec=[])  # noisy, unrelated config attribute
+        model = MagicMock(spec=[])
+        model.args = MagicMock(spec=[])  # the real config lives here
+        assert _resolve_config_holder(inner, model) is model
+
     def test_config_namespace_prefers_args(self):
         """When both .args and .config exist, prefer .args (mlx-lm idiom)."""
         from unittest.mock import MagicMock
@@ -842,7 +857,9 @@ class TestSpectralConfig:
 
     def test_build_empty_collection_error_chains_first_exc(self):
         """First forward-pass exception must be chained via __cause__ (and suppress
-        context) so the behavior matches `raise ... from first_exc`."""
+        context) so the behavior matches `raise ... from first_exc`. The message
+        body refers to the cause rather than duplicating its text — Python's
+        traceback format already prints both."""
         from olmlx.engine.spectralquant_calibrate import _build_empty_collection_error
 
         original = ValueError("synthetic forward-pass failure")
@@ -850,8 +867,9 @@ class TestSpectralConfig:
         assert isinstance(err, RuntimeError)
         assert err.__cause__ is original
         assert err.__suppress_context__ is True
-        assert "ValueError" in str(err)
-        assert "synthetic forward-pass failure" in str(err)
+        # The message references the cause rather than embedding its text.
+        assert "see cause" in str(err)
+        assert "synthetic forward-pass failure" not in str(err)
 
     def test_build_empty_collection_error_no_exc(self):
         """Without a forward-pass error, the message reports no attention caches found."""
