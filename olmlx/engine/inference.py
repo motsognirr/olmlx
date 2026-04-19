@@ -224,13 +224,15 @@ _generation_streams = _resolve_generation_streams()
 # lock would still allow interleaved GPU work from different models, risking
 # crashes or corruption.  A single global lock is an intentional trade-off:
 # we sacrifice parallelism for stability on Apple Silicon.
-#
-# On Python 3.10+ asyncio.Lock binds to a loop lazily (at first acquire, via
-# get_running_loop() — see bpo-39529), so the same instance can be shared
-# across loops as long as it is never acquired on one while still held by
-# another.  Test isolation relies on ``_reset_inference_state()``
-# force-releasing it between tests, not on recreating it per-loop like
-# ``_deferred_cleanup_locks`` below.
+# A lock acquired on loop A and never released leaves ``_locked = True`` and
+# a dead ``Future`` at the head of ``_waiters``.  Loop B then deadlocks trying
+# to acquire — its own waiter Future is queued behind a Future whose
+# ``set_result`` would need to run on loop A's (now-gone) scheduler.
+# Test isolation relies on ``_reset_inference_state()`` force-releasing
+# ``_inference_lock`` between tests, which clears both ``_locked`` and the
+# waiter queue, so loop B starts clean.  ``_deferred_cleanup_locks`` below
+# uses a different strategy (per-loop WeakKeyDictionary) because force-
+# releasing a lock held mid-cleanup would be unsafe.
 _inference_lock = asyncio.Lock()
 # A lock that was acquired on loop A (e.g. a test that crashed without
 # releasing it) causes deadlock or "Future attached to a different loop"
@@ -455,7 +457,7 @@ async def _await_deferred_cleanup():
     # the inference lock is always released and the next request can proceed.
     # Callers have no need to reject the following inference — the lock state
     # is correct regardless of cleanup outcome.  The log is the signal.
-    finished_task = done.pop()
+    finished_task = next(iter(done))
     if not finished_task.cancelled():
         exc = finished_task.exception()
         if exc is not None:
@@ -546,16 +548,19 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
                 # threads, so this is the "least bad" option vs permanent deadlock.
                 lock.release()
                 logger.info("Deferred inference cleanup: lock released")
-                # If this task is cancelled while ``_get_deferred_cleanup_lock().__aenter__``
-                # awaits the lock, ``CancelledError`` propagates before the body
-                # runs and the pop below is skipped.  In production that leaves a
-                # stale done/cancelled entry in ``_deferred_cleanup_tasks``, which
-                # is harmless: ``_inference_lock`` was already released above so a
-                # new inference can proceed; ``_await_deferred_cleanup`` returns
-                # immediately for ``task.done() == True``; and the next
+                # Any ``CancelledError`` delivered at the ``__aenter__`` ``await``
+                # below (cancellation during the acquire, or re-cancellation while
+                # this finally is running) skips the pop.  In production that
+                # leaves a stale done/cancelled entry in ``_deferred_cleanup_tasks``,
+                # which is harmless: ``_inference_lock`` was already released
+                # above so a new inference can proceed; ``_await_deferred_cleanup``
+                # returns immediately for ``task.done() == True``; and the next
                 # ``_schedule_deferred_inference_cleanup`` overwrites the entry.
                 # In tests, ``_reset_inference_state`` pops both dicts explicitly
                 # to keep per-test state clean — do not drop those fallback pops.
+                # We deliberately do *not* wrap this with ``asyncio.shield`` —
+                # the stale-entry path is benign, shielding would complicate
+                # cancellation semantics, and the pop is not load-bearing.
                 async with _get_deferred_cleanup_lock():
                     # Use the task's own running loop rather than closing over
                     # ``loop`` from the outer scope — ``_cleanup`` runs as a
