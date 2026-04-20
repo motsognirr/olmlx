@@ -312,12 +312,24 @@ class FlashWeightStore:
                 buf.insert(idx, gate, up, down)
             return buf.get_matrices(neuron_indices)
 
+    def _require_cache(self) -> _NeuronCache:
+        """Return the LRU cache, raising if the store is in preallocated-buffer mode.
+
+        Asserts are stripped under ``python -O``, so we use an explicit raise.
+        """
+        if self._cache is None:
+            raise RuntimeError(
+                "FlashWeightStore cache is None; "
+                "this path must not be reached when use_preallocated_buffer=True"
+            )
+        return self._cache
+
     def _load_neurons_cache(
         self, layer_idx: int, neuron_indices: list[int]
     ) -> tuple[mx.array, mx.array, mx.array]:
         """Load neurons via the per-layer LRU cache, fetching missing from SSD."""
-        assert self._cache is not None
-        cached = self._cache.get_batch(layer_idx, neuron_indices)
+        cache = self._require_cache()
+        cached = cache.get_batch(layer_idx, neuron_indices)
         missing = [idx for idx in neuron_indices if idx not in cached]
 
         if missing:
@@ -328,7 +340,7 @@ class FlashWeightStore:
             for idx, future in futures.items():
                 data = future.result()
                 cached[idx] = data
-                self._cache.put(layer_idx, idx, data)
+                cache.put(layer_idx, idx, data)
 
         gate_cols = []
         up_cols = []
@@ -357,8 +369,7 @@ class FlashWeightStore:
             buf = self._buffers[layer_idx]
             with buf.lock:
                 return buf.get_cached_indices(neuron_indices)
-        assert self._cache is not None
-        return self._cache.get_cached_indices(layer_idx, neuron_indices)
+        return self._require_cache().get_cached_indices(layer_idx, neuron_indices)
 
     def prefetch_neurons(
         self,
@@ -391,15 +402,15 @@ class FlashWeightStore:
                 for idx, (gate, up, down) in results.items():
                     buf.insert(idx, gate, up, down)
         else:
-            assert self._cache is not None
-            _, missing = self._cache.get_cached_indices(layer_idx, neuron_indices)
+            cache = self._require_cache()
+            _, missing = cache.get_cached_indices(layer_idx, neuron_indices)
             if not missing:
                 return
             futures = {
                 pool.submit(self._read_neuron, layer_idx, idx): idx for idx in missing
             }
             for fut in as_completed(futures):
-                self._cache.put(layer_idx, futures[fut], fut.result())
+                cache.put(layer_idx, futures[fut], fut.result())
 
     def close(self) -> None:
         """Release file descriptors and shut down the I/O thread pool."""

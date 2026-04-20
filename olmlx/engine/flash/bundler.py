@@ -57,6 +57,7 @@ def _encode_header(num_neurons: int, hidden_size: int, dtype: str) -> bytes:
 
 
 def parse_header(data: bytes) -> dict:
+    """Parse a .flashweights header. Raises ValueError on bad magic or version."""
     num_neurons, hidden_size, dtype_len, dtype_raw = _ssd_base.parse_header(
         _HEADER_SPEC, data
     )

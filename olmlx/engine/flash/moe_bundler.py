@@ -67,6 +67,7 @@ def _encode_moe_header(
 
 
 def parse_moe_header(data: bytes) -> dict:
+    """Parse a .flashexperts header. Raises ValueError on bad magic or version."""
     (
         num_experts,
         hidden_size,

@@ -40,9 +40,14 @@ F_NOCACHE = 48
 
 def full_pread(fd: int, size: int, offset: int) -> bytes:
     """Read exactly *size* bytes from *fd* at *offset*, retrying on short reads."""
-    buf = bytearray()
-    pos = offset
-    remaining = size
+    chunk = os.pread(fd, size, offset)
+    if len(chunk) == size:
+        return chunk
+    if not chunk:
+        raise OSError(f"Unexpected EOF: wanted {size} bytes at offset {offset}")
+    buf = bytearray(chunk)
+    pos = offset + len(chunk)
+    remaining = size - len(chunk)
     while remaining > 0:
         chunk = os.pread(fd, remaining, pos)
         if not chunk:
@@ -78,7 +83,8 @@ def open_fds(
             # except-block cleanup below is guaranteed to close it.
             fds[layer_idx] = fd
             if apply_nocache:
-                fcntl.fcntl(fd, F_NOCACHE, 1)
+                # fcntl is imported above when apply_nocache is True
+                fcntl.fcntl(fd, F_NOCACHE, 1)  # pyright: ignore[reportPossiblyUnboundVariable]
     except Exception:
         for fd in fds.values():
             try:
