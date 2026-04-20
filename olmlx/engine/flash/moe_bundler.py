@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import json
 import logging
-import struct
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+from olmlx.engine.flash import _ssd_base
+from olmlx.engine.flash._ssd_base import HeaderSpec
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +25,15 @@ MOE_HEADER_MAGIC = 0x464C4D45  # "FLME"
 MOE_HEADER_VERSION = 1
 MOE_HEADER_SIZE = 128  # bytes
 
-# Header format:
-# magic(4) version(4) num_experts(4) hidden_size(4) intermediate_size(4)
-# is_quantized(4) bits(4) group_size(4) expert_byte_size(8)
-# padding(88) = 128 bytes
-_MOE_HEADER_STRUCT = struct.Struct("<IIIIIIII Q 88s")
+# Body: num_experts(4) hidden(4) intermediate(4) is_quantized(4) bits(4)
+# group_size(4) expert_byte_size(8) = 32 bytes. Prefix (magic+version) is 8;
+# padding to 128 bytes is handled by the codec.
+_MOE_HEADER_SPEC = HeaderSpec(
+    magic=MOE_HEADER_MAGIC,
+    version=MOE_HEADER_VERSION,
+    size=MOE_HEADER_SIZE,
+    body_format="<IIIIIIQ",
+)
 
 # Map numpy dtype to string for manifest
 _DTYPE_TO_STR = {
@@ -48,9 +54,8 @@ def _encode_moe_header(
     group_size: int,
     expert_byte_size: int,
 ) -> bytes:
-    return _MOE_HEADER_STRUCT.pack(
-        MOE_HEADER_MAGIC,
-        MOE_HEADER_VERSION,
+    return _ssd_base.encode_header(
+        _MOE_HEADER_SPEC,
         num_experts,
         hidden_size,
         intermediate_size,
@@ -58,14 +63,12 @@ def _encode_moe_header(
         bits,
         group_size,
         expert_byte_size,
-        b"\x00" * 88,
     )
 
 
 def parse_moe_header(data: bytes) -> dict:
+    """Parse a .flashexperts header. Raises ValueError on bad magic or version."""
     (
-        magic,
-        version,
         num_experts,
         hidden_size,
         intermediate_size,
@@ -73,15 +76,10 @@ def parse_moe_header(data: bytes) -> dict:
         bits,
         group_size,
         expert_byte_size,
-        _,
-    ) = _MOE_HEADER_STRUCT.unpack(data[:MOE_HEADER_SIZE])
-    if magic != MOE_HEADER_MAGIC:
-        raise ValueError(
-            f"Invalid .flashexperts magic: expected {MOE_HEADER_MAGIC:#010x}, got {magic:#010x}"
-        )
+    ) = _ssd_base.parse_header(_MOE_HEADER_SPEC, data)
     return {
-        "magic": magic,
-        "version": version,
+        "magic": MOE_HEADER_MAGIC,
+        "version": MOE_HEADER_VERSION,
         "num_experts": num_experts,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,

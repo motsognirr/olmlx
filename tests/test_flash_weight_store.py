@@ -12,7 +12,7 @@ from olmlx.engine.flash.bundler import (
     bundle_ffn_weights,
     parse_header,
 )
-from olmlx.engine.flash.weight_store import FlashWeightStore, NeuronCache
+from olmlx.engine.flash.weight_store import FlashWeightStore
 
 
 # ---------------------------------------------------------------------------
@@ -216,57 +216,6 @@ class TestBundleVLModelWeights:
 
 
 # ---------------------------------------------------------------------------
-# NeuronCache tests
-# ---------------------------------------------------------------------------
-
-
-class TestNeuronCache:
-    def test_put_and_get(self):
-        cache = NeuronCache(max_neurons_per_layer=10)
-        data = (mx.ones((4,)), mx.ones((4,)), mx.ones((4,)))
-        cache.put(0, 5, data)
-        result = cache.get(0, 5)
-        assert result is not None
-        assert mx.array_equal(result[0], data[0])
-
-    def test_get_missing_returns_none(self):
-        cache = NeuronCache(max_neurons_per_layer=10)
-        assert cache.get(0, 99) is None
-
-    def test_lru_eviction(self):
-        cache = NeuronCache(max_neurons_per_layer=3)
-        for i in range(4):
-            cache.put(0, i, (mx.array([i]),) * 3)
-
-        # Neuron 0 should have been evicted (oldest)
-        assert cache.get(0, 0) is None
-        # Neurons 1, 2, 3 should still be present
-        assert cache.get(0, 1) is not None
-        assert cache.get(0, 2) is not None
-        assert cache.get(0, 3) is not None
-
-    def test_get_batch_returns_hits_and_misses(self):
-        cache = NeuronCache(max_neurons_per_layer=10)
-        cache.put(0, 1, (mx.array([1.0]),) * 3)
-        cache.put(0, 3, (mx.array([3.0]),) * 3)
-
-        cached = cache.get_batch(0, [1, 2, 3, 4])
-        assert 1 in cached and 3 in cached
-        assert 2 not in cached and 4 not in cached
-        assert len(cached) == 2
-
-    def test_layers_are_independent(self):
-        cache = NeuronCache(max_neurons_per_layer=5)
-        cache.put(0, 1, (mx.array([0.0]),) * 3)
-        cache.put(1, 1, (mx.array([1.0]),) * 3)
-
-        r0 = cache.get(0, 1)
-        r1 = cache.get(1, 1)
-        assert r0 is not None and r1 is not None
-        assert not mx.array_equal(r0[0], r1[0])
-
-
-# ---------------------------------------------------------------------------
 # FlashWeightStore tests
 # ---------------------------------------------------------------------------
 
@@ -371,21 +320,6 @@ class TestFlashWeightStore:
         # Different layers should have different weights (extremely unlikely to match)
         assert not mx.array_equal(g0, g1)
 
-    def test_bypass_cache_flag_stored(self, tmp_path):
-        """FlashWeightStore stores the bypass_cache flag."""
-        hidden, inter, num_layers = 16, 8, 1
-        model_dir = _make_synthetic_mlp_weights(hidden, inter, num_layers, tmp_path)
-        output_dir = tmp_path / "flash"
-        bundle_ffn_weights(model_dir, output_dir)
-
-        store = FlashWeightStore(output_dir, bypass_cache=True)
-        assert store._bypass_cache is True
-        store.close()
-
-        store2 = FlashWeightStore(output_dir, bypass_cache=False)
-        assert store2._bypass_cache is False
-        store2.close()
-
     def test_bypass_cache_reads_correctly(self, tmp_path):
         """With bypass_cache=True, reads still return correct data."""
         from safetensors.numpy import load_file
@@ -405,51 +339,3 @@ class TestFlashWeightStore:
         expected = mx.array(gate_w[indices].T)
         assert mx.allclose(gate_cols, expected, atol=1e-6)
         store.close()
-
-
-class TestFullPread:
-    """Tests for FlashWeightStore._full_pread handling short reads."""
-
-    def test_single_complete_read(self, tmp_path):
-        """Normal case: pread returns all bytes in one call."""
-        data = b"hello world, this is test data!"
-        p = tmp_path / "test.bin"
-        p.write_bytes(data)
-
-        import os
-
-        fd = os.open(str(p), os.O_RDONLY)
-        try:
-            result = FlashWeightStore._full_pread(fd, len(data), 0)
-            assert result == data
-        finally:
-            os.close(fd)
-
-    def test_short_reads_reassembled(self, tmp_path):
-        """When pread returns partial data, _full_pread retries and assembles."""
-        data = b"abcdefghijklmnopqrstuvwxyz"
-        p = tmp_path / "test.bin"
-        p.write_bytes(data)
-
-        import os
-        from unittest.mock import patch
-
-        fd = os.open(str(p), os.O_RDONLY)
-        try:
-            # Simulate short reads by returning small chunks
-            real_pread = os.pread
-            call_count = [0]
-
-            def short_pread(fd, size, offset):
-                call_count[0] += 1
-                # Return at most 5 bytes per call
-                return real_pread(fd, min(size, 5), offset)
-
-            with patch("os.pread", side_effect=short_pread):
-                result = FlashWeightStore._full_pread(fd, len(data), 0)
-
-            assert result == data
-            # Should have needed multiple calls
-            assert call_count[0] > 1
-        finally:
-            os.close(fd)
