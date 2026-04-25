@@ -12,7 +12,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from olmlx.chat.config import ChatConfig
+    from olmlx.chat.tui import ChatTUI
 
 from olmlx.config import settings
 

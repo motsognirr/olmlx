@@ -111,13 +111,7 @@ class ChatTUI:
         except (EOFError, KeyboardInterrupt):
             return False
 
-    def ask_question(
-        self,
-        header: str,
-        question: str,
-        options: list | None = None,
-        multiple: bool = False,
-    ) -> str | None:
+    def ask_question(self, header: str, question: str, options: list | None = None, multiple: bool = False) -> str | None:
         """Prompt user with a question. Returns the answer or None on EOF."""
         try:
             if options:
