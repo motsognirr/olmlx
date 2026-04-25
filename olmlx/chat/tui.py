@@ -111,6 +111,24 @@ class ChatTUI:
         except (EOFError, KeyboardInterrupt):
             return False
 
+    def ask_question(self, header: str, question: str, options: list | None = None, multiple: bool = False) -> str | None:
+        """Prompt user with a question. Returns the answer or None on EOF."""
+        try:
+            if options:
+                opts_str = ", ".join(f"'{o}'" for o in options)
+                self.console.print(f"[bold]{header}[/bold]")
+                self.console.print(question)
+                self.console.print(f"[dim]Options: {opts_str}[/dim]")
+                answer = self.console.input("[bold cyan]Your choice: [/bold cyan]")
+                return answer.strip()
+            else:
+                self.console.print(f"[bold]{header}[/bold]")
+                self.console.print(question)
+                answer = self.console.input("[bold cyan]> [/bold cyan]")
+                return answer.strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
     def display_tool_denied(self, name: str, reason: str = "policy") -> None:
         """Show that a tool call was blocked."""
         if reason == "user":
@@ -167,14 +185,14 @@ class StreamContext:
         self._chunks: list[str] = [initial_text] if initial_text else []
         self._thinking_chunks: list[str] = []
         self._in_thinking = False
-        self._started = False
+        self._needs_newline = False
         self._is_tty = sys.stdout.isatty()
 
     def __enter__(self):
         if self._chunks:
             sys.stdout.write("".join(self._chunks))
             sys.stdout.flush()
-        self._started = True
+        self._needs_newline = True
         return self
 
     def __exit__(self, *args):
@@ -183,17 +201,17 @@ class StreamContext:
     @property
     def is_active(self) -> bool:
         """Whether the stream context is currently started."""
-        return self._started
+        return self._needs_newline
 
     def finish(self) -> None:
         """End streaming output. Idempotent — safe to call multiple times."""
-        if self._started:
+        if self._needs_newline:
             if self._in_thinking:
                 self._write_ansi(self._ITALIC_OFF)
                 self._in_thinking = False
             sys.stdout.write("\n")
             sys.stdout.flush()
-            self._started = False
+            self._needs_newline = False
 
     def _write_ansi(self, code: str) -> None:
         """Write ANSI escape code only if stdout is a terminal."""
@@ -219,11 +237,7 @@ class StreamContext:
             self._thinking_chunks.append(token)
         else:
             self._chunks.append(token)
-        # Re-arm _started: when confirm_decider calls finish() mid-stream
-        # (ending the first model turn), the second turn's tokens still
-        # arrive through update(). Re-arming ensures __exit__ → finish()
-        # emits the trailing newline for the second turn's output.
-        self._started = True
+        self._needs_newline = True
         sys.stdout.write(token)
         sys.stdout.flush()
 

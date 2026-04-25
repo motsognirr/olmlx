@@ -49,6 +49,9 @@ class TestBuiltinToolManagerSkeleton:
             "create_plan",
             "update_plan",
             "read_plan",
+            "read_directory",
+            "question",
+            "TodoWrite",
         }
         assert names == expected
 
