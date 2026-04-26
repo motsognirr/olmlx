@@ -23,7 +23,9 @@ from olmlx.utils import memory as memory_utils
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
 
 if TYPE_CHECKING:
-    from olmlx.models.store import ModelStore, _strip_ollama_tag
+    from olmlx.models.store import ModelStore
+
+from olmlx.models.store import _strip_ollama_tag
 
 logger = logging.getLogger(__name__)
 
