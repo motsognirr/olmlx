@@ -133,16 +133,10 @@ class ThinkingTracker:
             and self._close_pos >= 0
         )
         if has_thinking:
-            cs = (
-                (self._open_pos + len(_THINK_OPEN))
-                if self._open_pos >= 0
-                else 0
-            )
+            cs = (self._open_pos + len(_THINK_OPEN)) if self._open_pos >= 0 else 0
             if self._close_pos >= 0:
                 think_content = self._accumulated[cs : self._close_pos]
-                visible = self._accumulated[
-                    self._close_pos + len(_THINK_CLOSE) :
-                ]
+                visible = self._accumulated[self._close_pos + len(_THINK_CLOSE) :]
             else:
                 think_content = self._accumulated[cs:]
                 visible = ""
@@ -150,9 +144,7 @@ class ThinkingTracker:
                 think_content = ""
         elif implicit_strip:
             think_content = ""
-            visible = self._accumulated[
-                self._close_pos + len(_THINK_CLOSE) :
-            ]
+            visible = self._accumulated[self._close_pos + len(_THINK_CLOSE) :]
         else:
             think_content = ""
             visible = self._accumulated
