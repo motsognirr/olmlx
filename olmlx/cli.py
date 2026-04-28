@@ -850,6 +850,22 @@ def cmd_chat(args):
             if uses_auto:
                 from olmlx.chat.llm_judge import SafeJudge
 
+                llm_judge = SafeJudge(
+                    manager,
+                    model_name=lambda: (
+                        safety_config.judge_model
+                        if safety_config.judge_model
+                        else config.model_name
+                    ),
+                )
+                if safety_config.judge_model:
+                    tui.console.print(
+                        f"[dim]LLM judge using separate model: "
+                        f"{safety_config.judge_model}[/dim]"
+                    )
+            if uses_auto:
+                from olmlx.chat.llm_judge import SafeJudge
+
                 llm_judge = SafeJudge(manager, model_name=lambda: config.model_name)
 
             policy = ToolSafetyPolicy(
@@ -911,6 +927,24 @@ def cmd_chat(args):
                             tui.display_error("Usage: /mode auto|confirm")
                             continue
                         safety_config.default_policy = new_default
+                        if new_default == ToolPolicy.CONFIRM:
+                            # Clear per-tool AUTO overrides so all tools
+                            # follow the new default (user expects full
+                            # manual review after /mode confirm).
+                            cleared = [
+                                name
+                                for name, pol in list(
+                                    safety_config.tool_policies.items()
+                                )
+                                if pol == ToolPolicy.AUTO
+                            ]
+                            for name in cleared:
+                                del safety_config.tool_policies[name]
+                            if cleared:
+                                tui.console.print(
+                                    f"[dim]Cleared AUTO override(s): "
+                                    f"{', '.join(cleared)}[/dim]"
+                                )
                         if new_default == ToolPolicy.AUTO and llm_judge is None:
                             from olmlx.chat.llm_judge import SafeJudge
 

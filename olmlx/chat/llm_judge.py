@@ -19,6 +19,7 @@ from olmlx.engine.model_manager import ModelManager
 logger = logging.getLogger(__name__)
 
 _THINK_STRIP_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_INCOMPLETE_THINK_RE = re.compile(r"<think>.*", re.DOTALL)
 
 _DEFAULT_JUDGE_PROMPT = """\
 You are a safety classifier for a coding assistant. Your job is to determine \
@@ -134,7 +135,15 @@ class SafeJudge:
                 text = chunk.get("text", "")
                 if text:
                     full_text += text
-            classification = _THINK_STRIP_RE.sub("", full_text).strip().upper()
+            # Strip complete <think> blocks and truncate at any incomplete
+            # opening tag (defense in depth — enable_thinking=False should
+            # suppress these, but a truncated block from max_tokens would
+            # otherwise make the classification unparseable).
+            classification = _THINK_STRIP_RE.sub("", full_text)
+            idx = classification.find("<think>")
+            if idx != -1:
+                classification = classification[:idx]
+            classification = classification.strip().upper().rstrip(".,!?:;\"' \t\n\r")
             if classification == "UNSAFE":
                 return False
             return classification == "SAFE"

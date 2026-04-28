@@ -20,6 +20,7 @@ class ToolPolicy(str, Enum):
 class ToolSafetyConfig:
     default_policy: ToolPolicy = ToolPolicy.CONFIRM
     tool_policies: dict[str, ToolPolicy] = field(default_factory=dict)
+    judge_model: str | None = None
 
 
 class ToolSafetyPolicy:
