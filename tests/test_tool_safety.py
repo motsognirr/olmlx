@@ -52,12 +52,13 @@ class TestToolPolicy:
 
 class TestClassifyBatch:
     def test_classify_batch(self):
-        """Splits tool list into allow, confirm, deny groups."""
+        """Splits tool list into allow, confirm, auto, deny groups."""
         config = ToolSafetyConfig(
             default_policy=ToolPolicy.CONFIRM,
             tool_policies={
                 "read_file": ToolPolicy.ALLOW,
                 "delete_file": ToolPolicy.DENY,
+                "bash": ToolPolicy.AUTO,
             },
         )
         policy = ToolSafetyPolicy(config)
@@ -65,18 +66,35 @@ class TestClassifyBatch:
             {"name": "read_file", "input": {}, "id": "1"},
             {"name": "write_file", "input": {}, "id": "2"},
             {"name": "delete_file", "input": {}, "id": "3"},
+            {"name": "bash", "input": {}, "id": "4"},
         ]
-        allow, confirm, deny = policy.classify_batch(tool_uses)
+        allow, confirm, auto, deny = policy.classify_batch(tool_uses)
         assert [tu["name"] for tu in allow] == ["read_file"]
         assert [tu["name"] for tu in confirm] == ["write_file"]
+        assert [tu["name"] for tu in auto] == ["bash"]
         assert [tu["name"] for tu in deny] == ["delete_file"]
 
     def test_classify_batch_empty(self):
         """Empty tool list returns empty groups."""
         policy = ToolSafetyPolicy(ToolSafetyConfig())
-        allow, confirm, deny = policy.classify_batch([])
+        allow, confirm, auto, deny = policy.classify_batch([])
         assert allow == []
         assert confirm == []
+        assert auto == []
+        assert deny == []
+
+    def test_classify_batch_all_auto(self):
+        """All tools classified as AUTO when default is AUTO."""
+        config = ToolSafetyConfig(default_policy=ToolPolicy.AUTO)
+        policy = ToolSafetyPolicy(config)
+        tool_uses = [
+            {"name": "read_file", "input": {}, "id": "1"},
+            {"name": "write_file", "input": {}, "id": "2"},
+        ]
+        allow, confirm, auto, deny = policy.classify_batch(tool_uses)
+        assert allow == []
+        assert confirm == []
+        assert len(auto) == 2
         assert deny == []
 
 
@@ -144,3 +162,74 @@ class TestCheckAndConfirm:
         policy = ToolSafetyPolicy(config, decider=None)
         result = await policy.check_and_confirm("write_file", {})
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_auto_calls_llm_judge_safe(self):
+        """AUTO tools call the LLM judge and return its result (True)."""
+        llm_called = False
+
+        async def judge(name, args, ctx):
+            nonlocal llm_called
+            llm_called = True
+            assert name == "bash"
+            assert args == {"cmd": "ls"}
+            assert ctx == [{"role": "user", "content": "hello"}]
+            return True
+
+        config = ToolSafetyConfig(tool_policies={"bash": ToolPolicy.AUTO})
+        policy = ToolSafetyPolicy(config, llm_judge=judge)
+        result = await policy.check_and_confirm(
+            "bash", {"cmd": "ls"}, context=[{"role": "user", "content": "hello"}]
+        )
+        assert result is True
+        assert llm_called
+
+    @pytest.mark.asyncio
+    async def test_auto_calls_llm_judge_unsafe(self):
+        """AUTO tools call the LLM judge and return its result (False)."""
+
+        async def judge(name, args, ctx):
+            return False
+
+        config = ToolSafetyConfig(tool_policies={"bash": ToolPolicy.AUTO})
+        policy = ToolSafetyPolicy(config, llm_judge=judge)
+        result = await policy.check_and_confirm("bash", {"cmd": "rm -rf /"})
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_auto_no_judge_falls_back_to_decider(self):
+        """AUTO tools without LLM judge fall back to the user decider."""
+        decider_called = False
+
+        async def decider(name, args):
+            nonlocal decider_called
+            decider_called = True
+            return True
+
+        config = ToolSafetyConfig(tool_policies={"bash": ToolPolicy.AUTO})
+        policy = ToolSafetyPolicy(config, decider=decider, llm_judge=None)
+        result = await policy.check_and_confirm("bash", {"cmd": "ls"})
+        assert result is True
+        assert decider_called
+
+    @pytest.mark.asyncio
+    async def test_auto_no_judge_no_decider_denies(self):
+        """AUTO tools without judge or decider are denied."""
+        config = ToolSafetyConfig(tool_policies={"bash": ToolPolicy.AUTO})
+        policy = ToolSafetyPolicy(config, decider=None, llm_judge=None)
+        result = await policy.check_and_confirm("bash", {"cmd": "ls"})
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_auto_default_policy(self):
+        """When default is AUTO, all tools go through the LLM judge."""
+
+        async def judge(name, args, ctx):
+            return name == "read_file"
+
+        config = ToolSafetyConfig(default_policy=ToolPolicy.AUTO)
+        policy = ToolSafetyPolicy(config, llm_judge=judge)
+        safe = await policy.check_and_confirm("read_file", {"path": "/a"})
+        unsafe = await policy.check_and_confirm("bash", {"cmd": "rm"})
+        assert safe is True
+        assert unsafe is False

@@ -36,7 +36,7 @@ class ChatTUI:
         lines.append("")
         lines.append(
             "Commands: /exit, /clear, /tools, /safety, /system <prompt>, "
-            "/model <name>, /model thinking on|off"
+            "/model <name>, /model thinking on|off, /mode auto|confirm"
         )
         self.console.print(
             Panel("\n".join(lines), title="olmlx chat", border_style="blue")
@@ -135,10 +135,16 @@ class ChatTUI:
         except (EOFError, KeyboardInterrupt):
             return None
 
+    def display_tool_auto_judging(self, name: str) -> None:
+        """Show that a tool call is being auto-judged by the LLM."""
+        self.console.print(f"[dim]Judging {name}...[/dim]")
+
     def display_tool_denied(self, name: str, reason: str = "policy") -> None:
         """Show that a tool call was blocked."""
         if reason == "user":
             msg = f"{name} — denied by user"
+        elif reason == "auto":
+            msg = f"{name} — denied by safety check"
         else:
             msg = f"{name} — blocked by safety policy"
         self.console.print(
@@ -147,7 +153,13 @@ class ChatTUI:
 
     def display_safety_policy(self, policy: "ToolSafetyPolicy") -> None:
         """Show current tool safety policy."""
-        lines = [f"Default policy: {policy.config.default_policy.value}"]
+        default = policy.config.default_policy.value
+        lines = [f"Default policy: {default}"]
+        if default == "auto":
+            has_judge = policy.llm_judge is not None
+            lines.append(
+                f"  LLM judge: {'available' if has_judge else 'NOT CONFIGURED'}"
+            )
         if policy.config.tool_policies:
             for name, pol in sorted(policy.config.tool_policies.items()):
                 lines.append(f"  {name}: {pol.value}")

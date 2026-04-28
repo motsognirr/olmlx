@@ -1167,14 +1167,15 @@ class TestToolSafetyIntegration:
         original_classify = session.tool_safety.classify_batch
 
         def classify_dropping_write(tool_uses):
-            allow, confirm, deny = original_classify(tool_uses)
+            allow, confirm, auto, deny = original_classify(tool_uses)
             assert any(tu["name"] == "write_file" for tu in allow), (
                 "write_file should be in allow before filtering"
             )
             allow = [tu for tu in allow if tu["name"] != "write_file"]
             confirm = [tu for tu in confirm if tu["name"] != "write_file"]
+            auto = [tu for tu in auto if tu["name"] != "write_file"]
             deny = [tu for tu in deny if tu["name"] != "write_file"]
-            return allow, confirm, deny
+            return allow, confirm, auto, deny
 
         with (
             patch(
