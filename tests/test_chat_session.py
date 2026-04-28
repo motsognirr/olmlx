@@ -1167,14 +1167,15 @@ class TestToolSafetyIntegration:
         original_classify = session.tool_safety.classify_batch
 
         def classify_dropping_write(tool_uses):
-            allow, confirm, deny = original_classify(tool_uses)
+            allow, confirm, auto, deny = original_classify(tool_uses)
             assert any(tu["name"] == "write_file" for tu in allow), (
                 "write_file should be in allow before filtering"
             )
             allow = [tu for tu in allow if tu["name"] != "write_file"]
             confirm = [tu for tu in confirm if tu["name"] != "write_file"]
+            auto = [tu for tu in auto if tu["name"] != "write_file"]
             deny = [tu for tu in deny if tu["name"] != "write_file"]
-            return allow, confirm, deny
+            return allow, confirm, auto, deny
 
         with (
             patch(
@@ -1253,6 +1254,91 @@ class TestToolSafetyIntegration:
 
         mcp.call_tool.assert_awaited_once()
         assert not decider_called
+
+    @pytest.mark.asyncio
+    async def test_auto_tool_executes_on_safe_judgment(self):
+        """AUTO tools execute when the LLM judge returns True."""
+        mcp = self._mcp_with_tools()
+        llm_called = False
+
+        async def judge(name, args, ctx):
+            nonlocal llm_called
+            llm_called = True
+            return True
+
+        config = ToolSafetyConfig(tool_policies={"write_file": ToolPolicy.AUTO})
+        policy = ToolSafetyPolicy(config, llm_judge=judge)
+        session = _make_session(mcp=mcp, tool_safety=policy)
+        call_count = 0
+
+        async def fake_generate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield {
+                    "text": '<tool_call>{"name": "write_file", "arguments": {"path": "/tmp/x"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": MagicMock()}
+            else:
+                yield {"text": "Done", "done": False}
+                yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            events = []
+            async for event in session.send_message("Write a file"):
+                events.append(event)
+
+        assert llm_called
+        mcp.call_tool.assert_awaited_once()
+        result_events = [e for e in events if e["type"] == "tool_result"]
+        assert len(result_events) == 1
+        approved_events = [e for e in events if e["type"] == "tool_approved"]
+        assert len(approved_events) == 1
+        judging_events = [e for e in events if e["type"] == "tool_auto_judging"]
+        assert len(judging_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_auto_tool_denied_on_unsafe_judgment(self):
+        """AUTO tools are denied when the LLM judge returns False."""
+        mcp = self._mcp_with_tools()
+
+        async def judge(name, args, ctx):
+            return False
+
+        config = ToolSafetyConfig(tool_policies={"write_file": ToolPolicy.AUTO})
+        policy = ToolSafetyPolicy(config, llm_judge=judge)
+        session = _make_session(mcp=mcp, tool_safety=policy)
+        call_count = 0
+
+        async def fake_generate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield {
+                    "text": '<tool_call>{"name": "write_file", "arguments": {"path": "/tmp/x"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": MagicMock()}
+            else:
+                yield {"text": "Done", "done": False}
+                yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            events = []
+            async for event in session.send_message("Write a file"):
+                events.append(event)
+
+        deny_events = [e for e in events if e["type"] == "tool_denied"]
+        assert len(deny_events) == 1
+        assert deny_events[0]["reason"] == "auto"
+        mcp.call_tool.assert_not_awaited()
 
 
 class TestPrepareTools:

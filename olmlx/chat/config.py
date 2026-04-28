@@ -167,4 +167,14 @@ def load_tool_safety_config(path: Path) -> ToolSafetyConfig:
             except ValueError:
                 logger.warning("Invalid policy %r for tool %r, skipping", value, name)
 
-    return ToolSafetyConfig(default_policy=default_policy, tool_policies=tool_policies)
+    # Parse optional judge model (separate model for safety evaluation)
+    judge_model = safety_raw.get("judgeModel")
+    if judge_model is not None and not isinstance(judge_model, str):
+        logger.warning("Invalid judgeModel %r, ignoring", judge_model)
+        judge_model = None
+
+    return ToolSafetyConfig(
+        default_policy=default_policy,
+        tool_policies=tool_policies,
+        judge_model=judge_model,
+    )

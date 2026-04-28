@@ -327,10 +327,10 @@ class ChatSession:
                 remote_tools.append(tu)
 
         if self.tool_safety:
-            allow, confirm, deny = self.tool_safety.classify_batch(remote_tools)
+            allow, confirm, auto, deny = self.tool_safety.classify_batch(remote_tools)
             allow = local_tools + allow
         else:
-            allow, confirm, deny = local_tools + remote_tools, [], []
+            allow, confirm, auto, deny = local_tools + remote_tools, [], [], []
 
         # Collect results by tool_call_id for call-order output.
         results_by_id: dict[str, dict] = {}
@@ -383,6 +383,40 @@ class ChatSession:
                         "tool_call_id": tu["id"],
                         "name": tu["name"],
                         "content": f"Tool '{tu['name']}' was not approved",
+                    },
+                }
+
+        # Auto-judge tools via LLM
+        for tu in auto:
+            yield {
+                "type": "tool_auto_judging",
+                "name": tu["name"],
+                "arguments": tu["input"],
+                "id": tu["id"],
+            }
+            if await self.tool_safety.check_and_confirm(
+                tu["name"], tu["input"], context=self.messages
+            ):
+                approved.append(tu)
+                yield {
+                    "type": "tool_approved",
+                    "name": tu["name"],
+                    "id": tu["id"],
+                }
+            else:
+                yield {
+                    "type": "tool_denied",
+                    "name": tu["name"],
+                    "arguments": tu["input"],
+                    "id": tu["id"],
+                    "reason": "auto",
+                }
+                results_by_id[tu["id"]] = {
+                    "message": {
+                        "role": "tool",
+                        "tool_call_id": tu["id"],
+                        "name": tu["name"],
+                        "content": f"Tool '{tu['name']}' was not approved by safety check",
                     },
                 }
 

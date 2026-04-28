@@ -7,6 +7,7 @@ from olmlx.chat.config import (
     load_tool_safety_config,
     sanitize_mcp_env,
 )
+from olmlx.chat.llm_judge import SafeJudge
 from olmlx.chat.mcp_client import MCPClientManager
 from olmlx.chat.session import ChatSession
 from olmlx.chat.skills import Skill, SkillManager
@@ -19,6 +20,7 @@ __all__ = [
     "ChatSession",
     "ChatTUI",
     "MCPClientManager",
+    "SafeJudge",
     "Skill",
     "SkillManager",
     "ToolPolicy",
