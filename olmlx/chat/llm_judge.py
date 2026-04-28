@@ -6,6 +6,7 @@ to classify it in the context of the conversation.
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
@@ -47,6 +48,19 @@ class SafeJudge:
     Calls the model with a structured prompt containing the conversation
     context and proposed tool call. The model must respond with
     ``SAFE`` or ``UNSAFE``.
+
+    **Security note:** When the judge uses the same model as the chat
+    session (the default), it lacks an independent vantage point for
+    adversarial prompt injection — a compromised model context may
+    approve its own malicious tool calls. For strongest guarantees,
+    configure a separate judge model. AUTO mode provides meaningful
+    protection against accidental misclassification and non-adversarial
+    safety concerns.
+
+    **Latency note:** Each AUTO-classified tool call triggers a full
+    judge inference cycle. Batches of multiple AUTO tools execute the
+    judge sequentially, adding latency proportional to the number of
+    tools.
 
     Args:
         manager: ModelManager to use for inference.
@@ -132,8 +146,9 @@ class SafeJudge:
     def _format_context(context: list[dict]) -> str:
         """Format recent conversation context for the judge prompt.
 
-        Wraps each message in XML tags to separate untrusted content
-        from the judge's instructions.
+        Wraps each message in XML tags with proper HTML escaping to
+        prevent untrusted content (tool results, user messages) from
+        breaking the tag structure or injecting instructions.
         """
         lines: list[str] = []
         for msg in context[-5:]:
@@ -141,11 +156,11 @@ class SafeJudge:
             content = msg.get("content", "")
             if not isinstance(content, str):
                 content = json.dumps(content)
-            else:
-                tc = msg.get("tool_calls")
-                if tc:
-                    content += " [calls tools]"
+            if msg.get("tool_calls"):
+                content += " [calls tools]"
             if len(content) > 500:
                 content = content[:500] + "..."
-            lines.append(f'<message role="{role}">{content}</message>')
+            lines.append(
+                f'<message role="{html.escape(role)}">{html.escape(content)}</message>'
+            )
         return "\n".join(lines)
