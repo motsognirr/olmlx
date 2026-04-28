@@ -1,9 +1,12 @@
 """Tool safety policy for gating tool execution."""
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class ToolPolicy(str, Enum):
@@ -69,4 +72,8 @@ class ToolSafetyPolicy:
             return False
         if self.decider:
             return await self.decider(name, arguments)
+        logger.warning(
+            "Tool %r requires confirmation but no decider is configured — denying",
+            name,
+        )
         return False

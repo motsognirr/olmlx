@@ -288,6 +288,46 @@ async def _handle_grep(args: dict) -> str:
     return output
 
 
+async def _handle_read_directory(args: dict) -> str:
+    path = args.get("path", ".")
+
+    try:
+        safe_path = _resolve_path(path)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    def _list_dir() -> list[str]:
+        if not safe_path.is_dir():
+            return [f"Error: not a directory: {safe_path}"]
+        lines = []
+        for entry in sorted(safe_path.iterdir()):
+            if entry.is_dir():
+                lines.append(f"{entry.name}/")
+            else:
+                size = entry.stat().st_size
+                lines.append(f"{entry.name} ({size} bytes)")
+        return lines
+
+    try:
+        entries = await asyncio.to_thread(_list_dir)
+    except OSError as exc:
+        return f"Error listing directory: {exc}"
+
+    return "\n".join(entries)
+
+
+async def _handle_question(args: dict) -> str:
+    import json
+
+    payload = {
+        "header": args.get("header", ""),
+        "question": args.get("question", ""),
+        "multiple": args.get("multiple", False),
+        "options": args.get("options"),
+    }
+    return "__question__:" + json.dumps(payload)
+
+
 async def _handle_bash(args: dict) -> str:
     command = args.get("command", "")
     timeout = args.get("timeout", _BASH_DEFAULT_TIMEOUT)
@@ -341,6 +381,21 @@ async def _handle_bash(args: dict) -> str:
         parts.append(f"Exit code: {proc.returncode}")
 
     return "\n".join(parts) if parts else "(no output)"
+
+
+async def _handle_todo_write(args: dict) -> str:
+    todos = args.get("todos", [])
+    if not todos:
+        return "Todo list cleared."
+
+    lines = []
+    for i, item in enumerate(todos, 1):
+        content = item.get("content", "")
+        priority = item.get("priority", "medium")
+        status = item.get("status", "pending")
+        lines.append(f"[{status}] [{priority}] {i}. {content}")
+
+    return "\n".join(lines)
 
 
 async def _handle_create_plan(args: dict, plans_dir: Path) -> str:
@@ -702,6 +757,92 @@ _TOOL_DEFS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "read_directory",
+            "description": "List files and directories in a path (ls equivalent).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative directory path (default: current directory)",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "question",
+            "description": "Ask the user a question and return their answer. Use for disambiguation, choosing between options, or gathering required input.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "header": {
+                        "type": "string",
+                        "description": "Short label for the question (max 30 chars)",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "The question to ask the user",
+                    },
+                    "multiple": {
+                        "type": "boolean",
+                        "description": "Allow selecting multiple options (default: false)",
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Available choices",
+                    },
+                },
+                "required": ["header", "question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "TodoWrite",
+            "description": "Create and manage a task list for the current session. Tracks todo items by content, priority, and status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "Brief description of the task",
+                                },
+                                "priority": {
+                                    "type": "string",
+                                    "enum": ["high", "medium", "low"],
+                                    "description": "Priority level",
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": [
+                                        "in_progress",
+                                        "completed",
+                                        "cancelled",
+                                        "pending",
+                                    ],
+                                    "description": "Current status",
+                                },
+                            },
+                        },
+                        "description": "List of todo items to set",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_plan",
             "description": "Read the current plan content.",
             "parameters": {
@@ -720,6 +861,7 @@ _SIMPLE_HANDLERS: dict[str, Callable] = {
     "glob": _handle_glob,
     "grep": _handle_grep,
     "bash": _handle_bash,
+    "read_directory": _handle_read_directory,
     "web_fetch": _handle_web_fetch,
     "web_search": _handle_web_search,
 }
@@ -728,6 +870,14 @@ _PLAN_HANDLERS: dict[str, Callable] = {
     "create_plan": _handle_create_plan,
     "update_plan": _handle_update_plan,
     "read_plan": _handle_read_plan,
+}
+
+_TODO_HANDLERS: dict[str, Callable] = {
+    "TodoWrite": _handle_todo_write,
+}
+
+_QUESTION_HANDLERS: dict[str, Callable] = {
+    "question": _handle_question,
 }
 
 
@@ -749,4 +899,8 @@ class BuiltinToolManager:
             return await _SIMPLE_HANDLERS[name](arguments)
         if name in _PLAN_HANDLERS:
             return await _PLAN_HANDLERS[name](arguments, self._config.plans_dir)
+        if name in _TODO_HANDLERS:
+            return await _TODO_HANDLERS[name](arguments)
+        if name in _QUESTION_HANDLERS:
+            return await _QUESTION_HANDLERS[name](arguments)
         raise ValueError(f"Unknown built-in tool: {name!r}")

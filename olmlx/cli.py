@@ -902,7 +902,6 @@ def cmd_chat(args):
                     elif command == "/model":
                         model_parts = arg.split(None, 1)
                         if model_parts and model_parts[0] == "thinking":
-                            # /model thinking [on|off]
                             if len(model_parts) == 2 and model_parts[1] in (
                                 "on",
                                 "off",
@@ -957,6 +956,23 @@ def cmd_chat(args):
                                 confirmed_tool_ids.add(event["id"])
                             else:
                                 pending_events.append(event)
+                    # Track if question was asked for post-processing
+                    question_asked = any(
+                        e.get("type") == "question" for e in pending_events
+                    )
+                    if question_asked:
+                        # Find the question event and ask user
+                        for event in pending_events:
+                            if event.get("type") == "question":
+                                answer = tui.ask_question(
+                                    event.get("header", ""),
+                                    event.get("question", ""),
+                                    options=event.get("options"),
+                                    multiple=event.get("multiple", False),
+                                )
+                                if answer is not None:
+                                    user_input = answer
+                                    break
                 finally:
                     active_stream_ctx = None
 

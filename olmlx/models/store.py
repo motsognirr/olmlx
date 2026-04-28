@@ -18,6 +18,21 @@ def _safe_dir_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
 
 
+def _strip_ollama_tag(hf_path: str) -> str:
+    """Strip Ollama-style tag from HF path.
+
+    Transforms "owner/repo:tag" → "owner/repo". Tags with "/" in them fail
+    HF validation because they exceed reasonable length and contain special chars.
+    Returns the original path if no single-slash tag is present.
+    """
+    if ":" not in hf_path:
+        return hf_path
+    base, _, tag = hf_path.partition(":")
+    if "/" in base and base.count("/") == 1:
+        return base
+    return hf_path
+
+
 def _extract_metadata(model_dir: Path) -> dict:
     """Extract model metadata from config.json if available."""
     config_path = model_dir / "config.json"
@@ -167,6 +182,9 @@ class ModelStore:
                 hf_path = name
             else:
                 raise ValueError(f"Model '{name}' not found in config")
+
+        # Strip Ollama-style tag before passing to HF.
+        hf_path = _strip_ollama_tag(hf_path)
 
         # Fast path: skip lock if already downloaded
         if self.is_downloaded(hf_path):

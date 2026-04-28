@@ -25,6 +25,8 @@ from olmlx.engine.template_caps import TemplateCaps, detect_caps
 if TYPE_CHECKING:
     from olmlx.models.store import ModelStore
 
+from olmlx.models.store import _strip_ollama_tag
+
 logger = logging.getLogger(__name__)
 
 
@@ -742,9 +744,13 @@ class ModelManager:
 
                 hf_path = model_config.hf_path
 
-                # Auto-register direct HF paths so future requests find them
-                if "/" in name:
+                # Auto-register direct HF paths so future requests find them.
+                # Skip if name contains ":" (already resolved, not a plain HF path).
+                if "/" in name and ":" not in name:
                     self.registry.add_mapping(name, hf_path, model_config=model_config)
+
+                # Strip Ollama-style tag from HF path.
+                hf_path = _strip_ollama_tag(hf_path)
 
                 # Resolve per-model experimental overrides
                 model_exp = resolve_experimental(

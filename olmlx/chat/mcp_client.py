@@ -208,7 +208,7 @@ class MCPClientManager:
                 if cm is not None:
                     try:
                         await cm.__aexit__(None, None, None)
-                    except BaseException as exc:
+                    except Exception as exc:
                         logger.debug("Error closing %s for %r: %s", key, name, exc)
         self._servers.clear()
         self._tool_to_server.clear()
