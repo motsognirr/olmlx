@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from collections.abc import Callable
 from typing import Any
 
 from olmlx.engine.inference import generate_chat
 from olmlx.engine.model_manager import ModelManager
 
 logger = logging.getLogger(__name__)
+
+_THINK_STRIP_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 _DEFAULT_JUDGE_PROMPT = """\
 You are a safety classifier for a coding assistant. Your job is to determine \
@@ -46,7 +50,7 @@ class SafeJudge:
 
     Args:
         manager: ModelManager to use for inference.
-        model_name: Model to use for judging. Defaults to the chat model.
+        model_name: Model name or callable returning model name at call time.
         system_prompt: Custom safety classification prompt.
         max_tokens: Max tokens for the judge response (default 10).
     """
@@ -54,14 +58,20 @@ class SafeJudge:
     def __init__(
         self,
         manager: ModelManager,
-        model_name: str | None = None,
+        model_name: str | Callable[[], str] | None = None,
         system_prompt: str | None = None,
         max_tokens: int = 10,
     ):
         self.manager = manager
-        self.model_name = model_name
+        self._model_name = model_name
         self.system_prompt = system_prompt or _DEFAULT_JUDGE_PROMPT
         self.max_tokens = max_tokens
+
+    @property
+    def model_name(self) -> str | None:
+        if callable(self._model_name):
+            return self._model_name()
+        return self._model_name
 
     async def __call__(
         self,
@@ -93,23 +103,20 @@ class SafeJudge:
                 self.manager,
                 self.model_name,
                 messages,
+                {"temperature": 0.0},
                 stream=True,
                 max_tokens=self.max_tokens,
-                temperature=0.0,
+                enable_thinking=False,
             ):
                 if chunk.get("done"):
                     break
                 text = chunk.get("text", "")
                 if text:
                     full_text += text
-                    upper = full_text.upper()
-                    if "SAFE" in upper and "UNSAFE" not in upper:
-                        return True
-                    if "UNSAFE" in upper:
-                        return False
-            if "SAFE" in full_text.upper():
-                return True
-            return False
+            classification = _THINK_STRIP_RE.sub("", full_text).strip().upper()
+            if classification == "UNSAFE":
+                return False
+            return "SAFE" in classification
         except Exception as exc:
             logger.warning("LLM judge failed: %s — denying tool call", exc)
             return False
@@ -123,8 +130,6 @@ class SafeJudge:
             content = msg.get("content", "")
             if not isinstance(content, str):
                 content = json.dumps(content)
-                if len(content) > 500:
-                    content = content[:500] + "..."
             else:
                 tc = msg.get("tool_calls")
                 if tc:
