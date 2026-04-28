@@ -863,10 +863,6 @@ def cmd_chat(args):
                         f"[dim]LLM judge using separate model: "
                         f"{safety_config.judge_model}[/dim]"
                     )
-            if uses_auto:
-                from olmlx.chat.llm_judge import SafeJudge
-
-                llm_judge = SafeJudge(manager, model_name=lambda: config.model_name)
 
             policy = ToolSafetyPolicy(
                 safety_config,
@@ -949,7 +945,12 @@ def cmd_chat(args):
                             from olmlx.chat.llm_judge import SafeJudge
 
                             llm_judge = SafeJudge(
-                                manager, model_name=lambda: config.model_name
+                                manager,
+                                model_name=lambda: (
+                                    safety_config.judge_model
+                                    if safety_config.judge_model
+                                    else config.model_name
+                                ),
                             )
                             policy.llm_judge = llm_judge
                             tui.console.print("[dim]LLM judge initialised[/dim]")

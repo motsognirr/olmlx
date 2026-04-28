@@ -139,10 +139,9 @@ class SafeJudge:
             # opening tag (defense in depth — enable_thinking=False should
             # suppress these, but a truncated block from max_tokens would
             # otherwise make the classification unparseable).
-            classification = _THINK_STRIP_RE.sub("", full_text)
-            idx = classification.find("<think>")
-            if idx != -1:
-                classification = classification[:idx]
+            classification = _INCOMPLETE_THINK_RE.sub(
+                "", _THINK_STRIP_RE.sub("", full_text)
+            )
             classification = classification.strip().upper().rstrip(".,!?:;\"' \t\n\r")
             if classification == "UNSAFE":
                 return False
