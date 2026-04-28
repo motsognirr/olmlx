@@ -844,19 +844,13 @@ def cmd_chat(args):
                 return await asyncio.to_thread(tui.confirm_tool_call, name, args)
 
             llm_judge = None
-            uses_auto = (
-                safety_config.default_policy == ToolPolicy.AUTO
-                or any(
-                    p == ToolPolicy.AUTO
-                    for p in safety_config.tool_policies.values()
-                )
+            uses_auto = safety_config.default_policy == ToolPolicy.AUTO or any(
+                p == ToolPolicy.AUTO for p in safety_config.tool_policies.values()
             )
             if uses_auto:
                 from olmlx.chat.llm_judge import SafeJudge
 
-                llm_judge = SafeJudge(
-                    manager, model_name=lambda: config.model_name
-                )
+                llm_judge = SafeJudge(manager, model_name=lambda: config.model_name)
 
             policy = ToolSafetyPolicy(
                 safety_config,
@@ -924,9 +918,7 @@ def cmd_chat(args):
                                 manager, model_name=lambda: config.model_name
                             )
                             policy.llm_judge = llm_judge
-                            tui.console.print(
-                                "[dim]LLM judge initialised[/dim]"
-                            )
+                            tui.console.print("[dim]LLM judge initialised[/dim]")
                         tui.console.print(
                             f"[dim]Default policy: {new_default.value}[/dim]"
                         )

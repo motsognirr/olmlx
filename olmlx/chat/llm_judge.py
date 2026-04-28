@@ -68,10 +68,16 @@ class SafeJudge:
         self.max_tokens = max_tokens
 
     @property
-    def model_name(self) -> str | None:
-        if callable(self._model_name):
-            return self._model_name()
-        return self._model_name
+    def model_name(self) -> str:
+        name = self._model_name
+        if callable(name):
+            name = name()
+        if name is None:
+            raise RuntimeError(
+                "SafeJudge has no model name configured; pass model_name= to the "
+                "constructor or use a callable."
+            )
+        return name
 
     async def __call__(
         self,
@@ -98,10 +104,11 @@ class SafeJudge:
         ]
 
         try:
+            md = self.model_name
             full_text = ""
             async for chunk in await generate_chat(
                 self.manager,
-                self.model_name,
+                md,
                 messages,
                 {"temperature": 0.0},
                 stream=True,
@@ -116,14 +123,18 @@ class SafeJudge:
             classification = _THINK_STRIP_RE.sub("", full_text).strip().upper()
             if classification == "UNSAFE":
                 return False
-            return "SAFE" in classification
+            return classification == "SAFE"
         except Exception as exc:
             logger.warning("LLM judge failed: %s — denying tool call", exc)
             return False
 
     @staticmethod
     def _format_context(context: list[dict]) -> str:
-        """Format recent conversation context for the judge prompt."""
+        """Format recent conversation context for the judge prompt.
+
+        Wraps each message in XML tags to separate untrusted content
+        from the judge's instructions.
+        """
         lines: list[str] = []
         for msg in context[-5:]:
             role = msg.get("role", "unknown")
@@ -136,5 +147,5 @@ class SafeJudge:
                     content += " [calls tools]"
             if len(content) > 500:
                 content = content[:500] + "..."
-            lines.append(f"{role}: {content}")
+            lines.append(f'<message role="{role}">{content}</message>')
         return "\n".join(lines)

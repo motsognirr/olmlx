@@ -327,9 +327,7 @@ class ChatSession:
                 remote_tools.append(tu)
 
         if self.tool_safety:
-            allow, confirm, auto, deny = self.tool_safety.classify_batch(
-                remote_tools
-            )
+            allow, confirm, auto, deny = self.tool_safety.classify_batch(remote_tools)
             allow = local_tools + allow
         else:
             allow, confirm, auto, deny = local_tools + remote_tools, [], [], []

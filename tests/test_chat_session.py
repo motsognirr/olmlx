@@ -1298,9 +1298,7 @@ class TestToolSafetyIntegration:
         assert len(result_events) == 1
         approved_events = [e for e in events if e["type"] == "tool_approved"]
         assert len(approved_events) == 1
-        judging_events = [
-            e for e in events if e["type"] == "tool_auto_judging"
-        ]
+        judging_events = [e for e in events if e["type"] == "tool_auto_judging"]
         assert len(judging_events) == 1
 
     @pytest.mark.asyncio
@@ -1337,9 +1335,7 @@ class TestToolSafetyIntegration:
             async for event in session.send_message("Write a file"):
                 events.append(event)
 
-        deny_events = [
-            e for e in events if e["type"] == "tool_denied"
-        ]
+        deny_events = [e for e in events if e["type"] == "tool_denied"]
         assert len(deny_events) == 1
         assert deny_events[0]["reason"] == "auto"
         mcp.call_tool.assert_not_awaited()

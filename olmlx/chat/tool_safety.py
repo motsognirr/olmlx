@@ -35,9 +35,7 @@ class ToolSafetyPolicy:
         self,
         config: ToolSafetyConfig,
         decider: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None,
-        llm_judge: Callable[
-            [str, dict[str, Any], list[dict] | None], Awaitable[bool]
-        ]
+        llm_judge: Callable[[str, dict[str, Any], list[dict] | None], Awaitable[bool]]
         | None = None,
     ):
         self.config = config
