@@ -843,14 +843,10 @@ def cmd_chat(args):
                     active_stream_ctx.finish()
                 return await asyncio.to_thread(tui.confirm_tool_call, name, args)
 
-            llm_judge = None
-            uses_auto = safety_config.default_policy == ToolPolicy.AUTO or any(
-                p == ToolPolicy.AUTO for p in safety_config.tool_policies.values()
-            )
-            if uses_auto:
+            def _build_judge():
                 from olmlx.chat.llm_judge import SafeJudge
 
-                llm_judge = SafeJudge(
+                return SafeJudge(
                     manager,
                     model_name=lambda: (
                         safety_config.judge_model
@@ -858,6 +854,13 @@ def cmd_chat(args):
                         else config.model_name
                     ),
                 )
+
+            llm_judge = None
+            uses_auto = safety_config.default_policy == ToolPolicy.AUTO or any(
+                p == ToolPolicy.AUTO for p in safety_config.tool_policies.values()
+            )
+            if uses_auto:
+                llm_judge = _build_judge()
                 if safety_config.judge_model:
                     tui.console.print(
                         f"[dim]LLM judge using separate model: "
@@ -924,9 +927,12 @@ def cmd_chat(args):
                             continue
                         safety_config.default_policy = new_default
                         if new_default == ToolPolicy.CONFIRM:
-                            # Clear per-tool AUTO overrides so all tools
-                            # follow the new default (user expects full
-                            # manual review after /mode confirm).
+                            # Clear per-tool AUTO overrides so tools that
+                            # were auto-judged are now confirmed manually.
+                            # ALLOW and DENY overrides are intentionally
+                            # preserved — the user explicitly configured
+                            # those and switching to confirm mode shouldn't
+                            # undo that policy.
                             cleared = [
                                 name
                                 for name, pol in list(
@@ -942,16 +948,7 @@ def cmd_chat(args):
                                     f"{', '.join(cleared)}[/dim]"
                                 )
                         if new_default == ToolPolicy.AUTO and llm_judge is None:
-                            from olmlx.chat.llm_judge import SafeJudge
-
-                            llm_judge = SafeJudge(
-                                manager,
-                                model_name=lambda: (
-                                    safety_config.judge_model
-                                    if safety_config.judge_model
-                                    else config.model_name
-                                ),
-                            )
+                            llm_judge = _build_judge()
                             policy.llm_judge = llm_judge
                             tui.console.print("[dim]LLM judge initialised[/dim]")
                         tui.console.print(

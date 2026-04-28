@@ -67,7 +67,7 @@ class SafeJudge:
         manager: ModelManager to use for inference.
         model_name: Model name or callable returning model name at call time.
         system_prompt: Custom safety classification prompt.
-        max_tokens: Max tokens for the judge response (default 10).
+        max_tokens: Max tokens for the judge response (default 50).
     """
 
     def __init__(
@@ -75,7 +75,7 @@ class SafeJudge:
         manager: ModelManager,
         model_name: str | Callable[[], str] | None = None,
         system_prompt: str | None = None,
-        max_tokens: int = 10,
+        max_tokens: int = 50,
     ):
         self.manager = manager
         self._model_name = model_name
@@ -112,7 +112,8 @@ class SafeJudge:
                 "role": "user",
                 "content": (
                     f"Conversation:\n{context_str}\n\n"
-                    f"Proposed tool call: {name}({args_str})\n\n"
+                    f"Proposed tool call: "
+                    f"{html.escape(name)}({args_str})\n\n"
                     f"Classification:"
                 ),
             },
