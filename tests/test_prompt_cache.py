@@ -63,41 +63,41 @@ class TestFindCommonPrefix:
 
 class TestTokenizeForCache:
     def test_with_bos_in_prompt(self):
-        from olmlx.engine.inference import _tokenize_for_cache
+        from olmlx.engine.inference import tokenize_for_cache
 
         tokenizer = MagicMock()
         tokenizer.bos_token = "<s>"
         tokenizer.encode = MagicMock(return_value=[1, 2, 3])
-        result = _tokenize_for_cache(tokenizer, "<s>hello")
+        result = tokenize_for_cache(tokenizer, "<s>hello")
         tokenizer.encode.assert_called_once_with("<s>hello", add_special_tokens=False)
         assert result == [1, 2, 3]
 
     def test_without_bos_in_prompt(self):
-        from olmlx.engine.inference import _tokenize_for_cache
+        from olmlx.engine.inference import tokenize_for_cache
 
         tokenizer = MagicMock()
         tokenizer.bos_token = "<s>"
         tokenizer.encode = MagicMock(return_value=[1, 2, 3])
-        result = _tokenize_for_cache(tokenizer, "hello")
+        result = tokenize_for_cache(tokenizer, "hello")
         tokenizer.encode.assert_called_once_with("hello", add_special_tokens=True)
         assert result == [1, 2, 3]
 
     def test_no_bos_token(self):
-        from olmlx.engine.inference import _tokenize_for_cache
+        from olmlx.engine.inference import tokenize_for_cache
 
         tokenizer = MagicMock(spec=[])  # no bos_token attribute
         tokenizer.encode = MagicMock(return_value=[1, 2, 3])
-        result = _tokenize_for_cache(tokenizer, "hello")
+        result = tokenize_for_cache(tokenizer, "hello")
         tokenizer.encode.assert_called_once_with("hello", add_special_tokens=True)
         assert result == [1, 2, 3]
 
     def test_bos_token_is_none(self):
-        from olmlx.engine.inference import _tokenize_for_cache
+        from olmlx.engine.inference import tokenize_for_cache
 
         tokenizer = MagicMock()
         tokenizer.bos_token = None
         tokenizer.encode = MagicMock(return_value=[1, 2, 3])
-        result = _tokenize_for_cache(tokenizer, "hello")
+        result = tokenize_for_cache(tokenizer, "hello")
         tokenizer.encode.assert_called_once_with("hello", add_special_tokens=True)
         assert result == [1, 2, 3]
 
@@ -1038,12 +1038,12 @@ class TestTokenizeForCacheEmptyBos:
         string falls through to `not prompt.startswith("")` which is always False.
         We must match exactly to avoid token sequence divergence and cache misses.
         """
-        from olmlx.engine.inference import _tokenize_for_cache
+        from olmlx.engine.inference import tokenize_for_cache
 
         tokenizer = MagicMock()
         tokenizer.bos_token = ""
         tokenizer.encode = MagicMock(return_value=[1, 2, 3])
-        result = _tokenize_for_cache(tokenizer, "hello")
+        result = tokenize_for_cache(tokenizer, "hello")
         tokenizer.encode.assert_called_once_with("hello", add_special_tokens=False)
         assert result == [1, 2, 3]
 

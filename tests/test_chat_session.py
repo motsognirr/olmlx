@@ -382,7 +382,9 @@ class TestAgentLoop:
         assert "file contents here" in tool_result_events[0]["result"]
 
         # MCP should have been called
-        mcp.call_tool.assert_awaited_once_with("read_file", {"path": "/tmp/test.txt"})
+        mcp.call_tool.assert_awaited_once_with(
+            "read_file", {"path": "/tmp/test.txt"}, timeout=30.0
+        )
 
         # Should have two generate_chat calls
         assert call_count == 2
@@ -660,6 +662,9 @@ class TestRepetitionOptions:
             repeat_last_n=128,
         )
         manager = MagicMock()
+        loaded_model = MagicMock()
+        loaded_model.template_caps = TemplateCaps()
+        manager.ensure_loaded = AsyncMock(return_value=loaded_model)
         session = ChatSession(config=config, manager=manager)
 
         captured_kwargs = {}
@@ -1107,10 +1112,10 @@ class TestToolSafetyIntegration:
 
         original_call_tool = mcp.call_tool
 
-        async def call_tool_with_cancel(name, args):
+        async def call_tool_with_cancel(name, args, timeout=30.0):
             if name == "write_file":
                 raise _asyncio.CancelledError("simulated")
-            return await original_call_tool(name, args)
+            return await original_call_tool(name, args, timeout=timeout)
 
         mcp.call_tool = AsyncMock(side_effect=call_tool_with_cancel)
 

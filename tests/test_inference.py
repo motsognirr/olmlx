@@ -11,13 +11,13 @@ from olmlx.engine.inference import (
     _acquire_inference_lock,
     _apply_seed,
     _build_generate_kwargs,
-    _estimate_kv_cache_bytes,
+    estimate_kv_cache_bytes,
     _extract_images,
     _inference_lock,
     _inference_locked,
     _inject_tools_into_system,
     _normalize_tool_calls_in_messages,
-    _apply_chat_template_text,
+    apply_chat_template_text,
     _lock_boundary_sync,
     _safe_sync,
     _schedule_deferred_inference_cleanup,
@@ -587,7 +587,7 @@ class TestApplyChatTemplateText:
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
         messages = [{"role": "user", "content": "hi"}]
-        result = _apply_chat_template_text(tokenizer, messages)
+        result = apply_chat_template_text(tokenizer, messages)
         assert result == "formatted prompt"
         tokenizer.apply_chat_template.assert_called_once_with(
             messages,
@@ -602,7 +602,7 @@ class TestApplyChatTemplateText:
         messages = [{"role": "user", "content": "hi"}]
         tools = [{"type": "function", "function": {"name": "f"}}]
         caps = TemplateCaps(supports_tools=True, supports_enable_thinking=True)
-        _apply_chat_template_text(tokenizer, messages, tools, caps)
+        apply_chat_template_text(tokenizer, messages, tools, caps)
         call_kwargs = tokenizer.apply_chat_template.call_args[1]
         assert call_kwargs["tools"] == tools
         assert call_kwargs["enable_thinking"] is False
@@ -618,7 +618,7 @@ class TestApplyChatTemplateText:
             }
         ]
         caps = TemplateCaps(supports_tools=False)
-        _apply_chat_template_text(tokenizer, messages, tools, caps)
+        apply_chat_template_text(tokenizer, messages, tools, caps)
         # Should inject tools into system message instead
         call_args = tokenizer.apply_chat_template.call_args[0][0]
         assert call_args[0]["role"] == "system"
@@ -643,7 +643,7 @@ class TestApplyChatTemplateText:
             }
         ]
         caps = TemplateCaps(supports_tools=True)
-        result = _apply_chat_template_text(tokenizer, messages, tools, caps)
+        result = apply_chat_template_text(tokenizer, messages, tools, caps)
         assert result == "fallback prompt"
         assert call_count[0] == 2
 
@@ -669,7 +669,7 @@ class TestApplyChatTemplateText:
             }
         ]
         caps = TemplateCaps(supports_tools=True, supports_enable_thinking=True)
-        result = _apply_chat_template_text(
+        result = apply_chat_template_text(
             tokenizer, messages, tools, caps, enable_thinking=False
         )
         assert result == "fallback prompt"
@@ -682,7 +682,7 @@ class TestApplyChatTemplateText:
         tokenizer.apply_chat_template = MagicMock(return_value="prompt")
         messages = [{"role": "user", "content": "hi"}]
         caps = TemplateCaps(supports_tools=False, supports_enable_thinking=True)
-        _apply_chat_template_text(tokenizer, messages, caps=caps, enable_thinking=True)
+        apply_chat_template_text(tokenizer, messages, caps=caps, enable_thinking=True)
         call_kwargs = tokenizer.apply_chat_template.call_args[1]
         assert call_kwargs["enable_thinking"] is True
 
@@ -692,7 +692,7 @@ class TestApplyChatTemplateText:
         tokenizer.apply_chat_template = MagicMock(return_value="prompt")
         messages = [{"role": "user", "content": "hi"}]
         caps = TemplateCaps(supports_tools=False, supports_enable_thinking=True)
-        _apply_chat_template_text(tokenizer, messages, caps=caps, enable_thinking=False)
+        apply_chat_template_text(tokenizer, messages, caps=caps, enable_thinking=False)
         call_kwargs = tokenizer.apply_chat_template.call_args[1]
         assert call_kwargs["enable_thinking"] is False
 
@@ -702,7 +702,7 @@ class TestApplyChatTemplateText:
         tokenizer.apply_chat_template = MagicMock(return_value="prompt")
         messages = [{"role": "user", "content": "hi"}]
         caps = TemplateCaps(supports_tools=False, supports_enable_thinking=True)
-        _apply_chat_template_text(tokenizer, messages, caps=caps)
+        apply_chat_template_text(tokenizer, messages, caps=caps)
         call_kwargs = tokenizer.apply_chat_template.call_args[1]
         assert call_kwargs["enable_thinking"] is True
 
@@ -713,9 +713,7 @@ class TestApplyChatTemplateText:
         messages = [{"role": "user", "content": "hi"}]
         tools = [{"type": "function", "function": {"name": "f"}}]
         caps = TemplateCaps(supports_tools=True, supports_enable_thinking=True)
-        _apply_chat_template_text(
-            tokenizer, messages, tools, caps, enable_thinking=True
-        )
+        apply_chat_template_text(tokenizer, messages, tools, caps, enable_thinking=True)
         call_kwargs = tokenizer.apply_chat_template.call_args[1]
         assert call_kwargs["tools"] == tools
         assert call_kwargs["enable_thinking"] is True
@@ -726,21 +724,21 @@ class TestApplyChatTemplateText:
         tokenizer.apply_chat_template = MagicMock(return_value="prompt")
         messages = [{"role": "user", "content": "hi"}]
         caps = TemplateCaps(supports_tools=False, supports_enable_thinking=False)
-        _apply_chat_template_text(tokenizer, messages, caps=caps, enable_thinking=True)
+        apply_chat_template_text(tokenizer, messages, caps=caps, enable_thinking=True)
         call_kwargs = tokenizer.apply_chat_template.call_args[1]
         assert "enable_thinking" not in call_kwargs
 
     def test_no_caps_defaults(self):
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="result")
-        _apply_chat_template_text(tokenizer, [], None, caps=None)
+        apply_chat_template_text(tokenizer, [], None, caps=None)
         tokenizer.apply_chat_template.assert_called_once()
 
     def test_template_fails_completely(self):
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(side_effect=RuntimeError("broken"))
         with pytest.raises(RuntimeError, match="Chat template failed"):
-            _apply_chat_template_text(tokenizer, [], None)
+            apply_chat_template_text(tokenizer, [], None)
 
     def test_tools_kwarg_fails_then_injection_fails(self):
         tokenizer = MagicMock()
@@ -757,7 +755,7 @@ class TestApplyChatTemplateText:
         with pytest.raises(
             RuntimeError, match="Chat template failed even without tools"
         ):
-            _apply_chat_template_text(tokenizer, [], tools, caps)
+            apply_chat_template_text(tokenizer, [], tools, caps)
 
 
 class TestApplyChatTemplateVlm:
@@ -1541,7 +1539,7 @@ class TestGenerateChatVlm:
         with patch("olmlx.engine.inference.mx", mock_mx):
             with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
                 with patch(
-                    "olmlx.engine.inference._apply_chat_template_text",
+                    "olmlx.engine.inference.apply_chat_template_text",
                 ) as mock_text_tpl:
                     with patch(
                         "olmlx.engine.inference.asyncio.to_thread",
@@ -2583,7 +2581,7 @@ class TestAwaitDeferredCleanup:
 
 
 class TestEstimateKvCacheBytes:
-    """Tests for _estimate_kv_cache_bytes()."""
+    """Tests for estimate_kv_cache_bytes()."""
 
     def _make_model_args(
         self,
@@ -2618,12 +2616,12 @@ class TestEstimateKvCacheBytes:
         # head_dim = 4096 / 32 = 128
         # raw = 32 * 2 * 8 * 128 * 1000 * 2 = 131_072_000
         # expected = int(131_072_000 * 1.3) = 170_393_600
-        result = _estimate_kv_cache_bytes(model, 1000)
+        result = estimate_kv_cache_bytes(model, 1000)
         assert result == int(131_072_000 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_zero_tokens(self):
         model = self._make_model()
-        assert _estimate_kv_cache_bytes(model, 0) == 0
+        assert estimate_kv_cache_bytes(model, 0) == 0
 
     def test_gqa_fallback_to_mha(self):
         """When num_key_value_heads is missing, fall back to num_attention_heads."""
@@ -2636,7 +2634,7 @@ class TestEstimateKvCacheBytes:
         del model.args.num_key_value_heads
         # head_dim = 128, kv_heads = 32 (fallback)
         # raw = 32 * 2 * 32 * 128 * 100 * 2 = 52_428_800
-        result = _estimate_kv_cache_bytes(model, 100)
+        result = estimate_kv_cache_bytes(model, 100)
         assert result == int(52_428_800 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_large_prompt(self):
@@ -2649,7 +2647,7 @@ class TestEstimateKvCacheBytes:
         )
         # head_dim = 3584 / 28 = 128
         # raw = 28 * 2 * 4 * 128 * 22000 * 2 = 1_261_568_000 (~1.2 GB)
-        result = _estimate_kv_cache_bytes(model, 22000)
+        result = estimate_kv_cache_bytes(model, 22000)
         assert result == int(1_261_568_000 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_explicit_head_dim(self):
@@ -2662,7 +2660,7 @@ class TestEstimateKvCacheBytes:
             head_dim=256,
         )
         # raw = 32 * 2 * 8 * 256 * 100 * 2 = 26_214_400
-        result = _estimate_kv_cache_bytes(model, 100)
+        result = estimate_kv_cache_bytes(model, 100)
         assert result == int(26_214_400 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_vlm_fallback_to_language_model_args(self):
@@ -2675,7 +2673,7 @@ class TestEstimateKvCacheBytes:
             num_key_value_heads=8,
             hidden_size=4096,
         )
-        result = _estimate_kv_cache_bytes(model, 1000)
+        result = estimate_kv_cache_bytes(model, 1000)
         assert result == int(131_072_000 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_vlm_introspects_language_model_layers(self):
@@ -2701,7 +2699,7 @@ class TestEstimateKvCacheBytes:
         model.language_model.model.layers = layers
 
         # Should use introspected kv_heads=4, not fallback to num_attention_heads=32
-        result = _estimate_kv_cache_bytes(model, 1000)
+        result = estimate_kv_cache_bytes(model, 1000)
         expected_raw = 32 * 2 * 4 * 128 * 1000 * 2
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
@@ -2715,7 +2713,7 @@ class TestEstimateKvCacheBytes:
             num_key_value_heads=8,
             hidden_size=4096,
         )
-        result = _estimate_kv_cache_bytes(model, 1000)
+        result = estimate_kv_cache_bytes(model, 1000)
         assert result == int(131_072_000 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_vlm_text_config_wrapper_prefers_language_model_args(self):
@@ -2742,14 +2740,14 @@ class TestEstimateKvCacheBytes:
             head_dim=256,
         )
         # raw = 64 * 2 * 4 * 256 * 1000 * 2 = 262_144_000
-        result = _estimate_kv_cache_bytes(model, 1000)
+        result = estimate_kv_cache_bytes(model, 1000)
         assert result == int(262_144_000 * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_raises_when_no_args_found(self):
         """Raises AttributeError when model has no discoverable args or config."""
         model = MagicMock(spec=[])
         with pytest.raises(AttributeError, match="no 'args'"):
-            _estimate_kv_cache_bytes(model, 1000)
+            estimate_kv_cache_bytes(model, 1000)
 
     def test_wrapper_without_language_model_raises(self):
         """Wrapper args + no language_model → explicit error (not opaque later crash)."""
@@ -2758,7 +2756,7 @@ class TestEstimateKvCacheBytes:
         wrapper.text_config = {"num_hidden_layers": 64}
         model.args = wrapper
         with pytest.raises(AttributeError, match="text_config wrapper"):
-            _estimate_kv_cache_bytes(model, 1000)
+            estimate_kv_cache_bytes(model, 1000)
 
     def test_wrapper_with_empty_language_model_raises(self):
         """Wrapper args + language_model without args/config → explicit error."""
@@ -2768,7 +2766,7 @@ class TestEstimateKvCacheBytes:
         model.args = wrapper
         model.language_model = MagicMock(spec=[])
         with pytest.raises(AttributeError, match="text_config wrapper"):
-            _estimate_kv_cache_bytes(model, 1000)
+            estimate_kv_cache_bytes(model, 1000)
 
     def test_nas_model_with_per_layer_variable_attention(self):
         """NAS models (nemotron-nas) have per-layer variable attention.
@@ -2806,7 +2804,7 @@ class TestEstimateKvCacheBytes:
         # head_dim = 8192 / 64 = 128
         # Correct: 49 layers * 2 * 8 kv_heads * 128 head_dim * 1000 tokens * 2 bytes
         # = 49 * 2 * 8 * 128 * 1000 * 2 = 200_704_000
-        result = _estimate_kv_cache_bytes(model, 1000)
+        result = estimate_kv_cache_bytes(model, 1000)
         expected_raw = 49 * 2 * 8 * 128 * 1000 * 2
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
@@ -2825,7 +2823,7 @@ class TestEstimateKvCacheBytes:
         del model.model
 
         # Falls back to: 80 * 2 * 64 * 128 * 1000 * 2
-        result = _estimate_kv_cache_bytes(model, 1000)
+        result = estimate_kv_cache_bytes(model, 1000)
         expected_raw = 80 * 2 * 64 * 128 * 1000 * 2
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
@@ -2850,7 +2848,7 @@ class TestEstimateKvCacheBytes:
         model.model.layers = layers
 
         # Should fall back to args-based estimate, not return 0
-        result = _estimate_kv_cache_bytes(model, 1000)
+        result = estimate_kv_cache_bytes(model, 1000)
         expected_raw = 32 * 2 * 8 * 128 * 1000 * 2
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
@@ -2870,7 +2868,7 @@ class TestEstimateKvCacheBytes:
         model = MagicMock(spec=[])
         model.args = args
 
-        result = _estimate_kv_cache_bytes(model, 1000)
+        result = estimate_kv_cache_bytes(model, 1000)
 
         # MLA cache per layer per token: (kv_lora_rank + qk_rope_head_dim) * 2 bytes
         # = (512 + 64) * 2 = 1152 bytes  (keys=compressed_kv, values=k_pe, 1 "head" each)
@@ -2937,7 +2935,7 @@ class TestEstimateKvCacheBytes:
         full_per_layer = 2 * 4 * 512 * num_tokens * 2
         expected_raw = 50 * sliding_per_layer + 10 * full_per_layer
 
-        result = _estimate_kv_cache_bytes(model, num_tokens)
+        result = estimate_kv_cache_bytes(model, num_tokens)
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
         # Sanity check: result should fit in 16 GB.  The naive uniform-layer
@@ -2977,7 +2975,7 @@ class TestEstimateKvCacheBytes:
         model.model.layers = layers
 
         # 8000 tokens, but per-layer window is 512 (not 4096)
-        result = _estimate_kv_cache_bytes(model, 8000)
+        result = estimate_kv_cache_bytes(model, 8000)
         expected_raw = 4 * 2 * 8 * 128 * 512 * 2
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
@@ -3007,7 +3005,7 @@ class TestEstimateKvCacheBytes:
         model.model.layers = layers
 
         # 500 < 1024, so sliding layers use full prompt length
-        result = _estimate_kv_cache_bytes(model, 500)
+        result = estimate_kv_cache_bytes(model, 500)
         expected_raw = 4 * 2 * 8 * 128 * 500 * 2
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
@@ -3025,8 +3023,8 @@ class TestEstimateKvCacheBytes:
             head_dim=128,
             hidden_size=8192,
         )
-        fp16_result = _estimate_kv_cache_bytes(model, 37000)
-        tq4_result = _estimate_kv_cache_bytes(
+        fp16_result = estimate_kv_cache_bytes(model, 37000)
+        tq4_result = estimate_kv_cache_bytes(
             model, 37000, kv_cache_quant="turboquant:4"
         )
         # TurboQuant 4-bit should be significantly smaller
@@ -3043,8 +3041,8 @@ class TestEstimateKvCacheBytes:
             head_dim=128,
             hidden_size=8192,
         )
-        fp16_result = _estimate_kv_cache_bytes(model, 37000)
-        tq2_result = _estimate_kv_cache_bytes(
+        fp16_result = estimate_kv_cache_bytes(model, 37000)
+        tq2_result = estimate_kv_cache_bytes(
             model, 37000, kv_cache_quant="turboquant:2"
         )
         # Per-element: fp16 = 256 bytes, tq2 = 36 bytes → ratio ≈ 7.1x
@@ -3054,7 +3052,7 @@ class TestEstimateKvCacheBytes:
     def test_turboquant_none_unchanged(self):
         """Passing kv_cache_quant=None should give the same result as no arg."""
         model = self._make_model()
-        assert _estimate_kv_cache_bytes(model, 1000) == _estimate_kv_cache_bytes(
+        assert estimate_kv_cache_bytes(model, 1000) == estimate_kv_cache_bytes(
             model, 1000, kv_cache_quant=None
         )
 
@@ -3099,7 +3097,7 @@ class TestEstimateKvCacheBytes:
         num_tokens = 86245
         # Only 12 full-attention layers contribute to growing KV cache
         expected_raw = 12 * 2 * 2 * 256 * num_tokens * 2
-        result = _estimate_kv_cache_bytes(model, num_tokens)
+        result = estimate_kv_cache_bytes(model, num_tokens)
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
         # Verify: ~2.6 GB, NOT ~10.3 GB
@@ -3169,7 +3167,7 @@ class TestKvCachePreflightCheck:
                 patch("olmlx.engine.inference.settings") as mock_settings,
                 patch("olmlx.engine.inference.mx"),
                 patch(
-                    "olmlx.engine.inference._estimate_kv_cache_bytes",
+                    "olmlx.engine.inference.estimate_kv_cache_bytes",
                     return_value=kv_estimate,
                 ),
                 patch("olmlx.engine.inference._safe_sync"),
@@ -3236,7 +3234,7 @@ class TestKvCachePreflightCheck:
                 patch("olmlx.engine.inference.settings") as mock_settings,
                 patch("olmlx.engine.inference.mx"),
                 patch(
-                    "olmlx.engine.inference._estimate_kv_cache_bytes",
+                    "olmlx.engine.inference.estimate_kv_cache_bytes",
                     return_value=kv_estimate,
                 ),
                 patch("olmlx.engine.inference._safe_sync"),
@@ -3514,7 +3512,7 @@ class TestKvCachePreflightCheckHelper:
             ),
             patch("olmlx.engine.inference.settings") as mock_settings,
             patch(
-                "olmlx.engine.inference._estimate_kv_cache_bytes",
+                "olmlx.engine.inference.estimate_kv_cache_bytes",
                 return_value=1 * 1024**3,
             ),
         ):
@@ -3549,7 +3547,7 @@ class TestKvCachePreflightCheckHelper:
             ),
             patch("olmlx.engine.inference.settings") as mock_settings,
             patch(
-                "olmlx.engine.inference._estimate_kv_cache_bytes",
+                "olmlx.engine.inference.estimate_kv_cache_bytes",
                 return_value=3 * 1024**3,
             ),
             patch("olmlx.engine.inference._safe_sync"),
@@ -3607,7 +3605,7 @@ class TestKvCachePreflightCheckHelper:
             ),
             patch("olmlx.engine.inference.settings") as mock_settings,
             patch(
-                "olmlx.engine.inference._estimate_kv_cache_bytes",
+                "olmlx.engine.inference.estimate_kv_cache_bytes",
                 side_effect=ValueError("bad model"),
             ),
         ):

@@ -659,7 +659,7 @@ memory usage to exceed the raw 2-bytes-per-element calculation by 20-30%.
 """
 
 
-def _estimate_kv_cache_bytes(
+def estimate_kv_cache_bytes(
     model: Any, num_tokens: int, *, kv_cache_quant: str | None = None
 ) -> int:
     """Estimate KV cache memory for a given number of tokens.
@@ -851,7 +851,7 @@ def _estimate_kv_cache_bytes(
     return int(raw * _tq_ratio * MEMORY_SAFETY_FACTOR)
 
 
-def _tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
+def tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
     """Tokenize prompt text matching stream_generate's tokenization logic.
 
     Must exactly replicate the BOS heuristic in mlx_lm.generate.stream_generate
@@ -1286,7 +1286,7 @@ def _apply_chat_template(
         raise RuntimeError(f"Chat template failed: {exc}") from exc
 
 
-def _apply_chat_template_text(
+def apply_chat_template_text(
     tokenizer: Any,
     messages: list[dict],
     tools: list[dict] | None = None,
@@ -1613,7 +1613,7 @@ async def generate_completion(
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         try:
-            prompt = _apply_chat_template_text(
+            prompt = apply_chat_template_text(
                 lm.text_tokenizer,
                 messages,
                 caps=lm.template_caps,
@@ -1914,7 +1914,7 @@ async def _kv_cache_preflight_check(
         return result
 
     try:
-        kv_bytes = _estimate_kv_cache_bytes(
+        kv_bytes = estimate_kv_cache_bytes(
             lm.model,
             num_prefill_tokens + max_tokens,
             kv_cache_quant=lm.kv_cache_quant,
@@ -1946,7 +1946,7 @@ async def _kv_cache_preflight_check(
                 if full_prompt_tokens is not None and not lm.is_vlm:
                     result.prompt = full_prompt_tokens
             estimate_total = estimate_tokens + max_tokens
-            kv_bytes = _estimate_kv_cache_bytes(
+            kv_bytes = estimate_kv_cache_bytes(
                 lm.model,
                 estimate_total,
                 kv_cache_quant=lm.kv_cache_quant,
@@ -2197,7 +2197,7 @@ async def _stream_completion(
             tokens = (
                 prompt_tokens
                 if prompt_tokens is not None
-                else _tokenize_for_cache(lm.text_tokenizer, original_prompt)
+                else tokenize_for_cache(lm.text_tokenizer, original_prompt)
             )
             broadcast_kwargs = {
                 k: v
@@ -2449,7 +2449,7 @@ async def _full_completion_inner(
         # computation at the same time (avoids all_sum timeout).
         # Must happen before _apply_seed which pops seed from gen_kwargs.
         if lm.is_distributed:
-            tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
+            tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
             _maybe_broadcast_distributed(lm, tokens, prompt, max_tokens, gen_kwargs)
 
         _apply_seed(gen_kwargs, consume=not lm.is_vlm)
@@ -2742,7 +2742,7 @@ async def generate_chat(
                 enable_thinking,
             )
     else:
-        prompt = _apply_chat_template_text(
+        prompt = apply_chat_template_text(
             lm.text_tokenizer,
             messages,
             tools,
@@ -2776,7 +2776,7 @@ async def generate_chat(
     )
     prompt_tokens = None
     if use_prompt_cache:
-        prompt_tokens = _tokenize_for_cache(lm.text_tokenizer, prompt)
+        prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
         # Memory-only peek for debug logging; the authoritative lookup happens
         # inside _stream_completion under the inference lock.
         cached_state = lm.prompt_cache_store.peek(cache_id)

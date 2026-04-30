@@ -49,6 +49,15 @@ class ChatConfig:
     builtin_tools_enabled: bool = True
     plans_dir: Path = field(default_factory=lambda: Path.home() / ".olmlx" / "plans")
     sequential_tool_execution: bool = False
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    tool_timeout: float = 30.0
+    repetition_min_phrase_len: int = 20
+    repetition_min_repeats: int = 4
+    local_tool_safety: bool = False
+    mcp_connect_retries: int = 3
+    tool_result_truncation: int = 2000
 
 
 def _load_json_file(path: Path) -> dict[str, Any]:

@@ -8,7 +8,7 @@ import pytest
 
 import olmlx.engine.inference as _inf_mod
 from olmlx.engine.inference import (
-    _estimate_kv_cache_bytes,
+    estimate_kv_cache_bytes,
     _inference_ref,
 )
 from olmlx.engine.model_manager import LoadedModel
@@ -703,7 +703,7 @@ class TestKVCacheMemorySafetyFactor:
         )
 
     def test_estimate_includes_safety_margin(self):
-        """_estimate_kv_cache_bytes should include MEMORY_SAFETY_FACTOR multiplier."""
+        """estimate_kv_cache_bytes should include MEMORY_SAFETY_FACTOR multiplier."""
         model = MagicMock()
         model.args.num_hidden_layers = 32
         model.args.num_attention_heads = 32
@@ -711,7 +711,7 @@ class TestKVCacheMemorySafetyFactor:
         model.args.head_dim = 128
         model.args.hidden_size = 4096
 
-        result = _estimate_kv_cache_bytes(model, 1000)
+        result = estimate_kv_cache_bytes(model, 1000)
         # Raw estimate: 32 layers * 2 * 8 heads * 128 dim * 1000 tokens * 2 bytes
         raw = 32 * 2 * 8 * 128 * 1000 * 2
         expected = int(raw * _inf_mod.MEMORY_SAFETY_FACTOR)
@@ -722,4 +722,4 @@ class TestKVCacheMemorySafetyFactor:
     def test_estimate_zero_tokens_unchanged(self):
         """Zero tokens should still return 0."""
         model = MagicMock()
-        assert _estimate_kv_cache_bytes(model, 0) == 0
+        assert estimate_kv_cache_bytes(model, 0) == 0
