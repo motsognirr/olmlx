@@ -1066,6 +1066,8 @@ def cmd_chat(args):
                         pass  # handled inline by decider callback
                     elif event["type"] == "max_turns_exceeded":
                         tui.display_error("Max tool turns reached")
+                    elif event["type"] == "memory_truncated":
+                        tui.display_memory_truncated(event["message"])
 
         except MemoryError as exc:
             tui.display_error(str(exc))

@@ -12,14 +12,177 @@ from olmlx.chat.config import ChatConfig
 from olmlx.chat.mcp_client import MCPClientManager
 from olmlx.chat.skills import SkillManager
 from olmlx.chat.tool_safety import ToolSafetyPolicy
-from olmlx.engine.inference import generate_chat
-from olmlx.engine.model_manager import ModelManager
+from olmlx.config import settings
+from olmlx.engine.inference import (
+    _apply_chat_template_text,
+    _estimate_kv_cache_bytes,
+    _tokenize_for_cache,
+    generate_chat,
+)
+from olmlx.engine.model_manager import LoadedModel, ModelManager
 from olmlx.engine.tool_parser import parse_model_output
+from olmlx.utils import memory as memory_utils
 
 logger = logging.getLogger(__name__)
 
+# Safety multiplier for chat memory estimates (matches inference.py)
+_CHAT_MEMORY_SAFETY_FACTOR = 1.3
+
+# Maximum messages to keep when truncating (system message + N recent pairs)
+_MIN_MESSAGES_AFTER_TRUNCATE = 6
+
 
 class ThinkingTracker:
+    """Tracks <think> tag boundaries during streaming generation.
+
+    Handles both explicit ``<think>...</think>`` tags and implicit
+    thinking (template-injected ``<think>`` at position 0). State
+    mutations are deterministic — callers check ``has_content()``
+    after each ``feed()`` to emit events.
+    """
+
+    def __init__(
+        self,
+        implicit_mode: bool = False,
+        thinking_disabled: bool = False,
+        template_has_thinking: bool = False,
+    ):
+        self._implicit_mode = implicit_mode
+        self._thinking_disabled = thinking_disabled
+        self._template_has_thinking = template_has_thinking
+        self._accumulated = ""
+        self._open_pos = -1
+        self._close_pos = -1
+        self._scan_pos = 0
+        self._think_emitted = 0
+        self._visible_emitted = 0
+        self._in_thinking = False
+        self._just_started = False
+        self._thinking_start_emitted = False
+
+    @property
+    def accumulated(self) -> str:
+        return self._accumulated
+
+    @property
+    def in_thinking(self) -> bool:
+        return self._in_thinking
+
+    @property
+    def just_started(self) -> bool:
+        """True if thinking block just started on this chunk."""
+        return self._just_started
+
+    @property
+    def think_emitted(self) -> int:
+        return self._think_emitted
+
+    @property
+    def visible_emitted(self) -> int:
+        return self._visible_emitted
+
+    def feed(self, text: str) -> tuple[str | None, str | None, bool, bool]:
+        """Ingest a chunk of text.
+
+        Returns ``(think_delta, visible_delta, thinking_ended, thinking_started)`` where
+        each delta is a new substring to emit (or None) and
+        ``thinking_ended`` is True when a visible delta transitions out
+        of thinking mode, ``thinking_started`` on the first thinking chunk.
+        """
+        self._accumulated += text
+
+        # Scan for tag boundaries
+        new_scan = max(0, self._scan_pos - len(_THINK_CLOSE) + 1)
+        self._scan_pos = len(self._accumulated)
+
+        if self._open_pos == -1:
+            pos = self._accumulated.find(_THINK_OPEN, new_scan)
+            if pos != -1:
+                self._open_pos = pos
+                self._implicit_mode = False
+
+        if self._close_pos == -1:
+            search_from = max(
+                (self._open_pos + len(_THINK_OPEN)) if self._open_pos >= 0 else 0,
+                new_scan,
+            )
+            pos = self._accumulated.find(_THINK_CLOSE, search_from)
+            if pos != -1:
+                self._close_pos = pos
+
+        think_content, visible = self._classify()
+        self._just_started = bool(not self._in_thinking and think_content)
+        think_delta = self._emit_think(think_content)
+        visible_delta, thinking_ended = self._emit_visible(visible)
+        return think_delta, visible_delta, thinking_ended, self._just_started
+
+    def flush_disabled(self) -> str | None:
+        """Flush buffered content as visible when thinking is disabled."""
+        if self._implicit_mode and self._close_pos == -1 and self._thinking_disabled:
+            if len(self._accumulated) > self._visible_emitted:
+                text = self._accumulated[self._visible_emitted:]
+                self._visible_emitted = len(self._accumulated)
+                return text
+        return None
+
+    def strip_on_repetition(self) -> int | None:
+        """Truncate accumulated text at the open tag position.
+
+        Cuts before the opening <think> tag to fully remove the incomplete block.
+        """
+        if self._in_thinking and self._open_pos >= 0:
+            self._accumulated = self._accumulated[: self._open_pos]
+            self._visible_emitted = len(self._accumulated)
+            self._in_thinking = False
+            return self._visible_emitted
+        return None
+
+    def _classify(self) -> tuple[str, str]:
+        has_thinking = self._open_pos >= 0 or self._implicit_mode
+        implicit_strip = (
+            self._thinking_disabled
+            and self._template_has_thinking
+            and self._open_pos == -1
+            and self._close_pos >= 0
+        )
+        if has_thinking:
+            cs = (self._open_pos + len(_THINK_OPEN)) if self._open_pos >= 0 else 0
+            if self._close_pos >= 0:
+                think_content = self._accumulated[cs : self._close_pos]
+                visible = self._accumulated[self._close_pos + len(_THINK_CLOSE) :]
+            else:
+                think_content = self._accumulated[cs:]
+                visible = ""
+            if self._thinking_disabled:
+                think_content = ""
+        elif implicit_strip:
+            think_content = ""
+            visible = self._accumulated[self._close_pos + len(_THINK_CLOSE) :]
+        else:
+            think_content = ""
+            visible = self._accumulated
+        return think_content, visible
+
+    def _emit_think(self, think_content: str) -> str | None:
+        if len(think_content) > self._think_emitted:
+            self._in_thinking = True
+            delta = think_content[self._think_emitted:]
+            self._think_emitted = len(think_content)
+            return delta
+        return None
+
+    def _emit_visible(self, visible: str) -> tuple[str | None, bool]:
+        if len(visible) > self._visible_emitted:
+            thinking_ended = self._in_thinking
+            if thinking_ended:
+                self._in_thinking = False
+            delta = visible[self._visible_emitted:]
+            self._visible_emitted = len(visible)
+            return delta, thinking_ended
+        return None, False
+
+
+class ChatSession:
     """Tracks <think> tag boundaries during streaming generation.
 
     Handles both explicit ``<think>...</think>`` tags and implicit
@@ -211,6 +374,84 @@ class ChatSession:
         if system_prompt:
             self.messages.append({"role": "system", "content": system_prompt})
         self.manager.invalidate_prompt_cache(self.config.model_name, "chat")
+
+    async def _estimate_conversation_tokens(self, lm: LoadedModel) -> int:
+        """Estimate total tokens for current conversation history."""
+        try:
+            tokenizer = lm.text_tokenizer
+            # Build a copy of messages for template estimation (without system prompt duplication)
+            msgs = list(self.messages)
+            prompt_text = _apply_chat_template_text(tokenizer, msgs, tools=None, caps=lm.template_caps)
+            tokens = _tokenize_for_cache(tokenizer, prompt_text)
+            return len(tokens)
+        except Exception as exc:
+            logger.debug("Token estimation failed: %s", exc)
+            return 0
+
+    async def _check_memory_and_truncate(self, lm: LoadedModel, max_tokens: int) -> bool:
+        """Check if conversation + generation would exceed memory, truncate if needed.
+
+        Returns True if truncation occurred.
+        """
+        total_physical = memory_utils.get_system_memory_bytes()
+        if total_physical <= 0:
+            return False
+
+        memory_limit = int(total_physical * settings.memory_limit_fraction)
+        current_metal = memory_utils.get_metal_memory()
+
+        # Estimate tokens for current conversation
+        conv_tokens = await self._estimate_conversation_tokens(lm)
+        if conv_tokens <= 0:
+            return False
+
+        # Estimate KV cache for full generation
+        from olmlx.engine.inference import _parse_kv_cache_quant
+
+        kv_bytes = _estimate_kv_cache_bytes(
+            lm.model,
+            conv_tokens + max_tokens,
+            kv_cache_quant=lm.kv_cache_quant,
+        )
+        # Apply safety factor for chat (matches inference.py)
+        kv_bytes = int(kv_bytes * _CHAT_MEMORY_SAFETY_FACTOR)
+
+        if current_metal + kv_bytes <= memory_limit:
+            return False
+
+        # Need to truncate — keep system message + recent message pairs
+        logger.warning(
+            "Chat memory check: %d tokens (%.1f GB KV) would exceed limit. Truncating history.",
+            conv_tokens,
+            kv_bytes / 1024**3,
+        )
+
+        # Find system message index
+        system_idx = 0
+        if self.messages and self.messages[0].get("role") == "system":
+            system_idx = 1
+
+        # Keep system + N most recent (user, assistant) pairs
+        kept = []
+        if system_idx > 0:
+            kept.append(self.messages[0])  # system message
+
+        # Walk backwards from the end, keeping complete user→assistant pairs
+        recent = []
+        idx = len(self.messages) - 1
+        while idx >= system_idx and len(recent) < _MIN_MESSAGES_AFTER_TRUNCATE:
+            msg = self.messages[idx]
+            recent.insert(0, msg)
+            idx -= 1
+
+        kept.extend(recent)
+        self.messages = kept
+
+        # Invalidate prompt cache since history changed
+        self.manager.invalidate_prompt_cache(self.config.model_name, "chat")
+
+        logger.info("Truncated chat history to %d messages", len(self.messages))
+        return True
 
     async def _exec_tool(self, tu: dict) -> dict:
         """Execute a single tool call and return the event + message."""
@@ -581,6 +822,7 @@ class ChatSession:
         - {"type": "tool_call", "name": str, "arguments": dict, "id": str}
         - {"type": "tool_result", "name": str, "result": str, "id": str}
         - {"type": "tool_error", "name": str, "error": str, "id": str}
+        - {"type": "memory_truncated", "message": str} — history was truncated
         - {"type": "max_turns_exceeded"}
         - {"type": "done"}
         """
@@ -593,10 +835,7 @@ class ChatSession:
             "repeat_last_n": self.config.repeat_last_n,
         }
 
-        # Check template caps for implicit thinking detection.
-        # generate_chat() calls ensure_loaded too; the model stays cached.
-        # Only has_thinking_tags implies implicit thinking (template injects
-        # <think>); supports_enable_thinking alone means explicit tags.
+        # Load model once and extract template caps + do memory check
         try:
             lm = await self.manager.ensure_loaded(self.config.model_name)
             template_has_thinking = lm.template_caps.has_thinking_tags
@@ -606,12 +845,24 @@ class ChatSession:
                 exc_info=True,
             )
             template_has_thinking = False
+            lm = None
 
         # Implicit thinking: model injects <think> into the template prompt,
         # so generated text starts with thinking content (no <think> prefix).
         # Buffer content before </think> regardless of the thinking display
         # flag — when disabled, we still need to strip thinking from output.
         assume_implicit_thinking = template_has_thinking
+
+        # Pre-check memory before starting agent loop
+        if lm is not None:
+            try:
+                truncated = await self._check_memory_and_truncate(
+                    lm, self.config.max_tokens
+                )
+                if truncated:
+                    yield {"type": "memory_truncated", "message": "History truncated to fit memory"}
+            except Exception:
+                logger.debug("Memory check failed, proceeding anyway", exc_info=True)
 
         for turn in range(self.config.max_turns):
             repetition_stopped = False

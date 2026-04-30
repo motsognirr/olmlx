@@ -102,6 +102,12 @@ class ChatTUI:
             Panel(f"[red]{message}[/red]", title="error", border_style="red")
         )
 
+    def display_memory_truncated(self, message: str) -> None:
+        """Show warning that chat history was truncated due to memory."""
+        self.console.print(
+            Panel(f"[yellow]{message}[/yellow]", title="memory", border_style="yellow")
+        )
+
     def confirm_tool_call(self, name: str, arguments: dict) -> bool:
         """Prompt user to approve a tool call. Returns True if approved."""
         self.display_tool_call(name, arguments)
