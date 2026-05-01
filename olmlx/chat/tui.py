@@ -19,8 +19,12 @@ logger = logging.getLogger(__name__)
 class ChatTUI:
     """Terminal UI using Rich for markdown rendering and panels."""
 
-    def __init__(self):
+    def __init__(self, tool_result_truncation: int | None = None):
         self.console = Console()
+        self._always_allow: set[str] = set()
+        self._tool_result_truncation = (
+            tool_result_truncation if tool_result_truncation is not None else 2000
+        )
 
     def display_welcome(self, model_name: str, tools: list[dict]) -> None:
         """Show welcome panel with model and tool info."""
@@ -80,8 +84,10 @@ class ChatTUI:
 
     def display_tool_result(self, name: str, result: str) -> None:
         """Show tool response panel."""
-        # Truncate long results
-        display = result if len(result) <= 2000 else result[:2000] + "\n... (truncated)"
+        limit = self._tool_result_truncation
+        display = (
+            result if len(result) <= limit else result[:limit] + "\n... (truncated)"
+        )
         self.console.print(
             Panel(display, title=f"tool result: {name}", border_style="green")
         )
@@ -102,12 +108,43 @@ class ChatTUI:
             Panel(f"[red]{message}[/red]", title="error", border_style="red")
         )
 
+    def display_memory_truncated(self, message: str) -> None:
+        """Show warning that chat history was truncated due to memory."""
+        self.console.print(
+            Panel(f"[yellow]{message}[/yellow]", title="memory", border_style="yellow")
+        )
+
+    def display_repetition_detected(self) -> None:
+        """Show warning that repetition was detected and generation stopped."""
+        self.console.print(
+            Panel(
+                "[yellow]Repetitive output detected, generation stopped[/yellow]",
+                title="warning",
+                border_style="yellow",
+            )
+        )
+
+    def display_model_load_error(self, error: str) -> None:
+        """Show model load error."""
+        self.console.print(
+            Panel(f"[red]{error}[/red]", title="error", border_style="red")
+        )
+
     def confirm_tool_call(self, name: str, arguments: dict) -> bool:
-        """Prompt user to approve a tool call. Returns True if approved."""
+        """Prompt user to approve a tool call. Returns True if approved.
+
+        Supports "always allow" (a) to auto-approve the tool for the session.
+        """
+        if name in self._always_allow:
+            return True
         self.display_tool_call(name, arguments)
         try:
-            answer = self.console.input("[yellow]Allow? [y/N] [/yellow]")
-            return answer.strip().lower() in ("y", "yes")
+            answer = self.console.input("[yellow]Allow? [y/N/a(always)] [/yellow]")
+            answer = answer.strip().lower()
+            if answer in ("a", "always"):
+                self._always_allow.add(name)
+                return True
+            return answer in ("y", "yes")
         except (EOFError, KeyboardInterrupt):
             return False
 

@@ -793,7 +793,26 @@ def cmd_chat(args):
         repeat_last_n=args.repeat_last_n,
         skills_enabled=not args.no_skills,
         builtin_tools_enabled=not args.no_builtin_tools,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        tool_timeout=args.tool_timeout,
+        mcp_connect_retries=args.mcp_connect_retries,
+        local_tool_safety=args.local_tool_safety,
+        tool_result_truncation=args.tool_result_truncation,
     )
+    # Filter out None for nullable args so ChatConfig defaults apply.
+    # Boolean flags (store_true) are never None — only filter numeric args.
+    for _key in (
+        "temperature",
+        "top_p",
+        "top_k",
+        "tool_timeout",
+        "mcp_connect_retries",
+        "tool_result_truncation",
+    ):
+        if chat_kwargs[_key] is None:
+            del chat_kwargs[_key]
     if args.mcp_config:
         chat_kwargs["mcp_config_path"] = Path(args.mcp_config)
     if args.skills_dir:
@@ -807,7 +826,7 @@ def cmd_chat(args):
         store = _create_store()
         manager = ModelManager(store.registry, store)
 
-        tui = ChatTUI()
+        tui = ChatTUI(tool_result_truncation=config.tool_result_truncation)
         mcp = None
         skills = None
         builtin = None
@@ -820,7 +839,9 @@ def cmd_chat(args):
                 mcp_cfg = load_mcp_config(config.mcp_config_path)
                 if mcp_cfg:
                     mcp = MCPClientManager()
-                    await mcp.connect_all(mcp_cfg)
+                    await mcp.connect_all(
+                        mcp_cfg, max_attempts=config.mcp_connect_retries
+                    )
 
             if config.skills_enabled:
                 skills = SkillManager(config.skills_dir)
@@ -1066,6 +1087,13 @@ def cmd_chat(args):
                         pass  # handled inline by decider callback
                     elif event["type"] == "max_turns_exceeded":
                         tui.display_error("Max tool turns reached")
+                    elif event["type"] == "memory_truncated":
+                        tui.display_memory_truncated(event["message"])
+                    elif event["type"] == "repetition_detected":
+                        tui.display_repetition_detected()
+                    elif event["type"] == "model_load_error":
+                        tui.display_model_load_error(event["error"])
+                        break
 
         except MemoryError as exc:
             tui.display_error(str(exc))
@@ -1470,6 +1498,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat_p.add_argument(
         "--skills-dir", help="Skills directory (default: ~/.olmlx/skills)"
+    )
+    chat_p.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature (default: model default)",
+    )
+    chat_p.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Top-p sampling (default: model default)",
+    )
+    chat_p.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Top-k sampling (default: model default)",
+    )
+    chat_p.add_argument(
+        "--tool-timeout",
+        type=float,
+        default=None,
+        help="Timeout for MCP tool calls in seconds (default: 30)",
+    )
+    chat_p.add_argument(
+        "--mcp-connect-retries",
+        type=int,
+        default=None,
+        help="MCP server connection retry attempts (default: 3)",
+    )
+    chat_p.add_argument(
+        "--local-tool-safety",
+        action="store_true",
+        default=False,
+        help="Apply tool safety policy to local tools (builtins, skills)",
+    )
+    chat_p.add_argument(
+        "--tool-result-truncation",
+        type=int,
+        default=None,
+        help="Max chars for tool result display (default: 2000)",
     )
 
     # Flash inference

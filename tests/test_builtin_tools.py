@@ -464,11 +464,16 @@ class TestSessionIntegration:
     @pytest.mark.asyncio
     async def test_builtin_tools_in_tool_list(self, tmp_path):
         """Built-in tools should be included in tools passed to generate_chat."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import AsyncMock, MagicMock, patch
+
         from olmlx.chat.session import ChatSession
+        from olmlx.engine.template_caps import TemplateCaps
 
         config = ChatConfig(model_name="test:latest", plans_dir=tmp_path / "plans")
         mgr = MagicMock()
+        loaded_model = MagicMock()
+        loaded_model.template_caps = TemplateCaps()
+        mgr.ensure_loaded = AsyncMock(return_value=loaded_model)
         builtin = BuiltinToolManager(config)
         session = ChatSession(config=config, manager=mgr, builtin=builtin)
 
@@ -496,14 +501,19 @@ class TestSessionIntegration:
     @pytest.mark.asyncio
     async def test_builtin_tool_routed_correctly(self, tmp_path):
         """Built-in tool calls should be routed to BuiltinToolManager, not MCP."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import AsyncMock, MagicMock, patch
+
         from olmlx.chat.session import ChatSession
+        from olmlx.engine.template_caps import TemplateCaps
 
         test_file = tmp_path / "test.txt"
         test_file.write_text("hello from file\n")
 
         config = ChatConfig(model_name="test:latest", plans_dir=tmp_path / "plans")
         mgr = MagicMock()
+        loaded_model = MagicMock()
+        loaded_model.template_caps = TemplateCaps()
+        mgr.ensure_loaded = AsyncMock(return_value=loaded_model)
         builtin = BuiltinToolManager(config)
         session = ChatSession(config=config, manager=mgr, builtin=builtin)
         call_count = 0

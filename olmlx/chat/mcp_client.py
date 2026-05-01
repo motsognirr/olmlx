@@ -75,16 +75,42 @@ class MCPClientManager:
             },
         }
 
-    async def connect_all(self, config: dict[str, Any]) -> None:
-        """Connect to each configured MCP server and discover tools."""
+    async def connect_all(self, config: dict[str, Any], max_attempts: int = 3) -> None:
+        """Connect to each configured MCP server and discover tools.
+
+        Retries on connection failure with exponential backoff.
+        ``max_attempts`` is the total number of connection attempts
+        (minimum 1).
+        """
+        attempts = max(max_attempts, 1)
         for name, server_cfg in config.items():
-            try:
-                if server_cfg["transport"] == "stdio":
-                    await self._connect_stdio(name, server_cfg)
-                elif server_cfg["transport"] == "sse":
-                    await self._connect_sse(name, server_cfg)
-            except Exception as exc:
-                logger.warning("Failed to connect to MCP server %r: %s", name, exc)
+            for attempt in range(attempts):
+                try:
+                    if server_cfg["transport"] == "stdio":
+                        await self._connect_stdio(name, server_cfg)
+                    elif server_cfg["transport"] == "sse":
+                        await self._connect_sse(name, server_cfg)
+                    break
+                except Exception as exc:
+                    if attempt < attempts - 1:
+                        delay = min(2**attempt, 10)
+                        logger.warning(
+                            "Failed to connect to MCP server %r (attempt %d/%d): %s. "
+                            "Retrying in %ds...",
+                            name,
+                            attempt + 1,
+                            attempts,
+                            exc,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.warning(
+                            "Failed to connect to MCP server %r after %d attempts: %s",
+                            name,
+                            attempts,
+                            exc,
+                        )
 
     async def _connect_stdio(self, name: str, cfg: dict[str, Any]) -> None:
         """Connect to a stdio MCP server."""

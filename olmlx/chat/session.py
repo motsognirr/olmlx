@@ -5,18 +5,157 @@ import json
 import logging
 import re
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 from olmlx.chat.builtin_tools import BuiltinToolManager
 from olmlx.chat.config import ChatConfig
 from olmlx.chat.mcp_client import MCPClientManager
 from olmlx.chat.skills import SkillManager
 from olmlx.chat.tool_safety import ToolSafetyPolicy
-from olmlx.engine.inference import generate_chat
-from olmlx.engine.model_manager import ModelManager
+from olmlx.config import settings
+from olmlx.engine.inference import (
+    apply_chat_template_text,
+    estimate_kv_cache_bytes,
+    tokenize_for_cache,
+    generate_chat,
+)
+from olmlx.engine.model_manager import LoadedModel, ModelManager
 from olmlx.engine.tool_parser import parse_model_output
+from olmlx.utils import memory as memory_utils
 
 logger = logging.getLogger(__name__)
+
+# Maximum messages to keep when truncating (system message + N recent pairs)
+_MIN_MESSAGES_AFTER_TRUNCATE = 6
+
+# Emergency truncation target when first pass still exceeds memory
+_MIN_MESSAGES_EMERGENCY_TRUNCATE = 2
+
+# Thinking tag constants
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_CONTENT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+class _TokenEvent(TypedDict):
+    type: Literal["token"]
+    text: str
+
+
+class _ThinkingTokenEvent(TypedDict):
+    type: Literal["thinking_token"]
+    text: str
+
+
+class _ToolCallEvent(TypedDict):
+    type: Literal["tool_call"]
+    name: str
+    arguments: dict[str, Any]
+    id: str
+
+
+class _ToolResultEvent(TypedDict):
+    type: Literal["tool_result"]
+    name: str
+    result: str
+    id: str
+
+
+class _ToolErrorEvent(TypedDict):
+    type: Literal["tool_error"]
+    name: str
+    error: str
+    id: str
+
+
+class _RepetitionDetectedEvent(TypedDict):
+    type: Literal["repetition_detected"]
+
+
+class _MemoryTruncatedEvent(TypedDict):
+    type: Literal["memory_truncated"]
+    message: str
+
+
+class _ModelLoadErrorEvent(TypedDict):
+    type: Literal["model_load_error"]
+    error: str
+
+
+class _ThinkingStartEvent(TypedDict):
+    type: Literal["thinking_start"]
+
+
+class _ThinkingEndEvent(TypedDict):
+    type: Literal["thinking_end"]
+
+
+class _DoneEvent(TypedDict):
+    type: Literal["done"]
+
+
+class _MaxTurnsExceededEvent(TypedDict):
+    type: Literal["max_turns_exceeded"]
+
+
+class _ToolConfirmationNeededEvent(TypedDict):
+    type: Literal["tool_confirmation_needed"]
+    name: str
+    arguments: dict[str, Any]
+    id: str
+
+
+class _ToolApprovedEvent(TypedDict):
+    type: Literal["tool_approved"]
+    name: str
+    id: str
+
+
+class _ToolDeniedEvent(TypedDict):
+    type: Literal["tool_denied"]
+    name: str
+    arguments: dict[str, Any]
+    id: str
+    reason: str
+
+
+class _ToolAutoJudgingEvent(TypedDict):
+    type: Literal["tool_auto_judging"]
+    name: str
+    arguments: dict[str, Any]
+    id: str
+
+
+class _QuestionEvent(TypedDict):
+    type: Literal["question"]
+    header: str
+    question: str
+    options: list[str] | None
+    multiple: bool
+    id: str
+
+
+# Union type for all events yielded by send_message
+ChatEvent = (
+    _TokenEvent
+    | _ThinkingTokenEvent
+    | _ToolCallEvent
+    | _ToolResultEvent
+    | _ToolErrorEvent
+    | _RepetitionDetectedEvent
+    | _MemoryTruncatedEvent
+    | _ModelLoadErrorEvent
+    | _ThinkingStartEvent
+    | _ThinkingEndEvent
+    | _DoneEvent
+    | _MaxTurnsExceededEvent
+    | _ToolConfirmationNeededEvent
+    | _ToolApprovedEvent
+    | _ToolDeniedEvent
+    | _ToolAutoJudgingEvent
+    | _QuestionEvent
+)
 
 
 class ThinkingTracker:
@@ -212,6 +351,141 @@ class ChatSession:
             self.messages.append({"role": "system", "content": system_prompt})
         self.manager.invalidate_prompt_cache(self.config.model_name, "chat")
 
+    async def _estimate_conversation_tokens(self, lm: LoadedModel) -> int:
+        """Estimate total tokens for current conversation history."""
+        try:
+            tokenizer = lm.text_tokenizer
+            msgs = list(self.messages)
+            caps = lm.template_caps
+
+            def _estimate() -> int:
+                prompt_text = apply_chat_template_text(
+                    tokenizer, msgs, tools=None, caps=caps
+                )
+                return len(tokenize_for_cache(tokenizer, prompt_text))
+
+            return await asyncio.to_thread(_estimate)
+        except Exception as exc:
+            logger.debug("Token estimation failed: %s", exc)
+            return 0
+
+    async def _check_memory_and_truncate(
+        self, lm: LoadedModel, max_tokens: int
+    ) -> bool:
+        """Check if conversation + generation would exceed memory, truncate if needed.
+
+        Returns True if truncation occurred.
+        """
+        total_physical = memory_utils.get_system_memory_bytes()
+        if total_physical <= 0:
+            return False
+
+        memory_limit = int(total_physical * settings.memory_limit_fraction)
+        current_metal = memory_utils.get_metal_memory()
+
+        # Estimate tokens for current conversation
+        conv_tokens = await self._estimate_conversation_tokens(lm)
+        if conv_tokens <= 0:
+            return False
+
+        # Estimate KV cache for full generation
+        kv_bytes = estimate_kv_cache_bytes(
+            lm.model,
+            conv_tokens + max_tokens,
+            kv_cache_quant=lm.kv_cache_quant,
+        )
+
+        if current_metal + kv_bytes <= memory_limit:
+            return False
+
+        # Need to truncate — keep system message + recent message pairs
+        logger.warning(
+            "Chat memory check: %d tokens (%.1f GB KV) would exceed limit. Truncating history.",
+            conv_tokens,
+            kv_bytes / 1024**3,
+        )
+
+        # Find system message index
+        system_idx = 0
+        if self.messages and self.messages[0].get("role") == "system":
+            system_idx = 1
+
+        # Capture original length so we only report truncation if
+        # messages were actually removed (not just memory pressure).
+        original_len = len(self.messages)
+
+        # Keep system + N most recent (user, assistant) pairs
+        kept = []
+        if system_idx > 0:
+            kept.append(self.messages[0])  # system message
+
+        # Walk backwards from the end, collecting messages. After hitting
+        # the target count, continue walking back until we reach a clean
+        # turn boundary (a user message) so we never split tool_call /
+        # tool_result pairs or leave orphan tool results.
+        recent = []
+        idx = len(self.messages) - 1
+        while idx >= system_idx:
+            msg = self.messages[idx]
+            recent.insert(0, msg)
+            idx -= 1
+            if len(recent) >= _MIN_MESSAGES_AFTER_TRUNCATE:
+                # Walk back to next user message to avoid splitting a turn
+                while idx >= system_idx:
+                    msg = self.messages[idx]
+                    if msg.get("role") == "user":
+                        recent.insert(0, msg)
+                        idx -= 1
+                        break
+                    recent.insert(0, msg)
+                    idx -= 1
+                break
+
+        kept.extend(recent)
+        self.messages = kept
+
+        # Re-verify the truncated history still fits; if not, truncate again
+        # but with a shallower target — keep only the last 2 messages.
+        conv_tokens_after = await self._estimate_conversation_tokens(lm)
+        if conv_tokens_after > 0:
+            kv_bytes_after = estimate_kv_cache_bytes(
+                lm.model,
+                conv_tokens_after + max_tokens,
+                kv_cache_quant=lm.kv_cache_quant,
+            )
+            if current_metal + kv_bytes_after > memory_limit:
+                logger.warning(
+                    "Truncated history still exceeds memory limit; reducing further"
+                )
+                kept = []
+                if system_idx > 0:
+                    kept.append(self.messages[0])
+                recent = []
+                idx = len(self.messages) - 1
+                while idx >= system_idx:
+                    msg = self.messages[idx]
+                    recent.insert(0, msg)
+                    idx -= 1
+                    if len(recent) >= _MIN_MESSAGES_EMERGENCY_TRUNCATE:
+                        while idx >= system_idx:
+                            msg = self.messages[idx]
+                            if msg.get("role") == "user":
+                                recent.insert(0, msg)
+                                idx -= 1
+                                break
+                            recent.insert(0, msg)
+                            idx -= 1
+                        break
+                kept.extend(recent)
+                self.messages = kept
+
+        if len(self.messages) < original_len:
+            self.manager.invalidate_prompt_cache(self.config.model_name, "chat")
+            logger.info("Truncated chat history to %d messages", len(self.messages))
+            return True
+
+        return False
+
     async def _exec_tool(self, tu: dict) -> dict:
         """Execute a single tool call and return the event + message."""
         tool_name = tu["name"]
@@ -223,7 +497,9 @@ class ChatSession:
             elif self.builtin and tool_name in self.builtin.tool_names:
                 result = await self.builtin.call_tool(tool_name, tool_input)
             elif self.mcp is not None:
-                result = await self.mcp.call_tool(tool_name, tool_input)
+                result = await self.mcp.call_tool(
+                    tool_name, tool_input, timeout=self.config.tool_timeout
+                )
             else:
                 raise ValueError(f"No handler for tool: {tool_name!r}")
             return {
@@ -302,7 +578,7 @@ class ChatSession:
 
     async def _execute_tool_calls(
         self, tool_uses: list[dict]
-    ) -> AsyncGenerator[dict, None]:
+    ) -> AsyncGenerator[ChatEvent, None]:
         """Classify, confirm, and execute tool calls. Yields event dicts.
 
         Appends tool result messages to self.messages in original call order.
@@ -310,18 +586,19 @@ class ChatSession:
         """
         # Classify tools by safety policy.
         # Local tools (skills, builtins) bypass the safety policy
-        # because they run in-process and were already trusted by
-        # the user when configured. Note: tool names come from model
-        # output (not MCP directly), so a prompt injection could
-        # cause the model to emit a local tool name — but local
-        # tools are no more dangerous than the model calling them
-        # without the safety layer.
+        # by default (local_tool_safety=False) because they run
+        # in-process and were already trusted by the user when
+        # configured. Set local_tool_safety=True to apply the
+        # safety policy to local tools as well.
         local_tools = []
         remote_tools = []
         for tu in tool_uses:
-            if tu["name"] == "use_skill" and self.skills:
-                local_tools.append(tu)
-            elif self.builtin and tu["name"] in self.builtin.tool_names:
+            is_local = (tu["name"] == "use_skill" and self.skills) or (
+                self.builtin and tu["name"] in self.builtin.tool_names
+            )
+            if is_local and self.config.local_tool_safety:
+                remote_tools.append(tu)
+            elif is_local:
                 local_tools.append(tu)
             else:
                 remote_tools.append(tu)
@@ -570,7 +847,7 @@ class ChatSession:
         if deferred_exc is not None:
             raise deferred_exc
 
-    async def send_message(self, user_text: str) -> AsyncGenerator[dict, None]:
+    async def send_message(self, user_text: str) -> AsyncGenerator[ChatEvent, None]:
         """Send a user message and run the agent loop.
 
         Yields event dicts:
@@ -581,37 +858,63 @@ class ChatSession:
         - {"type": "tool_call", "name": str, "arguments": dict, "id": str}
         - {"type": "tool_result", "name": str, "result": str, "id": str}
         - {"type": "tool_error", "name": str, "error": str, "id": str}
-        - {"type": "max_turns_exceeded"}
-        - {"type": "done"}
+        - {"type": "tool_confirmation_needed", "name": str, "arguments": dict, "id": str}
+        - {"type": "tool_approved", "name": str, "id": str}
+        - {"type": "tool_denied", "name": str, "arguments": dict, "id": str, "reason": str}
+        - {"type": "tool_auto_judging", "name": str, "arguments": dict, "id": str}
+        - {"type": "question", "header": str, "question": str, "options": list|None, "multiple": bool, "id": str}
+        - {"type": "memory_truncated", "message": str} — history was truncated
+        - {"type": "repetition_detected"} — repetitive output detected
+        - {"type": "model_load_error", "error": str} — model load failed
+        - {"type": "max_turns_exceeded"} — agent loop hit turn limit
+        - {"type": "done"} — end of response
         """
         self.messages.append({"role": "user", "content": user_text})
 
         mcp_tools = self._prepare_tools()
 
-        options = {
+        options: dict[str, Any] = {
             "repeat_penalty": self.config.repeat_penalty,
             "repeat_last_n": self.config.repeat_last_n,
         }
+        if self.config.temperature is not None:
+            options["temperature"] = self.config.temperature
+        if self.config.top_p is not None:
+            options["top_p"] = self.config.top_p
+        if self.config.top_k is not None:
+            options["top_k"] = self.config.top_k
 
-        # Check template caps for implicit thinking detection.
-        # generate_chat() calls ensure_loaded too; the model stays cached.
-        # Only has_thinking_tags implies implicit thinking (template injects
-        # <think>); supports_enable_thinking alone means explicit tags.
+        # Load model once and extract template caps + do memory check
         try:
             lm = await self.manager.ensure_loaded(self.config.model_name)
             template_has_thinking = lm.template_caps.has_thinking_tags
-        except Exception:
-            logger.debug(
-                "Could not detect template caps, assuming no implicit thinking",
-                exc_info=True,
-            )
-            template_has_thinking = False
+        except Exception as exc:
+            logger.error("Failed to load model %r: %s", self.config.model_name, exc)
+            # Roll back the user message already appended at the top of send_message
+            self.messages.pop()
+            error_msg = f"Failed to load model: {exc}"
+            yield {"type": "model_load_error", "error": error_msg}
+            yield {"type": "done"}
+            return
 
         # Implicit thinking: model injects <think> into the template prompt,
         # so generated text starts with thinking content (no <think> prefix).
         # Buffer content before </think> regardless of the thinking display
         # flag — when disabled, we still need to strip thinking from output.
         assume_implicit_thinking = template_has_thinking
+
+        # Pre-check memory before starting agent loop
+        try:
+            truncated = await self._check_memory_and_truncate(
+                lm, self.config.max_tokens
+            )
+            if truncated:
+                yield {
+                    "type": "memory_truncated",
+                    "message": f"History truncated to {len(self.messages)} messages to fit memory",
+                }
+        except Exception:
+            logger.debug("Memory check failed, proceeding anyway", exc_info=True)
 
         for turn in range(self.config.max_turns):
             repetition_stopped = False
@@ -655,12 +958,15 @@ class ChatSession:
                         yield {"type": "token", "text": visible_delta}
 
                     if token_count % 10 == 0 and _detect_repetition(
-                        tracker.accumulated
+                        tracker.accumulated,
+                        min_phrase_len=self.config.repetition_min_phrase_len,
+                        min_repeats=self.config.repetition_min_repeats,
                     ):
                         logger.warning(
                             "Repetitive output detected, stopping generation"
                         )
                         repetition_stopped = True
+                        yield {"type": "repetition_detected"}
                         break
 
             # Flush disabled-thinking content
@@ -678,9 +984,24 @@ class ChatSession:
 
             full_text = tracker.accumulated
 
-            thinking, visible_text, tool_uses = parse_model_output(
-                full_text, has_tools=(mcp_tools is not None)
-            )
+            try:
+                _, visible_text, tool_uses = parse_model_output(
+                    full_text, has_tools=(mcp_tools is not None)
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to parse model output: %s\ntext: %.200s",
+                    exc,
+                    full_text,
+                )
+                visible_text = _strip_thinking(full_text)
+                tool_uses = []
+                yield {
+                    "type": "tool_error",
+                    "name": "(parse error)",
+                    "error": f"Failed to parse model output; tools were dropped: {exc}",
+                    "id": "",
+                }
 
             # Build assistant message
             assistant_msg: dict[str, Any] = {
@@ -713,12 +1034,6 @@ class ChatSession:
         yield {"type": "done"}
 
 
-_THINK_OPEN = "<think>"
-_THINK_CLOSE = "</think>"
-_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-_THINK_CONTENT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-
-
 def _strip_thinking(text: str) -> str:
     """Remove complete and in-progress <think> blocks from text.
 
@@ -727,14 +1042,11 @@ def _strip_thinking(text: str) -> str:
     Also handles implicit thinking where the template injects ``<think>``
     so only ``</think>`` appears in the output.
     """
-    # Remove complete blocks
     result = _THINK_BLOCK_RE.sub("", text)
-    # Handle implicit thinking: </think> without matching <think>
     if _THINK_OPEN not in result:
         close_idx = result.find(_THINK_CLOSE)
         if close_idx != -1:
             return result[close_idx + len(_THINK_CLOSE) :]
-    # Truncate at any unclosed <think>
     idx = result.find(_THINK_OPEN)
     if idx != -1:
         result = result[:idx]
@@ -750,15 +1062,12 @@ def _extract_thinking_content(text: str) -> str:
     and only ``</think>`` appears in the output.
     """
     parts = []
-    # Closed blocks
     for m in _THINK_CONTENT_RE.finditer(text):
         parts.append(m.group(1))
-    # Check for unclosed trailing <think> after removing closed blocks
     cleaned = _THINK_BLOCK_RE.sub("", text)
     idx = cleaned.find(_THINK_OPEN)
     if idx != -1:
         parts.append(cleaned[idx + len(_THINK_OPEN) :])
-    # Implicit thinking: no <think> tag but </think> present
     elif not parts:
         close_idx = cleaned.find(_THINK_CLOSE)
         if close_idx != -1:
@@ -771,22 +1080,28 @@ def _detect_repetition(
 ) -> bool:
     """Detect if the accumulated text contains a repeating phrase.
 
-    Checks if any substring of length >= min_phrase_len repeats
-    min_repeats or more times consecutively in the recent text.
+    Searches the tail (last 1000 chars) of the text for any short
+    substring that repeats consecutively at least min_repeats times.
+    The phrase length is capped at 100 chars for performance; this
+    is a deliberate trade-off — very long repetitive blocks (e.g.
+    repeated function bodies >100 chars) won't be detected at the
+    default config values.  Lowering ``repetition_min_phrase_len``
+    or ``repetition_min_repeats`` increases detection surface at
+    the cost of more checks per step.
     """
     if len(text) < min_phrase_len * min_repeats:
         return False
 
-    # Only check the tail to keep it fast
-    tail = text[-1000:] if len(text) > 1000 else text
+    if min_repeats < 1 or min_phrase_len < 1:
+        return False
 
-    # Try different phrase lengths from short to long
-    for phrase_len in range(min_phrase_len, len(tail) // min_repeats + 1):
-        # Take the last phrase_len chars as candidate
+    tail = text[-1000:] if len(text) > 1000 else text
+    max_phrase_len = max(min_phrase_len, min(100, len(tail) // min_repeats))
+
+    for phrase_len in range(min_phrase_len, max_phrase_len + 1):
         candidate = tail[-phrase_len:]
         if not candidate.strip():
             continue
-        # Count consecutive occurrences from the end
         count = 0
         pos = len(tail)
         while pos >= phrase_len:
