@@ -75,14 +75,16 @@ class MCPClientManager:
             },
         }
 
-    async def connect_all(self, config: dict[str, Any], max_attempts: int = 3) -> None:
+    async def connect_all(
+        self, config: dict[str, Any], max_attempts: int | None = None
+    ) -> None:
         """Connect to each configured MCP server and discover tools.
 
         Retries on connection failure with exponential backoff.
         ``max_attempts`` is the total number of connection attempts
-        (minimum 1).
+        (minimum 1). ``None`` defaults to 3.
         """
-        attempts = max(max_attempts, 1)
+        attempts = max(max_attempts if max_attempts is not None else 3, 1)
         for name, server_cfg in config.items():
             for attempt in range(attempts):
                 try:

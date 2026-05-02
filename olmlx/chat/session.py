@@ -136,6 +136,12 @@ class _QuestionEvent(TypedDict):
     id: str
 
 
+class _ToolFailuresExceededEvent(TypedDict):
+    type: Literal["tool_failures_exceeded"]
+    message: str
+    consecutive_failures: int
+
+
 # Union type for all events yielded by send_message
 ChatEvent = (
     _TokenEvent
@@ -155,6 +161,7 @@ ChatEvent = (
     | _ToolDeniedEvent
     | _ToolAutoJudgingEvent
     | _QuestionEvent
+    | _ToolFailuresExceededEvent
 )
 
 
@@ -582,7 +589,8 @@ class ChatSession:
         """Classify, confirm, and execute tool calls. Yields event dicts.
 
         Appends tool result messages to self.messages in original call order.
-        Raises the first tool execution exception after all events are yielded.
+        Tool errors are fed back to the model for recovery via tool_error
+        events and error messages appended to the conversation history.
         """
         # Classify tools by safety policy.
         # Local tools (skills, builtins) bypass the safety policy
@@ -845,7 +853,17 @@ class ChatSession:
                 )
 
         if deferred_exc is not None:
-            raise deferred_exc
+            # Non-Exception BaseException (e.g. KeyboardInterrupt, SystemExit,
+            # GeneratorExit) captured by asyncio.gather in the parallel path —
+            # must be re-raised. Note: the tool error message was already
+            # appended to self.messages above; if the session is reused the
+            # history will contain a dangling tool error.
+            if not isinstance(deferred_exc, Exception):
+                raise deferred_exc
+            # Regular exceptions have already been yielded as tool_error
+            # events and appended to self.messages. Let the caller
+            # (agent loop) handle recovery and track consecutive failures.
+            return
 
     async def send_message(self, user_text: str) -> AsyncGenerator[ChatEvent, None]:
         """Send a user message and run the agent loop.
@@ -867,6 +885,7 @@ class ChatSession:
         - {"type": "repetition_detected"} — repetitive output detected
         - {"type": "model_load_error", "error": str} — model load failed
         - {"type": "max_turns_exceeded"} — agent loop hit turn limit
+        - {"type": "tool_failures_exceeded", "message": str, "consecutive_failures": int}
         - {"type": "done"} — end of response
         """
         self.messages.append({"role": "user", "content": user_text})
@@ -916,6 +935,7 @@ class ChatSession:
         except Exception:
             logger.debug("Memory check failed, proceeding anyway", exc_info=True)
 
+        consecutive_failures = 0
         for turn in range(self.config.max_turns):
             repetition_stopped = False
             token_count = 0
@@ -1025,8 +1045,48 @@ class ChatSession:
             if not tool_uses or repetition_stopped:
                 break
 
-            async for event in self._execute_tool_calls(tool_uses):
-                yield event
+            turn_had_success = False
+            turn_had_failure = False
+            try:
+                async for event in self._execute_tool_calls(tool_uses):
+                    yield event
+                    if event["type"] == "tool_error":
+                        turn_had_failure = True
+                    elif event["type"] == "tool_result":
+                        turn_had_success = True
+            except asyncio.CancelledError:
+                raise
+            # Defence-in-depth: _execute_tool_calls no longer raises Exception
+            # (errors are fed back as tool_error events), but guard against
+            # future regressions.
+            except Exception:
+                logger.warning(
+                    "Unexpected exception during tool execution", exc_info=True
+                )
+                turn_had_failure = True
+
+            # Any successful tool call in a turn resets the failure counter
+            # so that the agent loop continues as long as the model gets
+            # useful results. Mixed-result turns (parallel success + failure)
+            # also reset — the model has new information to work with.
+            if turn_had_success:
+                consecutive_failures = 0
+            elif turn_had_failure:
+                consecutive_failures += 1
+
+            if (
+                self.config.max_consecutive_tool_failures > 0
+                and consecutive_failures >= self.config.max_consecutive_tool_failures
+            ):
+                yield {
+                    "type": "tool_failures_exceeded",
+                    "message": (
+                        f"Too many consecutive turns with tool failures "
+                        f"({consecutive_failures}). Stopping agent loop."
+                    ),
+                    "consecutive_failures": consecutive_failures,
+                }
+                break
         else:
             # max_turns reached
             yield {"type": "max_turns_exceeded"}

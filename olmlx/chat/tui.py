@@ -124,6 +124,16 @@ class ChatTUI:
             )
         )
 
+    def display_tool_failures_exceeded(self, message: str) -> None:
+        """Show error when too many consecutive tool failures occurred."""
+        self.console.print(
+            Panel(
+                f"[red]{message}[/red]",
+                title="tool failures exceeded",
+                border_style="red",
+            )
+        )
+
     def display_model_load_error(self, error: str) -> None:
         """Show model load error."""
         self.console.print(
