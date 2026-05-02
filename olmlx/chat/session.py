@@ -136,6 +136,12 @@ class _QuestionEvent(TypedDict):
     id: str
 
 
+class _ToolFailuresExceededEvent(TypedDict):
+    type: Literal["tool_failures_exceeded"]
+    message: str
+    consecutive_failures: int
+
+
 # Union type for all events yielded by send_message
 ChatEvent = (
     _TokenEvent
@@ -155,6 +161,7 @@ ChatEvent = (
     | _ToolDeniedEvent
     | _ToolAutoJudgingEvent
     | _QuestionEvent
+    | _ToolFailuresExceededEvent
 )
 
 
@@ -845,7 +852,12 @@ class ChatSession:
                 )
 
         if deferred_exc is not None:
-            raise deferred_exc
+            if isinstance(deferred_exc, (KeyboardInterrupt, SystemExit)):
+                raise deferred_exc
+            # For other exceptions, the error events have already been
+            # yielded and error messages appended to self.messages.
+            # Let the caller (agent loop) handle recovery and track
+            # consecutive failures.
 
     async def send_message(self, user_text: str) -> AsyncGenerator[ChatEvent, None]:
         """Send a user message and run the agent loop.
@@ -867,6 +879,7 @@ class ChatSession:
         - {"type": "repetition_detected"} — repetitive output detected
         - {"type": "model_load_error", "error": str} — model load failed
         - {"type": "max_turns_exceeded"} — agent loop hit turn limit
+        - {"type": "tool_failures_exceeded", "message": str, "consecutive_failures": int}
         - {"type": "done"} — end of response
         """
         self.messages.append({"role": "user", "content": user_text})
@@ -916,6 +929,7 @@ class ChatSession:
         except Exception:
             logger.debug("Memory check failed, proceeding anyway", exc_info=True)
 
+        consecutive_failures = 0
         for turn in range(self.config.max_turns):
             repetition_stopped = False
             token_count = 0
@@ -1025,8 +1039,41 @@ class ChatSession:
             if not tool_uses or repetition_stopped:
                 break
 
-            async for event in self._execute_tool_calls(tool_uses):
-                yield event
+            turn_had_success = False
+            turn_had_failure = False
+            try:
+                async for event in self._execute_tool_calls(tool_uses):
+                    yield event
+                    if event["type"] == "tool_error":
+                        turn_had_failure = True
+                    elif event["type"] == "tool_result":
+                        turn_had_success = True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Unexpected error during tool execution", exc_info=True
+                )
+                turn_had_failure = True
+
+            if turn_had_success:
+                consecutive_failures = 0
+            elif turn_had_failure:
+                consecutive_failures += 1
+
+            if (
+                self.config.max_consecutive_tool_failures > 0
+                and consecutive_failures >= self.config.max_consecutive_tool_failures
+            ):
+                yield {
+                    "type": "tool_failures_exceeded",
+                    "message": (
+                        f"Too many consecutive turns with tool failures "
+                        f"({consecutive_failures}). Stopping agent loop."
+                    ),
+                    "consecutive_failures": consecutive_failures,
+                }
+                break
         else:
             # max_turns reached
             yield {"type": "max_turns_exceeded"}

@@ -800,6 +800,7 @@ def cmd_chat(args):
         mcp_connect_retries=args.mcp_connect_retries,
         local_tool_safety=args.local_tool_safety,
         tool_result_truncation=args.tool_result_truncation,
+        max_consecutive_tool_failures=args.max_consecutive_tool_failures,
     )
     # Filter out None for nullable args so ChatConfig defaults apply.
     # Boolean flags (store_true) are never None — only filter numeric args.
@@ -810,8 +811,15 @@ def cmd_chat(args):
         "tool_timeout",
         "mcp_connect_retries",
         "tool_result_truncation",
+        "max_consecutive_tool_failures",
     ):
         if chat_kwargs[_key] is None:
+            del chat_kwargs[_key]
+    # Boolean store_true flags default to False. Drop them when False so
+    # ChatConfig's default wins — if the default ever flips to True, the CLI
+    # won't silently override it back to False.
+    for _key in ("local_tool_safety",):
+        if not chat_kwargs.get(_key):
             del chat_kwargs[_key]
     if args.mcp_config:
         chat_kwargs["mcp_config_path"] = Path(args.mcp_config)
@@ -1087,6 +1095,8 @@ def cmd_chat(args):
                         pass  # handled inline by decider callback
                     elif event["type"] == "max_turns_exceeded":
                         tui.display_error("Max tool turns reached")
+                    elif event["type"] == "tool_failures_exceeded":
+                        tui.display_tool_failures_exceeded(event["message"])
                     elif event["type"] == "memory_truncated":
                         tui.display_memory_truncated(event["message"])
                     elif event["type"] == "repetition_detected":
@@ -1540,6 +1550,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Max chars for tool result display (default: 2000)",
+    )
+    chat_p.add_argument(
+        "--max-consecutive-tool-failures",
+        type=int,
+        default=None,
+        help="Max consecutive tool failure turns before stopping (default: 3, 0=unlimited)",
     )
 
     # Flash inference

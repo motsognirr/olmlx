@@ -58,6 +58,7 @@ class ChatConfig:
     local_tool_safety: bool = False
     mcp_connect_retries: int = 3
     tool_result_truncation: int = 2000
+    max_consecutive_tool_failures: int = 3
 
 
 def _load_json_file(path: Path) -> dict[str, Any]:

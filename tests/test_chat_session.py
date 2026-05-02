@@ -1595,3 +1595,172 @@ class TestExecuteToolCalls:
         assert len(session.messages) == 2
         assert session.messages[0]["tool_call_id"] == "tc_a"
         assert session.messages[1]["tool_call_id"] == "tc_b"
+
+
+class TestConsecutiveToolFailures:
+    """Tests for max_consecutive_tool_failures config option."""
+
+    @pytest.mark.asyncio
+    async def test_stops_after_consecutive_failures(self):
+        """Agent loop stops after exceeding max_consecutive_tool_failures."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "fail_tool",
+                    "description": "A tool that fails",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        mcp.call_tool = AsyncMock(side_effect=RuntimeError("Connection refused"))
+
+        config = ChatConfig(
+            model_name="test:latest",
+            max_turns=10,
+            max_consecutive_tool_failures=2,
+        )
+        manager = MagicMock()
+        loaded_model = MagicMock()
+        loaded_model.template_caps = TemplateCaps()
+        manager.ensure_loaded = AsyncMock(return_value=loaded_model)
+        session = ChatSession(config=config, manager=manager, mcp=mcp)
+
+        async def fake_generate(*args, **kwargs):
+            yield {
+                "text": '<tool_call>{"name": "fail_tool", "arguments": {}}</tool_call>',
+                "done": False,
+            }
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            events = []
+            async for event in session.send_message("Use the tool"):
+                events.append(event)
+
+        exceeded = [e for e in events if e["type"] == "tool_failures_exceeded"]
+        assert len(exceeded) == 1
+        assert exceeded[0]["consecutive_failures"] == 2
+
+        error_events = [e for e in events if e["type"] == "tool_error"]
+        assert len(error_events) == 2  # one per turn
+
+        # Should have stopped before max_turns (10)
+        max_turns_events = [e for e in events if e["type"] == "max_turns_exceeded"]
+        assert len(max_turns_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_success_resets_failure_counter(self):
+        """A successful tool call resets the consecutive failure counter."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "maybe_fail",
+                    "description": "Might fail",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        session = _make_session(mcp=mcp, max_turns=10)
+        session.config.max_consecutive_tool_failures = 2
+
+        call_num = 0
+
+        async def call_tool(name, args, timeout=30.0):
+            nonlocal call_num
+            call_num += 1
+            if call_num == 1:
+                raise RuntimeError("fail1")
+            elif call_num == 2:
+                return "success"
+            else:
+                raise RuntimeError("fail2")
+
+        mcp.call_tool = AsyncMock(side_effect=call_tool)
+        gen_count = 0
+
+        async def fake_generate(*args, **kwargs):
+            nonlocal gen_count
+            gen_count += 1
+            yield {
+                "text": '<tool_call>{"name": "maybe_fail", "arguments": {}}</tool_call>',
+                "done": False,
+            }
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            events = []
+            async for event in session.send_message("Use the tool"):
+                events.append(event)
+
+        # Failures should be: fail1 (turn1), then success (turn2, resets),
+        # then fail2 (turn3), then fail from call4 (turn4),
+        # and continue failing -> should hit limit after 2 more failures
+        # So at least 4 turns should have run before the exceeded event
+        exceeded = [e for e in events if e["type"] == "tool_failures_exceeded"]
+        assert len(exceeded) == 1
+        result_events = [e for e in events if e["type"] == "tool_result"]
+        assert len(result_events) == 1  # one success
+        error_events = [e for e in events if e["type"] == "tool_error"]
+        assert len(error_events) >= 2  # at least the 2 failures in the final run
+
+    @pytest.mark.asyncio
+    async def test_deferred_exception_does_not_crash_session(self):
+        """BaseException from parallel tool execution does not crash session."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "crash_tool",
+                    "description": "A tool that raises BaseException",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        mcp.call_tool = AsyncMock(side_effect=BaseException("unexpected"))
+
+        session = _make_session(mcp=mcp)
+        session.config.max_consecutive_tool_failures = 3
+
+        call_count = 0
+        async def fake_generate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield {
+                    "text": '<tool_call>{"name": "crash_tool", "arguments": {}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": MagicMock()}
+            else:
+                yield {"text": "The tool crashed, sorry.", "done": False}
+                yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            events = []
+            async for event in session.send_message("Use the tool"):
+                events.append(event)
+
+        # Should not crash — the old code raised deferred_exc and crashed
+        # With max_consecutive_tool_failures=3, a single error is fine
+        error_events = [e for e in events if e["type"] == "tool_error"]
+        assert len(error_events) == 1
+        exceeded = [e for e in events if e["type"] == "tool_failures_exceeded"]
+        assert len(exceeded) == 0
+
+        # Model should have seen the error and responded
+        assert session.messages[-1]["content"] == "The tool crashed, sorry."
