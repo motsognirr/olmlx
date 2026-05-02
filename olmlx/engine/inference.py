@@ -1984,6 +1984,12 @@ async def _store_prompt_cache_after_generation(
 
     Handles trimming to max_cache_tokens, eviction pressure cleanup,
     and cache invalidation on trim failure.
+
+    Non-trimmable hybrid caches (e.g. Gemma 4, Qwen3-Next with
+    RotatingKVCache layers) skip the trim path and are stored as-is
+    even when they exceed max_cache_tokens.  The pre-generation setup
+    path handles their eventual discard when alignment requires a trim;
+    this storage just keeps them alive for strict-extension cache hits.
     """
     prompt_cache = gen_kwargs.get("prompt_cache")
     if prompt_cache is None or full_prompt_tokens is None:
@@ -1993,10 +1999,34 @@ async def _store_prompt_cache_after_generation(
     actual_total = len(full_prompt_tokens) + eval_count
     max_cache_tokens = settings.prompt_cache_max_tokens
     if max_cache_tokens is not None and actual_total > max_cache_tokens:
+        if not lm.supports_cache_trim:
+            # Non-trimmable hybrid cache: trim_prompt_cache would call
+            # can_trim_prompt_cache → RotatingKVCache.is_trimmable()
+            # which returns False once the ring buffer fills, causing
+            # the trim to silently return 0.  Store without trimming
+            # so the cache survives for strict-extension reuse on the
+            # next turn; the pre-generation path will discard it if
+            # alignment requires a trim.
+            logger.debug(
+                "Skipping trim on non-trimmable hybrid cache "
+                "(would-be trim=%d), storing at %d tokens",
+                actual_total - max_cache_tokens,
+                actual_total,
+            )
+            evicted = await lm.prompt_cache_store.async_set(
+                cache_id,
+                CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
+            )
+            if evicted is not None:
+                del evicted
+                if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+                    gc.collect()
+                    mx.clear_cache()
+            return
+
         trim_amount = actual_total - max_cache_tokens
         # cache_invalidated drives the post-trim flow.  Set when:
-        # (a) trim returns the wrong amount (non-trimmable hybrid
-        # cache like Qwen3-Next — expected operating condition), or
+        # (a) trim returns the wrong amount (trimmable cache misreporting), or
         # (b) trim raises an unexpected exception.  In either case
         # the storage block is skipped and the cache reference is
         # released.  Using a flag avoids signalling a normal "this
@@ -2005,10 +2035,9 @@ async def _store_prompt_cache_after_generation(
         try:
             trimmed = trim_prompt_cache(prompt_cache, trim_amount)
             if trimmed != trim_amount:
-                # Hybrid/non-trimmable cache: a partial trim would
-                # leave the stored cache misaligned with stored_tokens
-                # metadata, so invalidate rather than carry a broken
-                # cache forward.
+                # A trimmable cache that under-delivers on trim
+                # (possible with unusual cache implementations).
+                # Invalidate rather than carry a broken cache forward.
                 logger.warning(
                     "Cache trim incomplete (asked for %d, got %d); invalidating cache",
                     trim_amount,
