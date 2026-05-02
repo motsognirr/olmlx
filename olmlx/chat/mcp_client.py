@@ -84,7 +84,7 @@ class MCPClientManager:
         ``max_attempts`` is the total number of connection attempts
         (minimum 1). ``None`` defaults to 3.
         """
-        attempts = max(max_attempts or 3, 1)
+        attempts = max(max_attempts if max_attempts is not None else 3, 1)
         for name, server_cfg in config.items():
             for attempt in range(attempts):
                 try:

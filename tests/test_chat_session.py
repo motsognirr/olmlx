@@ -1716,19 +1716,19 @@ class TestConsecutiveToolFailures:
 
     @pytest.mark.asyncio
     async def test_deferred_exception_does_not_crash_session(self):
-        """BaseException from parallel tool execution does not crash session."""
+        """Exception from parallel tool execution does not crash session."""
         mcp = MagicMock()
         mcp.get_tools_for_chat.return_value = [
             {
                 "type": "function",
                 "function": {
                     "name": "crash_tool",
-                    "description": "A tool that raises BaseException",
+                    "description": "A tool that raises an Exception",
                     "parameters": {"type": "object", "properties": {}},
                 },
             }
         ]
-        mcp.call_tool = AsyncMock(side_effect=BaseException("unexpected"))
+        mcp.call_tool = AsyncMock(side_effect=RuntimeError("unexpected"))
 
         session = _make_session(mcp=mcp)
         session.config.max_consecutive_tool_failures = 3

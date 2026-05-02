@@ -819,8 +819,8 @@ def cmd_chat(args):
     # ChatConfig's default wins — if the default ever flips to True, the CLI
     # won't silently override it back to False.
     for _key in ("local_tool_safety",):
-        if not chat_kwargs.get(_key):
-            del chat_kwargs[_key]
+        if not chat_kwargs.pop(_key, None):
+            pass  # key already absent; ChatConfig default wins
     if args.mcp_config:
         chat_kwargs["mcp_config_path"] = Path(args.mcp_config)
     if args.skills_dir:

@@ -589,7 +589,8 @@ class ChatSession:
         """Classify, confirm, and execute tool calls. Yields event dicts.
 
         Appends tool result messages to self.messages in original call order.
-        Raises the first tool execution exception after all events are yielded.
+        Tool errors are fed back to the model for recovery via tool_error
+        events and error messages appended to the conversation history.
         """
         # Classify tools by safety policy.
         # Local tools (skills, builtins) bypass the safety policy
@@ -852,12 +853,11 @@ class ChatSession:
                 )
 
         if deferred_exc is not None:
-            if isinstance(deferred_exc, (KeyboardInterrupt, SystemExit)):
+            if not isinstance(deferred_exc, Exception):
                 raise deferred_exc
-            # For other exceptions, the error events have already been
-            # yielded and error messages appended to self.messages.
-            # Let the caller (agent loop) handle recovery and track
-            # consecutive failures.
+            # Regular exceptions have already been yielded as tool_error
+            # events and appended to self.messages. Let the caller
+            # (agent loop) handle recovery and track consecutive failures.
 
     async def send_message(self, user_text: str) -> AsyncGenerator[ChatEvent, None]:
         """Send a user message and run the agent loop.
@@ -1050,10 +1050,19 @@ class ChatSession:
                         turn_had_success = True
             except asyncio.CancelledError:
                 raise
+            # Defence-in-depth: _execute_tool_calls no longer raises Exception
+            # (errors are fed back as tool_error events), but guard against
+            # future regressions.
             except Exception:
-                logger.warning("Unexpected error during tool execution", exc_info=True)
+                logger.warning(
+                    "Unexpected exception during tool execution", exc_info=True
+                )
                 turn_had_failure = True
 
+            # Any successful tool call in a turn resets the failure counter
+            # so that the agent loop continues as long as the model gets
+            # useful results. Mixed-result turns (parallel success + failure)
+            # also reset — the model has new information to work with.
             if turn_had_success:
                 consecutive_failures = 0
             elif turn_had_failure:
