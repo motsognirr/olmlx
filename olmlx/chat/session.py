@@ -1051,9 +1051,7 @@ class ChatSession:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.warning(
-                    "Unexpected error during tool execution", exc_info=True
-                )
+                logger.warning("Unexpected error during tool execution", exc_info=True)
                 turn_had_failure = True
 
             if turn_had_success:

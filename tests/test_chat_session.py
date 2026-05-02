@@ -1734,6 +1734,7 @@ class TestConsecutiveToolFailures:
         session.config.max_consecutive_tool_failures = 3
 
         call_count = 0
+
         async def fake_generate(*args, **kwargs):
             nonlocal call_count
             call_count += 1

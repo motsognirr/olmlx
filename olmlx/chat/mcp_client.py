@@ -75,7 +75,9 @@ class MCPClientManager:
             },
         }
 
-    async def connect_all(self, config: dict[str, Any], max_attempts: int | None = None) -> None:
+    async def connect_all(
+        self, config: dict[str, Any], max_attempts: int | None = None
+    ) -> None:
         """Connect to each configured MCP server and discover tools.
 
         Retries on connection failure with exponential backoff.
