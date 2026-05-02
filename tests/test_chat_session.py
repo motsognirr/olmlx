@@ -1703,16 +1703,17 @@ class TestConsecutiveToolFailures:
             async for event in session.send_message("Use the tool"):
                 events.append(event)
 
-        # Failures should be: fail1 (turn1), then success (turn2, resets),
-        # then fail2 (turn3), then fail from call4 (turn4),
-        # and continue failing -> should hit limit after 2 more failures
-        # So at least 4 turns should have run before the exceeded event
+        # Turn 1: fail → counter=1
+        # Turn 2: success → counter=0 (reset)
+        # Turn 3: fail → counter=1
+        # Turn 4: fail → counter=2 → exceeded
         exceeded = [e for e in events if e["type"] == "tool_failures_exceeded"]
         assert len(exceeded) == 1
+        assert exceeded[0]["consecutive_failures"] == 2
         result_events = [e for e in events if e["type"] == "tool_result"]
         assert len(result_events) == 1  # one success
         error_events = [e for e in events if e["type"] == "tool_error"]
-        assert len(error_events) >= 2  # at least the 2 failures in the final run
+        assert len(error_events) == 3  # fail1, fail2(turn3), fail2(turn4)
 
     @pytest.mark.asyncio
     async def test_deferred_exception_does_not_crash_session(self):

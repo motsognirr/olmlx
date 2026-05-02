@@ -853,6 +853,11 @@ class ChatSession:
                 )
 
         if deferred_exc is not None:
+            # Non-Exception BaseException (e.g. KeyboardInterrupt, SystemExit,
+            # GeneratorExit) captured by asyncio.gather in the parallel path —
+            # must be re-raised. Note: the tool error message was already
+            # appended to self.messages above; if the session is reused the
+            # history will contain a dangling tool error.
             if not isinstance(deferred_exc, Exception):
                 raise deferred_exc
             # Regular exceptions have already been yielded as tool_error
