@@ -858,6 +858,7 @@ class ChatSession:
             # Regular exceptions have already been yielded as tool_error
             # events and appended to self.messages. Let the caller
             # (agent loop) handle recovery and track consecutive failures.
+            return
 
     async def send_message(self, user_text: str) -> AsyncGenerator[ChatEvent, None]:
         """Send a user message and run the agent loop.
