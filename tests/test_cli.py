@@ -386,6 +386,36 @@ class TestBuildParser:
         assert "dormant/model:latest" in caplog.text
         assert "speculative_draft_model" in caplog.text
 
+    def test_audit_flags_global_flash_with_speculative(self, monkeypatch, tmp_path):
+        """Globally enabled Flash + speculative=True (per model, no per-model
+        flash override) must be caught as a flash-conflict — the previous
+        per-model-only check missed this case."""
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.config import experimental as _exp
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "global-flash/m:latest": {
+                        "hf_path": "global-flash/m",
+                        "speculative": True,
+                        "speculative_draft_model": "global-flash/draft",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(_exp, "flash", True)
+
+        bad, dormant, flash_conflicts = _audit_speculative_config()
+        assert bad == []
+        assert dormant == []
+        assert flash_conflicts == ["global-flash/m:latest"]
+
     def test_audit_speculative_config_classifies_models(self, monkeypatch, tmp_path):
         """End-to-end: registry walk classifies models into bad / dormant /
         flash-conflict buckets."""

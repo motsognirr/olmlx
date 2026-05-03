@@ -250,6 +250,8 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str]]:
     as "nothing to validate" so this never blocks startup on its own.
     """
     try:
+        from olmlx.config import experimental as global_exp
+        from olmlx.config import resolve_experimental
         from olmlx.engine.registry import ModelRegistry
 
         registry = ModelRegistry()
@@ -268,9 +270,19 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str]]:
         if enabled and not draft:
             bad.append(name)
         elif not enabled and mc.speculative_draft_model:
+            # Use the raw per-model field rather than the resolved
+            # ``draft``: the global dormant-draft case is already
+            # surfaced separately in ``_apply_serve_overrides``.
             dormant.append(name)
-        if enabled and isinstance(mc.experimental, dict):
-            if mc.experimental.get("flash") or mc.experimental.get("flash_moe"):
+        if enabled:
+            # Resolve the full experimental config (global defaults
+            # merged with per-model overrides) so a globally enabled
+            # OLMLX_EXPERIMENTAL_FLASH still trips the conflict check.
+            try:
+                resolved_exp = resolve_experimental(global_exp, mc.experimental)
+            except Exception:
+                continue
+            if resolved_exp.flash or resolved_exp.flash_moe:
                 flash_conflicts.append(name)
     return bad, dormant, flash_conflicts
 

@@ -195,6 +195,15 @@ class TestSpeculativeConfig:
         with pytest.raises(ValidationError):
             Settings(speculative_tokens=0, _env_file=None)
 
+    def test_model_config_speculative_tokens_validated_on_construct(self):
+        """Direct ModelConfig construction must enforce the >=1 invariant."""
+        from olmlx.engine.registry import ModelConfig
+
+        with pytest.raises(ValueError, match="speculative_tokens"):
+            ModelConfig(hf_path="x/y", speculative_tokens=0)
+        with pytest.raises(ValueError, match="speculative_tokens"):
+            ModelConfig(hf_path="x/y", speculative_tokens=-1)
+
     def test_speculative_tokens_assignment_validated(self, monkeypatch):
         """validate_assignment=True keeps Field(gt=0) honoured for programmatic writes."""
         monkeypatch.delenv("OLMLX_SPECULATIVE_TOKENS", raising=False)

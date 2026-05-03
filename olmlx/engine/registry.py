@@ -56,8 +56,9 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
 
 
 # Keys that were once experimental but have since been promoted out of the
-# ``experimental`` block. We surface a clear migration error if a user's
-# models.json still has them under ``experimental``.
+# ``experimental`` block. The dict is kept for forward compatibility (a
+# future promotion may rename the key); today every entry maps to itself
+# because the keys' names are unchanged — only their location moved.
 PROMOTED_EXPERIMENTAL_KEYS: dict[str, str] = {
     "speculative": "speculative",
     "speculative_draft_model": "speculative_draft_model",
@@ -76,13 +77,22 @@ def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
     """
     promoted = set(overrides) & PROMOTED_EXPERIMENTAL_KEYS.keys()
     if promoted:
-        moves = ", ".join(
-            f"{k!r} → top-level {PROMOTED_EXPERIMENTAL_KEYS[k]!r}"
-            for k in sorted(promoted)
-        )
+        renamed = sorted(k for k in promoted if k != PROMOTED_EXPERIMENTAL_KEYS[k])
+        unchanged = sorted(k for k in promoted if k == PROMOTED_EXPERIMENTAL_KEYS[k])
+        parts: list[str] = []
+        if unchanged:
+            parts.append(
+                "move " + ", ".join(repr(k) for k in unchanged) + " to the top level"
+            )
+        if renamed:
+            renames = ", ".join(
+                f"{k!r} → top-level {PROMOTED_EXPERIMENTAL_KEYS[k]!r}" for k in renamed
+            )
+            parts.append(f"rename {renames}")
         raise ValueError(
-            f"These keys have been promoted out of 'experimental' and must be "
-            f"set at the top level of the models.json entry: {moves}"
+            "These keys have been promoted out of 'experimental': "
+            + "; ".join(parts)
+            + ". Update the models.json entry accordingly."
         )
     unknown = set(overrides) - PER_MODEL_EXPERIMENTAL_KEYS
     if unknown:
@@ -211,6 +221,21 @@ class ModelConfig:
     speculative_tokens: int | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        # ``from_entry`` already validates JSON inputs, but direct
+        # construction (tests, programmatic callers) bypasses it. Keep
+        # this in lockstep with ``Settings.speculative_tokens``'s
+        # ``Field(gt=0)``.
+        if self.speculative_tokens is not None and (
+            isinstance(self.speculative_tokens, bool)
+            or not isinstance(self.speculative_tokens, int)
+            or self.speculative_tokens < 1
+        ):
+            raise ValueError(
+                f"'speculative_tokens' must be a positive integer or None, "
+                f"got {self.speculative_tokens!r}"
+            )
 
     def resolved_speculative(self) -> tuple[bool, str | None, int]:
         """Resolve speculative config: per-model overrides global settings."""
