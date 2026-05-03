@@ -230,7 +230,7 @@ class TestBuildParser:
         # Stub out registry-walking helpers so the test is hermetic.
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], False, True),
+            lambda: ([], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -266,7 +266,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], False, True),
+            lambda: ([], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -293,7 +293,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], False, True),
+            lambda: ([], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -308,6 +308,33 @@ class TestBuildParser:
         # The legacy value must NOT overwrite the (already-applied) new one.
         assert _settings.speculative_draft_model == "new/draft"
 
+    def test_legacy_does_not_clobber_dotenv_value(self, monkeypatch):
+        """If pydantic-settings already loaded the new value from a .env
+        file (so it never appears in ``os.environ``), the legacy shell var
+        must not overwrite it. The forwarder gates on the resolved
+        Settings value, not the raw env dict."""
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        # Simulate "pydantic-settings already populated the field from .env".
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", "dotenv/draft")
+        monkeypatch.setattr(_settings, "speculative_tokens", 4)
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda: ([], [], [], False),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+        monkeypatch.delenv("OLMLX_SPECULATIVE_DRAFT_MODEL", raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", "legacy/draft")
+
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        _apply_serve_overrides(args)
+        assert _settings.speculative_draft_model == "dotenv/draft"
+
     def test_apply_serve_overrides_warns_on_deprecated_env_vars(
         self, monkeypatch, caplog
     ):
@@ -319,7 +346,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], False, False)
+            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], False)
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -347,7 +374,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: (["bad/model:latest"], [], [], False, True),
+            lambda: (["bad/model:latest"], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -403,7 +430,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], False, False)
+            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], False)
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -446,7 +473,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], ["flash/model:latest"], False, True),
+            lambda: ([], [], ["flash/model:latest"], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -470,7 +497,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], ["dormant/model:latest"], [], False, False),
+            lambda: ([], ["dormant/model:latest"], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -549,6 +576,40 @@ class TestBuildParser:
             _apply_serve_overrides(args)
         assert "draft model will not be loaded" not in caplog.text
 
+    def test_global_dormant_warning_when_global_on_but_per_model_has_own_draft(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """Global ``speculative=True`` and global draft set, but every
+        per-model entry has its own draft override. The global draft is
+        unused — warning must fire."""
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "with-own/m:latest": {
+                        "hf_path": "with-own/m",
+                        "speculative": True,
+                        "speculative_draft_model": "with-own/draft",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", True)
+        monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
+
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        assert "global/draft" in caplog.text
+        assert "no model" in caplog.text
+
     def test_global_dormant_warning_when_all_per_model_override_disabled(
         self, monkeypatch, tmp_path, caplog
     ):
@@ -607,9 +668,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(_exp, "flash", True)
 
-        bad, dormant, flash_conflicts, _global_used, _any_enabled = (
-            _audit_speculative_config()
-        )
+        bad, dormant, flash_conflicts, _global_used = _audit_speculative_config()
         assert bad == []
         assert dormant == []
         assert flash_conflicts == ["global-flash/m:latest"]
@@ -650,16 +709,12 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
 
-        bad, dormant, flash_conflicts, global_used, any_enabled = (
-            _audit_speculative_config()
-        )
+        bad, dormant, flash_conflicts, global_used = _audit_speculative_config()
         assert bad == ["bad/no-draft:latest"]
         assert dormant == ["dormant/has-draft:latest"]
         assert flash_conflicts == ["conflict/flash-and-spec:latest"]
         # No model in this fixture uses the global draft (good/a has its own).
         assert global_used is False
-        # good/a, bad/no-draft, conflict/flash-and-spec all enable speculative.
-        assert any_enabled is True
 
     def test_service_install(self):
         parser = build_parser()

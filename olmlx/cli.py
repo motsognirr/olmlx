@@ -130,13 +130,24 @@ _LEGACY_SPECULATIVE_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], .
 def _forward_legacy_speculative_env(_settings) -> None:
     """Apply legacy env var values to the new Settings when the new env
     var is unset. Logs and swallows parse errors per-field so a single
-    bad legacy value never blocks startup."""
+    bad legacy value never blocks startup.
+
+    "Unset" is determined by comparing the live Settings value against
+    the field default — checking ``os.environ`` alone would miss values
+    pydantic-settings already loaded from a ``.env`` file and silently
+    let the legacy shell var clobber them.
+    """
+    from olmlx.config import Settings
+
     for legacy, new, attr, parse in _LEGACY_SPECULATIVE_FORWARD:
         legacy_val = os.environ.get(legacy)
         if legacy_val is None:
             continue
-        if os.environ.get(new) is not None:
-            # The new env var wins.
+        field_default = Settings.model_fields[attr].default
+        if getattr(_settings, attr) != field_default:
+            # The new value already came from somewhere — env, .env,
+            # CLI flag, or programmatic write. Don't override it with
+            # the legacy value.
             continue
         try:
             value = parse(legacy_val)
@@ -208,7 +219,7 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(2)
 
-    bad, dormant_drafts, flash_conflicts, global_draft_used, any_enabled = (
+    bad, dormant_drafts, flash_conflicts, global_draft_used = (
         _audit_speculative_config()
     )
     if dormant_drafts:
@@ -219,22 +230,14 @@ def _apply_serve_overrides(args) -> None:
             "Set speculative=true (per-model or globally) to enable.",
             ", ".join(dormant_drafts),
         )
-    # Global parallel of the per-model dormant-draft warning: warn
-    # whenever the global draft is set but no model actually consumes
-    # it. Two distinct cases:
-    #   (a) global ``speculative`` is False and no per-model entry
-    #       enables speculative — nobody loads anything.
-    #   (b) global ``speculative`` is True but every per-model entry
-    #       overrides ``speculative=false`` — the per-model overrides
-    #       win, so the global draft is dormant.
-    # Per-model entries with their own draft do not count — they
-    # neither use nor need the global. The message wording is narrow
-    # on purpose: it claims only that the global draft is unused.
-    if (
-        _settings.speculative_draft_model
-        and not global_draft_used
-        and (not _settings.speculative or not any_enabled)
-    ):
+    # Warn whenever the global draft is set but no model actually
+    # consumes it. ``global_draft_used`` already encodes "any model
+    # resolves to the global draft", so it's the only signal we need —
+    # global ``speculative=True`` paired with per-model drafts on
+    # every entry is just as dormant as ``speculative=False``. The
+    # message wording is narrow on purpose: it claims only that the
+    # global draft is unused.
+    if _settings.speculative_draft_model and not global_draft_used:
         logger.warning(
             "OLMLX_SPECULATIVE_DRAFT_MODEL is set to %r but no model "
             "consumes it: nothing inherits the global draft. The "
@@ -308,12 +311,11 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
     return bad
 
 
-def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool, bool]:
+def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
     """Walk the registry and audit each model's resolved speculative
     config.
 
-    Returns ``(bad, dormant_drafts, flash_conflicts, global_draft_used,
-    any_enabled)``:
+    Returns ``(bad, dormant_drafts, flash_conflicts, global_draft_used)``:
     - ``bad`` — models with ``speculative=True`` but no draft model
       anywhere. Triggers a startup error.
     - ``dormant_drafts`` — models with a per-model ``speculative_draft_model``
@@ -328,9 +330,6 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool, 
       the global ``speculative_draft_model`` (i.e. has ``speculative=True``
       and no per-model draft override). Used to suppress the global
       dormant-draft warning when the global draft actually has consumers.
-    - ``any_enabled`` — True if any model resolves to ``enabled=True``.
-      Used to surface a "global is dormant" warning when global
-      speculative is on but every per-model entry overrides it off.
 
     The registry is loaded from disk; failures are logged and treated
     as "nothing to validate" so this never blocks startup on its own.
@@ -350,22 +349,19 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool, 
             "Skipping speculative config validation: invalid models.json entry: %s",
             exc,
         )
-        return [], [], [], False, False
+        return [], [], [], False
     except Exception as exc:
         logger.warning(
             "Skipping speculative config validation: could not load registry: %s",
             exc,
         )
-        return [], [], [], False, False
+        return [], [], [], False
     bad: list[str] = []
     dormant: list[str] = []
     flash_conflicts: list[str] = []
     global_draft_used = False
-    any_enabled = False
     for name, mc in registry.list_models().items():
         enabled, draft, _ = mc.resolved_speculative()
-        if enabled:
-            any_enabled = True
         if enabled and not draft:
             bad.append(name)
         elif not enabled and mc.speculative_draft_model:
@@ -393,7 +389,7 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool, 
                 continue
             if resolved_exp.flash or resolved_exp.flash_moe:
                 flash_conflicts.append(name)
-    return bad, dormant, flash_conflicts, global_draft_used, any_enabled
+    return bad, dormant, flash_conflicts, global_draft_used
 
 
 # Module-level state set by cmd_serve() for the app lifespan to retrieve.
