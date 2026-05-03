@@ -2331,6 +2331,44 @@ class TestSpeculativeLoading:
                 "test/target-model", model_exp=model_exp, spec_config=spec_config
             )
 
+    def test_flash_path_warns_when_standalone_speculative_set(
+        self, monkeypatch, caplog
+    ):
+        """A Flash model combined with the standalone speculative flag must
+        log a warning so the user notices the redirect to flash_speculative."""
+        import logging
+
+        from olmlx.config import ExperimentalSettings
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-flash")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: True)
+        monkeypatch.setattr(
+            manager, "_flash_dir", lambda hf_path: Path("/tmp/test-flash/flash")
+        )
+        sentinel = (object(), object(), False, TemplateCaps(), object())
+        monkeypatch.setattr(
+            manager,
+            "_load_flash_model",
+            lambda hf_path, load_path, flash_dir, *, model_exp: sentinel,
+        )
+
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = (True, "test/draft", 4)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            result = manager._load_model(
+                "test/flash-model", model_exp=model_exp, spec_config=spec_config
+            )
+        # Flash path returns its own tuple unchanged.
+        assert result is sentinel
+        assert "OLMLX_SPECULATIVE" in caplog.text
+        assert "Flash" in caplog.text
+
 
 class TestDFlashLoading:
     """Tests for dflash decoder loading in _load_model."""

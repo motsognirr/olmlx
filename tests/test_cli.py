@@ -226,7 +226,7 @@ class TestBuildParser:
 
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
-        monkeypatch.setattr("olmlx.cli._audit_speculative_config", lambda: ([], []))
+        monkeypatch.setattr("olmlx.cli._audit_speculative_config", lambda: ([], [], []))
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
         )
@@ -253,7 +253,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: (["bad/model:latest"], []),
+            lambda: (["bad/model:latest"], [], []),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -308,7 +308,7 @@ class TestBuildParser:
 
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
-        monkeypatch.setattr("olmlx.cli._audit_speculative_config", lambda: ([], []))
+        monkeypatch.setattr("olmlx.cli._audit_speculative_config", lambda: ([], [], []))
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
         )
@@ -337,6 +337,31 @@ class TestBuildParser:
         assert result == []
         assert "models.json is invalid JSON" in caplog.text
 
+    def test_apply_serve_overrides_warns_on_flash_conflict(self, monkeypatch, caplog):
+        """A model that combines speculative with Flash gets a warning so the
+        user knows the standalone speculative knob is dropped on the Flash
+        load path."""
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda: ([], [], ["flash/model:latest"]),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        assert "flash/model:latest" in caplog.text
+        assert "flash_speculative" in caplog.text
+
     def test_apply_serve_overrides_warns_on_dormant_draft(self, monkeypatch, caplog):
         """A draft configured for a model with speculative=False emits a
         warning so the user notices the dormant config."""
@@ -349,7 +374,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], ["dormant/model:latest"]),
+            lambda: ([], ["dormant/model:latest"], []),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -362,7 +387,8 @@ class TestBuildParser:
         assert "speculative_draft_model" in caplog.text
 
     def test_audit_speculative_config_classifies_models(self, monkeypatch, tmp_path):
-        """End-to-end: registry walk classifies models into bad/dormant."""
+        """End-to-end: registry walk classifies models into bad / dormant /
+        flash-conflict buckets."""
         from olmlx.cli import _audit_speculative_config
         from olmlx.config import settings as _settings
 
@@ -383,6 +409,12 @@ class TestBuildParser:
                         "hf_path": "dormant/has-draft",
                         "speculative_draft_model": "dormant/draft",
                     },
+                    "conflict/flash-and-spec:latest": {
+                        "hf_path": "conflict/flash-and-spec",
+                        "speculative": True,
+                        "speculative_draft_model": "conflict/draft",
+                        "experimental": {"flash": True},
+                    },
                 }
             )
         )
@@ -390,9 +422,10 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
 
-        bad, dormant = _audit_speculative_config()
+        bad, dormant, flash_conflicts = _audit_speculative_config()
         assert bad == ["bad/no-draft:latest"]
         assert dormant == ["dormant/has-draft:latest"]
+        assert flash_conflicts == ["conflict/flash-and-spec:latest"]
 
     def test_service_install(self):
         parser = build_parser()

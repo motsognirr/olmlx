@@ -163,7 +163,7 @@ def _apply_serve_overrides(args) -> None:
             _settings.speculative_draft_model,
         )
 
-    bad, dormant_drafts = _audit_speculative_config()
+    bad, dormant_drafts, flash_conflicts = _audit_speculative_config()
     if dormant_drafts:
         logger.warning(
             "speculative_draft_model is configured for the following "
@@ -171,6 +171,14 @@ def _apply_serve_overrides(args) -> None:
             "(speculative=false), so the draft model will be ignored: %s. "
             "Set speculative=true (per-model or globally) to enable.",
             ", ".join(dormant_drafts),
+        )
+    if flash_conflicts:
+        logger.warning(
+            "The following models combine speculative=true with Flash or "
+            "Flash-MoE: %s. Standalone speculative decoding is dropped on "
+            "the Flash load path; use the model's flash_speculative "
+            "settings (OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_*) instead.",
+            ", ".join(flash_conflicts),
         )
     if bad:
         print(
@@ -222,16 +230,21 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
     return bad
 
 
-def _audit_speculative_config() -> tuple[list[str], list[str]]:
+def _audit_speculative_config() -> tuple[list[str], list[str], list[str]]:
     """Walk the registry and audit each model's resolved speculative
     config.
 
-    Returns ``(bad, dormant_drafts)``:
+    Returns ``(bad, dormant_drafts, flash_conflicts)``:
     - ``bad`` — models with ``speculative=True`` but no draft model
       anywhere. Triggers a startup error.
     - ``dormant_drafts`` — models with a per-model ``speculative_draft_model``
       set but the resolved ``enabled`` flag is False. Triggers a
       warning so users don't silently lose the draft they configured.
+    - ``flash_conflicts`` — models that combine ``speculative=True``
+      with Flash or Flash-MoE in the same entry. Standalone speculative
+      decoding is silently dropped on the Flash load path; the model's
+      own ``flash_speculative`` knob is the right one. Triggers a
+      warning so users see the redirect.
 
     The registry is loaded from disk; failures are logged and treated
     as "nothing to validate" so this never blocks startup on its own.
@@ -246,16 +259,20 @@ def _audit_speculative_config() -> tuple[list[str], list[str]]:
             "Skipping speculative config validation: could not load registry: %s",
             exc,
         )
-        return [], []
+        return [], [], []
     bad: list[str] = []
     dormant: list[str] = []
+    flash_conflicts: list[str] = []
     for name, mc in registry.list_models().items():
         enabled, draft, _ = mc.resolved_speculative()
         if enabled and not draft:
             bad.append(name)
         elif not enabled and mc.speculative_draft_model:
             dormant.append(name)
-    return bad, dormant
+        if enabled and isinstance(mc.experimental, dict):
+            if mc.experimental.get("flash") or mc.experimental.get("flash_moe"):
+                flash_conflicts.append(name)
+    return bad, dormant, flash_conflicts
 
 
 # Module-level state set by cmd_serve() for the app lifespan to retrieve.

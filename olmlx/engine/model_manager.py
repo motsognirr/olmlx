@@ -1741,6 +1741,13 @@ class ModelManager:
         if self._is_flash_moe_enabled(model_exp):
             flash_moe_dir = self._flash_moe_dir(hf_path)
             if flash_moe_dir is not None:
+                if spec_enabled:
+                    logger.warning(
+                        "OLMLX_SPECULATIVE is enabled but %s is loaded via "
+                        "Flash-MoE, which does not support standalone "
+                        "speculative decoding; the setting will be ignored.",
+                        hf_path,
+                    )
                 return (
                     *self._load_flash_moe_model(
                         hf_path, load_path, flash_moe_dir, model_exp=model_exp
@@ -1752,6 +1759,14 @@ class ModelManager:
         if self._is_flash_enabled(model_exp):
             flash_dir = self._flash_dir(hf_path)
             if flash_dir is not None:
+                if spec_enabled:
+                    logger.warning(
+                        "OLMLX_SPECULATIVE is enabled but %s is loaded via "
+                        "Flash, which uses OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE "
+                        "for speculative decoding; the OLMLX_SPECULATIVE "
+                        "setting will be ignored.",
+                        hf_path,
+                    )
                 return self._load_flash_model(
                     hf_path, load_path, flash_dir, model_exp=model_exp
                 )
