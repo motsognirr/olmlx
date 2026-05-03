@@ -468,7 +468,9 @@ def _derive_timing_stats(
         # forcing one to 0 would create divide-by-zero on the client.
         raw_total = raw_prompt_ns + raw_decode_ns
         if raw_total > eval_timer_ns:
-            stats.prompt_eval_duration = int(eval_timer_ns * raw_prompt_ns / raw_total)
+            # Use integer floor-division to keep the math exact — int(a*b/c)
+            # would coerce through float and lose precision for large values.
+            stats.prompt_eval_duration = eval_timer_ns * raw_prompt_ns // raw_total
             stats.eval_duration = eval_timer_ns - stats.prompt_eval_duration
         else:
             stats.prompt_eval_duration = raw_prompt_ns

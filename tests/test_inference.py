@@ -87,6 +87,17 @@ class TestDeriveTimingStats:
             "proportional split must exactly fill wall-clock"
         )
 
+    def test_decode_rate_noise_clamped_not_double_counted(self):
+        """Symmetric to the prompt-rate noise test: when only gen_tps is
+        reported and rate-derived decode exceeds wall-clock, fall back to
+        50/50 instead of zeroing prompt_eval_duration with prompt_eval_count > 0."""
+        stats = TimingStats(prompt_eval_count=10, eval_count=100)
+        # decode = 100 / 1000 = 100 ms but wall-clock = 90 ms (noise).
+        _derive_timing_stats(stats, 0.0, 1000.0, eval_timer_ns=90_000_000)
+        assert stats.prompt_eval_duration == 45_000_000
+        assert stats.eval_duration == 45_000_000
+        assert stats.prompt_eval_duration + stats.eval_duration == 90_000_000
+
     def test_back_compute_prefill_when_only_gen_tps_known(self):
         """When only gen_tps is reported, prompt_eval_duration is recovered
         from wall-clock minus the (now known) decode duration."""
