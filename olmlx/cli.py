@@ -101,6 +101,54 @@ _DEPRECATED_SPECULATIVE_ENV_VARS = (
     "OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS",
 )
 
+# Legacy → new env var mapping with parsers. Only applied when the
+# matching new env var is unset, so users with the old names in their
+# shell profile keep working through the deprecation window.
+_LEGACY_SPECULATIVE_FORWARD: tuple[tuple[str, str, str, callable], ...] = (
+    (
+        "OLMLX_EXPERIMENTAL_SPECULATIVE",
+        "OLMLX_SPECULATIVE",
+        "speculative",
+        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL",
+        "OLMLX_SPECULATIVE_DRAFT_MODEL",
+        "speculative_draft_model",
+        str,
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS",
+        "OLMLX_SPECULATIVE_TOKENS",
+        "speculative_tokens",
+        int,
+    ),
+)
+
+
+def _forward_legacy_speculative_env(_settings) -> None:
+    """Apply legacy env var values to the new Settings when the new env
+    var is unset. Logs and swallows parse errors per-field so a single
+    bad legacy value never blocks startup."""
+    for legacy, new, attr, parse in _LEGACY_SPECULATIVE_FORWARD:
+        legacy_val = os.environ.get(legacy)
+        if legacy_val is None:
+            continue
+        if os.environ.get(new) is not None:
+            # The new env var wins.
+            continue
+        try:
+            value = parse(legacy_val)
+            setattr(_settings, attr, value)
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "Could not forward legacy env var %s=%r to %s: %s",
+                legacy,
+                legacy_val,
+                new,
+                exc,
+            )
+
 
 def _apply_serve_overrides(args) -> None:
     """Apply CLI flags to the global Settings before the server starts.
@@ -118,11 +166,15 @@ def _apply_serve_overrides(args) -> None:
     stale = [v for v in _DEPRECATED_SPECULATIVE_ENV_VARS if os.environ.get(v)]
     if stale:
         logger.warning(
-            "Deprecated env vars detected (no longer read): %s. Rename to "
-            "OLMLX_SPECULATIVE, OLMLX_SPECULATIVE_DRAFT_MODEL, "
-            "OLMLX_SPECULATIVE_TOKENS.",
+            "Deprecated env vars detected: %s. They will be honoured for "
+            "this release but should be renamed to OLMLX_SPECULATIVE, "
+            "OLMLX_SPECULATIVE_DRAFT_MODEL, OLMLX_SPECULATIVE_TOKENS.",
             ", ".join(stale),
         )
+        # Forward legacy values to the new Settings only when the new env
+        # var is unset, so user-facing behaviour doesn't silently change
+        # on upgrade. Drop this once the deprecation window closes.
+        _forward_legacy_speculative_env(_settings)
 
     if args.speculative is not None:
         _settings.speculative = args.speculative
@@ -150,7 +202,7 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(2)
 
-    bad, dormant_drafts, flash_conflicts, global_draft_used = (
+    bad, dormant_drafts, flash_conflicts, global_draft_used, any_enabled = (
         _audit_speculative_config()
     )
     if dormant_drafts:
@@ -161,26 +213,27 @@ def _apply_serve_overrides(args) -> None:
             "Set speculative=true (per-model or globally) to enable.",
             ", ".join(dormant_drafts),
         )
-    # Global parallel of the per-model dormant-draft warning: warn when
-    # a global draft is set but no model actually consumes it. The
-    # ``global_draft_used`` flag is True when at least one per-model
-    # entry has ``speculative=true`` and falls back to the global
-    # draft. Per-model entries with their own draft do not count —
-    # they neither use nor need the global. The message wording is
-    # narrow on purpose: it claims only that the global draft is
-    # unused, not that speculative is disabled everywhere.
+    # Global parallel of the per-model dormant-draft warning: warn
+    # whenever the global draft is set but no model actually consumes
+    # it. Two distinct cases:
+    #   (a) global ``speculative`` is False and no per-model entry
+    #       enables speculative — nobody loads anything.
+    #   (b) global ``speculative`` is True but every per-model entry
+    #       overrides ``speculative=false`` — the per-model overrides
+    #       win, so the global draft is dormant.
+    # Per-model entries with their own draft do not count — they
+    # neither use nor need the global. The message wording is narrow
+    # on purpose: it claims only that the global draft is unused.
     if (
-        not _settings.speculative
-        and _settings.speculative_draft_model
+        _settings.speculative_draft_model
         and not global_draft_used
+        and (not _settings.speculative or not any_enabled)
     ):
         logger.warning(
             "OLMLX_SPECULATIVE_DRAFT_MODEL is set to %r but no model "
-            "consumes it: OLMLX_SPECULATIVE is false and no per-model "
-            "entry inherits the global draft. The setting has no effect "
-            "until a model with ``speculative=true`` (and no per-model "
-            "draft override) is configured, or OLMLX_SPECULATIVE is "
-            "enabled.",
+            "consumes it: nothing inherits the global draft. The "
+            "setting has no effect until a model with ``speculative=true`` "
+            "(and no per-model draft override) is configured.",
             _settings.speculative_draft_model,
         )
     if flash_conflicts:
@@ -249,11 +302,12 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
     return bad
 
 
-def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
+def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool, bool]:
     """Walk the registry and audit each model's resolved speculative
     config.
 
-    Returns ``(bad, dormant_drafts, flash_conflicts, global_draft_used)``:
+    Returns ``(bad, dormant_drafts, flash_conflicts, global_draft_used,
+    any_enabled)``:
     - ``bad`` — models with ``speculative=True`` but no draft model
       anywhere. Triggers a startup error.
     - ``dormant_drafts`` — models with a per-model ``speculative_draft_model``
@@ -268,6 +322,9 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
       the global ``speculative_draft_model`` (i.e. has ``speculative=True``
       and no per-model draft override). Used to suppress the global
       dormant-draft warning when the global draft actually has consumers.
+    - ``any_enabled`` — True if any model resolves to ``enabled=True``.
+      Used to surface a "global is dormant" warning when global
+      speculative is on but every per-model entry overrides it off.
 
     The registry is loaded from disk; failures are logged and treated
     as "nothing to validate" so this never blocks startup on its own.
@@ -287,19 +344,22 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
             "Skipping speculative config validation: invalid models.json entry: %s",
             exc,
         )
-        return [], [], [], False
+        return [], [], [], False, False
     except Exception as exc:
         logger.warning(
             "Skipping speculative config validation: could not load registry: %s",
             exc,
         )
-        return [], [], [], False
+        return [], [], [], False, False
     bad: list[str] = []
     dormant: list[str] = []
     flash_conflicts: list[str] = []
     global_draft_used = False
+    any_enabled = False
     for name, mc in registry.list_models().items():
         enabled, draft, _ = mc.resolved_speculative()
+        if enabled:
+            any_enabled = True
         if enabled and not draft:
             bad.append(name)
         elif not enabled and mc.speculative_draft_model:
@@ -317,11 +377,17 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
             # OLMLX_EXPERIMENTAL_FLASH still trips the conflict check.
             try:
                 resolved_exp = resolve_experimental(global_exp, mc.experimental)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "Skipping flash-conflict check for %s: could not "
+                    "resolve experimental overrides: %s",
+                    name,
+                    exc,
+                )
                 continue
             if resolved_exp.flash or resolved_exp.flash_moe:
                 flash_conflicts.append(name)
-    return bad, dormant, flash_conflicts, global_draft_used
+    return bad, dormant, flash_conflicts, global_draft_used, any_enabled
 
 
 # Module-level state set by cmd_serve() for the app lifespan to retrieve.

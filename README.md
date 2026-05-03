@@ -425,7 +425,7 @@ Real-world speedup typically lands between **1.4x and 2x** on Apple Silicon for 
 
 ### Migration from `OLMLX_EXPERIMENTAL_SPECULATIVE_*`
 
-The settings have been promoted out of `experimental`. The new env vars are `OLMLX_SPECULATIVE`, `OLMLX_SPECULATIVE_DRAFT_MODEL`, and `OLMLX_SPECULATIVE_TOKENS` (the legacy `OLMLX_EXPERIMENTAL_SPECULATIVE*` names log a deprecation warning at startup and are no longer read). Per-model `models.json` entries that previously placed these keys under `"experimental": {...}` now go at the top level — loading an old config raises a clear migration error pointing at the new location.
+The settings have been promoted out of `experimental`. The new env vars are `OLMLX_SPECULATIVE`, `OLMLX_SPECULATIVE_DRAFT_MODEL`, and `OLMLX_SPECULATIVE_TOKENS`. The legacy `OLMLX_EXPERIMENTAL_SPECULATIVE*` names are still honoured for one release: their values are forwarded to the new settings (the new names win when both are set) and a deprecation warning is logged at startup. Per-model `models.json` entries that previously placed these keys under `"experimental": {...}` now go at the top level — loading an old config raises a clear migration error pointing at the new location.
 
 ## LLM in a Flash (Experimental)
 
