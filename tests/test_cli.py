@@ -188,24 +188,33 @@ class TestBuildParser:
         args = parser.parse_args(["serve", "--no-speculative"])
         assert args.speculative is False
 
-    def test_apply_serve_overrides_rejects_speculative_without_draft(self, monkeypatch):
-        """Serve fails fast when --speculative is set without a draft model."""
+    def test_apply_serve_overrides_accepts_global_no_draft_when_per_model_supplies(
+        self, monkeypatch, tmp_path
+    ):
+        """Global speculative=True with no global draft must NOT exit when
+        every registered model supplies its own ``speculative_draft_model``."""
         from olmlx.cli import _apply_serve_overrides
         from olmlx.config import settings as _settings
 
-        # Snapshot and restore so the failed-validation write to
-        # ``settings.speculative`` doesn't leak into other tests.
-        monkeypatch.setattr(_settings, "speculative", False)
-        monkeypatch.setattr(_settings, "speculative_draft_model", None)
-        # Avoid registry-walk noise from a real ~/.olmlx/models.json.
-        monkeypatch.setattr(
-            "olmlx.cli._models_with_invalid_speculative_config", lambda: []
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "good/model:latest": {
+                        "hf_path": "good/model",
+                        "speculative": True,
+                        "speculative_draft_model": "good/draft",
+                    },
+                }
+            )
         )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", True)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
         parser = build_parser()
-        args = parser.parse_args(["serve", "--speculative"])
-        with pytest.raises(SystemExit) as excinfo:
-            _apply_serve_overrides(args)
-        assert excinfo.value.code == 2
+        args = parser.parse_args(["serve"])
+        # Should not raise SystemExit.
+        _apply_serve_overrides(args)
 
     def test_apply_serve_overrides_rejects_per_model_misconfig(self, monkeypatch):
         """Serve fails fast when a models.json entry enables speculative but
