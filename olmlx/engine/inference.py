@@ -436,6 +436,12 @@ def _derive_timing_stats(
     mlx-lm reports both rates in practice, so this path is essentially
     unreached.
     """
+    # Explicit zero of the fields this helper owns — several branches below
+    # write only one of the two, so initialize both up front to make the
+    # mutation contract independent of the caller's TimingStats state.
+    stats.prompt_eval_duration = 0
+    stats.eval_duration = 0
+
     # Defensive coercion: ``isinstance(x, (int, float))`` is the explicit
     # contract for what mlx-lm returns (Python floats). It rejects
     # MagicMock (whose ``__float__`` returns 1.0 and would otherwise
