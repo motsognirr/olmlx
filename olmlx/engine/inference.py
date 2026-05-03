@@ -7,7 +7,6 @@ import importlib
 import itertools
 import json
 import logging
-import numbers
 import threading
 import time
 import weakref
@@ -431,18 +430,26 @@ def _derive_timing_stats(
 
     Edge case worth knowing: when both counts are nonzero but neither rate
     is reported, the helper has no way to apportion wall-clock between
-    prefill and decode. It assigns the full timer to decode (since decode
-    is the field most consumers look at) and leaves prefill at 0. The sum
-    invariant still holds; the split is just underdetermined. mlx-lm
-    reports both rates in practice, so this path is essentially unreached.
+    prefill and decode. It splits ``eval_timer_ns`` 50/50 so neither phase
+    ends up at 0 (which would cause divide-by-zero on clients computing
+    tok/s). The sum invariant still holds; the split is just heuristic.
+    mlx-lm reports both rates in practice, so this path is essentially
+    unreached.
     """
-    # Defensive coercion: ``numbers.Real`` matches Python int/float and all
-    # numpy scalar types via ABC registration, but excludes MagicMock (which
-    # has a ``__float__`` returning 1.0 and would otherwise silently produce
-    # bogus durations in tests). mlx-lm returns Python floats for these
-    # fields in practice; mx.array scalars would be treated as missing.
-    prompt_tps = float(prompt_tps) if isinstance(prompt_tps, numbers.Real) else 0.0
-    gen_tps = float(gen_tps) if isinstance(gen_tps, numbers.Real) else 0.0
+    # Defensive coercion: ``isinstance(x, (int, float))`` is the explicit
+    # contract for what mlx-lm returns (Python floats). It rejects
+    # MagicMock (whose ``__float__`` returns 1.0 and would otherwise
+    # silently produce bogus durations in tests), and any future
+    # non-Python-numeric type from upstream — at which point we'd want to
+    # see real zeros and notice rather than silently coerce.
+    if not isinstance(prompt_tps, (int, float)):
+        prompt_tps = 0.0
+    else:
+        prompt_tps = float(prompt_tps)
+    if not isinstance(gen_tps, (int, float)):
+        gen_tps = 0.0
+    else:
+        gen_tps = float(gen_tps)
 
     raw_prompt_ns = (
         int(stats.prompt_eval_count / prompt_tps * 1e9)

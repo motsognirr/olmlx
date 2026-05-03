@@ -131,6 +131,14 @@ class TestDeriveTimingStats:
         assert stats.prompt_eval_duration == 0
         assert stats.eval_duration == 200_000_000
 
+    def test_no_rates_no_counts_stays_zero(self):
+        """No tokens of either kind: both durations stay 0 regardless of
+        wall-clock. The whole helper is a no-op for this case."""
+        stats = TimingStats(prompt_eval_count=0, eval_count=0)
+        _derive_timing_stats(stats, 0.0, 0.0, eval_timer_ns=200_000_000)
+        assert stats.prompt_eval_duration == 0
+        assert stats.eval_duration == 0
+
 
 class TestBuildGenerateKwargs:
     def test_empty_options(self):
