@@ -176,8 +176,12 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
 
     Such entries are dropped by ``ModelRegistry.load()`` with a buried
     log warning; surfacing them as a hard startup error makes the
-    migration actionable instead of mysterious.
+    migration actionable instead of mysterious. The set of promoted
+    keys is taken directly from ``registry.PROMOTED_EXPERIMENTAL_KEYS``
+    so the next promotion wires through automatically.
     """
+    from olmlx.engine.registry import PROMOTED_EXPERIMENTAL_KEYS
+
     try:
         with open(settings.models_config) as f:
             raw = json.load(f)
@@ -185,7 +189,7 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
         return []
     if not isinstance(raw, dict):
         return []
-    promoted_keys = {"speculative", "speculative_draft_model", "speculative_tokens"}
+    promoted_keys = set(PROMOTED_EXPERIMENTAL_KEYS.keys())
     bad: list[str] = []
     for name, entry in raw.items():
         if not isinstance(entry, dict):
@@ -1883,15 +1887,20 @@ def cli_main():
     args = parser.parse_args()
 
     if args.command is None or args.command == "serve":
-        # Re-parse with the serve subparser when invoked bare so the
-        # serve flags (--speculative, etc.) are always present on args.
-        # ``args.command is None`` is only reachable today when
-        # ``sys.argv[1:]`` is empty (the root parser has no global
-        # flags), so an empty arg list is correct. If a global flag is
-        # ever added to ``build_parser``, this re-parse must change to
-        # forward those flags into the serve subparser.
+        # Bare invocation: initialise the serve subparser's flag
+        # attributes directly on ``args`` so ``cmd_serve`` can read them
+        # uniformly. Doing this in-place (instead of re-parsing) means
+        # any future top-level flags survive verbatim and a missing
+        # attribute trips an AttributeError instead of being silently
+        # dropped on bare invocation.
         if args.command is None:
-            args = parser.parse_args(["serve"])
+            for _name, _default in (
+                ("speculative", None),
+                ("speculative_draft_model", None),
+                ("speculative_tokens", None),
+            ):
+                if not hasattr(args, _name):
+                    setattr(args, _name, _default)
         cmd_serve(args)
     elif args.command == "service":
         if args.service_command == "install":

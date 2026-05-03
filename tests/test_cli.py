@@ -227,6 +227,9 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr("olmlx.cli._audit_speculative_config", lambda: ([], []))
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE", "true")
         monkeypatch.setenv(
             "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", "Qwen/Qwen3-0.6B"
@@ -251,6 +254,9 @@ class TestBuildParser:
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
             lambda: (["bad/model:latest"], []),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
         )
         parser = build_parser()
         args = parser.parse_args(["serve"])
@@ -303,6 +309,9 @@ class TestBuildParser:
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
             lambda: ([], ["dormant/model:latest"]),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
         )
         parser = build_parser()
         args = parser.parse_args(["serve"])

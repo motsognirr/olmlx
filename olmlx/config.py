@@ -11,7 +11,14 @@ SyncMode = Literal["full", "minimal", "none"]
 
 
 class Settings(BaseSettings):
-    model_config = {"env_prefix": "OLMLX_", "env_file": ".env", "extra": "ignore"}
+    model_config = {
+        "env_prefix": "OLMLX_",
+        "env_file": ".env",
+        "extra": "ignore",
+        # Validate field constraints on assignment so programmatic writes
+        # (e.g. CLI overrides, tests) cannot bypass ``Field(gt=0)`` etc.
+        "validate_assignment": True,
+    }
 
     host: str = "0.0.0.0"
     port: Annotated[int, Field(ge=1, le=65535)] = 11434

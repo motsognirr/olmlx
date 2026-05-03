@@ -195,6 +195,15 @@ class TestSpeculativeConfig:
         with pytest.raises(ValidationError):
             Settings(speculative_tokens=0, _env_file=None)
 
+    def test_speculative_tokens_assignment_validated(self, monkeypatch):
+        """validate_assignment=True keeps Field(gt=0) honoured for programmatic writes."""
+        monkeypatch.delenv("OLMLX_SPECULATIVE_TOKENS", raising=False)
+        s = Settings(_env_file=None)
+        with pytest.raises(ValidationError):
+            s.speculative_tokens = 0
+        with pytest.raises(ValidationError):
+            s.speculative_tokens = -3
+
     def test_speculative_no_longer_in_experimental(self):
         """Promoted fields must not exist on ExperimentalSettings anymore."""
         e = ExperimentalSettings()
