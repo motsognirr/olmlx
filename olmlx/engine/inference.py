@@ -2007,11 +2007,22 @@ async def _store_prompt_cache_after_generation(
             # so the cache survives for strict-extension reuse on the
             # next turn; the pre-generation path will discard it if
             # alignment requires a trim.
-            logger.debug(
-                "Skipping trim on non-trimmable hybrid cache "
-                "(would-be trim=%d), storing at %d tokens",
+            #
+            # When None-ID tokens were produced during generation
+            # (eval_count != len(generated_tokens)), the KV cache
+            # offset does not match the full stored_tokens sequence.
+            # In that case store only full_prompt_tokens as metadata
+            # — the generated portion is unreliable and will cause
+            # offset misalignment on the next turn if cached.
+            if eval_count != len(generated_tokens):
+                stored_tokens = list(full_prompt_tokens)
+            logger.warning(
+                "Storing non-trimmable cache at %d tokens "
+                "(would-be trim=%d, exceeds limit of %d); "
+                "max_cache_tokens is advisory for hybrid sliding-window models",
+                len(stored_tokens),
                 actual_total - max_cache_tokens,
-                actual_total,
+                max_cache_tokens,
             )
             evicted = await lm.prompt_cache_store.async_set(
                 cache_id,

@@ -3724,8 +3724,50 @@ class TestStorePromptCacheAfterGeneration:
         mock_lm.prompt_cache_store.remove.assert_called_with("test")
         mock_lm.prompt_cache_store.async_set.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_non_trimmable_stores_without_trim(self, mock_lm):
+        """When supports_cache_trim=False and total > max, store as-is."""
+        from olmlx.engine.inference import _store_prompt_cache_after_generation
 
-class TestInferenceTimeout:
+        mock_lm.supports_cache_trim = False
+        cache = MagicMock()
+        gen_kwargs = {"prompt_cache": cache}
+        with patch("olmlx.engine.inference.settings") as mock_settings:
+            mock_settings.prompt_cache_max_tokens = 4
+            mock_settings.memory_limit_fraction = 0.9
+            await _store_prompt_cache_after_generation(
+                mock_lm, gen_kwargs, [1, 2, 3], [4, 5], 2, "test"
+            )
+
+        # Cache stored as-is (3 prompt + 2 gen = 5, exceeding limit of 4)
+        mock_lm.prompt_cache_store.async_set.assert_awaited_once()
+        call_args = mock_lm.prompt_cache_store.async_set.call_args
+        assert call_args[0][0] == "test"
+        stored = call_args[0][1]
+        assert stored.tokens == [1, 2, 3, 4, 5]
+
+    @pytest.mark.asyncio
+    async def test_non_trimmable_misaligned_eval_count(self, mock_lm):
+        """When supports_cache_trim=False and eval_count != len(generated_tokens),
+        store only full_prompt_tokens to avoid KV offset misalignment."""
+        from olmlx.engine.inference import _store_prompt_cache_after_generation
+
+        mock_lm.supports_cache_trim = False
+        cache = MagicMock()
+        gen_kwargs = {"prompt_cache": cache}
+        # eval_count=7 != len(generated_tokens)=2: None-ID tokens produced
+        with patch("olmlx.engine.inference.settings") as mock_settings:
+            mock_settings.prompt_cache_max_tokens = 4
+            mock_settings.memory_limit_fraction = 0.9
+            await _store_prompt_cache_after_generation(
+                mock_lm, gen_kwargs, [1, 2, 3], [4, 5], 7, "test"
+            )
+
+        # Only prompt tokens stored, generated tokens dropped
+        mock_lm.prompt_cache_store.async_set.assert_awaited_once()
+        call_args = mock_lm.prompt_cache_store.async_set.call_args
+        stored = call_args[0][1]
+        assert stored.tokens == [1, 2, 3]
     @pytest.mark.asyncio
     async def test_streaming_stops_after_inference_timeout(self, mock_manager):
         """Streaming generation should stop and return done_reason=timeout."""
