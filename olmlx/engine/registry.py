@@ -238,18 +238,38 @@ class ModelConfig:
             )
 
     def resolved_speculative(self) -> tuple[bool, str | None, int]:
-        """Resolve speculative config: per-model overrides global settings."""
+        """Resolve speculative config: per-model overrides global settings.
+
+        Returns ``(enabled, draft_model, tokens)``. When ``enabled`` is
+        ``False`` the draft slot is forced to ``None`` even if a global
+        ``speculative_draft_model`` is configured — callers should never
+        see a non-None draft for a disabled model. The token count is
+        always returned so callers that flip enabled at runtime keep a
+        sensible default.
+        """
         from olmlx.config import settings
 
-        return (
-            self.speculative if self.speculative is not None else settings.speculative,
+        enabled = (
+            self.speculative if self.speculative is not None else settings.speculative
+        )
+        if not enabled:
+            tokens = (
+                self.speculative_tokens
+                if self.speculative_tokens is not None
+                else settings.speculative_tokens
+            )
+            return (False, None, tokens)
+        draft = (
             self.speculative_draft_model
             if self.speculative_draft_model is not None
-            else settings.speculative_draft_model,
+            else settings.speculative_draft_model
+        )
+        tokens = (
             self.speculative_tokens
             if self.speculative_tokens is not None
-            else settings.speculative_tokens,
+            else settings.speculative_tokens
         )
+        return (True, draft, tokens)
 
     @classmethod
     def from_entry(cls, entry: str | dict) -> ModelConfig:
@@ -300,13 +320,21 @@ class ModelConfig:
             speculative = speculative_raw
 
             speculative_draft_model_raw = entry.get("speculative_draft_model")
-            if speculative_draft_model_raw is not None and not isinstance(
-                speculative_draft_model_raw, str
-            ):
-                raise ValueError(
-                    f"'speculative_draft_model' must be a string, "
-                    f"got {speculative_draft_model_raw!r}"
-                )
+            if speculative_draft_model_raw is not None:
+                if not isinstance(speculative_draft_model_raw, str):
+                    raise ValueError(
+                        f"'speculative_draft_model' must be a string, "
+                        f"got {speculative_draft_model_raw!r}"
+                    )
+                if not speculative_draft_model_raw.strip():
+                    # Empty/whitespace-only would slip past the load
+                    # check and surface as the misleading "draft model
+                    # not set" error. Reject it at parse time.
+                    raise ValueError(
+                        "'speculative_draft_model' must be a non-empty "
+                        "HuggingFace path; use ``null`` to inherit from "
+                        "the global setting."
+                    )
             speculative_draft_model = speculative_draft_model_raw
 
             speculative_tokens_raw = entry.get("speculative_tokens")

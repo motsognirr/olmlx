@@ -227,6 +227,17 @@ class TestSpeculativeConfig:
         with pytest.raises(ValueError, match="promoted out of 'experimental'"):
             _validate_experimental_overrides({"speculative": True})
 
+    def test_empty_speculative_draft_model_rejected(self):
+        """Empty / whitespace strings used to slip past parse and surface
+        as the misleading 'draft not set' error at load time."""
+        from olmlx.engine.registry import ModelConfig
+
+        for value in ("", "   ", "\t"):
+            with pytest.raises(ValueError, match="non-empty"):
+                ModelConfig.from_entry(
+                    {"hf_path": "x/y", "speculative_draft_model": value}
+                )
+
     def test_promoted_keys_renamed_branch_message(self, monkeypatch):
         """Cover the 'rename' branch of the migration error so it doesn't
         rot before the next promotion exercises it for real."""
@@ -283,13 +294,14 @@ class TestSpeculativeConfig:
         mc = ModelConfig(hf_path="Qwen/Qwen3-32B")
         assert mc.resolved_speculative() == (True, "Qwen/Qwen3-0.6B", 8)
 
-        # Per-model overrides win
+        # Per-model overrides win, and a disabled per-model setting
+        # zeros out the draft slot even if a global draft is configured.
         mc_override = ModelConfig(
             hf_path="Qwen/Qwen3-32B",
             speculative=False,
             speculative_tokens=2,
         )
-        assert mc_override.resolved_speculative() == (False, "Qwen/Qwen3-0.6B", 2)
+        assert mc_override.resolved_speculative() == (False, None, 2)
 
 
 class TestDFlashConfig:

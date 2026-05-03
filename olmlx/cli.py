@@ -263,6 +263,15 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str]]:
 
         registry = ModelRegistry()
         registry.load()
+    except ValueError as exc:
+        # Validation errors (e.g. a malformed entry that survived
+        # ``_models_with_promoted_keys_in_experimental``) are operator
+        # errors, not transient I/O issues — flag them distinctly.
+        logger.warning(
+            "Skipping speculative config validation: invalid models.json entry: %s",
+            exc,
+        )
+        return [], [], []
     except Exception as exc:
         logger.warning(
             "Skipping speculative config validation: could not load registry: %s",
