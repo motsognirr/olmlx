@@ -1498,13 +1498,52 @@ class TestFullCompletionInner:
             )
 
         assert result["text"] == "plain string"
-        # Fallback path: no token counts and no rates available, so
-        # prompt_eval_duration stays 0 and eval_duration falls back to the
-        # wall-clock timer.
+        # Fallback path: result has no token counts and no rates. Both
+        # durations stay 0 — eval_count == 0 explicitly forces eval_duration
+        # to 0 to match Ollama's convention (avoids double-counting wall time).
         assert stats.prompt_eval_count == 0
         assert stats.prompt_eval_duration == 0
         assert stats.eval_count == 0
-        assert stats.eval_duration > 0
+        assert stats.eval_duration == 0
+
+    @pytest.mark.asyncio
+    async def test_prefill_only_no_decode(self, mock_manager):
+        """Result with prompt tokens but no decode (eval_count=0) should not
+        double-count: prompt_eval_duration gets the wall-clock fallback,
+        eval_duration is 0 (Ollama convention)."""
+        from olmlx.engine.inference import _full_completion_inner
+
+        lm = mock_manager._loaded["qwen3:latest"]
+
+        # Result reports a prompt but no generation, and no rates — exercises
+        # the elif fallback for prompt_eval_duration and the eval_count == 0
+        # branch for eval_duration.
+        mock_result = MagicMock()
+        mock_result.text = ""
+        mock_result.prompt_tokens = 12
+        mock_result.generation_tokens = 0
+        mock_result.prompt_tps = 0
+        mock_result.generation_tps = 0
+
+        stats = TimingStats()
+        with patch(
+            "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+        ) as mock_thread:
+            mock_thread.return_value = mock_result
+            await _full_completion_inner(
+                lm,
+                "prompt",
+                100,
+                {},
+                stats,
+            )
+
+        assert stats.prompt_eval_count == 12
+        assert stats.eval_count == 0
+        # Prefill consumed the whole timer, decode was skipped. The two
+        # fields together must not exceed total wall time.
+        assert stats.prompt_eval_duration > 0
+        assert stats.eval_duration == 0
 
     @pytest.mark.asyncio
     async def test_result_other_type(self, mock_manager):

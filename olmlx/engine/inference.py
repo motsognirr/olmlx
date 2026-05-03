@@ -2377,6 +2377,9 @@ async def _stream_completion(
                 stats.prompt_eval_duration = eval_timer.duration_ns
             if gen_tps > 0 and stats.eval_count > 0:
                 stats.eval_duration = int(stats.eval_count / gen_tps * 1e9)
+            elif stats.eval_count == 0:
+                # No decode happened — match Ollama's convention.
+                stats.eval_duration = 0
             elif (
                 stats.prompt_eval_duration > 0
                 and eval_timer.duration_ns > stats.prompt_eval_duration
@@ -2388,6 +2391,18 @@ async def _stream_completion(
                 )
             else:
                 stats.eval_duration = eval_timer.duration_ns
+            # Log-only fallback so the "Generation complete" line stays
+            # informative when mlx-lm didn't report a rate directly.
+            if gen_tps == 0 and stats.eval_duration and stats.eval_count:
+                gen_tps = stats.eval_count / (stats.eval_duration / 1e9)
+            if (
+                prompt_tps == 0
+                and stats.prompt_eval_duration
+                and stats.prompt_eval_count
+            ):
+                prompt_tps = stats.prompt_eval_count / (
+                    stats.prompt_eval_duration / 1e9
+                )
 
         stats.total_duration = total_timer.duration_ns
         if not timed_out:
@@ -2651,6 +2666,9 @@ async def _full_completion_inner(
         stats.prompt_eval_duration = eval_timer.duration_ns
     if gen_tps > 0 and stats.eval_count > 0:
         stats.eval_duration = int(stats.eval_count / gen_tps * 1e9)
+    elif stats.eval_count == 0:
+        # No decode happened — match Ollama's convention.
+        stats.eval_duration = 0
     elif (
         stats.prompt_eval_duration > 0
         and eval_timer.duration_ns > stats.prompt_eval_duration
@@ -2658,6 +2676,12 @@ async def _full_completion_inner(
         stats.eval_duration = eval_timer.duration_ns - stats.prompt_eval_duration
     else:
         stats.eval_duration = eval_timer.duration_ns
+    # Log-only fallback so the "Generation complete" line stays informative
+    # when mlx-lm didn't report a rate directly.
+    if gen_tps == 0 and stats.eval_duration and stats.eval_count:
+        gen_tps = stats.eval_count / (stats.eval_duration / 1e9)
+    if prompt_tps == 0 and stats.prompt_eval_duration and stats.prompt_eval_count:
+        prompt_tps = stats.prompt_eval_count / (stats.prompt_eval_duration / 1e9)
     total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
     logger.info(
         "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
