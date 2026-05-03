@@ -308,6 +308,35 @@ class TestBuildParser:
         # The legacy value must NOT overwrite the (already-applied) new one.
         assert _settings.speculative_draft_model == "new/draft"
 
+    def test_legacy_does_not_clobber_new_shell_var_equal_to_default(self, monkeypatch):
+        """If the user explicitly sets the new shell var to a value that
+        happens to equal the schema default, the legacy var must not
+        win. Regression: the prior implementation only checked the
+        resolved Settings value against the default, missing this case."""
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(_settings, "speculative_tokens", 4)
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda: ([], [], [], False),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+        # Mimic "user explicitly set OLMLX_SPECULATIVE_TOKENS=4 (the
+        # default) in their shell". Settings already has the default,
+        # but the env var's presence must short-circuit forwarding.
+        monkeypatch.setenv("OLMLX_SPECULATIVE_TOKENS", "4")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS", "8")
+
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        _apply_serve_overrides(args)
+        assert _settings.speculative_tokens == 4
+
     def test_legacy_does_not_clobber_dotenv_value(self, monkeypatch):
         """If pydantic-settings already loaded the new value from a .env
         file (so it never appears in ``os.environ``), the legacy shell var

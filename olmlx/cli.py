@@ -143,11 +143,18 @@ def _forward_legacy_speculative_env(_settings) -> None:
         legacy_val = os.environ.get(legacy)
         if legacy_val is None:
             continue
+        if os.environ.get(new) is not None:
+            # The new shell var was set explicitly (even if its value
+            # happens to equal the schema default).
+            continue
         field_default = Settings.model_fields[attr].default
         if getattr(_settings, attr) != field_default:
-            # The new value already came from somewhere — env, .env,
+            # The new value already came from somewhere — .env file,
             # CLI flag, or programmatic write. Don't override it with
-            # the legacy value.
+            # the legacy value. The remaining blind spot is a .env
+            # entry that happens to match the schema default, which
+            # the legacy value would still overwrite — an acceptable
+            # tradeoff during the deprecation window.
             continue
         try:
             value = parse(legacy_val)

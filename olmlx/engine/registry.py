@@ -226,7 +226,7 @@ class ModelConfig:
         # ``from_entry`` already validates JSON inputs, but direct
         # construction (tests, programmatic callers) bypasses it. Keep
         # this in lockstep with ``Settings.speculative_tokens``'s
-        # ``Field(gt=0)``.
+        # ``Field(gt=0)`` and the empty-string check in ``from_entry``.
         if self.speculative_tokens is not None and (
             isinstance(self.speculative_tokens, bool)
             or not isinstance(self.speculative_tokens, int)
@@ -235,6 +235,13 @@ class ModelConfig:
             raise ValueError(
                 f"'speculative_tokens' must be a positive integer or None, "
                 f"got {self.speculative_tokens!r}"
+            )
+        if (
+            self.speculative_draft_model is not None
+            and not self.speculative_draft_model.strip()
+        ):
+            raise ValueError(
+                "'speculative_draft_model' must be a non-empty HuggingFace path or None"
             )
 
     def resolved_speculative(self) -> tuple[bool, str | None, int]:

@@ -204,6 +204,15 @@ class TestSpeculativeConfig:
         with pytest.raises(ValueError, match="speculative_tokens"):
             ModelConfig(hf_path="x/y", speculative_tokens=-1)
 
+    def test_model_config_empty_draft_validated_on_construct(self):
+        """Direct construction must reject empty / whitespace draft paths,
+        not just from_entry — same invariant either way."""
+        from olmlx.engine.registry import ModelConfig
+
+        for value in ("", "   ", "\t"):
+            with pytest.raises(ValueError, match="non-empty"):
+                ModelConfig(hf_path="x/y", speculative_draft_model=value)
+
     def test_speculative_tokens_assignment_validated(self, monkeypatch):
         """validate_assignment=True keeps Field(gt=0) honoured for programmatic writes."""
         monkeypatch.delenv("OLMLX_SPECULATIVE_TOKENS", raising=False)
