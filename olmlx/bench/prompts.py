@@ -4,6 +4,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# ~500-char paragraph repeated to build a long-context prompt. Repetition is
+# fine for microbenching attention/KV-cache cost — content variety doesn't
+# meaningfully change prefill or decode throughput, but determinism does.
+_LONG_CONTEXT_PARAGRAPH = (
+    "The migratory patterns of Arctic terns span the entire globe, with these "
+    "remarkable birds traveling from breeding grounds near the North Pole to "
+    "wintering sites in Antarctica. A single tern can cover more than seventy "
+    "thousand kilometers in a year, navigating by a combination of celestial "
+    "cues, magnetic fields, and learned coastal landmarks. Researchers have "
+    "tagged individuals to study route choice, fueling stops, and longevity, "
+    "uncovering surprising fidelity to specific staging islands across decades. "
+    "The species' endurance is matched only by its sensitivity to changes in "
+    "sea-ice extent and prey availability, making the tern an unusually clear "
+    "indicator of climate-driven shifts at both polar extremes. "
+)
+# Target ~70_000 characters → roughly 16-18k tokens with a typical BPE
+# tokenizer. Truncated to a fixed length so the prompt is identical across
+# runs regardless of paragraph length tweaks.
+_LONG_CONTEXT_BODY = (
+    _LONG_CONTEXT_PARAGRAPH * (70_000 // len(_LONG_CONTEXT_PARAGRAPH) + 1)
+)[:70_000]
+
 
 @dataclass(frozen=True)
 class BenchPrompt:
@@ -101,5 +123,21 @@ PROMPTS: list[BenchPrompt] = [
             },
         ],
         max_tokens=256,
+    ),
+    BenchPrompt(
+        name="long-context",
+        category="long-context",
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Below is a long passage. After it, answer the question "
+                    "in a single sentence.\n\n"
+                    f"{_LONG_CONTEXT_BODY}\n\n"
+                    "Question: What is the recurring subject of the passage?"
+                ),
+            },
+        ],
+        max_tokens=64,
     ),
 ]

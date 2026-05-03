@@ -53,8 +53,17 @@ class TestPromptsList:
             "creative",
             "instruction",
             "multi-turn",
+            "long-context",
         ):
             assert expected in cats, f"Missing category {expected}"
+
+    def test_long_context_prompt_is_actually_long(self):
+        long_prompts = [p for p in PROMPTS if p.category == "long-context"]
+        assert len(long_prompts) == 1
+        body = long_prompts[0].messages[0]["content"]
+        # ~70k chars body + framing — comfortably above 65k so we're stressing
+        # KV bandwidth on any tokenizer with avg <= 4 chars/token.
+        assert len(body) >= 65_000
 
     def test_multi_turn_has_multiple_messages(self):
         multi = [p for p in PROMPTS if p.category == "multi-turn"]

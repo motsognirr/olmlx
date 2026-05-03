@@ -410,6 +410,130 @@ def _safe_sync():
     _sync_generation_streams()
 
 
+def _derive_timing_stats(
+    stats: TimingStats,
+    prompt_tps: float,
+    gen_tps: float,
+    eval_timer_ns: int,
+) -> tuple[float, float]:
+    """Populate ``stats.prompt_eval_duration`` and ``stats.eval_duration`` from
+    mlx-lm's measured prefill/decode rates, with conservative fallbacks for
+    cases where mlx-lm didn't report a rate.
+
+    Returns the (possibly back-computed) ``(prompt_tps, gen_tps)`` so the
+    caller's "Generation complete" log line remains informative when a rate
+    was missing.
+
+    Convention (matches Ollama): ``prompt_eval_duration`` covers prefill,
+    ``eval_duration`` covers decode only. Both fields are clamped so their
+    sum never exceeds ``eval_timer_ns``.
+
+    Edge case worth knowing: when both counts are nonzero but neither rate
+    is reported, the helper has no way to apportion wall-clock between
+    prefill and decode. It splits ``eval_timer_ns`` 50/50 so neither phase
+    ends up at 0 (which would cause divide-by-zero on clients computing
+    tok/s). The sum invariant still holds; the split is just heuristic.
+    mlx-lm reports both rates in practice, so this path is essentially
+    unreached.
+    """
+    # Explicit zero of the fields this helper owns — several branches below
+    # write only one of the two, so initialize both up front to make the
+    # mutation contract independent of the caller's TimingStats state.
+    stats.prompt_eval_duration = 0
+    stats.eval_duration = 0
+
+    # Defensive coercion: ``isinstance(x, (int, float))`` is the explicit
+    # contract for what mlx-lm returns (Python floats). It rejects
+    # MagicMock (whose ``__float__`` returns 1.0 and would otherwise
+    # silently produce bogus durations in tests), and any future
+    # non-Python-numeric type from upstream — at which point we'd want to
+    # see real zeros and notice rather than silently coerce.
+    if not isinstance(prompt_tps, (int, float)):
+        prompt_tps = 0.0
+    else:
+        prompt_tps = float(prompt_tps)
+    if not isinstance(gen_tps, (int, float)):
+        gen_tps = 0.0
+    else:
+        gen_tps = float(gen_tps)
+
+    raw_prompt_ns = (
+        int(stats.prompt_eval_count / prompt_tps * 1e9)
+        if prompt_tps > 0 and stats.prompt_eval_count > 0
+        else 0
+    )
+    raw_decode_ns = (
+        int(stats.eval_count / gen_tps * 1e9)
+        if gen_tps > 0 and stats.eval_count > 0
+        else 0
+    )
+
+    if raw_prompt_ns and raw_decode_ns:
+        # Both rates known. If their sum exceeds wall-clock (rate noise) split
+        # eval_timer_ns proportionally so each phase gets a non-zero share —
+        # forcing one to 0 would create divide-by-zero on the client.
+        raw_total = raw_prompt_ns + raw_decode_ns
+        if raw_total > eval_timer_ns:
+            # Use integer floor-division to keep the math exact — int(a*b/c)
+            # would coerce through float and lose precision for large values.
+            stats.prompt_eval_duration = eval_timer_ns * raw_prompt_ns // raw_total
+            stats.eval_duration = eval_timer_ns - stats.prompt_eval_duration
+        else:
+            stats.prompt_eval_duration = raw_prompt_ns
+            stats.eval_duration = raw_decode_ns
+    elif raw_prompt_ns:
+        # Only prompt rate known.
+        if raw_prompt_ns >= eval_timer_ns and stats.eval_count > 0:
+            # Rate noise: prefill alone would consume the full timer, leaving
+            # nothing for decode despite eval_count > 0. Split 50/50 so
+            # clients don't divide by zero on decode tok/s.
+            stats.prompt_eval_duration = eval_timer_ns // 2
+            stats.eval_duration = eval_timer_ns - stats.prompt_eval_duration
+        else:
+            stats.prompt_eval_duration = min(raw_prompt_ns, eval_timer_ns)
+            if stats.eval_count == 0:
+                stats.eval_duration = 0
+            else:
+                stats.eval_duration = max(0, eval_timer_ns - stats.prompt_eval_duration)
+    elif raw_decode_ns:
+        # Only decode rate known. Recover prefill by subtraction.
+        if raw_decode_ns >= eval_timer_ns and stats.prompt_eval_count > 0:
+            # Symmetric noise case.
+            stats.eval_duration = eval_timer_ns // 2
+            stats.prompt_eval_duration = eval_timer_ns - stats.eval_duration
+        else:
+            stats.eval_duration = min(raw_decode_ns, eval_timer_ns)
+            if stats.prompt_eval_count > 0:
+                stats.prompt_eval_duration = max(0, eval_timer_ns - stats.eval_duration)
+    else:
+        # Neither rate known.
+        if stats.eval_count == 0:
+            if stats.prompt_eval_count > 0:
+                # Whole timer is prefill.
+                stats.prompt_eval_duration = eval_timer_ns
+            stats.eval_duration = 0
+        elif stats.prompt_eval_count > 0:
+            # Both counts > 0 with no rates: 50/50 to avoid divide-by-zero on
+            # either side. mlx-lm reports rates in practice, so this path is
+            # essentially unreached.
+            stats.prompt_eval_duration = eval_timer_ns // 2
+            stats.eval_duration = eval_timer_ns - stats.prompt_eval_duration
+        else:
+            # Only eval_count > 0: assign full timer to decode.
+            stats.eval_duration = eval_timer_ns
+
+    # Log-line rates: always derive from the final stored durations so the
+    # "Generation complete" log agrees with the API response. This matters
+    # when clamping kicks in — the raw mlx-lm rate would imply a different
+    # duration than the one we actually report.
+    if stats.eval_duration > 0 and stats.eval_count > 0:
+        gen_tps = stats.eval_count / (stats.eval_duration / 1e9)
+    if stats.prompt_eval_duration > 0 and stats.prompt_eval_count > 0:
+        prompt_tps = stats.prompt_eval_count / (stats.prompt_eval_duration / 1e9)
+
+    return prompt_tps, gen_tps
+
+
 def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
     """Sync Metal GPU state at inference-lock entry/exit with configurable scope.
 
@@ -2362,9 +2486,12 @@ async def _stream_completion(
             else:
                 raw_text = ""
 
-            stats.eval_duration = eval_timer.duration_ns
-            prompt_tps = getattr(token, "prompt_tps", 0) or 0
-            gen_tps = getattr(token, "generation_tps", 0) or 0
+            prompt_tps, gen_tps = _derive_timing_stats(
+                stats,
+                getattr(token, "prompt_tps", 0) or 0,
+                getattr(token, "generation_tps", 0) or 0,
+                eval_timer.duration_ns,
+            )
 
         stats.total_duration = total_timer.duration_ns
         if not timed_out:
@@ -2603,7 +2730,6 @@ async def _full_completion_inner(
         with Timer() as eval_timer:
             result = await asyncio.to_thread(_generate_sync)
 
-    stats.eval_duration = eval_timer.duration_ns
     stats.total_duration = total_timer.duration_ns
 
     # Unpack (GenerationResult, full_text) tuple from stream_generate path
@@ -2618,9 +2744,12 @@ async def _full_completion_inner(
     if hasattr(result, "generation_tokens"):
         stats.eval_count = result.generation_tokens
 
-    eval_secs = stats.eval_duration / 1e9 if stats.eval_duration else 0
-    gen_tps = stats.eval_count / eval_secs if eval_secs > 0 else 0
-    prompt_tps = stats.prompt_eval_count / eval_secs if eval_secs > 0 else 0
+    prompt_tps, gen_tps = _derive_timing_stats(
+        stats,
+        getattr(result, "prompt_tps", 0) or 0,
+        getattr(result, "generation_tps", 0) or 0,
+        eval_timer.duration_ns,
+    )
     total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
     logger.info(
         "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
