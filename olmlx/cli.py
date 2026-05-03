@@ -1926,6 +1926,9 @@ def _show_flash_dense_info(model_name, flash_dir):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # Each subparser group MUST use ``{cmd}_command`` as its ``dest``
+    # so that ``cli_main()`` can look up the subcommand via
+    # ``getattr(args, f"{cmd}_command", None)``.
     parser = argparse.ArgumentParser(
         prog="olmlx",
         description="Ollama-compatible API server using Apple MLX",
@@ -2221,11 +2224,75 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Registry: (command, subcommand) → handler name.
+# Handler names are resolved via globals() at call time so test
+# monkeypatching (``monkeypatch.setattr("olmlx.cli.cmd_serve", mock)``)
+# works.  _validate_command_handlers() catches typos at import time.
+# Subcommand=None for commands that take no subcommand (serve, chat).
+_COMMAND_HANDLERS: dict[tuple[str, str | None], str] = {
+    ("serve", None): "cmd_serve",
+    ("chat", None): "cmd_chat",
+    ("service", "install"): "cmd_service_install",
+    ("service", "uninstall"): "cmd_service_uninstall",
+    ("service", "status"): "cmd_service_status",
+    ("models", "list"): "cmd_models_list",
+    ("models", "pull"): "cmd_models_pull",
+    ("models", "show"): "cmd_models_show",
+    ("models", "delete"): "cmd_models_delete",
+    ("models", "search"): "cmd_models_search",
+    ("flash", "prepare"): "cmd_flash_prepare",
+    ("flash", "info"): "cmd_flash_info",
+    ("spectral", "prepare"): "cmd_spectral_prepare",
+    ("bench", "run"): "cmd_bench_run",
+    ("bench", "compare"): "cmd_bench_compare",
+    ("bench", "list"): "cmd_bench_list",
+    ("bench", "leaderboard"): "cmd_bench_leaderboard",
+    ("config", "show"): "cmd_config_show",
+}
+
+
+def _validate_command_handlers() -> None:
+    """Verify every handler name in the registry refers to a callable.
+
+    Called at module load to catch typos before runtime dispatch.
+    """
+    for (cmd, sub), name in _COMMAND_HANDLERS.items():
+        handler = globals().get(name)
+        if handler is None:
+            raise NameError(
+                f"Handler {name!r} (registered for ({cmd!r}, {sub!r})) "
+                f"not found in module globals"
+            )
+        if not callable(handler):
+            raise TypeError(f"Handler {name!r} for ({cmd!r}, {sub!r}) is not callable")
+
+
+_validate_command_handlers()
+
+
+def _resolve_handler(cmd: str, sub_name: str | None) -> Any | None:
+    """Look up a handler by (command, subcommand) in the registry.
+
+    Resolves via ``globals()`` so that test monkeypatching
+    (``monkeypatch.setattr("olmlx.cli.cmd_serve", mock_fn)``) works.
+    """
+    name = _COMMAND_HANDLERS.get((cmd, sub_name))
+    if name is None:
+        return None
+    handler = globals().get(name)
+    if handler is None:
+        raise NameError(
+            f"Handler {name!r} (registered for ({cmd!r}, {sub_name!r})) "
+            f"not found in module globals"
+        )
+    return handler
+
+
 def cli_main():
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.command is None or args.command == "serve":
+    if args.command is None:
         # Bare invocation: derive serve-subparser defaults from the
         # parser itself rather than hardcoding the flag list. New serve
         # flags wire through automatically; any top-level flags already
@@ -2234,61 +2301,17 @@ def cli_main():
         # serve-only flag names — otherwise this loop would suppress the
         # serve default for the colliding name. The root parser only
         # declares the ``command`` dest today, so this holds.
-        if args.command is None:
-            serve_defaults = vars(parser.parse_args(["serve"]))
-            for _name, _default in serve_defaults.items():
-                if not hasattr(args, _name):
-                    setattr(args, _name, _default)
-        cmd_serve(args)
-    elif args.command == "service":
-        if args.service_command == "install":
-            cmd_service_install(args)
-        elif args.service_command == "uninstall":
-            cmd_service_uninstall(args)
-        elif args.service_command == "status":
-            cmd_service_status(args)
-        else:
-            parser.parse_args(["service", "--help"])
-    elif args.command == "chat":
-        cmd_chat(args)
-    elif args.command == "models":
-        if args.models_command == "list":
-            cmd_models_list(args)
-        elif args.models_command == "pull":
-            cmd_models_pull(args)
-        elif args.models_command == "show":
-            cmd_models_show(args)
-        elif args.models_command == "delete":
-            cmd_models_delete(args)
-        elif args.models_command == "search":
-            cmd_models_search(args)
-        else:
-            parser.parse_args(["models", "--help"])
-    elif args.command == "flash":
-        if args.flash_command == "prepare":
-            cmd_flash_prepare(args)
-        elif args.flash_command == "info":
-            cmd_flash_info(args)
-        else:
-            parser.parse_args(["flash", "--help"])
-    elif args.command == "spectral":
-        if args.spectral_command == "prepare":
-            cmd_spectral_prepare(args)
-        else:
-            parser.parse_args(["spectral", "--help"])
-    elif args.command == "bench":
-        if args.bench_command == "run":
-            cmd_bench_run(args)
-        elif args.bench_command == "compare":
-            cmd_bench_compare(args)
-        elif args.bench_command == "list":
-            cmd_bench_list(args)
-        elif args.bench_command == "leaderboard":
-            cmd_bench_leaderboard(args)
-        else:
-            parser.parse_args(["bench", "--help"])
-    elif args.command == "config":
-        if args.config_command == "show":
-            cmd_config_show(args)
-        else:
-            parser.parse_args(["config", "--help"])
+        serve_defaults = vars(parser.parse_args(["serve"]))
+        for _name, _default in serve_defaults.items():
+            if not hasattr(args, _name):
+                setattr(args, _name, _default)
+
+    cmd = args.command or "serve"  # default
+    sub_name = getattr(args, f"{cmd}_command", None)
+
+    handler = _resolve_handler(cmd, sub_name)
+    if handler:
+        return handler(args)
+
+    # Unknown subcommand — print help for the parent command
+    parser.parse_args([cmd, "--help"])

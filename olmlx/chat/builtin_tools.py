@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable
 
 from olmlx.chat.config import ChatConfig
+from olmlx.chat.errors import ToolError
 
 logger = logging.getLogger(__name__)
 
@@ -111,12 +112,12 @@ def _resolve_path(path: str, base_dir: Path | None = None) -> Path:
 # -- Tool handler functions --
 
 
-async def _handle_read_file(args: dict) -> str:
+async def _handle_read_file(args: dict) -> str | ToolError:
     path = args.get("path", "")
     try:
         safe_path = _resolve_path(path)
     except ValueError as exc:
-        return f"Error: {exc}"
+        return ToolError(message=str(exc), tool_name="read_file", is_user_error=True)
     offset = args.get("offset", 1)
     limit = args.get("limit")
     start = max(offset - 1, 0)
@@ -149,7 +150,11 @@ async def _handle_read_file(args: dict) -> str:
     try:
         selected = await asyncio.to_thread(_read)
     except (OSError, ValueError) as exc:
-        return f"Error reading file: {exc}"
+        return ToolError(
+            message=f"Error reading file: {exc}",
+            tool_name="read_file",
+            is_user_error=isinstance(exc, ValueError),
+        )
 
     numbered = []
     for i, line in enumerate(selected, start=start + 1):
@@ -157,14 +162,14 @@ async def _handle_read_file(args: dict) -> str:
     return "\n".join(numbered)
 
 
-async def _handle_write_file(args: dict) -> str:
+async def _handle_write_file(args: dict) -> str | ToolError:
     path = args.get("path", "")
     content = args.get("content", "")
 
     try:
         safe_path = _resolve_path(path)
     except ValueError as exc:
-        return f"Error: {exc}"
+        return ToolError(message=str(exc), tool_name="write_file", is_user_error=True)
 
     def _write():
         safe_path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,12 +178,16 @@ async def _handle_write_file(args: dict) -> str:
     try:
         await asyncio.to_thread(_write)
     except OSError as exc:
-        return f"Error writing file: {exc}"
+        return ToolError(
+            message=f"Error writing file: {exc}",
+            tool_name="write_file",
+            is_user_error=False,
+        )
 
     return f"Wrote {len(content.encode())} bytes to {safe_path}"
 
 
-async def _handle_edit_file(args: dict) -> str:
+async def _handle_edit_file(args: dict) -> str | ToolError:
     path = args.get("path", "")
     old_text = args.get("old_text", "")
     new_text = args.get("new_text", "")
@@ -186,23 +195,42 @@ async def _handle_edit_file(args: dict) -> str:
     try:
         safe_path = _resolve_path(path)
     except ValueError as exc:
-        return f"Error: {exc}"
+        return ToolError(message=str(exc), tool_name="edit_file", is_user_error=True)
 
-    def _edit() -> str:
-        content = safe_path.read_text(encoding="utf-8", errors="replace")
+    def _edit() -> str | ToolError:
+        try:
+            content = safe_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return ToolError(
+                message=f"Error: {exc}",
+                tool_name="edit_file",
+                is_user_error=False,
+            )
         count = content.count(old_text)
         if count == 0:
-            return "Error: old_text not found in file."
+            return ToolError(
+                message="old_text not found in file.",
+                tool_name="edit_file",
+                is_user_error=True,
+            )
         if count > 1:
-            return f"Error: old_text found {count} times (multiple matches). Provide more context to make it unique."
-        new_content = content.replace(old_text, new_text, 1)
-        safe_path.write_text(new_content, encoding="utf-8")
+            return ToolError(
+                message=f"old_text found {count} times (multiple matches). Provide more context to make it unique.",
+                tool_name="edit_file",
+                is_user_error=True,
+            )
+        try:
+            new_content = content.replace(old_text, new_text, 1)
+            safe_path.write_text(new_content, encoding="utf-8")
+        except OSError as exc:
+            return ToolError(
+                message=f"Error: {exc}",
+                tool_name="edit_file",
+                is_user_error=False,
+            )
         return "Applied edit successfully."
 
-    try:
-        return await asyncio.to_thread(_edit)
-    except OSError as exc:
-        return f"Error: {exc}"
+    return await asyncio.to_thread(_edit)
 
 
 async def _handle_glob(args: dict) -> str:
@@ -220,7 +248,7 @@ async def _handle_glob(args: dict) -> str:
     return "\n".join(matches)
 
 
-async def _handle_grep(args: dict) -> str:
+async def _handle_grep(args: dict) -> str | ToolError:
     pattern = args.get("pattern", "")
     path = args.get("path", ".")
 
@@ -260,7 +288,11 @@ async def _handle_grep(args: dict) -> str:
         elif rc == 1:
             return "No matches found."
         else:
-            return f"Error: {stderr.strip() or 'rg returned exit code ' + str(rc)}"
+            return ToolError(
+                message=stderr.strip() or "rg returned exit code " + str(rc),
+                tool_name="grep",
+                is_user_error=True,  # exit code 2+ is typically invalid regex
+            )
     except FileNotFoundError:
         # rg not installed, fall back to grep
         try:
@@ -272,15 +304,29 @@ async def _handle_grep(args: dict) -> str:
             elif rc == 1:
                 return "No matches found."
             else:
-                return (
-                    f"Error: {stderr.strip() or 'grep returned exit code ' + str(rc)}"
+                return ToolError(
+                    message=stderr.strip() or "grep returned exit code " + str(rc),
+                    tool_name="grep",
+                    is_user_error=False,  # grep exit code 2+ is system errors (perm, I/O)
                 )
         except FileNotFoundError:
-            return "Error: search tools (rg, grep) not available."
+            return ToolError(
+                message="search tools (rg, grep) not available.",
+                tool_name="grep",
+                is_user_error=False,
+            )
         except asyncio.TimeoutError:
-            return "Error: search timed out."
+            return ToolError(
+                message="search timed out.",
+                tool_name="grep",
+                is_user_error=False,
+            )
     except asyncio.TimeoutError:
-        return "Error: search timed out."
+        return ToolError(
+            message="search timed out.",
+            tool_name="grep",
+            is_user_error=False,
+        )
 
     if len(output) > _GREP_MAX_BYTES:
         output = output[:_GREP_MAX_BYTES] + "\n... truncated"
@@ -288,17 +334,23 @@ async def _handle_grep(args: dict) -> str:
     return output
 
 
-async def _handle_read_directory(args: dict) -> str:
+async def _handle_read_directory(args: dict) -> str | ToolError:
     path = args.get("path", ".")
 
     try:
         safe_path = _resolve_path(path)
     except ValueError as exc:
-        return f"Error: {exc}"
+        return ToolError(
+            message=str(exc), tool_name="read_directory", is_user_error=True
+        )
 
-    def _list_dir() -> list[str]:
+    def _list_dir() -> list[str] | ToolError:
         if not safe_path.is_dir():
-            return [f"Error: not a directory: {safe_path}"]
+            return ToolError(
+                message=f"not a directory: {safe_path}",
+                tool_name="read_directory",
+                is_user_error=True,
+            )
         lines = []
         for entry in sorted(safe_path.iterdir()):
             if entry.is_dir():
@@ -311,7 +363,14 @@ async def _handle_read_directory(args: dict) -> str:
     try:
         entries = await asyncio.to_thread(_list_dir)
     except OSError as exc:
-        return f"Error listing directory: {exc}"
+        return ToolError(
+            message=f"Error listing directory: {exc}",
+            tool_name="read_directory",
+            is_user_error=False,
+        )
+
+    if isinstance(entries, ToolError):
+        return entries
 
     return "\n".join(entries)
 
@@ -328,7 +387,7 @@ async def _handle_question(args: dict) -> str:
     return "__question__:" + json.dumps(payload)
 
 
-async def _handle_bash(args: dict) -> str:
+async def _handle_bash(args: dict) -> str | ToolError:
     command = args.get("command", "")
     timeout = args.get("timeout", _BASH_DEFAULT_TIMEOUT)
 
@@ -340,7 +399,11 @@ async def _handle_bash(args: dict) -> str:
             start_new_session=True,
         )
     except OSError as exc:
-        return f"Error running command: {exc}"
+        return ToolError(
+            message=f"Error running command: {exc}",
+            tool_name="bash",
+            is_user_error=isinstance(exc, FileNotFoundError),
+        )
 
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -352,13 +415,21 @@ async def _handle_bash(args: dict) -> str:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, OSError):
             pass
-        return f"Command timed out after {timeout}s."
+        return ToolError(
+            message=f"Command timed out after {timeout}s.",
+            tool_name="bash",
+            is_user_error=False,
+        )
     except OSError as exc:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, OSError):
             pass
-        return f"Error running command: {exc}"
+        return ToolError(
+            message=f"Error running command: {exc}",
+            tool_name="bash",
+            is_user_error=False,
+        )
     except BaseException:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -398,7 +469,7 @@ async def _handle_todo_write(args: dict) -> str:
     return "\n".join(lines)
 
 
-async def _handle_create_plan(args: dict, plans_dir: Path) -> str:
+async def _handle_create_plan(args: dict, plans_dir: Path) -> str | ToolError:
     content = args.get("content", "")
 
     def _create():
@@ -410,37 +481,57 @@ async def _handle_create_plan(args: dict, plans_dir: Path) -> str:
     try:
         return await asyncio.to_thread(_create)
     except OSError as exc:
-        return f"Error writing plan: {exc}"
+        return ToolError(
+            message=f"Error writing plan: {exc}",
+            tool_name="create_plan",
+            is_user_error=False,
+        )
 
 
-async def _handle_update_plan(args: dict, plans_dir: Path) -> str:
+async def _handle_update_plan(args: dict, plans_dir: Path) -> str | ToolError:
     content = args.get("content", "")
     plan_path = plans_dir / "plan.md"
 
-    def _update():
+    def _update() -> str | ToolError:
         if not plan_path.exists():
-            return "Error: No plan found. Use create_plan first."
-        plan_path.write_text(content, encoding="utf-8")
+            return ToolError(
+                message="No plan found. Use create_plan first.",
+                tool_name="update_plan",
+                is_user_error=True,
+            )
+        try:
+            plan_path.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            return ToolError(
+                message=f"Error writing plan: {exc}",
+                tool_name="update_plan",
+                is_user_error=False,
+            )
         return f"Plan updated at {plan_path}"
 
-    try:
-        return await asyncio.to_thread(_update)
-    except OSError as exc:
-        return f"Error writing plan: {exc}"
+    return await asyncio.to_thread(_update)
 
 
-async def _handle_read_plan(args: dict, plans_dir: Path) -> str:
+async def _handle_read_plan(args: dict, plans_dir: Path) -> str | ToolError:
     plan_path = plans_dir / "plan.md"
 
-    def _read():
+    def _read() -> str | ToolError:
         if not plan_path.exists():
-            return "No plan found. Use create_plan to create one."
+            return ToolError(
+                message="No plan found. Use create_plan to create one.",
+                tool_name="read_plan",
+                is_user_error=True,
+            )
         return plan_path.read_text(encoding="utf-8", errors="replace")
 
     try:
         return await asyncio.to_thread(_read)
     except OSError as exc:
-        return f"Error reading plan: {exc}"
+        return ToolError(
+            message=f"Error reading plan: {exc}",
+            tool_name="read_plan",
+            is_user_error=False,
+        )
 
 
 def _is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -455,14 +546,22 @@ def _is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     )
 
 
-async def _handle_web_fetch(args: dict) -> str:
+async def _handle_web_fetch(args: dict) -> str | ToolError:
     url = args.get("url", "")
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
-        return f"Error: unsupported URL scheme {parsed.scheme!r}. Only http and https are allowed."
+        return ToolError(
+            message=f"unsupported URL scheme {parsed.scheme!r}. Only http and https are allowed.",
+            tool_name="web_fetch",
+            is_user_error=True,
+        )
 
     if not parsed.hostname:
-        return "Error: invalid URL: missing hostname."
+        return ToolError(
+            message="invalid URL: missing hostname.",
+            tool_name="web_fetch",
+            is_user_error=True,
+        )
 
     class _SafeHTTPConnection(http.client.HTTPConnection):
         def connect(self):
@@ -532,7 +631,11 @@ async def _handle_web_fetch(args: dict) -> str:
     try:
         raw = await asyncio.to_thread(_fetch)
     except Exception as exc:
-        return f"Error fetching URL: {exc}"
+        return ToolError(
+            message=f"Error fetching URL: {exc}",
+            tool_name="web_fetch",
+            is_user_error=isinstance(exc, ValueError),
+        )
 
     text = _strip_html(raw)
     if len(text) > _WEB_FETCH_MAX_CHARS:
@@ -540,16 +643,24 @@ async def _handle_web_fetch(args: dict) -> str:
     return text
 
 
-async def _handle_web_search(args: dict) -> str:
+async def _handle_web_search(args: dict) -> str | ToolError:
     query = args.get("query", "")
     max_results = args.get("max_results", 5)
 
     try:
         results = await asyncio.to_thread(_web_search_impl, query, max_results)
     except ImportError:
-        return "Error: duckduckgo-search is not installed. Install it with: pip install duckduckgo-search"
+        return ToolError(
+            message="duckduckgo-search is not installed. Install it with: pip install duckduckgo-search",
+            tool_name="web_search",
+            is_user_error=False,
+        )
     except Exception as exc:
-        return f"Error performing search: {exc}"
+        return ToolError(
+            message=f"Error performing search: {exc}",
+            tool_name="web_search",
+            is_user_error=False,
+        )
 
     if not results:
         return "No results found."
@@ -894,7 +1005,7 @@ class BuiltinToolManager:
     def get_tool_definitions(self) -> list[dict]:
         return list(_TOOL_DEFS)
 
-    async def call_tool(self, name: str, arguments: dict) -> str:
+    async def call_tool(self, name: str, arguments: dict) -> str | ToolError:
         if name in _SIMPLE_HANDLERS:
             return await _SIMPLE_HANDLERS[name](arguments)
         if name in _PLAN_HANDLERS:
@@ -903,4 +1014,8 @@ class BuiltinToolManager:
             return await _TODO_HANDLERS[name](arguments)
         if name in _QUESTION_HANDLERS:
             return await _QUESTION_HANDLERS[name](arguments)
-        raise ValueError(f"Unknown built-in tool: {name!r}")
+        return ToolError(
+            message=f"Unknown built-in tool: {name!r}",
+            tool_name=name,
+            is_user_error=True,
+        )
