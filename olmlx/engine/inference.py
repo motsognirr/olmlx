@@ -410,6 +410,61 @@ def _safe_sync():
     _sync_generation_streams()
 
 
+def _derive_timing_stats(
+    stats: TimingStats,
+    prompt_tps: float,
+    gen_tps: float,
+    eval_timer_ns: int,
+) -> tuple[float, float]:
+    """Populate ``stats.prompt_eval_duration`` and ``stats.eval_duration`` from
+    mlx-lm's measured prefill/decode rates, with conservative fallbacks for
+    cases where mlx-lm didn't report a rate.
+
+    Returns the (possibly back-computed) ``(prompt_tps, gen_tps)`` so the
+    caller's "Generation complete" log line remains informative when a rate
+    was missing.
+
+    Convention (matches Ollama): ``prompt_eval_duration`` covers prefill,
+    ``eval_duration`` covers decode only. Their sum should never exceed
+    ``eval_timer_ns``.
+    """
+    if prompt_tps > 0 and stats.prompt_eval_count > 0:
+        stats.prompt_eval_duration = int(stats.prompt_eval_count / prompt_tps * 1e9)
+    elif stats.prompt_eval_count > 0 and stats.eval_count == 0:
+        # No decode happened — entire timer is prefill.
+        stats.prompt_eval_duration = eval_timer_ns
+
+    if gen_tps > 0 and stats.eval_count > 0:
+        stats.eval_duration = int(stats.eval_count / gen_tps * 1e9)
+    elif stats.eval_count == 0:
+        # No decode happened — match Ollama's convention.
+        stats.eval_duration = 0
+    else:
+        # Subtract known prefill from the wall-clock timer. ``max(0, …)``
+        # guards against rate-noise where the rate-derived prefill exceeds
+        # the wall-clock — clamp instead of double-counting.
+        stats.eval_duration = max(0, eval_timer_ns - stats.prompt_eval_duration)
+
+    # Symmetric back-compute: if only ``gen_tps`` was reported, recover
+    # prefill from the wall-clock minus the (now known) decode duration.
+    if (
+        stats.prompt_eval_duration == 0
+        and stats.prompt_eval_count > 0
+        and stats.eval_duration > 0
+        and eval_timer_ns > stats.eval_duration
+    ):
+        stats.prompt_eval_duration = eval_timer_ns - stats.eval_duration
+
+    # Log-only fallback so the "Generation complete" line stays informative
+    # when mlx-lm didn't report a rate directly.
+    if gen_tps == 0 and stats.eval_duration and stats.eval_count:
+        gen_tps = stats.eval_count / (stats.eval_duration / 1e9)
+    if prompt_tps == 0 and stats.prompt_eval_duration and stats.prompt_eval_count:
+        prompt_tps = stats.prompt_eval_count / (stats.prompt_eval_duration / 1e9)
+
+    return prompt_tps, gen_tps
+
+
 def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
     """Sync Metal GPU state at inference-lock entry/exit with configurable scope.
 
@@ -2362,47 +2417,12 @@ async def _stream_completion(
             else:
                 raw_text = ""
 
-            # eval_timer covers prefill + decode. To match Ollama's convention
-            # (prompt_eval_duration = prefill, eval_duration = decode-only) we
-            # derive both from mlx-lm's measured rates. Fallbacks below cover
-            # the cases where mlx-lm doesn't report a rate.
-            prompt_tps = getattr(token, "prompt_tps", 0) or 0
-            gen_tps = getattr(token, "generation_tps", 0) or 0
-            if prompt_tps > 0 and stats.prompt_eval_count > 0:
-                stats.prompt_eval_duration = int(
-                    stats.prompt_eval_count / prompt_tps * 1e9
-                )
-            elif stats.prompt_eval_count > 0 and stats.eval_count == 0:
-                # No decode happened — entire timer is prefill.
-                stats.prompt_eval_duration = eval_timer.duration_ns
-            if gen_tps > 0 and stats.eval_count > 0:
-                stats.eval_duration = int(stats.eval_count / gen_tps * 1e9)
-            elif stats.eval_count == 0:
-                # No decode happened — match Ollama's convention.
-                stats.eval_duration = 0
-            elif (
-                stats.prompt_eval_duration > 0
-                and eval_timer.duration_ns > stats.prompt_eval_duration
-            ):
-                # Subtract the (known) prefill from the wall-clock timer to
-                # recover decode-only time exactly.
-                stats.eval_duration = (
-                    eval_timer.duration_ns - stats.prompt_eval_duration
-                )
-            else:
-                stats.eval_duration = eval_timer.duration_ns
-            # Log-only fallback so the "Generation complete" line stays
-            # informative when mlx-lm didn't report a rate directly.
-            if gen_tps == 0 and stats.eval_duration and stats.eval_count:
-                gen_tps = stats.eval_count / (stats.eval_duration / 1e9)
-            if (
-                prompt_tps == 0
-                and stats.prompt_eval_duration
-                and stats.prompt_eval_count
-            ):
-                prompt_tps = stats.prompt_eval_count / (
-                    stats.prompt_eval_duration / 1e9
-                )
+            prompt_tps, gen_tps = _derive_timing_stats(
+                stats,
+                getattr(token, "prompt_tps", 0) or 0,
+                getattr(token, "generation_tps", 0) or 0,
+                eval_timer.duration_ns,
+            )
 
         stats.total_duration = total_timer.duration_ns
         if not timed_out:
@@ -2655,33 +2675,12 @@ async def _full_completion_inner(
     if hasattr(result, "generation_tokens"):
         stats.eval_count = result.generation_tokens
 
-    # eval_timer covers prefill + decode. Match Ollama's convention by deriving
-    # prompt_eval_duration (prefill) and eval_duration (decode) from mlx-lm's
-    # measured rates. Fallbacks mirror the streaming path.
-    prompt_tps = getattr(result, "prompt_tps", 0) or 0
-    gen_tps = getattr(result, "generation_tps", 0) or 0
-    if prompt_tps > 0 and stats.prompt_eval_count > 0:
-        stats.prompt_eval_duration = int(stats.prompt_eval_count / prompt_tps * 1e9)
-    elif stats.prompt_eval_count > 0 and stats.eval_count == 0:
-        stats.prompt_eval_duration = eval_timer.duration_ns
-    if gen_tps > 0 and stats.eval_count > 0:
-        stats.eval_duration = int(stats.eval_count / gen_tps * 1e9)
-    elif stats.eval_count == 0:
-        # No decode happened — match Ollama's convention.
-        stats.eval_duration = 0
-    elif (
-        stats.prompt_eval_duration > 0
-        and eval_timer.duration_ns > stats.prompt_eval_duration
-    ):
-        stats.eval_duration = eval_timer.duration_ns - stats.prompt_eval_duration
-    else:
-        stats.eval_duration = eval_timer.duration_ns
-    # Log-only fallback so the "Generation complete" line stays informative
-    # when mlx-lm didn't report a rate directly.
-    if gen_tps == 0 and stats.eval_duration and stats.eval_count:
-        gen_tps = stats.eval_count / (stats.eval_duration / 1e9)
-    if prompt_tps == 0 and stats.prompt_eval_duration and stats.prompt_eval_count:
-        prompt_tps = stats.prompt_eval_count / (stats.prompt_eval_duration / 1e9)
+    prompt_tps, gen_tps = _derive_timing_stats(
+        stats,
+        getattr(result, "prompt_tps", 0) or 0,
+        getattr(result, "generation_tps", 0) or 0,
+        eval_timer.duration_ns,
+    )
     total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
     logger.info(
         "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",

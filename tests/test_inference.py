@@ -31,6 +31,81 @@ from olmlx.utils.streaming import CancellableStream, StreamToken
 from olmlx.utils.timing import TimingStats
 
 
+class TestDeriveTimingStats:
+    """Unit tests for _derive_timing_stats — the helper that converts
+    mlx-lm's rates + a wall-clock fallback into Ollama-convention durations."""
+
+    def test_happy_path_uses_measured_rates(self):
+        from olmlx.engine.inference import _derive_timing_stats
+
+        stats = TimingStats(prompt_eval_count=5, eval_count=10)
+        # 5 / 100 = 50 ms; 10 / 50 = 200 ms — wall clock is irrelevant here.
+        p, g = _derive_timing_stats(stats, 100.0, 50.0, eval_timer_ns=999_999_999)
+        assert stats.prompt_eval_duration == 50_000_000
+        assert stats.eval_duration == 200_000_000
+        assert (p, g) == (100.0, 50.0)
+
+    def test_no_decode_zeroes_eval_duration(self):
+        """eval_count == 0 → eval_duration = 0 (Ollama convention).
+        prompt_eval_duration falls back to the wall-clock timer."""
+        from olmlx.engine.inference import _derive_timing_stats
+
+        stats = TimingStats(prompt_eval_count=12, eval_count=0)
+        _derive_timing_stats(stats, 0.0, 0.0, eval_timer_ns=1_000_000_000)
+        assert stats.prompt_eval_duration == 1_000_000_000
+        assert stats.eval_duration == 0
+
+    def test_decode_subtracts_prefill_from_wall_clock(self):
+        """When gen_tps is missing but prompt_tps is known, decode-only time
+        is the wall-clock minus the (rate-derived) prefill."""
+        from olmlx.engine.inference import _derive_timing_stats
+
+        stats = TimingStats(prompt_eval_count=100, eval_count=10)
+        # prefill = 100 / 1000 = 100 ms; wall-clock = 500 ms → decode = 400 ms.
+        _derive_timing_stats(stats, 1000.0, 0.0, eval_timer_ns=500_000_000)
+        assert stats.prompt_eval_duration == 100_000_000
+        assert stats.eval_duration == 400_000_000
+
+    def test_rate_noise_clamped_not_double_counted(self):
+        """If the rate-derived prefill ends up greater than wall-clock (rate
+        noise), eval_duration must clamp to 0 instead of falling back to the
+        full timer (which would double-count prefill)."""
+        from olmlx.engine.inference import _derive_timing_stats
+
+        stats = TimingStats(prompt_eval_count=100, eval_count=10)
+        # prefill = 100 / 1000 = 100 ms but wall-clock = 90 ms (noise).
+        _derive_timing_stats(stats, 1000.0, 0.0, eval_timer_ns=90_000_000)
+        assert stats.prompt_eval_duration == 100_000_000
+        # Sum of fields must not exceed wall-clock — clamp to 0.
+        assert stats.eval_duration == 0
+
+    def test_back_compute_prefill_when_only_gen_tps_known(self):
+        """When only gen_tps is reported, prompt_eval_duration is recovered
+        from wall-clock minus the (now known) decode duration."""
+        from olmlx.engine.inference import _derive_timing_stats
+
+        stats = TimingStats(prompt_eval_count=200, eval_count=10)
+        # decode = 10 / 50 = 200 ms; wall-clock = 500 ms → prefill = 300 ms.
+        p, g = _derive_timing_stats(stats, 0.0, 50.0, eval_timer_ns=500_000_000)
+        assert stats.eval_duration == 200_000_000
+        assert stats.prompt_eval_duration == 300_000_000
+        # Log-only tps fallback fills in the missing prompt_tps.
+        assert p == pytest.approx(200 / 0.300)
+        assert g == 50.0
+
+    def test_log_fallback_derives_tps_from_durations(self):
+        """When neither rate is reported but durations come from fallbacks,
+        the returned tps values are back-computed for the log line."""
+        from olmlx.engine.inference import _derive_timing_stats
+
+        stats = TimingStats(prompt_eval_count=5, eval_count=0)
+        p, g = _derive_timing_stats(stats, 0.0, 0.0, eval_timer_ns=100_000_000)
+        # eval_count==0 → gen_tps stays 0 (no decode to back-compute from).
+        assert g == 0.0
+        # prompt_eval_duration is 100 ms, prompt_eval_count is 5 → 50 tok/s.
+        assert p == pytest.approx(50.0)
+
+
 class TestBuildGenerateKwargs:
     def test_empty_options(self):
         assert _build_generate_kwargs(None) == {}
