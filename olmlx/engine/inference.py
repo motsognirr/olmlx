@@ -1998,30 +1998,28 @@ async def _store_prompt_cache_after_generation(
     stored_tokens = list(full_prompt_tokens) + generated_tokens
     actual_total = len(full_prompt_tokens) + eval_count
     max_cache_tokens = settings.prompt_cache_max_tokens
-    if max_cache_tokens is not None and actual_total > max_cache_tokens:
-        if not lm.supports_cache_trim:
-            # Non-trimmable hybrid cache: trim_prompt_cache would call
-            # can_trim_prompt_cache → RotatingKVCache.is_trimmable()
-            # which returns False once the ring buffer fills, causing
-            # the trim to silently return 0.  Store without trimming
-            # so the cache survives for strict-extension reuse on the
-            # next turn; the pre-generation path will discard it if
-            # alignment requires a trim.
-            #
-            # If None-ID tokens were produced during generation
-            # (eval_count != len(generated_tokens)), the KV ring buffer
-            # contains stale generation entries at positions we can't
-            # trim out, and the metadata can't faithfully represent
-            # them.  Don't store at all — a stale cache is worse than
-            # no cache.
-            if eval_count != len(generated_tokens):
-                logger.debug(
-                    "Non-trimmable cache with misaligned eval_count "
-                    "(%d != %d); skipping storage",
-                    eval_count,
-                    len(generated_tokens),
-                )
-                return
+
+    # Non-trimmable hybrid caches (RotatingKVCache) can never be trimmed
+    # back.  The pre-generation setup path handles cache alignment by
+    # discarding and creating fresh; here we store as-is or skip entirely
+    # when the metadata is known to be unreliable.
+    if not lm.supports_cache_trim:
+        if eval_count != len(generated_tokens):
+            # None-ID tokens: the ring buffer has stale generation entries
+            # at positions we can't trim out, and the metadata can't
+            # faithfully represent them.  Remove any previous entry from
+            # the store (the mutable cache object was shared) and skip
+            # storage — a corrupt cache is worse than no cache.
+            lm.prompt_cache_store.remove(cache_id)
+            logger.debug(
+                "Non-trimmable cache with misaligned eval_count "
+                "(%d != %d); skipping storage",
+                eval_count,
+                len(generated_tokens),
+            )
+            return
+
+        if max_cache_tokens is not None and actual_total > max_cache_tokens:
             logger.warning(
                 "Storing non-trimmable cache at %d tokens "
                 "(would-be trim=%d, exceeds limit of %d); "
@@ -2030,17 +2028,18 @@ async def _store_prompt_cache_after_generation(
                 actual_total - max_cache_tokens,
                 max_cache_tokens,
             )
-            evicted = await lm.prompt_cache_store.async_set(
-                cache_id,
-                CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
-            )
-            if evicted is not None:
-                del evicted
-                if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
-                    gc.collect()
-                    mx.clear_cache()
-            return
+        evicted = await lm.prompt_cache_store.async_set(
+            cache_id,
+            CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
+        )
+        if evicted is not None:
+            del evicted
+            if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+                gc.collect()
+                mx.clear_cache()
+        return
 
+    if max_cache_tokens is not None and actual_total > max_cache_tokens:
         trim_amount = actual_total - max_cache_tokens
         # cache_invalidated drives the post-trim flow.  Set when:
         # (a) trim returns the wrong amount (trimmable cache misreporting), or
