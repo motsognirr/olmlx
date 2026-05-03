@@ -444,39 +444,50 @@ def _derive_timing_stats(
     if not isinstance(gen_tps, (int, float)):
         gen_tps = 0.0
 
-    if prompt_tps > 0 and stats.prompt_eval_count > 0:
-        # Clamp to wall-clock — rate noise can produce values exceeding the
-        # actual elapsed time, which would otherwise break the sum invariant.
-        stats.prompt_eval_duration = min(
-            int(stats.prompt_eval_count / prompt_tps * 1e9),
-            eval_timer_ns,
-        )
-    elif stats.prompt_eval_count > 0 and stats.eval_count == 0:
-        # No decode happened — entire timer is prefill.
-        stats.prompt_eval_duration = eval_timer_ns
+    raw_prompt_ns = (
+        int(stats.prompt_eval_count / prompt_tps * 1e9)
+        if prompt_tps > 0 and stats.prompt_eval_count > 0
+        else 0
+    )
+    raw_decode_ns = (
+        int(stats.eval_count / gen_tps * 1e9)
+        if gen_tps > 0 and stats.eval_count > 0
+        else 0
+    )
 
-    if gen_tps > 0 and stats.eval_count > 0:
-        stats.eval_duration = min(
-            int(stats.eval_count / gen_tps * 1e9),
-            eval_timer_ns - stats.prompt_eval_duration,
-        )
-    elif stats.eval_count == 0:
-        # No decode happened — match Ollama's convention.
-        stats.eval_duration = 0
+    if raw_prompt_ns and raw_decode_ns:
+        # Both rates known. If their sum exceeds wall-clock (rate noise) split
+        # eval_timer_ns proportionally so each phase gets a non-zero share —
+        # forcing one to 0 would create divide-by-zero on the client.
+        raw_total = raw_prompt_ns + raw_decode_ns
+        if raw_total > eval_timer_ns:
+            stats.prompt_eval_duration = int(eval_timer_ns * raw_prompt_ns / raw_total)
+            stats.eval_duration = eval_timer_ns - stats.prompt_eval_duration
+        else:
+            stats.prompt_eval_duration = raw_prompt_ns
+            stats.eval_duration = raw_decode_ns
+    elif raw_prompt_ns:
+        # Only prompt rate known.
+        stats.prompt_eval_duration = min(raw_prompt_ns, eval_timer_ns)
+        if stats.eval_count == 0:
+            stats.eval_duration = 0
+        else:
+            stats.eval_duration = max(0, eval_timer_ns - stats.prompt_eval_duration)
+    elif raw_decode_ns:
+        # Only decode rate known. Recover prefill by subtraction.
+        stats.eval_duration = min(raw_decode_ns, eval_timer_ns)
+        if stats.prompt_eval_count > 0:
+            stats.prompt_eval_duration = max(0, eval_timer_ns - stats.eval_duration)
     else:
-        # Subtract known prefill from the wall-clock timer. ``max(0, …)``
-        # guards against the (post-clamp impossible) negative case.
-        stats.eval_duration = max(0, eval_timer_ns - stats.prompt_eval_duration)
-
-    # Symmetric back-compute: if only ``gen_tps`` was reported, recover
-    # prefill from the wall-clock minus the (now known) decode duration.
-    if (
-        stats.prompt_eval_duration == 0
-        and stats.prompt_eval_count > 0
-        and stats.eval_duration > 0
-        and eval_timer_ns > stats.eval_duration
-    ):
-        stats.prompt_eval_duration = eval_timer_ns - stats.eval_duration
+        # Neither rate known.
+        if stats.eval_count == 0:
+            if stats.prompt_eval_count > 0:
+                # Whole timer is prefill.
+                stats.prompt_eval_duration = eval_timer_ns
+            stats.eval_duration = 0
+        else:
+            # Underdetermined: assign full timer to decode (documented above).
+            stats.eval_duration = eval_timer_ns
 
     # Log-line rates: always derive from the final stored durations so the
     # "Generation complete" log agrees with the API response. This matters

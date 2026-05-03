@@ -72,6 +72,20 @@ class TestDeriveTimingStats:
         assert stats.eval_duration == 0
         assert stats.prompt_eval_duration + stats.eval_duration <= 90_000_000
 
+    def test_both_rates_exceed_wall_clock_split_proportionally(self):
+        """Both rates valid but their combined duration > wall-clock: split
+        eval_timer_ns proportionally so neither phase ends up at 0 (which
+        would cause divide-by-zero on Ollama clients computing tok/s)."""
+        stats = TimingStats(prompt_eval_count=100, eval_count=50)
+        # raw prefill = 100/200 = 500ms; raw decode = 50/100 = 500ms;
+        # combined 1000ms but wall-clock = 400ms → 50/50 split → 200ms each.
+        _derive_timing_stats(stats, 200.0, 100.0, eval_timer_ns=400_000_000)
+        assert stats.prompt_eval_duration == 200_000_000
+        assert stats.eval_duration == 200_000_000
+        assert stats.prompt_eval_duration + stats.eval_duration == 400_000_000, (
+            "proportional split must exactly fill wall-clock"
+        )
+
     def test_back_compute_prefill_when_only_gen_tps_known(self):
         """When only gen_tps is reported, prompt_eval_duration is recovered
         from wall-clock minus the (now known) decode duration."""
