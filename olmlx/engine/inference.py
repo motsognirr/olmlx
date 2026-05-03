@@ -1984,6 +1984,12 @@ async def _store_prompt_cache_after_generation(
 
     Handles trimming to max_cache_tokens, eviction pressure cleanup,
     and cache invalidation on trim failure.
+
+    Non-trimmable hybrid caches (e.g. Gemma 4, Qwen3-Next with
+    RotatingKVCache layers) skip the trim path and are stored as-is
+    even when they exceed max_cache_tokens.  The pre-generation setup
+    path handles their eventual discard when alignment requires a trim;
+    this storage just keeps them alive for strict-extension cache hits.
     """
     prompt_cache = gen_kwargs.get("prompt_cache")
     if prompt_cache is None or full_prompt_tokens is None:
@@ -1992,11 +1998,57 @@ async def _store_prompt_cache_after_generation(
     stored_tokens = list(full_prompt_tokens) + generated_tokens
     actual_total = len(full_prompt_tokens) + eval_count
     max_cache_tokens = settings.prompt_cache_max_tokens
+
+    # Non-trimmable hybrid caches (RotatingKVCache) can never be trimmed
+    # back.  The pre-generation setup path handles cache alignment by
+    # discarding and creating fresh; here we store as-is or skip entirely
+    # when the metadata is known to be unreliable.
+    if not lm.supports_cache_trim:
+        if eval_count != len(generated_tokens):
+            # None-ID tokens: the ring buffer has stale generation entries
+            # at positions we can't trim out, and the metadata can't
+            # faithfully represent them.  Remove any previous entry from
+            # the store (the mutable cache object was shared) and skip
+            # storage — a corrupt cache is worse than no cache.
+            lm.prompt_cache_store.remove(cache_id)
+            logger.debug(
+                "Non-trimmable cache with misaligned eval_count "
+                "(%d != %d); skipping storage",
+                eval_count,
+                len(generated_tokens),
+            )
+            return
+
+        if max_cache_tokens is not None and actual_total > max_cache_tokens:
+            logger.warning(
+                "Storing non-trimmable cache at %d tokens "
+                "(would-be trim=%d, exceeds limit of %d); "
+                "max_cache_tokens is advisory for hybrid sliding-window models",
+                len(stored_tokens),
+                actual_total - max_cache_tokens,
+                max_cache_tokens,
+            )
+        evicted = await lm.prompt_cache_store.async_set(
+            cache_id,
+            CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
+        )
+        if evicted is not None:
+            del evicted
+            if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+                gc.collect()
+                mx.clear_cache()
+        logger.debug(
+            "Cache stored (non-trimmable): %d tokens (%d prompt + %d generated)",
+            len(stored_tokens),
+            len(full_prompt_tokens),
+            len(generated_tokens),
+        )
+        return
+
     if max_cache_tokens is not None and actual_total > max_cache_tokens:
         trim_amount = actual_total - max_cache_tokens
         # cache_invalidated drives the post-trim flow.  Set when:
-        # (a) trim returns the wrong amount (non-trimmable hybrid
-        # cache like Qwen3-Next — expected operating condition), or
+        # (a) trim returns the wrong amount (trimmable cache misreporting), or
         # (b) trim raises an unexpected exception.  In either case
         # the storage block is skipped and the cache reference is
         # released.  Using a flag avoids signalling a normal "this
@@ -2005,10 +2057,9 @@ async def _store_prompt_cache_after_generation(
         try:
             trimmed = trim_prompt_cache(prompt_cache, trim_amount)
             if trimmed != trim_amount:
-                # Hybrid/non-trimmable cache: a partial trim would
-                # leave the stored cache misaligned with stored_tokens
-                # metadata, so invalidate rather than carry a broken
-                # cache forward.
+                # A trimmable cache that under-delivers on trim
+                # (possible with unusual cache implementations).
+                # Invalidate rather than carry a broken cache forward.
                 logger.warning(
                     "Cache trim incomplete (asked for %d, got %d); invalidating cache",
                     trim_amount,
