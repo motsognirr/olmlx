@@ -2362,13 +2362,20 @@ async def _stream_completion(
             else:
                 raw_text = ""
 
-            stats.eval_duration = eval_timer.duration_ns
+            # eval_timer covers prefill + decode. To match Ollama's convention
+            # (prompt_eval_duration = prefill, eval_duration = decode-only) we
+            # derive both from mlx-lm's measured rates instead. Fall back to the
+            # wall-clock timer only when mlx-lm doesn't report a rate.
             prompt_tps = getattr(token, "prompt_tps", 0) or 0
             gen_tps = getattr(token, "generation_tps", 0) or 0
             if prompt_tps > 0 and stats.prompt_eval_count > 0:
                 stats.prompt_eval_duration = int(
                     stats.prompt_eval_count / prompt_tps * 1e9
                 )
+            if gen_tps > 0 and stats.eval_count > 0:
+                stats.eval_duration = int(stats.eval_count / gen_tps * 1e9)
+            else:
+                stats.eval_duration = eval_timer.duration_ns
 
         stats.total_duration = total_timer.duration_ns
         if not timed_out:
@@ -2607,7 +2614,6 @@ async def _full_completion_inner(
         with Timer() as eval_timer:
             result = await asyncio.to_thread(_generate_sync)
 
-    stats.eval_duration = eval_timer.duration_ns
     stats.total_duration = total_timer.duration_ns
 
     # Unpack (GenerationResult, full_text) tuple from stream_generate path
@@ -2622,17 +2628,17 @@ async def _full_completion_inner(
     if hasattr(result, "generation_tokens"):
         stats.eval_count = result.generation_tokens
 
-    eval_secs = stats.eval_duration / 1e9 if stats.eval_duration else 0
-    prompt_tps_raw = getattr(result, "prompt_tps", 0)
-    prompt_tps = (
-        float(prompt_tps_raw) if isinstance(prompt_tps_raw, (int, float)) else 0.0
-    )
-    gen_tps_raw = getattr(result, "generation_tps", 0)
-    gen_tps = float(gen_tps_raw) if isinstance(gen_tps_raw, (int, float)) else 0.0
+    # eval_timer covers prefill + decode. Match Ollama's convention by deriving
+    # prompt_eval_duration (prefill) and eval_duration (decode) from mlx-lm's
+    # measured rates, falling back to the wall-clock timer if unavailable.
+    prompt_tps = float(getattr(result, "prompt_tps", 0) or 0)
+    gen_tps = float(getattr(result, "generation_tps", 0) or 0)
     if prompt_tps > 0 and stats.prompt_eval_count > 0:
         stats.prompt_eval_duration = int(stats.prompt_eval_count / prompt_tps * 1e9)
-    if gen_tps <= 0 and eval_secs > 0:
-        gen_tps = stats.eval_count / eval_secs
+    if gen_tps > 0 and stats.eval_count > 0:
+        stats.eval_duration = int(stats.eval_count / gen_tps * 1e9)
+    else:
+        stats.eval_duration = eval_timer.duration_ns
     total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
     logger.info(
         "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",

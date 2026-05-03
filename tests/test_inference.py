@@ -1326,12 +1326,15 @@ class TestGenerateCompletion:
         # last chunk is the done signal
         assert chunks[-1]["done"] is True
         assert any(c.get("text") == "Hello" for c in chunks if not c.get("done"))
-        # prompt_eval_duration should be derived from prompt_tps so the
-        # Ollama-compatible response surfaces a non-zero prefill time.
-        # 5 prompt tokens at 100 tok/s → 50 ms = 50_000_000 ns
+        # Ollama convention: prompt_eval_duration covers prefill, eval_duration
+        # covers decode only. Both are derived from mlx-lm's measured rates so
+        # they don't overlap (eval_duration used to include prefill time).
+        # 5 prompt tokens at 100 tok/s → 50 ms; 2 gen tokens at 50 tok/s → 40 ms
         done_stats = chunks[-1]["stats"]
         assert done_stats.prompt_eval_count == 5
         assert done_stats.prompt_eval_duration == 50_000_000
+        assert done_stats.eval_count == 2
+        assert done_stats.eval_duration == 40_000_000
 
 
 class TestGenerateChat:
@@ -1448,7 +1451,14 @@ class TestFullCompletionInner:
 
         mock_result = MagicMock()
         mock_result.text = "result text"
+        # Provide real numeric rates so the production code can derive
+        # prompt_eval_duration / eval_duration without needing a type guard.
+        mock_result.prompt_tokens = 5
+        mock_result.generation_tokens = 10
+        mock_result.prompt_tps = 100.0
+        mock_result.generation_tps = 50.0
 
+        stats = TimingStats()
         with patch(
             "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
         ) as mock_thread:
@@ -1458,10 +1468,15 @@ class TestFullCompletionInner:
                 "prompt",
                 100,
                 {},
-                TimingStats(),
+                stats,
             )
 
         assert result["text"] == "result text"
+        # 5 / 100 tok/s = 50 ms;  10 / 50 tok/s = 200 ms
+        assert stats.prompt_eval_count == 5
+        assert stats.prompt_eval_duration == 50_000_000
+        assert stats.eval_count == 10
+        assert stats.eval_duration == 200_000_000
 
     @pytest.mark.asyncio
     async def test_result_as_string(self, mock_manager):
