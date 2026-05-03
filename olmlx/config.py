@@ -11,12 +11,16 @@ SyncMode = Literal["full", "minimal", "none"]
 
 
 class Settings(BaseSettings):
+    # Note: ``validate_assignment=True`` applies to *all* fields, not just
+    # the new speculative ones. Programmatic writes that previously
+    # silently set out-of-range values (e.g. ``settings.port = 0``) now
+    # raise ``ValidationError``. This is intentional — tests and CLI
+    # overrides should not be able to construct invalid Settings — but
+    # it does broaden the surface beyond the immediate use case.
     model_config = {
         "env_prefix": "OLMLX_",
         "env_file": ".env",
         "extra": "ignore",
-        # Validate field constraints on assignment so programmatic writes
-        # (e.g. CLI overrides, tests) cannot bypass ``Field(gt=0)`` etc.
         "validate_assignment": True,
     }
 

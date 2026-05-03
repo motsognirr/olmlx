@@ -159,6 +159,19 @@ def _forward_legacy_speculative_env(_settings) -> None:
         try:
             value = parse(legacy_val)
             setattr(_settings, attr, value)
+            # Per-field log so the override is visible alongside the
+            # bulk deprecation banner. Notable when a ``.env`` file set
+            # the new field to its schema default and the legacy shell
+            # var clobbers it — the operator gets a clear "X → Y"
+            # trail, not just the up-front banner.
+            logger.warning(
+                "Forwarding legacy %s=%r → settings.%s; the new env var "
+                "%s would take precedence if set.",
+                legacy,
+                legacy_val,
+                attr,
+                new,
+            )
         except Exception as exc:
             # Catches both parse errors (ValueError/TypeError) and the
             # ``pydantic_core.ValidationError`` raised on assignment when
@@ -357,7 +370,10 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
             exc,
         )
         return [], [], [], False
-    except Exception as exc:
+    except (OSError, ImportError) as exc:
+        # I/O / packaging failures: never block startup. A wider catch
+        # would silently swallow programming errors (typos, missing
+        # attributes), so we keep it narrow on purpose.
         logger.warning(
             "Skipping speculative config validation: could not load registry: %s",
             exc,

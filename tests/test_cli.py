@@ -216,10 +216,14 @@ class TestBuildParser:
         # Should not raise SystemExit.
         _apply_serve_overrides(args)
 
-    def test_apply_serve_overrides_forwards_legacy_env_vars(self, monkeypatch):
+    def test_apply_serve_overrides_forwards_legacy_env_vars(self, monkeypatch, caplog):
         """Legacy OLMLX_EXPERIMENTAL_SPECULATIVE* values are forwarded to
         the new Settings during the deprecation window so users don't
-        silently lose speculative decoding on upgrade."""
+        silently lose speculative decoding on upgrade. Each forwarded
+        field also produces a per-field warning so the override is
+        visible alongside the bulk deprecation banner."""
+        import logging
+
         from olmlx.cli import _apply_serve_overrides
         from olmlx.config import settings as _settings
 
@@ -246,11 +250,18 @@ class TestBuildParser:
 
         parser = build_parser()
         args = parser.parse_args(["serve"])
-        _apply_serve_overrides(args)
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
 
         assert _settings.speculative is True
         assert _settings.speculative_draft_model == "Qwen/Qwen3-0.6B"
         assert _settings.speculative_tokens == 8
+        # Per-field forward warning fired for each value.
+        assert "Forwarding legacy OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS" in caplog.text
+        assert (
+            "Forwarding legacy OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL"
+            in caplog.text
+        )
 
     def test_legacy_env_var_validation_errors_are_swallowed(self, monkeypatch, caplog):
         """A legacy value that fails Settings validation must not block

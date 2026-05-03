@@ -1724,9 +1724,13 @@ class ModelManager:
         if spec_config is None:
             from olmlx.config import settings as _settings
 
+            # Mirror ``ModelConfig.resolved_speculative()``: zero out
+            # the draft slot when speculative is disabled so callers
+            # never see a non-None draft on a disabled tuple.
+            draft = _settings.speculative_draft_model if _settings.speculative else None
             spec_config = (
                 _settings.speculative,
-                _settings.speculative_draft_model,
+                draft,
                 _settings.speculative_tokens,
             )
         spec_enabled = spec_config[0]
