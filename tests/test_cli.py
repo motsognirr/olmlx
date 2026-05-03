@@ -226,9 +226,7 @@ class TestBuildParser:
 
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
-        monkeypatch.setattr(
-            "olmlx.cli._models_with_invalid_speculative_config", lambda: []
-        )
+        monkeypatch.setattr("olmlx.cli._audit_speculative_config", lambda: ([], []))
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE", "true")
         monkeypatch.setenv(
             "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", "Qwen/Qwen3-0.6B"
@@ -251,14 +249,68 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
-            "olmlx.cli._models_with_invalid_speculative_config",
-            lambda: ["bad/model:latest"],
+            "olmlx.cli._audit_speculative_config",
+            lambda: (["bad/model:latest"], []),
         )
         parser = build_parser()
         args = parser.parse_args(["serve"])
         with pytest.raises(SystemExit) as excinfo:
             _apply_serve_overrides(args)
         assert excinfo.value.code == 2
+
+    def test_apply_serve_overrides_warns_on_dormant_draft(self, monkeypatch, caplog):
+        """A draft configured for a model with speculative=False emits a
+        warning so the user notices the dormant config."""
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda: ([], ["dormant/model:latest"]),
+        )
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        assert "dormant/model:latest" in caplog.text
+        assert "speculative_draft_model" in caplog.text
+
+    def test_audit_speculative_config_classifies_models(self, monkeypatch, tmp_path):
+        """End-to-end: registry walk classifies models into bad/dormant."""
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "good/a:latest": {
+                        "hf_path": "good/a",
+                        "speculative": True,
+                        "speculative_draft_model": "good/draft",
+                    },
+                    "bad/no-draft:latest": {
+                        "hf_path": "bad/no-draft",
+                        "speculative": True,
+                    },
+                    "dormant/has-draft:latest": {
+                        "hf_path": "dormant/has-draft",
+                        "speculative_draft_model": "dormant/draft",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+
+        bad, dormant = _audit_speculative_config()
+        assert bad == ["bad/no-draft:latest"]
+        assert dormant == ["dormant/has-draft:latest"]
 
     def test_service_install(self):
         parser = build_parser()

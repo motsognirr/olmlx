@@ -138,7 +138,15 @@ def _apply_serve_overrides(args) -> None:
     # catches per-model entries that enable speculative without a draft.
     # The "global speculative=true and zero registered models" case is
     # not flagged here — the first model load will raise a clear error.
-    bad = _models_with_invalid_speculative_config()
+    bad, dormant_drafts = _audit_speculative_config()
+    if dormant_drafts:
+        logger.warning(
+            "speculative_draft_model is configured for the following "
+            "models but speculative decoding is disabled "
+            "(speculative=false), so the draft model will be ignored: %s. "
+            "Set speculative=true (per-model or globally) to enable.",
+            ", ".join(dormant_drafts),
+        )
     if bad:
         print(
             "Error: the following models in models.json enable speculative "
@@ -150,11 +158,19 @@ def _apply_serve_overrides(args) -> None:
         sys.exit(2)
 
 
-def _models_with_invalid_speculative_config() -> list[str]:
-    """Return models whose resolved speculative config is enabled but has
-    no draft model. The registry is loaded from disk; failures are logged
-    and treated as "nothing to validate" so this never blocks startup on
-    its own.
+def _audit_speculative_config() -> tuple[list[str], list[str]]:
+    """Walk the registry and audit each model's resolved speculative
+    config.
+
+    Returns ``(bad, dormant_drafts)``:
+    - ``bad`` — models with ``speculative=True`` but no draft model
+      anywhere. Triggers a startup error.
+    - ``dormant_drafts`` — models with a per-model ``speculative_draft_model``
+      set but the resolved ``enabled`` flag is False. Triggers a
+      warning so users don't silently lose the draft they configured.
+
+    The registry is loaded from disk; failures are logged and treated
+    as "nothing to validate" so this never blocks startup on its own.
     """
     try:
         from olmlx.engine.registry import ModelRegistry
@@ -166,12 +182,17 @@ def _models_with_invalid_speculative_config() -> list[str]:
             "Skipping speculative config validation: could not load registry: %s",
             exc,
         )
-        return []
+        return [], []
     bad: list[str] = []
+    dormant: list[str] = []
     for name, mc in registry.list_models().items():
         enabled, draft, _ = mc.resolved_speculative()
         if enabled and not draft:
             bad.append(name)
+        elif not enabled and mc.speculative_draft_model:
+            dormant.append(name)
+    return bad, dormant
+
     return bad
 
 
@@ -1828,11 +1849,13 @@ def cli_main():
     if args.command is None or args.command == "serve":
         # Re-parse with the serve subparser when invoked bare so the
         # serve flags (--speculative, etc.) are always present on args.
-        # Forwarding ``sys.argv[1:]`` keeps any future top-level flags
-        # working — the only argv that reaches here is empty today, but
-        # hard-coding ``["serve"]`` would silently drop additions.
+        # ``args.command is None`` is only reachable today when
+        # ``sys.argv[1:]`` is empty (the root parser has no global
+        # flags), so an empty arg list is correct. If a global flag is
+        # ever added to ``build_parser``, this re-parse must change to
+        # forward those flags into the serve subparser.
         if args.command is None:
-            args = parser.parse_args(["serve", *sys.argv[1:]])
+            args = parser.parse_args(["serve"])
         cmd_serve(args)
     elif args.command == "service":
         if args.service_command == "install":

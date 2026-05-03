@@ -1454,9 +1454,12 @@ class ModelManager:
         from olmlx.engine.speculative import SpeculativeDecoder
 
         spec_enabled, draft_model_path, num_tokens = spec_config
-        assert spec_enabled, (
-            "_load_speculative_decoder called with spec_config[0]=False"
-        )
+        # Hard guard rather than assert — assert is elided under
+        # ``python -O``, and this invariant must hold in production too.
+        if not spec_enabled:
+            raise RuntimeError(
+                "_load_speculative_decoder called with spec_config[0]=False"
+            )
         if not draft_model_path:
             raise ValueError(
                 "speculative requires speculative_draft_model to be set "
