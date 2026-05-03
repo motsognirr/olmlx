@@ -296,6 +296,47 @@ class TestBuildParser:
             _apply_serve_overrides(args)
         assert excinfo.value.code == 2
 
+    def test_apply_serve_overrides_warns_on_global_dormant_draft(
+        self, monkeypatch, caplog
+    ):
+        """Global ``speculative_draft_model`` set without ``speculative=True``
+        emits a warning so the user notices the dormant config."""
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
+        monkeypatch.setattr("olmlx.cli._audit_speculative_config", lambda: ([], []))
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        assert "OLMLX_SPECULATIVE_DRAFT_MODEL" in caplog.text
+        assert "global/draft" in caplog.text
+
+    def test_models_with_promoted_keys_warns_on_corrupt_json(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A corrupt models.json should produce a visible warning rather
+        than silently passing the migration check."""
+        import logging
+
+        from olmlx.cli import _models_with_promoted_keys_in_experimental
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text("{not valid json")
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            result = _models_with_promoted_keys_in_experimental()
+        assert result == []
+        assert "models.json is invalid JSON" in caplog.text
+
     def test_apply_serve_overrides_warns_on_dormant_draft(self, monkeypatch, caplog):
         """A draft configured for a model with speculative=False emits a
         warning so the user notices the dormant config."""

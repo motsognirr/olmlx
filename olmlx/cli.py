@@ -150,6 +150,19 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(2)
 
+    # Global parallel of the per-model dormant-draft warning: a draft
+    # model is set globally but speculative is off, so the draft will
+    # never be loaded. Per-model overrides still resolve correctly via
+    # ``resolved_speculative()``; this warns about the unused global.
+    if not _settings.speculative and _settings.speculative_draft_model:
+        logger.warning(
+            "OLMLX_SPECULATIVE_DRAFT_MODEL is set to %r but "
+            "OLMLX_SPECULATIVE is false; the draft model will not be "
+            "loaded. Set OLMLX_SPECULATIVE=true (or --speculative) to "
+            "enable.",
+            _settings.speculative_draft_model,
+        )
+
     bad, dormant_drafts = _audit_speculative_config()
     if dormant_drafts:
         logger.warning(
@@ -185,7 +198,16 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
     try:
         with open(settings.models_config) as f:
             raw = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError as exc:
+        # A corrupt models.json hides any pending migration; surface it
+        # as a warning here so the operator notices, rather than letting
+        # the audit's broad except swallow the same failure later.
+        logger.warning(
+            "Skipping speculative migration check: models.json is invalid JSON: %s",
+            exc,
+        )
         return []
     if not isinstance(raw, dict):
         return []
@@ -1887,18 +1909,13 @@ def cli_main():
     args = parser.parse_args()
 
     if args.command is None or args.command == "serve":
-        # Bare invocation: initialise the serve subparser's flag
-        # attributes directly on ``args`` so ``cmd_serve`` can read them
-        # uniformly. Doing this in-place (instead of re-parsing) means
-        # any future top-level flags survive verbatim and a missing
-        # attribute trips an AttributeError instead of being silently
-        # dropped on bare invocation.
+        # Bare invocation: derive serve-subparser defaults from the
+        # parser itself rather than hardcoding the flag list. New serve
+        # flags wire through automatically; any top-level flags already
+        # on ``args`` win because ``hasattr`` short-circuits the copy.
         if args.command is None:
-            for _name, _default in (
-                ("speculative", None),
-                ("speculative_draft_model", None),
-                ("speculative_tokens", None),
-            ):
+            serve_defaults = vars(parser.parse_args(["serve"]))
+            for _name, _default in serve_defaults.items():
                 if not hasattr(args, _name):
                     setattr(args, _name, _default)
         cmd_serve(args)
