@@ -195,7 +195,8 @@ def _apply_serve_overrides(args) -> None:
             "Flash-MoE: %s. Once Flash is prepared and loads, standalone "
             "speculative decoding is dropped — use the model's "
             "flash_speculative settings "
-            "(OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_*) instead.",
+            "(OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_*; flash-speculative "
+            "remains experimental) instead.",
             ", ".join(flash_conflicts),
         )
     if bad:
@@ -1978,6 +1979,10 @@ def cli_main():
         # parser itself rather than hardcoding the flag list. New serve
         # flags wire through automatically; any top-level flags already
         # on ``args`` win because ``hasattr`` short-circuits the copy.
+        # Invariant: top-level parser flag names must not overlap with
+        # serve-only flag names — otherwise this loop would suppress the
+        # serve default for the colliding name. The root parser only
+        # declares the ``command`` dest today, so this holds.
         if args.command is None:
             serve_defaults = vars(parser.parse_args(["serve"]))
             for _name, _default in serve_defaults.items():

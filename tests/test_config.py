@@ -264,12 +264,28 @@ class TestSpeculativeConfig:
         assert mc.speculative is True
         assert mc.speculative_draft_model == "Qwen/Qwen3-0.6B"
         assert mc.speculative_tokens == 6
+        # Promoted keys must NOT leak into ``_extra`` (which is reserved
+        # for unknown forward-compat keys). Reviewers have flagged this
+        # as a suspected bug multiple times — _KNOWN_CONFIG_KEYS is
+        # auto-derived from dataclass fields, but lock it down with an
+        # explicit assertion so the invariant is visible in the suite.
+        assert mc._extra == {}
         # Round-trip preserves the new top-level fields
         entry = mc.to_entry()
         assert isinstance(entry, dict)
         assert entry["speculative"] is True
         assert entry["speculative_draft_model"] == "Qwen/Qwen3-0.6B"
         assert entry["speculative_tokens"] == 6
+
+    def test_known_config_keys_includes_promoted_speculative_fields(self):
+        """Regression: the auto-derived ``_KNOWN_CONFIG_KEYS`` must include
+        the three promoted speculative fields so they don't leak into
+        ``_extra``. This has been a recurring false-positive review finding;
+        locking the invariant down explicitly."""
+        from olmlx.engine.registry import _KNOWN_CONFIG_KEYS
+
+        for key in ("speculative", "speculative_draft_model", "speculative_tokens"):
+            assert key in _KNOWN_CONFIG_KEYS
 
     def test_per_model_speculative_without_draft_resolves_to_none(self):
         """A per-model entry that enables speculative but provides no
