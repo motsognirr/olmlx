@@ -2037,6 +2037,12 @@ async def _store_prompt_cache_after_generation(
             if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
                 gc.collect()
                 mx.clear_cache()
+        logger.debug(
+            "Cache stored (non-trimmable): %d tokens (%d prompt + %d generated)",
+            len(stored_tokens),
+            len(full_prompt_tokens),
+            len(generated_tokens),
+        )
         return
 
     if max_cache_tokens is not None and actual_total > max_cache_tokens:

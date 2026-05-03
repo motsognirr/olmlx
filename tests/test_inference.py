@@ -3790,6 +3790,9 @@ class TestStorePromptCacheAfterGeneration:
         assert call_args[0][0] == "test"
         stored = call_args[0][1]
         assert stored.tokens == [1, 2, 3, 4, 5]
+
+
+class TestInferenceTimeout:
     @pytest.mark.asyncio
     async def test_streaming_stops_after_inference_timeout(self, mock_manager):
         """Streaming generation should stop and return done_reason=timeout."""
