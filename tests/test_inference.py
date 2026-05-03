@@ -102,9 +102,10 @@ class TestDeriveTimingStats:
         bogus = MagicMock()
         # bogus would otherwise be truthy and silently absorbed via __int__.
         _derive_timing_stats(stats, bogus, bogus, eval_timer_ns=200_000_000)
-        # prompt_tps treated as 0 → prefill falls back; eval_count > 0 means
-        # eval_duration = wall-clock - prefill = 200 - 0 = 200 ms.
-        # But back-compute then sets prompt_eval_duration = 200 - 200 = 0.
+        # Both rates coerced to 0; prefill is never set; eval_count > 0
+        # makes the else-branch fire: eval_duration = 200 - 0 = 200 ms.
+        # Back-compute is blocked (eval_timer_ns > eval_duration is
+        # 200 > 200 = false), so prompt_eval_duration stays at 0.
         # The key invariant: no garbage int values from MagicMock arithmetic.
         assert isinstance(stats.prompt_eval_duration, int)
         assert isinstance(stats.eval_duration, int)

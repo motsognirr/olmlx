@@ -427,6 +427,13 @@ def _derive_timing_stats(
     Convention (matches Ollama): ``prompt_eval_duration`` covers prefill,
     ``eval_duration`` covers decode only. Both fields are clamped so their
     sum never exceeds ``eval_timer_ns``.
+
+    Edge case worth knowing: when both counts are nonzero but neither rate
+    is reported, the helper has no way to apportion wall-clock between
+    prefill and decode. It assigns the full timer to decode (since decode
+    is the field most consumers look at) and leaves prefill at 0. The sum
+    invariant still holds; the split is just underdetermined. mlx-lm
+    reports both rates in practice, so this path is essentially unreached.
     """
     # Defensive coercion: third-party result objects sometimes carry
     # non-Python-numeric scalars (numpy/mlx) for these fields, and ad-hoc
@@ -471,11 +478,13 @@ def _derive_timing_stats(
     ):
         stats.prompt_eval_duration = eval_timer_ns - stats.eval_duration
 
-    # Log-only fallback so the "Generation complete" line stays informative
-    # when mlx-lm didn't report a rate directly.
-    if gen_tps == 0 and stats.eval_duration and stats.eval_count:
+    # Log-line rates: always derive from the final stored durations so the
+    # "Generation complete" log agrees with the API response. This matters
+    # when clamping kicks in — the raw mlx-lm rate would imply a different
+    # duration than the one we actually report.
+    if stats.eval_duration > 0 and stats.eval_count > 0:
         gen_tps = stats.eval_count / (stats.eval_duration / 1e9)
-    if prompt_tps == 0 and stats.prompt_eval_duration and stats.prompt_eval_count:
+    if stats.prompt_eval_duration > 0 and stats.prompt_eval_count > 0:
         prompt_tps = stats.prompt_eval_count / (stats.prompt_eval_duration / 1e9)
 
     return prompt_tps, gen_tps
