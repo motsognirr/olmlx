@@ -118,7 +118,7 @@ def _apply_serve_overrides(args) -> None:
     stale = [v for v in _DEPRECATED_SPECULATIVE_ENV_VARS if os.environ.get(v)]
     if stale:
         logger.warning(
-            "Deprecated env vars detected (ignored): %s. Rename to "
+            "Deprecated env vars detected (no longer read): %s. Rename to "
             "OLMLX_SPECULATIVE, OLMLX_SPECULATIVE_DRAFT_MODEL, "
             "OLMLX_SPECULATIVE_TOKENS.",
             ", ".join(stale),
@@ -138,6 +138,18 @@ def _apply_serve_overrides(args) -> None:
     # catches per-model entries that enable speculative without a draft.
     # The "global speculative=true and zero registered models" case is
     # not flagged here — the first model load will raise a clear error.
+    needs_migration = _models_with_promoted_keys_in_experimental()
+    if needs_migration:
+        print(
+            "Error: the following models in models.json still place "
+            "speculative settings under 'experimental' — these keys have "
+            "been promoted to top-level fields. Move 'speculative', "
+            "'speculative_draft_model', and 'speculative_tokens' out of "
+            f"the 'experimental' block. Affected entries: {', '.join(needs_migration)}.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     bad, dormant_drafts = _audit_speculative_config()
     if dormant_drafts:
         logger.warning(
@@ -156,6 +168,32 @@ def _apply_serve_overrides(args) -> None:
             file=sys.stderr,
         )
         sys.exit(2)
+
+
+def _models_with_promoted_keys_in_experimental() -> list[str]:
+    """Return models.json entry names whose ``experimental`` block still
+    contains the promoted speculative keys.
+
+    Such entries are dropped by ``ModelRegistry.load()`` with a buried
+    log warning; surfacing them as a hard startup error makes the
+    migration actionable instead of mysterious.
+    """
+    try:
+        with open(settings.models_config) as f:
+            raw = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, dict):
+        return []
+    promoted_keys = {"speculative", "speculative_draft_model", "speculative_tokens"}
+    bad: list[str] = []
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        exp = entry.get("experimental")
+        if isinstance(exp, dict) and promoted_keys & exp.keys():
+            bad.append(name)
+    return bad
 
 
 def _audit_speculative_config() -> tuple[list[str], list[str]]:
@@ -192,8 +230,6 @@ def _audit_speculative_config() -> tuple[list[str], list[str]]:
         elif not enabled and mc.speculative_draft_model:
             dormant.append(name)
     return bad, dormant
-
-    return bad
 
 
 # Module-level state set by cmd_serve() for the app lifespan to retrieve.

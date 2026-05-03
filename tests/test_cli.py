@@ -258,6 +258,38 @@ class TestBuildParser:
             _apply_serve_overrides(args)
         assert excinfo.value.code == 2
 
+    def test_apply_serve_overrides_rejects_promoted_keys_in_experimental(
+        self, monkeypatch, tmp_path
+    ):
+        """Loading a models.json that still places speculative keys under
+        ``experimental`` exits with a clear migration error rather than
+        burying it in registry warnings."""
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "stale/model:latest": {
+                        "hf_path": "stale/model",
+                        "experimental": {
+                            "speculative": True,
+                            "speculative_draft_model": "stale/draft",
+                        },
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        with pytest.raises(SystemExit) as excinfo:
+            _apply_serve_overrides(args)
+        assert excinfo.value.code == 2
+
     def test_apply_serve_overrides_warns_on_dormant_draft(self, monkeypatch, caplog):
         """A draft configured for a model with speculative=False emits a
         warning so the user notices the dormant config."""
