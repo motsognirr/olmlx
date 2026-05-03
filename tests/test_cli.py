@@ -252,6 +252,37 @@ class TestBuildParser:
         assert _settings.speculative_draft_model == "Qwen/Qwen3-0.6B"
         assert _settings.speculative_tokens == 8
 
+    def test_legacy_env_var_validation_errors_are_swallowed(self, monkeypatch, caplog):
+        """A legacy value that fails Settings validation must not block
+        startup; ``validate_assignment=True`` raises pydantic ValidationError
+        which is not a ValueError subclass."""
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(_settings, "speculative_tokens", 4)
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda: ([], [], [], False, True),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+        monkeypatch.delenv("OLMLX_SPECULATIVE_TOKENS", raising=False)
+        # 0 fails Field(gt=0) on assignment.
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS", "0")
+
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        assert "Could not forward legacy env var" in caplog.text
+        # Settings keeps its prior default.
+        assert _settings.speculative_tokens == 4
+
     def test_apply_serve_overrides_new_env_var_wins_over_legacy(self, monkeypatch):
         """When both legacy and new env vars are set, the new one wins."""
         from olmlx.cli import _apply_serve_overrides

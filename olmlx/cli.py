@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -104,7 +105,7 @@ _DEPRECATED_SPECULATIVE_ENV_VARS = (
 # Legacy → new env var mapping with parsers. Only applied when the
 # matching new env var is unset, so users with the old names in their
 # shell profile keep working through the deprecation window.
-_LEGACY_SPECULATIVE_FORWARD: tuple[tuple[str, str, str, callable], ...] = (
+_LEGACY_SPECULATIVE_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], ...] = (
     (
         "OLMLX_EXPERIMENTAL_SPECULATIVE",
         "OLMLX_SPECULATIVE",
@@ -140,7 +141,12 @@ def _forward_legacy_speculative_env(_settings) -> None:
         try:
             value = parse(legacy_val)
             setattr(_settings, attr, value)
-        except (ValueError, TypeError) as exc:
+        except Exception as exc:
+            # Catches both parse errors (ValueError/TypeError) and the
+            # ``pydantic_core.ValidationError`` raised on assignment when
+            # ``validate_assignment=True`` rejects the value (e.g.
+            # speculative_tokens=0). A bad legacy value must never block
+            # startup — fall back to the new Settings default.
             logger.warning(
                 "Could not forward legacy env var %s=%r to %s: %s",
                 legacy,
