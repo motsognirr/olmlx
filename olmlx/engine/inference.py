@@ -436,12 +436,18 @@ def _derive_timing_stats(
     reports both rates in practice, so this path is essentially unreached.
     """
     # Defensive coercion: third-party result objects sometimes carry
-    # non-Python-numeric scalars (numpy/mlx) for these fields, and ad-hoc
-    # MagicMock objects in tests would otherwise sneak through truthiness
-    # checks. Treat anything non-numeric as missing.
-    if not isinstance(prompt_tps, (int, float)):
+    # non-Python-numeric scalars (numpy.float32/16, mx.array) for these
+    # fields, and MagicMock objects in tests would otherwise sneak through
+    # truthiness checks. ``float()`` handles all numeric types — including
+    # numpy and mlx 0-D scalars — and raises only on genuinely
+    # unconvertible objects (which we then treat as missing).
+    try:
+        prompt_tps = float(prompt_tps)
+    except (TypeError, ValueError):
         prompt_tps = 0.0
-    if not isinstance(gen_tps, (int, float)):
+    try:
+        gen_tps = float(gen_tps)
+    except (TypeError, ValueError):
         gen_tps = 0.0
 
     raw_prompt_ns = (
