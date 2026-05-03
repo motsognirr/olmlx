@@ -2259,15 +2259,11 @@ class TestSpeculativeLoading:
         mock_mlx_lm.load.return_value = (draft_model, MagicMock())
         monkeypatch.setitem(__import__("sys").modules, "mlx_lm", mock_mlx_lm)
 
-        model_exp = ExperimentalSettings(
-            speculative=True,
-            speculative_draft_model="test/draft-model",
-            speculative_tokens=5,
-            _env_file=None,
-        )
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = (True, "test/draft-model", 5)
 
         model, tok, is_vlm, caps_out, decoder = manager._load_model(
-            "test/target-model", model_exp=model_exp
+            "test/target-model", model_exp=model_exp, spec_config=spec_config
         )
 
         assert isinstance(decoder, SpeculativeDecoder)
@@ -2302,14 +2298,13 @@ class TestSpeculativeLoading:
         mock_mlx_lm.load.return_value = (draft_model, MagicMock())
         monkeypatch.setitem(__import__("sys").modules, "mlx_lm", mock_mlx_lm)
 
-        model_exp = ExperimentalSettings(
-            speculative=True,
-            speculative_draft_model="test/draft-model",
-            _env_file=None,
-        )
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = (True, "test/draft-model", 4)
 
         with pytest.raises(ValueError, match="vocab_size"):
-            manager._load_model("test/target-model", model_exp=model_exp)
+            manager._load_model(
+                "test/target-model", model_exp=model_exp, spec_config=spec_config
+            )
 
     def test_load_model_requires_draft_model_path(self, monkeypatch):
         """Should raise ValueError when speculative is enabled but no draft model."""
@@ -2328,14 +2323,13 @@ class TestSpeculativeLoading:
         monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: False)
         monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
 
-        model_exp = ExperimentalSettings(
-            speculative=True,
-            speculative_draft_model=None,
-            _env_file=None,
-        )
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = (True, None, 4)
 
         with pytest.raises(ValueError, match="speculative_draft_model"):
-            manager._load_model("test/target-model", model_exp=model_exp)
+            manager._load_model(
+                "test/target-model", model_exp=model_exp, spec_config=spec_config
+            )
 
 
 class TestDFlashLoading:

@@ -41,10 +41,6 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
         "flash_speculative",
         "flash_speculative_draft_model",
         "flash_speculative_tokens",
-        # Standalone speculative decoding
-        "speculative",
-        "speculative_draft_model",
-        "speculative_tokens",
         # DFlash block-diffusion speculative decoding
         "dflash",
         "dflash_draft_model",
@@ -59,6 +55,16 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
 )
 
 
+# Keys that were once experimental but have since been promoted out of the
+# ``experimental`` block. We surface a clear migration error if a user's
+# models.json still has them under ``experimental``.
+PROMOTED_EXPERIMENTAL_KEYS: dict[str, str] = {
+    "speculative": "speculative",
+    "speculative_draft_model": "speculative_draft_model",
+    "speculative_tokens": "speculative_tokens",
+}
+
+
 def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
     """Validate per-model experimental overrides.
 
@@ -68,6 +74,16 @@ def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
     (all fields present), so pydantic-settings env var resolution cannot
     override any values or produce confusing errors for unrelated fields.
     """
+    promoted = set(overrides) & PROMOTED_EXPERIMENTAL_KEYS.keys()
+    if promoted:
+        moves = ", ".join(
+            f"{k!r} → top-level {PROMOTED_EXPERIMENTAL_KEYS[k]!r}"
+            for k in sorted(promoted)
+        )
+        raise ValueError(
+            f"These keys have been promoted out of 'experimental' and must be "
+            f"set at the top level of the models.json entry: {moves}"
+        )
     unknown = set(overrides) - PER_MODEL_EXPERIMENTAL_KEYS
     if unknown:
         raise ValueError(
@@ -188,8 +204,27 @@ class ModelConfig:
     #: (skip lock-boundary sync entirely). None means use the global
     #: ``settings.sync_mode``.
     sync_mode: SyncMode | None = None
+    #: Per-model speculative decoding overrides. ``None`` means inherit the
+    #: global ``Settings.speculative*`` value.
+    speculative: bool | None = None
+    speculative_draft_model: str | None = None
+    speculative_tokens: int | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def resolved_speculative(self) -> tuple[bool, str | None, int]:
+        """Resolve speculative config: per-model overrides global settings."""
+        from olmlx.config import settings
+
+        return (
+            self.speculative if self.speculative is not None else settings.speculative,
+            self.speculative_draft_model
+            if self.speculative_draft_model is not None
+            else settings.speculative_draft_model,
+            self.speculative_tokens
+            if self.speculative_tokens is not None
+            else settings.speculative_tokens,
+        )
 
     @classmethod
     def from_entry(cls, entry: str | dict) -> ModelConfig:
@@ -232,6 +267,36 @@ class ModelConfig:
                 if sync_mode_raw is not None
                 else None
             )
+            speculative_raw = entry.get("speculative")
+            if speculative_raw is not None and not isinstance(speculative_raw, bool):
+                raise ValueError(
+                    f"'speculative' must be a bool, got {speculative_raw!r}"
+                )
+            speculative = speculative_raw
+
+            speculative_draft_model_raw = entry.get("speculative_draft_model")
+            if speculative_draft_model_raw is not None and not isinstance(
+                speculative_draft_model_raw, str
+            ):
+                raise ValueError(
+                    f"'speculative_draft_model' must be a string, "
+                    f"got {speculative_draft_model_raw!r}"
+                )
+            speculative_draft_model = speculative_draft_model_raw
+
+            speculative_tokens_raw = entry.get("speculative_tokens")
+            if speculative_tokens_raw is not None:
+                if (
+                    isinstance(speculative_tokens_raw, bool)
+                    or not isinstance(speculative_tokens_raw, int)
+                    or speculative_tokens_raw < 1
+                ):
+                    raise ValueError(
+                        f"'speculative_tokens' must be a positive integer, "
+                        f"got {speculative_tokens_raw!r}"
+                    )
+            speculative_tokens = speculative_tokens_raw
+
             extra = {k: v for k, v in entry.items() if k not in _KNOWN_CONFIG_KEYS}
             return cls(
                 hf_path=hf_path,
@@ -241,6 +306,9 @@ class ModelConfig:
                 inference_queue_timeout=inference_queue_timeout,
                 inference_timeout=inference_timeout,
                 sync_mode=sync_mode,
+                speculative=speculative,
+                speculative_draft_model=speculative_draft_model,
+                speculative_tokens=speculative_tokens,
                 _extra=extra,
             )
         raise TypeError(
@@ -256,6 +324,9 @@ class ModelConfig:
             and self.inference_queue_timeout is None
             and self.inference_timeout is None
             and self.sync_mode is None
+            and self.speculative is None
+            and self.speculative_draft_model is None
+            and self.speculative_tokens is None
             and not self._extra
         ):
             return self.hf_path
@@ -273,6 +344,12 @@ class ModelConfig:
             result["inference_timeout"] = self.inference_timeout
         if self.sync_mode is not None:
             result["sync_mode"] = self.sync_mode
+        if self.speculative is not None:
+            result["speculative"] = self.speculative
+        if self.speculative_draft_model is not None:
+            result["speculative_draft_model"] = self.speculative_draft_model
+        if self.speculative_tokens is not None:
+            result["speculative_tokens"] = self.speculative_tokens
         # Filter known keys defensively — from_entry() already excludes them,
         # but _extra can be set directly via ModelConfig construction.
         result.update(

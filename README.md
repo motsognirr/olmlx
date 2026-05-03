@@ -329,6 +329,9 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_PROMPT_CACHE_MAX_TOKENS` | `32768` | Invalidate the KV cache after a conversation exceeds this many tokens. Use a very large value to effectively disable |
 | `OLMLX_MAX_TOKENS_LIMIT` | `131072` | Maximum tokens allowed per request |
 | `OLMLX_CORS_ORIGINS` | `http://localhost:*`, `http://127.0.0.1:*` | Allowed CORS origins |
+| `OLMLX_SPECULATIVE` | `false` | Enable speculative decoding with a draft model (also `--speculative` on `olmlx serve`) |
+| `OLMLX_SPECULATIVE_DRAFT_MODEL` | `None` | HuggingFace path of the draft model (also `--speculative-draft-model`) |
+| `OLMLX_SPECULATIVE_TOKENS` | `4` | Candidate tokens generated per verification step (also `--speculative-tokens`) |
 
 ### Flash inference settings (experimental)
 
@@ -370,6 +373,59 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET` | *(empty)* | Shared secret for worker authentication |
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR` | *(empty)* | Working directory on remote workers |
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON` | `python` | Python command on remote workers |
+
+## Speculative Decoding
+
+Speculative decoding pairs a small *draft* model with a larger *target* model: the draft proposes several tokens autoregressively, and the target verifies them in a single forward pass. When most drafts are accepted you get multiple tokens per target step, which lowers latency without changing output quality (greedy verification ensures bit-identical output to plain greedy decoding).
+
+```bash
+OLMLX_SPECULATIVE=true \
+OLMLX_SPECULATIVE_DRAFT_MODEL=mlx-community/Qwen3-0.6B-4bit \
+olmlx serve
+```
+
+Or, equivalently, with CLI flags:
+
+```bash
+olmlx serve \
+  --speculative \
+  --speculative-draft-model mlx-community/Qwen3-0.6B-4bit \
+  --speculative-tokens 4
+```
+
+You can also pin per-model defaults in `~/.olmlx/models.json`:
+
+```json
+{
+  "mlx-community/Qwen3.5-27B-4bit:latest": {
+    "hf_path": "mlx-community/Qwen3.5-27B-4bit",
+    "speculative": true,
+    "speculative_draft_model": "mlx-community/Qwen3.5-0.8B-MLX-4bit",
+    "speculative_tokens": 4
+  }
+}
+```
+
+### Picking a draft model
+
+- Use the same model family — vocabulary mismatches are rejected at load.
+- Smaller is better for latency *if* the draft tracks the target's distribution. A 0.5–1B draft for a 7–32B target is a good starting point.
+- Quantization matters less for the draft than for the target — pick whatever fits comfortably alongside the target in memory.
+
+### Expected speedup
+
+Real-world speedup typically lands between **1.4x and 2x** on Apple Silicon for code/chat workloads, dropping toward **1x** on highly creative or out-of-distribution prompts where the draft is frequently rejected. The token budget (`--speculative-tokens`, default 4) trades draft work for verification savings — try 4–8 for routine workloads, lower if your prompts are noisy.
+
+### When not to use it
+
+- The target is already small (under ~3B). The draft+target overhead can dominate.
+- You're memory-constrained: both models stay resident, including their KV caches.
+- Prompts are highly stochastic / high-temperature — acceptance drops and overhead dominates.
+- You're using vision-language models that don't expose `.language_model` (most VLMs work, but a few do not).
+
+### Migration from `OLMLX_EXPERIMENTAL_SPECULATIVE_*`
+
+The settings were promoted out of `experimental` in olmlx 0.x. The new names are `OLMLX_SPECULATIVE`, `OLMLX_SPECULATIVE_DRAFT_MODEL`, and `OLMLX_SPECULATIVE_TOKENS`. Per-model `models.json` entries that previously placed these keys under `"experimental": {...}` now go at the top level — loading an old config raises a clear migration error pointing at the new location.
 
 ## LLM in a Flash (Experimental)
 

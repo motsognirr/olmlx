@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
     anthropic_models: dict[str, str] = {}
 
+    # Speculative decoding (works with any model, not just Flash).
+    # Per-model overrides live on ``ModelConfig`` in ``olmlx.engine.registry``.
+    speculative: bool = False
+    speculative_draft_model: str | None = None
+    speculative_tokens: Annotated[int, Field(gt=0)] = 4
+
     @field_validator("anthropic_models")
     @classmethod
     def validate_anthropic_model_keys(cls, v: dict[str, str]) -> dict[str, str]:
@@ -92,11 +98,6 @@ class ExperimentalSettings(BaseSettings):
     flash_speculative: bool = False
     flash_speculative_draft_model: str | None = None
     flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
-
-    # Standalone speculative decoding (works with any model, not just Flash)
-    speculative: bool = False
-    speculative_draft_model: str | None = None
-    speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
     # DFlash block-diffusion speculative decoding
     dflash: bool = False

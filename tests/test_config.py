@@ -171,42 +171,85 @@ class TestResolveExperimental:
 
 
 class TestSpeculativeConfig:
-    """Tests for standalone speculative decoding config fields."""
+    """Tests for standalone speculative decoding config fields (now on Settings)."""
 
     def test_speculative_defaults(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS", raising=False)
-        s = ExperimentalSettings()
+        monkeypatch.delenv("OLMLX_SPECULATIVE", raising=False)
+        monkeypatch.delenv("OLMLX_SPECULATIVE_DRAFT_MODEL", raising=False)
+        monkeypatch.delenv("OLMLX_SPECULATIVE_TOKENS", raising=False)
+        s = Settings()
         assert s.speculative is False
         assert s.speculative_draft_model is None
         assert s.speculative_tokens == 4
 
     def test_speculative_env_override(self, monkeypatch):
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE", "true")
-        monkeypatch.setenv(
-            "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", "Qwen/Qwen3-0.6B"
-        )
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS", "6")
-        s = ExperimentalSettings()
+        monkeypatch.setenv("OLMLX_SPECULATIVE", "true")
+        monkeypatch.setenv("OLMLX_SPECULATIVE_DRAFT_MODEL", "Qwen/Qwen3-0.6B")
+        monkeypatch.setenv("OLMLX_SPECULATIVE_TOKENS", "6")
+        s = Settings()
         assert s.speculative is True
         assert s.speculative_draft_model == "Qwen/Qwen3-0.6B"
         assert s.speculative_tokens == 6
 
     def test_speculative_tokens_rejects_zero(self):
         with pytest.raises(ValidationError):
-            ExperimentalSettings(speculative_tokens=0, _env_file=None)
+            Settings(speculative_tokens=0, _env_file=None)
 
-    def test_speculative_per_model_override(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE", raising=False)
-        base = ExperimentalSettings()
-        result = resolve_experimental(
-            base,
-            {"speculative": True, "speculative_draft_model": "Qwen/Qwen3-0.6B"},
+    def test_speculative_no_longer_in_experimental(self):
+        """Promoted fields must not exist on ExperimentalSettings anymore."""
+        e = ExperimentalSettings()
+        assert not hasattr(e, "speculative")
+        assert not hasattr(e, "speculative_draft_model")
+        assert not hasattr(e, "speculative_tokens")
+
+    def test_speculative_rejected_in_experimental_overrides(self):
+        """Per-model overrides under 'experimental' should raise a clear migration error."""
+        from olmlx.engine.registry import _validate_experimental_overrides
+
+        with pytest.raises(ValueError, match="promoted out of 'experimental'"):
+            _validate_experimental_overrides({"speculative": True})
+
+    def test_speculative_per_model_top_level(self):
+        """Per-model overrides go at the top level of the models.json entry."""
+        from olmlx.engine.registry import ModelConfig
+
+        mc = ModelConfig.from_entry(
+            {
+                "hf_path": "Qwen/Qwen3-32B",
+                "speculative": True,
+                "speculative_draft_model": "Qwen/Qwen3-0.6B",
+                "speculative_tokens": 6,
+            }
         )
-        assert result.speculative is True
-        assert result.speculative_draft_model == "Qwen/Qwen3-0.6B"
-        assert base.speculative is False
+        assert mc.speculative is True
+        assert mc.speculative_draft_model == "Qwen/Qwen3-0.6B"
+        assert mc.speculative_tokens == 6
+        # Round-trip preserves the new top-level fields
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["speculative"] is True
+        assert entry["speculative_draft_model"] == "Qwen/Qwen3-0.6B"
+        assert entry["speculative_tokens"] == 6
+
+    def test_resolved_speculative_falls_back_to_settings(self, monkeypatch):
+        from olmlx.engine.registry import ModelConfig
+
+        monkeypatch.setattr("olmlx.config.settings.speculative", True)
+        monkeypatch.setattr(
+            "olmlx.config.settings.speculative_draft_model", "Qwen/Qwen3-0.6B"
+        )
+        monkeypatch.setattr("olmlx.config.settings.speculative_tokens", 8)
+
+        mc = ModelConfig(hf_path="Qwen/Qwen3-32B")
+        assert mc.resolved_speculative() == (True, "Qwen/Qwen3-0.6B", 8)
+
+        # Per-model overrides win
+        mc_override = ModelConfig(
+            hf_path="Qwen/Qwen3-32B",
+            speculative=False,
+            speculative_tokens=2,
+        )
+        assert mc_override.resolved_speculative() == (False, "Qwen/Qwen3-0.6B", 2)
 
 
 class TestDFlashConfig:

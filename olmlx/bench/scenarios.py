@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -77,6 +78,23 @@ def _requires_flash_moe(model_path: Path) -> str | None:
     ):
         return f"No flash-MoE preparation found at {flash_moe_dir}"
     return None
+
+
+def _requires_speculative_draft(_model_path: Path) -> str | None:
+    """Skip if no draft model is configured for speculative decoding.
+
+    Reads the parent process env so the user can opt in via either
+    ``OLMLX_SPECULATIVE_DRAFT_MODEL`` or the legacy
+    ``OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL``.
+    """
+    if os.environ.get("OLMLX_SPECULATIVE_DRAFT_MODEL") or os.environ.get(
+        "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL"
+    ):
+        return None
+    return (
+        "Set OLMLX_SPECULATIVE_DRAFT_MODEL to a draft model HF path "
+        "to run this scenario"
+    )
 
 
 def _requires_distributed(_model_path: Path) -> str | None:
@@ -175,6 +193,15 @@ SCENARIOS: list[Scenario] = [
             "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "turboquant:4",
         },
         should_skip=_requires_flash,
+    ),
+    Scenario(
+        name="speculative",
+        description=(
+            "Standalone speculative decoding "
+            "(set OLMLX_SPECULATIVE_DRAFT_MODEL to a draft model HF path)"
+        ),
+        env_overrides={"OLMLX_SPECULATIVE": "true"},
+        should_skip=_requires_speculative_draft,
     ),
     Scenario(
         name="flash-moe",

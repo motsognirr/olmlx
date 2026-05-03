@@ -39,10 +39,11 @@ def ensure_config():
         print(f"Created {settings.models_config} with example models")
 
 
-def cmd_serve(_args):
+def cmd_serve(args):
     """Start the olmlx server."""
     import uvicorn
 
+    _apply_serve_overrides(args)
     ensure_config()
     _configure_logging()
 
@@ -90,6 +91,26 @@ def cmd_serve(_args):
         port=settings.port,
         log_level=settings.log_level.lower(),
     )
+
+
+def _apply_serve_overrides(args) -> None:
+    """Apply CLI flags to the global Settings before the server starts.
+
+    The flags are written to the ``settings`` instance so that the rest of
+    the codebase (which reads ``from olmlx.config import settings``) picks
+    them up without needing extra plumbing.
+    """
+    from olmlx.config import settings as _settings
+
+    spec = getattr(args, "speculative", None)
+    spec_draft = getattr(args, "speculative_draft_model", None)
+    spec_tokens = getattr(args, "speculative_tokens", None)
+    if spec is not None:
+        _settings.speculative = spec
+    if spec_draft is not None:
+        _settings.speculative_draft_model = spec_draft
+    if spec_tokens is not None:
+        _settings.speculative_tokens = spec_tokens
 
 
 # Module-level state set by cmd_serve() for the app lifespan to retrieve.
@@ -1450,7 +1471,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("serve", help="Start the server (default)")
+    serve_p = sub.add_parser("serve", help="Start the server (default)")
+    serve_p.add_argument(
+        "--speculative",
+        dest="speculative",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable speculative decoding (overrides OLMLX_SPECULATIVE)",
+    )
+    serve_p.add_argument(
+        "--speculative-draft-model",
+        dest="speculative_draft_model",
+        default=None,
+        help="HuggingFace path of the draft model used for speculative decoding",
+    )
+    serve_p.add_argument(
+        "--speculative-tokens",
+        dest="speculative_tokens",
+        type=_positive_int,
+        default=None,
+        help="Number of tokens drafted per verification step (default: 4)",
+    )
 
     svc = sub.add_parser("service", help="Manage the launchd service")
     svc_sub = svc.add_subparsers(dest="service_command")
