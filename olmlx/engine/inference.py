@@ -7,6 +7,7 @@ import importlib
 import itertools
 import json
 import logging
+import numbers
 import threading
 import time
 import weakref
@@ -435,20 +436,13 @@ def _derive_timing_stats(
     invariant still holds; the split is just underdetermined. mlx-lm
     reports both rates in practice, so this path is essentially unreached.
     """
-    # Defensive coercion: third-party result objects sometimes carry
-    # non-Python-numeric scalars (numpy.float32/16, mx.array) for these
-    # fields, and MagicMock objects in tests would otherwise sneak through
-    # truthiness checks. ``float()`` handles all numeric types — including
-    # numpy and mlx 0-D scalars — and raises only on genuinely
-    # unconvertible objects (which we then treat as missing).
-    try:
-        prompt_tps = float(prompt_tps)
-    except (TypeError, ValueError):
-        prompt_tps = 0.0
-    try:
-        gen_tps = float(gen_tps)
-    except (TypeError, ValueError):
-        gen_tps = 0.0
+    # Defensive coercion: ``numbers.Real`` matches Python int/float and all
+    # numpy scalar types via ABC registration, but excludes MagicMock (which
+    # has a ``__float__`` returning 1.0 and would otherwise silently produce
+    # bogus durations in tests). mlx-lm returns Python floats for these
+    # fields in practice; mx.array scalars would be treated as missing.
+    prompt_tps = float(prompt_tps) if isinstance(prompt_tps, numbers.Real) else 0.0
+    gen_tps = float(gen_tps) if isinstance(gen_tps, numbers.Real) else 0.0
 
     raw_prompt_ns = (
         int(stats.prompt_eval_count / prompt_tps * 1e9)
@@ -474,16 +468,28 @@ def _derive_timing_stats(
             stats.eval_duration = raw_decode_ns
     elif raw_prompt_ns:
         # Only prompt rate known.
-        stats.prompt_eval_duration = min(raw_prompt_ns, eval_timer_ns)
-        if stats.eval_count == 0:
-            stats.eval_duration = 0
+        if raw_prompt_ns >= eval_timer_ns and stats.eval_count > 0:
+            # Rate noise: prefill alone would consume the full timer, leaving
+            # nothing for decode despite eval_count > 0. Split 50/50 so
+            # clients don't divide by zero on decode tok/s.
+            stats.prompt_eval_duration = eval_timer_ns // 2
+            stats.eval_duration = eval_timer_ns - stats.prompt_eval_duration
         else:
-            stats.eval_duration = max(0, eval_timer_ns - stats.prompt_eval_duration)
+            stats.prompt_eval_duration = min(raw_prompt_ns, eval_timer_ns)
+            if stats.eval_count == 0:
+                stats.eval_duration = 0
+            else:
+                stats.eval_duration = max(0, eval_timer_ns - stats.prompt_eval_duration)
     elif raw_decode_ns:
         # Only decode rate known. Recover prefill by subtraction.
-        stats.eval_duration = min(raw_decode_ns, eval_timer_ns)
-        if stats.prompt_eval_count > 0:
-            stats.prompt_eval_duration = max(0, eval_timer_ns - stats.eval_duration)
+        if raw_decode_ns >= eval_timer_ns and stats.prompt_eval_count > 0:
+            # Symmetric noise case.
+            stats.eval_duration = eval_timer_ns // 2
+            stats.prompt_eval_duration = eval_timer_ns - stats.eval_duration
+        else:
+            stats.eval_duration = min(raw_decode_ns, eval_timer_ns)
+            if stats.prompt_eval_count > 0:
+                stats.prompt_eval_duration = max(0, eval_timer_ns - stats.eval_duration)
     else:
         # Neither rate known.
         if stats.eval_count == 0:
@@ -491,8 +497,14 @@ def _derive_timing_stats(
                 # Whole timer is prefill.
                 stats.prompt_eval_duration = eval_timer_ns
             stats.eval_duration = 0
+        elif stats.prompt_eval_count > 0:
+            # Both counts > 0 with no rates: 50/50 to avoid divide-by-zero on
+            # either side. mlx-lm reports rates in practice, so this path is
+            # essentially unreached.
+            stats.prompt_eval_duration = eval_timer_ns // 2
+            stats.eval_duration = eval_timer_ns - stats.prompt_eval_duration
         else:
-            # Underdetermined: assign full timer to decode (documented above).
+            # Only eval_count > 0: assign full timer to decode.
             stats.eval_duration = eval_timer_ns
 
     # Log-line rates: always derive from the final stored durations so the

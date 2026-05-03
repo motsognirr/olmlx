@@ -62,15 +62,16 @@ class TestDeriveTimingStats:
         assert stats.eval_duration == 400_000_000
 
     def test_rate_noise_clamped_not_double_counted(self):
-        """If the rate-derived prefill exceeds wall-clock (rate noise), both
-        fields must be clamped so their sum never exceeds the timer."""
+        """If the rate-derived prefill exceeds wall-clock (single-rate noise)
+        with eval_count > 0, the helper splits 50/50 instead of zeroing
+        eval_duration — clients computing decode tok/s would otherwise
+        divide by zero."""
         stats = TimingStats(prompt_eval_count=100, eval_count=10)
         # prefill = 100 / 1000 = 100 ms but wall-clock = 90 ms (noise).
         _derive_timing_stats(stats, 1000.0, 0.0, eval_timer_ns=90_000_000)
-        # prompt_eval_duration clamped to wall-clock (was 100 ms raw).
-        assert stats.prompt_eval_duration == 90_000_000
-        assert stats.eval_duration == 0
-        assert stats.prompt_eval_duration + stats.eval_duration <= 90_000_000
+        assert stats.prompt_eval_duration == 45_000_000
+        assert stats.eval_duration == 45_000_000
+        assert stats.prompt_eval_duration + stats.eval_duration == 90_000_000
 
     def test_both_rates_exceed_wall_clock_split_proportionally(self):
         """Both rates valid but their combined duration > wall-clock: split
@@ -116,14 +117,19 @@ class TestDeriveTimingStats:
         bogus = MagicMock()
         # bogus would otherwise be truthy and silently absorbed via __int__.
         _derive_timing_stats(stats, bogus, bogus, eval_timer_ns=200_000_000)
-        # Both rates coerced to 0; eval_count > 0 takes the neither-rate-known
-        # else-branch which only assigns eval_duration = eval_timer_ns.
-        # prompt_eval_duration is never written, so it stays at the
-        # TimingStats default of 0.
-        # The key invariant: no garbage int values from MagicMock arithmetic.
+        # Both rates coerced to 0; both counts > 0 takes the 50/50 branch.
         assert isinstance(stats.prompt_eval_duration, int)
         assert isinstance(stats.eval_duration, int)
-        assert stats.prompt_eval_duration + stats.eval_duration <= 200_000_000
+        assert stats.prompt_eval_duration == 100_000_000
+        assert stats.eval_duration == 100_000_000
+
+    def test_no_rates_eval_count_only(self):
+        """Underdetermined fallback: when both rates are missing and only
+        eval_count > 0, the full timer is assigned to decode."""
+        stats = TimingStats(prompt_eval_count=0, eval_count=5)
+        _derive_timing_stats(stats, 0.0, 0.0, eval_timer_ns=200_000_000)
+        assert stats.prompt_eval_duration == 0
+        assert stats.eval_duration == 200_000_000
 
 
 class TestBuildGenerateKwargs:
