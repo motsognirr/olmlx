@@ -150,20 +150,9 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(2)
 
-    # Global parallel of the per-model dormant-draft warning: a draft
-    # model is set globally but speculative is off, so the draft will
-    # never be loaded. Per-model overrides still resolve correctly via
-    # ``resolved_speculative()``; this warns about the unused global.
-    if not _settings.speculative and _settings.speculative_draft_model:
-        logger.warning(
-            "OLMLX_SPECULATIVE_DRAFT_MODEL is set to %r but "
-            "OLMLX_SPECULATIVE is false; the draft model will not be "
-            "loaded. Set OLMLX_SPECULATIVE=true (or --speculative) to "
-            "enable.",
-            _settings.speculative_draft_model,
-        )
-
-    bad, dormant_drafts, flash_conflicts = _audit_speculative_config()
+    bad, dormant_drafts, flash_conflicts, global_draft_used = (
+        _audit_speculative_config()
+    )
     if dormant_drafts:
         logger.warning(
             "speculative_draft_model is configured for the following "
@@ -171,6 +160,22 @@ def _apply_serve_overrides(args) -> None:
             "(speculative=false), so the draft model will be ignored: %s. "
             "Set speculative=true (per-model or globally) to enable.",
             ", ".join(dormant_drafts),
+        )
+    # Global parallel of the per-model dormant-draft warning: warn when a
+    # global draft is set but no model actually consumes it. Suppress
+    # when at least one per-model entry resolves to the global draft —
+    # the "global is dormant" claim would be a false positive.
+    if (
+        not _settings.speculative
+        and _settings.speculative_draft_model
+        and not global_draft_used
+    ):
+        logger.warning(
+            "OLMLX_SPECULATIVE_DRAFT_MODEL is set to %r but "
+            "OLMLX_SPECULATIVE is false and no per-model entry enables "
+            "speculative decoding; the draft model will not be loaded. "
+            "Set OLMLX_SPECULATIVE=true (or --speculative) to enable.",
+            _settings.speculative_draft_model,
         )
     if flash_conflicts:
         # Note: standalone speculative is only dropped when the Flash
@@ -237,11 +242,11 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
     return bad
 
 
-def _audit_speculative_config() -> tuple[list[str], list[str], list[str]]:
+def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
     """Walk the registry and audit each model's resolved speculative
     config.
 
-    Returns ``(bad, dormant_drafts, flash_conflicts)``:
+    Returns ``(bad, dormant_drafts, flash_conflicts, global_draft_used)``:
     - ``bad`` — models with ``speculative=True`` but no draft model
       anywhere. Triggers a startup error.
     - ``dormant_drafts`` — models with a per-model ``speculative_draft_model``
@@ -252,6 +257,10 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str]]:
       decoding is silently dropped on the Flash load path; the model's
       own ``flash_speculative`` knob is the right one. Triggers a
       warning so users see the redirect.
+    - ``global_draft_used`` — True if at least one model resolves to
+      the global ``speculative_draft_model`` (i.e. has ``speculative=True``
+      and no per-model draft override). Used to suppress the global
+      dormant-draft warning when the global draft actually has consumers.
 
     The registry is loaded from disk; failures are logged and treated
     as "nothing to validate" so this never blocks startup on its own.
@@ -271,16 +280,17 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str]]:
             "Skipping speculative config validation: invalid models.json entry: %s",
             exc,
         )
-        return [], [], []
+        return [], [], [], False
     except Exception as exc:
         logger.warning(
             "Skipping speculative config validation: could not load registry: %s",
             exc,
         )
-        return [], [], []
+        return [], [], [], False
     bad: list[str] = []
     dormant: list[str] = []
     flash_conflicts: list[str] = []
+    global_draft_used = False
     for name, mc in registry.list_models().items():
         enabled, draft, _ = mc.resolved_speculative()
         if enabled and not draft:
@@ -290,6 +300,10 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str]]:
             # ``draft``: the global dormant-draft case is already
             # surfaced separately in ``_apply_serve_overrides``.
             dormant.append(name)
+        if enabled and mc.speculative_draft_model is None and draft is not None:
+            # This model enables speculative without a per-model draft,
+            # so it is consuming the global ``speculative_draft_model``.
+            global_draft_used = True
         if enabled:
             # Resolve the full experimental config (global defaults
             # merged with per-model overrides) so a globally enabled
@@ -300,7 +314,7 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str]]:
                 continue
             if resolved_exp.flash or resolved_exp.flash_moe:
                 flash_conflicts.append(name)
-    return bad, dormant, flash_conflicts
+    return bad, dormant, flash_conflicts, global_draft_used
 
 
 # Module-level state set by cmd_serve() for the app lifespan to retrieve.

@@ -226,7 +226,9 @@ class TestBuildParser:
 
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
-        monkeypatch.setattr("olmlx.cli._audit_speculative_config", lambda: ([], [], []))
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], False)
+        )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
         )
@@ -253,7 +255,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: (["bad/model:latest"], [], []),
+            lambda: (["bad/model:latest"], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -308,7 +310,9 @@ class TestBuildParser:
 
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
-        monkeypatch.setattr("olmlx.cli._audit_speculative_config", lambda: ([], [], []))
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], False)
+        )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
         )
@@ -350,7 +354,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], ["flash/model:latest"]),
+            lambda: ([], [], ["flash/model:latest"], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -374,7 +378,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], ["dormant/model:latest"], []),
+            lambda: ([], ["dormant/model:latest"], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -385,6 +389,37 @@ class TestBuildParser:
             _apply_serve_overrides(args)
         assert "dormant/model:latest" in caplog.text
         assert "speculative_draft_model" in caplog.text
+
+    def test_global_dormant_warning_suppressed_when_per_model_consumes(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A global draft + global speculative=False used to warn even when a
+        per-model entry enables speculative and consumes that global draft."""
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "consumer/m:latest": {
+                        "hf_path": "consumer/m",
+                        "speculative": True,
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
+
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        assert "draft model will not be loaded" not in caplog.text
 
     def test_audit_flags_global_flash_with_speculative(self, monkeypatch, tmp_path):
         """Globally enabled Flash + speculative=True (per model, no per-model
@@ -411,7 +446,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(_exp, "flash", True)
 
-        bad, dormant, flash_conflicts = _audit_speculative_config()
+        bad, dormant, flash_conflicts, _global_used = _audit_speculative_config()
         assert bad == []
         assert dormant == []
         assert flash_conflicts == ["global-flash/m:latest"]
@@ -452,10 +487,12 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
 
-        bad, dormant, flash_conflicts = _audit_speculative_config()
+        bad, dormant, flash_conflicts, global_used = _audit_speculative_config()
         assert bad == ["bad/no-draft:latest"]
         assert dormant == ["dormant/has-draft:latest"]
         assert flash_conflicts == ["conflict/flash-and-spec:latest"]
+        # No model in this fixture uses the global draft (good/a has its own).
+        assert global_used is False
 
     def test_service_install(self):
         parser = build_parser()
