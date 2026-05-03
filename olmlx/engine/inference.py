@@ -2364,16 +2364,28 @@ async def _stream_completion(
 
             # eval_timer covers prefill + decode. To match Ollama's convention
             # (prompt_eval_duration = prefill, eval_duration = decode-only) we
-            # derive both from mlx-lm's measured rates instead. Fall back to the
-            # wall-clock timer only when mlx-lm doesn't report a rate.
+            # derive both from mlx-lm's measured rates. Fallbacks below cover
+            # the cases where mlx-lm doesn't report a rate.
             prompt_tps = getattr(token, "prompt_tps", 0) or 0
             gen_tps = getattr(token, "generation_tps", 0) or 0
             if prompt_tps > 0 and stats.prompt_eval_count > 0:
                 stats.prompt_eval_duration = int(
                     stats.prompt_eval_count / prompt_tps * 1e9
                 )
+            elif stats.prompt_eval_count > 0 and stats.eval_count == 0:
+                # No decode happened — entire timer is prefill.
+                stats.prompt_eval_duration = eval_timer.duration_ns
             if gen_tps > 0 and stats.eval_count > 0:
                 stats.eval_duration = int(stats.eval_count / gen_tps * 1e9)
+            elif (
+                stats.prompt_eval_duration > 0
+                and eval_timer.duration_ns > stats.prompt_eval_duration
+            ):
+                # Subtract the (known) prefill from the wall-clock timer to
+                # recover decode-only time exactly.
+                stats.eval_duration = (
+                    eval_timer.duration_ns - stats.prompt_eval_duration
+                )
             else:
                 stats.eval_duration = eval_timer.duration_ns
 
@@ -2630,13 +2642,20 @@ async def _full_completion_inner(
 
     # eval_timer covers prefill + decode. Match Ollama's convention by deriving
     # prompt_eval_duration (prefill) and eval_duration (decode) from mlx-lm's
-    # measured rates, falling back to the wall-clock timer if unavailable.
-    prompt_tps = float(getattr(result, "prompt_tps", 0) or 0)
-    gen_tps = float(getattr(result, "generation_tps", 0) or 0)
+    # measured rates. Fallbacks mirror the streaming path.
+    prompt_tps = getattr(result, "prompt_tps", 0) or 0
+    gen_tps = getattr(result, "generation_tps", 0) or 0
     if prompt_tps > 0 and stats.prompt_eval_count > 0:
         stats.prompt_eval_duration = int(stats.prompt_eval_count / prompt_tps * 1e9)
+    elif stats.prompt_eval_count > 0 and stats.eval_count == 0:
+        stats.prompt_eval_duration = eval_timer.duration_ns
     if gen_tps > 0 and stats.eval_count > 0:
         stats.eval_duration = int(stats.eval_count / gen_tps * 1e9)
+    elif (
+        stats.prompt_eval_duration > 0
+        and eval_timer.duration_ns > stats.prompt_eval_duration
+    ):
+        stats.eval_duration = eval_timer.duration_ns - stats.prompt_eval_duration
     else:
         stats.eval_duration = eval_timer.duration_ns
     total_secs = stats.total_duration / 1e9 if stats.total_duration else 0

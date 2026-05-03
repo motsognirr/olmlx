@@ -1484,6 +1484,7 @@ class TestFullCompletionInner:
 
         lm = mock_manager._loaded["qwen3:latest"]
 
+        stats = TimingStats()
         with patch(
             "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
         ) as mock_thread:
@@ -1493,10 +1494,17 @@ class TestFullCompletionInner:
                 "prompt",
                 100,
                 {},
-                TimingStats(),
+                stats,
             )
 
         assert result["text"] == "plain string"
+        # Fallback path: no token counts and no rates available, so
+        # prompt_eval_duration stays 0 and eval_duration falls back to the
+        # wall-clock timer.
+        assert stats.prompt_eval_count == 0
+        assert stats.prompt_eval_duration == 0
+        assert stats.eval_count == 0
+        assert stats.eval_duration > 0
 
     @pytest.mark.asyncio
     async def test_result_other_type(self, mock_manager):
