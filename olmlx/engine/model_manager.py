@@ -1453,7 +1453,9 @@ class ModelManager:
         """
         from olmlx.engine.speculative import SpeculativeDecoder
 
-        _enabled, draft_model_path, num_tokens = spec_config
+        # First element is ignored — callers gate on ``spec_enabled``
+        # before invoking this method, so it is always True here.
+        _, draft_model_path, num_tokens = spec_config
         if not draft_model_path:
             raise ValueError(
                 "speculative requires speculative_draft_model to be set "

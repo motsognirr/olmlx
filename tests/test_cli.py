@@ -167,6 +167,42 @@ class TestBuildParser:
         args = parser.parse_args(["serve"])
         assert args.command == "serve"
 
+    def test_serve_speculative_flags(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "serve",
+                "--speculative",
+                "--speculative-draft-model",
+                "Qwen/Qwen3-0.6B",
+                "--speculative-tokens",
+                "6",
+            ]
+        )
+        assert args.speculative is True
+        assert args.speculative_draft_model == "Qwen/Qwen3-0.6B"
+        assert args.speculative_tokens == 6
+
+    def test_serve_no_speculative_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--no-speculative"])
+        assert args.speculative is False
+
+    def test_apply_serve_overrides_rejects_speculative_without_draft(self, monkeypatch):
+        """Serve fails fast when --speculative is set without a draft model."""
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        # Snapshot and restore so the failed-validation write to
+        # ``settings.speculative`` doesn't leak into other tests.
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--speculative"])
+        with pytest.raises(SystemExit) as excinfo:
+            _apply_serve_overrides(args)
+        assert excinfo.value.code == 2
+
     def test_service_install(self):
         parser = build_parser()
         args = parser.parse_args(["service", "install"])

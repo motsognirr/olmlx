@@ -112,6 +112,18 @@ def _apply_serve_overrides(args) -> None:
     if spec_tokens is not None:
         _settings.speculative_tokens = spec_tokens
 
+    # Surface the misconfiguration at startup rather than at the first
+    # request — the model load thread cannot raise back to the user
+    # cleanly.
+    if _settings.speculative and not _settings.speculative_draft_model:
+        print(
+            "Error: speculative decoding is enabled but no draft model is "
+            "configured. Set --speculative-draft-model or "
+            "OLMLX_SPECULATIVE_DRAFT_MODEL.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
 
 # Module-level state set by cmd_serve() for the app lifespan to retrieve.
 _cli_distributed_group = None
