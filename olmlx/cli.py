@@ -102,19 +102,17 @@ def _apply_serve_overrides(args) -> None:
     """
     from olmlx.config import settings as _settings
 
-    spec = getattr(args, "speculative", None)
-    spec_draft = getattr(args, "speculative_draft_model", None)
-    spec_tokens = getattr(args, "speculative_tokens", None)
-    if spec is not None:
-        _settings.speculative = spec
-    if spec_draft is not None:
-        _settings.speculative_draft_model = spec_draft
-    if spec_tokens is not None:
-        _settings.speculative_tokens = spec_tokens
+    if args.speculative is not None:
+        _settings.speculative = args.speculative
+    if args.speculative_draft_model is not None:
+        _settings.speculative_draft_model = args.speculative_draft_model
+    if args.speculative_tokens is not None:
+        _settings.speculative_tokens = args.speculative_tokens
 
-    # Surface the misconfiguration at startup rather than at the first
-    # request — the model load thread cannot raise back to the user
-    # cleanly.
+    # Surface speculative misconfigurations at startup rather than on the
+    # first request: the model load thread cannot raise back to the user
+    # cleanly. Covers both the global setting (above) and any per-model
+    # override in models.json.
     if _settings.speculative and not _settings.speculative_draft_model:
         print(
             "Error: speculative decoding is enabled but no draft model is "
@@ -123,6 +121,37 @@ def _apply_serve_overrides(args) -> None:
             file=sys.stderr,
         )
         sys.exit(2)
+    bad = _models_with_invalid_speculative_config()
+    if bad:
+        print(
+            "Error: the following models in models.json enable speculative "
+            "decoding but have no draft model configured (per-model or "
+            f"global): {', '.join(bad)}. Set 'speculative_draft_model' on "
+            "each entry or set OLMLX_SPECULATIVE_DRAFT_MODEL globally.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
+def _models_with_invalid_speculative_config() -> list[str]:
+    """Return models whose resolved speculative config is enabled but has
+    no draft model. The registry is loaded from disk; missing or corrupt
+    config is treated as "nothing to validate" so this never blocks
+    startup on its own.
+    """
+    try:
+        from olmlx.engine.registry import ModelRegistry
+
+        registry = ModelRegistry()
+        registry.load()
+    except Exception:
+        return []
+    bad: list[str] = []
+    for name, mc in registry.list_models().items():
+        enabled, draft, _ = mc.resolved_speculative()
+        if enabled and not draft:
+            bad.append(name)
+    return bad
 
 
 # Module-level state set by cmd_serve() for the app lifespan to retrieve.
@@ -1776,6 +1805,10 @@ def cli_main():
     args = parser.parse_args()
 
     if args.command is None or args.command == "serve":
+        # Re-parse with the serve subparser when invoked bare so the
+        # serve flags (--speculative, etc.) are always present on args.
+        if args.command is None:
+            args = parser.parse_args(["serve"])
         cmd_serve(args)
     elif args.command == "service":
         if args.service_command == "install":

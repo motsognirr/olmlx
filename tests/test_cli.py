@@ -197,8 +197,30 @@ class TestBuildParser:
         # ``settings.speculative`` doesn't leak into other tests.
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        # Avoid registry-walk noise from a real ~/.olmlx/models.json.
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_invalid_speculative_config", lambda: []
+        )
         parser = build_parser()
         args = parser.parse_args(["serve", "--speculative"])
+        with pytest.raises(SystemExit) as excinfo:
+            _apply_serve_overrides(args)
+        assert excinfo.value.code == 2
+
+    def test_apply_serve_overrides_rejects_per_model_misconfig(self, monkeypatch):
+        """Serve fails fast when a models.json entry enables speculative but
+        has no draft model anywhere."""
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_invalid_speculative_config",
+            lambda: ["bad/model:latest"],
+        )
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
         with pytest.raises(SystemExit) as excinfo:
             _apply_serve_overrides(args)
         assert excinfo.value.code == 2

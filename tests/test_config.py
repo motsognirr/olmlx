@@ -231,6 +231,17 @@ class TestSpeculativeConfig:
         assert entry["speculative_draft_model"] == "Qwen/Qwen3-0.6B"
         assert entry["speculative_tokens"] == 6
 
+    def test_per_model_speculative_without_draft_resolves_to_none(self):
+        """A per-model entry that enables speculative but provides no
+        draft model resolves to (True, None, default). The error surfaces
+        either at startup (registry walk) or at first model load."""
+        from olmlx.engine.registry import ModelConfig
+
+        mc = ModelConfig.from_entry({"hf_path": "Qwen/Qwen3-32B", "speculative": True})
+        enabled, draft, _tokens = mc.resolved_speculative()
+        assert enabled is True
+        assert draft is None
+
     def test_resolved_speculative_falls_back_to_settings(self, monkeypatch):
         from olmlx.engine.registry import ModelConfig
 
