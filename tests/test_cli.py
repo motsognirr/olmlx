@@ -390,6 +390,42 @@ class TestBuildParser:
         assert "dormant/model:latest" in caplog.text
         assert "speculative_draft_model" in caplog.text
 
+    def test_global_dormant_warning_when_per_model_uses_own_draft(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """If global draft is set but each speculative-enabled model has its
+        own draft (so nobody consumes the global), the warning must fire —
+        and the wording must not falsely claim speculative is off everywhere."""
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "with-own/m:latest": {
+                        "hf_path": "with-own/m",
+                        "speculative": True,
+                        "speculative_draft_model": "with-own/draft",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
+
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        assert "no model" in caplog.text
+        assert "global/draft" in caplog.text
+        # Must not falsely claim speculative is disabled globally.
+        assert "no per-model entry enables speculative decoding" not in caplog.text
+
     def test_global_dormant_warning_suppressed_when_per_model_consumes(
         self, monkeypatch, tmp_path, caplog
     ):

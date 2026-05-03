@@ -161,20 +161,26 @@ def _apply_serve_overrides(args) -> None:
             "Set speculative=true (per-model or globally) to enable.",
             ", ".join(dormant_drafts),
         )
-    # Global parallel of the per-model dormant-draft warning: warn when a
-    # global draft is set but no model actually consumes it. Suppress
-    # when at least one per-model entry resolves to the global draft —
-    # the "global is dormant" claim would be a false positive.
+    # Global parallel of the per-model dormant-draft warning: warn when
+    # a global draft is set but no model actually consumes it. The
+    # ``global_draft_used`` flag is True when at least one per-model
+    # entry has ``speculative=true`` and falls back to the global
+    # draft. Per-model entries with their own draft do not count —
+    # they neither use nor need the global. The message wording is
+    # narrow on purpose: it claims only that the global draft is
+    # unused, not that speculative is disabled everywhere.
     if (
         not _settings.speculative
         and _settings.speculative_draft_model
         and not global_draft_used
     ):
         logger.warning(
-            "OLMLX_SPECULATIVE_DRAFT_MODEL is set to %r but "
-            "OLMLX_SPECULATIVE is false and no per-model entry enables "
-            "speculative decoding; the draft model will not be loaded. "
-            "Set OLMLX_SPECULATIVE=true (or --speculative) to enable.",
+            "OLMLX_SPECULATIVE_DRAFT_MODEL is set to %r but no model "
+            "consumes it: OLMLX_SPECULATIVE is false and no per-model "
+            "entry inherits the global draft. The setting has no effect "
+            "until a model with ``speculative=true`` (and no per-model "
+            "draft override) is configured, or OLMLX_SPECULATIVE is "
+            "enabled.",
             _settings.speculative_draft_model,
         )
     if flash_conflicts:
