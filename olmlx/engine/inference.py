@@ -2008,14 +2008,20 @@ async def _store_prompt_cache_after_generation(
             # next turn; the pre-generation path will discard it if
             # alignment requires a trim.
             #
-            # When None-ID tokens were produced during generation
-            # (eval_count != len(generated_tokens)), the KV cache
-            # offset does not match the full stored_tokens sequence.
-            # In that case store only full_prompt_tokens as metadata
-            # — the generated portion is unreliable and will cause
-            # offset misalignment on the next turn if cached.
+            # If None-ID tokens were produced during generation
+            # (eval_count != len(generated_tokens)), the KV ring buffer
+            # contains stale generation entries at positions we can't
+            # trim out, and the metadata can't faithfully represent
+            # them.  Don't store at all — a stale cache is worse than
+            # no cache.
             if eval_count != len(generated_tokens):
-                stored_tokens = list(full_prompt_tokens)
+                logger.debug(
+                    "Non-trimmable cache with misaligned eval_count "
+                    "(%d != %d); skipping storage",
+                    eval_count,
+                    len(generated_tokens),
+                )
+                return
             logger.warning(
                 "Storing non-trimmable cache at %d tokens "
                 "(would-be trim=%d, exceeds limit of %d); "
