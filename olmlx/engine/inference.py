@@ -425,24 +425,40 @@ def _derive_timing_stats(
     was missing.
 
     Convention (matches Ollama): ``prompt_eval_duration`` covers prefill,
-    ``eval_duration`` covers decode only. Their sum should never exceed
-    ``eval_timer_ns``.
+    ``eval_duration`` covers decode only. Both fields are clamped so their
+    sum never exceeds ``eval_timer_ns``.
     """
+    # Defensive coercion: third-party result objects sometimes carry
+    # non-Python-numeric scalars (numpy/mlx) for these fields, and ad-hoc
+    # MagicMock objects in tests would otherwise sneak through truthiness
+    # checks. Treat anything non-numeric as missing.
+    if not isinstance(prompt_tps, (int, float)):
+        prompt_tps = 0.0
+    if not isinstance(gen_tps, (int, float)):
+        gen_tps = 0.0
+
     if prompt_tps > 0 and stats.prompt_eval_count > 0:
-        stats.prompt_eval_duration = int(stats.prompt_eval_count / prompt_tps * 1e9)
+        # Clamp to wall-clock — rate noise can produce values exceeding the
+        # actual elapsed time, which would otherwise break the sum invariant.
+        stats.prompt_eval_duration = min(
+            int(stats.prompt_eval_count / prompt_tps * 1e9),
+            eval_timer_ns,
+        )
     elif stats.prompt_eval_count > 0 and stats.eval_count == 0:
         # No decode happened — entire timer is prefill.
         stats.prompt_eval_duration = eval_timer_ns
 
     if gen_tps > 0 and stats.eval_count > 0:
-        stats.eval_duration = int(stats.eval_count / gen_tps * 1e9)
+        stats.eval_duration = min(
+            int(stats.eval_count / gen_tps * 1e9),
+            eval_timer_ns - stats.prompt_eval_duration,
+        )
     elif stats.eval_count == 0:
         # No decode happened — match Ollama's convention.
         stats.eval_duration = 0
     else:
         # Subtract known prefill from the wall-clock timer. ``max(0, …)``
-        # guards against rate-noise where the rate-derived prefill exceeds
-        # the wall-clock — clamp instead of double-counting.
+        # guards against the (post-clamp impossible) negative case.
         stats.eval_duration = max(0, eval_timer_ns - stats.prompt_eval_duration)
 
     # Symmetric back-compute: if only ``gen_tps`` was reported, recover

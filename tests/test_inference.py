@@ -27,6 +27,7 @@ from olmlx.engine.inference import (
     ServerBusyError,
 )
 from olmlx.engine.template_caps import TemplateCaps
+from olmlx.engine.inference import _derive_timing_stats
 from olmlx.utils.streaming import CancellableStream, StreamToken
 from olmlx.utils.timing import TimingStats
 
@@ -36,8 +37,6 @@ class TestDeriveTimingStats:
     mlx-lm's rates + a wall-clock fallback into Ollama-convention durations."""
 
     def test_happy_path_uses_measured_rates(self):
-        from olmlx.engine.inference import _derive_timing_stats
-
         stats = TimingStats(prompt_eval_count=5, eval_count=10)
         # 5 / 100 = 50 ms; 10 / 50 = 200 ms — wall clock is irrelevant here.
         p, g = _derive_timing_stats(stats, 100.0, 50.0, eval_timer_ns=999_999_999)
@@ -48,8 +47,6 @@ class TestDeriveTimingStats:
     def test_no_decode_zeroes_eval_duration(self):
         """eval_count == 0 → eval_duration = 0 (Ollama convention).
         prompt_eval_duration falls back to the wall-clock timer."""
-        from olmlx.engine.inference import _derive_timing_stats
-
         stats = TimingStats(prompt_eval_count=12, eval_count=0)
         _derive_timing_stats(stats, 0.0, 0.0, eval_timer_ns=1_000_000_000)
         assert stats.prompt_eval_duration == 1_000_000_000
@@ -58,8 +55,6 @@ class TestDeriveTimingStats:
     def test_decode_subtracts_prefill_from_wall_clock(self):
         """When gen_tps is missing but prompt_tps is known, decode-only time
         is the wall-clock minus the (rate-derived) prefill."""
-        from olmlx.engine.inference import _derive_timing_stats
-
         stats = TimingStats(prompt_eval_count=100, eval_count=10)
         # prefill = 100 / 1000 = 100 ms; wall-clock = 500 ms → decode = 400 ms.
         _derive_timing_stats(stats, 1000.0, 0.0, eval_timer_ns=500_000_000)
@@ -67,23 +62,19 @@ class TestDeriveTimingStats:
         assert stats.eval_duration == 400_000_000
 
     def test_rate_noise_clamped_not_double_counted(self):
-        """If the rate-derived prefill ends up greater than wall-clock (rate
-        noise), eval_duration must clamp to 0 instead of falling back to the
-        full timer (which would double-count prefill)."""
-        from olmlx.engine.inference import _derive_timing_stats
-
+        """If the rate-derived prefill exceeds wall-clock (rate noise), both
+        fields must be clamped so their sum never exceeds the timer."""
         stats = TimingStats(prompt_eval_count=100, eval_count=10)
         # prefill = 100 / 1000 = 100 ms but wall-clock = 90 ms (noise).
         _derive_timing_stats(stats, 1000.0, 0.0, eval_timer_ns=90_000_000)
-        assert stats.prompt_eval_duration == 100_000_000
-        # Sum of fields must not exceed wall-clock — clamp to 0.
+        # prompt_eval_duration clamped to wall-clock (was 100 ms raw).
+        assert stats.prompt_eval_duration == 90_000_000
         assert stats.eval_duration == 0
+        assert stats.prompt_eval_duration + stats.eval_duration <= 90_000_000
 
     def test_back_compute_prefill_when_only_gen_tps_known(self):
         """When only gen_tps is reported, prompt_eval_duration is recovered
         from wall-clock minus the (now known) decode duration."""
-        from olmlx.engine.inference import _derive_timing_stats
-
         stats = TimingStats(prompt_eval_count=200, eval_count=10)
         # decode = 10 / 50 = 200 ms; wall-clock = 500 ms → prefill = 300 ms.
         p, g = _derive_timing_stats(stats, 0.0, 50.0, eval_timer_ns=500_000_000)
@@ -96,14 +87,28 @@ class TestDeriveTimingStats:
     def test_log_fallback_derives_tps_from_durations(self):
         """When neither rate is reported but durations come from fallbacks,
         the returned tps values are back-computed for the log line."""
-        from olmlx.engine.inference import _derive_timing_stats
-
         stats = TimingStats(prompt_eval_count=5, eval_count=0)
         p, g = _derive_timing_stats(stats, 0.0, 0.0, eval_timer_ns=100_000_000)
         # eval_count==0 → gen_tps stays 0 (no decode to back-compute from).
         assert g == 0.0
         # prompt_eval_duration is 100 ms, prompt_eval_count is 5 → 50 tok/s.
         assert p == pytest.approx(50.0)
+
+    def test_non_numeric_rate_treated_as_missing(self):
+        """Defensive boundary: a non-Python-numeric scalar (e.g. MagicMock
+        from a sloppy test, numpy/mlx scalar from mlx-lm) must not be trusted
+        as a rate — the helper coerces to 0 and uses fallbacks instead."""
+        stats = TimingStats(prompt_eval_count=10, eval_count=5)
+        bogus = MagicMock()
+        # bogus would otherwise be truthy and silently absorbed via __int__.
+        _derive_timing_stats(stats, bogus, bogus, eval_timer_ns=200_000_000)
+        # prompt_tps treated as 0 → prefill falls back; eval_count > 0 means
+        # eval_duration = wall-clock - prefill = 200 - 0 = 200 ms.
+        # But back-compute then sets prompt_eval_duration = 200 - 200 = 0.
+        # The key invariant: no garbage int values from MagicMock arithmetic.
+        assert isinstance(stats.prompt_eval_duration, int)
+        assert isinstance(stats.eval_duration, int)
+        assert stats.prompt_eval_duration + stats.eval_duration <= 200_000_000
 
 
 class TestBuildGenerateKwargs:
@@ -1401,15 +1406,19 @@ class TestGenerateCompletion:
         # last chunk is the done signal
         assert chunks[-1]["done"] is True
         assert any(c.get("text") == "Hello" for c in chunks if not c.get("done"))
-        # Ollama convention: prompt_eval_duration covers prefill, eval_duration
-        # covers decode only. Both are derived from mlx-lm's measured rates so
-        # they don't overlap (eval_duration used to include prefill time).
-        # 5 prompt tokens at 100 tok/s → 50 ms; 2 gen tokens at 50 tok/s → 40 ms
+        # End-to-end invariants — the precise rate→duration math lives in
+        # TestDeriveTimingStats. Here we verify the streaming path actually
+        # populates both fields and respects the clamp (wall-clock in unit
+        # tests is microseconds, well below any rate-derived value).
         done_stats = chunks[-1]["stats"]
         assert done_stats.prompt_eval_count == 5
-        assert done_stats.prompt_eval_duration == 50_000_000
         assert done_stats.eval_count == 2
-        assert done_stats.eval_duration == 40_000_000
+        assert done_stats.prompt_eval_duration > 0
+        assert done_stats.eval_duration >= 0
+        assert (
+            done_stats.prompt_eval_duration + done_stats.eval_duration
+            <= done_stats.total_duration
+        )
 
 
 class TestGenerateChat:
@@ -1547,11 +1556,14 @@ class TestFullCompletionInner:
             )
 
         assert result["text"] == "result text"
-        # 5 / 100 tok/s = 50 ms;  10 / 50 tok/s = 200 ms
+        # End-to-end invariants — exact rate→duration math is covered by
+        # TestDeriveTimingStats. Wall-clock in this test is microseconds,
+        # well below any rate-derived value, so both fields clamp.
         assert stats.prompt_eval_count == 5
-        assert stats.prompt_eval_duration == 50_000_000
         assert stats.eval_count == 10
-        assert stats.eval_duration == 200_000_000
+        assert stats.prompt_eval_duration > 0
+        assert stats.eval_duration >= 0
+        assert stats.prompt_eval_duration + stats.eval_duration <= stats.total_duration
 
     @pytest.mark.asyncio
     async def test_result_as_string(self, mock_manager):
