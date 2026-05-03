@@ -1326,6 +1326,12 @@ class TestGenerateCompletion:
         # last chunk is the done signal
         assert chunks[-1]["done"] is True
         assert any(c.get("text") == "Hello" for c in chunks if not c.get("done"))
+        # prompt_eval_duration should be derived from prompt_tps so the
+        # Ollama-compatible response surfaces a non-zero prefill time.
+        # 5 prompt tokens at 100 tok/s → 50 ms = 50_000_000 ns
+        done_stats = chunks[-1]["stats"]
+        assert done_stats.prompt_eval_count == 5
+        assert done_stats.prompt_eval_duration == 50_000_000
 
 
 class TestGenerateChat:

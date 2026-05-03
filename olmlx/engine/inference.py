@@ -2365,6 +2365,10 @@ async def _stream_completion(
             stats.eval_duration = eval_timer.duration_ns
             prompt_tps = getattr(token, "prompt_tps", 0) or 0
             gen_tps = getattr(token, "generation_tps", 0) or 0
+            if prompt_tps > 0 and stats.prompt_eval_count > 0:
+                stats.prompt_eval_duration = int(
+                    stats.prompt_eval_count / prompt_tps * 1e9
+                )
 
         stats.total_duration = total_timer.duration_ns
         if not timed_out:
@@ -2619,8 +2623,16 @@ async def _full_completion_inner(
         stats.eval_count = result.generation_tokens
 
     eval_secs = stats.eval_duration / 1e9 if stats.eval_duration else 0
-    gen_tps = stats.eval_count / eval_secs if eval_secs > 0 else 0
-    prompt_tps = stats.prompt_eval_count / eval_secs if eval_secs > 0 else 0
+    prompt_tps_raw = getattr(result, "prompt_tps", 0)
+    prompt_tps = (
+        float(prompt_tps_raw) if isinstance(prompt_tps_raw, (int, float)) else 0.0
+    )
+    gen_tps_raw = getattr(result, "generation_tps", 0)
+    gen_tps = float(gen_tps_raw) if isinstance(gen_tps_raw, (int, float)) else 0.0
+    if prompt_tps > 0 and stats.prompt_eval_count > 0:
+        stats.prompt_eval_duration = int(stats.prompt_eval_count / prompt_tps * 1e9)
+    if gen_tps <= 0 and eval_secs > 0:
+        gen_tps = stats.eval_count / eval_secs
     total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
     logger.info(
         "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
