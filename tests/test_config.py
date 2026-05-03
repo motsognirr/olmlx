@@ -227,6 +227,17 @@ class TestSpeculativeConfig:
         with pytest.raises(ValueError, match="promoted out of 'experimental'"):
             _validate_experimental_overrides({"speculative": True})
 
+    def test_promoted_keys_renamed_branch_message(self, monkeypatch):
+        """Cover the 'rename' branch of the migration error so it doesn't
+        rot before the next promotion exercises it for real."""
+        from olmlx.engine import registry
+
+        monkeypatch.setitem(registry.PROMOTED_EXPERIMENTAL_KEYS, "old_name", "new_name")
+        with pytest.raises(
+            ValueError, match="rename 'old_name' → top-level 'new_name'"
+        ):
+            registry._validate_experimental_overrides({"old_name": True})
+
     def test_speculative_per_model_top_level(self):
         """Per-model overrides go at the top level of the models.json entry."""
         from olmlx.engine.registry import ModelConfig

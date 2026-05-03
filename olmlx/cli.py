@@ -173,11 +173,18 @@ def _apply_serve_overrides(args) -> None:
             ", ".join(dormant_drafts),
         )
     if flash_conflicts:
+        # Note: standalone speculative is only dropped when the Flash
+        # bundle actually loads — if the bundle directory is missing
+        # ``_load_model`` falls through to the standard load path and
+        # the standalone speculative decoder still runs. The startup
+        # warning is advisory; the authoritative runtime warning lives
+        # in ``_load_model`` for the case where Flash actually wins.
         logger.warning(
             "The following models combine speculative=true with Flash or "
-            "Flash-MoE: %s. Standalone speculative decoding is dropped on "
-            "the Flash load path; use the model's flash_speculative "
-            "settings (OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_*) instead.",
+            "Flash-MoE: %s. Once Flash is prepared and loads, standalone "
+            "speculative decoding is dropped — use the model's "
+            "flash_speculative settings "
+            "(OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_*) instead.",
             ", ".join(flash_conflicts),
         )
     if bad:
