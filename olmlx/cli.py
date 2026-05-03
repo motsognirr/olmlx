@@ -43,9 +43,11 @@ def cmd_serve(args):
     """Start the olmlx server."""
     import uvicorn
 
-    _apply_serve_overrides(args)
+    # ensure_config() must run before override validation so the registry
+    # walk in _apply_serve_overrides sees a real models.json on first run.
     ensure_config()
     _configure_logging()
+    _apply_serve_overrides(args)
 
     from olmlx.config import experimental
 
@@ -93,6 +95,13 @@ def cmd_serve(args):
     )
 
 
+_DEPRECATED_SPECULATIVE_ENV_VARS = (
+    "OLMLX_EXPERIMENTAL_SPECULATIVE",
+    "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL",
+    "OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS",
+)
+
+
 def _apply_serve_overrides(args) -> None:
     """Apply CLI flags to the global Settings before the server starts.
 
@@ -101,6 +110,19 @@ def _apply_serve_overrides(args) -> None:
     them up without needing extra plumbing.
     """
     from olmlx.config import settings as _settings
+
+    # Surface the env-var rename so a user upgrading with the old names
+    # in their shell profile doesn't silently lose speculative decoding —
+    # pydantic-settings drops unknown OLMLX_EXPERIMENTAL_* keys without
+    # warning.
+    stale = [v for v in _DEPRECATED_SPECULATIVE_ENV_VARS if os.environ.get(v)]
+    if stale:
+        logger.warning(
+            "Deprecated env vars detected (ignored): %s. Rename to "
+            "OLMLX_SPECULATIVE, OLMLX_SPECULATIVE_DRAFT_MODEL, "
+            "OLMLX_SPECULATIVE_TOKENS.",
+            ", ".join(stale),
+        )
 
     if args.speculative is not None:
         _settings.speculative = args.speculative

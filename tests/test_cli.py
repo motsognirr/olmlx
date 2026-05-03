@@ -216,6 +216,32 @@ class TestBuildParser:
         # Should not raise SystemExit.
         _apply_serve_overrides(args)
 
+    def test_apply_serve_overrides_warns_on_deprecated_env_vars(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_invalid_speculative_config", lambda: []
+        )
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE", "true")
+        monkeypatch.setenv(
+            "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", "Qwen/Qwen3-0.6B"
+        )
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        msg = caplog.text
+        assert "Deprecated env vars" in msg
+        assert "OLMLX_EXPERIMENTAL_SPECULATIVE" in msg
+        assert "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL" in msg
+
     def test_apply_serve_overrides_rejects_per_model_misconfig(self, monkeypatch):
         """Serve fails fast when a models.json entry enables speculative but
         has no draft model anywhere."""
