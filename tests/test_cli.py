@@ -216,6 +216,25 @@ class TestBuildParser:
         # Should not raise SystemExit.
         _apply_serve_overrides(args)
 
+    def test_legacy_dotenv_strips_inline_comments(self, monkeypatch, tmp_path):
+        """An unquoted ``.env`` value with a trailing ``# …`` comment
+        must parse to just the value. Without comment stripping, the
+        boolean forwarder would coerce ``true  # enable`` to False
+        and the user's intent would silently invert."""
+        from olmlx.cli import _legacy_speculative_values_in_dotenv
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "OLMLX_EXPERIMENTAL_SPECULATIVE=true  # enable speculative\n"
+            "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL=Qwen/Qwen3-0.6B # draft\n"
+            'OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS="6"\n'
+        )
+        values = _legacy_speculative_values_in_dotenv()
+        assert values["OLMLX_EXPERIMENTAL_SPECULATIVE"] == "true"
+        assert values["OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL"] == "Qwen/Qwen3-0.6B"
+        # Properly-quoted values keep their content verbatim.
+        assert values["OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS"] == "6"
+
     def test_legacy_dotenv_values_are_forwarded(self, monkeypatch, tmp_path, caplog):
         """A user with the legacy ``OLMLX_EXPERIMENTAL_SPECULATIVE*`` in
         their ``.env`` (not in shell) should still see their config

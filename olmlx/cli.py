@@ -164,10 +164,19 @@ def _legacy_speculative_values_in_dotenv() -> dict[str, str]:
         if key.startswith("export "):
             key = key[len("export ") :].strip()
         value = value.strip()
-        if (value.startswith('"') and value.endswith('"')) or (
+        is_quoted = (value.startswith('"') and value.endswith('"')) or (
             value.startswith("'") and value.endswith("'")
-        ):
+        )
+        if is_quoted:
             value = value[1:-1]
+        else:
+            # Strip inline ``# comment`` from unquoted values. Without
+            # this, a line like ``KEY=true  # enable`` would parse
+            # ``true  # enable``, which the boolean forwarder coerces
+            # to ``False`` — the opposite of intent.
+            comment_idx = value.find("#")
+            if comment_idx != -1:
+                value = value[:comment_idx].rstrip()
         if key in legacy and key not in found:
             found[key] = value
     return found
