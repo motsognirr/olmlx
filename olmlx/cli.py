@@ -245,12 +245,15 @@ def _apply_serve_overrides(args) -> None:
     # not flagged here — the first model load will raise a clear error.
     needs_migration = _models_with_promoted_keys_in_experimental()
     if needs_migration:
+        from olmlx.engine.registry import PROMOTED_EXPERIMENTAL_KEYS
+
+        promoted_list = ", ".join(repr(k) for k in sorted(PROMOTED_EXPERIMENTAL_KEYS))
         print(
             "Error: the following models in models.json still place "
             "speculative settings under 'experimental' — these keys have "
-            "been promoted to top-level fields. Move 'speculative', "
-            "'speculative_draft_model', and 'speculative_tokens' out of "
-            f"the 'experimental' block. Affected entries: {', '.join(needs_migration)}.",
+            f"been promoted to top-level fields. Move {promoted_list} "
+            "out of the 'experimental' block. Affected entries: "
+            f"{', '.join(needs_migration)}.",
             file=sys.stderr,
         )
         sys.exit(2)
