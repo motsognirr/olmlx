@@ -750,9 +750,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
 
         bad, dormant, flash_conflicts, global_used = _audit_speculative_config()
-        assert bad == ["bad/no-draft:latest"]
-        assert dormant == ["dormant/has-draft:latest"]
-        assert flash_conflicts == ["conflict/flash-and-spec:latest"]
+        # Compare as sets so the test isn't coupled to the registry's
+        # internal iteration order.
+        assert set(bad) == {"bad/no-draft:latest"}
+        assert set(dormant) == {"dormant/has-draft:latest"}
+        assert set(flash_conflicts) == {"conflict/flash-and-spec:latest"}
         # No model in this fixture uses the global draft (good/a has its own).
         assert global_used is False
 

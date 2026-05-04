@@ -354,26 +354,29 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
     The registry is loaded from disk; failures are logged and treated
     as "nothing to validate" so this never blocks startup on its own.
     """
-    try:
-        from olmlx.config import experimental as global_exp
-        from olmlx.config import resolve_experimental
-        from olmlx.engine.registry import ModelRegistry
+    from olmlx.config import experimental as global_exp
+    from olmlx.config import resolve_experimental
+    from olmlx.engine.registry import ModelRegistry
 
-        registry = ModelRegistry()
+    registry = ModelRegistry()
+    try:
         registry.load()
     except ValueError as exc:
         # Validation errors (e.g. a malformed entry that survived
         # ``_models_with_promoted_keys_in_experimental``) are operator
         # errors, not transient I/O issues — flag them distinctly.
+        # Note: ``ModelRegistry.load`` itself catches per-entry
+        # ValueError today and logs them, so this branch fires only if
+        # validation moves earlier in the load sequence.
         logger.warning(
             "Skipping speculative config validation: invalid models.json entry: %s",
             exc,
         )
         return [], [], [], False
-    except (OSError, ImportError) as exc:
-        # I/O / packaging failures: never block startup. A wider catch
-        # would silently swallow programming errors (typos, missing
-        # attributes), so we keep it narrow on purpose.
+    except OSError as exc:
+        # I/O failures: never block startup. The catch is narrow so
+        # programming errors (typos, missing attributes, etc.) inside
+        # the loop below propagate instead of being swallowed.
         logger.warning(
             "Skipping speculative config validation: could not load registry: %s",
             exc,
