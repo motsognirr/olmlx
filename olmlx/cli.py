@@ -379,11 +379,7 @@ def _warn_kv_cache_quant_incompatibilities() -> None:
     """Warn about tracked incompatibilities at startup."""
     from olmlx.config import settings as _settings
 
-    if not _settings.prompt_cache_disk:
-        return
-
-    # Check global setting first.
-    if _settings.kv_cache_quant:
+    if _settings.prompt_cache_disk and _settings.kv_cache_quant:
         logger.warning(
             "Prompt cache disk offload is enabled (OLMLX_PROMPT_CACHE_DISK=true) "
             "together with KV cache quantization (OLMLX_KV_CACHE_QUANT=%s). "
@@ -391,28 +387,12 @@ def _warn_kv_cache_quant_incompatibilities() -> None:
             "will be silently skipped. Disable one of these options.",
             _settings.kv_cache_quant,
         )
-        return
-
-    # Walk the registry for per-model kv_cache_quant overrides.
-    try:
-        from olmlx.engine.registry import ModelRegistry
-
-        reg = ModelRegistry()
-        reg.load()
-        for name, mc in reg.list_models().items():
-            resolved = mc.resolved_kv_cache_quant()
-            if resolved:
-                logger.warning(
-                    "Prompt cache disk offload is enabled (OLMLX_PROMPT_CACHE_DISK=true) "
-                    "together with per-model KV cache quantization for '%s' "
-                    "(kv_cache_quant=%s). "
-                    "Quantized KV caches cannot be serialized to disk — disk saves "
-                    "will be silently skipped. Disable one of these options.",
-                    name,
-                    resolved,
-                )
-    except Exception:
-        pass  # registry unavailable — skip per-model check
+    # Per-model kv_cache_quant overrides are not checked here — walking
+    # the full registry at startup is noisy (every entry with a per-model
+    # override would warn, even for models not being loaded). The runtime
+    # guard in PromptCacheStore._save_to_disk silently skips disk saves
+    # for any non-serializable cache regardless of the source, so there
+    # is no silent data loss.
 
 
 def _apply_serve_overrides(args) -> None:
@@ -1045,8 +1025,12 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
                 mc = reg.resolve(model)
                 if mc is not None:
                     _resolved_kvq = mc.resolved_kv_cache_quant()
-            except Exception:
-                pass  # registry unavailable — fall back to global
+            except Exception as exc:
+                logger.debug(
+                    "Skipping per-model kv_cache_quant resolution for distributed "
+                    "worker: %s",
+                    exc,
+                )
         if _resolved_kvq:
             env["OLMLX_KV_CACHE_QUANT"] = _resolved_kvq
         if experimental.flash:
