@@ -410,7 +410,19 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
     flash_conflicts: list[str] = []
     global_draft_used = False
     for name, mc in registry.list_models().items():
-        enabled, draft, _ = mc.resolved_speculative()
+        try:
+            enabled, draft, _ = mc.resolved_speculative()
+        except Exception as exc:
+            # ``resolved_speculative`` reads ``settings`` and could
+            # raise if the runtime ``Settings`` is in an unexpected
+            # state. Skipping the entry is safer than killing
+            # startup with a stack trace.
+            logger.warning(
+                "Skipping audit of %s: could not resolve speculative config: %s",
+                name,
+                exc,
+            )
+            continue
         if enabled and not draft:
             bad.append(name)
         elif not enabled and mc.speculative_draft_model:
@@ -421,6 +433,12 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
         if enabled and mc.speculative_draft_model is None and draft is not None:
             # This model enables speculative without a per-model draft,
             # so it is consuming the global ``speculative_draft_model``.
+            # Note: a per-model entry that copies the global draft path
+            # verbatim into its own ``speculative_draft_model`` looks
+            # "not consuming the global" here, even though the values
+            # are identical. That's intentional — the user wrote a
+            # per-model override, so the global setting is still
+            # logically unused for that model.
             global_draft_used = True
         if enabled:
             # Resolve the full experimental config (global defaults

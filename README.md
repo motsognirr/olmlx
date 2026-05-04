@@ -376,7 +376,7 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 
 ## Speculative Decoding
 
-Speculative decoding pairs a small *draft* model with a larger *target* model: the draft proposes several tokens autoregressively, and the target verifies them in a single forward pass. When most drafts are accepted you get multiple tokens per target step, which lowers latency without changing output quality (greedy verification ensures bit-identical output to plain greedy decoding).
+Speculative decoding pairs a small *draft* model with a larger *target* model: the draft proposes several tokens autoregressively, and the target verifies them in a single forward pass. When most drafts are accepted you get multiple tokens per target step, which lowers latency. Verification is performed with greedy argmax against the target's logits — so for `temperature=0` requests the output is bit-identical to plain greedy decoding. With `temperature > 0`, output quality is preserved but the token stream is no longer drawn from the target's sampled distribution, so individual completions can differ from a non-speculative run with the same seed.
 
 ```bash
 OLMLX_SPECULATIVE=true \
