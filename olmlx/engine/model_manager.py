@@ -1725,9 +1725,9 @@ class ModelManager:
         if spec_config is None:
             # Delegate to the canonical resolution path so this fallback
             # can't drift from ``ModelConfig.resolved_speculative()``.
-            # An empty ``ModelConfig`` resolves entirely from global
-            # ``Settings``, which is what we want when no ModelConfig
-            # is passed in.
+            # ``ModelConfig`` requires an ``hf_path`` but the value is
+            # not consulted by ``resolved_speculative`` — it reads only
+            # from ``settings`` for an unconfigured ModelConfig.
             from olmlx.engine.registry import ModelConfig
 
             spec_config = ModelConfig(hf_path=hf_path).resolved_speculative()

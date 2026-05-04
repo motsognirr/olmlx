@@ -222,12 +222,19 @@ def _apply_serve_overrides(args) -> None:
         # on upgrade. Drop this once the deprecation window closes.
         _forward_legacy_speculative_env(_settings)
 
-    if args.speculative is not None:
-        _settings.speculative = args.speculative
-    if args.speculative_draft_model is not None:
-        _settings.speculative_draft_model = args.speculative_draft_model
-    if args.speculative_tokens is not None:
-        _settings.speculative_tokens = args.speculative_tokens
+    # ``getattr`` defends programmatic callers that hand a bare
+    # ``argparse.Namespace`` (e.g. tests) without populating these
+    # attributes. The parser-derived defaults already cover bare
+    # ``olmlx`` invocation; this is just a safety net.
+    spec = getattr(args, "speculative", None)
+    spec_draft = getattr(args, "speculative_draft_model", None)
+    spec_tokens = getattr(args, "speculative_tokens", None)
+    if spec is not None:
+        _settings.speculative = spec
+    if spec_draft is not None:
+        _settings.speculative_draft_model = spec_draft
+    if spec_tokens is not None:
+        _settings.speculative_tokens = spec_tokens
 
     # Surface speculative misconfigurations at startup by walking the
     # registry and checking each model's ``resolved_speculative()``. This
@@ -421,6 +428,7 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
                 "Skipping audit of %s: could not resolve speculative config: %s",
                 name,
                 exc,
+                exc_info=True,
             )
             continue
         if enabled and not draft:
@@ -452,6 +460,7 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
                     "resolve experimental overrides: %s",
                     name,
                     exc,
+                    exc_info=True,
                 )
                 continue
             if resolved_exp.flash or resolved_exp.flash_moe:
