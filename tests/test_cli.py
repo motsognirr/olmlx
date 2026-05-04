@@ -188,6 +188,25 @@ class TestBuildParser:
         args = parser.parse_args(["serve", "--no-speculative"])
         assert args.speculative is False
 
+    def test_root_parser_has_no_serve_flag_collisions(self):
+        """The bare-invocation default synthesis in ``cli_main`` copies
+        serve-subparser defaults onto ``args`` only when the attribute
+        is missing. That is correct only as long as the root parser's
+        attribute names don't overlap with the serve subparser's
+        names — otherwise the serve default would be silently skipped.
+        Pin the invariant so adding a colliding flag fails CI."""
+        parser = build_parser()
+        root_attrs = set(vars(parser.parse_args([])))
+        # ``command`` is owned by the root parser (subparsers dest).
+        root_attrs.discard("command")
+        serve_attrs = set(vars(parser.parse_args(["serve"]))) - {"command"}
+        assert root_attrs.isdisjoint(serve_attrs), (
+            "Root parser and serve subparser share attribute names: "
+            f"{root_attrs & serve_attrs}. The bare-invocation default "
+            "synthesis in cli_main would silently skip serve defaults "
+            "for these names. Rename one side or update cli_main."
+        )
+
     def test_serve_empty_draft_model_rejected(self, capsys):
         """``--speculative-draft-model ""`` should be rejected by argparse,
         not propagate as a Pydantic ``ValidationError`` at startup."""
@@ -684,8 +703,10 @@ class TestBuildParser:
         with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
             with pytest.raises(SystemExit):
                 _apply_serve_overrides(args)
-        # No flash-conflict warning when the model is also missing its draft.
-        assert "use the model's flash_speculative settings" not in caplog.text
+        # No flash-conflict warning when the model is also missing its
+        # draft. ``flash_speculative`` is the unique substring of the
+        # flash-conflict warning, so its absence rules the warning out.
+        assert "flash_speculative" not in caplog.text
 
     def test_apply_serve_overrides_warns_on_flash_conflict(self, monkeypatch, caplog):
         """A model that combines speculative with Flash gets a warning so the
