@@ -315,16 +315,17 @@ def _legacy_kv_cache_quant_in_dotenv() -> str | None:
         if key != "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT":
             continue
         value = value.strip()
+        # Strip inline comment first so that ``"turboquant:4" # comment``
+        # correctly detects the surrounding quotes.
+        comment_idx = value.find("#")
+        if comment_idx != -1:
+            value = value[:comment_idx].rstrip()
         is_quoted = len(value) >= 2 and (
             (value.startswith('"') and value.endswith('"'))
             or (value.startswith("'") and value.endswith("'"))
         )
         if is_quoted:
             value = value[1:-1]
-        else:
-            comment_idx = value.find("#")
-            if comment_idx != -1:
-                value = value[:comment_idx].rstrip()
         return value
     return None
 
@@ -367,6 +368,20 @@ def _surface_legacy_kv_cache_quant_env() -> None:
         )
 
 
+def _warn_kv_cache_quant_incompatibilities() -> None:
+    """Warn about tracked incompatibilities at startup."""
+    from olmlx.config import settings as _settings
+
+    if _settings.prompt_cache_disk and _settings.kv_cache_quant:
+        logger.warning(
+            "Prompt cache disk offload is enabled (OLMLX_PROMPT_CACHE_DISK=true) "
+            "together with KV cache quantization (OLMLX_KV_CACHE_QUANT=%s). "
+            "Quantized KV caches cannot be serialized to disk — disk saves "
+            "will be silently skipped. Disable one of these options.",
+            _settings.kv_cache_quant,
+        )
+
+
 def _apply_serve_overrides(args) -> None:
     """Apply CLI flags to the global Settings before the server starts.
 
@@ -398,16 +413,7 @@ def _apply_serve_overrides(args) -> None:
 
     _surface_legacy_kv_cache_quant_env()
 
-    # Load time check for tracked incompatibilities — add to this block as
-    # features are validated against their stated compatibility matrix.
-    if _settings.prompt_cache_disk and _settings.kv_cache_quant:
-        logger.warning(
-            "Prompt cache disk offload is enabled (OLMLX_PROMPT_CACHE_DISK=true) "
-            "together with KV cache quantization (OLMLX_KV_CACHE_QUANT=%s). "
-            "Quantized KV caches cannot be serialized to disk — disk saves "
-            "will be silently skipped. Disable one of these options.",
-            _settings.kv_cache_quant,
-        )
+    _warn_kv_cache_quant_incompatibilities()
 
     # Surface speculative misconfigurations at startup by walking the
     # registry and checking each model's ``resolved_speculative()``. This
@@ -1336,6 +1342,7 @@ def cmd_chat(args):
     # ``serve`` handles it correctly.
     _surface_legacy_speculative_env()
     _surface_legacy_kv_cache_quant_env()
+    _warn_kv_cache_quant_incompatibilities()
 
     model_name = args.model_name
     if model_name is None:

@@ -1092,6 +1092,51 @@ class TestBuildParser:
         args = parser.parse_args(["serve", "--kv-cache-quant", "turboquant:4"])
         assert args.kv_cache_quant == "turboquant:4"
 
+    def test_kv_cache_quant_disk_incompat_warning(self, monkeypatch, caplog):
+        """prompt_cache_disk + kv_cache_quant together produce a warning."""
+        import logging
+
+        from olmlx.cli import _warn_kv_cache_quant_incompatibilities
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "prompt_cache_disk", True)
+        monkeypatch.setattr(_settings, "kv_cache_quant", "turboquant:4")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _warn_kv_cache_quant_incompatibilities()
+
+        assert "Prompt cache disk offload" in caplog.text
+        assert "turboquant:4" in caplog.text
+
+    def test_kv_cache_quant_disk_incompat_no_warning_when_disabled(
+        self, monkeypatch, caplog
+    ):
+        """No warning when either setting is off."""
+        import logging
+
+        from olmlx.cli import _warn_kv_cache_quant_incompatibilities
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "prompt_cache_disk", False)
+        monkeypatch.setattr(_settings, "kv_cache_quant", "turboquant:4")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _warn_kv_cache_quant_incompatibilities()
+
+        assert "Prompt cache disk offload" not in caplog.text
+
+    def test_legacy_kv_cache_quant_dotenv_quoted_with_comment(
+        self, monkeypatch, tmp_path
+    ):
+        """Quoted value with trailing inline comment is parsed correctly."""
+        from olmlx.cli import _legacy_kv_cache_quant_in_dotenv
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            'OLMLX_EXPERIMENTAL_KV_CACHE_QUANT="turboquant:4" # use 4-bit\n'
+        )
+        assert _legacy_kv_cache_quant_in_dotenv() == "turboquant:4"
+
 
 class TestCliMain:
     def test_default_calls_serve(self, monkeypatch):
