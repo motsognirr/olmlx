@@ -45,8 +45,6 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
         "dflash",
         "dflash_draft_model",
         "dflash_block_size",
-        # KV cache quantization
-        "kv_cache_quant",
         # Flash MoE
         "flash_moe",
         "flash_moe_cache_budget_experts",
@@ -63,6 +61,7 @@ PROMOTED_EXPERIMENTAL_KEYS: dict[str, str] = {
     "speculative": "speculative",
     "speculative_draft_model": "speculative_draft_model",
     "speculative_tokens": "speculative_tokens",
+    "kv_cache_quant": "kv_cache_quant",
 }
 
 
@@ -233,6 +232,9 @@ class ModelConfig:
     speculative: bool | None = None
     speculative_draft_model: str | None = None
     speculative_tokens: int | None = None
+    #: KV cache quantization method and bits (e.g. "turboquant:4").
+    #: ``None`` means inherit the global ``Settings.kv_cache_quant`` value.
+    kv_cache_quant: str | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -286,6 +288,12 @@ class ModelConfig:
             else settings.speculative_draft_model
         )
         return SpeculativeConfig(True, draft, tokens)
+
+    def resolved_kv_cache_quant(self) -> str | None:
+        """Resolve KV cache quant config: per-model overrides global settings."""
+        if self.kv_cache_quant is not None:
+            return self.kv_cache_quant
+        return settings.kv_cache_quant
 
     @classmethod
     def from_entry(cls, entry: str | dict) -> ModelConfig:
@@ -366,6 +374,19 @@ class ModelConfig:
                     )
             speculative_tokens = speculative_tokens_raw
 
+            kv_cache_quant_raw = entry.get("kv_cache_quant")
+            if kv_cache_quant_raw is not None:
+                if not isinstance(kv_cache_quant_raw, str):
+                    raise ValueError(
+                        f"'kv_cache_quant' must be a string, "
+                        f"got {kv_cache_quant_raw!r}"
+                    )
+                if not kv_cache_quant_raw.strip():
+                    raise ValueError(
+                        "'kv_cache_quant' must be a non-empty string; "
+                        "use ``null`` to inherit from the global setting."
+                    )
+
             extra = {k: v for k, v in entry.items() if k not in _KNOWN_CONFIG_KEYS}
             return cls(
                 hf_path=hf_path,
@@ -378,6 +399,7 @@ class ModelConfig:
                 speculative=speculative,
                 speculative_draft_model=speculative_draft_model,
                 speculative_tokens=speculative_tokens,
+                kv_cache_quant=kv_cache_quant_raw,
                 _extra=extra,
             )
         raise TypeError(
@@ -396,6 +418,7 @@ class ModelConfig:
             and self.speculative is None
             and self.speculative_draft_model is None
             and self.speculative_tokens is None
+            and self.kv_cache_quant is None
             and not self._extra
         ):
             return self.hf_path
@@ -419,6 +442,8 @@ class ModelConfig:
             result["speculative_draft_model"] = self.speculative_draft_model
         if self.speculative_tokens is not None:
             result["speculative_tokens"] = self.speculative_tokens
+        if self.kv_cache_quant is not None:
+            result["kv_cache_quant"] = self.kv_cache_quant
         # Filter known keys defensively — from_entry() already excludes them,
         # but _extra can be set directly via ModelConfig construction.
         result.update(

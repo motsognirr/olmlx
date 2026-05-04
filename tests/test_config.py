@@ -111,11 +111,9 @@ class TestSettings:
 class TestResolveExperimental:
     def test_empty_overrides_returns_global(self, monkeypatch):
         monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", raising=False)
         base = ExperimentalSettings()
         result = resolve_experimental(base, {})
         assert result.flash == base.flash
-        assert result.kv_cache_quant == base.kv_cache_quant
 
     def test_flash_override(self, monkeypatch):
         monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
@@ -126,11 +124,13 @@ class TestResolveExperimental:
         # Original should be unchanged
         assert base.flash is False
 
-    def test_kv_cache_quant_override(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", raising=False)
-        base = ExperimentalSettings()
-        result = resolve_experimental(base, {"kv_cache_quant": "turboquant:4"})
-        assert result.kv_cache_quant == "turboquant:4"
+    def test_kv_cache_quant_top_level(self, monkeypatch):
+        """kv_cache_quant is a top-level ModelConfig field, not an experimental override."""
+        monkeypatch.delenv("OLMLX_KV_CACHE_QUANT", raising=False)
+        from olmlx.engine.registry import ModelConfig
+
+        mc = ModelConfig(hf_path="test/model", kv_cache_quant="turboquant:4")
+        assert mc.kv_cache_quant == "turboquant:4"
 
     def test_partial_override_preserves_other_fields(self, monkeypatch):
         monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
@@ -160,14 +160,14 @@ class TestResolveExperimental:
     def test_env_var_does_not_leak_into_overrides(self, monkeypatch):
         """resolve_experimental should not re-read env vars for unrelated fields."""
         monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", raising=False)
+        monkeypatch.delenv("OLMLX_KV_CACHE_QUANT", raising=False)
         base = ExperimentalSettings()
-        # Set a bad env var *after* base is created
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", "bad_value")
-        # Overriding only 'flash' should not trigger kv_cache_quant env var parsing
+        # Set a bad env var *after* base is created — kv_cache_quant is now on
+        # Settings (OLMLX_ prefix), not ExperimentalSettings, so it won't leak.
+        monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "bad_value")
+        # Overriding only 'flash' should not trigger any env var parsing
         result = resolve_experimental(base, {"flash": True})
         assert result.flash is True
-        assert result.kv_cache_quant is None
 
 
 class TestSpeculativeConfig:
@@ -310,14 +310,15 @@ class TestSpeculativeConfig:
         assert entry["speculative_draft_model"] == "Qwen/Qwen3-0.6B"
         assert entry["speculative_tokens"] == 6
 
-    def test_known_config_keys_includes_promoted_speculative_fields(self):
+    def test_known_config_keys_includes_promoted_fields(self):
         """Regression: the auto-derived ``_KNOWN_CONFIG_KEYS`` must include
-        the three promoted speculative fields so they don't leak into
-        ``_extra``. This has been a recurring false-positive review finding;
-        locking the invariant down explicitly."""
+        all promoted fields so they don't leak into ``_extra``."""
         from olmlx.engine.registry import _KNOWN_CONFIG_KEYS
 
-        for key in ("speculative", "speculative_draft_model", "speculative_tokens"):
+        for key in (
+            "speculative", "speculative_draft_model", "speculative_tokens",
+            "kv_cache_quant",
+        ):
             assert key in _KNOWN_CONFIG_KEYS
 
     def test_per_model_speculative_without_draft_resolves_to_none(self):

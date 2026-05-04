@@ -1195,11 +1195,11 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_SHARD_DIR` | path | `~/.olmlx/shards` | Local directory for pre-sharded weights |
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_WORKER_SHARD_DIR` | string | `~/.olmlx/shards` | Shard directory on remote workers |
 
-### TurboQuant KV Cache Settings (Experimental)
+### TurboQuant KV Cache Settings
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `OLMLX_EXPERIMENTAL_KV_CACHE_QUANT` | string/None | `None` | KV cache quantization method. Format: `turboquant:<bits>` where bits is `2` or `4` |
+| `OLMLX_KV_CACHE_QUANT` | string/None | `None` | KV cache quantization method. Format: `turboquant:<bits>` where bits is `2` or `4` |
 
 ### Flash-MoE Settings (Experimental)
 
@@ -1752,10 +1752,10 @@ Add to your `.env` file or pass as environment variables:
 
 ```bash
 # 4-bit quantization (~3.9x compression)
-OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:4
+OLMLX_KV_CACHE_QUANT=turboquant:4
 
 # 2-bit quantization (~7.5x compression, lower quality)
-OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:2
+OLMLX_KV_CACHE_QUANT=turboquant:2
 ```
 
 ### How It Works

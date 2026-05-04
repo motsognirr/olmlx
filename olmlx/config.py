@@ -46,14 +46,40 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
     anthropic_models: dict[str, str] = {}
 
+    # KV cache quantization (TurboQuant or SpectralQuant).
+    # Format: "<method>:<bits>" where method ∈ {turboquant, spectral} and
+    # bits ∈ {2, 4}. Per-model overrides live on ``ModelConfig`` in
+    # ``olmlx.engine.registry``.
+    kv_cache_quant: str | None = None
+
     # Speculative decoding (works with any model, not just Flash).
     # Per-model overrides live on ``ModelConfig`` in ``olmlx.engine.registry``.
     # ``min_length=1`` rejects ``OLMLX_SPECULATIVE_DRAFT_MODEL=""`` at parse
-    # time so the load path doesn't surface a misleading "draft not set"
+    # time so the load process doesn't surface a misleading "draft not set"
     # error for an empty string.
     speculative: bool = False
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] = 4
+
+    @field_validator("kv_cache_quant")
+    @classmethod
+    def validate_kv_cache_quant(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        _VALID_METHODS = {"turboquant", "spectral"}
+        _VALID_BITS = {"2", "4"}
+        parts = v.split(":", 1)
+        if (
+            len(parts) != 2
+            or parts[0] not in _VALID_METHODS
+            or parts[1] not in _VALID_BITS
+        ):
+            raise ValueError(
+                f"Invalid kv_cache_quant={v!r}. "
+                f"Expected '<method>:<bits>' where method is one of {_VALID_METHODS} "
+                f"and bits is one of {_VALID_BITS}."
+            )
+        return v
 
     @field_validator("speculative_draft_model")
     @classmethod
@@ -133,29 +159,6 @@ class ExperimentalSettings(BaseSettings):
     dflash: bool = False
     dflash_draft_model: str | None = None
     dflash_block_size: Annotated[int, Field(gt=0)] = 4
-
-    # TurboQuant KV cache quantization (e.g. "turboquant:4", "turboquant:2")
-    kv_cache_quant: str | None = None
-
-    @field_validator("kv_cache_quant")
-    @classmethod
-    def validate_kv_cache_quant(cls, v: str | None) -> str | None:
-        if v is None:
-            return v
-        _VALID_METHODS = {"turboquant", "spectral"}
-        _VALID_BITS = {"2", "4"}
-        parts = v.split(":", 1)
-        if (
-            len(parts) != 2
-            or parts[0] not in _VALID_METHODS
-            or parts[1] not in _VALID_BITS
-        ):
-            raise ValueError(
-                f"Invalid kv_cache_quant={v!r}. "
-                f"Expected '<method>:<bits>' where method is one of {_VALID_METHODS} "
-                f"and bits is one of {_VALID_BITS}."
-            )
-        return v
 
     # Flash MoE (SSD-based expert offloading for MoE models)
     flash_moe: bool = False

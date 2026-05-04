@@ -155,7 +155,7 @@ class TestDistributedScenarios:
         dist = get_scenarios(["distributed+tq4"])[0]
         assert dist.env_overrides.get("OLMLX_EXPERIMENTAL_DISTRIBUTED") == "true"
         assert (
-            dist.env_overrides.get("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT")
+            dist.env_overrides.get("OLMLX_KV_CACHE_QUANT")
             == "turboquant:4"
         )
 

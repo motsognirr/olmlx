@@ -294,6 +294,80 @@ def _surface_legacy_speculative_env() -> None:
         _forward_legacy_speculative_env(_settings, dotenv_values)
 
 
+def _legacy_kv_cache_quant_in_dotenv() -> str | None:
+    """Return the value of ``OLMLX_EXPERIMENTAL_KV_CACHE_QUANT`` from the
+    project ``.env`` file, or None if not present or the file is unreadable."""
+    dotenv_path = Path(".env")
+    try:
+        text = dotenv_path.read_text()
+    except (FileNotFoundError, OSError):
+        return None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        if key != "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT":
+            continue
+        value = value.strip()
+        is_quoted = len(value) >= 2 and (
+            (value.startswith('"') and value.endswith('"'))
+            or (value.startswith("'") and value.endswith("'"))
+        )
+        if is_quoted:
+            value = value[1:-1]
+        else:
+            comment_idx = value.find("#")
+            if comment_idx != -1:
+                value = value[:comment_idx].rstrip()
+        return value
+    return None
+
+
+def _surface_legacy_kv_cache_quant_env() -> None:
+    """Forward legacy OLMLX_EXPERIMENTAL_KV_CACHE_QUANT to OLMLX_KV_CACHE_QUANT
+    when the new env var is unset.
+
+    Mirrors the speculative legacy forwarding pattern. Called from every
+    subcommand that reads ``settings.kv_cache_quant`` so the deprecation
+    window is honoured uniformly — ``serve`` and ``chat``.
+    """
+    from olmlx.config import settings as _settings
+
+    legacy_val = os.environ.get(
+        "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT",
+        _legacy_kv_cache_quant_in_dotenv(),
+    )
+    if legacy_val is None:
+        return
+    if os.environ.get("OLMLX_KV_CACHE_QUANT") is not None:
+        return  # new env var takes precedence
+    if _settings.kv_cache_quant is not None:
+        # Already set via .env or programmatic write (CLI flags are
+        # applied after this call in _apply_serve_overrides, so they
+        # can't be the source here).
+        return
+    try:
+        _settings.kv_cache_quant = legacy_val
+        logger.warning(
+            "Forwarding legacy OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=%r "
+            "→ settings.kv_cache_quant. Rename to OLMLX_KV_CACHE_QUANT.",
+            legacy_val,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not forward legacy env var "
+            "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=%r: %s",
+            legacy_val,
+            exc,
+        )
+
+
 def _apply_serve_overrides(args) -> None:
     """Apply CLI flags to the global Settings before the server starts.
 
@@ -318,6 +392,23 @@ def _apply_serve_overrides(args) -> None:
         _settings.speculative_draft_model = spec_draft
     if spec_tokens is not None:
         _settings.speculative_tokens = spec_tokens
+
+    kvq = getattr(args, "kv_cache_quant", None)
+    if kvq is not None:
+        _settings.kv_cache_quant = kvq
+
+    _surface_legacy_kv_cache_quant_env()
+
+    # Load time check for tracked incompatibilities — add to this block as
+    # features are validated against their stated compatibility matrix.
+    if _settings.prompt_cache_disk and _settings.kv_cache_quant:
+        logger.warning(
+            "Prompt cache disk offload is enabled (OLMLX_PROMPT_CACHE_DISK=true) "
+            "together with KV cache quantization (OLMLX_KV_CACHE_QUANT=%s). "
+            "Quantized KV caches cannot be serialized to disk — disk saves "
+            "will be silently skipped. Disable one of these options.",
+            _settings.kv_cache_quant,
+        )
 
     # Surface speculative misconfigurations at startup by walking the
     # registry and checking each model's ``resolved_speculative()``. This
@@ -1245,6 +1336,7 @@ def cmd_chat(args):
     # who only runs chat would silently lose forwarding even though
     # ``serve`` handles it correctly.
     _surface_legacy_speculative_env()
+    _surface_legacy_kv_cache_quant_env()
 
     model_name = args.model_name
     if model_name is None:
@@ -1606,6 +1698,8 @@ def cmd_config_show(_args):
     print(f"Prompt cache:           {settings.prompt_cache}")
     print(f"Prompt cache max tokens: {settings.prompt_cache_max_tokens}")
     print(f"CORS origins:           {settings.cors_origins}")
+    if settings.kv_cache_quant:
+        print(f"KV cache quant:         {settings.kv_cache_quant}")
     if experimental.distributed:
         print()
         print("Experimental distributed inference:")
@@ -1765,7 +1859,7 @@ def cmd_spectral_prepare(args):
     print("\nSpectral calibration complete!")
     print(f"  Output: {output_dir}")
     print("\nTo use spectral quant:")
-    print(f"  OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=spectral:{args.avg_bits} olmlx serve")
+    print(f"  OLMLX_KV_CACHE_QUANT=spectral:{args.avg_bits} olmlx serve")
 
 
 def cmd_flash_prepare(args):
@@ -1956,6 +2050,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=None,
         help="Number of tokens drafted per verification step (default: 4)",
+    )
+    serve_p.add_argument(
+        "--kv-cache-quant",
+        dest="kv_cache_quant",
+        type=str,
+        default=None,
+        help="KV cache quantization method and bits (e.g. turboquant:4, spectral:2)",
     )
 
     svc = sub.add_parser("service", help="Manage the launchd service")
