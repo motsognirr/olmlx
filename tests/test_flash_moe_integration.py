@@ -180,3 +180,56 @@ class TestLoadedModelField:
 
         fields = {f.name for f in dataclasses.fields(LoadedModel)}
         assert "is_flash_moe" in fields
+
+
+class TestSanitizeModelConfigInPlace:
+    """Step-3.5 ships layer_types longer than num_hidden_layers; fix in place."""
+
+    def test_truncates_oversized_layer_types(self, tmp_path):
+        from olmlx.engine.model_manager import _sanitize_model_config_in_place
+
+        cfg = {
+            "num_hidden_layers": 3,
+            "layer_types": ["full", "sliding", "full", "extra1", "extra2"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(cfg))
+
+        _sanitize_model_config_in_place(tmp_path)
+
+        out = json.loads((tmp_path / "config.json").read_text())
+        assert out["layer_types"] == ["full", "sliding", "full"]
+        assert out["num_hidden_layers"] == 3
+
+    def test_idempotent_when_lengths_match(self, tmp_path):
+        from olmlx.engine.model_manager import _sanitize_model_config_in_place
+
+        cfg = {
+            "num_hidden_layers": 2,
+            "layer_types": ["full", "sliding"],
+        }
+        original = json.dumps(cfg)
+        (tmp_path / "config.json").write_text(original)
+
+        _sanitize_model_config_in_place(tmp_path)
+        _sanitize_model_config_in_place(tmp_path)
+
+        out = json.loads((tmp_path / "config.json").read_text())
+        assert out["layer_types"] == ["full", "sliding"]
+
+    def test_no_op_without_layer_types(self, tmp_path):
+        from olmlx.engine.model_manager import _sanitize_model_config_in_place
+
+        cfg = {"num_hidden_layers": 4, "hidden_size": 64}
+        original = json.dumps(cfg, indent=2)
+        (tmp_path / "config.json").write_text(original)
+
+        _sanitize_model_config_in_place(tmp_path)
+
+        # Untouched.
+        assert (tmp_path / "config.json").read_text() == original
+
+    def test_missing_config_is_silent(self, tmp_path):
+        from olmlx.engine.model_manager import _sanitize_model_config_in_place
+
+        # No config.json present — must not raise.
+        _sanitize_model_config_in_place(tmp_path)
