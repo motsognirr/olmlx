@@ -316,7 +316,9 @@ class TestSpeculativeConfig:
         from olmlx.engine.registry import _KNOWN_CONFIG_KEYS
 
         for key in (
-            "speculative", "speculative_draft_model", "speculative_tokens",
+            "speculative",
+            "speculative_draft_model",
+            "speculative_tokens",
             "kv_cache_quant",
         ):
             assert key in _KNOWN_CONFIG_KEYS

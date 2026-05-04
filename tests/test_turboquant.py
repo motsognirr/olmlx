@@ -960,6 +960,7 @@ class TestKvCacheQuantConfig:
         monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "turboquant:3")
         with pytest.raises(ValidationError):
             from olmlx.config import Settings
+
             Settings(_env_file=None)
 
     def test_missing_bits_rejected(self, monkeypatch):
@@ -969,6 +970,7 @@ class TestKvCacheQuantConfig:
         monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "turboquant:")
         with pytest.raises(ValidationError):
             from olmlx.config import Settings
+
             Settings(_env_file=None)
 
     def test_unknown_method_rejected(self, monkeypatch):
@@ -977,6 +979,7 @@ class TestKvCacheQuantConfig:
         monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "foo:4")
         with pytest.raises(ValidationError):
             from olmlx.config import Settings
+
             Settings(_env_file=None)
 
     def test_bare_string_rejected(self, monkeypatch):
@@ -985,6 +988,7 @@ class TestKvCacheQuantConfig:
         monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "turboquant")
         with pytest.raises(ValidationError):
             from olmlx.config import Settings
+
             Settings(_env_file=None)
 
 

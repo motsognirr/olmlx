@@ -378,8 +378,7 @@ class ModelConfig:
             if kv_cache_quant_raw is not None:
                 if not isinstance(kv_cache_quant_raw, str):
                     raise ValueError(
-                        f"'kv_cache_quant' must be a string, "
-                        f"got {kv_cache_quant_raw!r}"
+                        f"'kv_cache_quant' must be a string, got {kv_cache_quant_raw!r}"
                     )
                 if not kv_cache_quant_raw.strip():
                     raise ValueError(

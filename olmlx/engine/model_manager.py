@@ -910,10 +910,10 @@ class ModelManager:
                         weight_store=_weight_store,
                         template_caps=caps,
                         expires_at=expires,
-                    kv_cache_quant=kv_cache_quant,
-                    spectral_calibration_dir=self._find_spectral_dir(
-                        hf_path, kv_cache_quant
-                    ),
+                        kv_cache_quant=kv_cache_quant,
+                        spectral_calibration_dir=self._find_spectral_dir(
+                            hf_path, kv_cache_quant
+                        ),
                         default_options=dict(model_config.options),
                         inference_queue_timeout=model_config.inference_queue_timeout,
                         inference_timeout=model_config.inference_timeout,

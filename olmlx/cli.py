@@ -361,8 +361,7 @@ def _surface_legacy_kv_cache_quant_env() -> None:
         )
     except Exception as exc:
         logger.warning(
-            "Could not forward legacy env var "
-            "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=%r: %s",
+            "Could not forward legacy env var OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=%r: %s",
             legacy_val,
             exc,
         )

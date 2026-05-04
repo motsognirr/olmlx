@@ -711,6 +711,7 @@ class TestSpectralConfig:
     def test_spectral_3_rejected(self):
         with pytest.raises(Exception):
             from olmlx.config import Settings
+
             Settings(kv_cache_quant="spectral:3", _env_file=None)
 
     def test_turboquant_still_accepted(self):
