@@ -267,7 +267,11 @@ def _apply_serve_overrides(args) -> None:
             "(and no per-model draft override) is configured.",
             _settings.speculative_draft_model,
         )
-    if flash_conflicts:
+    # Suppress the flash-conflict warning for models that are also in
+    # ``bad`` — telling the user "use flash_speculative" is misleading
+    # when the actual error is the missing draft model.
+    flash_conflicts_actionable = [m for m in flash_conflicts if m not in set(bad)]
+    if flash_conflicts_actionable:
         # Note: standalone speculative is only dropped when the Flash
         # bundle actually loads — if the bundle directory is missing
         # ``_load_model`` falls through to the standard load path and
@@ -281,7 +285,7 @@ def _apply_serve_overrides(args) -> None:
             "flash_speculative settings "
             "(OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_*; flash-speculative "
             "remains experimental) instead.",
-            ", ".join(flash_conflicts),
+            ", ".join(flash_conflicts_actionable),
         )
     if bad:
         print(
@@ -310,6 +314,16 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
         with open(settings.models_config) as f:
             raw = json.load(f)
     except FileNotFoundError:
+        return []
+    except OSError as exc:
+        # Permission denied, IsADirectoryError, etc. — degrade
+        # gracefully like ``_audit_speculative_config`` does for the
+        # registry load. Crashing startup over an unreadable
+        # models.json is worse than skipping the migration check.
+        logger.warning(
+            "Skipping speculative migration check: could not read models.json: %s",
+            exc,
+        )
         return []
     except json.JSONDecodeError as exc:
         # A corrupt models.json hides any pending migration; surface it

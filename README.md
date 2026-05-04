@@ -429,6 +429,8 @@ The settings have been promoted out of `experimental`. The new env vars are `OLM
 
 > **Edge case during the deprecation window:** the legacy forwarder cannot tell "field was never set" from "field was explicitly set to its default value (e.g. `OLMLX_SPECULATIVE=false`) via a `.env` file." If you have such an explicit-default `.env` opt-out **and** the old `OLMLX_EXPERIMENTAL_SPECULATIVE*` still set in your shell, the legacy value will overwrite the `.env` value — verify the per-field `Forwarding legacy …` warnings at startup, or simply remove the legacy shell vars before upgrading.
 
+> **Settings now validate assignment.** As part of this change, `Settings` runs Pydantic validators on every programmatic field assignment (not just the speculative ones). Code that previously did `settings.port = 0` to test error handling will now raise `ValidationError` instead of silently accepting the bad value. This is intentional — invalid settings should never be reachable — but it is a behaviour change for anyone who was monkey-patching settings in tests or tools.
+
 ## LLM in a Flash (Experimental)
 
 Run models larger than available GPU memory by keeping only active neurons in RAM and loading the rest from SSD on demand.

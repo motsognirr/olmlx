@@ -537,6 +537,34 @@ class TestBuildParser:
         assert result == []
         assert "models.json is invalid JSON" in caplog.text
 
+    def test_flash_conflict_warning_suppressed_for_bad_models(
+        self, monkeypatch, caplog
+    ):
+        """A model that's both ``bad`` (missing draft) and a flash-conflict
+        should only surface the missing-draft error — the
+        ``use flash_speculative`` warning would be misleading."""
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda: (["m:latest"], [], ["m:latest"], False),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            with pytest.raises(SystemExit):
+                _apply_serve_overrides(args)
+        # No flash-conflict warning when the model is also missing its draft.
+        assert "use the model's flash_speculative settings" not in caplog.text
+
     def test_apply_serve_overrides_warns_on_flash_conflict(self, monkeypatch, caplog):
         """A model that combines speculative with Flash gets a warning so the
         user knows the standalone speculative knob is dropped on the Flash
