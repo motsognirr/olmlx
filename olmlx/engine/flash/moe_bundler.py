@@ -270,6 +270,11 @@ def _detect_moe_layers(config: dict) -> list[int]:
             )
         return [i for i, c in enumerate(pattern) if c == "E"]
 
+    # Step-3.5: explicit comma-separated MoE layer indices.
+    enum = config.get("moe_layers_enum")
+    if enum:
+        return sorted(int(i) for i in enum.split(","))
+
     num_layers = config.get("num_hidden_layers") or config.get("num_layers", 0)
     first_dense = config.get("first_k_dense_replace", 0)
     # Qwen3-MoE uses decoder_sparse_step instead of moe_layer_freq
