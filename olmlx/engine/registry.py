@@ -387,9 +387,13 @@ class ModelConfig:
                     )
                 # Validate format so bad values fail at config load time,
                 # not at inference time with a confusing internal error.
+                # Assign the return value in case the validator ever normalizes
+                # (e.g. lowercasing the method name).
                 from olmlx.config import Settings
 
-                Settings.validate_kv_cache_quant(kv_cache_quant_raw)
+                kv_cache_quant_raw = Settings.validate_kv_cache_quant(
+                    kv_cache_quant_raw
+                )
 
             extra = {k: v for k, v in entry.items() if k not in _KNOWN_CONFIG_KEYS}
             return cls(

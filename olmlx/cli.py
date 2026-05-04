@@ -339,10 +339,11 @@ def _surface_legacy_kv_cache_quant_env() -> None:
     """
     from olmlx.config import settings as _settings
 
-    legacy_val = os.environ.get(
-        "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT",
-        _legacy_kv_cache_quant_in_dotenv(),
-    )
+    legacy_val = os.environ.get("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT")
+    if legacy_val is None:
+        # Only read .env when the shell env var is absent, mirroring the
+        # speculative forwarding pattern.
+        legacy_val = _legacy_kv_cache_quant_in_dotenv()
     if legacy_val is None:
         return
     if os.environ.get("OLMLX_KV_CACHE_QUANT") is not None:

@@ -1199,7 +1199,7 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `OLMLX_KV_CACHE_QUANT` | string/None | `None` | KV cache quantization method. Format: `turboquant:<bits>` where bits is `2` or `4` |
+| `OLMLX_KV_CACHE_QUANT` | string/None | `None` | KV cache quantization method. Format: `<method>:<bits>` where method is `turboquant` or `spectral`, bits is `2` or `4` |
 
 ### Flash-MoE Settings (Experimental)
 

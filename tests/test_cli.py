@@ -984,6 +984,114 @@ class TestBuildParser:
         assert args.command == "service"
         assert args.service_command == "status"
 
+    # ── Legacy kv_cache_quant forwarding tests ────────────────────────
+
+    def test_legacy_kv_cache_quant_dotenv_parsing(self, monkeypatch, tmp_path):
+        """_legacy_kv_cache_quant_in_dotenv reads the value from .env."""
+        from olmlx.cli import _legacy_kv_cache_quant_in_dotenv
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:4\n"
+        )
+        assert _legacy_kv_cache_quant_in_dotenv() == "turboquant:4"
+
+    def test_legacy_kv_cache_quant_dotenv_missing(self, monkeypatch, tmp_path):
+        """_legacy_kv_cache_quant_in_dotenv returns None when .env is absent."""
+        from olmlx.cli import _legacy_kv_cache_quant_in_dotenv
+
+        monkeypatch.chdir(tmp_path)
+        assert _legacy_kv_cache_quant_in_dotenv() is None
+
+    def test_legacy_kv_cache_quant_dotenv_not_this_key(self, monkeypatch, tmp_path):
+        """_legacy_kv_cache_quant_in_dotenv ignores unrelated keys."""
+        from olmlx.cli import _legacy_kv_cache_quant_in_dotenv
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("OTHER_VAR=hello\n")
+        assert _legacy_kv_cache_quant_in_dotenv() is None
+
+    def test_legacy_kv_cache_quant_shell_env_forwarding(self, monkeypatch, caplog):
+        """Legacy OLMLX_EXPERIMENTAL_KV_CACHE_QUANT in the shell is forwarded."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_kv_cache_quant_env
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "kv_cache_quant", None)
+        monkeypatch.delenv("OLMLX_KV_CACHE_QUANT", raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", "turboquant:4")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _surface_legacy_kv_cache_quant_env()
+
+        assert _settings.kv_cache_quant == "turboquant:4"
+        assert "Forwarding legacy OLMLX_EXPERIMENTAL_KV_CACHE_QUANT" in caplog.text
+
+    def test_legacy_kv_cache_quant_dotenv_forwarding(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """Legacy OLMLX_EXPERIMENTAL_KV_CACHE_QUANT in .env (not shell) is forwarded."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_kv_cache_quant_env
+        from olmlx.config import settings as _settings
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:2\n"
+        )
+        monkeypatch.setattr(_settings, "kv_cache_quant", None)
+        monkeypatch.delenv("OLMLX_KV_CACHE_QUANT", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _surface_legacy_kv_cache_quant_env()
+
+        assert _settings.kv_cache_quant == "turboquant:2"
+        assert "Forwarding legacy OLMLX_EXPERIMENTAL_KV_CACHE_QUANT" in caplog.text
+
+    def test_legacy_kv_cache_quant_new_env_var_wins(self, monkeypatch, caplog):
+        """When both legacy and new env vars are set, the new one wins."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_kv_cache_quant_env
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "kv_cache_quant", "turboquant:4")
+        monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "turboquant:4")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", "turboquant:2")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _surface_legacy_kv_cache_quant_env()
+
+        # New env var value retained; legacy not forwarded.
+        assert _settings.kv_cache_quant == "turboquant:4"
+        assert "Forwarding legacy" not in caplog.text
+
+    def test_legacy_kv_cache_quant_bad_value_swallowed(self, monkeypatch, caplog):
+        """A legacy value that fails validation must not block startup."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_kv_cache_quant_env
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "kv_cache_quant", None)
+        monkeypatch.delenv("OLMLX_KV_CACHE_QUANT", raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", "bogus:99")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _surface_legacy_kv_cache_quant_env()
+
+        assert "Could not forward legacy env var" in caplog.text
+        assert _settings.kv_cache_quant is None
+
+    def test_serve_kv_cache_quant_flag(self):
+        """CLI --kv-cache-quant flag is parsed correctly."""
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--kv-cache-quant", "turboquant:4"])
+        assert args.kv_cache_quant == "turboquant:4"
+
 
 class TestCliMain:
     def test_default_calls_serve(self, monkeypatch):
