@@ -176,7 +176,10 @@ def _legacy_speculative_values_in_dotenv() -> dict[str, str]:
             # Strip inline ``# comment`` from unquoted values. Without
             # this, a line like ``KEY=true  # enable`` would parse
             # ``true  # enable``, which the boolean forwarder coerces
-            # to ``False`` — the opposite of intent.
+            # to ``False`` — the opposite of intent. Limitation: an
+            # unquoted value containing a literal ``#`` (e.g. a path
+            # fragment) is silently truncated. Quote the value to
+            # disable this stripping.
             comment_idx = value.find("#")
             if comment_idx != -1:
                 value = value[:comment_idx].rstrip()
@@ -236,11 +239,16 @@ def _forward_legacy_speculative_env(
             # var clobbers it — the operator gets a clear "X → Y"
             # trail, not just the up-front banner.
             logger.warning(
-                "Forwarding legacy %s=%r → settings.%s; the new env var "
-                "%s would take precedence if set.",
+                "Forwarding legacy %s=%r → settings.%s. The new env var "
+                "%s would take precedence if explicitly set in the shell. "
+                "Note: a value in .env that equals the schema default "
+                "cannot be distinguished from 'unset' and may be silently "
+                "overridden by the legacy var — rename the .env entry to "
+                "%s to avoid this.",
                 legacy,
                 legacy_val,
                 attr,
+                new,
                 new,
             )
         except Exception as exc:
