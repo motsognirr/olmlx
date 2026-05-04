@@ -190,7 +190,10 @@ def _legacy_speculative_keys_in_dotenv() -> list[str]:
     return list(_legacy_speculative_values_in_dotenv())
 
 
-def _forward_legacy_speculative_env(_settings) -> None:
+def _forward_legacy_speculative_env(
+    _settings,
+    dotenv_values: dict[str, str] | None = None,
+) -> None:
     """Apply legacy env var values to the new Settings when the new env
     var is unset. Logs and swallows parse errors per-field so a single
     bad legacy value never blocks startup.
@@ -199,10 +202,15 @@ def _forward_legacy_speculative_env(_settings) -> None:
     the field default — checking ``os.environ`` alone would miss values
     pydantic-settings already loaded from a ``.env`` file and silently
     let the legacy shell var clobber them.
+
+    *dotenv_values* lets callers pass in pre-parsed ``.env`` values so
+    the file isn't read twice when the deprecation banner already
+    needed it. Defaults to a fresh parse for direct callers.
     """
     from olmlx.config import Settings
 
-    dotenv_values = _legacy_speculative_values_in_dotenv()
+    if dotenv_values is None:
+        dotenv_values = _legacy_speculative_values_in_dotenv()
     for legacy, new, attr, parse in _LEGACY_SPECULATIVE_FORWARD:
         # Shell wins over .env if both have the legacy var set, mirroring
         # pydantic-settings' precedence for the new names.
@@ -261,13 +269,15 @@ def _surface_legacy_speculative_env() -> None:
 
     Called from every subcommand that touches speculative decoding so
     the deprecation window is honoured uniformly — ``serve``, ``chat``,
-    and any future surface that reads ``settings.speculative*``.
+    and any future surface that reads ``settings.speculative*``. Reads
+    ``.env`` once and threads the result into the forwarder so the
+    file is only opened once per startup.
     """
     from olmlx.config import settings as _settings
 
-    dotenv_legacy = _legacy_speculative_keys_in_dotenv()
+    dotenv_values = _legacy_speculative_values_in_dotenv()
     shell_stale = [v for v in _DEPRECATED_SPECULATIVE_ENV_VARS if os.environ.get(v)]
-    stale = sorted({*shell_stale, *dotenv_legacy})
+    stale = sorted({*shell_stale, *dotenv_values.keys()})
     if stale:
         logger.warning(
             "Deprecated env vars detected: %s. They will be honoured for "
@@ -278,7 +288,7 @@ def _surface_legacy_speculative_env() -> None:
         # Forward legacy values to the new Settings only when the new env
         # var is unset, so user-facing behaviour doesn't silently change
         # on upgrade. Drop this once the deprecation window closes.
-        _forward_legacy_speculative_env(_settings)
+        _forward_legacy_speculative_env(_settings, dotenv_values)
 
 
 def _apply_serve_overrides(args) -> None:
@@ -1677,6 +1687,16 @@ def _positive_int(value: str) -> int:
     return n
 
 
+def _non_empty_str(value: str) -> str:
+    """argparse ``type`` validator that mirrors ``Field(min_length=1)``
+    on the corresponding Settings field. Without it, ``--flag ""``
+    propagates an empty string into Settings and surfaces as an
+    unhandled ``ValidationError`` traceback at startup."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("value must be a non-empty string")
+    return value
+
+
 def cmd_bench_leaderboard(args):
     """Show the model leaderboard derived from saved bench runs."""
     from pathlib import Path
@@ -1915,6 +1935,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument(
         "--speculative-draft-model",
         dest="speculative_draft_model",
+        type=_non_empty_str,
         default=None,
         help="HuggingFace path of the draft model used for speculative decoding",
     )

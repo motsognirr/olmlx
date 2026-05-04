@@ -188,6 +188,15 @@ class TestBuildParser:
         args = parser.parse_args(["serve", "--no-speculative"])
         assert args.speculative is False
 
+    def test_serve_empty_draft_model_rejected(self, capsys):
+        """``--speculative-draft-model ""`` should be rejected by argparse,
+        not propagate as a Pydantic ``ValidationError`` at startup."""
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["serve", "--speculative-draft-model", ""])
+        captured = capsys.readouterr()
+        assert "non-empty" in captured.err
+
     def test_apply_serve_overrides_accepts_global_no_draft_when_per_model_supplies(
         self, monkeypatch, tmp_path
     ):
