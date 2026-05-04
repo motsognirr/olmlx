@@ -404,11 +404,13 @@ def bundle_moe_experts(
         config.get("n_routed_experts")
         or config.get("num_local_experts")
         or config.get("num_experts")
+        or config.get("moe_num_experts")
     )
     if num_experts is None:
         raise ValueError(
             f"config.json at {model_dir} is missing "
-            "'n_routed_experts', 'num_local_experts', and 'num_experts'"
+            "'n_routed_experts', 'num_local_experts', 'num_experts', "
+            "and 'moe_num_experts'"
         )
 
     # Check for safetensors index (sharded models)

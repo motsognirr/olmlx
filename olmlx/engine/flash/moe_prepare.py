@@ -80,6 +80,7 @@ def prepare_moe_for_flash(
         text_config.get("n_routed_experts")
         or text_config.get("num_local_experts")
         or text_config.get("num_experts")
+        or text_config.get("moe_num_experts")
     )
     num_layers = text_config.get("num_hidden_layers") or text_config.get("num_layers")
     first_dense = text_config.get("first_k_dense_replace", 0)

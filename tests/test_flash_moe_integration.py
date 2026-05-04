@@ -107,6 +107,34 @@ class TestPrepareMoeForFlash:
         assert config["moe_layer_indices"] == [1, 2]
         assert "prepared_at" in config
 
+    def test_step3p5_moe_num_experts_in_config(self, tmp_path):
+        """Expert count must be read from moe_num_experts when present."""
+        hidden, inter, experts = 64, 32, 6
+        model_dir = _make_synthetic_moe_weights(hidden, inter, experts, 2, 1, tmp_path)
+
+        # Overwrite config to use moe_num_experts (Step-3.5 style)
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "step3p5",
+                    "hidden_size": hidden,
+                    "moe_intermediate_size": inter,
+                    "moe_num_experts": experts,
+                    "num_hidden_layers": 3,
+                    "moe_layers_enum": "1,2",
+                    "num_experts_per_tok": 2,
+                }
+            )
+        )
+
+        from olmlx.engine.flash.moe_prepare import prepare_moe_for_flash
+
+        output_dir = tmp_path / "flash_moe"
+        prepare_moe_for_flash(str(model_dir), output_dir)
+
+        cfg = json.loads((output_dir / "flash_moe_config.json").read_text())
+        assert cfg["num_experts"] == experts
+
 
 class TestModelManagerFlashMoe:
     def test_flash_moe_dir_detection(self, tmp_path):
