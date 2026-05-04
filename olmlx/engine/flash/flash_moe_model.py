@@ -59,7 +59,10 @@ class _FlashMoEDeepSeek(_FlashMoEBase):
     def __init__(self, original_moe, flash_moe: FlashMoE):
         super().__init__(original_moe, flash_moe)
         self.gate = original_moe.gate
-        self.shared_experts = getattr(original_moe, "shared_experts", None)
+        # Some models (Step-3.5) name the shared expert `share_expert` (singular).
+        self.shared_experts = getattr(
+            original_moe, "shared_experts", None
+        ) or getattr(original_moe, "share_expert", None)
 
     def _route(self, x):
         return self.gate(x)
