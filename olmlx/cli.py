@@ -96,6 +96,13 @@ def cmd_serve(args):
     )
 
 
+# DEPRECATION: drop _DEPRECATED_SPECULATIVE_ENV_VARS,
+# _LEGACY_SPECULATIVE_FORWARD, _forward_legacy_speculative_env, the
+# warning + forwarding call site in _apply_serve_overrides, and the
+# legacy fallback in olmlx/bench/scenarios._requires_speculative_draft
+# in the next release after this PR ships. The promotion in PR #270
+# included a one-release deprecation window; once it passes, leaving
+# this code in place silently keeps a now-unsupported alias alive.
 _DEPRECATED_SPECULATIVE_ENV_VARS = (
     "OLMLX_EXPERIMENTAL_SPECULATIVE",
     "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL",

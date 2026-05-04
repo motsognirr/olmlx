@@ -2307,6 +2307,19 @@ class TestSpeculativeLoading:
                 "test/target-model", model_exp=model_exp, spec_config=spec_config
             )
 
+    def test_load_speculative_decoder_rejects_disabled_config(self, monkeypatch):
+        """``_load_speculative_decoder`` keeps the invariant that callers gate
+        on ``spec_config.enabled`` before invoking it. Direct invocation with
+        ``enabled=False`` must raise — assert is elided under ``python -O``,
+        so the guard is a real ``RuntimeError``."""
+        registry = MagicMock()
+        store = MagicMock()
+        manager = ModelManager(registry, store)
+
+        spec_config = SpeculativeConfig(False, "test/draft", 4)
+        with pytest.raises(RuntimeError, match="spec_config.enabled=False"):
+            manager._load_speculative_decoder(MagicMock(), "test/target", spec_config)
+
     def test_load_model_requires_draft_model_path(self, monkeypatch):
         """Should raise ValueError when speculative is enabled but no draft model."""
         from olmlx.config import ExperimentalSettings
