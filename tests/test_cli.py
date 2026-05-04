@@ -348,6 +348,43 @@ class TestBuildParser:
         _apply_serve_overrides(args)
         assert _settings.speculative_tokens == 4
 
+    def test_legacy_clobbers_explicit_dotenv_default_documented_blind_spot(
+        self, monkeypatch
+    ):
+        """Pin the documented blind spot: a ``.env`` value that equals the
+        schema default is indistinguishable from "field unset", so the
+        legacy shell var still wins. Catching this would require parsing
+        the ``.env`` file directly (or tracking provenance through
+        pydantic-settings), neither of which is worth the complexity for
+        a one-release deprecation window. If the behaviour ever changes,
+        update the README migration note and this test together."""
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        # Mimic ".env contains OLMLX_SPECULATIVE=false (explicit
+        # opt-out)". Settings was constructed with the default, so the
+        # comparison `getattr(_settings, attr) == field_default` is True.
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", "x/draft")
+        monkeypatch.setattr(_settings, "speculative_tokens", 4)
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda: ([], [], [], False),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+        monkeypatch.delenv("OLMLX_SPECULATIVE", raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE", "true")
+
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        _apply_serve_overrides(args)
+        # Documented behaviour: legacy wins over the matching-default
+        # ``.env`` opt-out. The per-field forwarding warning makes the
+        # override visible.
+        assert _settings.speculative is True
+
     def test_legacy_does_not_clobber_dotenv_value(self, monkeypatch):
         """If pydantic-settings already loaded the new value from a .env
         file (so it never appears in ``os.environ``), the legacy shell var
@@ -784,6 +821,27 @@ class TestCliMain:
         monkeypatch.setattr("olmlx.cli.cmd_serve", mock_serve)
         cli_main()
         mock_serve.assert_called_once()
+
+    def test_bare_invocation_synthesizes_serve_defaults(self, monkeypatch):
+        """Regression: bare ``olmlx`` must populate the serve-subparser
+        defaults on ``args`` so cmd_serve can read them uniformly. If the
+        list goes out of sync with the parser, _apply_serve_overrides
+        would AttributeError instead of seeing a None default."""
+        monkeypatch.setattr("sys.argv", ["olmlx"])
+        captured: dict[str, object] = {}
+
+        def fake_serve(args):
+            captured["speculative"] = args.speculative
+            captured["speculative_draft_model"] = args.speculative_draft_model
+            captured["speculative_tokens"] = args.speculative_tokens
+
+        monkeypatch.setattr("olmlx.cli.cmd_serve", fake_serve)
+        cli_main()
+        assert captured == {
+            "speculative": None,
+            "speculative_draft_model": None,
+            "speculative_tokens": None,
+        }
 
     def test_serve_calls_serve(self, monkeypatch):
         monkeypatch.setattr("sys.argv", ["olmlx", "serve"])
