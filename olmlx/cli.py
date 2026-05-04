@@ -998,6 +998,11 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
             )
         if pre_sharded:
             env[PRE_SHARDED_DIR_ENV] = f"{worker_shard_dir}/{safe_name}/rank{rank}"
+        # Forward promoted settings so workers use the same config as the
+        # coordinator. KV cache quant is per-rank and won't crash if missing,
+        # but workers should compress their caches when the coordinator does.
+        if settings.kv_cache_quant:
+            env["OLMLX_KV_CACHE_QUANT"] = settings.kv_cache_quant
         if experimental.flash:
             env["OLMLX_EXPERIMENTAL_FLASH"] = "true"
             # Forward all flash tuning params so worker FlashConfig matches.
@@ -1342,7 +1347,6 @@ def cmd_chat(args):
     # ``serve`` handles it correctly.
     _surface_legacy_speculative_env()
     _surface_legacy_kv_cache_quant_env()
-    _warn_kv_cache_quant_incompatibilities()
 
     model_name = args.model_name
     if model_name is None:

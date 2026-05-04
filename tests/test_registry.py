@@ -527,6 +527,24 @@ class TestModelConfig:
                 }
             )
 
+    def test_resolved_kv_cache_quant_falls_back_to_global(self, monkeypatch):
+        """When per-model kv_cache_quant is None, the global setting is used."""
+        from olmlx.config import settings as _settings
+        from olmlx.engine.registry import ModelConfig
+
+        monkeypatch.setattr(_settings, "kv_cache_quant", "turboquant:4")
+        mc = ModelConfig(hf_path="org/model", kv_cache_quant=None)
+        assert mc.resolved_kv_cache_quant() == "turboquant:4"
+
+    def test_resolved_kv_cache_quant_per_model_overrides_global(self, monkeypatch):
+        """Per-model kv_cache_quant takes precedence over the global setting."""
+        from olmlx.config import settings as _settings
+        from olmlx.engine.registry import ModelConfig
+
+        monkeypatch.setattr(_settings, "kv_cache_quant", "turboquant:4")
+        mc = ModelConfig(hf_path="org/model", kv_cache_quant="turboquant:2")
+        assert mc.resolved_kv_cache_quant() == "turboquant:2"
+
 
 class TestRegistryModelConfig:
     def test_load_mixed_format(self, tmp_path, monkeypatch):
