@@ -1137,6 +1137,30 @@ class TestBuildParser:
         )
         assert _legacy_kv_cache_quant_in_dotenv() == "turboquant:4"
 
+    def test_legacy_kv_cache_quant_dotenv_quoted_no_comment(
+        self, monkeypatch, tmp_path
+    ):
+        """Quoted value without trailing comment works."""
+        from olmlx.cli import _legacy_kv_cache_quant_in_dotenv
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            'OLMLX_EXPERIMENTAL_KV_CACHE_QUANT="turboquant:2"\n'
+        )
+        assert _legacy_kv_cache_quant_in_dotenv() == "turboquant:2"
+
+    def test_legacy_kv_cache_quant_dotenv_unquoted_with_comment(
+        self, monkeypatch, tmp_path
+    ):
+        """Unquoted value with trailing inline comment is parsed correctly."""
+        from olmlx.cli import _legacy_kv_cache_quant_in_dotenv
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:4 # comment\n"
+        )
+        assert _legacy_kv_cache_quant_in_dotenv() == "turboquant:4"
+
 
 class TestCliMain:
     def test_default_calls_serve(self, monkeypatch):

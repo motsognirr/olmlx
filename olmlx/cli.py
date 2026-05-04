@@ -315,15 +315,22 @@ def _legacy_kv_cache_quant_in_dotenv() -> str | None:
         if key != "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT":
             continue
         value = value.strip()
-        # Strip inline comment first so that ``"turboquant:4" # comment``
-        # correctly detects the surrounding quotes.
-        comment_idx = value.find("#")
-        if comment_idx != -1:
-            value = value[:comment_idx].rstrip()
+        # Detect surrounding quotes first; a ``#`` inside quotes is
+        # preserved.  If no quotes are found, strip trailing inline
+        # comments and re-check — ``"turboquant:4" # comment`` has no
+        # terminating quote until the comment is removed.
         is_quoted = len(value) >= 2 and (
             (value.startswith('"') and value.endswith('"'))
             or (value.startswith("'") and value.endswith("'"))
         )
+        if not is_quoted:
+            comment_idx = value.find("#")
+            if comment_idx != -1:
+                value = value[:comment_idx].rstrip()
+                is_quoted = len(value) >= 2 and (
+                    (value.startswith('"') and value.endswith('"'))
+                    or (value.startswith("'") and value.endswith("'"))
+                )
         if is_quoted:
             value = value[1:-1]
         return value
@@ -1347,6 +1354,7 @@ def cmd_chat(args):
     # ``serve`` handles it correctly.
     _surface_legacy_speculative_env()
     _surface_legacy_kv_cache_quant_env()
+    _warn_kv_cache_quant_incompatibilities()
 
     model_name = args.model_name
     if model_name is None:
