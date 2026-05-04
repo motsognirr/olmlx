@@ -379,7 +379,11 @@ def _warn_kv_cache_quant_incompatibilities() -> None:
     """Warn about tracked incompatibilities at startup."""
     from olmlx.config import settings as _settings
 
-    if _settings.prompt_cache_disk and _settings.kv_cache_quant:
+    if not _settings.prompt_cache_disk:
+        return
+
+    # Check global setting first.
+    if _settings.kv_cache_quant:
         logger.warning(
             "Prompt cache disk offload is enabled (OLMLX_PROMPT_CACHE_DISK=true) "
             "together with KV cache quantization (OLMLX_KV_CACHE_QUANT=%s). "
@@ -387,6 +391,28 @@ def _warn_kv_cache_quant_incompatibilities() -> None:
             "will be silently skipped. Disable one of these options.",
             _settings.kv_cache_quant,
         )
+        return
+
+    # Walk the registry for per-model kv_cache_quant overrides.
+    try:
+        from olmlx.engine.registry import ModelRegistry
+
+        reg = ModelRegistry()
+        reg.load()
+        for name, mc in reg.list_models().items():
+            resolved = mc.resolved_kv_cache_quant()
+            if resolved:
+                logger.warning(
+                    "Prompt cache disk offload is enabled (OLMLX_PROMPT_CACHE_DISK=true) "
+                    "together with per-model KV cache quantization for '%s' "
+                    "(kv_cache_quant=%s). "
+                    "Quantized KV caches cannot be serialized to disk — disk saves "
+                    "will be silently skipped. Disable one of these options.",
+                    name,
+                    resolved,
+                )
+    except Exception:
+        pass  # registry unavailable — skip per-model check
 
 
 def _apply_serve_overrides(args) -> None:
@@ -1006,10 +1032,23 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
         if pre_sharded:
             env[PRE_SHARDED_DIR_ENV] = f"{worker_shard_dir}/{safe_name}/rank{rank}"
         # Forward promoted settings so workers use the same config as the
-        # coordinator. KV cache quant is per-rank and won't crash if missing,
-        # but workers should compress their caches when the coordinator does.
-        if settings.kv_cache_quant:
-            env["OLMLX_KV_CACHE_QUANT"] = settings.kv_cache_quant
+        # coordinator. Resolve per-model overrides so a models.json entry
+        # with ``kv_cache_quant: "turboquant:2"`` reaches workers even
+        # when the global OLMLX_KV_CACHE_QUANT is unset.
+        _resolved_kvq = settings.kv_cache_quant
+        if model:
+            try:
+                from olmlx.engine.registry import ModelRegistry
+
+                reg = ModelRegistry()
+                reg.load()
+                mc = reg.resolve(model)
+                if mc is not None:
+                    _resolved_kvq = mc.resolved_kv_cache_quant()
+            except Exception:
+                pass  # registry unavailable — fall back to global
+        if _resolved_kvq:
+            env["OLMLX_KV_CACHE_QUANT"] = _resolved_kvq
         if experimental.flash:
             env["OLMLX_EXPERIMENTAL_FLASH"] = "true"
             # Forward all flash tuning params so worker FlashConfig matches.
@@ -1703,6 +1742,7 @@ def cmd_chat(args):
 
 def cmd_config_show(_args):
     """Show current configuration."""
+    _surface_legacy_kv_cache_quant_env()
     from olmlx.config import experimental
 
     print(f"Host:                   {settings.host}")
