@@ -2229,6 +2229,9 @@ def build_parser() -> argparse.ArgumentParser:
 # monkeypatching (``monkeypatch.setattr("olmlx.cli.cmd_serve", mock)``)
 # works.  _validate_command_handlers() catches typos at import time.
 # Subcommand=None for commands that take no subcommand (serve, chat).
+#
+# IMPORTANT: every cmd_* handler referenced below must be defined
+# above this point in the file (import-time globals() resolution).
 _COMMAND_HANDLERS: dict[tuple[str, str | None], str] = {
     ("serve", None): "cmd_serve",
     ("chat", None): "cmd_chat",
@@ -2270,7 +2273,7 @@ def _validate_command_handlers() -> None:
 _validate_command_handlers()
 
 
-def _resolve_handler(cmd: str, sub_name: str | None) -> Any | None:
+def _resolve_handler(cmd: str, sub_name: str | None) -> Callable[..., Any] | None:
     """Look up a handler by (command, subcommand) in the registry.
 
     Resolves via ``globals()`` so that test monkeypatching

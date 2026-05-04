@@ -209,13 +209,13 @@ async def _handle_edit_file(args: dict) -> str | ToolError:
         count = content.count(old_text)
         if count == 0:
             return ToolError(
-                message="old_text not found in file.",
+                message="Error: old_text not found in file.",
                 tool_name="edit_file",
                 is_user_error=True,
             )
         if count > 1:
             return ToolError(
-                message=f"old_text found {count} times (multiple matches). Provide more context to make it unique.",
+                message=f"Error: old_text found {count} times (multiple matches). Provide more context to make it unique.",
                 tool_name="edit_file",
                 is_user_error=True,
             )
@@ -291,7 +291,7 @@ async def _handle_grep(args: dict) -> str | ToolError:
             return ToolError(
                 message=stderr.strip() or "rg returned exit code " + str(rc),
                 tool_name="grep",
-                is_user_error=True,  # exit code 2+ is typically invalid regex
+                is_user_error=False,
             )
     except FileNotFoundError:
         # rg not installed, fall back to grep
@@ -307,23 +307,23 @@ async def _handle_grep(args: dict) -> str | ToolError:
                 return ToolError(
                     message=stderr.strip() or "grep returned exit code " + str(rc),
                     tool_name="grep",
-                    is_user_error=False,  # grep exit code 2+ is system errors (perm, I/O)
+                    is_user_error=False,
                 )
         except FileNotFoundError:
             return ToolError(
-                message="search tools (rg, grep) not available.",
+                message="Error: search tools (rg, grep) not available.",
                 tool_name="grep",
                 is_user_error=False,
             )
         except asyncio.TimeoutError:
             return ToolError(
-                message="search timed out.",
+                message="Error: search timed out.",
                 tool_name="grep",
                 is_user_error=False,
             )
     except asyncio.TimeoutError:
         return ToolError(
-            message="search timed out.",
+            message="Error: search timed out.",
             tool_name="grep",
             is_user_error=False,
         )
@@ -347,7 +347,7 @@ async def _handle_read_directory(args: dict) -> str | ToolError:
     def _list_dir() -> list[str] | ToolError:
         if not safe_path.is_dir():
             return ToolError(
-                message=f"not a directory: {safe_path}",
+                message=f"Error: not a directory: {safe_path}",
                 tool_name="read_directory",
                 is_user_error=True,
             )
@@ -402,7 +402,7 @@ async def _handle_bash(args: dict) -> str | ToolError:
         return ToolError(
             message=f"Error running command: {exc}",
             tool_name="bash",
-            is_user_error=isinstance(exc, FileNotFoundError),
+            is_user_error=False,
         )
 
     try:
@@ -495,7 +495,7 @@ async def _handle_update_plan(args: dict, plans_dir: Path) -> str | ToolError:
     def _update() -> str | ToolError:
         if not plan_path.exists():
             return ToolError(
-                message="No plan found. Use create_plan first.",
+                message="Error: No plan found. Use create_plan first.",
                 tool_name="update_plan",
                 is_user_error=True,
             )
@@ -551,14 +551,14 @@ async def _handle_web_fetch(args: dict) -> str | ToolError:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return ToolError(
-            message=f"unsupported URL scheme {parsed.scheme!r}. Only http and https are allowed.",
+            message=f"Error: unsupported URL scheme {parsed.scheme!r}. Only http and https are allowed.",
             tool_name="web_fetch",
             is_user_error=True,
         )
 
     if not parsed.hostname:
         return ToolError(
-            message="invalid URL: missing hostname.",
+            message="Error: invalid URL: missing hostname.",
             tool_name="web_fetch",
             is_user_error=True,
         )
@@ -651,7 +651,7 @@ async def _handle_web_search(args: dict) -> str | ToolError:
         results = await asyncio.to_thread(_web_search_impl, query, max_results)
     except ImportError:
         return ToolError(
-            message="duckduckgo-search is not installed. Install it with: pip install duckduckgo-search",
+            message="Error: duckduckgo-search is not installed. Install it with: pip install duckduckgo-search",
             tool_name="web_search",
             is_user_error=False,
         )

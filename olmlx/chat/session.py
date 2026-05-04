@@ -516,7 +516,11 @@ class ChatSession:
                     tool_name, tool_input, timeout=self.config.tool_timeout
                 )
             else:
-                raise ValueError(f"No handler for tool: {tool_name!r}")
+                result = ToolError(
+                    message=f"No handler for tool: {tool_name!r}",
+                    tool_name=tool_name,
+                    is_user_error=True,
+                )
 
             if isinstance(result, ToolError):
                 return {

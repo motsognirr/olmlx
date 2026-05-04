@@ -17,6 +17,10 @@ class ToolError:
     ``is_user_error`` distinguishes user-input problems (bad path,
     invalid arguments) from system errors (connection refused, timeout)
     so callers can format or filter differently.
+
+    ``tool_name`` is carried for logging and for programmatic callers
+    (MCP, tests); the session layer uses the dispatch-time name as the
+    authoritative source in emitted events.
     """
 
     message: str

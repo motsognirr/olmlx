@@ -233,6 +233,7 @@ class MCPClientManager:
                 session.call_tool(name, arguments), timeout=timeout
             )
         except asyncio.TimeoutError:
+            logger.warning("Tool %r timed out after %ss via MCP", name, timeout)
             return ToolError(
                 message=f"Tool {name!r} timed out after {timeout}s",
                 tool_name=name,
@@ -242,6 +243,20 @@ class MCPClientManager:
             logger.exception("Unexpected error calling tool %r via MCP", name)
             return ToolError(
                 message=f"Error calling {name}: {exc}",
+                tool_name=name,
+                is_user_error=False,
+            )
+
+        if getattr(result, "isError", False):
+            parts = []
+            for content in result.content:
+                if hasattr(content, "text"):
+                    parts.append(content.text)
+                else:
+                    parts.append(str(content))
+            error_text = "\n".join(parts) if parts else "MCP server returned an error"
+            return ToolError(
+                message=error_text,
                 tool_name=name,
                 is_user_error=False,
             )

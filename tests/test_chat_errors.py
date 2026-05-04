@@ -369,16 +369,16 @@ class TestRouterErrorShapeConsistency:
         client = TestClient(app)
 
         # Simulate a manage endpoint condition that produces a JSON error
-        # POST /api/copy with missing destination
+        # POST /api/copy with nonexistent source
         resp = client.post(
             "/api/copy",
-            content='{"source": "nonexistent:latest"}',
+            content="{}",
             headers={"Content-Type": "application/json"},
         )
-        if resp.status_code == 404:
-            body = resp.json()
-            assert "error" in body
-            assert isinstance(body["error"], str)
+        # Returns validation error — fastapi sends 422 with {'detail': [...]}
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "detail" in body
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +390,7 @@ class TestEndToEndToolErrorEvents:
     """Verify that tool_error events have a consistent shape regardless of
     whether the error comes from built-in tools, MCP, or parse failures."""
 
-    REQUIRED_TOOL_ERROR_KEYS = {"type", "name", "error", "id"}
+    REQUIRED_TOOL_ERROR_KEYS = {"type", "name", "error", "id", "is_user_error"}
 
     @pytest.mark.asyncio
     async def test_builtin_tool_error_event_shape(self, tmp_path):
@@ -578,6 +578,7 @@ class TestMCPCallToolResultHandling:
 
         mock_result = MagicMock()
         mock_result.content = [mock_content]
+        mock_result.isError = False
 
         mock_session = MagicMock()
         mock_session.call_tool = AsyncMock(return_value=mock_result)
@@ -598,6 +599,7 @@ class TestMCPCallToolResultHandling:
 
         mock_result = MagicMock()
         mock_result.content = [NoText()]
+        mock_result.isError = False
 
         mock_session = MagicMock()
         mock_session.call_tool = AsyncMock(return_value=mock_result)
@@ -613,6 +615,7 @@ class TestMCPCallToolResultHandling:
 
         mock_result = MagicMock()
         mock_result.content = []
+        mock_result.isError = False
 
         mock_session = MagicMock()
         mock_session.call_tool = AsyncMock(return_value=mock_result)
@@ -620,3 +623,25 @@ class TestMCPCallToolResultHandling:
 
         result = await mgr.call_tool("empty", {})
         assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_result_is_error_converts_to_tool_error(self):
+        mgr = MCPClientManager()
+        mgr._tool_to_server["fail"] = "srv"
+
+        mock_content = MagicMock()
+        mock_content.text = "server refused"
+
+        mock_result = MagicMock()
+        mock_result.content = [mock_content]
+        mock_result.isError = True
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(return_value=mock_result)
+        mgr._servers["srv"] = {"session": mock_session}
+
+        result = await mgr.call_tool("fail", {})
+        assert isinstance(result, ToolError)
+        assert "server refused" in result.message
+        assert result.tool_name == "fail"
+        assert result.is_user_error is False
