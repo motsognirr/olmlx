@@ -2,6 +2,7 @@
 
 import pytest
 
+from olmlx.chat.errors import ToolError
 from olmlx.chat.mcp_client import MCPClientManager
 
 
@@ -86,7 +87,10 @@ class TestMCPToolRouting:
         assert names == {"read_file", "search"}
 
     @pytest.mark.asyncio
-    async def test_call_tool_unknown_raises(self):
+    async def test_call_tool_unknown_returns_tool_error(self):
         mgr = MCPClientManager()
-        with pytest.raises(ValueError, match="Unknown tool"):
-            await mgr.call_tool("nonexistent", {})
+        result = await mgr.call_tool("nonexistent", {})
+        assert isinstance(result, ToolError)
+        assert "Unknown tool" in result.message
+        assert result.tool_name == "nonexistent"
+        assert result.is_user_error is True

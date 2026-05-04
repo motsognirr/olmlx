@@ -8,6 +8,7 @@ import sys
 from typing import Any, Protocol, TypedDict
 
 from olmlx.chat.config import sanitize_mcp_env
+from olmlx.chat.errors import ToolError
 
 logger = logging.getLogger(__name__)
 
@@ -202,22 +203,63 @@ class MCPClientManager:
         """Return tools in OpenAI function-calling format for generate_chat()."""
         return self._tools
 
-    async def call_tool(self, name: str, arguments: dict, timeout: float = 30.0) -> str:
-        """Route a tool call to the correct server and return the result text."""
+    async def call_tool(
+        self, name: str, arguments: dict, timeout: float = 30.0
+    ) -> str | ToolError:
+        """Route a tool call to the correct server and return the result text.
+
+        Returns ToolError for routing failures, timeouts, and server errors
+        instead of raising exceptions, so callers get a uniform error type.
+        """
         server_name = self._tool_to_server.get(name)
         if server_name is None:
-            raise ValueError(f"Unknown tool: {name!r}")
+            return ToolError(
+                message=f"Unknown tool: {name!r}",
+                tool_name=name,
+                is_user_error=True,
+            )
 
         server = self._servers.get(server_name)
         if server is None:
-            raise RuntimeError(
-                f"Server {server_name!r} for tool {name!r} is not connected"
+            return ToolError(
+                message=f"Server {server_name!r} for tool {name!r} is not connected",
+                tool_name=name,
+                is_user_error=False,
             )
 
         session = server["session"]
-        result = await asyncio.wait_for(
-            session.call_tool(name, arguments), timeout=timeout
-        )
+        try:
+            result = await asyncio.wait_for(
+                session.call_tool(name, arguments), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Tool %r timed out after %ss via MCP", name, timeout)
+            return ToolError(
+                message=f"Tool {name!r} timed out after {timeout}s",
+                tool_name=name,
+                is_user_error=False,
+            )
+        except Exception as exc:
+            logger.exception("Unexpected error calling tool %r via MCP", name)
+            return ToolError(
+                message=f"Error calling {name}: {exc}",
+                tool_name=name,
+                is_user_error=False,
+            )
+
+        if getattr(result, "isError", False):
+            parts = []
+            for content in result.content:
+                if hasattr(content, "text"):
+                    parts.append(content.text)
+                else:
+                    parts.append(str(content))
+            error_text = "\n".join(parts) if parts else "MCP server returned an error"
+            return ToolError(
+                message=error_text,
+                tool_name=name,
+                is_user_error=False,
+            )
 
         parts = []
         for content in result.content:

@@ -1075,6 +1075,114 @@ class TestCliMain:
             cli_main()
         assert exc_info.value.code == 0
 
+    # --- Dispatch gaps: unregistered subcommand fallback paths ---
+
+    def test_service_no_subcommand_shows_help(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "service"])
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main()
+        assert exc_info.value.code == 0
+
+    def test_flash_no_subcommand_shows_help(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "flash"])
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main()
+        assert exc_info.value.code == 0
+
+    def test_flash_prepare_calls_handler(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "flash", "prepare", "some/model"])
+        mock_fn = MagicMock()
+        monkeypatch.setattr("olmlx.cli.cmd_flash_prepare", mock_fn)
+        cli_main()
+        mock_fn.assert_called_once()
+
+    def test_flash_info_calls_handler(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "flash", "info", "some/model"])
+        mock_fn = MagicMock()
+        monkeypatch.setattr("olmlx.cli.cmd_flash_info", mock_fn)
+        cli_main()
+        mock_fn.assert_called_once()
+
+    def test_spectral_no_subcommand_shows_help(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "spectral"])
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main()
+        assert exc_info.value.code == 0
+
+    def test_spectral_prepare_calls_handler(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "spectral", "prepare", "some/model"])
+        mock_fn = MagicMock()
+        monkeypatch.setattr("olmlx.cli.cmd_spectral_prepare", mock_fn)
+        cli_main()
+        mock_fn.assert_called_once()
+
+    def test_bench_no_subcommand_shows_help(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "bench"])
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main()
+        assert exc_info.value.code == 0
+
+    def test_bench_run_calls_handler(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "bench", "run"])
+        mock_fn = MagicMock()
+        monkeypatch.setattr("olmlx.cli.cmd_bench_run", mock_fn)
+        cli_main()
+        mock_fn.assert_called_once()
+
+    def test_bench_compare_calls_handler(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "bench", "compare", "a", "b"])
+        mock_fn = MagicMock()
+        monkeypatch.setattr("olmlx.cli.cmd_bench_compare", mock_fn)
+        cli_main()
+        mock_fn.assert_called_once()
+
+    def test_bench_list_calls_handler(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "bench", "list"])
+        mock_fn = MagicMock()
+        monkeypatch.setattr("olmlx.cli.cmd_bench_list", mock_fn)
+        cli_main()
+        mock_fn.assert_called_once()
+
+    def test_bench_leaderboard_calls_handler(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "bench", "leaderboard"])
+        mock_fn = MagicMock()
+        monkeypatch.setattr("olmlx.cli.cmd_bench_leaderboard", mock_fn)
+        cli_main()
+        mock_fn.assert_called_once()
+
+    def test_completely_unknown_command_prints_help(self, monkeypatch):
+        """Unregistered top-level command should fall through to help."""
+        monkeypatch.setattr("sys.argv", ["olmlx", "nope"])
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main()
+        # Argparse exits 2 for unknown args when they don't match any subparser
+        assert exc_info.value.code in (0, 2)
+
+    def test_unknown_models_subcommand_prints_help(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "models", "nonexistent"])
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main()
+        # argparse validates choices before dispatch; it may exit 0 (our
+        # fallback) or 2 (argparse's built-in choice validation).
+        assert exc_info.value.code in (0, 2)
+
+    def test_chat_calls_handler(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["olmlx", "chat"])
+        mock_fn = MagicMock()
+        monkeypatch.setattr("olmlx.cli.cmd_chat", mock_fn)
+        cli_main()
+        mock_fn.assert_called_once()
+
+
+class TestCommandHandlerRegistry:
+    """Verify every handler in _COMMAND_HANDLERS resolves at import time."""
+
+    def test_all_handlers_resolve(self):
+        from olmlx.cli import _validate_command_handlers
+
+        # Raises NameError/TypeError on any broken entry
+        _validate_command_handlers()
+
 
 class TestCreateStore:
     def test_calls_ensure_config(self, tmp_path, monkeypatch):

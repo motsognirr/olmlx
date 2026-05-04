@@ -8,6 +8,7 @@ import pytest
 
 from olmlx.chat.builtin_tools import BuiltinToolManager
 from olmlx.chat.config import ChatConfig
+from olmlx.chat.errors import ToolError
 
 
 @pytest.fixture
@@ -56,9 +57,12 @@ class TestBuiltinToolManagerSkeleton:
         assert names == expected
 
     @pytest.mark.asyncio
-    async def test_call_unknown_tool_raises(self, manager):
-        with pytest.raises(ValueError, match="Unknown built-in tool"):
-            await manager.call_tool("nonexistent", {})
+    async def test_call_unknown_tool_returns_tool_error(self, manager):
+        result = await manager.call_tool("nonexistent", {})
+        assert isinstance(result, ToolError)
+        assert "Unknown built-in tool" in result.message
+        assert result.tool_name == "nonexistent"
+        assert result.is_user_error is True
 
 
 class TestReadFile:
@@ -93,7 +97,8 @@ class TestReadFile:
         result = await manager.call_tool(
             "read_file", {"path": str(tmp_path / "nope.txt")}
         )
-        assert "Error" in result or "error" in result
+        assert isinstance(result, ToolError)
+        assert "Error reading file" in result.message
 
 
 class TestWriteFile:
@@ -151,7 +156,8 @@ class TestEditFile:
                 "new_text": "replacement",
             },
         )
-        assert "not found" in result.lower() or "error" in result.lower()
+        assert isinstance(result, ToolError)
+        assert "not found" in result.message.lower()
 
     @pytest.mark.asyncio
     async def test_edit_file_multiple_matches(self, manager, tmp_path):
@@ -165,7 +171,8 @@ class TestEditFile:
                 "new_text": "bar",
             },
         )
-        assert "multiple" in result.lower() or "2" in result
+        assert isinstance(result, ToolError)
+        assert "multiple" in result.message.lower()
 
     @pytest.mark.asyncio
     async def test_edit_file_not_found(self, manager, tmp_path):
@@ -177,7 +184,8 @@ class TestEditFile:
                 "new_text": "y",
             },
         )
-        assert "error" in result.lower()
+        assert isinstance(result, ToolError)
+        assert result.tool_name == "edit_file"
 
 
 class TestGlob:
@@ -280,7 +288,8 @@ class TestBash:
                 "timeout": 1,
             },
         )
-        assert "timeout" in result.lower() or "timed out" in result.lower()
+        assert isinstance(result, ToolError)
+        assert "timed out" in result.message.lower()
 
     @pytest.mark.asyncio
     async def test_bash_output_truncated(self, manager):
@@ -316,16 +325,14 @@ class TestPlanTools:
     @pytest.mark.asyncio
     async def test_read_plan_no_plan(self, manager):
         result = await manager.call_tool("read_plan", {})
-        assert "no plan" in result.lower() or "not found" in result.lower()
+        assert isinstance(result, ToolError)
+        assert "No plan found" in result.message
 
     @pytest.mark.asyncio
     async def test_update_plan_no_plan(self, manager):
         result = await manager.call_tool("update_plan", {"content": "# V2"})
-        assert (
-            "no plan" in result.lower()
-            or "not found" in result.lower()
-            or "error" in result.lower()
-        )
+        assert isinstance(result, ToolError)
+        assert "No plan found" in result.message
 
 
 class TestBashSubprocessCleanup:
@@ -370,13 +377,15 @@ class TestWebFetchSchemeValidation:
     @pytest.mark.asyncio
     async def test_rejects_file_scheme(self, manager):
         result = await manager.call_tool("web_fetch", {"url": "file:///etc/passwd"})
-        assert "unsupported" in result.lower() or "error" in result.lower()
-        assert "http" in result.lower()
+        assert isinstance(result, ToolError)
+        assert result.tool_name == "web_fetch"
+        assert result.is_user_error is True
 
     @pytest.mark.asyncio
     async def test_rejects_ftp_scheme(self, manager):
         result = await manager.call_tool("web_fetch", {"url": "ftp://example.com/file"})
-        assert "unsupported" in result.lower() or "error" in result.lower()
+        assert isinstance(result, ToolError)
+        assert result.tool_name == "web_fetch"
 
 
 class TestHTMLExtractorNested:
@@ -455,7 +464,9 @@ class TestWebSearch:
             side_effect=ImportError("No module named 'duckduckgo_search'"),
         ):
             result = await manager.call_tool("web_search", {"query": "test"})
-        assert "duckduckgo" in result.lower() or "install" in result.lower()
+        assert isinstance(result, ToolError)
+        assert result.tool_name == "web_search"
+        assert "duckduckgo" in result.message.lower()
 
 
 class TestSessionIntegration:

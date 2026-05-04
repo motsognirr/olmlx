@@ -9,6 +9,7 @@ from typing import Any, Literal, TypedDict
 
 from olmlx.chat.builtin_tools import BuiltinToolManager
 from olmlx.chat.config import ChatConfig
+from olmlx.chat.errors import ToolError
 from olmlx.chat.mcp_client import MCPClientManager
 from olmlx.chat.skills import SkillManager
 from olmlx.chat.tool_safety import ToolSafetyPolicy
@@ -67,6 +68,7 @@ class _ToolErrorEvent(TypedDict):
     name: str
     error: str
     id: str
+    is_user_error: bool
 
 
 class _RepetitionDetectedEvent(TypedDict):
@@ -494,7 +496,13 @@ class ChatSession:
         return False
 
     async def _exec_tool(self, tu: dict) -> dict:
-        """Execute a single tool call and return the event + message."""
+        """Execute a single tool call and return the event + message.
+
+        ToolError returns from builtin tools and MCP are converted to
+        tool_error events so the model always sees a uniform error format
+        regardless of whether the failure came from a builtin, MCP, or
+        exception path.
+        """
         tool_name = tu["name"]
         tool_input = tu["input"]
         tool_id = tu["id"]
@@ -508,7 +516,35 @@ class ChatSession:
                     tool_name, tool_input, timeout=self.config.tool_timeout
                 )
             else:
-                raise ValueError(f"No handler for tool: {tool_name!r}")
+                result = ToolError(
+                    message=f"No handler for tool: {tool_name!r}",
+                    tool_name=tool_name,
+                    is_user_error=True,
+                )
+
+            if isinstance(result, ToolError):
+                return {
+                    "call_event": {
+                        "type": "tool_call",
+                        "name": tool_name,
+                        "arguments": tool_input,
+                        "id": tool_id,
+                    },
+                    "result_event": {
+                        "type": "tool_error",
+                        "name": tool_name,
+                        "error": result.message,
+                        "id": tool_id,
+                        "is_user_error": result.is_user_error,
+                    },
+                    "message": {
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "name": tool_name,
+                        "content": result.message,
+                    },
+                }
+
             return {
                 "call_event": {
                     "type": "tool_call",
@@ -543,6 +579,7 @@ class ChatSession:
                     "name": tool_name,
                     "error": str(exc),
                     "id": tool_id,
+                    "is_user_error": False,
                 },
                 "message": {
                     "role": "tool",
@@ -760,6 +797,7 @@ class ChatSession:
                         "name": name,
                         "error": "task cancelled",
                         "id": tu["id"],
+                        "is_user_error": False,
                     }
                     results_by_id[tu["id"]] = {
                         "message": {
@@ -786,6 +824,7 @@ class ChatSession:
                         "name": name,
                         "error": str(r),
                         "id": tu["id"],
+                        "is_user_error": False,
                     }
                     results_by_id[tu["id"]] = {
                         "message": {
@@ -842,6 +881,7 @@ class ChatSession:
                     "name": tu["name"],
                     "error": error_detail,
                     "id": tu["id"],
+                    "is_user_error": False,
                 }
                 self.messages.append(
                     {
@@ -875,7 +915,7 @@ class ChatSession:
         - {"type": "thinking_end"} — thinking block ends
         - {"type": "tool_call", "name": str, "arguments": dict, "id": str}
         - {"type": "tool_result", "name": str, "result": str, "id": str}
-        - {"type": "tool_error", "name": str, "error": str, "id": str}
+        - {"type": "tool_error", "name": str, "error": str, "id": str, "is_user_error": bool}
         - {"type": "tool_confirmation_needed", "name": str, "arguments": dict, "id": str}
         - {"type": "tool_approved", "name": str, "id": str}
         - {"type": "tool_denied", "name": str, "arguments": dict, "id": str, "reason": str}
@@ -1021,6 +1061,7 @@ class ChatSession:
                     "name": "(parse error)",
                     "error": f"Failed to parse model output; tools were dropped: {exc}",
                     "id": "",
+                    "is_user_error": False,
                 }
 
             # Build assistant message
