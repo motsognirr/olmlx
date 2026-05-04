@@ -385,6 +385,11 @@ class ModelConfig:
                         "'kv_cache_quant' must be a non-empty string; "
                         "use ``null`` to inherit from the global setting."
                     )
+                # Validate format so bad values fail at config load time,
+                # not at inference time with a confusing internal error.
+                from olmlx.config import Settings
+
+                Settings.validate_kv_cache_quant(kv_cache_quant_raw)
 
             extra = {k: v for k, v in entry.items() if k not in _KNOWN_CONFIG_KEYS}
             return cls(

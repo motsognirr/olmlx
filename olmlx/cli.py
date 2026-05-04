@@ -348,9 +348,8 @@ def _surface_legacy_kv_cache_quant_env() -> None:
     if os.environ.get("OLMLX_KV_CACHE_QUANT") is not None:
         return  # new env var takes precedence
     if _settings.kv_cache_quant is not None:
-        # Already set via .env or programmatic write (CLI flags are
-        # applied after this call in _apply_serve_overrides, so they
-        # can't be the source here).
+        # Already set via .env or a CLI flag applied earlier in
+        # _apply_serve_overrides.
         return
     try:
         _settings.kv_cache_quant = legacy_val

@@ -332,7 +332,7 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_SPECULATIVE` | `false` | Enable speculative decoding with a draft model (also `--speculative` on `olmlx serve`) |
 | `OLMLX_SPECULATIVE_DRAFT_MODEL` | `None` | HuggingFace path of the draft model (also `--speculative-draft-model`) |
 | `OLMLX_SPECULATIVE_TOKENS` | `4` | Candidate tokens generated per verification step (also `--speculative-tokens`) |
-| `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4`, or `spectral:2` (also `--kv-cache-quant`) |
+| `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), or `spectral:2` (also `--kv-cache-quant`) |
 
 ### Flash inference settings (experimental)
 
