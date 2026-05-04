@@ -55,6 +55,22 @@ class Settings(BaseSettings):
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
+    @field_validator("speculative_draft_model")
+    @classmethod
+    def validate_speculative_draft_model(cls, v: str | None) -> str | None:
+        # ``Field(min_length=1)`` already rejects ``""``, but a
+        # whitespace-only value (``"   "``) has length > 0 and would
+        # otherwise reach the load path and surface as a misleading
+        # "draft not set" error. Strip and reject empty here.
+        if v is None:
+            return v
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError(
+                "speculative_draft_model must be a non-empty HuggingFace path"
+            )
+        return stripped
+
     @field_validator("anthropic_models")
     @classmethod
     def validate_anthropic_model_keys(cls, v: dict[str, str]) -> dict[str, str]:

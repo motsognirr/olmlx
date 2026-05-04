@@ -203,6 +203,22 @@ class TestSpeculativeConfig:
         with pytest.raises(ValidationError):
             Settings()
 
+    def test_speculative_draft_model_rejects_whitespace_only(self, monkeypatch):
+        """``Field(min_length=1)`` accepts ``"   "`` (length > 0). The
+        custom validator strips and re-rejects so a whitespace-only env
+        var doesn't surface as a misleading load-time error."""
+        monkeypatch.setenv("OLMLX_SPECULATIVE_DRAFT_MODEL", "   ")
+        with pytest.raises(ValidationError, match="non-empty"):
+            Settings()
+
+    def test_speculative_draft_model_strips_whitespace(self, monkeypatch):
+        """Surrounding whitespace is stripped on parse, so a
+        ``OLMLX_SPECULATIVE_DRAFT_MODEL=" hf/path "`` doesn't reach the
+        loader with a path containing spaces."""
+        monkeypatch.setenv("OLMLX_SPECULATIVE_DRAFT_MODEL", "  Qwen/Qwen3-0.6B  ")
+        s = Settings()
+        assert s.speculative_draft_model == "Qwen/Qwen3-0.6B"
+
     def test_model_config_speculative_tokens_validated_on_construct(self):
         """Direct ModelConfig construction must enforce the >=1 invariant."""
         from olmlx.engine.registry import ModelConfig
