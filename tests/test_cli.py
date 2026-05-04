@@ -216,6 +216,36 @@ class TestBuildParser:
         # Should not raise SystemExit.
         _apply_serve_overrides(args)
 
+    def test_cmd_chat_forwards_legacy_env_vars(self, monkeypatch, capsys):
+        """``olmlx chat`` must run the deprecation forwarder too —
+        otherwise users who only run chat after upgrading silently lose
+        speculative even though ``serve`` honours the legacy names."""
+        from olmlx.cli import cmd_chat
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE", "true")
+        monkeypatch.setenv(
+            "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", "Qwen/Qwen3-0.6B"
+        )
+        monkeypatch.delenv("OLMLX_SPECULATIVE", raising=False)
+        monkeypatch.delenv("OLMLX_SPECULATIVE_DRAFT_MODEL", raising=False)
+        # ``cmd_chat`` calls ``_configure_logging`` which clears caplog's
+        # handler — read warnings off stderr instead.
+
+        # Drive cmd_chat to the point right after the forwarder runs by
+        # giving it a missing model name — it exits before doing any
+        # real model loading.
+        ns = MagicMock()
+        ns.model_name = None
+        with pytest.raises(SystemExit):
+            cmd_chat(ns)
+        captured = capsys.readouterr()
+        assert "Deprecated env vars detected" in captured.err
+        assert _settings.speculative is True
+        assert _settings.speculative_draft_model == "Qwen/Qwen3-0.6B"
+
     def test_legacy_dotenv_strips_inline_comments(self, monkeypatch, tmp_path):
         """An unquoted ``.env`` value with a trailing ``# …`` comment
         must parse to just the value. Without comment stripping, the

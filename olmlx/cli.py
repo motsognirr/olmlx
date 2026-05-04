@@ -164,8 +164,11 @@ def _legacy_speculative_values_in_dotenv() -> dict[str, str]:
         if key.startswith("export "):
             key = key[len("export ") :].strip()
         value = value.strip()
-        is_quoted = (value.startswith('"') and value.endswith('"')) or (
-            value.startswith("'") and value.endswith("'")
+        # Require length >= 2 so a literal single quote ``"`` doesn't
+        # collapse to the empty string.
+        is_quoted = len(value) >= 2 and (
+            (value.startswith('"') and value.endswith('"'))
+            or (value.startswith("'") and value.endswith("'"))
         )
         if is_quoted:
             value = value[1:-1]
@@ -252,22 +255,16 @@ def _forward_legacy_speculative_env(_settings) -> None:
             )
 
 
-def _apply_serve_overrides(args) -> None:
-    """Apply CLI flags to the global Settings before the server starts.
+def _surface_legacy_speculative_env() -> None:
+    """Warn about and forward legacy ``OLMLX_EXPERIMENTAL_SPECULATIVE*``
+    env vars (shell or ``.env``) to the new Settings.
 
-    The flags are written to the ``settings`` instance so that the rest of
-    the codebase (which reads ``from olmlx.config import settings``) picks
-    them up without needing extra plumbing.
+    Called from every subcommand that touches speculative decoding so
+    the deprecation window is honoured uniformly — ``serve``, ``chat``,
+    and any future surface that reads ``settings.speculative*``.
     """
     from olmlx.config import settings as _settings
 
-    # Surface the env-var rename so a user upgrading with the old names
-    # in their shell profile or ``.env`` doesn't silently lose
-    # speculative decoding — pydantic-settings drops unknown
-    # OLMLX_EXPERIMENTAL_* keys without warning. We scan both
-    # ``os.environ`` (shell exports) and the ``.env`` file directly,
-    # since pydantic-settings populates Settings from ``.env`` without
-    # touching ``os.environ``.
     dotenv_legacy = _legacy_speculative_keys_in_dotenv()
     shell_stale = [v for v in _DEPRECATED_SPECULATIVE_ENV_VARS if os.environ.get(v)]
     stale = sorted({*shell_stale, *dotenv_legacy})
@@ -282,6 +279,18 @@ def _apply_serve_overrides(args) -> None:
         # var is unset, so user-facing behaviour doesn't silently change
         # on upgrade. Drop this once the deprecation window closes.
         _forward_legacy_speculative_env(_settings)
+
+
+def _apply_serve_overrides(args) -> None:
+    """Apply CLI flags to the global Settings before the server starts.
+
+    The flags are written to the ``settings`` instance so that the rest of
+    the codebase (which reads ``from olmlx.config import settings``) picks
+    them up without needing extra plumbing.
+    """
+    from olmlx.config import settings as _settings
+
+    _surface_legacy_speculative_env()
 
     # ``getattr`` defends programmatic callers that hand a bare
     # ``argparse.Namespace`` (e.g. tests) without populating these
@@ -1216,6 +1225,11 @@ def cmd_chat(args):
 
     ensure_config()
     _configure_logging()
+    # ``olmlx chat`` reads ``settings.speculative*`` via ModelManager
+    # too, so honour the deprecation window here. Without this a user
+    # who only runs chat would silently lose forwarding even though
+    # ``serve`` handles it correctly.
+    _surface_legacy_speculative_env()
 
     model_name = args.model_name
     if model_name is None:
