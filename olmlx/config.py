@@ -11,7 +11,18 @@ SyncMode = Literal["full", "minimal", "none"]
 
 
 class Settings(BaseSettings):
-    model_config = {"env_prefix": "OLMLX_", "env_file": ".env", "extra": "ignore"}
+    # Note: ``validate_assignment=True`` applies to *all* fields, not just
+    # the new speculative ones. Programmatic writes that previously
+    # silently set out-of-range values (e.g. ``settings.port = 0``) now
+    # raise ``ValidationError``. This is intentional — tests and CLI
+    # overrides should not be able to construct invalid Settings — but
+    # it does broaden the surface beyond the immediate use case.
+    model_config = {
+        "env_prefix": "OLMLX_",
+        "env_file": ".env",
+        "extra": "ignore",
+        "validate_assignment": True,
+    }
 
     host: str = "0.0.0.0"
     port: Annotated[int, Field(ge=1, le=65535)] = 11434
@@ -34,6 +45,31 @@ class Settings(BaseSettings):
     max_tokens_limit: Annotated[int, Field(gt=0)] = 131072
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
     anthropic_models: dict[str, str] = {}
+
+    # Speculative decoding (works with any model, not just Flash).
+    # Per-model overrides live on ``ModelConfig`` in ``olmlx.engine.registry``.
+    # ``min_length=1`` rejects ``OLMLX_SPECULATIVE_DRAFT_MODEL=""`` at parse
+    # time so the load path doesn't surface a misleading "draft not set"
+    # error for an empty string.
+    speculative: bool = False
+    speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
+    speculative_tokens: Annotated[int, Field(gt=0)] = 4
+
+    @field_validator("speculative_draft_model")
+    @classmethod
+    def validate_speculative_draft_model(cls, v: str | None) -> str | None:
+        # ``Field(min_length=1)`` already rejects ``""``, but a
+        # whitespace-only value (``"   "``) has length > 0 and would
+        # otherwise reach the load path and surface as a misleading
+        # "draft not set" error. Strip and reject empty here.
+        if v is None:
+            return v
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError(
+                "speculative_draft_model must be a non-empty HuggingFace path"
+            )
+        return stripped
 
     @field_validator("anthropic_models")
     @classmethod
@@ -92,11 +128,6 @@ class ExperimentalSettings(BaseSettings):
     flash_speculative: bool = False
     flash_speculative_draft_model: str | None = None
     flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
-
-    # Standalone speculative decoding (works with any model, not just Flash)
-    speculative: bool = False
-    speculative_draft_model: str | None = None
-    speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
     # DFlash block-diffusion speculative decoding
     dflash: bool = False

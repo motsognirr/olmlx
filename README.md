@@ -329,6 +329,9 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_PROMPT_CACHE_MAX_TOKENS` | `32768` | Invalidate the KV cache after a conversation exceeds this many tokens. Use a very large value to effectively disable |
 | `OLMLX_MAX_TOKENS_LIMIT` | `131072` | Maximum tokens allowed per request |
 | `OLMLX_CORS_ORIGINS` | `http://localhost:*`, `http://127.0.0.1:*` | Allowed CORS origins |
+| `OLMLX_SPECULATIVE` | `false` | Enable speculative decoding with a draft model (also `--speculative` on `olmlx serve`) |
+| `OLMLX_SPECULATIVE_DRAFT_MODEL` | `None` | HuggingFace path of the draft model (also `--speculative-draft-model`) |
+| `OLMLX_SPECULATIVE_TOKENS` | `4` | Candidate tokens generated per verification step (also `--speculative-tokens`) |
 
 ### Flash inference settings (experimental)
 
@@ -370,6 +373,68 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET` | *(empty)* | Shared secret for worker authentication |
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR` | *(empty)* | Working directory on remote workers |
 | `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON` | `python` | Python command on remote workers |
+
+## Speculative Decoding
+
+Speculative decoding pairs a small *draft* model with a larger *target* model: the draft proposes several tokens autoregressively, and the target verifies them in a single forward pass. When most drafts are accepted you get multiple tokens per target step, which lowers latency. Verification is performed with greedy argmax against the target's logits — so for `temperature=0` requests the output is bit-identical to plain greedy decoding. With `temperature > 0`, output quality is preserved but the token stream is no longer drawn from the target's sampled distribution, so individual completions can differ from a non-speculative run with the same seed.
+
+```bash
+OLMLX_SPECULATIVE=true \
+OLMLX_SPECULATIVE_DRAFT_MODEL=mlx-community/Qwen3-0.6B-4bit \
+olmlx serve
+```
+
+Or, equivalently, with CLI flags:
+
+```bash
+olmlx serve \
+  --speculative \
+  --speculative-draft-model mlx-community/Qwen3-0.6B-4bit \
+  --speculative-tokens 4
+```
+
+You can also pin per-model defaults in `~/.olmlx/models.json`:
+
+```json
+{
+  "mlx-community/Qwen3.5-27B-4bit:latest": {
+    "hf_path": "mlx-community/Qwen3.5-27B-4bit",
+    "speculative": true,
+    "speculative_draft_model": "mlx-community/Qwen3.5-0.8B-MLX-4bit",
+    "speculative_tokens": 4
+  }
+}
+```
+
+### Picking a draft model
+
+- Use the same model family — vocabulary mismatches are rejected at load.
+- Smaller is better for latency *if* the draft tracks the target's distribution. A 0.5–1B draft for a 7–32B target is a good starting point.
+- Quantization matters less for the draft than for the target — pick whatever fits comfortably alongside the target in memory.
+
+### Expected speedup
+
+Real-world speedup typically lands between **1.4x and 2x** on Apple Silicon for code/chat workloads, dropping toward **1x** on highly creative or out-of-distribution prompts where the draft is frequently rejected. The token budget (`--speculative-tokens`, default 4) trades draft work for verification savings — try 4–8 for routine workloads, lower if your prompts are noisy.
+
+### When not to use it
+
+- The target is already small (under ~3B). The draft+target overhead can dominate.
+- You're memory-constrained: both models stay resident, including their KV caches.
+- Prompts are highly stochastic / high-temperature — acceptance drops and overhead dominates.
+- You're using vision-language models that don't expose `.language_model` (most VLMs work, but a few do not).
+
+### Migration from `OLMLX_EXPERIMENTAL_SPECULATIVE_*`
+
+The settings have been promoted out of `experimental`. The new env vars are `OLMLX_SPECULATIVE`, `OLMLX_SPECULATIVE_DRAFT_MODEL`, and `OLMLX_SPECULATIVE_TOKENS`. The legacy `OLMLX_EXPERIMENTAL_SPECULATIVE*` names are still honoured for one release: their values are forwarded to the new settings (the new names win when both are set) and a deprecation warning is logged at startup. Per-model `models.json` entries that previously placed these keys under `"experimental": {...}` now go at the top level — loading an old config raises a clear migration error pointing at the new location.
+
+**Important — also rename the keys in your `.env`.** pydantic-settings reads the project's `.env` file to populate `Settings`; if your `.env` still has the old `OLMLX_EXPERIMENTAL_SPECULATIVE*` names, the deprecation banner and per-field forwarder honour them too. Rename the keys in `.env` to the new names; the legacy names are scanned and forwarded for one release only.
+
+**Important — `.env` opt-outs during the deprecation window.** The legacy env-var forwarder cannot distinguish "field was never set" from "field was explicitly written to its schema default in `.env`" (e.g. `OLMLX_SPECULATIVE=false`). If you have an explicit-default `.env` opt-out **and** the old `OLMLX_EXPERIMENTAL_SPECULATIVE*` still set in your shell, the legacy value will silently overwrite the `.env` value — and speculative will be re-enabled despite your `.env` saying otherwise. Two ways to avoid this surprise:
+
+- Remove the legacy `OLMLX_EXPERIMENTAL_SPECULATIVE*` exports from your shell profile before upgrading.
+- Watch the startup logs for `Forwarding legacy …` warnings — they fire per-field whenever the forwarder applies a value, so you can spot an unwanted override immediately.
+
+**Behaviour change — Settings now validate on assignment.** As part of this change, `Settings` runs Pydantic validators on every programmatic field assignment (not just the speculative ones). Code that previously did `settings.port = 0` to test error handling will now raise `ValidationError` instead of silently accepting the bad value. This is intentional — invalid settings should never be reachable — but it is a behaviour change for anyone who was monkey-patching settings in tests or tools.
 
 ## LLM in a Flash (Experimental)
 

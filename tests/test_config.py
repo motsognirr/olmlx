@@ -171,42 +171,186 @@ class TestResolveExperimental:
 
 
 class TestSpeculativeConfig:
-    """Tests for standalone speculative decoding config fields."""
+    """Tests for standalone speculative decoding config fields (now on Settings)."""
 
     def test_speculative_defaults(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS", raising=False)
-        s = ExperimentalSettings()
+        monkeypatch.delenv("OLMLX_SPECULATIVE", raising=False)
+        monkeypatch.delenv("OLMLX_SPECULATIVE_DRAFT_MODEL", raising=False)
+        monkeypatch.delenv("OLMLX_SPECULATIVE_TOKENS", raising=False)
+        s = Settings()
         assert s.speculative is False
         assert s.speculative_draft_model is None
         assert s.speculative_tokens == 4
 
     def test_speculative_env_override(self, monkeypatch):
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE", "true")
-        monkeypatch.setenv(
-            "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", "Qwen/Qwen3-0.6B"
-        )
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS", "6")
-        s = ExperimentalSettings()
+        monkeypatch.setenv("OLMLX_SPECULATIVE", "true")
+        monkeypatch.setenv("OLMLX_SPECULATIVE_DRAFT_MODEL", "Qwen/Qwen3-0.6B")
+        monkeypatch.setenv("OLMLX_SPECULATIVE_TOKENS", "6")
+        s = Settings()
         assert s.speculative is True
         assert s.speculative_draft_model == "Qwen/Qwen3-0.6B"
         assert s.speculative_tokens == 6
 
     def test_speculative_tokens_rejects_zero(self):
         with pytest.raises(ValidationError):
-            ExperimentalSettings(speculative_tokens=0, _env_file=None)
+            Settings(speculative_tokens=0, _env_file=None)
 
-    def test_speculative_per_model_override(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_SPECULATIVE", raising=False)
-        base = ExperimentalSettings()
-        result = resolve_experimental(
-            base,
-            {"speculative": True, "speculative_draft_model": "Qwen/Qwen3-0.6B"},
+    def test_speculative_draft_model_rejects_empty_string(self, monkeypatch):
+        """``OLMLX_SPECULATIVE_DRAFT_MODEL=""`` slips past a ``str | None``
+        check; ``Field(min_length=1)`` blocks it at parse time so the
+        load path doesn't surface a misleading "draft not set" error."""
+        monkeypatch.setenv("OLMLX_SPECULATIVE_DRAFT_MODEL", "")
+        with pytest.raises(ValidationError):
+            Settings()
+
+    def test_speculative_draft_model_rejects_whitespace_only(self, monkeypatch):
+        """``Field(min_length=1)`` accepts ``"   "`` (length > 0). The
+        custom validator strips and re-rejects so a whitespace-only env
+        var doesn't surface as a misleading load-time error."""
+        monkeypatch.setenv("OLMLX_SPECULATIVE_DRAFT_MODEL", "   ")
+        with pytest.raises(ValidationError, match="non-empty"):
+            Settings()
+
+    def test_speculative_draft_model_strips_whitespace(self, monkeypatch):
+        """Surrounding whitespace is stripped on parse, so a
+        ``OLMLX_SPECULATIVE_DRAFT_MODEL=" hf/path "`` doesn't reach the
+        loader with a path containing spaces."""
+        monkeypatch.setenv("OLMLX_SPECULATIVE_DRAFT_MODEL", "  Qwen/Qwen3-0.6B  ")
+        s = Settings()
+        assert s.speculative_draft_model == "Qwen/Qwen3-0.6B"
+
+    def test_model_config_speculative_tokens_validated_on_construct(self):
+        """Direct ModelConfig construction must enforce the >=1 invariant."""
+        from olmlx.engine.registry import ModelConfig
+
+        with pytest.raises(ValueError, match="speculative_tokens"):
+            ModelConfig(hf_path="x/y", speculative_tokens=0)
+        with pytest.raises(ValueError, match="speculative_tokens"):
+            ModelConfig(hf_path="x/y", speculative_tokens=-1)
+
+    def test_model_config_empty_draft_validated_on_construct(self):
+        """Direct construction must reject empty / whitespace draft paths,
+        not just from_entry — same invariant either way."""
+        from olmlx.engine.registry import ModelConfig
+
+        for value in ("", "   ", "\t"):
+            with pytest.raises(ValueError, match="non-empty"):
+                ModelConfig(hf_path="x/y", speculative_draft_model=value)
+
+    def test_speculative_tokens_assignment_validated(self, monkeypatch):
+        """validate_assignment=True keeps Field(gt=0) honoured for programmatic writes."""
+        monkeypatch.delenv("OLMLX_SPECULATIVE_TOKENS", raising=False)
+        s = Settings(_env_file=None)
+        with pytest.raises(ValidationError):
+            s.speculative_tokens = 0
+        with pytest.raises(ValidationError):
+            s.speculative_tokens = -3
+
+    def test_speculative_no_longer_in_experimental(self):
+        """Promoted fields must not exist on ExperimentalSettings anymore."""
+        e = ExperimentalSettings()
+        assert not hasattr(e, "speculative")
+        assert not hasattr(e, "speculative_draft_model")
+        assert not hasattr(e, "speculative_tokens")
+
+    def test_speculative_rejected_in_experimental_overrides(self):
+        """Per-model overrides under 'experimental' should raise a clear migration error."""
+        from olmlx.engine.registry import _validate_experimental_overrides
+
+        with pytest.raises(ValueError, match="promoted out of 'experimental'"):
+            _validate_experimental_overrides({"speculative": True})
+
+    def test_empty_speculative_draft_model_rejected(self):
+        """Empty / whitespace strings used to slip past parse and surface
+        as the misleading 'draft not set' error at load time."""
+        from olmlx.engine.registry import ModelConfig
+
+        for value in ("", "   ", "\t"):
+            with pytest.raises(ValueError, match="non-empty"):
+                ModelConfig.from_entry(
+                    {"hf_path": "x/y", "speculative_draft_model": value}
+                )
+
+    def test_promoted_keys_renamed_branch_message(self, monkeypatch):
+        """Cover the 'rename' branch of the migration error so it doesn't
+        rot before the next promotion exercises it for real."""
+        from olmlx.engine import registry
+
+        monkeypatch.setitem(registry.PROMOTED_EXPERIMENTAL_KEYS, "old_name", "new_name")
+        with pytest.raises(
+            ValueError, match="rename 'old_name' → top-level 'new_name'"
+        ):
+            registry._validate_experimental_overrides({"old_name": True})
+
+    def test_speculative_per_model_top_level(self):
+        """Per-model overrides go at the top level of the models.json entry."""
+        from olmlx.engine.registry import ModelConfig
+
+        mc = ModelConfig.from_entry(
+            {
+                "hf_path": "Qwen/Qwen3-32B",
+                "speculative": True,
+                "speculative_draft_model": "Qwen/Qwen3-0.6B",
+                "speculative_tokens": 6,
+            }
         )
-        assert result.speculative is True
-        assert result.speculative_draft_model == "Qwen/Qwen3-0.6B"
-        assert base.speculative is False
+        assert mc.speculative is True
+        assert mc.speculative_draft_model == "Qwen/Qwen3-0.6B"
+        assert mc.speculative_tokens == 6
+        # Promoted keys must NOT leak into ``_extra`` (which is reserved
+        # for unknown forward-compat keys). Reviewers have flagged this
+        # as a suspected bug multiple times — _KNOWN_CONFIG_KEYS is
+        # auto-derived from dataclass fields, but lock it down with an
+        # explicit assertion so the invariant is visible in the suite.
+        assert mc._extra == {}
+        # Round-trip preserves the new top-level fields
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["speculative"] is True
+        assert entry["speculative_draft_model"] == "Qwen/Qwen3-0.6B"
+        assert entry["speculative_tokens"] == 6
+
+    def test_known_config_keys_includes_promoted_speculative_fields(self):
+        """Regression: the auto-derived ``_KNOWN_CONFIG_KEYS`` must include
+        the three promoted speculative fields so they don't leak into
+        ``_extra``. This has been a recurring false-positive review finding;
+        locking the invariant down explicitly."""
+        from olmlx.engine.registry import _KNOWN_CONFIG_KEYS
+
+        for key in ("speculative", "speculative_draft_model", "speculative_tokens"):
+            assert key in _KNOWN_CONFIG_KEYS
+
+    def test_per_model_speculative_without_draft_resolves_to_none(self):
+        """A per-model entry that enables speculative but provides no
+        draft model resolves to (True, None, default). The error surfaces
+        either at startup (registry walk) or at first model load."""
+        from olmlx.engine.registry import ModelConfig
+
+        mc = ModelConfig.from_entry({"hf_path": "Qwen/Qwen3-32B", "speculative": True})
+        enabled, draft, _tokens = mc.resolved_speculative()
+        assert enabled is True
+        assert draft is None
+
+    def test_resolved_speculative_falls_back_to_settings(self, monkeypatch):
+        from olmlx.engine.registry import ModelConfig
+
+        monkeypatch.setattr("olmlx.config.settings.speculative", True)
+        monkeypatch.setattr(
+            "olmlx.config.settings.speculative_draft_model", "Qwen/Qwen3-0.6B"
+        )
+        monkeypatch.setattr("olmlx.config.settings.speculative_tokens", 8)
+
+        mc = ModelConfig(hf_path="Qwen/Qwen3-32B")
+        assert mc.resolved_speculative() == (True, "Qwen/Qwen3-0.6B", 8)
+
+        # Per-model overrides win, and a disabled per-model setting
+        # zeros out the draft slot even if a global draft is configured.
+        mc_override = ModelConfig(
+            hf_path="Qwen/Qwen3-32B",
+            speculative=False,
+            speculative_tokens=2,
+        )
+        assert mc_override.resolved_speculative() == (False, None, 2)
 
 
 class TestDFlashConfig:

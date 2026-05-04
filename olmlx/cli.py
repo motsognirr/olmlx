@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -39,12 +40,15 @@ def ensure_config():
         print(f"Created {settings.models_config} with example models")
 
 
-def cmd_serve(_args):
+def cmd_serve(args):
     """Start the olmlx server."""
     import uvicorn
 
+    # ensure_config() must run before override validation so the registry
+    # walk in _apply_serve_overrides sees a real models.json on first run.
     ensure_config()
     _configure_logging()
+    _apply_serve_overrides(args)
 
     from olmlx.config import experimental
 
@@ -90,6 +94,466 @@ def cmd_serve(_args):
         port=settings.port,
         log_level=settings.log_level.lower(),
     )
+
+
+# DEPRECATION: drop _DEPRECATED_SPECULATIVE_ENV_VARS,
+# _LEGACY_SPECULATIVE_FORWARD, _forward_legacy_speculative_env, the
+# warning + forwarding call site in _apply_serve_overrides, and the
+# legacy fallback in olmlx/bench/scenarios._requires_speculative_draft
+# in the next release after this PR ships. The promotion in PR #270
+# included a one-release deprecation window; once it passes, leaving
+# this code in place silently keeps a now-unsupported alias alive.
+_DEPRECATED_SPECULATIVE_ENV_VARS = (
+    "OLMLX_EXPERIMENTAL_SPECULATIVE",
+    "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL",
+    "OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS",
+)
+
+# Legacy → new env var mapping with parsers. Only applied when the
+# matching new env var is unset, so users with the old names in their
+# shell profile keep working through the deprecation window.
+_LEGACY_SPECULATIVE_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], ...] = (
+    (
+        "OLMLX_EXPERIMENTAL_SPECULATIVE",
+        "OLMLX_SPECULATIVE",
+        "speculative",
+        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL",
+        "OLMLX_SPECULATIVE_DRAFT_MODEL",
+        "speculative_draft_model",
+        str,
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS",
+        "OLMLX_SPECULATIVE_TOKENS",
+        "speculative_tokens",
+        int,
+    ),
+)
+
+
+def _legacy_speculative_values_in_dotenv() -> dict[str, str]:
+    """Return ``{name: value}`` for any ``_DEPRECATED_SPECULATIVE_ENV_VARS``
+    found in the project ``.env`` file.
+
+    ``Settings.model_config`` declares ``env_file=".env"`` (cwd-relative);
+    pydantic-settings reads it into Settings without touching
+    ``os.environ``, so a shell-only scan would miss legacy values in the
+    file. The format accepted is a subset of pydantic-settings' own
+    ``.env`` parser: ``KEY=value`` lines (optionally ``export KEY=...``),
+    with ``#`` comments and blank lines ignored, and surrounding single
+    or double quotes stripped from the value.
+    """
+    dotenv_path = Path(".env")
+    try:
+        text = dotenv_path.read_text()
+    except (FileNotFoundError, OSError):
+        return {}
+    found: dict[str, str] = {}
+    legacy = set(_DEPRECATED_SPECULATIVE_ENV_VARS)
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        value = value.strip()
+        # Require length >= 2 so a literal single quote ``"`` doesn't
+        # collapse to the empty string.
+        is_quoted = len(value) >= 2 and (
+            (value.startswith('"') and value.endswith('"'))
+            or (value.startswith("'") and value.endswith("'"))
+        )
+        if is_quoted:
+            value = value[1:-1]
+        else:
+            # Strip inline ``# comment`` from unquoted values. Without
+            # this, a line like ``KEY=true  # enable`` would parse
+            # ``true  # enable``, which the boolean forwarder coerces
+            # to ``False`` — the opposite of intent. Limitation: an
+            # unquoted value containing a literal ``#`` (e.g. a path
+            # fragment) is silently truncated. Quote the value to
+            # disable this stripping.
+            comment_idx = value.find("#")
+            if comment_idx != -1:
+                value = value[:comment_idx].rstrip()
+        if key in legacy and key not in found:
+            found[key] = value
+    return found
+
+
+def _forward_legacy_speculative_env(
+    settings_obj,
+    dotenv_values: dict[str, str] | None = None,
+) -> None:
+    """Apply legacy env var values to the new Settings when the new env
+    var is unset. Logs and swallows parse errors per-field so a single
+    bad legacy value never blocks startup.
+
+    "Unset" is determined by comparing the live Settings value against
+    the field default — checking ``os.environ`` alone would miss values
+    pydantic-settings already loaded from a ``.env`` file and silently
+    let the legacy shell var clobber them.
+
+    *dotenv_values* lets callers pass in pre-parsed ``.env`` values so
+    the file isn't read twice when the deprecation banner already
+    needed it. Defaults to a fresh parse for direct callers.
+    """
+    from olmlx.config import Settings
+
+    if dotenv_values is None:
+        dotenv_values = _legacy_speculative_values_in_dotenv()
+    for legacy, new, attr, parse in _LEGACY_SPECULATIVE_FORWARD:
+        # Shell wins over .env if both have the legacy var set, mirroring
+        # pydantic-settings' precedence for the new names.
+        legacy_val = os.environ.get(legacy, dotenv_values.get(legacy))
+        if legacy_val is None:
+            continue
+        if os.environ.get(new) is not None:
+            # The new shell var was set explicitly (even if its value
+            # happens to equal the schema default).
+            continue
+        field_default = Settings.model_fields[attr].default
+        if getattr(settings_obj, attr) != field_default:
+            # pydantic-settings already loaded a non-default value into
+            # the field (from a ``.env`` file or programmatic write at
+            # import time). CLI flags can't be the source here — they
+            # are applied later in ``_apply_serve_overrides``. The
+            # remaining blind spot is a ``.env`` entry that happens to
+            # match the schema default, which the legacy value would
+            # still overwrite — an acceptable tradeoff during the
+            # deprecation window.
+            continue
+        try:
+            value = parse(legacy_val)
+            setattr(settings_obj, attr, value)
+            # Per-field log so the override is visible alongside the
+            # bulk deprecation banner. Notable when a ``.env`` file set
+            # the new field to its schema default and the legacy shell
+            # var clobbers it — the operator gets a clear "X → Y"
+            # trail, not just the up-front banner.
+            logger.warning(
+                "Forwarding legacy %s=%r → settings.%s. The new env var "
+                "%s would take precedence if explicitly set in the shell. "
+                "Note: a value in .env that equals the schema default "
+                "cannot be distinguished from 'unset' and may be silently "
+                "overridden by the legacy var — rename the .env entry to "
+                "%s to avoid this.",
+                legacy,
+                legacy_val,
+                attr,
+                new,
+                new,
+            )
+        except Exception as exc:
+            # Catches both parse errors (ValueError/TypeError) and the
+            # ``pydantic_core.ValidationError`` raised on assignment when
+            # ``validate_assignment=True`` rejects the value (e.g.
+            # speculative_tokens=0). A bad legacy value must never block
+            # startup — fall back to the new Settings default.
+            logger.warning(
+                "Could not forward legacy env var %s=%r to %s: %s",
+                legacy,
+                legacy_val,
+                new,
+                exc,
+            )
+
+
+def _surface_legacy_speculative_env() -> None:
+    """Warn about and forward legacy ``OLMLX_EXPERIMENTAL_SPECULATIVE*``
+    env vars (shell or ``.env``) to the new Settings.
+
+    Called from every subcommand that touches speculative decoding so
+    the deprecation window is honoured uniformly — ``serve``, ``chat``,
+    and any future surface that reads ``settings.speculative*``. Reads
+    ``.env`` once and threads the result into the forwarder so the
+    file is only opened once per startup.
+    """
+    from olmlx.config import settings as _settings
+
+    dotenv_values = _legacy_speculative_values_in_dotenv()
+    shell_stale = [v for v in _DEPRECATED_SPECULATIVE_ENV_VARS if os.environ.get(v)]
+    stale = sorted({*shell_stale, *dotenv_values.keys()})
+    if stale:
+        logger.warning(
+            "Deprecated env vars detected: %s. They will be honoured for "
+            "this release but should be renamed to OLMLX_SPECULATIVE, "
+            "OLMLX_SPECULATIVE_DRAFT_MODEL, OLMLX_SPECULATIVE_TOKENS.",
+            ", ".join(stale),
+        )
+        # Forward legacy values to the new Settings only when the new env
+        # var is unset, so user-facing behaviour doesn't silently change
+        # on upgrade. Drop this once the deprecation window closes.
+        _forward_legacy_speculative_env(_settings, dotenv_values)
+
+
+def _apply_serve_overrides(args) -> None:
+    """Apply CLI flags to the global Settings before the server starts.
+
+    The flags are written to the ``settings`` instance so that the rest of
+    the codebase (which reads ``from olmlx.config import settings``) picks
+    them up without needing extra plumbing.
+    """
+    from olmlx.config import settings as _settings
+
+    _surface_legacy_speculative_env()
+
+    # ``getattr`` defends programmatic callers that hand a bare
+    # ``argparse.Namespace`` (e.g. tests) without populating these
+    # attributes. The parser-derived defaults already cover bare
+    # ``olmlx`` invocation; this is just a safety net.
+    spec = getattr(args, "speculative", None)
+    spec_draft = getattr(args, "speculative_draft_model", None)
+    spec_tokens = getattr(args, "speculative_tokens", None)
+    if spec is not None:
+        _settings.speculative = spec
+    if spec_draft is not None:
+        _settings.speculative_draft_model = spec_draft
+    if spec_tokens is not None:
+        _settings.speculative_tokens = spec_tokens
+
+    # Surface speculative misconfigurations at startup by walking the
+    # registry and checking each model's ``resolved_speculative()``. This
+    # is precise: it accepts ``OLMLX_SPECULATIVE=true`` with no global
+    # draft as long as every registered model supplies its own. It also
+    # catches per-model entries that enable speculative without a draft.
+    # The "global speculative=true and zero registered models" case is
+    # not flagged here — the first model load will raise a clear error.
+    needs_migration = _models_with_promoted_keys_in_experimental()
+    if needs_migration:
+        from olmlx.engine.registry import PROMOTED_EXPERIMENTAL_KEYS
+
+        promoted_list = ", ".join(repr(k) for k in sorted(PROMOTED_EXPERIMENTAL_KEYS))
+        print(
+            "Error: the following models in models.json still place "
+            "speculative settings under 'experimental' — these keys have "
+            f"been promoted to top-level fields. Move {promoted_list} "
+            "out of the 'experimental' block. Affected entries: "
+            f"{', '.join(needs_migration)}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    bad, dormant_drafts, flash_conflicts, global_draft_used = (
+        _audit_speculative_config()
+    )
+    if dormant_drafts:
+        logger.warning(
+            "speculative_draft_model is configured for the following "
+            "models but speculative decoding is disabled "
+            "(speculative=false), so the draft model will be ignored: %s. "
+            "Set speculative=true (per-model or globally) to enable.",
+            ", ".join(dormant_drafts),
+        )
+    # Warn whenever the global draft is set but no model actually
+    # consumes it. ``global_draft_used`` already encodes "any model
+    # resolves to the global draft", so it's the only signal we need —
+    # global ``speculative=True`` paired with per-model drafts on
+    # every entry is just as dormant as ``speculative=False``. The
+    # message wording is narrow on purpose: it claims only that the
+    # global draft is unused.
+    if _settings.speculative_draft_model and not global_draft_used:
+        logger.warning(
+            "OLMLX_SPECULATIVE_DRAFT_MODEL is set to %r but no model "
+            "consumes it: nothing inherits the global draft. The "
+            "setting has no effect until a model with ``speculative=true`` "
+            "(and no per-model draft override) is configured.",
+            _settings.speculative_draft_model,
+        )
+    # Suppress the flash-conflict warning for models that are also in
+    # ``bad`` — telling the user "use flash_speculative" is misleading
+    # when the actual error is the missing draft model.
+    flash_conflicts_actionable = [m for m in flash_conflicts if m not in set(bad)]
+    if flash_conflicts_actionable:
+        # Note: standalone speculative is only dropped when the Flash
+        # bundle actually loads — if the bundle directory is missing
+        # ``_load_model`` falls through to the standard load path and
+        # the standalone speculative decoder still runs. The startup
+        # warning is advisory; the authoritative runtime warning lives
+        # in ``_load_model`` for the case where Flash actually wins.
+        logger.warning(
+            "The following models combine speculative=true with Flash or "
+            "Flash-MoE: %s. Once Flash is prepared and loads, standalone "
+            "speculative decoding is dropped — use the per-model "
+            "``flash_speculative`` field (or "
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE / "
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL / "
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS) instead. "
+            "Note: flash-speculative is still experimental.",
+            ", ".join(flash_conflicts_actionable),
+        )
+    if bad:
+        print(
+            "Error: the following models in models.json enable speculative "
+            "decoding but have no draft model configured (per-model or "
+            f"global): {', '.join(bad)}. Set 'speculative_draft_model' on "
+            "each entry or set OLMLX_SPECULATIVE_DRAFT_MODEL globally.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _models_with_promoted_keys_in_experimental() -> list[str]:
+    """Return models.json entry names whose ``experimental`` block still
+    contains the promoted speculative keys.
+
+    Such entries are dropped by ``ModelRegistry.load()`` with a buried
+    log warning; surfacing them as a hard startup error makes the
+    migration actionable instead of mysterious. The set of promoted
+    keys is taken directly from ``registry.PROMOTED_EXPERIMENTAL_KEYS``
+    so the next promotion wires through automatically.
+    """
+    from olmlx.engine.registry import PROMOTED_EXPERIMENTAL_KEYS
+
+    try:
+        with open(settings.models_config) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        # Permission denied, IsADirectoryError, etc. — degrade
+        # gracefully like ``_audit_speculative_config`` does for the
+        # registry load. Crashing startup over an unreadable
+        # models.json is worse than skipping the migration check.
+        logger.warning(
+            "Skipping speculative migration check: could not read models.json: %s",
+            exc,
+        )
+        return []
+    except json.JSONDecodeError as exc:
+        # A corrupt models.json hides any pending migration; surface it
+        # as a warning here so the operator notices, rather than letting
+        # the audit's broad except swallow the same failure later.
+        logger.warning(
+            "Skipping speculative migration check: models.json is invalid JSON: %s",
+            exc,
+        )
+        return []
+    if not isinstance(raw, dict):
+        return []
+    promoted_keys = set(PROMOTED_EXPERIMENTAL_KEYS.keys())
+    bad: list[str] = []
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        exp = entry.get("experimental")
+        if isinstance(exp, dict) and promoted_keys & exp.keys():
+            bad.append(name)
+    return bad
+
+
+def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
+    """Walk the registry and audit each model's resolved speculative
+    config.
+
+    Returns ``(bad, dormant_drafts, flash_conflicts, global_draft_used)``:
+    - ``bad`` — models with ``speculative=True`` but no draft model
+      anywhere. Triggers a startup error.
+    - ``dormant_drafts`` — models with a per-model ``speculative_draft_model``
+      set but the resolved ``enabled`` flag is False. Triggers a
+      warning so users don't silently lose the draft they configured.
+    - ``flash_conflicts`` — models that combine ``speculative=True``
+      with Flash or Flash-MoE in the same entry. Standalone speculative
+      decoding is silently dropped on the Flash load path; the model's
+      own ``flash_speculative`` knob is the right one. Triggers a
+      warning so users see the redirect.
+    - ``global_draft_used`` — True if at least one model resolves to
+      the global ``speculative_draft_model`` (i.e. has ``speculative=True``
+      and no per-model draft override). Used to suppress the global
+      dormant-draft warning when the global draft actually has consumers.
+
+    The registry is loaded from disk; failures are logged and treated
+    as "nothing to validate" so this never blocks startup on its own.
+    """
+    from olmlx.config import experimental as global_exp
+    from olmlx.config import resolve_experimental
+    from olmlx.engine.registry import ModelRegistry
+
+    registry = ModelRegistry()
+    try:
+        registry.load()
+    except ValueError as exc:
+        # Validation errors (e.g. a malformed entry that survived
+        # ``_models_with_promoted_keys_in_experimental``) are operator
+        # errors, not transient I/O issues — flag them distinctly.
+        # Note: ``ModelRegistry.load`` itself catches per-entry
+        # ValueError today and logs them, so this branch fires only if
+        # validation moves earlier in the load sequence.
+        logger.warning(
+            "Skipping speculative config validation: invalid models.json entry: %s",
+            exc,
+        )
+        return [], [], [], False
+    except OSError as exc:
+        # I/O failures: never block startup. The catch is narrow so
+        # programming errors (typos, missing attributes, etc.) inside
+        # the loop below propagate instead of being swallowed.
+        logger.warning(
+            "Skipping speculative config validation: could not load registry: %s",
+            exc,
+        )
+        return [], [], [], False
+    bad: list[str] = []
+    dormant: list[str] = []
+    flash_conflicts: list[str] = []
+    global_draft_used = False
+    for name, mc in registry.list_models().items():
+        try:
+            enabled, draft, _ = mc.resolved_speculative()
+        except Exception as exc:
+            # ``resolved_speculative`` reads ``settings`` and could
+            # raise if the runtime ``Settings`` is in an unexpected
+            # state. Skipping the entry is safer than killing
+            # startup with a stack trace.
+            logger.warning(
+                "Skipping audit of %s: could not resolve speculative config: %s",
+                name,
+                exc,
+                exc_info=True,
+            )
+            continue
+        if enabled and not draft:
+            bad.append(name)
+        elif not enabled and mc.speculative_draft_model:
+            # Use the raw per-model field rather than the resolved
+            # ``draft``: the global dormant-draft case is already
+            # surfaced separately in ``_apply_serve_overrides``.
+            dormant.append(name)
+        if enabled and mc.speculative_draft_model is None and draft is not None:
+            # This model enables speculative without a per-model draft,
+            # so it is consuming the global ``speculative_draft_model``.
+            # Note: a per-model entry that copies the global draft path
+            # verbatim into its own ``speculative_draft_model`` looks
+            # "not consuming the global" here, even though the values
+            # are identical. That's intentional — the user wrote a
+            # per-model override, so the global setting is still
+            # logically unused for that model.
+            global_draft_used = True
+        if enabled:
+            # Resolve the full experimental config (global defaults
+            # merged with per-model overrides) so a globally enabled
+            # OLMLX_EXPERIMENTAL_FLASH still trips the conflict check.
+            try:
+                resolved_exp = resolve_experimental(global_exp, mc.experimental)
+            except Exception as exc:
+                logger.warning(
+                    "Skipping flash-conflict check for %s: could not "
+                    "resolve experimental overrides: %s",
+                    name,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            if resolved_exp.flash or resolved_exp.flash_moe:
+                flash_conflicts.append(name)
+    return bad, dormant, flash_conflicts, global_draft_used
 
 
 # Module-level state set by cmd_serve() for the app lifespan to retrieve.
@@ -776,6 +1240,11 @@ def cmd_chat(args):
 
     ensure_config()
     _configure_logging()
+    # ``olmlx chat`` reads ``settings.speculative*`` via ModelManager
+    # too, so honour the deprecation window here. Without this a user
+    # who only runs chat would silently lose forwarding even though
+    # ``serve`` handles it correctly.
+    _surface_legacy_speculative_env()
 
     model_name = args.model_name
     if model_name is None:
@@ -1223,6 +1692,19 @@ def _positive_int(value: str) -> int:
     return n
 
 
+def _non_empty_str(value: str) -> str:
+    """argparse ``type`` validator that mirrors ``Field(min_length=1)``
+    on the corresponding Settings field. Without it, ``--flag ""``
+    propagates an empty string into Settings and surfaces as an
+    unhandled ``ValidationError`` traceback at startup. Surrounding
+    whitespace is stripped so that ``--flag " hf/path "`` doesn't
+    later fail with a confusing path-not-found error."""
+    stripped = value.strip()
+    if not stripped:
+        raise argparse.ArgumentTypeError("value must be a non-empty string")
+    return stripped
+
+
 def cmd_bench_leaderboard(args):
     """Show the model leaderboard derived from saved bench runs."""
     from pathlib import Path
@@ -1450,7 +1932,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("serve", help="Start the server (default)")
+    serve_p = sub.add_parser("serve", help="Start the server (default)")
+    serve_p.add_argument(
+        "--speculative",
+        dest="speculative",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable speculative decoding (overrides OLMLX_SPECULATIVE)",
+    )
+    serve_p.add_argument(
+        "--speculative-draft-model",
+        dest="speculative_draft_model",
+        type=_non_empty_str,
+        default=None,
+        help="HuggingFace path of the draft model used for speculative decoding",
+    )
+    serve_p.add_argument(
+        "--speculative-tokens",
+        dest="speculative_tokens",
+        type=_positive_int,
+        default=None,
+        help="Number of tokens drafted per verification step (default: 4)",
+    )
 
     svc = sub.add_parser("service", help="Manage the launchd service")
     svc_sub = svc.add_subparsers(dest="service_command")
@@ -1723,6 +2226,19 @@ def cli_main():
     args = parser.parse_args()
 
     if args.command is None or args.command == "serve":
+        # Bare invocation: derive serve-subparser defaults from the
+        # parser itself rather than hardcoding the flag list. New serve
+        # flags wire through automatically; any top-level flags already
+        # on ``args`` win because ``hasattr`` short-circuits the copy.
+        # Invariant: top-level parser flag names must not overlap with
+        # serve-only flag names — otherwise this loop would suppress the
+        # serve default for the colliding name. The root parser only
+        # declares the ``command`` dest today, so this holds.
+        if args.command is None:
+            serve_defaults = vars(parser.parse_args(["serve"]))
+            for _name, _default in serve_defaults.items():
+                if not hasattr(args, _name):
+                    setattr(args, _name, _default)
         cmd_serve(args)
     elif args.command == "service":
         if args.service_command == "install":

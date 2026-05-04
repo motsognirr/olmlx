@@ -18,7 +18,7 @@ import mlx.core as mx
 
 from olmlx.config import SyncMode, experimental as global_experimental
 from olmlx.config import resolve_experimental, settings
-from olmlx.engine.registry import ModelRegistry
+from olmlx.engine.registry import ModelRegistry, SpeculativeConfig
 from olmlx.utils import memory as memory_utils
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
 
@@ -756,6 +756,9 @@ class ModelManager:
                 model_exp = resolve_experimental(
                     global_experimental, model_config.experimental
                 )
+                # Resolve per-model speculative settings (now top-level, not
+                # under ``experimental``). Falls back to global Settings.
+                spec_config = model_config.resolved_speculative()
 
                 self._evict_lru_if_needed()
 
@@ -768,7 +771,7 @@ class ModelManager:
                 load_task = lm = None
                 try:
                     coro = asyncio.to_thread(
-                        self._load_model_and_shard, hf_path, model_exp
+                        self._load_model_and_shard, hf_path, model_exp, spec_config
                     )
                     timeout = settings.model_load_timeout
                     is_distributed = False
@@ -1437,7 +1440,7 @@ class ModelManager:
         self,
         target_model: Any,
         hf_path: str,
-        model_exp: Any,
+        spec_config: SpeculativeConfig,
         *,
         is_vlm: bool = False,
     ) -> Any:
@@ -1450,17 +1453,26 @@ class ModelManager:
         """
         from olmlx.engine.speculative import SpeculativeDecoder
 
-        if not model_exp.speculative_draft_model:
+        # Hard guard rather than assert — assert is elided under
+        # ``python -O``, and this invariant must hold in production too.
+        if not spec_config.enabled:
+            raise RuntimeError(
+                "_load_speculative_decoder called with spec_config.enabled=False"
+            )
+        draft_model_path = spec_config.draft_model
+        num_tokens = spec_config.num_tokens
+        if not draft_model_path:
             raise ValueError(
                 "speculative requires speculative_draft_model to be set "
-                "(OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL)"
+                "(OLMLX_SPECULATIVE_DRAFT_MODEL or per-model "
+                "'speculative_draft_model' in models.json)"
             )
 
         logger.info(
             "Loading draft model %s for speculative decoding",
-            model_exp.speculative_draft_model,
+            draft_model_path,
         )
-        load_path = self._resolve_draft_path(model_exp.speculative_draft_model)
+        load_path = self._resolve_draft_path(draft_model_path)
 
         import mlx_lm
 
@@ -1482,7 +1494,7 @@ class ModelManager:
         return SpeculativeDecoder(
             draft_model=draft_model,
             target_model=spec_target,
-            num_speculative_tokens=model_exp.speculative_tokens,
+            num_speculative_tokens=num_tokens,
         )
 
     def _is_flash_enabled(self, model_exp: Any) -> bool:
@@ -1689,12 +1701,20 @@ class ModelManager:
         return wrapped, tokenizer, is_vlm, caps
 
     def _load_model(
-        self, hf_path: str, *, model_exp: Any = None
+        self,
+        hf_path: str,
+        *,
+        model_exp: Any = None,
+        spec_config: SpeculativeConfig | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
 
         *model_exp* is the resolved ExperimentalSettings for this model.
         Falls back to global defaults if not provided.
+
+        *spec_config* is the resolved ``SpeculativeConfig`` (per-model
+        overrides applied). Falls back to global ``Settings`` values
+        when ``None``.
 
         Returns (model, tokenizer, is_vlm, caps, speculative_decoder).
         """
@@ -1702,6 +1722,16 @@ class ModelManager:
             from olmlx.config import experimental
 
             model_exp = experimental
+        if spec_config is None:
+            # Delegate to the canonical resolution path so this fallback
+            # can't drift from ``ModelConfig.resolved_speculative()``.
+            # ``ModelConfig`` requires an ``hf_path`` but the value is
+            # not consulted by ``resolved_speculative`` — it reads only
+            # from ``settings`` for an unconfigured ModelConfig.
+            from olmlx.engine.registry import ModelConfig
+
+            spec_config = ModelConfig(hf_path=hf_path).resolved_speculative()
+        spec_enabled = spec_config.enabled
 
         # Ensure model is downloaded to the store
         load_path: str = hf_path
@@ -1713,6 +1743,13 @@ class ModelManager:
         if self._is_flash_moe_enabled(model_exp):
             flash_moe_dir = self._flash_moe_dir(hf_path)
             if flash_moe_dir is not None:
+                if spec_enabled:
+                    logger.warning(
+                        "OLMLX_SPECULATIVE is enabled but %s is loaded via "
+                        "Flash-MoE, which does not support standalone "
+                        "speculative decoding; the setting will be ignored.",
+                        hf_path,
+                    )
                 return (
                     *self._load_flash_moe_model(
                         hf_path, load_path, flash_moe_dir, model_exp=model_exp
@@ -1724,6 +1761,14 @@ class ModelManager:
         if self._is_flash_enabled(model_exp):
             flash_dir = self._flash_dir(hf_path)
             if flash_dir is not None:
+                if spec_enabled:
+                    logger.warning(
+                        "OLMLX_SPECULATIVE is enabled but %s is loaded via "
+                        "Flash, which uses OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE "
+                        "for speculative decoding; the OLMLX_SPECULATIVE "
+                        "setting will be ignored.",
+                        hf_path,
+                    )
                 return self._load_flash_model(
                     hf_path, load_path, flash_dir, model_exp=model_exp
                 )
@@ -1757,9 +1802,9 @@ class ModelManager:
                         "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE) and use "
                         "speculative instead"
                     )
-                if model_exp.speculative:
+                if spec_enabled:
                     decoder = self._load_speculative_decoder(
-                        model, hf_path, model_exp, is_vlm=True
+                        model, hf_path, spec_config, is_vlm=True
                     )
                     return model, processor, True, caps, decoder
                 return model, processor, True, caps, None
@@ -1777,7 +1822,7 @@ class ModelManager:
             name
             for name, flag in [
                 ("dflash", model_exp.dflash),
-                ("speculative", model_exp.speculative),
+                ("speculative", spec_enabled),
                 ("flash_speculative", model_exp.flash_speculative),
             ]
             if flag
@@ -1791,24 +1836,30 @@ class ModelManager:
             decoder = self._load_dflash_decoder(model, hf_path, model_exp)
             return model, tokenizer, is_vlm, caps, decoder
 
-        if model_exp.speculative:
-            decoder = self._load_speculative_decoder(model, hf_path, model_exp)
+        if spec_enabled:
+            decoder = self._load_speculative_decoder(model, hf_path, spec_config)
             return model, tokenizer, is_vlm, caps, decoder
 
         return model, tokenizer, is_vlm, caps, None
 
     def _load_model_and_shard(
-        self, hf_path: str, model_exp: Any = None
+        self,
+        hf_path: str,
+        model_exp: Any = None,
+        spec_config: SpeculativeConfig | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 
         *model_exp* is the resolved ExperimentalSettings for this model
         (global defaults merged with per-model overrides).
 
+        *spec_config* is the resolved speculative config tuple
+        ``(enabled, draft_model, num_tokens)``.
+
         Returns (model, tokenizer, is_vlm, caps, is_distributed, speculative_decoder).
         """
         model, tokenizer, is_vlm, caps, speculative_decoder = self._load_model(
-            hf_path, model_exp=model_exp
+            hf_path, model_exp=model_exp, spec_config=spec_config
         )
         is_distributed = False
 

@@ -8,7 +8,7 @@ import threading
 import dataclasses
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any, NamedTuple, get_args
 
 import logging
 
@@ -41,10 +41,6 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
         "flash_speculative",
         "flash_speculative_draft_model",
         "flash_speculative_tokens",
-        # Standalone speculative decoding
-        "speculative",
-        "speculative_draft_model",
-        "speculative_tokens",
         # DFlash block-diffusion speculative decoding
         "dflash",
         "dflash_draft_model",
@@ -59,6 +55,17 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
 )
 
 
+# Keys that were once experimental but have since been promoted out of the
+# ``experimental`` block. The dict is kept for forward compatibility (a
+# future promotion may rename the key); today every entry maps to itself
+# because the keys' names are unchanged — only their location moved.
+PROMOTED_EXPERIMENTAL_KEYS: dict[str, str] = {
+    "speculative": "speculative",
+    "speculative_draft_model": "speculative_draft_model",
+    "speculative_tokens": "speculative_tokens",
+}
+
+
 def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
     """Validate per-model experimental overrides.
 
@@ -68,6 +75,25 @@ def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
     (all fields present), so pydantic-settings env var resolution cannot
     override any values or produce confusing errors for unrelated fields.
     """
+    promoted = set(overrides) & PROMOTED_EXPERIMENTAL_KEYS.keys()
+    if promoted:
+        renamed = sorted(k for k in promoted if k != PROMOTED_EXPERIMENTAL_KEYS[k])
+        unchanged = sorted(k for k in promoted if k == PROMOTED_EXPERIMENTAL_KEYS[k])
+        parts: list[str] = []
+        if unchanged:
+            parts.append(
+                "move " + ", ".join(repr(k) for k in unchanged) + " to the top level"
+            )
+        if renamed:
+            renames = ", ".join(
+                f"{k!r} → top-level {PROMOTED_EXPERIMENTAL_KEYS[k]!r}" for k in renamed
+            )
+            parts.append(f"rename {renames}")
+        raise ValueError(
+            "These keys have been promoted out of 'experimental': "
+            + "; ".join(parts)
+            + ". Update the models.json entry accordingly."
+        )
     unknown = set(overrides) - PER_MODEL_EXPERIMENTAL_KEYS
     if unknown:
         raise ValueError(
@@ -170,6 +196,20 @@ def _validate_keep_alive(value: str) -> None:
 _KNOWN_CONFIG_KEYS: frozenset[str] = frozenset()  # set after ModelConfig is defined
 
 
+class SpeculativeConfig(NamedTuple):
+    """Resolved speculative decoding config for a single model.
+
+    Returned by ``ModelConfig.resolved_speculative()`` and threaded
+    through the model loader. Using a ``NamedTuple`` (rather than a
+    bare 3-tuple) keeps positional unpack ergonomics for tests while
+    making call-site access self-documenting.
+    """
+
+    enabled: bool
+    draft_model: str | None
+    num_tokens: int
+
+
 @dataclass
 class ModelConfig:
     """Per-model configuration resolved from models.json."""
@@ -188,8 +228,64 @@ class ModelConfig:
     #: (skip lock-boundary sync entirely). None means use the global
     #: ``settings.sync_mode``.
     sync_mode: SyncMode | None = None
+    #: Per-model speculative decoding overrides. ``None`` means inherit the
+    #: global ``Settings.speculative*`` value.
+    speculative: bool | None = None
+    speculative_draft_model: str | None = None
+    speculative_tokens: int | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        # ``from_entry`` already validates JSON inputs, but direct
+        # construction (tests, programmatic callers) bypasses it. Keep
+        # this in lockstep with ``Settings.speculative_tokens``'s
+        # ``Field(gt=0)`` and the empty-string check in ``from_entry``.
+        if self.speculative_tokens is not None and (
+            isinstance(self.speculative_tokens, bool)
+            or not isinstance(self.speculative_tokens, int)
+            or self.speculative_tokens < 1
+        ):
+            raise ValueError(
+                f"'speculative_tokens' must be a positive integer or None, "
+                f"got {self.speculative_tokens!r}"
+            )
+        if (
+            self.speculative_draft_model is not None
+            and not self.speculative_draft_model.strip()
+        ):
+            raise ValueError(
+                "'speculative_draft_model' must be a non-empty HuggingFace path or None"
+            )
+
+    def resolved_speculative(self) -> SpeculativeConfig:
+        """Resolve speculative config: per-model overrides global settings.
+
+        Returns a ``SpeculativeConfig(enabled, draft_model, num_tokens)``.
+        When ``enabled`` is ``False`` the draft slot is forced to
+        ``None`` even if a global ``speculative_draft_model`` is
+        configured — callers should never see a non-None draft for a
+        disabled model. The token count is always returned so callers
+        that flip enabled at runtime keep a sensible default.
+        """
+        from olmlx.config import settings
+
+        enabled = (
+            self.speculative if self.speculative is not None else settings.speculative
+        )
+        tokens = (
+            self.speculative_tokens
+            if self.speculative_tokens is not None
+            else settings.speculative_tokens
+        )
+        if not enabled:
+            return SpeculativeConfig(False, None, tokens)
+        draft = (
+            self.speculative_draft_model
+            if self.speculative_draft_model is not None
+            else settings.speculative_draft_model
+        )
+        return SpeculativeConfig(True, draft, tokens)
 
     @classmethod
     def from_entry(cls, entry: str | dict) -> ModelConfig:
@@ -232,6 +328,44 @@ class ModelConfig:
                 if sync_mode_raw is not None
                 else None
             )
+            speculative_raw = entry.get("speculative")
+            if speculative_raw is not None and not isinstance(speculative_raw, bool):
+                raise ValueError(
+                    f"'speculative' must be a bool, got {speculative_raw!r}"
+                )
+            speculative = speculative_raw
+
+            speculative_draft_model_raw = entry.get("speculative_draft_model")
+            if speculative_draft_model_raw is not None:
+                if not isinstance(speculative_draft_model_raw, str):
+                    raise ValueError(
+                        f"'speculative_draft_model' must be a string, "
+                        f"got {speculative_draft_model_raw!r}"
+                    )
+                if not speculative_draft_model_raw.strip():
+                    # Empty/whitespace-only would slip past the load
+                    # check and surface as the misleading "draft model
+                    # not set" error. Reject it at parse time.
+                    raise ValueError(
+                        "'speculative_draft_model' must be a non-empty "
+                        "HuggingFace path; use ``null`` to inherit from "
+                        "the global setting."
+                    )
+            speculative_draft_model = speculative_draft_model_raw
+
+            speculative_tokens_raw = entry.get("speculative_tokens")
+            if speculative_tokens_raw is not None:
+                if (
+                    isinstance(speculative_tokens_raw, bool)
+                    or not isinstance(speculative_tokens_raw, int)
+                    or speculative_tokens_raw < 1
+                ):
+                    raise ValueError(
+                        f"'speculative_tokens' must be a positive integer, "
+                        f"got {speculative_tokens_raw!r}"
+                    )
+            speculative_tokens = speculative_tokens_raw
+
             extra = {k: v for k, v in entry.items() if k not in _KNOWN_CONFIG_KEYS}
             return cls(
                 hf_path=hf_path,
@@ -241,6 +375,9 @@ class ModelConfig:
                 inference_queue_timeout=inference_queue_timeout,
                 inference_timeout=inference_timeout,
                 sync_mode=sync_mode,
+                speculative=speculative,
+                speculative_draft_model=speculative_draft_model,
+                speculative_tokens=speculative_tokens,
                 _extra=extra,
             )
         raise TypeError(
@@ -256,6 +393,9 @@ class ModelConfig:
             and self.inference_queue_timeout is None
             and self.inference_timeout is None
             and self.sync_mode is None
+            and self.speculative is None
+            and self.speculative_draft_model is None
+            and self.speculative_tokens is None
             and not self._extra
         ):
             return self.hf_path
@@ -273,6 +413,12 @@ class ModelConfig:
             result["inference_timeout"] = self.inference_timeout
         if self.sync_mode is not None:
             result["sync_mode"] = self.sync_mode
+        if self.speculative is not None:
+            result["speculative"] = self.speculative
+        if self.speculative_draft_model is not None:
+            result["speculative_draft_model"] = self.speculative_draft_model
+        if self.speculative_tokens is not None:
+            result["speculative_tokens"] = self.speculative_tokens
         # Filter known keys defensively — from_entry() already excludes them,
         # but _extra can be set directly via ModelConfig construction.
         result.update(
