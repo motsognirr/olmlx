@@ -29,6 +29,7 @@ def is_moe_model(model_path: str | Path) -> bool:
         (config.get("n_routed_experts") or 0) > 1
         or (config.get("num_local_experts") or 0) > 1
         or (config.get("num_experts") or 0) > 1
+        or (config.get("moe_num_experts") or 0) > 1
     )
 
 

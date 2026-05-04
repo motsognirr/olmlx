@@ -72,6 +72,18 @@ class TestIsMoeModel:
 
         assert is_moe_model(tmp_path) is False
 
+    def test_step3p5_moe_detected(self, tmp_path):
+        """Step-3.5 uses 'moe_num_experts' instead of the other aliases."""
+        from olmlx.engine.flash.moe_prepare import is_moe_model
+
+        config = {
+            "model_type": "step3p5",
+            "moe_num_experts": 288,
+            "hidden_size": 4096,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert is_moe_model(tmp_path) is True
+
 
 class TestPrepareMoeForFlash:
     def test_full_preparation(self, tmp_path):
