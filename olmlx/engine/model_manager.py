@@ -18,7 +18,7 @@ import mlx.core as mx
 
 from olmlx.config import SyncMode, experimental as global_experimental
 from olmlx.config import resolve_experimental, settings
-from olmlx.engine.registry import ModelRegistry
+from olmlx.engine.registry import ModelRegistry, SpeculativeConfig
 from olmlx.utils import memory as memory_utils
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
 
@@ -1440,7 +1440,7 @@ class ModelManager:
         self,
         target_model: Any,
         hf_path: str,
-        spec_config: tuple[bool, str | None, int],
+        spec_config: SpeculativeConfig,
         *,
         is_vlm: bool = False,
     ) -> Any:
@@ -1453,13 +1453,14 @@ class ModelManager:
         """
         from olmlx.engine.speculative import SpeculativeDecoder
 
-        spec_enabled, draft_model_path, num_tokens = spec_config
         # Hard guard rather than assert — assert is elided under
         # ``python -O``, and this invariant must hold in production too.
-        if not spec_enabled:
+        if not spec_config.enabled:
             raise RuntimeError(
-                "_load_speculative_decoder called with spec_config[0]=False"
+                "_load_speculative_decoder called with spec_config.enabled=False"
             )
+        draft_model_path = spec_config.draft_model
+        num_tokens = spec_config.num_tokens
         if not draft_model_path:
             raise ValueError(
                 "speculative requires speculative_draft_model to be set "
@@ -1704,16 +1705,16 @@ class ModelManager:
         hf_path: str,
         *,
         model_exp: Any = None,
-        spec_config: tuple[bool, str | None, int] | None = None,
+        spec_config: SpeculativeConfig | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
 
         *model_exp* is the resolved ExperimentalSettings for this model.
         Falls back to global defaults if not provided.
 
-        *spec_config* is the resolved speculative config tuple
-        ``(enabled, draft_model, num_tokens)`` (per-model overrides applied).
-        Falls back to global ``Settings`` values when ``None``.
+        *spec_config* is the resolved ``SpeculativeConfig`` (per-model
+        overrides applied). Falls back to global ``Settings`` values
+        when ``None``.
 
         Returns (model, tokenizer, is_vlm, caps, speculative_decoder).
         """
@@ -1728,12 +1729,12 @@ class ModelManager:
             # the draft slot when speculative is disabled so callers
             # never see a non-None draft on a disabled tuple.
             draft = _settings.speculative_draft_model if _settings.speculative else None
-            spec_config = (
+            spec_config = SpeculativeConfig(
                 _settings.speculative,
                 draft,
                 _settings.speculative_tokens,
             )
-        spec_enabled = spec_config[0]
+        spec_enabled = spec_config.enabled
 
         # Ensure model is downloaded to the store
         load_path: str = hf_path
@@ -1848,7 +1849,7 @@ class ModelManager:
         self,
         hf_path: str,
         model_exp: Any = None,
-        spec_config: tuple[bool, str | None, int] | None = None,
+        spec_config: SpeculativeConfig | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 

@@ -427,6 +427,8 @@ Real-world speedup typically lands between **1.4x and 2x** on Apple Silicon for 
 
 The settings have been promoted out of `experimental`. The new env vars are `OLMLX_SPECULATIVE`, `OLMLX_SPECULATIVE_DRAFT_MODEL`, and `OLMLX_SPECULATIVE_TOKENS`. The legacy `OLMLX_EXPERIMENTAL_SPECULATIVE*` names are still honoured for one release: their values are forwarded to the new settings (the new names win when both are set) and a deprecation warning is logged at startup. Per-model `models.json` entries that previously placed these keys under `"experimental": {...}` now go at the top level — loading an old config raises a clear migration error pointing at the new location.
 
+> **Edge case during the deprecation window:** the legacy forwarder cannot tell "field was never set" from "field was explicitly set to its default value (e.g. `OLMLX_SPECULATIVE=false`) via a `.env` file." If you have such an explicit-default `.env` opt-out **and** the old `OLMLX_EXPERIMENTAL_SPECULATIVE*` still set in your shell, the legacy value will overwrite the `.env` value — verify the per-field `Forwarding legacy …` warnings at startup, or simply remove the legacy shell vars before upgrading.
+
 ## LLM in a Flash (Experimental)
 
 Run models larger than available GPU memory by keeping only active neurons in RAM and loading the rest from SSD on demand.

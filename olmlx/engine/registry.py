@@ -8,7 +8,7 @@ import threading
 import dataclasses
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any, NamedTuple, get_args
 
 import logging
 
@@ -196,6 +196,20 @@ def _validate_keep_alive(value: str) -> None:
 _KNOWN_CONFIG_KEYS: frozenset[str] = frozenset()  # set after ModelConfig is defined
 
 
+class SpeculativeConfig(NamedTuple):
+    """Resolved speculative decoding config for a single model.
+
+    Returned by ``ModelConfig.resolved_speculative()`` and threaded
+    through the model loader. Using a ``NamedTuple`` (rather than a
+    bare 3-tuple) keeps positional unpack ergonomics for tests while
+    making call-site access self-documenting.
+    """
+
+    enabled: bool
+    draft_model: str | None
+    num_tokens: int
+
+
 @dataclass
 class ModelConfig:
     """Per-model configuration resolved from models.json."""
@@ -244,39 +258,34 @@ class ModelConfig:
                 "'speculative_draft_model' must be a non-empty HuggingFace path or None"
             )
 
-    def resolved_speculative(self) -> tuple[bool, str | None, int]:
+    def resolved_speculative(self) -> SpeculativeConfig:
         """Resolve speculative config: per-model overrides global settings.
 
-        Returns ``(enabled, draft_model, tokens)``. When ``enabled`` is
-        ``False`` the draft slot is forced to ``None`` even if a global
-        ``speculative_draft_model`` is configured — callers should never
-        see a non-None draft for a disabled model. The token count is
-        always returned so callers that flip enabled at runtime keep a
-        sensible default.
+        Returns a ``SpeculativeConfig(enabled, draft_model, num_tokens)``.
+        When ``enabled`` is ``False`` the draft slot is forced to
+        ``None`` even if a global ``speculative_draft_model`` is
+        configured — callers should never see a non-None draft for a
+        disabled model. The token count is always returned so callers
+        that flip enabled at runtime keep a sensible default.
         """
         from olmlx.config import settings
 
         enabled = (
             self.speculative if self.speculative is not None else settings.speculative
         )
-        if not enabled:
-            tokens = (
-                self.speculative_tokens
-                if self.speculative_tokens is not None
-                else settings.speculative_tokens
-            )
-            return (False, None, tokens)
-        draft = (
-            self.speculative_draft_model
-            if self.speculative_draft_model is not None
-            else settings.speculative_draft_model
-        )
         tokens = (
             self.speculative_tokens
             if self.speculative_tokens is not None
             else settings.speculative_tokens
         )
-        return (True, draft, tokens)
+        if not enabled:
+            return SpeculativeConfig(False, None, tokens)
+        draft = (
+            self.speculative_draft_model
+            if self.speculative_draft_model is not None
+            else settings.speculative_draft_model
+        )
+        return SpeculativeConfig(True, draft, tokens)
 
     @classmethod
     def from_entry(cls, entry: str | dict) -> ModelConfig:

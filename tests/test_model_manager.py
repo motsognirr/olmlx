@@ -15,6 +15,7 @@ from olmlx.engine.model_manager import (
     ModelManager,
     parse_keep_alive,
 )
+from olmlx.engine.registry import SpeculativeConfig
 from olmlx.engine.template_caps import TemplateCaps
 
 
@@ -2260,7 +2261,7 @@ class TestSpeculativeLoading:
         monkeypatch.setitem(__import__("sys").modules, "mlx_lm", mock_mlx_lm)
 
         model_exp = ExperimentalSettings(_env_file=None)
-        spec_config = (True, "test/draft-model", 5)
+        spec_config = SpeculativeConfig(True, "test/draft-model", 5)
 
         model, tok, is_vlm, caps_out, decoder = manager._load_model(
             "test/target-model", model_exp=model_exp, spec_config=spec_config
@@ -2299,7 +2300,7 @@ class TestSpeculativeLoading:
         monkeypatch.setitem(__import__("sys").modules, "mlx_lm", mock_mlx_lm)
 
         model_exp = ExperimentalSettings(_env_file=None)
-        spec_config = (True, "test/draft-model", 4)
+        spec_config = SpeculativeConfig(True, "test/draft-model", 4)
 
         with pytest.raises(ValueError, match="vocab_size"):
             manager._load_model(
@@ -2324,7 +2325,7 @@ class TestSpeculativeLoading:
         monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
 
         model_exp = ExperimentalSettings(_env_file=None)
-        spec_config = (True, None, 4)
+        spec_config = SpeculativeConfig(True, None, 4)
 
         with pytest.raises(ValueError, match="speculative_draft_model"):
             manager._load_model(
@@ -2358,7 +2359,7 @@ class TestSpeculativeLoading:
         )
 
         model_exp = ExperimentalSettings(_env_file=None)
-        spec_config = (True, "test/draft", 4)
+        spec_config = SpeculativeConfig(True, "test/draft", 4)
 
         with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
             result = manager._load_model(
@@ -2395,7 +2396,7 @@ class TestSpeculativeLoading:
         )
 
         model_exp = ExperimentalSettings(_env_file=None)
-        spec_config = (True, "test/draft", 4)
+        spec_config = SpeculativeConfig(True, "test/draft", 4)
 
         with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
             model, tokenizer, is_vlm, caps, decoder = manager._load_model(
