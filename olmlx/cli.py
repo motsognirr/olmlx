@@ -134,6 +134,50 @@ _LEGACY_SPECULATIVE_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], .
 )
 
 
+def _legacy_speculative_values_in_dotenv() -> dict[str, str]:
+    """Return ``{name: value}`` for any ``_DEPRECATED_SPECULATIVE_ENV_VARS``
+    found in the project ``.env`` file.
+
+    ``Settings.model_config`` declares ``env_file=".env"`` (cwd-relative);
+    pydantic-settings reads it into Settings without touching
+    ``os.environ``, so a shell-only scan would miss legacy values in the
+    file. The format accepted is a subset of pydantic-settings' own
+    ``.env`` parser: ``KEY=value`` lines (optionally ``export KEY=...``),
+    with ``#`` comments and blank lines ignored, and surrounding single
+    or double quotes stripped from the value.
+    """
+    dotenv_path = Path(".env")
+    try:
+        text = dotenv_path.read_text()
+    except (FileNotFoundError, OSError):
+        return {}
+    found: dict[str, str] = {}
+    legacy = set(_DEPRECATED_SPECULATIVE_ENV_VARS)
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        value = value.strip()
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+        if key in legacy and key not in found:
+            found[key] = value
+    return found
+
+
+def _legacy_speculative_keys_in_dotenv() -> list[str]:
+    """Wrapper that returns just the keys (for the deprecation banner)."""
+    return list(_legacy_speculative_values_in_dotenv())
+
+
 def _forward_legacy_speculative_env(_settings) -> None:
     """Apply legacy env var values to the new Settings when the new env
     var is unset. Logs and swallows parse errors per-field so a single
@@ -146,8 +190,11 @@ def _forward_legacy_speculative_env(_settings) -> None:
     """
     from olmlx.config import Settings
 
+    dotenv_values = _legacy_speculative_values_in_dotenv()
     for legacy, new, attr, parse in _LEGACY_SPECULATIVE_FORWARD:
-        legacy_val = os.environ.get(legacy)
+        # Shell wins over .env if both have the legacy var set, mirroring
+        # pydantic-settings' precedence for the new names.
+        legacy_val = os.environ.get(legacy, dotenv_values.get(legacy))
         if legacy_val is None:
             continue
         if os.environ.get(new) is not None:
@@ -206,10 +253,15 @@ def _apply_serve_overrides(args) -> None:
     from olmlx.config import settings as _settings
 
     # Surface the env-var rename so a user upgrading with the old names
-    # in their shell profile doesn't silently lose speculative decoding —
-    # pydantic-settings drops unknown OLMLX_EXPERIMENTAL_* keys without
-    # warning.
-    stale = [v for v in _DEPRECATED_SPECULATIVE_ENV_VARS if os.environ.get(v)]
+    # in their shell profile or ``.env`` doesn't silently lose
+    # speculative decoding — pydantic-settings drops unknown
+    # OLMLX_EXPERIMENTAL_* keys without warning. We scan both
+    # ``os.environ`` (shell exports) and the ``.env`` file directly,
+    # since pydantic-settings populates Settings from ``.env`` without
+    # touching ``os.environ``.
+    dotenv_legacy = _legacy_speculative_keys_in_dotenv()
+    shell_stale = [v for v in _DEPRECATED_SPECULATIVE_ENV_VARS if os.environ.get(v)]
+    stale = sorted({*shell_stale, *dotenv_legacy})
     if stale:
         logger.warning(
             "Deprecated env vars detected: %s. They will be honoured for "
@@ -256,7 +308,7 @@ def _apply_serve_overrides(args) -> None:
             f"{', '.join(needs_migration)}.",
             file=sys.stderr,
         )
-        sys.exit(2)
+        sys.exit(1)
 
     bad, dormant_drafts, flash_conflicts, global_draft_used = (
         _audit_speculative_config()
@@ -312,7 +364,7 @@ def _apply_serve_overrides(args) -> None:
             "each entry or set OLMLX_SPECULATIVE_DRAFT_MODEL globally.",
             file=sys.stderr,
         )
-        sys.exit(2)
+        sys.exit(1)
 
 
 def _models_with_promoted_keys_in_experimental() -> list[str]:

@@ -427,6 +427,8 @@ Real-world speedup typically lands between **1.4x and 2x** on Apple Silicon for 
 
 The settings have been promoted out of `experimental`. The new env vars are `OLMLX_SPECULATIVE`, `OLMLX_SPECULATIVE_DRAFT_MODEL`, and `OLMLX_SPECULATIVE_TOKENS`. The legacy `OLMLX_EXPERIMENTAL_SPECULATIVE*` names are still honoured for one release: their values are forwarded to the new settings (the new names win when both are set) and a deprecation warning is logged at startup. Per-model `models.json` entries that previously placed these keys under `"experimental": {...}` now go at the top level — loading an old config raises a clear migration error pointing at the new location.
 
+**Important — also rename the keys in your `.env`.** pydantic-settings reads the project's `.env` file to populate `Settings`; if your `.env` still has the old `OLMLX_EXPERIMENTAL_SPECULATIVE*` names, the deprecation banner and per-field forwarder honour them too. Rename the keys in `.env` to the new names; the legacy names are scanned and forwarded for one release only.
+
 **Important — `.env` opt-outs during the deprecation window.** The legacy env-var forwarder cannot distinguish "field was never set" from "field was explicitly written to its schema default in `.env`" (e.g. `OLMLX_SPECULATIVE=false`). If you have an explicit-default `.env` opt-out **and** the old `OLMLX_EXPERIMENTAL_SPECULATIVE*` still set in your shell, the legacy value will silently overwrite the `.env` value — and speculative will be re-enabled despite your `.env` saying otherwise. Two ways to avoid this surprise:
 
 - Remove the legacy `OLMLX_EXPERIMENTAL_SPECULATIVE*` exports from your shell profile before upgrading.

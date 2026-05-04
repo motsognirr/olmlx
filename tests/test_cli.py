@@ -216,6 +216,59 @@ class TestBuildParser:
         # Should not raise SystemExit.
         _apply_serve_overrides(args)
 
+    def test_legacy_dotenv_values_are_forwarded(self, monkeypatch, tmp_path, caplog):
+        """A user with the legacy ``OLMLX_EXPERIMENTAL_SPECULATIVE*`` in
+        their ``.env`` (not in shell) should still see their config
+        forwarded during the deprecation window — pydantic-settings
+        reads ``.env`` without touching ``os.environ``."""
+        import logging
+        import os
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        # Move into tmp_path so the cwd-relative .env scan picks up our
+        # fixture and doesn't see the developer's real .env.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "OLMLX_EXPERIMENTAL_SPECULATIVE=true\n"
+            'OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL="Qwen/Qwen3-0.6B"\n'
+            "OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS=7\n"
+        )
+        # Ensure none of the legacy or new vars are in the shell.
+        for v in (
+            "OLMLX_EXPERIMENTAL_SPECULATIVE",
+            "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL",
+            "OLMLX_EXPERIMENTAL_SPECULATIVE_TOKENS",
+            "OLMLX_SPECULATIVE",
+            "OLMLX_SPECULATIVE_DRAFT_MODEL",
+            "OLMLX_SPECULATIVE_TOKENS",
+        ):
+            monkeypatch.delenv(v, raising=False)
+        # Settings is at default; the .env scan supplies the legacy values.
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(_settings, "speculative_tokens", 4)
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda: ([], [], [], False),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+
+        assert _settings.speculative is True
+        assert _settings.speculative_draft_model == "Qwen/Qwen3-0.6B"
+        assert _settings.speculative_tokens == 7
+        assert "Deprecated env vars detected" in caplog.text
+        # Belt-and-braces: confirm we didn't pollute os.environ.
+        assert os.environ.get("OLMLX_EXPERIMENTAL_SPECULATIVE") is None
+
     def test_apply_serve_overrides_forwards_legacy_env_vars(self, monkeypatch, caplog):
         """Legacy OLMLX_EXPERIMENTAL_SPECULATIVE* values are forwarded to
         the new Settings during the deprecation window so users don't
@@ -460,7 +513,7 @@ class TestBuildParser:
         args = parser.parse_args(["serve"])
         with pytest.raises(SystemExit) as excinfo:
             _apply_serve_overrides(args)
-        assert excinfo.value.code == 2
+        assert excinfo.value.code == 1
 
     def test_apply_serve_overrides_rejects_promoted_keys_in_experimental(
         self, monkeypatch, tmp_path
@@ -492,7 +545,7 @@ class TestBuildParser:
         args = parser.parse_args(["serve"])
         with pytest.raises(SystemExit) as excinfo:
             _apply_serve_overrides(args)
-        assert excinfo.value.code == 2
+        assert excinfo.value.code == 1
 
     def test_apply_serve_overrides_warns_on_global_dormant_draft(
         self, monkeypatch, caplog
