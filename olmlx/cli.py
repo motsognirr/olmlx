@@ -185,13 +185,8 @@ def _legacy_speculative_values_in_dotenv() -> dict[str, str]:
     return found
 
 
-def _legacy_speculative_keys_in_dotenv() -> list[str]:
-    """Wrapper that returns just the keys (for the deprecation banner)."""
-    return list(_legacy_speculative_values_in_dotenv())
-
-
 def _forward_legacy_speculative_env(
-    _settings,
+    settings_obj,
     dotenv_values: dict[str, str] | None = None,
 ) -> None:
     """Apply legacy env var values to the new Settings when the new env
@@ -222,7 +217,7 @@ def _forward_legacy_speculative_env(
             # happens to equal the schema default).
             continue
         field_default = Settings.model_fields[attr].default
-        if getattr(_settings, attr) != field_default:
+        if getattr(settings_obj, attr) != field_default:
             # pydantic-settings already loaded a non-default value into
             # the field (from a ``.env`` file or programmatic write at
             # import time). CLI flags can't be the source here — they
@@ -234,7 +229,7 @@ def _forward_legacy_speculative_env(
             continue
         try:
             value = parse(legacy_val)
-            setattr(_settings, attr, value)
+            setattr(settings_obj, attr, value)
             # Per-field log so the override is visible alongside the
             # bulk deprecation banner. Notable when a ``.env`` file set
             # the new field to its schema default and the legacy shell
@@ -378,10 +373,12 @@ def _apply_serve_overrides(args) -> None:
         logger.warning(
             "The following models combine speculative=true with Flash or "
             "Flash-MoE: %s. Once Flash is prepared and loads, standalone "
-            "speculative decoding is dropped — use the model's "
-            "flash_speculative settings "
-            "(OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_*; flash-speculative "
-            "remains experimental) instead.",
+            "speculative decoding is dropped — use the per-model "
+            "``flash_speculative`` field (or "
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE / "
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL / "
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS) instead. "
+            "Note: flash-speculative is still experimental.",
             ", ".join(flash_conflicts_actionable),
         )
     if bad:
