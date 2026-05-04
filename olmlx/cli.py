@@ -149,12 +149,14 @@ def _forward_legacy_speculative_env(_settings) -> None:
             continue
         field_default = Settings.model_fields[attr].default
         if getattr(_settings, attr) != field_default:
-            # The new value already came from somewhere — .env file,
-            # CLI flag, or programmatic write. Don't override it with
-            # the legacy value. The remaining blind spot is a .env
-            # entry that happens to match the schema default, which
-            # the legacy value would still overwrite — an acceptable
-            # tradeoff during the deprecation window.
+            # pydantic-settings already loaded a non-default value into
+            # the field (from a ``.env`` file or programmatic write at
+            # import time). CLI flags can't be the source here — they
+            # are applied later in ``_apply_serve_overrides``. The
+            # remaining blind spot is a ``.env`` entry that happens to
+            # match the schema default, which the legacy value would
+            # still overwrite — an acceptable tradeoff during the
+            # deprecation window.
             continue
         try:
             value = parse(legacy_val)

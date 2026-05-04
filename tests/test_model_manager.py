@@ -2369,6 +2369,44 @@ class TestSpeculativeLoading:
         assert "OLMLX_SPECULATIVE" in caplog.text
         assert "Flash" in caplog.text
 
+    def test_flash_moe_path_warns_when_standalone_speculative_set(
+        self, monkeypatch, caplog
+    ):
+        """Symmetric to the Flash test: a Flash-MoE model with the
+        standalone speculative flag must log a warning."""
+        import logging
+
+        from olmlx.config import ExperimentalSettings
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-moe")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: True)
+        monkeypatch.setattr(
+            manager, "_flash_moe_dir", lambda hf_path: Path("/tmp/test-moe/flash_moe")
+        )
+        sentinel_load = (object(), object(), False, TemplateCaps())
+        monkeypatch.setattr(
+            manager,
+            "_load_flash_moe_model",
+            lambda hf_path, load_path, flash_moe_dir, *, model_exp: sentinel_load,
+        )
+
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = (True, "test/draft", 4)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            model, tokenizer, is_vlm, caps, decoder = manager._load_model(
+                "test/moe-model", model_exp=model_exp, spec_config=spec_config
+            )
+        # Flash-MoE path returns the sentinel followed by None.
+        assert (model, tokenizer, is_vlm, caps) == sentinel_load
+        assert decoder is None
+        assert "OLMLX_SPECULATIVE" in caplog.text
+        assert "Flash-MoE" in caplog.text
+
 
 class TestDFlashLoading:
     """Tests for dflash decoder loading in _load_model."""

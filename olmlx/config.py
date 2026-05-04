@@ -48,8 +48,11 @@ class Settings(BaseSettings):
 
     # Speculative decoding (works with any model, not just Flash).
     # Per-model overrides live on ``ModelConfig`` in ``olmlx.engine.registry``.
+    # ``min_length=1`` rejects ``OLMLX_SPECULATIVE_DRAFT_MODEL=""`` at parse
+    # time so the load path doesn't surface a misleading "draft not set"
+    # error for an empty string.
     speculative: bool = False
-    speculative_draft_model: str | None = None
+    speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
     @field_validator("anthropic_models")

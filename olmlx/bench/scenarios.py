@@ -83,12 +83,16 @@ def _requires_flash_moe(model_path: Path) -> str | None:
 def _requires_speculative_draft(_model_path: Path) -> str | None:
     """Skip if no draft model is configured for speculative decoding.
 
-    The bench worker reads ``OLMLX_SPECULATIVE_DRAFT_MODEL`` from the
-    forwarded parent env. The legacy ``OLMLX_EXPERIMENTAL_*`` name is
-    not honoured anymore — accepting it here would let the scenario run
-    and then fail at model load.
+    The bench worker inherits the parent environment, so either the
+    new ``OLMLX_SPECULATIVE_DRAFT_MODEL`` or the legacy
+    ``OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL`` name is enough —
+    ``_apply_serve_overrides`` in the worker will forward the legacy
+    value during the deprecation window. Accept either so users on
+    the old name during migration can still run the scenario.
     """
-    if os.environ.get("OLMLX_SPECULATIVE_DRAFT_MODEL"):
+    if os.environ.get("OLMLX_SPECULATIVE_DRAFT_MODEL") or os.environ.get(
+        "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL"
+    ):
         return None
     return (
         "Set OLMLX_SPECULATIVE_DRAFT_MODEL to a draft model HF path "

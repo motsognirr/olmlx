@@ -195,6 +195,14 @@ class TestSpeculativeConfig:
         with pytest.raises(ValidationError):
             Settings(speculative_tokens=0, _env_file=None)
 
+    def test_speculative_draft_model_rejects_empty_string(self, monkeypatch):
+        """``OLMLX_SPECULATIVE_DRAFT_MODEL=""`` slips past a ``str | None``
+        check; ``Field(min_length=1)`` blocks it at parse time so the
+        load path doesn't surface a misleading "draft not set" error."""
+        monkeypatch.setenv("OLMLX_SPECULATIVE_DRAFT_MODEL", "")
+        with pytest.raises(ValidationError):
+            Settings()
+
     def test_model_config_speculative_tokens_validated_on_construct(self):
         """Direct ModelConfig construction must enforce the >=1 invariant."""
         from olmlx.engine.registry import ModelConfig
