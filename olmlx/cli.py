@@ -1691,10 +1691,13 @@ def _non_empty_str(value: str) -> str:
     """argparse ``type`` validator that mirrors ``Field(min_length=1)``
     on the corresponding Settings field. Without it, ``--flag ""``
     propagates an empty string into Settings and surfaces as an
-    unhandled ``ValidationError`` traceback at startup."""
-    if not value.strip():
+    unhandled ``ValidationError`` traceback at startup. Surrounding
+    whitespace is stripped so that ``--flag " hf/path "`` doesn't
+    later fail with a confusing path-not-found error."""
+    stripped = value.strip()
+    if not stripped:
         raise argparse.ArgumentTypeError("value must be a non-empty string")
-    return value
+    return stripped
 
 
 def cmd_bench_leaderboard(args):

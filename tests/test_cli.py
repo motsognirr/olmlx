@@ -197,6 +197,17 @@ class TestBuildParser:
         captured = capsys.readouterr()
         assert "non-empty" in captured.err
 
+    def test_serve_draft_model_strips_whitespace(self):
+        """A value like ``" hf/path "`` should be accepted but stripped, so
+        Settings doesn't end up with a path that has leading/trailing
+        spaces (which would later fail with a confusing not-found
+        error at model-load time)."""
+        parser = build_parser()
+        args = parser.parse_args(
+            ["serve", "--speculative-draft-model", "  Qwen/Qwen3-0.6B  "]
+        )
+        assert args.speculative_draft_model == "Qwen/Qwen3-0.6B"
+
     def test_apply_serve_overrides_accepts_global_no_draft_when_per_model_supplies(
         self, monkeypatch, tmp_path
     ):
