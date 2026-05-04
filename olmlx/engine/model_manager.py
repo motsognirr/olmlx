@@ -1723,17 +1723,14 @@ class ModelManager:
 
             model_exp = experimental
         if spec_config is None:
-            from olmlx.config import settings as _settings
+            # Delegate to the canonical resolution path so this fallback
+            # can't drift from ``ModelConfig.resolved_speculative()``.
+            # An empty ``ModelConfig`` resolves entirely from global
+            # ``Settings``, which is what we want when no ModelConfig
+            # is passed in.
+            from olmlx.engine.registry import ModelConfig
 
-            # Mirror ``ModelConfig.resolved_speculative()``: zero out
-            # the draft slot when speculative is disabled so callers
-            # never see a non-None draft on a disabled tuple.
-            draft = _settings.speculative_draft_model if _settings.speculative else None
-            spec_config = SpeculativeConfig(
-                _settings.speculative,
-                draft,
-                _settings.speculative_tokens,
-            )
+            spec_config = ModelConfig(hf_path=hf_path).resolved_speculative()
         spec_enabled = spec_config.enabled
 
         # Ensure model is downloaded to the store
