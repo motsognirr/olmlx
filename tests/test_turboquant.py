@@ -930,72 +930,66 @@ class TestMakeTurboQuantCache:
 
 
 class TestKvCacheQuantConfig:
-    """Tests for the kv_cache_quant experimental setting."""
+    """Tests for the kv_cache_quant setting (now on Settings, not ExperimentalSettings)."""
 
-    def test_default_is_none(self):
-        from olmlx.config import ExperimentalSettings
+    def test_default_is_none(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_KV_CACHE_QUANT", raising=False)
+        from olmlx.config import Settings
 
-        s = ExperimentalSettings(
-            _env_file=None,
-            **{
-                k: v.default
-                for k, v in ExperimentalSettings.model_fields.items()
-                if v.default is not None and k != "kv_cache_quant"
-            },
-        )
+        s = Settings(_env_file=None)
         assert s.kv_cache_quant is None
 
     def test_turboquant_4(self, monkeypatch):
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", "turboquant:4")
-        from olmlx.config import ExperimentalSettings
+        monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "turboquant:4")
+        from olmlx.config import Settings
 
-        s = ExperimentalSettings(_env_file=None)
+        s = Settings(_env_file=None)
         assert s.kv_cache_quant == "turboquant:4"
 
     def test_turboquant_2(self, monkeypatch):
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", "turboquant:2")
-        from olmlx.config import ExperimentalSettings
+        monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "turboquant:2")
+        from olmlx.config import Settings
 
-        s = ExperimentalSettings(_env_file=None)
+        s = Settings(_env_file=None)
         assert s.kv_cache_quant == "turboquant:2"
 
     def test_invalid_bits_rejected(self, monkeypatch):
         """Unsupported bit-width should fail at config validation time."""
         from pydantic import ValidationError
 
-        from olmlx.config import ExperimentalSettings
-
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", "turboquant:3")
+        monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "turboquant:3")
         with pytest.raises(ValidationError):
-            ExperimentalSettings(_env_file=None)
+            from olmlx.config import Settings
+
+            Settings(_env_file=None)
 
     def test_missing_bits_rejected(self, monkeypatch):
         """Malformed value without bits should fail at config validation."""
         from pydantic import ValidationError
 
-        from olmlx.config import ExperimentalSettings
-
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", "turboquant:")
+        monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "turboquant:")
         with pytest.raises(ValidationError):
-            ExperimentalSettings(_env_file=None)
+            from olmlx.config import Settings
+
+            Settings(_env_file=None)
 
     def test_unknown_method_rejected(self, monkeypatch):
         from pydantic import ValidationError
 
-        from olmlx.config import ExperimentalSettings
-
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", "foo:4")
+        monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "foo:4")
         with pytest.raises(ValidationError):
-            ExperimentalSettings(_env_file=None)
+            from olmlx.config import Settings
+
+            Settings(_env_file=None)
 
     def test_bare_string_rejected(self, monkeypatch):
         from pydantic import ValidationError
 
-        from olmlx.config import ExperimentalSettings
-
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT", "turboquant")
+        monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "turboquant")
         with pytest.raises(ValidationError):
-            ExperimentalSettings(_env_file=None)
+            from olmlx.config import Settings
+
+            Settings(_env_file=None)
 
 
 # ---------------------------------------------------------------------------

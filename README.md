@@ -332,6 +332,7 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_SPECULATIVE` | `false` | Enable speculative decoding with a draft model (also `--speculative` on `olmlx serve`) |
 | `OLMLX_SPECULATIVE_DRAFT_MODEL` | `None` | HuggingFace path of the draft model (also `--speculative-draft-model`) |
 | `OLMLX_SPECULATIVE_TOKENS` | `4` | Candidate tokens generated per verification step (also `--speculative-tokens`) |
+| `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), or `spectral:2` (also `--kv-cache-quant`) |
 
 ### Flash inference settings (experimental)
 
@@ -346,12 +347,6 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL` | `None` | Draft model name or HuggingFace path |
 | `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS` | `4` | Candidate tokens per speculative step |
 | `OLMLX_EXPERIMENTAL_FLASH_PREFETCH` | `false` | Enable speculative neuron prefetching |
-
-### TurboQuant KV cache settings (experimental)
-
-| Variable | Default | Description |
-|---|---|---|
-| `OLMLX_EXPERIMENTAL_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), or `spectral:2` |
 
 ### Flash-MoE settings (experimental)
 
@@ -480,10 +475,10 @@ Compress the KV cache ~4-8x using TurboQuant quantization, enabling longer conte
 
 ```bash
 # 4-bit (~3.9x compression)
-OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:4
+OLMLX_KV_CACHE_QUANT=turboquant:4
 
 # 2-bit (~7.5x compression, lower quality)
-OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:2
+OLMLX_KV_CACHE_QUANT=turboquant:2
 ```
 
 **SpectralQuant** improves on TurboQuant with data-driven eigenvector rotations and non-uniform bit allocation (~19% better compression, +2.6pp cosine similarity). Requires one-time calibration:
@@ -493,7 +488,7 @@ OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=turboquant:2
 olmlx spectral prepare <model>
 
 # Use spectral quant
-OLMLX_EXPERIMENTAL_KV_CACHE_QUANT=spectral:4
+OLMLX_KV_CACHE_QUANT=spectral:4
 ```
 
 Note: TurboQuant and SpectralQuant are incompatible with disk cache offload.

@@ -154,10 +154,7 @@ class TestDistributedScenarios:
     def test_distributed_tq4_has_both_overrides(self):
         dist = get_scenarios(["distributed+tq4"])[0]
         assert dist.env_overrides.get("OLMLX_EXPERIMENTAL_DISTRIBUTED") == "true"
-        assert (
-            dist.env_overrides.get("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT")
-            == "turboquant:4"
-        )
+        assert dist.env_overrides.get("OLMLX_KV_CACHE_QUANT") == "turboquant:4"
 
     def test_distributed_skips_without_hostfile(self, tmp_path, monkeypatch):
         monkeypatch.setattr(

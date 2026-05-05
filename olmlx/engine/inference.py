@@ -1635,7 +1635,7 @@ def _make_spectral_prompt_cache(
 
 
 def _parse_kv_cache_quant(spec: str) -> tuple[str, int]:
-    """Split an `OLMLX_EXPERIMENTAL_KV_CACHE_QUANT` value like `"spectral:4"`
+    """Split an `OLMLX_KV_CACHE_QUANT` value like `"spectral:4"`
     into `(method, bits)`.  Format is validated at config load time."""
     method, bits_str = spec.split(":")
     return method, int(bits_str)

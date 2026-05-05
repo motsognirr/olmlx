@@ -317,13 +317,15 @@ class TestModelConfig:
         """Dict entries in models.json become ModelConfig with full config."""
         entry = {
             "hf_path": "Qwen/Qwen3-8B-MLX",
-            "experimental": {"flash": True, "kv_cache_quant": "turboquant:4"},
+            "experimental": {"flash": True},
+            "kv_cache_quant": "turboquant:4",
             "options": {"temperature": 0.7, "num_predict": 2048},
             "keep_alive": "30m",
         }
         mc = ModelConfig.from_entry(entry)
         assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
-        assert mc.experimental == {"flash": True, "kv_cache_quant": "turboquant:4"}
+        assert mc.experimental == {"flash": True}
+        assert mc.kv_cache_quant == "turboquant:4"
         assert mc.options == {"temperature": 0.7, "num_predict": 2048}
         assert mc.keep_alive == "30m"
 
@@ -515,15 +517,33 @@ class TestModelConfig:
                 }
             )
 
-    def test_invalid_kv_cache_quant_rejected(self):
-        """Invalid kv_cache_quant value is rejected."""
-        with pytest.raises(ValueError, match="kv_cache_quant"):
+    def test_kv_cache_quant_in_experimental_rejected(self):
+        """kv_cache_quant in the experimental block is rejected as a promoted key."""
+        with pytest.raises(ValueError, match="promoted out of 'experimental'"):
             ModelConfig.from_entry(
                 {
                     "hf_path": "org/model",
                     "experimental": {"kv_cache_quant": "bad_value"},
                 }
             )
+
+    def test_resolved_kv_cache_quant_falls_back_to_global(self, monkeypatch):
+        """When per-model kv_cache_quant is None, the global setting is used."""
+        from olmlx.config import settings as _settings
+        from olmlx.engine.registry import ModelConfig
+
+        monkeypatch.setattr(_settings, "kv_cache_quant", "turboquant:4")
+        mc = ModelConfig(hf_path="org/model", kv_cache_quant=None)
+        assert mc.resolved_kv_cache_quant() == "turboquant:4"
+
+    def test_resolved_kv_cache_quant_per_model_overrides_global(self, monkeypatch):
+        """Per-model kv_cache_quant takes precedence over the global setting."""
+        from olmlx.config import settings as _settings
+        from olmlx.engine.registry import ModelConfig
+
+        monkeypatch.setattr(_settings, "kv_cache_quant", "turboquant:4")
+        mc = ModelConfig(hf_path="org/model", kv_cache_quant="turboquant:2")
+        assert mc.resolved_kv_cache_quant() == "turboquant:2"
 
 
 class TestRegistryModelConfig:
@@ -567,7 +587,7 @@ class TestRegistryModelConfig:
         config = {
             "qwen3:latest": {
                 "hf_path": "Qwen/Qwen3-8B-MLX",
-                "experimental": {"kv_cache_quant": "turboquant:4"},
+                "kv_cache_quant": "turboquant:4",
                 "keep_alive": "30m",
             }
         }
@@ -578,7 +598,7 @@ class TestRegistryModelConfig:
         reg.load()
         result = reg.resolve("qwen3")
         assert result.hf_path == "Qwen/Qwen3-8B-MLX"
-        assert result.experimental == {"kv_cache_quant": "turboquant:4"}
+        assert result.kv_cache_quant == "turboquant:4"
         assert result.keep_alive == "30m"
 
     def test_resolve_hf_path_passthrough_returns_model_config(
@@ -620,11 +640,12 @@ class TestRegistryModelConfig:
         }
 
     def test_save_preserves_rich_config(self, tmp_path, monkeypatch):
-        """Round-trip: load → save → load preserves experimental overrides."""
+        """Round-trip: load → save → load preserves config including promoted fields."""
         config = {
             "qwen3:latest": {
                 "hf_path": "Qwen/Qwen3-8B-MLX",
-                "experimental": {"flash": True, "kv_cache_quant": "turboquant:4"},
+                "experimental": {"flash": True},
+                "kv_cache_quant": "turboquant:4",
                 "options": {"temperature": 0.7},
             }
         }
@@ -639,7 +660,8 @@ class TestRegistryModelConfig:
         reg2 = ModelRegistry()
         reg2.load()
         qwen = reg2._mappings["qwen3:latest"]
-        assert qwen.experimental == {"flash": True, "kv_cache_quant": "turboquant:4"}
+        assert qwen.experimental == {"flash": True}
+        assert qwen.kv_cache_quant == "turboquant:4"
         assert qwen.options == {"temperature": 0.7}
 
     def test_save_compacts_plain_models(self, tmp_path, monkeypatch):

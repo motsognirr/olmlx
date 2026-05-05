@@ -697,27 +697,27 @@ class TestSpectralConfig:
     """Tests for spectral quant config validation."""
 
     def test_spectral_4_accepted(self):
-        from olmlx.config import ExperimentalSettings
+        from olmlx.config import Settings
 
-        s = ExperimentalSettings(kv_cache_quant="spectral:4")
+        s = Settings(kv_cache_quant="spectral:4", _env_file=None)
         assert s.kv_cache_quant == "spectral:4"
 
     def test_spectral_2_accepted(self):
-        from olmlx.config import ExperimentalSettings
+        from olmlx.config import Settings
 
-        s = ExperimentalSettings(kv_cache_quant="spectral:2")
+        s = Settings(kv_cache_quant="spectral:2", _env_file=None)
         assert s.kv_cache_quant == "spectral:2"
 
     def test_spectral_3_rejected(self):
-        from olmlx.config import ExperimentalSettings
-
         with pytest.raises(Exception):
-            ExperimentalSettings(kv_cache_quant="spectral:3")
+            from olmlx.config import Settings
+
+            Settings(kv_cache_quant="spectral:3", _env_file=None)
 
     def test_turboquant_still_accepted(self):
-        from olmlx.config import ExperimentalSettings
+        from olmlx.config import Settings
 
-        s = ExperimentalSettings(kv_cache_quant="turboquant:4")
+        s = Settings(kv_cache_quant="turboquant:4", _env_file=None)
         assert s.kv_cache_quant == "turboquant:4"
 
     def test_resolve_config_holder_prefers_inner_when_it_has_args(self):

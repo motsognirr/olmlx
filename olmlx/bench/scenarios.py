@@ -155,23 +155,23 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="turboquant-4",
         description="TurboQuant 4-bit KV cache quantization",
-        env_overrides={"OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "turboquant:4"},
+        env_overrides={"OLMLX_KV_CACHE_QUANT": "turboquant:4"},
     ),
     Scenario(
         name="turboquant-2",
         description="TurboQuant 2-bit KV cache quantization",
-        env_overrides={"OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "turboquant:2"},
+        env_overrides={"OLMLX_KV_CACHE_QUANT": "turboquant:2"},
     ),
     Scenario(
         name="spectral-4",
         description="SpectralQuant 4-bit KV cache quantization",
-        env_overrides={"OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "spectral:4"},
+        env_overrides={"OLMLX_KV_CACHE_QUANT": "spectral:4"},
         should_skip=_requires_spectral,
     ),
     Scenario(
         name="spectral-2",
         description="SpectralQuant 2-bit KV cache quantization",
-        env_overrides={"OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "spectral:2"},
+        env_overrides={"OLMLX_KV_CACHE_QUANT": "spectral:2"},
         should_skip=_requires_spectral,
     ),
     Scenario(
@@ -179,7 +179,7 @@ SCENARIOS: list[Scenario] = [
         description="Prompt cache + TurboQuant 4-bit",
         env_overrides={
             "OLMLX_PROMPT_CACHE": "true",
-            "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "turboquant:4",
+            "OLMLX_KV_CACHE_QUANT": "turboquant:4",
         },
     ),
     Scenario(
@@ -193,7 +193,7 @@ SCENARIOS: list[Scenario] = [
         description="Flash inference + TurboQuant 4-bit",
         env_overrides={
             "OLMLX_EXPERIMENTAL_FLASH": "true",
-            "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "turboquant:4",
+            "OLMLX_KV_CACHE_QUANT": "turboquant:4",
         },
         should_skip=_requires_flash,
     ),
@@ -217,7 +217,7 @@ SCENARIOS: list[Scenario] = [
         description="Flash MoE + TurboQuant 4-bit",
         env_overrides={
             "OLMLX_EXPERIMENTAL_FLASH_MOE": "true",
-            "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "turboquant:4",
+            "OLMLX_KV_CACHE_QUANT": "turboquant:4",
         },
         should_skip=_requires_flash_moe,
     ),
@@ -236,7 +236,7 @@ SCENARIOS: list[Scenario] = [
         description="Distributed tensor-parallel + TurboQuant 4-bit",
         env_overrides={
             "OLMLX_EXPERIMENTAL_DISTRIBUTED": "true",
-            "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "turboquant:4",
+            "OLMLX_KV_CACHE_QUANT": "turboquant:4",
         },
         should_skip=_requires_distributed,
         server_mode=True,

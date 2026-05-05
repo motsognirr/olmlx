@@ -97,7 +97,7 @@ class TestRunWorker:
         scenario = Scenario(
             name="tq4",
             description="TurboQuant",
-            env_overrides={"OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "turboquant:4"},
+            env_overrides={"OLMLX_KV_CACHE_QUANT": "turboquant:4"},
         )
 
         captured_env = {}
@@ -118,7 +118,7 @@ class TestRunWorker:
         with patch("olmlx.bench.runner.subprocess.run", side_effect=capture_run):
             _run_worker("model", scenario, [], None)
 
-        assert captured_env.get("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT") == "turboquant:4"
+        assert captured_env.get("OLMLX_KV_CACHE_QUANT") == "turboquant:4"
 
     def test_worker_passes_max_tokens(self):
         """Verify --max-tokens is passed when provided."""
@@ -371,7 +371,7 @@ class TestRunServerScenario:
             description="Distributed",
             env_overrides={
                 "OLMLX_EXPERIMENTAL_DISTRIBUTED": "true",
-                "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT": "turboquant:4",
+                "OLMLX_KV_CACHE_QUANT": "turboquant:4",
             },
             server_mode=True,
         )
@@ -389,7 +389,7 @@ class TestRunServerScenario:
             _run_server_scenario("model", scenario, [], None)
 
         assert captured_env.get("OLMLX_EXPERIMENTAL_DISTRIBUTED") == "true"
-        assert captured_env.get("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT") == "turboquant:4"
+        assert captured_env.get("OLMLX_KV_CACHE_QUANT") == "turboquant:4"
 
 
 class TestRunPromptsOverHttp:
