@@ -1244,42 +1244,31 @@ class ModelManager:
                                 model_type,
                             )
                             return "text"
-                        # mlx-lm has no module for this model_type.  Return
-                        # "unknown" so the caller's fallback chain
-                        # (_try_lm_then_vlm: mlx-lm first, then mlx-vlm)
-                        # gets to try mlx-lm via model_type aliasing
-                        # before reaching mlx-vlm.  If mlx-lm load also
-                        # fails the chain ends in mlx-vlm — the same
-                        # crash this discriminator exists to avert.  This
-                        # branch only defers, not prevents, that crash
-                        # for unknown hybrid families; updating
-                        # _PERSISTABLE_CACHE_CLASSES and this matcher to
-                        # cover new families is required for true
-                        # protection.
-                        logger.warning(
-                            "Hybrid linear-attention VLM '%s' has no mlx-lm "
-                            "module; the mlx-vlm path is known to crash "
-                            "(issue #284). Returning 'unknown'; the "
-                            "fallback chain will try mlx-vlm last and "
-                            "may still crash.",
-                            model_type,
+                        # mlx-lm has no module for this model_type.  The
+                        # mlx-vlm fallback chain is the known-crashing
+                        # path for these models; raise at detection time
+                        # so the user sees a clear load-time error rather
+                        # than a silent Metal stream crash mid-inference.
+                        raise ValueError(
+                            f"Model '{hf_path}' (model_type '{model_type}', "
+                            f"text_config.model_type '{text_model_type}') "
+                            f"uses hybrid linear-attention layers (issue "
+                            f"#284) but no mlx-lm module was found. "
+                            f"Loading through mlx-vlm would crash with a "
+                            f"Metal stream error. Ensure mlx-lm with the "
+                            f"matching text-only module is installed."
                         )
-                        return "unknown"
-                    except ImportError:
-                        # mlx-lm absent or restructured.  Same caveat as
-                        # the no-module branch above: returning "unknown"
-                        # defers the crash through the fallback chain
-                        # rather than averting it.
-                        logger.warning(
-                            "mlx_lm.utils.MODEL_REMAPPING unavailable; "
-                            "cannot route hybrid linear-attention VLM "
-                            "'%s' through the mlx-lm text path "
-                            "(issue #284). Returning 'unknown'; the "
-                            "fallback chain will try mlx-vlm last and "
-                            "may still crash.",
-                            model_type,
-                        )
-                        return "unknown"
+                    except ImportError as exc:
+                        # mlx-lm absent or restructured.  Same reasoning
+                        # as the no-module branch: raise at load time
+                        # rather than defer to a known-broken loader.
+                        raise ValueError(
+                            f"Model '{hf_path}' (model_type '{model_type}') "
+                            f"uses hybrid linear-attention layers (issue "
+                            f"#284) but mlx_lm.utils.MODEL_REMAPPING is "
+                            f"unavailable. Loading through mlx-vlm would "
+                            f"crash with a Metal stream error."
+                        ) from exc
 
             # Verify mlx-vlm can handle it
             try:
@@ -1525,16 +1514,18 @@ class ModelManager:
                 "prompt cache will only be reused for strict-extension turns.",
                 lm.name,
             )
-        # Only describe the cache layout reason when the probe actually
-        # inspected it.  The probe-failure path already emits its own
-        # WARNING above with the real cause; this INFO would otherwise
-        # misattribute the disable to ArraysCache when it was an
-        # exception in make_prompt_cache or the classification helpers.
+        # Only log the layout reason when the probe actually inspected
+        # the cache.  The probe-failure path already emits its own WARNING
+        # above with the real cause.  Message is generic ("hybrid
+        # SSM/ArraysCache or unclassified") because an empty cache_list
+        # also returns False from the persistence check — the message
+        # would otherwise misattribute the disable to ArraysCache when
+        # the layout had nothing to do with it.
         if not lm.supports_cache_persistence and probe_succeeded:
             logger.info(
-                "Model %s uses a non-persistable hybrid cache (ArraysCache, "
-                "gated-delta SSM state); prompt cache will not be stored "
-                "across requests (issue #284).",
+                "Model %s uses a non-persistable cache (hybrid SSM/"
+                "ArraysCache or unclassified); prompt cache will not be "
+                "stored across requests (issue #284).",
                 lm.name,
             )
 
