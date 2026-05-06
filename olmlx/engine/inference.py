@@ -2066,28 +2066,24 @@ async def _kv_cache_preflight_check(
             gen_kwargs.pop("input_ids", None)
             # Re-add cache temporarily so evict_all_to_disk() can persist it.
             # Use cache_read_tokens to match the trimmed KV state.  Issue
-            # #284: skip for non-persistable models — re-storing the cache
-            # would re-introduce the cross-request reuse path the persistence
-            # guard exists to prevent.  Dropping the working reference is
-            # enough to free its memory; the eviction below still runs to
-            # flush any other in-memory entries.  Also clean up any stale
-            # entry from before the persistence guard existed since
-            # _store_prompt_cache_after_generation isn't reached on the
-            # MemoryError path.
-            if had_cache and not lm.supports_cache_persistence:
-                lm.prompt_cache_store.remove(cache_id)
-            if (
-                had_cache
-                and full_prompt_tokens is not None
-                and lm.supports_cache_persistence
-            ):
-                await lm.prompt_cache_store.async_set(
-                    cache_id,
-                    CachedPromptState(
-                        tokens=list(full_prompt_tokens[:cache_read_tokens]),
-                        cache=working,
-                    ),
-                )
+            # #284: for non-persistable models we skip the re-store and
+            # clean up any stale entry instead — re-storing would
+            # re-introduce the cross-request reuse path the persistence
+            # guard exists to prevent, and _store_prompt_cache_after_generation
+            # (which normally cleans up) isn't reached on the MemoryError
+            # path.  Dropping the working reference still frees memory;
+            # the eviction below runs regardless to flush other entries.
+            if had_cache:
+                if not lm.supports_cache_persistence:
+                    lm.prompt_cache_store.remove(cache_id)
+                elif full_prompt_tokens is not None:
+                    await lm.prompt_cache_store.async_set(
+                        cache_id,
+                        CachedPromptState(
+                            tokens=list(full_prompt_tokens[:cache_read_tokens]),
+                            cache=working,
+                        ),
+                    )
             working = None
             await lm.prompt_cache_store.async_evict_all_to_disk()
             gc.collect()

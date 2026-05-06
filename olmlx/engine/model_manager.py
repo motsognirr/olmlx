@@ -630,8 +630,14 @@ class LoadedModel:
     # False for hybrid SSM-style models (ArraysCache layers, e.g. Qwen3.5,
     # Qwen3-Next).  When False, prompt cache state is not persisted across
     # requests because cross-request reuse crashes mlx-lm with a Metal
-    # stream error.  Set by the loader.  Issue #284.
-    supports_cache_persistence: bool = True
+    # stream error.  Set by the loader's _probe_cache_capabilities call.
+    # Issue #284.
+    #
+    # Defaults to False (unsafe-by-default) — unlike supports_cache_trim,
+    # a false-positive here crashes the next request rather than wasting a
+    # trim_prompt_cache() call.  Direct LoadedModel construction must
+    # explicitly opt in if the model's cache layout is known to be safe.
+    supports_cache_persistence: bool = False
     spectral_calibration_dir: Any = None  # Path | None, typed as Any to avoid import
     default_options: dict = field(default_factory=dict)
     inference_queue_timeout: float | None = None
