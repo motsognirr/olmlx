@@ -393,6 +393,48 @@ class TestDetectModelKind:
                 kind = manager._detect_model_kind("test/future_hybrid_vlm")
         assert kind == "unknown"
 
+    def test_hybrid_linear_attention_vlm_uses_text_config_model_type(
+        self, tmp_path, registry, mock_store
+    ):
+        """Issue #284: when the top-level model_type is VLM-specific (e.g.
+        a hypothetical ``qwen3_5_vl``) but ``text_config.model_type`` names
+        the architecture mlx-lm actually has a module for (``qwen3_5``),
+        the lookup should prefer the text_config key.  Otherwise the
+        routing falls through to ``unknown`` and the model fails to load.
+        """
+        config_path = self._make_config(
+            tmp_path,
+            {
+                # Top-level: VLM-specific name with no mlx-lm module.
+                "model_type": "qwen3_5_vl",
+                "vision_config": {"hidden_size": 1024},
+                "text_config": {
+                    # Inner: the architecture name mlx-lm has a module for.
+                    "model_type": "qwen3_5",
+                    "layer_types": ["linear_attention", "full_attention"],
+                },
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec_with_qwen3_5_only(name, *args, **kwargs):
+            if name == "mlx_lm.models.qwen3_5":
+                return object()
+            if name == "mlx_lm.models.qwen3_5_vl":
+                return None  # mlx-lm has no qwen3_5_vl module
+            return real_find_spec(name, *args, **kwargs)
+
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            with patch(
+                "importlib.util.find_spec", side_effect=find_spec_with_qwen3_5_only
+            ):
+                kind = manager._detect_model_kind("test/qwen3_5_vl")
+        assert kind == "text"
+
     def test_hybrid_linear_attention_vlm_returns_unknown_when_mlx_lm_import_fails(
         self, tmp_path, registry, mock_store
     ):
@@ -439,8 +481,21 @@ class TestDetectModelKind:
         )
         manager = self._make_manager(registry, mock_store)
 
+        # Mock find_spec for the mlx-vlm verification block so the test
+        # doesn't depend on the installed mlx-vlm version actually shipping
+        # mlx_vlm.models.qwen2_vl.
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec_with_qwen2_vl(name, *args, **kwargs):
+            if name == "mlx_vlm.models.qwen2_vl":
+                return object()  # truthy sentinel
+            return real_find_spec(name, *args, **kwargs)
+
         with patch("huggingface_hub.hf_hub_download", return_value=config_path):
-            kind = manager._detect_model_kind("test/qwen2_vl")
+            with patch("importlib.util.find_spec", side_effect=find_spec_with_qwen2_vl):
+                kind = manager._detect_model_kind("test/qwen2_vl")
         assert kind == "vlm"
 
 

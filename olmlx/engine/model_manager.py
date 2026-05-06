@@ -225,10 +225,19 @@ def _cache_supports_persistence(cache_list: list) -> bool:
     Models that fail this check still get within-request cache reuse — just
     not the cross-request strict-extension reuse the prompt cache store
     normally provides.
+
+    Walks the MRO so subclasses (e.g. a future ``QuantizedArraysCache``)
+    inherit the non-persistable classification from their base.  Unlike
+    ``_cache_supports_trim`` — where a false-negative falls back gracefully
+    to a full prefill — a false-negative here would crash mlx-lm with a
+    Metal stream error on the next request, so the safer default is to
+    treat anything inheriting from a banned class as non-persistable.
     """
-    return not any(
-        type(layer).__name__ in _NON_PERSISTABLE_CACHE_CLASSES for layer in cache_list
-    )
+    for layer in cache_list:
+        for cls in type(layer).__mro__:
+            if cls.__name__ in _NON_PERSISTABLE_CACHE_CLASSES:
+                return False
+    return True
 
 
 class ModelLoadTimeoutError(TimeoutError):
@@ -1175,7 +1184,13 @@ class ModelManager:
                     try:
                         from mlx_lm.utils import MODEL_REMAPPING as LM_REMAP
 
-                        mapped_lm = LM_REMAP.get(model_type, model_type)
+                        # Hybrid VLMs (Qwen3.5) carry the model architecture
+                        # in text_config.model_type; the top-level model_type
+                        # may be VLM-specific (e.g. "qwen3_5_vl") with no
+                        # mlx-lm module, while text_config.model_type
+                        # ("qwen3_5") does.  Prefer the text_config key.
+                        text_model_type = text_cfg.get("model_type", model_type)
+                        mapped_lm = LM_REMAP.get(text_model_type, text_model_type)
                         if (
                             importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}")
                             is not None

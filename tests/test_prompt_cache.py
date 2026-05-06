@@ -499,6 +499,22 @@ class TestCachePersistenceProbe:
 
         assert _cache_supports_persistence([_FakeArraysCache()]) is False
 
+    def test_arrays_cache_subclass_breaks_persistence(self):
+        """MRO walk catches subclasses (e.g. a future ``QuantizedArraysCache``).
+        The persistence check has no graceful fallback — a missed subclass
+        would crash mlx-lm on the next request — so the safer default is
+        for anything inheriting from a banned class to inherit the
+        classification."""
+        from olmlx.engine.model_manager import _cache_supports_persistence
+
+        class _QuantizedArraysCache(_FakeArraysCache):
+            pass
+
+        # Subclass renamed deliberately to a name not in the allowlist —
+        # it should still match via MRO walk.
+        _QuantizedArraysCache.__name__ = "QuantizedArraysCache"
+        assert _cache_supports_persistence([_QuantizedArraysCache()]) is False
+
 
 class TestNonTrimmableModelSkipsTrim:
     @pytest.mark.asyncio
