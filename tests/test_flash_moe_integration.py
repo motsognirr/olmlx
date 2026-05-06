@@ -72,6 +72,18 @@ class TestIsMoeModel:
 
         assert is_moe_model(tmp_path) is False
 
+    def test_step3p5_moe_detected(self, tmp_path):
+        """Step-3.5 uses 'moe_num_experts' instead of the other aliases."""
+        from olmlx.engine.flash.moe_prepare import is_moe_model
+
+        config = {
+            "model_type": "step3p5",
+            "moe_num_experts": 288,
+            "hidden_size": 4096,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert is_moe_model(tmp_path) is True
+
 
 class TestPrepareMoeForFlash:
     def test_full_preparation(self, tmp_path):
@@ -94,6 +106,34 @@ class TestPrepareMoeForFlash:
         assert config["num_moe_layers"] == 2
         assert config["moe_layer_indices"] == [1, 2]
         assert "prepared_at" in config
+
+    def test_step3p5_moe_num_experts_in_config(self, tmp_path):
+        """Expert count must be read from moe_num_experts when present."""
+        hidden, inter, experts = 64, 32, 6
+        model_dir = _make_synthetic_moe_weights(hidden, inter, experts, 2, 1, tmp_path)
+
+        # Overwrite config to use moe_num_experts (Step-3.5 style)
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "step3p5",
+                    "hidden_size": hidden,
+                    "moe_intermediate_size": inter,
+                    "moe_num_experts": experts,
+                    "num_hidden_layers": 3,
+                    "moe_layers_enum": "1,2",
+                    "num_experts_per_tok": 2,
+                }
+            )
+        )
+
+        from olmlx.engine.flash.moe_prepare import prepare_moe_for_flash
+
+        output_dir = tmp_path / "flash_moe"
+        prepare_moe_for_flash(str(model_dir), output_dir)
+
+        cfg = json.loads((output_dir / "flash_moe_config.json").read_text())
+        assert cfg["num_experts"] == experts
 
 
 class TestModelManagerFlashMoe:
@@ -140,3 +180,73 @@ class TestLoadedModelField:
 
         fields = {f.name for f in dataclasses.fields(LoadedModel)}
         assert "is_flash_moe" in fields
+
+
+class TestSanitizeModelConfigInPlace:
+    """Step-3.5 ships layer_types longer than num_hidden_layers; fix in place."""
+
+    def test_truncates_oversized_layer_types(self, tmp_path):
+        from olmlx.engine.model_manager import _sanitize_model_config_in_place
+
+        cfg = {
+            "num_hidden_layers": 3,
+            "layer_types": ["full", "sliding", "full", "extra1", "extra2"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(cfg))
+
+        _sanitize_model_config_in_place(tmp_path)
+
+        out = json.loads((tmp_path / "config.json").read_text())
+        assert out["layer_types"] == ["full", "sliding", "full"]
+        assert out["num_hidden_layers"] == 3
+
+    def test_idempotent_when_lengths_match(self, tmp_path):
+        from olmlx.engine.model_manager import _sanitize_model_config_in_place
+
+        cfg = {
+            "num_hidden_layers": 2,
+            "layer_types": ["full", "sliding"],
+        }
+        original = json.dumps(cfg)
+        (tmp_path / "config.json").write_text(original)
+
+        _sanitize_model_config_in_place(tmp_path)
+        _sanitize_model_config_in_place(tmp_path)
+
+        out = json.loads((tmp_path / "config.json").read_text())
+        assert out["layer_types"] == ["full", "sliding"]
+
+    def test_no_op_without_layer_types(self, tmp_path):
+        from olmlx.engine.model_manager import _sanitize_model_config_in_place
+
+        cfg = {"num_hidden_layers": 4, "hidden_size": 64}
+        original = json.dumps(cfg, indent=2)
+        (tmp_path / "config.json").write_text(original)
+
+        _sanitize_model_config_in_place(tmp_path)
+
+        # Untouched.
+        assert (tmp_path / "config.json").read_text() == original
+
+    def test_missing_config_is_silent(self, tmp_path):
+        from olmlx.engine.model_manager import _sanitize_model_config_in_place
+
+        # No config.json present — must not raise.
+        _sanitize_model_config_in_place(tmp_path)
+
+    def test_non_writable_config_does_not_crash(self, tmp_path):
+        """Write failure on config.json must not crash model loading."""
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from olmlx.engine.model_manager import _sanitize_model_config_in_place
+
+        cfg = {
+            "num_hidden_layers": 3,
+            "layer_types": ["full", "sliding", "full", "extra1", "extra2"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(cfg))
+
+        with patch.object(Path, "write_text", side_effect=OSError("read-only")):
+            # Must not raise.
+            _sanitize_model_config_in_place(tmp_path)

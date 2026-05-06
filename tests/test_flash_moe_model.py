@@ -827,3 +827,39 @@ class TestFlashMoeGemma4Vlm:
 
         assert isinstance(wrapped.layers[0].mlp, _MockMLP)
         assert not hasattr(wrapped.layers[0], "router")
+
+
+class TestFlashMoEDeepSeekShareExpertSingular:
+    """Step-3.5MoE uses share_expert (singular), not shared_experts (plural)."""
+
+    def test_share_expert_singular_picked_up(self):
+        from olmlx.engine.flash.flash_moe_model import _FlashMoEDeepSeek
+
+        class _FakeGate(nn.Module):
+            def __call__(self, x):
+                B, L, _ = x.shape
+                inds = mx.zeros((B, L, 1), dtype=mx.int32)
+                scores = mx.ones((B, L, 1))
+                return inds, scores
+
+        class _FakeShareExpert(nn.Module):
+            def __call__(self, x):
+                return x * 2.0
+
+        class _FakeMoE(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate = _FakeGate()
+                # Singular name — Step-3.5 style.
+                self.share_expert = _FakeShareExpert()
+
+        class _StubFlashMoE:
+            def __call__(self, x, inds, scores):
+                return mx.zeros_like(x)
+
+        replacement = _FlashMoEDeepSeek(_FakeMoE(), _StubFlashMoE())
+
+        x = mx.ones((1, 1, 4))
+        y = replacement(x)
+        # Routed output is zeros; share_expert doubles input → expect 2.0.
+        assert mx.allclose(y, mx.full((1, 1, 4), 2.0))

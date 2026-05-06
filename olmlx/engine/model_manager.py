@@ -52,6 +52,52 @@ _FALLBACK_EXCEPTIONS = (
 )
 
 
+def _sanitize_model_config_in_place(load_path) -> None:
+    """Fix known on-disk config.json issues that block transformers loading.
+
+    Currently handles: ``layer_types`` longer than ``num_hidden_layers``.
+    Step-3.5 ships with ``num_hidden_layers=45`` but ``len(layer_types)=48``
+    (the trailing 3 entries describe MTP layers whose weights mlx-lm's
+    sanitize() drops). Newer transformers' ``validate_layer_type`` rejects
+    the mismatch. Truncating ``layer_types`` to match is consistent with
+    what mlx-lm does for the weights and is idempotent on subsequent loads.
+    """
+    config_file = Path(load_path) / "config.json"
+    if not config_file.exists():
+        return
+    try:
+        cfg = json.loads(config_file.read_text())
+    except json.JSONDecodeError:
+        return
+
+    nhl = cfg.get("num_hidden_layers")
+    layer_types = cfg.get("layer_types")
+    if (
+        isinstance(layer_types, list)
+        and isinstance(nhl, int)
+        and nhl > 0
+        and len(layer_types) > nhl
+    ):
+        logger.info(
+            "Truncating layer_types from %d to %d entries in %s "
+            "(num_hidden_layers); excess entries describe layers mlx-lm drops "
+            "(e.g. MTP).",
+            len(layer_types),
+            nhl,
+            config_file,
+        )
+        cfg["layer_types"] = layer_types[:nhl]
+        try:
+            config_file.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+        except OSError:
+            logger.warning(
+                "Failed to write sanitized layer_types to %s "
+                "(read-only?); model may fail to load if transformers validates "
+                "the mismatch.",
+                config_file,
+            )
+
+
 def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     """Load model + tokenizer, remapping unrecognised model_type if needed.
 
@@ -64,6 +110,7 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     So we load the model first with the real config, then patch config.json
     temporarily to load only the tokenizer.
     """
+    _sanitize_model_config_in_place(load_path)
     kwargs.setdefault("tokenizer_config", {"trust_remote_code": True})
     try:
         return mlx_lm.load(str(load_path), **kwargs)

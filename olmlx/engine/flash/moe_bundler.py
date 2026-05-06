@@ -270,6 +270,19 @@ def _detect_moe_layers(config: dict) -> list[int]:
             )
         return [i for i, c in enumerate(pattern) if c == "E"]
 
+    # Step-3.5: explicit comma-separated MoE layer indices.
+    enum = config.get("moe_layers_enum")
+    if enum:
+        num_layers = config.get("num_hidden_layers") or config.get("num_layers", 0)
+        parsed = sorted(int(i) for i in enum.split(","))
+        out_of_bounds = [i for i in parsed if i >= num_layers]
+        if out_of_bounds:
+            raise ValueError(
+                f"moe_layers_enum contains indices {out_of_bounds} "
+                f"beyond num_hidden_layers ({num_layers}); likely MTP-layer leak"
+            )
+        return parsed
+
     num_layers = config.get("num_hidden_layers") or config.get("num_layers", 0)
     first_dense = config.get("first_k_dense_replace", 0)
     # Qwen3-MoE uses decoder_sparse_step instead of moe_layer_freq
@@ -404,11 +417,13 @@ def bundle_moe_experts(
         config.get("n_routed_experts")
         or config.get("num_local_experts")
         or config.get("num_experts")
+        or config.get("moe_num_experts")
     )
     if num_experts is None:
         raise ValueError(
             f"config.json at {model_dir} is missing "
-            "'n_routed_experts', 'num_local_experts', and 'num_experts'"
+            "'n_routed_experts', 'num_local_experts', 'num_experts', "
+            "and 'moe_num_experts'"
         )
 
     # Check for safetensors index (sharded models)

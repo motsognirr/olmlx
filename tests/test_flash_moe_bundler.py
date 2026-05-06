@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -1217,3 +1218,42 @@ class TestShardCacheCleanup:
             f"_shard_cache exceeded max size: {len(_shard_cache)} > {MAX_SHARD_CACHE_SIZE}"
         )
         _clear_shard_cache()
+
+
+class TestDetectMoeLayersEnum:
+    """Step-3.5-Flash declares MoE layers via explicit moe_layers_enum string."""
+
+    def test_moe_layers_enum_parsed(self):
+        from olmlx.engine.flash.moe_bundler import _detect_moe_layers
+
+        config = {
+            "num_hidden_layers": 6,
+            "moe_layers_enum": "2,3,5",
+            # Conflicting freq/offset settings should be ignored.
+            "first_k_dense_replace": 0,
+            "moe_layer_freq": 1,
+        }
+        assert _detect_moe_layers(config) == [2, 3, 5]
+
+    def test_moe_layers_enum_empty_string_falls_through(self):
+        """Empty moe_layers_enum falls back to freq-based detection."""
+        from olmlx.engine.flash.moe_bundler import _detect_moe_layers
+
+        config = {
+            "num_hidden_layers": 4,
+            "moe_layers_enum": "",
+            "first_k_dense_replace": 1,
+            "moe_layer_freq": 1,
+        }
+        assert _detect_moe_layers(config) == [1, 2, 3]
+
+    def test_moe_layers_enum_out_of_bounds_raises(self):
+        """Indices >= num_hidden_layers should raise clear ValueError."""
+        from olmlx.engine.flash.moe_bundler import _detect_moe_layers
+
+        config = {
+            "num_hidden_layers": 4,
+            "moe_layers_enum": "2,3,7",
+        }
+        with pytest.raises(ValueError, match="beyond num_hidden_layers"):
+            _detect_moe_layers(config)
