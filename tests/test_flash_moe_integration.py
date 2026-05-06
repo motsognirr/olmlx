@@ -233,3 +233,20 @@ class TestSanitizeModelConfigInPlace:
 
         # No config.json present — must not raise.
         _sanitize_model_config_in_place(tmp_path)
+
+    def test_non_writable_config_does_not_crash(self, tmp_path):
+        """Write failure on config.json must not crash model loading."""
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from olmlx.engine.model_manager import _sanitize_model_config_in_place
+
+        cfg = {
+            "num_hidden_layers": 3,
+            "layer_types": ["full", "sliding", "full", "extra1", "extra2"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(cfg))
+
+        with patch.object(Path, "write_text", side_effect=OSError("read-only")):
+            # Must not raise.
+            _sanitize_model_config_in_place(tmp_path)

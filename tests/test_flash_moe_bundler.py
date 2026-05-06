@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -1245,3 +1246,14 @@ class TestDetectMoeLayersEnum:
             "moe_layer_freq": 1,
         }
         assert _detect_moe_layers(config) == [1, 2, 3]
+
+    def test_moe_layers_enum_out_of_bounds_raises(self):
+        """Indices >= num_hidden_layers should raise clear ValueError."""
+        from olmlx.engine.flash.moe_bundler import _detect_moe_layers
+
+        config = {
+            "num_hidden_layers": 4,
+            "moe_layers_enum": "2,3,7",
+        }
+        with pytest.raises(ValueError, match="beyond num_hidden_layers"):
+            _detect_moe_layers(config)

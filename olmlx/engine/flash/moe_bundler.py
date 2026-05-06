@@ -273,7 +273,15 @@ def _detect_moe_layers(config: dict) -> list[int]:
     # Step-3.5: explicit comma-separated MoE layer indices.
     enum = config.get("moe_layers_enum")
     if enum:
-        return sorted(int(i) for i in enum.split(","))
+        num_layers = config.get("num_hidden_layers") or config.get("num_layers", 0)
+        parsed = sorted(int(i) for i in enum.split(","))
+        out_of_bounds = [i for i in parsed if i >= num_layers]
+        if out_of_bounds:
+            raise ValueError(
+                f"moe_layers_enum contains indices {out_of_bounds} "
+                f"beyond num_hidden_layers ({num_layers}); likely MTP-layer leak"
+            )
+        return parsed
 
     num_layers = config.get("num_hidden_layers") or config.get("num_layers", 0)
     first_dense = config.get("first_k_dense_replace", 0)

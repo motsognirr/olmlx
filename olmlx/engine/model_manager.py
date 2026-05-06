@@ -87,7 +87,15 @@ def _sanitize_model_config_in_place(load_path) -> None:
             config_file,
         )
         cfg["layer_types"] = layer_types[:nhl]
-        config_file.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+        try:
+            config_file.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+        except OSError:
+            logger.warning(
+                "Failed to write sanitized layer_types to %s "
+                "(read-only?); model may fail to load if transformers validates "
+                "the mismatch.",
+                config_file,
+            )
 
 
 def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
