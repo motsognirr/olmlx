@@ -1224,40 +1224,16 @@ class ModelManager:
             if isinstance(text_cfg, dict):
                 layer_types = text_cfg.get("layer_types")
                 if isinstance(layer_types, list) and "linear_attention" in layer_types:
+                    # Resolve the mlx-lm module name in the try/except so the
+                    # ImportError/AttributeError handler only catches errors
+                    # from that resolution — not from find_spec or the
+                    # raise-on-no-module path below — to keep error
+                    # attribution unambiguous.
+                    text_model_type = text_cfg.get("model_type", model_type)
                     try:
                         from mlx_lm.utils import MODEL_REMAPPING as LM_REMAP
 
-                        # Hybrid VLMs (Qwen3.5) carry the model architecture
-                        # in text_config.model_type; the top-level model_type
-                        # may be VLM-specific (e.g. "qwen3_5_vl") with no
-                        # mlx-lm module, while text_config.model_type
-                        # ("qwen3_5") does.  Prefer the text_config key.
-                        text_model_type = text_cfg.get("model_type", model_type)
                         mapped_lm = LM_REMAP.get(text_model_type, text_model_type)
-                        if (
-                            importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}")
-                            is not None
-                        ):
-                            logger.info(
-                                "Routing hybrid linear-attention VLM '%s' "
-                                "through mlx-lm text path (issue #284)",
-                                model_type,
-                            )
-                            return "text"
-                        # mlx-lm has no module for this model_type.  The
-                        # mlx-vlm fallback chain is the known-crashing
-                        # path for these models; raise at detection time
-                        # so the user sees a clear load-time error rather
-                        # than a silent Metal stream crash mid-inference.
-                        raise ValueError(
-                            f"Model '{hf_path}' (model_type '{model_type}', "
-                            f"text_config.model_type '{text_model_type}') "
-                            f"uses hybrid linear-attention layers (issue "
-                            f"#284) but no mlx-lm module was found. "
-                            f"Loading through mlx-vlm would crash with a "
-                            f"Metal stream error. Ensure mlx-lm with the "
-                            f"matching text-only module is installed."
-                        )
                     except (ImportError, AttributeError) as exc:
                         # mlx-lm absent or restructured.  Catching
                         # AttributeError too because if MODEL_REMAPPING
@@ -1274,6 +1250,36 @@ class ModelManager:
                             f"unavailable. Loading through mlx-vlm would "
                             f"crash with a Metal stream error."
                         ) from exc
+
+                    # Hybrid VLMs (Qwen3.5) carry the model architecture in
+                    # text_config.model_type; the top-level model_type may be
+                    # VLM-specific (e.g. "qwen3_5_vl") with no mlx-lm module,
+                    # while text_config.model_type ("qwen3_5") does.  We
+                    # already resolved using text_model_type above.
+                    if (
+                        importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}")
+                        is not None
+                    ):
+                        logger.info(
+                            "Routing hybrid linear-attention VLM '%s' "
+                            "through mlx-lm text path (issue #284)",
+                            model_type,
+                        )
+                        return "text"
+                    # mlx-lm has no module for this model_type.  The mlx-vlm
+                    # fallback chain is the known-crashing path for these
+                    # models; raise at detection time so the user sees a
+                    # clear load-time error rather than a silent Metal
+                    # stream crash mid-inference.
+                    raise ValueError(
+                        f"Model '{hf_path}' (model_type '{model_type}', "
+                        f"text_config.model_type '{text_model_type}') "
+                        f"uses hybrid linear-attention layers (issue "
+                        f"#284) but no mlx-lm module was found. "
+                        f"Loading through mlx-vlm would crash with a "
+                        f"Metal stream error. Ensure mlx-lm with the "
+                        f"matching text-only module is installed."
+                    )
 
             # Verify mlx-vlm can handle it
             try:

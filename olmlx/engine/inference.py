@@ -2152,14 +2152,11 @@ async def _store_prompt_cache_after_generation(
     # layers using ArraysCache) cannot have their cache safely persisted
     # across requests — the next prefill crashes mlx-lm with a Metal stream
     # error.  Skip storage entirely; the next request will run a fresh
-    # prefill.  Drop any prior entry too, since the mutable cache object
-    # may have been shared with the store on a previous turn.  remove() is
-    # called synchronously here to keep the dict mutation on the event
-    # loop — the design invariant in PromptCacheStore — and matches the
-    # other non-async remove() call sites in this file.  The disk unlink
-    # is missing_ok=True on a path we almost certainly never wrote.
+    # prefill.  No remove() call here: _setup_prompt_cache already removed
+    # any stale entry at request setup time, and we never stored anything
+    # between then and now, so a second remove() would be a guaranteed
+    # no-op disk stat on the event loop.
     if not lm.supports_cache_persistence:
-        lm.prompt_cache_store.remove(cache_id)
         logger.debug(
             "Cache not persistable (hybrid SSM/ArraysCache); "
             "skipping cross-request storage for %s",

@@ -4145,9 +4145,11 @@ class TestStorePromptCacheAfterGeneration:
         layers) cannot have their cache safely persisted across requests —
         cross-request reuse crashes mlx-lm with a GPU stream error.
 
-        When supports_cache_persistence=False, skip storage entirely and remove
-        any prior entry from the store.  Within-request cache reuse during
-        generation continues to work normally.
+        When supports_cache_persistence=False, skip storage entirely.
+        Within-request cache reuse during generation continues to work
+        normally.  No remove() call: _setup_prompt_cache already removed
+        any stale entry at request setup time and we never stored
+        anything between then and now.
         """
         from olmlx.engine.inference import _store_prompt_cache_after_generation
 
@@ -4164,7 +4166,7 @@ class TestStorePromptCacheAfterGeneration:
             )
 
         mock_lm.prompt_cache_store.async_set.assert_not_awaited()
-        mock_lm.prompt_cache_store.remove.assert_called_once_with("test")
+        mock_lm.prompt_cache_store.remove.assert_not_called()
 
 
 class TestInferenceTimeout:
