@@ -1186,6 +1186,18 @@ class ModelManager:
                                 model_type,
                             )
                             return "text"
+                        # mlx-lm has no module for this model_type, but the
+                        # discriminator says mlx-vlm crashes (issue #284).
+                        # Returning "unknown" lets the caller try both paths
+                        # via fallback rather than silently picking the
+                        # known-broken one.
+                        logger.warning(
+                            "Hybrid linear-attention VLM '%s' has no mlx-lm "
+                            "module; cannot safely route through mlx-vlm "
+                            "(issue #284). Returning 'unknown' for fallback.",
+                            model_type,
+                        )
+                        return "unknown"
                     except (ImportError, ModuleNotFoundError):
                         pass
 
@@ -1396,13 +1408,17 @@ class ModelManager:
         except Exception:
             # Best-effort probe; on failure assume trim works so the
             # request path's existing partial-trim fallback handles it.
+            # Persistence has no equivalent fallback — store + reload of an
+            # ArraysCache crashes the next request (issue #284) — so default
+            # to False on probe failure.  Worst case we lose cross-request
+            # cache reuse for a model that didn't need protection.
             logger.debug(
-                "Cache-trim probe failed for %s; assuming trimmable",
+                "Cache-trim probe failed for %s; assuming trimmable, non-persistable",
                 lm.name,
                 exc_info=True,
             )
             lm.supports_cache_trim = True
-            lm.supports_cache_persistence = True
+            lm.supports_cache_persistence = False
         finally:
             if probe_cache is not None:
                 del probe_cache

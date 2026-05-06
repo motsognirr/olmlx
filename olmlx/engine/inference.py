@@ -2131,7 +2131,7 @@ async def _store_prompt_cache_after_generation(
     # error.  Skip storage entirely; the next request will run a fresh
     # prefill.  Drop any prior entry too, since the mutable cache object
     # may have been shared with the store on a previous turn.
-    if not getattr(lm, "supports_cache_persistence", True):
+    if not lm.supports_cache_persistence:
         lm.prompt_cache_store.remove(cache_id)
         logger.debug(
             "Cache not persistable (hybrid SSM/ArraysCache); "

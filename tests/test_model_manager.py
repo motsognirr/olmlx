@@ -344,9 +344,54 @@ class TestDetectModelKind:
         )
         manager = self._make_manager(registry, mock_store)
 
+        # Mock find_spec so the test doesn't depend on the installed mlx-lm
+        # version actually shipping mlx_lm.models.qwen3_5 — without the
+        # mock, an older install would silently route through mlx-vlm and
+        # the assertion would mask a regression.
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec_with_qwen3_5(name, *args, **kwargs):
+            if name == "mlx_lm.models.qwen3_5":
+                return object()  # truthy sentinel
+            return real_find_spec(name, *args, **kwargs)
+
         with patch("huggingface_hub.hf_hub_download", return_value=config_path):
-            kind = manager._detect_model_kind("test/qwen3_5")
+            with patch("importlib.util.find_spec", side_effect=find_spec_with_qwen3_5):
+                kind = manager._detect_model_kind("test/qwen3_5")
         assert kind == "text"
+
+    def test_hybrid_linear_attention_vlm_returns_unknown_when_no_mlx_lm_module(
+        self, tmp_path, registry, mock_store
+    ):
+        """Issue #284: when the discriminator fires (linear_attention layers
+        present) but mlx-lm has no module for the model_type, return
+        'unknown' rather than falling through to the mlx-vlm path that we
+        know crashes for these models."""
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "future_hybrid_vlm",
+                "vision_config": {"hidden_size": 1024},
+                "text_config": {"layer_types": ["linear_attention", "full_attention"]},
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def no_mlx_lm_module(name, *args, **kwargs):
+            if name.startswith("mlx_lm.models."):
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            with patch("importlib.util.find_spec", side_effect=no_mlx_lm_module):
+                kind = manager._detect_model_kind("test/future_hybrid_vlm")
+        assert kind == "unknown"
 
     def test_standard_vlm_without_linear_attention_stays_vlm(
         self, tmp_path, registry, mock_store
