@@ -499,21 +499,23 @@ class TestCachePersistenceProbe:
 
         assert _cache_supports_persistence([_FakeArraysCache()]) is False
 
-    def test_arrays_cache_subclass_breaks_persistence(self):
-        """MRO walk catches subclasses (e.g. a future ``QuantizedArraysCache``).
-        The persistence check has no graceful fallback — a missed subclass
-        would crash mlx-lm on the next request — so the safer default is
-        for anything inheriting from a banned class to inherit the
-        classification."""
+    def test_subclass_of_allowlisted_cache_defaults_to_non_persistable(self):
+        """Allowlist semantics + exact-name match: a subclass of an
+        allowlisted class (e.g. a hypothetical ``BadSSMCache(KVCache)``
+        that grafts unsafe state onto a safe base) is correctly treated
+        as non-persistable until explicitly added to the allowlist.
+
+        An MRO walk here would invert the safety guarantee — anything
+        inheriting from an allowlisted class would auto-pass even if the
+        subclass introduces unsafe state.
+        """
         from olmlx.engine.model_manager import _cache_supports_persistence
 
-        class _QuantizedArraysCache(_FakeArraysCache):
+        class _BadSSMCache(_FakeKVCache):
             pass
 
-        # Subclass renamed deliberately to a name not in the allowlist —
-        # it should still match via MRO walk.
-        _QuantizedArraysCache.__name__ = "QuantizedArraysCache"
-        assert _cache_supports_persistence([_QuantizedArraysCache()]) is False
+        _BadSSMCache.__name__ = "BadSSMCache"
+        assert _cache_supports_persistence([_BadSSMCache()]) is False
 
     def test_unknown_cache_class_defaults_to_non_persistable(self):
         """Allowlist semantics: an unknown cache class (e.g. a hypothetical

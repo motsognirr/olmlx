@@ -248,16 +248,15 @@ def _cache_supports_persistence(cache_list: list) -> bool:
     cross-request strict-extension reuse the prompt cache store normally
     provides.
 
-    Walks the MRO so subclasses (e.g. a future ``QuantizedArraysCache``)
-    inherit their base's classification.  Unlike ``_cache_supports_trim``
-    — where a false-negative falls back gracefully to a full prefill — a
-    false-positive here would crash mlx-lm with a Metal stream error on
-    the next request, so any unknown class defaults to non-persistable.
+    Exact class-name match (no MRO walk).  With allowlist semantics an MRO
+    walk would invert the safety guarantee: a future ``BadSSMCache(KVCache)``
+    that has unsafe state but inherits from an allowlisted class would
+    silently pass.  Subclasses must be added to the allowlist explicitly.
+    A false-negative just costs a cache miss; a false-positive crashes
+    mlx-lm with a Metal stream error on the next request.
     """
     for layer in cache_list:
-        if not any(
-            cls.__name__ in _PERSISTABLE_CACHE_CLASSES for cls in type(layer).__mro__
-        ):
+        if type(layer).__name__ not in _PERSISTABLE_CACHE_CLASSES:
             return False
     return True
 
@@ -1233,28 +1232,39 @@ class ModelManager:
                                 model_type,
                             )
                             return "text"
-                        # mlx-lm has no module for this model_type, but the
-                        # discriminator says mlx-vlm crashes (issue #284).
-                        # Returning "unknown" lets the caller try both paths
-                        # via fallback rather than silently picking the
-                        # known-broken one.
+                        # mlx-lm has no module for this model_type.  Return
+                        # "unknown" so the caller's fallback chain
+                        # (_try_lm_then_vlm: mlx-lm first, then mlx-vlm)
+                        # gets to try mlx-lm via model_type aliasing
+                        # before reaching mlx-vlm.  If mlx-lm load also
+                        # fails the chain ends in mlx-vlm — the same
+                        # crash this discriminator exists to avert.  This
+                        # branch only defers, not prevents, that crash
+                        # for unknown hybrid families; updating
+                        # _PERSISTABLE_CACHE_CLASSES and this matcher to
+                        # cover new families is required for true
+                        # protection.
                         logger.warning(
                             "Hybrid linear-attention VLM '%s' has no mlx-lm "
-                            "module; cannot safely route through mlx-vlm "
-                            "(issue #284). Returning 'unknown' for fallback.",
+                            "module; the mlx-vlm path is known to crash "
+                            "(issue #284). Returning 'unknown'; the "
+                            "fallback chain will try mlx-vlm last and "
+                            "may still crash.",
                             model_type,
                         )
                         return "unknown"
-                    except (ImportError, ModuleNotFoundError):
-                        # mlx-lm absent or restructured.  Same reasoning as
-                        # the no-module branch above: the discriminator has
-                        # already fired, so falling through to the mlx-vlm
-                        # path would route to a known-broken loader.
+                    except ImportError:
+                        # mlx-lm absent or restructured.  Same caveat as
+                        # the no-module branch above: returning "unknown"
+                        # defers the crash through the fallback chain
+                        # rather than averting it.
                         logger.warning(
                             "mlx_lm.utils.MODEL_REMAPPING unavailable; "
-                            "cannot safely route hybrid linear-attention "
-                            "VLM '%s' through mlx-vlm (issue #284). "
-                            "Returning 'unknown' for fallback.",
+                            "cannot route hybrid linear-attention VLM "
+                            "'%s' through the mlx-lm text path "
+                            "(issue #284). Returning 'unknown'; the "
+                            "fallback chain will try mlx-vlm last and "
+                            "may still crash.",
                             model_type,
                         )
                         return "unknown"
@@ -1267,7 +1277,7 @@ class ModelManager:
                 spec = importlib.util.find_spec(f"mlx_vlm.models.{mapped}")
                 if spec is not None:
                     return "vlm"
-            except (ImportError, ModuleNotFoundError):
+            except ImportError:
                 pass
             # Has vision keys but mlx-vlm can't handle it — check mlx-lm
             try:
@@ -1282,7 +1292,7 @@ class ModelManager:
                         model_type,
                     )
                     return "text"
-            except (ImportError, ModuleNotFoundError):
+            except ImportError:
                 pass
             # Neither library explicitly supports it — try both via fallback
             logger.info(
@@ -1299,7 +1309,7 @@ class ModelManager:
             spec = importlib.util.find_spec(f"mlx_lm.models.{mapped}")
             if spec is not None:
                 return "text"
-        except (ImportError, ModuleNotFoundError):
+        except ImportError:
             pass
 
         # Fallback: check mlx-vlm even without vision keys
@@ -1310,7 +1320,7 @@ class ModelManager:
             spec = importlib.util.find_spec(f"mlx_vlm.models.{mapped}")
             if spec is not None:
                 return "vlm"
-        except (ImportError, ModuleNotFoundError):
+        except ImportError:
             pass
 
         return "unknown"
