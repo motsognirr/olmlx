@@ -997,7 +997,7 @@ class ModelManager:
                         inference_timeout=model_config.inference_timeout,
                         sync_mode=model_config.sync_mode,
                     )
-                    self._probe_cache_trim_support(lm)
+                    self._probe_cache_capabilities(lm)
                     self._loaded[normalized] = lm
                     return lm
                 except BaseException:
@@ -1382,7 +1382,7 @@ class ModelManager:
             return flash_path
         return None
 
-    def _probe_cache_trim_support(self, lm: LoadedModel) -> None:
+    def _probe_cache_capabilities(self, lm: LoadedModel) -> None:
         """Probe how the model's prompt cache can be safely reused, recording
         the result on ``lm.supports_cache_trim`` and ``lm.supports_cache_persistence``.
 

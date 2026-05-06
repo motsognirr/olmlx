@@ -3874,6 +3874,56 @@ class TestKvCachePreflightCheckHelper:
             )
         assert result.memory_limit > 0
 
+    @pytest.mark.asyncio
+    async def test_does_not_re_store_cache_for_non_persistable_model(self, mock_lm):
+        """Issue #284: under memory pressure the preflight check temporarily
+        re-stores the working cache so ``async_evict_all_to_disk`` can flush
+        it.  For non-persistable models this would re-introduce the
+        cross-request reuse path the persistence guard exists to prevent —
+        the disk-stored cache would be picked up on the next request and
+        crash mlx-lm.  Skip the re-store; eviction still runs to flush
+        other in-memory entries."""
+        from olmlx.engine.inference import _kv_cache_preflight_check
+
+        mock_lm.supports_cache_persistence = False
+        cache = MagicMock()
+        gen_kwargs = {"prompt_cache": cache}
+        with (
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=24 * 1024**3,
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                return_value=10 * 1024**3,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference.estimate_kv_cache_bytes",
+                return_value=3 * 1024**3,
+            ),
+            patch("olmlx.engine.inference._safe_sync"),
+            patch("olmlx.engine.inference.mx"),
+        ):
+            mock_settings.memory_limit_fraction = 0.5
+            with pytest.raises(MemoryError, match="prompt too long"):
+                await _kv_cache_preflight_check(
+                    mock_lm,
+                    [1, 2, 3],
+                    100,
+                    gen_kwargs,
+                    cache_read_tokens=2,
+                    cache_creation_tokens=1,
+                    full_prompt_tokens=[1, 2, 3],
+                    cache_id="test",
+                )
+
+        # The non-persistable cache must NOT be re-stored, even though
+        # had_cache=True and full_prompt_tokens is provided.  Eviction
+        # still runs so other in-memory entries are flushed.
+        mock_lm.prompt_cache_store.async_set.assert_not_awaited()
+        mock_lm.prompt_cache_store.async_evict_all_to_disk.assert_awaited_once()
+
 
 class TestStorePromptCacheAfterGeneration:
     """Tests for the extracted _store_prompt_cache_after_generation helper."""
@@ -4054,7 +4104,8 @@ class TestStorePromptCacheAfterGeneration:
         """
         from olmlx.engine.inference import _store_prompt_cache_after_generation
 
-        mock_lm.supports_cache_trim = False
+        # supports_cache_trim is irrelevant: the persistence guard returns
+        # before the trim branch is reached.
         mock_lm.supports_cache_persistence = False
         cache = MagicMock()
         gen_kwargs = {"prompt_cache": cache}

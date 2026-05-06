@@ -2056,8 +2056,17 @@ async def _kv_cache_preflight_check(
             had_cache = working is not None
             gen_kwargs.pop("input_ids", None)
             # Re-add cache temporarily so evict_all_to_disk() can persist it.
-            # Use cache_read_tokens to match the trimmed KV state.
-            if had_cache and full_prompt_tokens is not None:
+            # Use cache_read_tokens to match the trimmed KV state.  Issue
+            # #284: skip for non-persistable models — re-storing the cache
+            # would re-introduce the cross-request reuse path the persistence
+            # guard exists to prevent.  Dropping the working reference is
+            # enough to free its memory; the eviction below still runs to
+            # flush any other in-memory entries.
+            if (
+                had_cache
+                and full_prompt_tokens is not None
+                and lm.supports_cache_persistence
+            ):
                 await lm.prompt_cache_store.async_set(
                     cache_id,
                     CachedPromptState(
