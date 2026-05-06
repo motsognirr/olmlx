@@ -254,7 +254,13 @@ def _cache_supports_persistence(cache_list: list) -> bool:
     silently pass.  Subclasses must be added to the allowlist explicitly.
     A false-negative just costs a cache miss; a false-positive crashes
     mlx-lm with a Metal stream error on the next request.
+
+    Empty ``cache_list`` returns False (no evidence of safety).  Unlike the
+    trim probe — where a false-positive falls back gracefully — a stray
+    True here would crash the next request.
     """
+    if not cache_list:
+        return False
     for layer in cache_list:
         if type(layer).__name__ not in _PERSISTABLE_CACHE_CLASSES:
             return False

@@ -530,6 +530,15 @@ class TestCachePersistenceProbe:
         _MambaCache.__name__ = "MambaCache"
         assert _cache_supports_persistence([_MambaCache()]) is False
 
+    def test_empty_cache_list_is_non_persistable(self):
+        """An empty cache list is not evidence that the cache is safe to
+        reuse — the same false-positive risk that motivated the allowlist
+        applies.  Trim returns vacuously True for an empty list, but a
+        trim false-positive falls back gracefully; persistence does not."""
+        from olmlx.engine.model_manager import _cache_supports_persistence
+
+        assert _cache_supports_persistence([]) is False
+
     def test_persistable_allowlist_covers_all_mlx_lm_cache_types(self):
         """Regression fence: every ``*KVCache`` / ``*Cache`` class shipped by
         the installed mlx-lm must be classified as persistable or not.

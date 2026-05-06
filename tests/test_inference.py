@@ -4093,6 +4093,48 @@ class TestStorePromptCacheAfterGeneration:
         assert stored.tokens == [1, 2, 3, 4, 5]
 
     @pytest.mark.asyncio
+    async def test_lookup_skipped_for_non_persistable_model(self, mock_manager):
+        """Issue #284: at request time, models with
+        supports_cache_persistence=False must not load any prior cache
+        (even from disk).  Pre-PR olmlx may have left ArraysCache state on
+        disk; loading it would crash the next prefill.  Skip the lookup
+        and remove any stale entry so it doesn't survive process restart.
+        """
+        from olmlx.engine.inference import _setup_prompt_cache
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.supports_cache_persistence = False
+        # Stash a stale entry that mimics pre-PR storage.
+        stale_cache = [MagicMock()]
+        lm.prompt_cache_store.set(
+            "stale-key",
+            CachedPromptState(tokens=[1, 2, 3], cache=stale_cache),
+        )
+        # Spy on async_get to confirm it isn't called.
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        lm.prompt_cache_store.async_get = _AsyncMock(
+            side_effect=AssertionError("async_get must not be called")
+        )
+
+        gen_kwargs: dict = {}
+        with patch("olmlx.engine.inference.settings") as mock_settings:
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.memory_limit_fraction = 0.9
+            await _setup_prompt_cache(
+                lm,
+                "the prompt",
+                gen_kwargs,
+                prompt_tokens=[1, 2, 3, 4, 5],
+                cache_id="stale-key",
+            )
+
+        # Stale entry must be removed so it doesn't survive a restart.
+        assert lm.prompt_cache_store.peek("stale-key") is None
+
+    @pytest.mark.asyncio
     async def test_skips_storage_when_cache_not_persistable(self, mock_lm):
         """Issue #284: hybrid SSM-style models (Qwen3.5/Qwen3-Next, ArraysCache
         layers) cannot have their cache safely persisted across requests —

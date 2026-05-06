@@ -1849,7 +1849,16 @@ async def _setup_prompt_cache(
     if memory_too_high or prompt_tokens is None or make_prompt_cache is None:
         return result
 
-    cached = await lm.prompt_cache_store.async_get(cache_id)
+    # Issue #284: for non-persistable models (hybrid SSM-style ArraysCache),
+    # any stored entry is unsafe to reuse — pre-PR data on disk would crash
+    # mlx-lm on prefill.  Skip the lookup and clean up any stale entry so
+    # it doesn't survive across process restarts and ambush the next
+    # request.  remove() is idempotent on a missing entry.
+    if not lm.supports_cache_persistence:
+        lm.prompt_cache_store.remove(cache_id)
+        cached = None
+    else:
+        cached = await lm.prompt_cache_store.async_get(cache_id)
     logger.debug(
         "Cache lookup: cached=%s, new prompt=%d tokens",
         (
@@ -2061,7 +2070,12 @@ async def _kv_cache_preflight_check(
             # would re-introduce the cross-request reuse path the persistence
             # guard exists to prevent.  Dropping the working reference is
             # enough to free its memory; the eviction below still runs to
-            # flush any other in-memory entries.
+            # flush any other in-memory entries.  Also clean up any stale
+            # entry from before the persistence guard existed since
+            # _store_prompt_cache_after_generation isn't reached on the
+            # MemoryError path.
+            if had_cache and not lm.supports_cache_persistence:
+                lm.prompt_cache_store.remove(cache_id)
             if (
                 had_cache
                 and full_prompt_tokens is not None
