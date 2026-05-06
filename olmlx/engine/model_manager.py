@@ -205,38 +205,60 @@ def _cache_supports_trim(cache_list: list) -> bool:
     return all(type(layer).__name__ in _TRIMMABLE_CACHE_CLASSES for layer in cache_list)
 
 
-# Cache layer classes whose stored state cannot be safely reused on a later
-# request.  ArraysCache holds the recurrent state of gated-delta SSM-style
-# layers (Qwen3.5, Qwen3-Next).  Persisting these arrays across the boundary
-# between two inference invocations crashes mlx-lm during the next prefill
-# with "RuntimeError: There is no Stream(gpu, N) in current thread" — the
-# stored arrays carry a lazy graph that references a Metal stream from the
-# previous worker thread, and re-evaluating them in a fresh worker thread
-# fails.  Within-request cache reuse during a single generation works fine;
-# only cross-request persistence is unsafe.  Issue #284.
-_NON_PERSISTABLE_CACHE_CLASSES = frozenset({"ArraysCache"})
+# Cache layer classes whose stored state CAN be safely reused on a later
+# request.  Allowlist (not denylist) so that any new mlx-lm cache class
+# defaults to non-persistable: a false negative here just means a missed
+# cache hit, while a false positive (treating an unknown SSM-style cache
+# as persistable) crashes mlx-lm during the next prefill with "RuntimeError:
+# There is no Stream(gpu, N) in current thread".  Issue #284.
+#
+# ArraysCache (gated-delta SSM state used by Qwen3.5, Qwen3-Next) is the
+# motivating exclusion: its stored arrays carry a lazy graph that
+# references a Metal stream from the previous worker thread; re-evaluating
+# them in a fresh worker thread fails.  Within-request cache reuse during
+# a single generation works fine; only cross-request persistence is unsafe.
+#
+# Verified safe against mlx-lm:
+# - KVCache / QuantizedKVCache / ConcatenateKVCache: standard KV layouts.
+# - RotatingKVCache: ring buffer over fixed window (Gemma 4 etc.).
+# - ChunkedKVCache: chunked layout (afm7 etc.).
+#
+# Deliberately excluded:
+# - ArraysCache: gated-delta SSM state — see issue #284.
+# - CacheList: wraps other caches, would need recursion to classify safely.
+# - BatchKVCache / BatchRotatingKVCache: batch path, untested in olmlx
+#   (single-user server) — disable persistence rather than risk a crash.
+_PERSISTABLE_CACHE_CLASSES = frozenset(
+    {
+        "KVCache",
+        "QuantizedKVCache",
+        "ConcatenateKVCache",
+        "RotatingKVCache",
+        "ChunkedKVCache",
+    }
+)
 
 
 def _cache_supports_persistence(cache_list: list) -> bool:
-    """False if any layer is a cache type whose state cannot be safely
-    reused on a subsequent request.
+    """True iff every layer is a cache type known to be safe for
+    cross-request persistence.
 
-    See ``_NON_PERSISTABLE_CACHE_CLASSES`` for the set of disallowed types.
-    Models that fail this check still get within-request cache reuse — just
-    not the cross-request strict-extension reuse the prompt cache store
-    normally provides.
+    See ``_PERSISTABLE_CACHE_CLASSES`` for the allowlist.  Models that fail
+    this check still get within-request cache reuse — just not the
+    cross-request strict-extension reuse the prompt cache store normally
+    provides.
 
     Walks the MRO so subclasses (e.g. a future ``QuantizedArraysCache``)
-    inherit the non-persistable classification from their base.  Unlike
-    ``_cache_supports_trim`` — where a false-negative falls back gracefully
-    to a full prefill — a false-negative here would crash mlx-lm with a
-    Metal stream error on the next request, so the safer default is to
-    treat anything inheriting from a banned class as non-persistable.
+    inherit their base's classification.  Unlike ``_cache_supports_trim``
+    — where a false-negative falls back gracefully to a full prefill — a
+    false-positive here would crash mlx-lm with a Metal stream error on
+    the next request, so any unknown class defaults to non-persistable.
     """
     for layer in cache_list:
-        for cls in type(layer).__mro__:
-            if cls.__name__ in _NON_PERSISTABLE_CACHE_CLASSES:
-                return False
+        if not any(
+            cls.__name__ in _PERSISTABLE_CACHE_CLASSES for cls in type(layer).__mro__
+        ):
+            return False
     return True
 
 
@@ -1177,6 +1199,16 @@ class ModelManager:
             # Discriminator: text_config.layer_types contains
             # "linear_attention", which also signals the gated-delta
             # ArraysCache layout that triggers the persistence bug.
+            #
+            # Heuristic — known limitations:
+            # - Over-fires: a future VLM that uses "linear_attention" but
+            #   loads correctly through mlx-vlm would be silently rerouted
+            #   to the text path, losing vision.
+            # - Under-fires: a new hybrid SSM model that names its layers
+            #   differently (e.g. "gated_delta", "mamba") wouldn't trigger
+            #   this guard and would still crash through mlx-vlm.
+            # Update this matcher (or replace with a model_type allowlist)
+            # as new hybrid families appear.
             text_cfg = config.get("text_config")
             if isinstance(text_cfg, dict):
                 layer_types = text_cfg.get("layer_types")

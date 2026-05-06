@@ -515,6 +515,73 @@ class TestCachePersistenceProbe:
         _QuantizedArraysCache.__name__ = "QuantizedArraysCache"
         assert _cache_supports_persistence([_QuantizedArraysCache()]) is False
 
+    def test_unknown_cache_class_defaults_to_non_persistable(self):
+        """Allowlist semantics: an unknown cache class (e.g. a hypothetical
+        future ``MambaCache`` from mlx-lm) defaults to non-persistable.
+        A false-negative here just costs a cache miss; a false-positive
+        crashes mlx-lm on the next request."""
+        from olmlx.engine.model_manager import _cache_supports_persistence
+
+        class _MambaCache:
+            pass
+
+        _MambaCache.__name__ = "MambaCache"
+        assert _cache_supports_persistence([_MambaCache()]) is False
+
+    def test_persistable_allowlist_covers_all_mlx_lm_cache_types(self):
+        """Regression fence: every ``*KVCache`` / ``*Cache`` class shipped by
+        the installed mlx-lm must be classified as persistable or not.
+
+        Mirrors ``test_allowlist_covers_all_mlx_lm_cache_types`` for the
+        trim allowlist.  When mlx-lm ships a new cache class it lands here
+        and forces a reviewer to classify it explicitly — silently leaving
+        it out of the allowlist is safe (the worst case is a missed cache
+        hit), but adding it to the allowlist without verifying is not.
+        """
+        import inspect
+
+        import mlx_lm.models.cache as mlx_cache
+
+        from olmlx.engine.model_manager import _PERSISTABLE_CACHE_CLASSES
+
+        # Known non-persistable; document reason next to each name.
+        known_non_persistable = {
+            "ArraysCache",  # gated-delta SSM state, see issue #284
+            "CacheList",  # wraps other caches; would need recursion
+            "BatchKVCache",  # batch path untested in this server
+            "BatchRotatingKVCache",  # same: batch path untested
+        }
+
+        # Per-layer cache classes only.  Skip helpers (_BaseCache),
+        # the top-level prompt cache wrapper (LRUPromptCache — olmlx uses
+        # its own PromptCacheStore), and `CacheList` is in the
+        # known_non_persistable set above.
+        excluded = {"_BaseCache", "LRUPromptCache"}
+        mlx_lm_cache_classes = {
+            name
+            for name, obj in inspect.getmembers(mlx_cache, inspect.isclass)
+            if obj.__module__ == mlx_cache.__name__
+            and name.endswith("Cache")
+            and name not in excluded
+        }
+        classified = _PERSISTABLE_CACHE_CLASSES | known_non_persistable
+        unclassified = mlx_lm_cache_classes - classified
+        assert not unclassified, (
+            f"mlx-lm shipped new cache classes that olmlx has not classified "
+            f"for persistence: {sorted(unclassified)}.  Add each to "
+            f"_PERSISTABLE_CACHE_CLASSES in olmlx/engine/model_manager.py "
+            f"(if its stored state is safe to reuse across requests) or to "
+            f"`known_non_persistable` in this test."
+        )
+        # Reverse direction: every allowlist entry must be a real class in
+        # the installed mlx-lm.
+        missing = _PERSISTABLE_CACHE_CLASSES - mlx_lm_cache_classes
+        assert not missing, (
+            f"_PERSISTABLE_CACHE_CLASSES entries not found in "
+            f"mlx_lm.models.cache: {sorted(missing)}.  Either remove them "
+            f"or confirm the class exists in the installed mlx-lm version."
+        )
+
 
 class TestNonTrimmableModelSkipsTrim:
     @pytest.mark.asyncio
