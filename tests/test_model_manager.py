@@ -312,6 +312,63 @@ class TestDetectModelKind:
         assert kind == "text"
         mock_dl.assert_not_called()
 
+    def test_hybrid_linear_attention_vlm_routes_to_text(
+        self, tmp_path, registry, mock_store
+    ):
+        """Issue #284: VLMs with hybrid SSM+attention layers (Qwen3.5,
+        Qwen3_5_moe) must route through mlx-lm's text path.  The mlx-vlm
+        path crashes on stream synchronization for these models even on
+        text-only requests; mlx-lm has dedicated text-only modules
+        (qwen3_5.py, qwen3_5_moe.py) that work correctly.
+
+        Discriminator: ``text_config.layer_types`` containing
+        ``"linear_attention"`` signals the hybrid architecture.  Standard
+        VLMs (Gemma 4, Qwen2-VL) lack this field and continue to route
+        through mlx-vlm.
+        """
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "qwen3_5",  # mlx-lm has qwen3_5.py
+                "vision_config": {"hidden_size": 1024},
+                "image_token_id": 248056,
+                "text_config": {
+                    "layer_types": [
+                        "linear_attention",
+                        "linear_attention",
+                        "linear_attention",
+                        "full_attention",
+                    ],
+                },
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/qwen3_5")
+        assert kind == "text"
+
+    def test_standard_vlm_without_linear_attention_stays_vlm(
+        self, tmp_path, registry, mock_store
+    ):
+        """Regression fence: standard VLMs (no linear_attention) must
+        continue to load through mlx-vlm.  Only the hybrid SSM bug warrants
+        the mlx-lm detour."""
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "qwen2_vl",  # known mlx-vlm model
+                "vision_config": {"hidden_size": 1024},
+                "image_token_id": 151655,
+                # No layer_types — standard transformer.
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/qwen2_vl")
+        assert kind == "vlm"
+
 
 class TestLoadModel:
     def _make_manager(self, registry, mock_store):

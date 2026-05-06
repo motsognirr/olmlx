@@ -2125,6 +2125,21 @@ async def _store_prompt_cache_after_generation(
     if prompt_cache is None or full_prompt_tokens is None:
         return
 
+    # Issue #284: hybrid SSM-style models (Qwen3.5, Qwen3-Next gated-delta
+    # layers using ArraysCache) cannot have their cache safely persisted
+    # across requests — the next prefill crashes mlx-lm with a Metal stream
+    # error.  Skip storage entirely; the next request will run a fresh
+    # prefill.  Drop any prior entry too, since the mutable cache object
+    # may have been shared with the store on a previous turn.
+    if not getattr(lm, "supports_cache_persistence", True):
+        lm.prompt_cache_store.remove(cache_id)
+        logger.debug(
+            "Cache not persistable (hybrid SSM/ArraysCache); "
+            "skipping cross-request storage for %s",
+            cache_id,
+        )
+        return
+
     stored_tokens = list(full_prompt_tokens) + generated_tokens
     actual_total = len(full_prompt_tokens) + eval_count
     max_cache_tokens = settings.prompt_cache_max_tokens

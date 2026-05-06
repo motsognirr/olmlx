@@ -205,6 +205,32 @@ def _cache_supports_trim(cache_list: list) -> bool:
     return all(type(layer).__name__ in _TRIMMABLE_CACHE_CLASSES for layer in cache_list)
 
 
+# Cache layer classes whose stored state cannot be safely reused on a later
+# request.  ArraysCache holds the recurrent state of gated-delta SSM-style
+# layers (Qwen3.5, Qwen3-Next).  Persisting these arrays across the boundary
+# between two inference invocations crashes mlx-lm during the next prefill
+# with "RuntimeError: There is no Stream(gpu, N) in current thread" — the
+# stored arrays carry a lazy graph that references a Metal stream from the
+# previous worker thread, and re-evaluating them in a fresh worker thread
+# fails.  Within-request cache reuse during a single generation works fine;
+# only cross-request persistence is unsafe.  Issue #284.
+_NON_PERSISTABLE_CACHE_CLASSES = frozenset({"ArraysCache"})
+
+
+def _cache_supports_persistence(cache_list: list) -> bool:
+    """False if any layer is a cache type whose state cannot be safely
+    reused on a subsequent request.
+
+    See ``_NON_PERSISTABLE_CACHE_CLASSES`` for the set of disallowed types.
+    Models that fail this check still get within-request cache reuse — just
+    not the cross-request strict-extension reuse the prompt cache store
+    normally provides.
+    """
+    return not any(
+        type(layer).__name__ in _NON_PERSISTABLE_CACHE_CLASSES for layer in cache_list
+    )
+
+
 class ModelLoadTimeoutError(TimeoutError):
     """Raised when model loading exceeds OLMLX_MODEL_LOAD_TIMEOUT."""
 
@@ -565,6 +591,11 @@ class LoadedModel:
     # False for hybrid sliding-window models (RotatingKVCache layers).
     # Set by the loader; default True covers direct construction in tests.
     supports_cache_trim: bool = True
+    # False for hybrid SSM-style models (ArraysCache layers, e.g. Qwen3.5,
+    # Qwen3-Next).  When False, prompt cache state is not persisted across
+    # requests because cross-request reuse crashes mlx-lm with a Metal
+    # stream error.  Set by the loader.  Issue #284.
+    supports_cache_persistence: bool = True
     spectral_calibration_dir: Any = None  # Path | None, typed as Any to avoid import
     default_options: dict = field(default_factory=dict)
     inference_queue_timeout: float | None = None
@@ -1130,6 +1161,34 @@ class ModelManager:
         # of whether the base model_type also exists in mlx-lm
         has_vision_keys = bool(self._VLM_CONFIG_KEYS & config.keys())
         if has_vision_keys:
+            # Issue #284: hybrid SSM+attention VLMs (Qwen3.5, Qwen3_5_moe)
+            # crash in mlx-vlm with "There is no Stream(gpu, N) in current
+            # thread" on text-only inference.  These models ship with a
+            # dedicated text-only module in mlx-lm — route through it.
+            # Discriminator: text_config.layer_types contains
+            # "linear_attention", which also signals the gated-delta
+            # ArraysCache layout that triggers the persistence bug.
+            text_cfg = config.get("text_config")
+            if isinstance(text_cfg, dict):
+                layer_types = text_cfg.get("layer_types")
+                if isinstance(layer_types, list) and "linear_attention" in layer_types:
+                    try:
+                        from mlx_lm.utils import MODEL_REMAPPING as LM_REMAP
+
+                        mapped_lm = LM_REMAP.get(model_type, model_type)
+                        if (
+                            importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}")
+                            is not None
+                        ):
+                            logger.info(
+                                "Routing hybrid linear-attention VLM '%s' "
+                                "through mlx-lm text path (issue #284)",
+                                model_type,
+                            )
+                            return "text"
+                    except (ImportError, ModuleNotFoundError):
+                        pass
+
             # Verify mlx-vlm can handle it
             try:
                 from mlx_vlm.utils import MODEL_REMAPPING as VLM_REMAP
@@ -1301,14 +1360,20 @@ class ModelManager:
         return None
 
     def _probe_cache_trim_support(self, lm: LoadedModel) -> None:
-        """Probe whether `trim_prompt_cache` will work on this model and
-        record the result on `lm.supports_cache_trim`.
+        """Probe how the model's prompt cache can be safely reused, recording
+        the result on ``lm.supports_cache_trim`` and ``lm.supports_cache_persistence``.
 
         Hybrid sliding-window models (Gemma 4, Qwen3-Next) include
         `RotatingKVCache` layers which become non-trimmable once the
         rotating buffer fills.  Detecting this once at load time lets the
         request path skip a doomed `trim_prompt_cache()` call (which
         would silently return 0 and force a full prefill).
+
+        Hybrid SSM-style models (Qwen3.5, Qwen3-Next gated-delta layers) use
+        ``ArraysCache`` whose stored state cannot be reused across requests
+        without crashing mlx-lm during the next prefill — see issue #284.
+        Such models keep within-request cache reuse but skip the cross-
+        request store/load path.
 
         Always probes the bare mlx-lm cache — trim behaviour is determined
         by the underlying layer classes, not the quantization wrapper, and
@@ -1327,6 +1392,7 @@ class ModelManager:
         try:
             probe_cache = make_prompt_cache(cache_model)
             lm.supports_cache_trim = _cache_supports_trim(probe_cache)
+            lm.supports_cache_persistence = _cache_supports_persistence(probe_cache)
         except Exception:
             # Best-effort probe; on failure assume trim works so the
             # request path's existing partial-trim fallback handles it.
@@ -1336,6 +1402,7 @@ class ModelManager:
                 exc_info=True,
             )
             lm.supports_cache_trim = True
+            lm.supports_cache_persistence = True
         finally:
             if probe_cache is not None:
                 del probe_cache
@@ -1346,6 +1413,13 @@ class ModelManager:
             logger.info(
                 "Model %s uses a non-trimmable hybrid cache (e.g. RotatingKVCache); "
                 "prompt cache will only be reused for strict-extension turns.",
+                lm.name,
+            )
+        if not lm.supports_cache_persistence:
+            logger.info(
+                "Model %s uses a non-persistable hybrid cache (ArraysCache, "
+                "gated-delta SSM state); prompt cache will not be stored "
+                "across requests (issue #284).",
                 lm.name,
             )
 

@@ -4042,6 +4042,32 @@ class TestStorePromptCacheAfterGeneration:
         stored = call_args[0][1]
         assert stored.tokens == [1, 2, 3, 4, 5]
 
+    @pytest.mark.asyncio
+    async def test_skips_storage_when_cache_not_persistable(self, mock_lm):
+        """Issue #284: hybrid SSM-style models (Qwen3.5/Qwen3-Next, ArraysCache
+        layers) cannot have their cache safely persisted across requests —
+        cross-request reuse crashes mlx-lm with a GPU stream error.
+
+        When supports_cache_persistence=False, skip storage entirely and remove
+        any prior entry from the store.  Within-request cache reuse during
+        generation continues to work normally.
+        """
+        from olmlx.engine.inference import _store_prompt_cache_after_generation
+
+        mock_lm.supports_cache_trim = False
+        mock_lm.supports_cache_persistence = False
+        cache = MagicMock()
+        gen_kwargs = {"prompt_cache": cache}
+        with patch("olmlx.engine.inference.settings") as mock_settings:
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.memory_limit_fraction = 0.9
+            await _store_prompt_cache_after_generation(
+                mock_lm, gen_kwargs, [1, 2, 3], [4, 5], 2, "test"
+            )
+
+        mock_lm.prompt_cache_store.async_set.assert_not_awaited()
+        mock_lm.prompt_cache_store.remove.assert_called_once_with("test")
+
 
 class TestInferenceTimeout:
     @pytest.mark.asyncio

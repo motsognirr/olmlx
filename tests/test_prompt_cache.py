@@ -376,8 +376,19 @@ class _FakeKVCache:
         return True
 
 
+class _FakeArraysCache:
+    """Stand-in for mlx-lm's ArraysCache (matched by class name).
+
+    Used by hybrid SSM-style layers (Qwen3.5/Qwen3-Next gated_delta).
+    """
+
+    def is_trimmable(self) -> bool:  # noqa: D401 — matches real API
+        return False
+
+
 _FakeKVCache.__name__ = "KVCache"
 _FakeRotatingKVCache.__name__ = "RotatingKVCache"
+_FakeArraysCache.__name__ = "ArraysCache"
 
 
 class TestCacheTrimProbe:
@@ -447,6 +458,46 @@ class TestCacheTrimProbe:
             f"{sorted(missing)}.  Either remove them or confirm the class "
             f"exists in the installed mlx-lm version."
         )
+
+
+class TestCachePersistenceProbe:
+    """Issue #284: ArraysCache layers (hybrid SSM-style models like Qwen3.5,
+    Qwen3-Next) cannot be safely persisted across inference invocations.
+
+    The bug: a stored cache containing ArraysCache state crashes on the next
+    request with "RuntimeError: There is no Stream(gpu, N) in current thread"
+    when mlx-lm calls ``mx.eval([c.state for c in prompt_cache])`` during
+    chunked prefill.  Skipping storage for these models avoids the crash.
+    """
+
+    def test_pure_kvcache_supports_persistence(self):
+        from olmlx.engine.model_manager import _cache_supports_persistence
+
+        assert _cache_supports_persistence([_FakeKVCache(), _FakeKVCache()]) is True
+
+    def test_kvcache_plus_rotating_supports_persistence(self):
+        """Gemma 4 / hybrid sliding-window models still benefit from
+        strict-extension cache reuse — only ArraysCache is unsafe."""
+        from olmlx.engine.model_manager import _cache_supports_persistence
+
+        assert (
+            _cache_supports_persistence([_FakeKVCache(), _FakeRotatingKVCache()])
+            is True
+        )
+
+    def test_arrays_cache_breaks_persistence(self):
+        from olmlx.engine.model_manager import _cache_supports_persistence
+
+        # Hybrid linear+full attention: ArraysCache for SSM layers,
+        # KVCache for full-attention layers (Qwen3.5/Qwen3-Next layout).
+        assert (
+            _cache_supports_persistence([_FakeArraysCache(), _FakeKVCache()]) is False
+        )
+
+    def test_arrays_cache_only_breaks_persistence(self):
+        from olmlx.engine.model_manager import _cache_supports_persistence
+
+        assert _cache_supports_persistence([_FakeArraysCache()]) is False
 
 
 class TestNonTrimmableModelSkipsTrim:
