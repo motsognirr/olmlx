@@ -1975,8 +1975,12 @@ async def _setup_prompt_cache(
         # (b) trim-fallback above.  In the trim-fallback path the
         # cache was already removed before the trim attempt — this
         # remove is then a harmless no-op (PromptCacheStore.remove
-        # is idempotent).  Kept for the cache-miss path.
-        lm.prompt_cache_store.remove(cache_id)
+        # is idempotent).  Kept for the cache-miss path.  Skip for
+        # non-persistable models — the lookup branch above already
+        # called remove() and a second call would issue a redundant
+        # blocking unlink on every request.
+        if lm.supports_cache_persistence:
+            lm.prompt_cache_store.remove(cache_id)
         new_cache = _make_prompt_cache_for_lm(lm)
         gen_kwargs["prompt_cache"] = new_cache
         result.cache_creation_tokens = len(prompt_tokens)
