@@ -1456,6 +1456,12 @@ def _normalize_tool_calls_in_messages(messages: list[dict]) -> list[dict]:
     for m in messages:
         if m.get("role") == "assistant" and m.get("tool_calls"):
             m = dict(m)
+            # Templates (Qwen3, Llama3, ...) access message.content directly;
+            # OpenAI clients send content=null on tool-call assistant messages
+            # and the router strips None via exclude_none=True, leaving the
+            # key absent. Coerce to "" so the template can render.
+            if m.get("content") is None:
+                m["content"] = ""
             normalised = []
             for tc in m["tool_calls"]:
                 fn = tc.get("function", tc)
