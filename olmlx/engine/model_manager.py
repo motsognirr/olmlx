@@ -1423,8 +1423,13 @@ class ModelManager:
             # ArraysCache crashes the next request (issue #284) — so default
             # to False on probe failure.  Worst case we lose cross-request
             # cache reuse for a model that didn't need protection.
-            logger.debug(
-                "Cache-trim probe failed for %s; assuming trimmable, non-persistable",
+            # Logged at WARNING because the consequence — cross-request
+            # cache reuse silently disabled for this model — would be hard
+            # to diagnose from DEBUG output alone.
+            logger.warning(
+                "Cache probe raised an exception for %s; defaulting to "
+                "trimmable, non-persistable. Cross-request prompt cache "
+                "reuse is disabled for this model.",
                 lm.name,
                 exc_info=True,
             )

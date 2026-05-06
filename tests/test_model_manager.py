@@ -411,18 +411,14 @@ class TestDetectModelKind:
         )
         manager = self._make_manager(registry, mock_store)
 
-        # Stub the import machinery so importing MODEL_REMAPPING fails.
-        import builtins
-
-        real_import = builtins.__import__
-
-        def import_blocking_mlx_lm_utils(name, *args, **kwargs):
-            if name == "mlx_lm.utils":
-                raise ImportError("simulated older mlx-lm without MODEL_REMAPPING")
-            return real_import(name, *args, **kwargs)
-
+        # Setting sys.modules["mlx_lm.utils"] = None makes Python raise
+        # ImportError on subsequent ``from mlx_lm.utils import ...``
+        # statements, regardless of whether mlx_lm.utils was already
+        # imported in the test environment.  Patching builtins.__import__
+        # alone wouldn't work because the cached module would be returned
+        # without ever calling the patched __import__.
         with patch("huggingface_hub.hf_hub_download", return_value=config_path):
-            with patch("builtins.__import__", side_effect=import_blocking_mlx_lm_utils):
+            with patch.dict("sys.modules", {"mlx_lm.utils": None}):
                 kind = manager._detect_model_kind("test/qwen3_5")
         assert kind == "unknown"
 
