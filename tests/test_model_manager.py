@@ -393,6 +393,39 @@ class TestDetectModelKind:
                 kind = manager._detect_model_kind("test/future_hybrid_vlm")
         assert kind == "unknown"
 
+    def test_hybrid_linear_attention_vlm_returns_unknown_when_mlx_lm_import_fails(
+        self, tmp_path, registry, mock_store
+    ):
+        """Issue #284: when ``from mlx_lm.utils import MODEL_REMAPPING``
+        raises ImportError (older mlx-lm without that export, or mlx-lm
+        absent), the discriminator has already fired so falling through to
+        the mlx-vlm verification block would route to a known-broken
+        loader.  Return 'unknown' instead."""
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "qwen3_5",
+                "vision_config": {"hidden_size": 1024},
+                "text_config": {"layer_types": ["linear_attention", "full_attention"]},
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        # Stub the import machinery so importing MODEL_REMAPPING fails.
+        import builtins
+
+        real_import = builtins.__import__
+
+        def import_blocking_mlx_lm_utils(name, *args, **kwargs):
+            if name == "mlx_lm.utils":
+                raise ImportError("simulated older mlx-lm without MODEL_REMAPPING")
+            return real_import(name, *args, **kwargs)
+
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            with patch("builtins.__import__", side_effect=import_blocking_mlx_lm_utils):
+                kind = manager._detect_model_kind("test/qwen3_5")
+        assert kind == "unknown"
+
     def test_standard_vlm_without_linear_attention_stays_vlm(
         self, tmp_path, registry, mock_store
     ):

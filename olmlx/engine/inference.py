@@ -2130,9 +2130,11 @@ async def _store_prompt_cache_after_generation(
     # across requests — the next prefill crashes mlx-lm with a Metal stream
     # error.  Skip storage entirely; the next request will run a fresh
     # prefill.  Drop any prior entry too, since the mutable cache object
-    # may have been shared with the store on a previous turn.
+    # may have been shared with the store on a previous turn.  Offload the
+    # disk-unlink path to a worker thread to match the rest of the
+    # PromptCacheStore async wrappers and keep the event loop free.
     if not lm.supports_cache_persistence:
-        lm.prompt_cache_store.remove(cache_id)
+        await asyncio.to_thread(lm.prompt_cache_store.remove, cache_id)
         logger.debug(
             "Cache not persistable (hybrid SSM/ArraysCache); "
             "skipping cross-request storage for %s",

@@ -1199,7 +1199,18 @@ class ModelManager:
                         )
                         return "unknown"
                     except (ImportError, ModuleNotFoundError):
-                        pass
+                        # mlx-lm absent or restructured.  Same reasoning as
+                        # the no-module branch above: the discriminator has
+                        # already fired, so falling through to the mlx-vlm
+                        # path would route to a known-broken loader.
+                        logger.warning(
+                            "mlx_lm.utils.MODEL_REMAPPING unavailable; "
+                            "cannot safely route hybrid linear-attention "
+                            "VLM '%s' through mlx-vlm (issue #284). "
+                            "Returning 'unknown' for fallback.",
+                            model_type,
+                        )
+                        return "unknown"
 
             # Verify mlx-vlm can handle it
             try:
