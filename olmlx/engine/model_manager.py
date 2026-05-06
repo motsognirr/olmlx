@@ -1471,8 +1471,15 @@ class ModelManager:
         probe_cache: list | None = None
         try:
             probe_cache = make_prompt_cache(cache_model)
-            lm.supports_cache_trim = _cache_supports_trim(probe_cache)
-            lm.supports_cache_persistence = _cache_supports_persistence(probe_cache)
+            # Stage both results before assigning so a hypothetical raise
+            # in either probe doesn't leave one flag set and the other
+            # falling into the except handler's defaults.  Currently both
+            # probes are pure string-set lookups that can't raise, but the
+            # pattern is cheap and removes the ordering dependency.
+            trim_ok = _cache_supports_trim(probe_cache)
+            persist_ok = _cache_supports_persistence(probe_cache)
+            lm.supports_cache_trim = trim_ok
+            lm.supports_cache_persistence = persist_ok
         except Exception:
             # Best-effort probe; on failure assume trim works so the
             # request path's existing partial-trim fallback handles it.
