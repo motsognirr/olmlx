@@ -1258,10 +1258,15 @@ class ModelManager:
                             f"Metal stream error. Ensure mlx-lm with the "
                             f"matching text-only module is installed."
                         )
-                    except ImportError as exc:
-                        # mlx-lm absent or restructured.  Same reasoning
-                        # as the no-module branch: raise at load time
-                        # rather than defer to a known-broken loader.
+                    except (ImportError, AttributeError) as exc:
+                        # mlx-lm absent or restructured.  Catching
+                        # AttributeError too because if MODEL_REMAPPING
+                        # imports as something that isn't a dict, the
+                        # ``LM_REMAP.get(...)`` call would raise
+                        # AttributeError uncaught — defeating the
+                        # discriminator the same way an ImportError
+                        # would.  Either way: raise at load time rather
+                        # than defer to a known-broken loader.
                         raise ValueError(
                             f"Model '{hf_path}' (model_type '{model_type}') "
                             f"uses hybrid linear-attention layers (issue "

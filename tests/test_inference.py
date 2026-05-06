@@ -3923,6 +3923,11 @@ class TestKvCachePreflightCheckHelper:
         # still runs so other in-memory entries are flushed.
         mock_lm.prompt_cache_store.async_set.assert_not_awaited()
         mock_lm.prompt_cache_store.async_evict_all_to_disk.assert_awaited_once()
+        # Critical: remove(cache_id) must be called so any stale on-disk
+        # entry is gone before evict_all_to_disk runs — otherwise the
+        # eviction would persist the stale ArraysCache state and the
+        # next request would load it and crash (regressing the fix).
+        mock_lm.prompt_cache_store.remove.assert_called_once_with("test")
 
 
 class TestStorePromptCacheAfterGeneration:
