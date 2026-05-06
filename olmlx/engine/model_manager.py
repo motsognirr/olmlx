@@ -1481,6 +1481,7 @@ class ModelManager:
             getattr(lm.model, "language_model", lm.model) if lm.is_vlm else lm.model
         )
         probe_cache: list | None = None
+        probe_succeeded = False
         try:
             probe_cache = make_prompt_cache(cache_model)
             # Stage both results before assigning so a hypothetical raise
@@ -1492,6 +1493,7 @@ class ModelManager:
             persist_ok = _cache_supports_persistence(probe_cache)
             lm.supports_cache_trim = trim_ok
             lm.supports_cache_persistence = persist_ok
+            probe_succeeded = True
         except Exception:
             # Best-effort probe; on failure assume trim works so the
             # request path's existing partial-trim fallback handles it.
@@ -1523,7 +1525,12 @@ class ModelManager:
                 "prompt cache will only be reused for strict-extension turns.",
                 lm.name,
             )
-        if not lm.supports_cache_persistence:
+        # Only describe the cache layout reason when the probe actually
+        # inspected it.  The probe-failure path already emits its own
+        # WARNING above with the real cause; this INFO would otherwise
+        # misattribute the disable to ArraysCache when it was an
+        # exception in make_prompt_cache or the classification helpers.
+        if not lm.supports_cache_persistence and probe_succeeded:
             logger.info(
                 "Model %s uses a non-persistable hybrid cache (ArraysCache, "
                 "gated-delta SSM state); prompt cache will not be stored "
