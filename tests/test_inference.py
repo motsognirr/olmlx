@@ -1019,6 +1019,62 @@ class TestNormalizeToolCallsInMessages:
         result = _normalize_tool_calls_in_messages(messages)
         assert result[0]["tool_calls"][0]["arguments"] == {}
 
+    def test_assistant_tool_calls_missing_content_coerced_to_empty(self):
+        """Assistant messages with tool_calls but no content key (e.g. from
+        OpenAI router's model_dump(exclude_none=True) when client sends
+        canonical content=null) must get content="" so chat templates that
+        access message.content (Qwen3, Llama3, etc.) don't fail."""
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+        result = _normalize_tool_calls_in_messages(messages)
+        assert result[0]["content"] == ""
+
+    def test_assistant_tool_calls_none_content_coerced_to_empty(self):
+        """Same coercion when content is explicitly None."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+        result = _normalize_tool_calls_in_messages(messages)
+        assert result[0]["content"] == ""
+
+    def test_assistant_tool_calls_existing_content_preserved(self):
+        """Non-empty content on assistant tool-call messages is preserved."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Let me check.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+        result = _normalize_tool_calls_in_messages(messages)
+        assert result[0]["content"] == "Let me check."
+
 
 class TestGemma4TemplateOrdering:
     """Document Gemma 4 template ordering: system prompt before tool declarations.
