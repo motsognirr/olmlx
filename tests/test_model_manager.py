@@ -522,6 +522,25 @@ class TestProbeCacheCapabilities:
         lm.supports_cache_trim = False
         return lm
 
+    def test_probe_empty_cache_list_disables_persistence(self, registry, mock_store):
+        """If ``make_prompt_cache`` returns an empty list (a degenerate model
+        with no cache layers), ``_cache_supports_persistence`` returns
+        False — there's no evidence the cache layout is safe — and the
+        probe leaves persistence disabled.  Trim's vacuous-True for the
+        same input is fine because trim has a graceful fallback;
+        persistence does not."""
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+
+        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]):
+            manager._probe_cache_capabilities(lm)
+
+        # Trim is vacuously True — trim of an empty cache is a no-op
+        # that mlx-lm handles cleanly, so leaving the flag True is fine.
+        assert lm.supports_cache_trim is True
+        # Persistence: no evidence of safety → False.
+        assert lm.supports_cache_persistence is False
+
     def test_probe_failure_warns_and_disables_persistence(
         self, registry, mock_store, caplog
     ):

@@ -1983,8 +1983,8 @@ async def _setup_prompt_cache(
         # remove is then a harmless no-op (PromptCacheStore.remove
         # is idempotent).  Kept for the cache-miss path.  Skip for
         # non-persistable models — the lookup branch above already
-        # called remove() and a second call would issue a redundant
-        # blocking unlink on every request.
+        # ran the (peek-gated) cleanup, so any further remove() here
+        # would be redundant disk I/O on the event loop hot path.
         if lm.supports_cache_persistence:
             lm.prompt_cache_store.remove(cache_id)
         new_cache = _make_prompt_cache_for_lm(lm)

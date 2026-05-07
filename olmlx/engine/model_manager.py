@@ -1276,13 +1276,18 @@ class ModelManager:
                     # clear load-time error rather than a silent Metal
                     # stream crash mid-inference.
                     raise ValueError(
-                        f"Model '{hf_path}' (model_type '{model_type}', "
-                        f"text_config.model_type '{text_model_type}') "
-                        f"uses hybrid linear-attention layers (issue "
-                        f"#284) but no mlx-lm module was found. "
-                        f"Loading through mlx-vlm would crash with a "
-                        f"Metal stream error. Ensure mlx-lm with the "
-                        f"matching text-only module is installed."
+                        f"Cannot load '{hf_path}': it has hybrid "
+                        f"linear-attention layers (model_type "
+                        f"'{model_type}', text_config.model_type "
+                        f"'{text_model_type}') but mlx-lm has no module "
+                        f"named 'mlx_lm.models.{mapped_lm}'.  Loading "
+                        f"through mlx-vlm would crash with a Metal "
+                        f"stream error (issue #284).  Upgrade mlx-lm to "
+                        f"a version that ships the matching text-only "
+                        f"module, or — if a future mlx-vlm release has "
+                        f"fixed this for the model — relax the "
+                        f"discriminator in olmlx/engine/model_manager.py "
+                        f"_detect_model_kind."
                     )
 
             # Verify mlx-vlm can handle it
