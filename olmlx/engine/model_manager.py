@@ -1605,12 +1605,15 @@ class ModelManager:
                 lm.name,
             )
         # One-pass cleanup of any stale pre-PR on-disk entries for this
-        # model.  Run unconditionally on persistence=False — including the
-        # probe-failure path, where stale files would otherwise sit on
-        # disk indefinitely until the disk-size eviction got to them.
-        # They're harmless (the request path bypasses async_get for
-        # non-persistable models) but they consume disk space.
-        if not lm.supports_cache_persistence:
+        # model.  Gated on BOTH probe_succeeded and not-persistable so we
+        # only wipe disk when we KNOW the model is non-persistable.  On a
+        # probe-failure path, supports_cache_persistence is False as a
+        # safe default but the model may be genuinely persistable —
+        # deleting its disk cache because of a transient probe failure
+        # (e.g. import error during make_prompt_cache, OOM) would
+        # destroy valid cached prefixes.  Stale pre-PR files on a probe-
+        # failure model are handled by the existing disk-size eviction.
+        if probe_succeeded and not lm.supports_cache_persistence:
             try:
                 removed = lm.prompt_cache_store.clear_disk()
                 if removed:
