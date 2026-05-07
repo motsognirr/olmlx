@@ -74,6 +74,10 @@ def mock_loaded_model():
         tokenizer=tokenizer,
         is_vlm=False,
         template_caps=TemplateCaps(supports_tools=True, supports_enable_thinking=True),
+        # supports_cache_persistence defaults to False (issue #284 safety
+        # default).  This fixture stands in for a normal text model whose
+        # KV cache is safe to persist, so opt in explicitly.
+        supports_cache_persistence=True,
     )
 
 
