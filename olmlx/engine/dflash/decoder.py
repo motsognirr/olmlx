@@ -246,8 +246,6 @@ class _GDNStateCapture:
             raise
 
     def _patch(self) -> None:
-        from mlx.nn.layers.distributed import sum_gradients
-
         gdn_cls = self._gdn_cls
         self._orig_call = gdn_cls.__call__
         capture = self
@@ -255,7 +253,15 @@ class _GDNStateCapture:
 
         def _capturing_gdn_call(self_layer, inputs, mask=None, cache=None):  # type: ignore[no-untyped-def]
             B, S, _ = inputs.shape
-            if self_layer.sharding_group is not None:
+            # ``sharding_group`` is only set when the model is sharded for
+            # distributed inference; it is initialised to ``None`` on the
+            # standard ``GatedDeltaNet`` and may be entirely absent on a
+            # third-party GDN subclass — ``getattr`` covers both. The
+            # ``sum_gradients`` import is also deferred so non-distributed
+            # builds don't pay for it.
+            if getattr(self_layer, "sharding_group", None) is not None:
+                from mlx.nn.layers.distributed import sum_gradients
+
                 # ``sum_gradients`` returns an ``mx.custom_function``-decorated
                 # callable whose pyright-inferred signature picks up the inner
                 # ``vjp(x, dx, _)``; the runtime call takes a single tensor.
@@ -324,7 +330,7 @@ class _GDNStateCapture:
                 cache[1] = new_state
             out = self_layer.norm(out, z)
             out = self_layer.out_proj(out.reshape(B, S, -1))
-            if self_layer.sharding_group is not None:
+            if getattr(self_layer, "sharding_group", None) is not None:
                 out = mx.distributed.all_sum(out, group=self_layer.sharding_group)
             return out
 
@@ -381,6 +387,16 @@ class _GDNStateCapture:
                 "DFlash rollback assumes every non-trimmable cache is a "
                 "GatedDeltaNet layer"
             )
+        # Ordering invariant: ``_gdn_inputs`` and ``conv_data`` are
+        # populated in the order the verification forward pass invokes
+        # ``_capturing_gdn_call``, which must match the order in which
+        # ``cache`` was built by ``make_prompt_cache``. mlx-lm walks
+        # ``model.layers`` in index order in both cases, so the j-th
+        # captured input lines up with the j-th non-trimmable cache.
+        # If a future hybrid model visits layers out of cache order
+        # (tied layers, model-parallel reordering), this loop would
+        # silently apply state to the wrong slot — the count check
+        # above only catches mismatched cardinality, not ordering.
         j = 0
         for c in cache:
             if c.is_trimmable():
@@ -400,11 +416,17 @@ class _GDNStateCapture:
                     None if mask is None else mask[:, :n],
                     use_kernel=True,
                 )
-                # Use the public ``__setitem__`` API to match the
-                # ``cache[i] = ...`` writes in ``_capturing_gdn_call``;
-                # both forms hit ``ArraysCache.cache`` today, but going
-                # through ``__setitem__`` is forward-compatible if mlx-lm
-                # adds validation or lazy semantics there.
+                # Cache layout: mlx-lm's GDN models build the per-layer
+                # cache as ``ArraysCache(size=2)`` with index 0 holding
+                # the conv state and index 1 holding the delta state
+                # (mirrors ``mlx_lm.models.qwen3_5`` line 148+). The same
+                # convention is used by ``_capturing_gdn_call``'s writes
+                # above, so the two stay in lockstep. If a future GDN
+                # variant rearranges the tuple, both halves of this
+                # module need updating together. Going through the
+                # public ``__setitem__`` (``c[i] = ...``) instead of
+                # ``c.cache[i]`` is forward-compatible if mlx-lm adds
+                # validation or lazy semantics to the cache.
                 c[1] = state
                 conv_input, K = self.conv_data[j]
                 c[0] = conv_input[:, accepted + 1 : accepted + K]
