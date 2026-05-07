@@ -104,11 +104,11 @@ def stream_training_batches(
     unavailable or the dataset can't be opened — this keeps tests
     deterministic without network access.
     """
-    pad_token_id = (
-        getattr(tokenizer, "pad_token_id", None)
-        or getattr(tokenizer, "eos_token_id", None)
-        or 0
-    )
+    # ``or`` would short-circuit on token ID 0, which is the standard pad
+    # token for Llama 2 / Mistral / Qwen 1.x — fall through only on None.
+    _pad = getattr(tokenizer, "pad_token_id", None)
+    _eos = getattr(tokenizer, "eos_token_id", None)
+    pad_token_id = _pad if _pad is not None else (_eos if _eos is not None else 0)
 
     def _tokenize(text: str) -> list[int] | None:
         try:
@@ -153,8 +153,9 @@ def stream_training_batches(
             # Top up the final partial batch by recycling earlier examples
             # rather than emitting an undersized batch (which would break
             # static-shape assumptions in the training loop).
+            orig = len(batch)
             while len(batch) < batch_size:
-                batch.append(batch[len(batch) % max(1, len(batch))])
+                batch.append(batch[len(batch) % orig])
             yield _emit(batch)
         return
 
