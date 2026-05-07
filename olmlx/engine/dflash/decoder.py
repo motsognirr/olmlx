@@ -263,6 +263,18 @@ class _GDNStateCapture:
         capture = self
         assert _gd_mod is not None  # guarded by _HAS_GDN
 
+        # WARNING: ``_capturing_gdn_call`` MUST stay bit-for-bit in sync
+        # with ``mlx_lm.models.qwen3_5.GatedDeltaNet.__call__`` (which
+        # ``mlx_lm.models.qwen3_5_moe`` reuses). If mlx-lm changes the
+        # GDN forward — adds an argument to ``gated_delta_update``,
+        # changes the conv-state buffer shape, introduces a bias, or
+        # reorders the projection calls — inference still uses the
+        # patched ``__call__``, but ``_gdn_inputs`` / ``conv_data``
+        # captured here will no longer reflect what ran, and
+        # ``rollback`` will replay a different operation than the
+        # forward pass. The result is silent generation corruption.
+        # When bumping mlx-lm: diff this closure against
+        # ``GatedDeltaNet.__call__`` and update both halves together.
         def _capturing_gdn_call(self_layer, inputs, mask=None, cache=None):  # type: ignore[no-untyped-def]
             B, S, _ = inputs.shape
             # ``sharding_group`` is only set when the model is sharded for
@@ -545,10 +557,17 @@ class DFlashDecoder:
         self.reset()
 
         target_layer_ids = list(self._config.target_layer_ids)
+        # Build the target cache before patching: ``make_prompt_cache``
+        # walks ``model.layers`` to pick a per-layer cache type (sliding
+        # vs. full attention) by probing the layer object. Today it uses
+        # ``hasattr``, which ``_LayerHook.__getattr__`` proxies through,
+        # but a future ``isinstance`` check would silently get the wrong
+        # cache type for patched layers. Doing the cache build first
+        # decouples cache selection from the patch.
+        self._target_cache = make_prompt_cache(self._target)
         _patch_model(self._target, target_layer_ids)
         self._draft.bind(self._target)
 
-        self._target_cache = make_prompt_cache(self._target)
         # Call the draft's own ``make_cache`` directly. ``make_prompt_cache``
         # would defer to it via ``hasattr(model, "make_cache")`` today, but
         # going through the public method keeps the per-layer
@@ -602,12 +621,20 @@ class DFlashDecoder:
         draft_logits = self._draft(
             block, self._hidden, self._draft_cache, logits_start=1
         )
-        # Trim draft cache so its offset matches `prompt_size + n_generated - 1`.
-        # Past tokens whose hiddens were partially rejected get dropped.
+        # Invariant: the draft cache stores exactly the context tokens
+        # corresponding to ``prompt_size + n_generated - 1`` target
+        # positions (the draft processes ``S = _hidden.shape[1]`` ctx
+        # tokens per step, equal to the previous step's ``num_accepted``,
+        # so its offset advances in lockstep with ``_n_generated``). If
+        # it ever drifts, it is a bookkeeping bug — surface loudly
+        # rather than silently masking with a trim.
         draft_offset = self._draft_cache[0].offset
         target_offset = self._prompt_size + self._n_generated - 1
-        if draft_offset > target_offset:
-            _trim_recent_cache(self._draft_cache, draft_offset - target_offset)
+        if draft_offset != target_offset:
+            raise RuntimeError(
+                f"Draft cache offset ({draft_offset}) drifted from expected "
+                f"target offset ({target_offset}); DFlash bookkeeping bug."
+            )
         draft_tokens_arr = mx.argmax(draft_logits, axis=-1)
         mx.eval(draft_tokens_arr)
         # ``mx.array.tolist()`` is typed as ``list_or_scalar``; for a 1-D
