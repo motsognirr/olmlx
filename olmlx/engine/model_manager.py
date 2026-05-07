@@ -465,6 +465,28 @@ class PromptCacheStore:
         if self._disk_enabled:
             self._disk_file_path(cache_id).unlink(missing_ok=True)
 
+    def clear_disk(self) -> int:
+        """Remove all on-disk entries for this store's model namespace.
+
+        Returns the number of files removed.  Used at probe time for
+        non-persistable models to clean up stale pre-PR data that would
+        otherwise sit on disk indefinitely (issue #284).  Caller must
+        also call ``clear()`` if they want to drop the in-memory entries.
+        """
+        if not self._disk_enabled or self._disk_path is None:
+            return 0
+        disk_dir = self._disk_dir()
+        if not disk_dir.exists():
+            return 0
+        removed = 0
+        for f in disk_dir.glob("*.safetensors"):
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                logger.debug("Failed to remove stale disk cache %s", f, exc_info=True)
+        return removed
+
     def evict_all_to_disk(self) -> None:
         """Save all in-memory entries to disk, then clear memory.
 
@@ -1247,8 +1269,9 @@ class ModelManager:
                             f"Model '{hf_path}' (model_type '{model_type}') "
                             f"uses hybrid linear-attention layers (issue "
                             f"#284) but mlx_lm.utils.MODEL_REMAPPING is "
-                            f"unavailable. Loading through mlx-vlm would "
-                            f"crash with a Metal stream error."
+                            f"unavailable or not a mapping. Loading "
+                            f"through mlx-vlm would crash with a Metal "
+                            f"stream error."
                         ) from exc
 
                     # Hybrid VLMs (Qwen3.5) carry the model architecture in
@@ -1275,19 +1298,33 @@ class ModelManager:
                     # models; raise at detection time so the user sees a
                     # clear load-time error rather than a silent Metal
                     # stream crash mid-inference.
+                    text_mt_present = "model_type" in text_cfg
                     raise ValueError(
                         f"Cannot load '{hf_path}': it has hybrid "
                         f"linear-attention layers (model_type "
-                        f"'{model_type}', text_config.model_type "
-                        f"'{text_model_type}') but mlx-lm has no module "
-                        f"named 'mlx_lm.models.{mapped_lm}'.  Loading "
-                        f"through mlx-vlm would crash with a Metal "
-                        f"stream error (issue #284).  Upgrade mlx-lm to "
-                        f"a version that ships the matching text-only "
-                        f"module, or — if a future mlx-vlm release has "
-                        f"fixed this for the model — relax the "
-                        f"discriminator in olmlx/engine/model_manager.py "
-                        f"_detect_model_kind."
+                        f"'{model_type}', "
+                        + (
+                            f"text_config.model_type '{text_model_type}'"
+                            if text_mt_present
+                            else f"text_config.model_type missing — fell "
+                            f"back to top-level '{text_model_type}'"
+                        )
+                        + f") but mlx-lm has no module named "
+                        f"'mlx_lm.models.{mapped_lm}'.  Loading through "
+                        f"mlx-vlm would crash with a Metal stream error "
+                        f"(issue #284).  Upgrade mlx-lm to a version "
+                        f"that ships the matching text-only module"
+                        + (
+                            ""
+                            if text_mt_present
+                            else " (or add 'model_type' to text_config "
+                            "in the model's config.json if it points to "
+                            "a different mlx-lm architecture)"
+                        )
+                        + ", or — if a future mlx-vlm release has fixed "
+                        "this for the model — relax the discriminator "
+                        "in olmlx/engine/model_manager.py "
+                        "_detect_model_kind."
                     )
 
             # Verify mlx-vlm can handle it
@@ -1548,6 +1585,28 @@ class ModelManager:
                 "stored across requests (issue #284).",
                 lm.name,
             )
+            # One-pass cleanup of any stale pre-PR on-disk entries for
+            # this model.  Without this, pre-PR ArraysCache files would
+            # sit on disk indefinitely until the disk size eviction got
+            # to them.  They're harmless (the request path bypasses
+            # async_get for non-persistable models) but they consume
+            # disk space.
+            try:
+                removed = lm.prompt_cache_store.clear_disk()
+                if removed:
+                    logger.info(
+                        "Removed %d stale on-disk prompt cache file(s) for "
+                        "non-persistable model %s",
+                        removed,
+                        lm.name,
+                    )
+            except Exception:
+                logger.debug(
+                    "clear_disk failed for %s; non-persistable cleanup "
+                    "deferred to disk-size eviction",
+                    lm.name,
+                    exc_info=True,
+                )
 
     def _find_spectral_dir(
         self, hf_path: str, kv_cache_quant: str | None
