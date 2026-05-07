@@ -49,7 +49,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import mlx.utils as mx_utils
 
-from olmlx.engine.dflash.decoder import _patch_model, _unpatch_model
+from olmlx.engine.dflash.decoder import _get_layers, _patch_model, _unpatch_model
 from olmlx.engine.dflash.draft_model import DFlashDraftModel, DraftConfig
 from olmlx.engine.dflash.training_data import stream_training_batches
 
@@ -116,7 +116,14 @@ def _resolve_target_layer_ids(
                     f"target_layer_ids contains {lid}, out of range "
                     f"[0, {target_num_layers})"
                 )
-        return list(requested)
+        # Duplicates would double-wrap a layer in ``_LayerHook`` and leak
+        # the wrapper through ``_unpatch_model`` (which only strips one
+        # level), corrupting hidden-state captures.
+        if len(set(requested)) != len(requested):
+            raise ValueError(
+                f"target_layer_ids contains duplicate indices: {requested}"
+            )
+        return sorted(requested)
     k = num_target_layers or DEFAULT_NUM_HIDDEN_LAYERS
     return _evenly_spaced(target_num_layers, k)
 
@@ -336,10 +343,15 @@ def prepare_dflash_draft(
     if hasattr(target, "freeze"):
         target.freeze()
 
-    target_layers_attr = (
-        target.layers if hasattr(target, "layers") else target.model.layers
-    )
-    target_num_layers = len(target_layers_attr)
+    # Reuse ``_get_layers`` so the layer-count probe stays in sync with
+    # ``_patch_model`` — covers VLM targets (``language_model.layers``).
+    try:
+        target_num_layers = len(_get_layers(target))
+    except AttributeError as exc:
+        raise ValueError(
+            f"Cannot determine layer count for target model "
+            f"{type(target).__name__}: {exc}"
+        ) from exc
 
     layer_ids = _resolve_target_layer_ids(
         target_layer_ids, num_target_layers, target_num_layers
@@ -347,11 +359,12 @@ def prepare_dflash_draft(
     logger.info("DFlash target_layer_ids = %s", layer_ids)
 
     if mask_token_id is None:
-        mask_token_id = (
-            getattr(tokenizer, "pad_token_id", None)
-            or getattr(tokenizer, "eos_token_id", None)
-            or 0
-        )
+        # ``or`` would short-circuit on token ID 0 (a valid pad id for
+        # Llama 2 / Mistral / Qwen 1.x), silently picking EOS as the
+        # mask id and misaligning training vs. inference.
+        _pad = getattr(tokenizer, "pad_token_id", None)
+        _eos = getattr(tokenizer, "eos_token_id", None)
+        mask_token_id = _pad if _pad is not None else (_eos if _eos is not None else 0)
 
     draft_config = _build_draft_config(
         target_cfg,
