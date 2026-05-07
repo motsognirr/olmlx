@@ -17,11 +17,22 @@ Pipeline mirrors ``engine/flash/prepare.py``:
    schema so ``_load_dflash_decoder`` can consume the result without
    any further translation.
 
-This v1 trains on **one random window per sequence per step**. That
+Trains on **one random window per sequence per step**. That
 under-uses each target forward pass (one window vs. potentially
 ``L - block_size`` windows) but keeps the loss/grad surface tiny and
-debuggable. Sharded hidden-state precompute and KL distillation land
-in PR #3.
+debuggable.
+
+Two acceleration paths are available:
+
+- ``distill=True`` adds a Hinton-style KL term against the target's
+  logits at the masked positions: ``(1 - alpha) * CE + alpha * T^2 *
+  KL``. The target forward already runs to capture hiddens, so
+  capturing logits is free.
+- ``use_precomputed=<dir>`` reads precomputed
+  ``(input_ids, target_hidden)`` shards from disk (produced by
+  ``engine/dflash/precompute.py``) instead of running the target each
+  step. Mutually exclusive with ``distill`` because precomputed shards
+  do not store vocab-size logits.
 """
 
 from __future__ import annotations
@@ -163,26 +174,35 @@ def _build_draft_config(
 # ---------------------------------------------------------------------------
 
 
-def _capture_target_hidden(
+def _capture_target_outputs(
     target: nn.Module,
     inputs: mx.array,
     cache: list[Any] | None,
-) -> mx.array:
-    """Run target on ``inputs`` and return the concatenated hidden states.
+    *,
+    capture_logits: bool,
+) -> tuple[mx.array, mx.array | None]:
+    """Run target on ``inputs`` and return ``(hidden, logits | None)``.
 
-    Assumes ``_patch_model`` has been installed. The returned tensor has
-    shape ``(B, L, num_target_layers * hidden_size)`` and is detached
-    via ``mx.stop_gradient`` — the target is frozen during draft
-    training.
+    Assumes ``_patch_model`` has been installed. ``hidden`` has shape
+    ``(B, L, num_target_layers * hidden_size)``. ``logits`` is captured
+    only when ``capture_logits=True`` (KL distillation needs them); the
+    pure-CE path skips it to avoid materializing the vocab-size tensor.
+    Both outputs are detached via ``mx.stop_gradient`` — the target is
+    frozen during draft training.
     """
-    target(inputs, cache=cache)
+    out = target(inputs, cache=cache)
     captured = list(target._hidden_states)  # type: ignore[attr-defined]
     if any(h is None for h in captured):
         raise RuntimeError(
             "Target forward did not populate all configured target_layer_ids"
         )
-    hidden = mx.concatenate(captured, axis=-1)
-    return mx.stop_gradient(hidden)
+    hidden = mx.stop_gradient(mx.concatenate(captured, axis=-1))
+    logits: mx.array | None = None
+    if capture_logits:
+        # mlx-vlm wraps logits in a dataclass; mlx-lm returns the raw array.
+        raw = getattr(out, "logits", out)
+        logits = mx.stop_gradient(raw)
+    return hidden, logits
 
 
 def _draft_loss(
@@ -191,20 +211,44 @@ def _draft_loss(
     target_hidden: mx.array,
     targets: mx.array,
     cache: list[Any],
+    target_logits_window: mx.array | None = None,
+    distill_alpha: float = 0.0,
+    distill_temp: float = 1.0,
 ) -> mx.array:
-    """Cross-entropy loss on the masked positions only.
+    """Loss on the masked positions: cross-entropy + optional KL distillation.
 
     ``block_input`` has shape ``(B, block_size + 1)`` — position 0 is
     the visible pending token, positions 1..block_size are MASK.
-    ``logits_start=1`` slices the position-0 logit out so logits has
-    shape ``(B, block_size, vocab)``. ``targets`` has shape
+    ``logits_start=1`` slices the position-0 logit out so draft logits
+    has shape ``(B, block_size, vocab)``. ``targets`` has shape
     ``(B, block_size)`` and contains the original (unmasked) tokens.
+
+    When ``target_logits_window`` is provided (also shape ``(B,
+    block_size, vocab)``), the loss is
+    ``(1 - alpha) * CE + alpha * T^2 * KL(target || draft)`` per the
+    Hinton-style distillation recipe. The ``T^2`` factor restores the
+    gradient magnitude lost to the temperature softening so distillation
+    stays comparable to CE in scale.
     """
-    logits = draft(block_input, target_hidden, cache, logits_start=1)
-    # Numerically stable cross-entropy: log_softmax + gather.
-    log_probs = nn.log_softmax(logits, axis=-1)
+    draft_logits = draft(block_input, target_hidden, cache, logits_start=1)
+    log_probs = nn.log_softmax(draft_logits, axis=-1)
     nll = -mx.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
-    return mx.mean(nll)
+    ce = mx.mean(nll)
+
+    if target_logits_window is None or distill_alpha <= 0.0:
+        return ce
+
+    # KL(p || q) where p is target softmax(./T), q is draft softmax(./T).
+    # Computed via target_log_probs - draft_log_probs weighted by p; the
+    # T^2 multiplier is the standard distillation correction.
+    t = float(distill_temp)
+    target_log_probs = nn.log_softmax(target_logits_window / t, axis=-1)
+    target_probs = mx.exp(target_log_probs)
+    draft_log_probs_t = nn.log_softmax(draft_logits / t, axis=-1)
+    kl = mx.sum(target_probs * (target_log_probs - draft_log_probs_t), axis=-1)
+    kl_loss = mx.mean(kl) * (t * t)
+
+    return (1.0 - distill_alpha) * ce + distill_alpha * kl_loss
 
 
 def _cosine_lr(step: int, total: int, peak: float, warmup: int) -> float:
@@ -239,15 +283,40 @@ def prepare_dflash_draft(
     output_dir: str | Path | None = None,
     progress_callback: Callable[[str, float], None] | None = None,
     log_every: int = 50,
+    distill: bool = False,
+    distill_alpha: float = 0.5,
+    distill_temp: float = 2.0,
+    use_precomputed: str | Path | None = None,
     _target_loader: Callable[[str], tuple[Any, Any]] | None = None,
     _batch_iterator: Any = None,
 ) -> Path:
     """Train a DFlash draft model and write it to disk.
 
-    ``_target_loader`` is an injection hook for tests so the trainer
-    can run without downloading a multi-GB target. In normal use it
-    defaults to ``mlx_lm.load``.
+    ``distill``: enable Hinton-style KL distillation against the target
+    logits at the masked positions. Loss becomes
+    ``(1 - alpha) * CE + alpha * T^2 * KL``. Requires running the
+    target online — incompatible with ``use_precomputed`` (precomputed
+    shards store hiddens but not vocab-size logits).
+
+    ``use_precomputed``: read precomputed (input_ids, hidden) shards
+    from this directory instead of running the target each step. Skips
+    target instantiation entirely.
+
+    ``_target_loader`` and ``_batch_iterator`` are injection hooks for
+    tests so the trainer can run without downloading a multi-GB target
+    and without hitting the network. In normal use the trainer
+    defaults to ``mlx_lm.load`` and ``stream_training_batches``.
     """
+    if distill and use_precomputed is not None:
+        raise ValueError(
+            "--distill requires running the target online for vocab-size "
+            "logits and is incompatible with --use-precomputed (which "
+            "stores hidden states only). Re-run with one or the other."
+        )
+    if not 0.0 <= distill_alpha <= 1.0:
+        raise ValueError(f"distill_alpha must be in [0, 1], got {distill_alpha}")
+    if distill_temp <= 0:
+        raise ValueError(f"distill_temp must be > 0, got {distill_temp}")
     model_path = Path(model_path)
     target_cfg = _read_target_config(model_path)
 
@@ -303,16 +372,27 @@ def prepare_dflash_draft(
     warmup = max(int(steps * DEFAULT_WARMUP_FRAC), 1)
 
     # Closure that ``nn.value_and_grad`` differentiates wrt ``draft``
-    # parameters only. ``cache`` is passed positionally so it's not
-    # treated as a parameter; ``target_hidden`` is detached upstream.
+    # parameters only. ``cache`` and the (detached) target tensors are
+    # passed positionally so the optimizer doesn't see them as
+    # parameters.
     def loss_fn(
         model: DFlashDraftModel,
         block_input: mx.array,
         target_hidden: mx.array,
         targets: mx.array,
         cache: list[Any],
+        target_logits_window: mx.array | None,
     ) -> mx.array:
-        return _draft_loss(model, block_input, target_hidden, targets, cache)
+        return _draft_loss(
+            model,
+            block_input,
+            target_hidden,
+            targets,
+            cache,
+            target_logits_window=target_logits_window,
+            distill_alpha=distill_alpha if distill else 0.0,
+            distill_temp=distill_temp,
+        )
 
     loss_and_grad = nn.value_and_grad(draft, loss_fn)
 
@@ -321,16 +401,29 @@ def prepare_dflash_draft(
         target_hidden: mx.array,
         targets: mx.array,
         cache: list[Any],
+        target_logits_window: mx.array | None,
     ) -> mx.array:
-        loss, grads = loss_and_grad(draft, block_input, target_hidden, targets, cache)
+        loss, grads = loss_and_grad(
+            draft,
+            block_input,
+            target_hidden,
+            targets,
+            cache,
+            target_logits_window,
+        )
         optimizer.update(draft, grads)
         return loss
 
-    # Streaming data loop — each iteration produces one (B, seq_len) batch.
-    # ``_batch_iterator`` is a test-only injection hook so the trainer
-    # can run against synthetic data without hitting the network.
+    # Streaming data loop — each iteration yields either a raw
+    # ``input_ids`` array (online target path) or a
+    # ``(input_ids, hidden)`` tuple (precomputed-shards path). The
+    # ``_batch_iterator`` test hook bypasses both real data sources.
     if _batch_iterator is not None:
         batches = _batch_iterator
+    elif use_precomputed is not None:
+        from olmlx.engine.dflash.precompute import iter_precomputed_shards
+
+        batches = iter_precomputed_shards(use_precomputed, max_examples=steps)
     else:
         batches = stream_training_batches(
             tokenizer,
@@ -343,15 +436,25 @@ def prepare_dflash_draft(
 
     losses: list[float] = []
     try:
-        for step, input_ids in enumerate(batches):
+        for step, batch in enumerate(batches):
             if step >= steps:
                 break
 
             optimizer.learning_rate = _cosine_lr(step, steps, lr, warmup)
 
-            # Capture target hidden states (frozen).
-            cache = None  # one-shot prefill; no cross-step caching for now.
-            target_hidden_full = _capture_target_hidden(target, input_ids, cache)
+            # Resolve the per-batch target signal: either freshly
+            # computed (online) or read from disk (precomputed).
+            if isinstance(batch, tuple):
+                input_ids, target_hidden_full = batch
+                target_logits_full: mx.array | None = None
+            else:
+                input_ids = batch
+                target_hidden_full, target_logits_full = _capture_target_outputs(
+                    target,
+                    input_ids,
+                    cache=None,
+                    capture_logits=distill,
+                )
 
             # Pick a random pivot p in [block_size, seq_len - block_size - 1).
             # Using the same p across the batch keeps shapes static; cycling
@@ -376,11 +479,21 @@ def prepare_dflash_draft(
             targets = input_ids[:, p + 1 : p + 1 + block_size]
             target_hidden = target_hidden_full[:, : p + 1, :]
 
+            target_logits_window: mx.array | None = None
+            if distill and target_logits_full is not None:
+                # The target's logit at position i is its prediction for
+                # position i+1 (next-token), so the logits we want for
+                # masked positions p+1..p+block_size live at indices
+                # p..p+block_size-1 of the target's output.
+                target_logits_window = target_logits_full[:, p : p + block_size, :]
+
             # Fresh draft cache per step — block-diffusion training does
             # not cross step boundaries (each window is independent).
             draft_cache = draft.make_cache()
 
-            loss = _step(block_input, target_hidden, targets, draft_cache)
+            loss = _step(
+                block_input, target_hidden, targets, draft_cache, target_logits_window
+            )
             mx.eval(loss, draft.parameters(), optimizer.state)
             losses.append(float(loss.item()))
 
