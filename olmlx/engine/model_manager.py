@@ -218,10 +218,24 @@ def _cache_supports_trim(cache_list: list) -> bool:
 # them in a fresh worker thread fails.  Within-request cache reuse during
 # a single generation works fine; only cross-request persistence is unsafe.
 #
-# Verified safe against mlx-lm:
-# - KVCache / QuantizedKVCache / ConcatenateKVCache: standard KV layouts.
-# - RotatingKVCache: ring buffer over fixed window (Gemma 4 etc.).
-# - ChunkedKVCache: chunked layout (afm7 etc.).
+# Verified safe against mlx-lm by inspection of mlx_lm/models/cache.py:
+# the failure mode in #284 is that ArraysCache stores arrays produced by
+# the ``gated_delta_kernel`` (mx.fast.metal_kernel) whose lazy graph
+# carries a Metal stream reference from the generating worker thread,
+# and re-evaluating that graph in a different worker thread raises
+# "There is no Stream(gpu, N)".  The classes in the allowlist below
+# all store keys/values produced by stock matmul/attention ops only —
+# no metal_kernel outputs, no generator-thread-bound state — so their
+# arrays are reusable across worker threads:
+# - KVCache: bare keys + values, mx.concatenate at update boundaries.
+# - QuantizedKVCache: same, with mx.quantize/dequantize wrappers.
+# - ConcatenateKVCache: same, used by AFM-7 family.
+# - RotatingKVCache: ring buffer over fixed window (Gemma 4); writes
+#   in place via mx.assign at modular offsets.
+# - ChunkedKVCache: chunked layout (afm7); same semantics as KVCache
+#   bounded by chunk_size.
+# If a future mlx-lm release adds metal_kernel-style state to any of
+# these, that class must be removed from the allowlist.
 #
 # Deliberately excluded:
 # - ArraysCache: gated-delta SSM state — see issue #284.
@@ -1585,12 +1599,13 @@ class ModelManager:
                 "stored across requests (issue #284).",
                 lm.name,
             )
-            # One-pass cleanup of any stale pre-PR on-disk entries for
-            # this model.  Without this, pre-PR ArraysCache files would
-            # sit on disk indefinitely until the disk size eviction got
-            # to them.  They're harmless (the request path bypasses
-            # async_get for non-persistable models) but they consume
-            # disk space.
+        # One-pass cleanup of any stale pre-PR on-disk entries for this
+        # model.  Run unconditionally on persistence=False — including the
+        # probe-failure path, where stale files would otherwise sit on
+        # disk indefinitely until the disk-size eviction got to them.
+        # They're harmless (the request path bypasses async_get for
+        # non-persistable models) but they consume disk space.
+        if not lm.supports_cache_persistence:
             try:
                 removed = lm.prompt_cache_store.clear_disk()
                 if removed:
