@@ -2063,6 +2063,88 @@ def _cmd_flash_dense_prepare(args, model_path):
     print("  OLMLX_EXPERIMENTAL_FLASH=true olmlx serve")
 
 
+def cmd_dflash_precompute(args):
+    """Precompute target hidden states for DFlash draft training."""
+    _configure_logging()
+
+    store = _create_store()
+    _resolved = store.registry.resolve(args.model)
+    hf_path = _resolved.hf_path if _resolved is not None else args.model
+    local_dir = store.ensure_downloaded(hf_path)
+    model_path = str(local_dir)
+
+    target_layer_ids: list[int] | None = None
+    if args.target_layer_ids:
+        try:
+            target_layer_ids = [int(x) for x in args.target_layer_ids.split(",")]
+        except ValueError as exc:
+            raise SystemExit(
+                f"--target-layer-ids must be a comma-separated list of "
+                f"integers, got {args.target_layer_ids!r}: {exc}"
+            ) from exc
+
+    output_dir = Path(args.output) if args.output else Path(model_path) / "dflash_cache"
+
+    print(f"Precomputing target hidden states for {args.model}...")
+    print(f"  Target path: {model_path}")
+    print(f"  Output: {output_dir}")
+    print(f"  Shards: {args.shards}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Seq len: {args.seq_len}")
+    if target_layer_ids:
+        print(f"  Target layer ids: {target_layer_ids}")
+    else:
+        print(f"  Target layers: {args.num_target_layers} (evenly spaced)")
+    print()
+
+    from mlx_lm import load as _mlx_lm_load
+
+    from olmlx.engine.dflash.decoder import _patch_model, _unpatch_model
+    from olmlx.engine.dflash.precompute import precompute_target_hiddens
+    from olmlx.engine.dflash.prepare import _resolve_target_layer_ids
+    from olmlx.engine.dflash.training_data import stream_training_batches
+
+    target, tokenizer = _mlx_lm_load(model_path)
+    target.eval()
+    if hasattr(target, "freeze"):
+        target.freeze()
+
+    target_layers_attr = (
+        target.layers if hasattr(target, "layers") else target.model.layers
+    )
+    layer_ids = _resolve_target_layer_ids(
+        target_layer_ids, args.num_target_layers, len(target_layers_attr)
+    )
+    print(f"  Resolved target_layer_ids: {layer_ids}\n")
+
+    _patch_model(target, layer_ids)
+    try:
+        batches = stream_training_batches(
+            tokenizer,
+            dataset=args.data or "HuggingFaceH4/ultrachat_200k",
+            split=args.split or "train_sft",
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            max_examples=args.shards,
+        )
+        precompute_target_hiddens(
+            target,
+            batches,
+            output_dir,
+            num_shards=args.shards,
+            progress_callback=_flash_progress,
+        )
+    finally:
+        _unpatch_model(target)
+
+    print("\nPrecompute complete!")
+    print(f"  Output: {output_dir}")
+    print(
+        f"  Re-use with: olmlx dflash prepare {args.model} "
+        f"--use-precomputed {output_dir}"
+    )
+
+
 def cmd_dflash_prepare(args):
     """Train a DFlash draft model for a target."""
     _configure_logging()
@@ -2096,6 +2178,10 @@ def cmd_dflash_prepare(args):
         print(f"  Target layers: {args.num_target_layers} (evenly spaced)")
     print(f"  Dataset: {args.data}")
     print(f"  LR: {args.lr}")
+    if args.distill:
+        print(f"  Distillation: alpha={args.distill_alpha} temp={args.distill_temp}")
+    if args.use_precomputed:
+        print(f"  Precomputed shards: {args.use_precomputed}")
     print()
 
     from olmlx.engine.dflash.prepare import prepare_dflash_draft
@@ -2113,6 +2199,10 @@ def cmd_dflash_prepare(args):
         num_target_layers=args.num_target_layers,
         lr=args.lr,
         output_dir=args.output,
+        distill=args.distill,
+        distill_alpha=args.distill_alpha,
+        distill_temp=args.distill_temp,
+        use_precomputed=args.use_precomputed,
         progress_callback=_flash_progress,
     )
 
@@ -2484,6 +2574,83 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output directory (default: <target-model-dir>/dflash)",
     )
+    dflash_prepare_p.add_argument(
+        "--distill",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Hinton-style KL distillation against the target's "
+            "logits at the masked positions. Incompatible with "
+            "--use-precomputed (precomputed shards do not store logits)."
+        ),
+    )
+    dflash_prepare_p.add_argument(
+        "--distill-alpha",
+        type=float,
+        default=0.5,
+        help=(
+            "Distillation mixing weight: loss = (1-alpha)*CE + "
+            "alpha*T^2*KL. Default 0.5; ignored when --distill is unset."
+        ),
+    )
+    dflash_prepare_p.add_argument(
+        "--distill-temp",
+        type=float,
+        default=2.0,
+        help="Distillation temperature T (default: 2.0)",
+    )
+    dflash_prepare_p.add_argument(
+        "--use-precomputed",
+        type=str,
+        default=None,
+        help=(
+            "Read (input_ids, target_hidden) shards from this directory "
+            "instead of running the target each step. Produced by "
+            "`olmlx dflash precompute`."
+        ),
+    )
+
+    dflash_precompute_p = dflash_sub.add_parser(
+        "precompute",
+        help="Precompute target hidden states for DFlash draft training",
+    )
+    dflash_precompute_p.add_argument("model", help="Target model name or HF path")
+    dflash_precompute_p.add_argument(
+        "--data", type=str, default=None, help="HuggingFace dataset path"
+    )
+    dflash_precompute_p.add_argument(
+        "--split", type=str, default=None, help="Dataset split"
+    )
+    dflash_precompute_p.add_argument(
+        "--shards",
+        type=int,
+        default=500,
+        help="Number of shards to write (default: 500)",
+    )
+    dflash_precompute_p.add_argument(
+        "--batch-size", type=int, default=4, help="Batch size (default: 4)"
+    )
+    dflash_precompute_p.add_argument(
+        "--seq-len", type=int, default=2048, help="Sequence length (default: 2048)"
+    )
+    dflash_precompute_p.add_argument(
+        "--num-target-layers",
+        type=int,
+        default=4,
+        help="Number of target hidden states to extract (default: 4)",
+    )
+    dflash_precompute_p.add_argument(
+        "--target-layer-ids",
+        type=str,
+        default=None,
+        help="Comma-separated target layer indices (overrides --num-target-layers)",
+    )
+    dflash_precompute_p.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output directory (default: <target-model-dir>/dflash_cache)",
+    )
 
     # Spectral quant calibration
     spectral = sub.add_parser("spectral", help="SpectralQuant KV cache compression")
@@ -2615,6 +2782,7 @@ _COMMAND_HANDLERS: dict[tuple[str, str | None], str] = {
     ("flash", "prepare"): "cmd_flash_prepare",
     ("flash", "info"): "cmd_flash_info",
     ("dflash", "prepare"): "cmd_dflash_prepare",
+    ("dflash", "precompute"): "cmd_dflash_precompute",
     ("spectral", "prepare"): "cmd_spectral_prepare",
     ("bench", "run"): "cmd_bench_run",
     ("bench", "compare"): "cmd_bench_compare",
