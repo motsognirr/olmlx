@@ -197,6 +197,11 @@ def _capture_target_outputs(
     Both outputs are detached via ``mx.stop_gradient`` — the target is
     frozen during draft training.
     """
+    # Reset slots before each forward — the ``any(h is None ...)`` guard
+    # below only catches hooks that *never* fired, not hooks that fired
+    # on a previous step but were skipped this step.
+    for i in range(len(target._hidden_states)):  # type: ignore[attr-defined]
+        target._hidden_states[i] = None  # type: ignore[attr-defined]
     out = target(inputs, cache=cache)
     captured = list(target._hidden_states)  # type: ignore[attr-defined]
     if any(h is None for h in captured):
@@ -434,8 +439,31 @@ def prepare_dflash_draft(
     if _batch_iterator is not None:
         batches = _batch_iterator
     elif use_precomputed is not None:
-        from olmlx.engine.dflash.precompute import iter_precomputed_shards
+        from olmlx.engine.dflash.precompute import (
+            iter_precomputed_shards,
+            read_precomputed_index,
+        )
 
+        # Validate shard shape against the current training config so
+        # mismatches surface as a clear error here rather than as an
+        # obscure shape crash inside ``_draft_loss``.
+        meta = read_precomputed_index(use_precomputed)
+        expected_hidden = len(layer_ids) * int(target_cfg["hidden_size"])
+        mismatches = []
+        if meta["batch_size"] != batch_size:
+            mismatches.append(f"batch_size: shard={meta['batch_size']} requested={batch_size}")
+        if meta["seq_len"] != seq_len:
+            mismatches.append(f"seq_len: shard={meta['seq_len']} requested={seq_len}")
+        if meta["hidden_size"] != expected_hidden:
+            mismatches.append(
+                f"hidden_size: shard={meta['hidden_size']} expected="
+                f"{expected_hidden} (num_target_layers * target hidden_size)"
+            )
+        if mismatches:
+            raise ValueError(
+                "Precompute shard shape does not match current training config: "
+                + "; ".join(mismatches)
+            )
         batches = iter_precomputed_shards(use_precomputed, max_examples=steps)
     else:
         batches = stream_training_batches(

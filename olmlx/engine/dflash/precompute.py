@@ -60,6 +60,10 @@ def precompute_target_hiddens(
     function returns early once the cap is hit. ``None`` consumes the
     full ``batches`` iterator.
     """
+    if num_shards is not None and num_shards <= 0:
+        raise ValueError(
+            f"num_shards must be a positive integer or None, got {num_shards}"
+        )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     if not hasattr(target, "_hidden_states"):
@@ -77,6 +81,12 @@ def precompute_target_hiddens(
         if num_shards is not None and shard_idx >= num_shards:
             break
 
+        # Reset slots before each forward so a hook that fires zero times
+        # this iteration cannot leak a stale tensor from the previous one
+        # — the ``any(h is None ...)`` guard below only catches hooks
+        # that *never* fired.
+        for i in range(len(target._hidden_states)):  # type: ignore[attr-defined]
+            target._hidden_states[i] = None  # type: ignore[attr-defined]
         target(input_ids, cache=None)
         captured = list(target._hidden_states)  # type: ignore[attr-defined]
         if any(h is None for h in captured):
@@ -124,6 +134,32 @@ def precompute_target_hiddens(
     return output_dir
 
 
+_REQUIRED_INDEX_KEYS = ("num_shards", "batch_size", "seq_len", "hidden_size")
+
+
+def read_precomputed_index(shard_dir: str | Path) -> dict[str, Any]:
+    """Parse ``index.json`` from a precompute directory and validate keys.
+
+    Raises ``FileNotFoundError`` if the index is missing, ``ValueError``
+    on JSON corruption or missing required keys. Callers can use the
+    returned dict to validate ``batch_size``/``seq_len``/``hidden_size``
+    against the current training configuration before iteration starts.
+    """
+    index_path = Path(shard_dir) / INDEX_FILENAME
+    if not index_path.exists():
+        raise FileNotFoundError(f"Precompute index missing: {index_path}")
+    try:
+        index = json.loads(index_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Corrupt precompute index at {index_path}: {exc}") from exc
+    missing = [k for k in _REQUIRED_INDEX_KEYS if index.get(k) is None]
+    if missing:
+        raise ValueError(
+            f"Precompute index at {index_path} missing required keys: {missing}"
+        )
+    return index
+
+
 def iter_precomputed_shards(
     shard_dir: str | Path,
     *,
@@ -132,10 +168,14 @@ def iter_precomputed_shards(
     """Yield ``(input_ids, target_hidden)`` tuples from precomputed shards.
 
     Shards are read in lexicographic order, which matches the writer's
-    ``shard-NNNNN`` zero-padded naming. When the iterator exhausts the
-    on-disk shards but the training loop still wants more steps, it
-    cycles back to the first shard — this provides "free" multi-epoch
-    behavior without complicating the training loop's bookkeeping.
+    ``shard-NNNNN`` zero-padded naming.
+
+    ``max_examples=None`` yields each shard exactly once (one-shot dump
+    mode). When ``max_examples`` exceeds the on-disk shard count, the
+    iterator cycles back to the first shard — this provides "free"
+    multi-epoch behavior without complicating the training loop's
+    bookkeeping. The training pipeline always passes ``max_examples=
+    steps``, so the cycling path is the production code path.
     """
     shard_dir = Path(shard_dir)
     if not shard_dir.exists():
@@ -143,12 +183,9 @@ def iter_precomputed_shards(
 
     index_path = shard_dir / INDEX_FILENAME
     if index_path.exists():
-        try:
-            json.loads(index_path.read_text())
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"Corrupt precompute index at {index_path}: {exc}"
-            ) from exc
+        # Parsed for validation only — callers needing the metadata
+        # should call ``read_precomputed_index`` directly.
+        read_precomputed_index(shard_dir)
 
     shard_paths = sorted(shard_dir.glob("shard-*.safetensors"))
     if not shard_paths:
