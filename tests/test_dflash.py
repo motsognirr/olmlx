@@ -255,12 +255,20 @@ class TestFindGDNClass:
         assert _find_gdn_class(target) is None
 
     def test_finds_gdn_class_by_name(self):
-        # Define a fresh GDN class in a fresh "module" — class name is
-        # what the discovery matches on, not the import path.
+        # Class name plus the structural attributes ``_capturing_gdn_call``
+        # actually reads — same-named classes without those attributes are
+        # skipped to avoid silently patching unrelated modules.
         class GatedDeltaNet(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.proj = nn.Linear(4, 4, bias=False)
+                self.in_proj_qkv = nn.Linear(4, 4, bias=False)
+                self.in_proj_z = nn.Linear(4, 4, bias=False)
+                self.in_proj_b = nn.Linear(4, 4, bias=False)
+                self.in_proj_a = nn.Linear(4, 4, bias=False)
+                self.conv1d = nn.Conv1d(4, 4, kernel_size=3)
+                self.A_log = mx.zeros((4,))
+                self.dt_bias = mx.zeros((4,))
+                self.out_proj = nn.Linear(4, 4, bias=False)
 
         class _GDNLayer(nn.Module):
             def __init__(self):
@@ -275,6 +283,27 @@ class TestFindGDNClass:
         target = _GDNTarget()
         found = _find_gdn_class(target)
         assert found is GatedDeltaNet
+
+    def test_skips_namesake_without_required_attrs(self):
+        # A class that happens to be named ``GatedDeltaNet`` but does not
+        # expose the GDN interface must not be patched — patching its
+        # ``__call__`` would silently corrupt inference.
+        class GatedDeltaNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(4, 4, bias=False)
+
+        class _Layer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fake_gdn = GatedDeltaNet()
+
+        class _Target(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = [_Layer()]
+
+        assert _find_gdn_class(_Target()) is None
 
 
 # ---------------------------------------------------------------------------

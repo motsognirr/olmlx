@@ -164,6 +164,22 @@ def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Attributes that ``_capturing_gdn_call`` reads off the patched layer.
+# Used by ``_find_gdn_class`` as a structural check so the patch only
+# attaches to a class that actually exposes the GDN interface — a
+# same-named but unrelated class would be skipped.
+_GDN_REQUIRED_ATTRS = (
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_b",
+    "in_proj_a",
+    "conv1d",
+    "A_log",
+    "dt_bias",
+    "out_proj",
+)
+
+
 def _find_gdn_class(model: nn.Module) -> type | None:
     """Locate the ``GatedDeltaNet`` class actually used by *model*.
 
@@ -172,11 +188,16 @@ def _find_gdn_class(model: nn.Module) -> type | None:
     target's submodules and matching by class name avoids hardcoding a
     single source module (e.g. ``qwen3_5``) and transparently covers
     future hybrid models that subclass or redefine the layer in their
-    own module. Returns the first match, or ``None`` if no GDN-style
-    layer is in the model.
+    own module. We additionally check for the attributes the capturing
+    ``__call__`` reads — a same-named class without those attributes is
+    not a GDN layer and patching it would silently corrupt inference.
+    Returns the first match, or ``None`` if no GDN-style layer is in
+    the model.
     """
     for _name, mod in model.named_modules():
-        if type(mod).__name__ == "GatedDeltaNet":
+        if type(mod).__name__ != "GatedDeltaNet":
+            continue
+        if all(hasattr(mod, a) for a in _GDN_REQUIRED_ATTRS):
             return type(mod)
     return None
 
@@ -326,6 +347,19 @@ class _GDNStateCapture:
             self._patched_call = None
             _GDN_PATCH_LOCK.release()
 
+    def __del__(self) -> None:
+        # Belt-and-braces: if the owning ``DFlashDecoder`` is garbage-
+        # collected without an explicit ``reset()``/``close()`` (e.g. a
+        # generation task is cancelled and the decoder is dropped), the
+        # ``_GDN_PATCH_LOCK`` would otherwise stay held until the GC
+        # finalises this object. ``close()`` is idempotent.
+        try:
+            self.close()
+        except Exception:
+            # Finalisers must never raise — at this point the interpreter
+            # may already be shutting down.
+            pass
+
     def rollback(self, cache: list[Any], accepted: int, trim: int) -> None:
         """Restore the GDN state to reflect ``accepted + 1`` accepted tokens."""
         if _gd_mod is None:
@@ -366,9 +400,14 @@ class _GDNStateCapture:
                     None if mask is None else mask[:, :n],
                     use_kernel=True,
                 )
-                c.cache[1] = state
+                # Use the public ``__setitem__`` API to match the
+                # ``cache[i] = ...`` writes in ``_capturing_gdn_call``;
+                # both forms hit ``ArraysCache.cache`` today, but going
+                # through ``__setitem__`` is forward-compatible if mlx-lm
+                # adds validation or lazy semantics there.
+                c[1] = state
                 conv_input, K = self.conv_data[j]
-                c.cache[0] = conv_input[:, accepted + 1 : accepted + K]
+                c[0] = conv_input[:, accepted + 1 : accepted + K]
                 j += 1
 
 
@@ -476,7 +515,13 @@ class DFlashDecoder:
         self._draft.bind(self._target)
 
         self._target_cache = make_prompt_cache(self._target)
-        self._draft_cache = make_prompt_cache(self._draft)
+        # Call the draft's own ``make_cache`` directly. ``make_prompt_cache``
+        # would defer to it via ``hasattr(model, "make_cache")`` today, but
+        # going through the public method keeps the per-layer
+        # ``RotatingKVCache`` / ``KVCache`` selection (driven by
+        # ``DraftConfig.layer_types``) explicit at the call site rather
+        # than relying on mlx-lm's dispatch.
+        self._draft_cache = self._draft.make_cache()
         self._target_can_trim = can_trim_prompt_cache(self._target_cache)
         if not self._target_can_trim:
             if not _HAS_GDN:
