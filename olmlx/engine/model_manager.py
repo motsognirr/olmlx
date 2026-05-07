@@ -1674,21 +1674,33 @@ class ModelManager:
             )
 
     def _load_dflash_decoder(
-        self, target_model: Any, hf_path: str, model_exp: Any
+        self,
+        target_model: Any,
+        spec_config: SpeculativeConfig,
     ) -> Any:
-        """Load a dflash draft model and create a DFlashDecoder."""
-        from olmlx.engine.dflash.adapters import get_adapter
+        """Load a dflash draft model and create a DFlashDecoder.
+
+        Universal target support: no per-architecture adapter is required —
+        the decoder hooks the target's selected layers in place via
+        ``_patch_model``. The draft borrows ``embed_tokens`` and
+        ``lm_head`` from the target via ``draft.bind(target_model)``.
+        """
         from olmlx.engine.dflash.decoder import DFlashDecoder
         from olmlx.engine.dflash.draft_model import DFlashDraftModel, DraftConfig
 
-        if not model_exp.dflash_draft_model:
+        if not spec_config.enabled:
+            raise RuntimeError(
+                "_load_dflash_decoder called with spec_config.enabled=False"
+            )
+        if not spec_config.draft_model:
             raise ValueError(
-                "dflash requires dflash_draft_model to be set "
-                "(OLMLX_EXPERIMENTAL_DFLASH_DRAFT_MODEL)"
+                "speculative_strategy='dflash' requires speculative_draft_model "
+                "to be set (OLMLX_SPECULATIVE_DRAFT_MODEL or per-model "
+                "'speculative_draft_model' in models.json)"
             )
 
-        logger.info("Loading dflash draft model %s", model_exp.dflash_draft_model)
-        load_path = self._resolve_draft_path(model_exp.dflash_draft_model)
+        logger.info("Loading dflash draft model %s", spec_config.draft_model)
+        load_path = self._resolve_draft_path(spec_config.draft_model)
 
         config_file = Path(load_path) / "config.json"
         if not config_file.exists():
@@ -1697,73 +1709,100 @@ class ModelManager:
             )
 
         draft_cfg_dict = json.loads(config_file.read_text())
-        _required = [
+        dflash_cfg = draft_cfg_dict.get("dflash_config")
+        if not isinstance(dflash_cfg, dict):
+            raise ValueError(
+                f"DFlash draft config at {config_file} is missing the "
+                "'dflash_config' object (must contain 'target_layer_ids' "
+                "and 'mask_token_id'). This loader expects the upstream "
+                "z-lab DFlash schema."
+            )
+        _required_top = [
             "hidden_size",
+            "num_hidden_layers",
             "num_attention_heads",
-            "num_layers",
-            "target_layer_ids",
+            "num_key_value_heads",
+            "head_dim",
+            "intermediate_size",
             "vocab_size",
+            "rms_norm_eps",
+            "rope_theta",
+            "max_position_embeddings",
+            "block_size",
+            "num_target_layers",
         ]
-        missing = [k for k in _required if k not in draft_cfg_dict]
+        missing = [k for k in _required_top if k not in draft_cfg_dict]
+        _required_dflash = ["target_layer_ids", "mask_token_id"]
+        missing += [
+            f"dflash_config.{k}" for k in _required_dflash if k not in dflash_cfg
+        ]
         if missing:
             raise ValueError(
                 f"DFlash draft config at {config_file} is missing "
                 f"required keys: {missing}"
             )
-        target_hidden_size = getattr(
-            getattr(target_model, "args", None), "hidden_size", None
+
+        layer_types_raw = (
+            draft_cfg_dict.get("layer_types")
+            or ["full_attention"] * draft_cfg_dict["num_hidden_layers"]
         )
+
         draft_config = DraftConfig(
             hidden_size=draft_cfg_dict["hidden_size"],
+            num_hidden_layers=draft_cfg_dict["num_hidden_layers"],
             num_attention_heads=draft_cfg_dict["num_attention_heads"],
-            num_layers=draft_cfg_dict["num_layers"],
-            target_layer_ids=draft_cfg_dict["target_layer_ids"],
+            num_key_value_heads=draft_cfg_dict["num_key_value_heads"],
+            head_dim=draft_cfg_dict["head_dim"],
+            intermediate_size=draft_cfg_dict["intermediate_size"],
             vocab_size=draft_cfg_dict["vocab_size"],
-            target_hidden_size=target_hidden_size or draft_cfg_dict.get("hidden_size"),
+            rms_norm_eps=draft_cfg_dict["rms_norm_eps"],
+            rope_theta=draft_cfg_dict["rope_theta"],
+            max_position_embeddings=draft_cfg_dict["max_position_embeddings"],
+            block_size=draft_cfg_dict["block_size"],
+            num_target_layers=draft_cfg_dict["num_target_layers"],
+            target_layer_ids=list(dflash_cfg["target_layer_ids"]),
+            mask_token_id=int(dflash_cfg["mask_token_id"]),
+            rope_scaling=draft_cfg_dict.get("rope_scaling"),
+            layer_types=tuple(layer_types_raw),
+            sliding_window=draft_cfg_dict.get("sliding_window"),
+            final_logit_softcapping=draft_cfg_dict.get("final_logit_softcapping"),
         )
 
         draft_model = DFlashDraftModel(draft_config)
         draft_dir = Path(load_path)
-        weight_files = sorted(draft_dir.glob("model*.safetensors"))
+        weight_files = sorted(draft_dir.glob("*.safetensors"))
         if not weight_files:
             raise FileNotFoundError(
                 f"DFlash draft model weights not found in {draft_dir}. "
                 "A pre-trained dflash draft model is required."
             )
+        weights: list[tuple[str, Any]] = []
         for wf in weight_files:
-            draft_model.load_weights(str(wf), strict=False)
+            weights.extend(mx.load(str(wf)).items())
+        # ``strict=False`` permits missing keys for ``embed_tokens`` and
+        # ``lm_head`` — those are bound from the target via
+        # ``DFlashDraftModel.bind()`` and are intentionally absent from
+        # the draft safetensors.
+        draft_model.load_weights(weights, strict=False)
         logger.info(
             "Loaded dflash draft weights from %s (%d file(s))",
             draft_dir,
             len(weight_files),
         )
 
-        # Detect model type for adapter selection
-        target_config_file = None
-        if self.store is not None:
-            target_local = self.store.local_path(hf_path)
-            target_config_file = target_local / "config.json"
-        if target_config_file is not None and target_config_file.exists():
-            target_cfg = json.loads(target_config_file.read_text())
-            model_type = target_cfg.get("model_type", "")
-        else:
-            model_type = draft_cfg_dict.get("target_model_type", "")
-
-        if not model_type:
-            raise ValueError(
-                "Cannot determine target model_type for dflash adapter selection. "
-                "Set 'target_model_type' in the draft model's config.json or "
-                "ensure the target model's config.json contains 'model_type'."
-            )
-
-        adapter = get_adapter(model_type)
-
+        # ``speculative_tokens`` overrides the draft config's ``block_size``
+        # so users can shrink the block at inference time without
+        # re-training. The draft's positional encoding is unaffected.
+        block_size = (
+            spec_config.num_tokens
+            if spec_config.num_tokens
+            else draft_config.block_size
+        )
         return DFlashDecoder(
             target_model=target_model,
             draft_model=draft_model,
-            adapter=adapter,
             draft_config=draft_config,
-            block_size=model_exp.dflash_block_size,
+            block_size=block_size,
         )
 
     def _load_speculative_decoder(
@@ -2119,11 +2158,11 @@ class ModelManager:
                 )
                 self._load_chat_template(tok, load_path, hf_path)
                 caps = detect_caps(tok)
-                if model_exp.dflash:
+                if spec_enabled and spec_config.strategy == "dflash":
                     raise ValueError(
-                        "dflash is not supported on VLM targets; "
-                        "remove dflash from models.json or unset "
-                        "OLMLX_EXPERIMENTAL_DFLASH"
+                        "speculative_strategy='dflash' is not supported on "
+                        "VLM targets. Use speculative_strategy='classic' or "
+                        "remove the speculative settings."
                     )
                 if model_exp.flash_speculative:
                     raise ValueError(
@@ -2148,26 +2187,17 @@ class ModelManager:
         # Text or unknown — try mlx-lm first, fall back to mlx-vlm
         model, tokenizer, is_vlm, caps = self._try_lm_then_vlm(load_path, hf_path)
 
-        enabled = [
-            name
-            for name, flag in [
-                ("dflash", model_exp.dflash),
-                ("speculative", spec_enabled),
-                ("flash_speculative", model_exp.flash_speculative),
-            ]
-            if flag
-        ]
-        if len(enabled) > 1:
+        if spec_enabled and model_exp.flash_speculative:
             raise ValueError(
-                f"Only one speculative decoder can be active at a time; got: {enabled}"
+                "Only one speculative decoder can be active at a time; "
+                "got both 'speculative' and 'flash_speculative'."
             )
 
-        if model_exp.dflash:
-            decoder = self._load_dflash_decoder(model, hf_path, model_exp)
-            return model, tokenizer, is_vlm, caps, decoder
-
         if spec_enabled:
-            decoder = self._load_speculative_decoder(model, hf_path, spec_config)
+            if spec_config.strategy == "dflash":
+                decoder = self._load_dflash_decoder(model, spec_config)
+            else:
+                decoder = self._load_speculative_decoder(model, hf_path, spec_config)
             return model, tokenizer, is_vlm, caps, decoder
 
         return model, tokenizer, is_vlm, caps, None

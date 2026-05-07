@@ -8,11 +8,14 @@ import threading
 import dataclasses
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, NamedTuple, get_args
+from typing import Any, Literal, NamedTuple, get_args
 
 import logging
 
 from olmlx.config import SyncMode, settings
+
+SpeculativeStrategy = Literal["classic", "dflash"]
+_VALID_SPECULATIVE_STRATEGIES: frozenset[str] = frozenset(("classic", "dflash"))
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +44,6 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
         "flash_speculative",
         "flash_speculative_draft_model",
         "flash_speculative_tokens",
-        # DFlash block-diffusion speculative decoding
-        "dflash",
-        "dflash_draft_model",
-        "dflash_block_size",
         # Flash MoE
         "flash_moe",
         "flash_moe_cache_budget_experts",
@@ -65,6 +64,16 @@ PROMOTED_EXPERIMENTAL_KEYS: dict[str, str] = {
 }
 
 
+# DFlash legacy keys (formerly under ``experimental``) → migration target.
+# DFlash is now a strategy of the unified speculative path:
+#   - ``dflash`` → set ``speculative=true`` and ``speculative_strategy="dflash"``
+#   - ``dflash_draft_model`` → ``speculative_draft_model``
+#   - ``dflash_block_size`` → ``speculative_tokens``
+DFLASH_LEGACY_KEYS: frozenset[str] = frozenset(
+    {"dflash", "dflash_draft_model", "dflash_block_size"}
+)
+
+
 def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
     """Validate per-model experimental overrides.
 
@@ -74,6 +83,16 @@ def _validate_experimental_overrides(overrides: dict[str, Any]) -> None:
     (all fields present), so pydantic-settings env var resolution cannot
     override any values or produce confusing errors for unrelated fields.
     """
+    dflash = set(overrides) & DFLASH_LEGACY_KEYS
+    if dflash:
+        raise ValueError(
+            "DFlash settings have been folded into the unified speculative "
+            "path: replace the 'experimental' block keys "
+            f"{sorted(repr(k) for k in dflash)} with top-level fields "
+            "'speculative=true', 'speculative_strategy=\"dflash\"', "
+            "'speculative_draft_model=<hf-path>' (was 'dflash_draft_model'), "
+            "and 'speculative_tokens=<N>' (was 'dflash_block_size')."
+        )
     promoted = set(overrides) & PROMOTED_EXPERIMENTAL_KEYS.keys()
     if promoted:
         renamed = sorted(k for k in promoted if k != PROMOTED_EXPERIMENTAL_KEYS[k])
@@ -207,6 +226,7 @@ class SpeculativeConfig(NamedTuple):
     enabled: bool
     draft_model: str | None
     num_tokens: int
+    strategy: SpeculativeStrategy = "classic"
 
 
 @dataclass
@@ -230,6 +250,7 @@ class ModelConfig:
     #: Per-model speculative decoding overrides. ``None`` means inherit the
     #: global ``Settings.speculative*`` value.
     speculative: bool | None = None
+    speculative_strategy: SpeculativeStrategy | None = None
     speculative_draft_model: str | None = None
     speculative_tokens: int | None = None
     #: KV cache quantization method and bits (e.g. "turboquant:4").
@@ -259,6 +280,15 @@ class ModelConfig:
             raise ValueError(
                 "'speculative_draft_model' must be a non-empty HuggingFace path or None"
             )
+        if (
+            self.speculative_strategy is not None
+            and self.speculative_strategy not in _VALID_SPECULATIVE_STRATEGIES
+        ):
+            raise ValueError(
+                f"'speculative_strategy' must be one of "
+                f"{sorted(_VALID_SPECULATIVE_STRATEGIES)} or None, "
+                f"got {self.speculative_strategy!r}"
+            )
 
     def resolved_speculative(self) -> SpeculativeConfig:
         """Resolve speculative config: per-model overrides global settings.
@@ -280,14 +310,19 @@ class ModelConfig:
             if self.speculative_tokens is not None
             else settings.speculative_tokens
         )
+        strategy: SpeculativeStrategy = (
+            self.speculative_strategy
+            if self.speculative_strategy is not None
+            else settings.speculative_strategy
+        )
         if not enabled:
-            return SpeculativeConfig(False, None, tokens)
+            return SpeculativeConfig(False, None, tokens, strategy)
         draft = (
             self.speculative_draft_model
             if self.speculative_draft_model is not None
             else settings.speculative_draft_model
         )
-        return SpeculativeConfig(True, draft, tokens)
+        return SpeculativeConfig(True, draft, tokens, strategy)
 
     def resolved_kv_cache_quant(self) -> str | None:
         """Resolve KV cache quant config: per-model overrides global settings."""
@@ -361,6 +396,19 @@ class ModelConfig:
                     )
             speculative_draft_model = speculative_draft_model_raw
 
+            speculative_strategy_raw = entry.get("speculative_strategy")
+            if speculative_strategy_raw is not None:
+                if (
+                    not isinstance(speculative_strategy_raw, str)
+                    or speculative_strategy_raw not in _VALID_SPECULATIVE_STRATEGIES
+                ):
+                    raise ValueError(
+                        f"'speculative_strategy' must be one of "
+                        f"{sorted(_VALID_SPECULATIVE_STRATEGIES)}, "
+                        f"got {speculative_strategy_raw!r}"
+                    )
+            speculative_strategy = speculative_strategy_raw
+
             speculative_tokens_raw = entry.get("speculative_tokens")
             if speculative_tokens_raw is not None:
                 if (
@@ -401,6 +449,7 @@ class ModelConfig:
                 inference_timeout=inference_timeout,
                 sync_mode=sync_mode,
                 speculative=speculative,
+                speculative_strategy=speculative_strategy,
                 speculative_draft_model=speculative_draft_model,
                 speculative_tokens=speculative_tokens,
                 kv_cache_quant=kv_cache_quant_raw,
@@ -420,6 +469,7 @@ class ModelConfig:
             and self.inference_timeout is None
             and self.sync_mode is None
             and self.speculative is None
+            and self.speculative_strategy is None
             and self.speculative_draft_model is None
             and self.speculative_tokens is None
             and self.kv_cache_quant is None
@@ -442,6 +492,8 @@ class ModelConfig:
             result["sync_mode"] = self.sync_mode
         if self.speculative is not None:
             result["speculative"] = self.speculative
+        if self.speculative_strategy is not None:
+            result["speculative_strategy"] = self.speculative_strategy
         if self.speculative_draft_model is not None:
             result["speculative_draft_model"] = self.speculative_draft_model
         if self.speculative_tokens is not None:

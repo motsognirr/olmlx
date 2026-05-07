@@ -330,7 +330,7 @@ class TestSpeculativeConfig:
         from olmlx.engine.registry import ModelConfig
 
         mc = ModelConfig.from_entry({"hf_path": "Qwen/Qwen3-32B", "speculative": True})
-        enabled, draft, _tokens = mc.resolved_speculative()
+        enabled, draft, _tokens, _strategy = mc.resolved_speculative()
         assert enabled is True
         assert draft is None
 
@@ -344,7 +344,7 @@ class TestSpeculativeConfig:
         monkeypatch.setattr("olmlx.config.settings.speculative_tokens", 8)
 
         mc = ModelConfig(hf_path="Qwen/Qwen3-32B")
-        assert mc.resolved_speculative() == (True, "Qwen/Qwen3-0.6B", 8)
+        assert mc.resolved_speculative() == (True, "Qwen/Qwen3-0.6B", 8, "classic")
 
         # Per-model overrides win, and a disabled per-model setting
         # zeros out the draft slot even if a global draft is configured.
@@ -353,32 +353,22 @@ class TestSpeculativeConfig:
             speculative=False,
             speculative_tokens=2,
         )
-        assert mc_override.resolved_speculative() == (False, None, 2)
+        assert mc_override.resolved_speculative() == (False, None, 2, "classic")
 
 
-class TestDFlashConfig:
-    """Tests for dflash config fields."""
+class TestSpeculativeStrategySettings:
+    """Tests for the unified speculative_strategy field on Settings."""
 
-    def test_dflash_defaults(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DFLASH", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DFLASH_DRAFT_MODEL", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DFLASH_BLOCK_SIZE", raising=False)
-        s = ExperimentalSettings()
-        assert s.dflash is False
-        assert s.dflash_draft_model is None
-        assert s.dflash_block_size == 4
+    def test_default_is_classic(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_SPECULATIVE_STRATEGY", raising=False)
+        s = Settings(_env_file=None)
+        assert s.speculative_strategy == "classic"
 
-    def test_dflash_env_override(self, monkeypatch):
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DFLASH", "true")
-        monkeypatch.setenv(
-            "OLMLX_EXPERIMENTAL_DFLASH_DRAFT_MODEL", "aryagm/dflash-qwen3"
-        )
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DFLASH_BLOCK_SIZE", "8")
-        s = ExperimentalSettings()
-        assert s.dflash is True
-        assert s.dflash_draft_model == "aryagm/dflash-qwen3"
-        assert s.dflash_block_size == 8
+    def test_env_override_dflash(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_SPECULATIVE_STRATEGY", "dflash")
+        s = Settings()
+        assert s.speculative_strategy == "dflash"
 
-    def test_dflash_block_size_rejects_zero(self):
+    def test_invalid_strategy_rejected(self):
         with pytest.raises(ValidationError):
-            ExperimentalSettings(dflash_block_size=0, _env_file=None)
+            Settings(speculative_strategy="bogus", _env_file=None)  # type: ignore[arg-type]

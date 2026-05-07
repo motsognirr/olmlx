@@ -1,180 +1,529 @@
 """DFlash block-diffusion speculative decoder.
 
-Uses hidden states from specific target layers to condition a draft model,
-which proposes candidate tokens. The target then verifies all candidates
-in one forward pass. Compatible with the SpeculativeDecoder interface
-(prefill/step/reset) for seamless integration with the streaming pipeline.
+Implements the same ``prefill``/``step``/``reset`` protocol as
+``SpeculativeDecoder`` so the existing ``speculative_stream_generate``
+streaming bridge works unchanged.
+
+Universal target support is achieved by monkey-patching the target's
+selected layers with ``_LayerHook`` (see ``_patch_model``) — this works
+for any model whose layers list lives at one of three known locations
+(``model.layers`` / ``model.model.layers`` / ``model.language_model.layers``).
+No per-architecture adapter code is needed.
+
+For target architectures whose KV cache cannot be trimmed in-place
+(notably Qwen3.5 / Qwen3-Coder-Next with ``GatedDeltaNet`` linear-attention
+layers), ``_GDNStateCapture`` monkey-patches ``GatedDeltaNet.__call__``
+to snapshot the conv + GDN state per draft step and replays
+``gated_delta_update`` on the accepted prefix to restore the correct
+state on rejection.
 """
 
 from __future__ import annotations
 
 import logging
+from threading import RLock
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.cache import (
+    RotatingKVCache,
+    can_trim_prompt_cache,
+    make_prompt_cache,
+)
 
-from olmlx.engine.dflash.adapters import TargetAdapter
 from olmlx.engine.dflash.draft_model import DFlashDraftModel, DraftConfig
 from olmlx.engine.speculative import verify_draft_greedy
 
 try:
-    from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+    import mlx_lm.models.gated_delta as _gd_mod  # type: ignore[import-not-found]
+
+    _HAS_GDN = True
 except ImportError:
-    make_prompt_cache = None  # type: ignore[assignment]
-    trim_prompt_cache = None  # type: ignore[assignment]
+    _gd_mod = None  # type: ignore[assignment]
+    _HAS_GDN = False
 
 logger = logging.getLogger(__name__)
+
+# Module-level lock guarding the GatedDeltaNet monkey-patch. Prevents
+# two ``_GDNStateCapture`` instances from racing on the class-level
+# ``__call__`` attribute.
+_GDN_PATCH_LOCK = RLock()
+
+
+# ---------------------------------------------------------------------------
+# Layer hooks
+# ---------------------------------------------------------------------------
+
+
+class _LayerHook:
+    """Wrap a target layer to capture its output hidden state.
+
+    Transparently proxies attribute access via ``__getattr__`` so the
+    rest of the model sees the original layer's interface.
+    """
+
+    def __init__(self, layer: Any, idx: int, storage: list[Any]):
+        self._layer = layer
+        self._idx = idx
+        self._storage = storage
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        out = self._layer(*args, **kwargs)
+        self._storage[self._idx] = out[0] if isinstance(out, tuple) else out
+        return out
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._layer, name)
+
+
+def _get_layers(model: nn.Module) -> list[Any]:
+    """Find the layers list on a target model.
+
+    Tries (in order): ``model.model.layers``, ``model.language_model.layers``,
+    ``model.layers``. Raises ``AttributeError`` if none is found.
+    """
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers  # type: ignore[no-any-return]
+    if hasattr(model, "language_model") and hasattr(model.language_model, "layers"):
+        return model.language_model.layers  # type: ignore[no-any-return]
+    if hasattr(model, "layers"):
+        return model.layers  # type: ignore[no-any-return]
+    raise AttributeError(
+        f"Cannot find layers in {type(model).__name__}; tried .model.layers, "
+        ".language_model.layers, .layers"
+    )
+
+
+def _patch_model(model: nn.Module, layer_ids: list[int]) -> None:
+    """Install ``_LayerHook`` on the target's selected layers (idempotent).
+
+    Storage list ``model._hidden_states`` is allocated; each hook writes
+    into the slot matching its position in ``layer_ids``.
+    """
+    if hasattr(model, "_hidden_states"):
+        return
+    model._hidden_states = [None] * len(layer_ids)  # type: ignore[attr-defined]
+    layers = _get_layers(model)
+    for i, lid in enumerate(layer_ids):
+        layers[lid] = _LayerHook(layers[lid], i, model._hidden_states)
+
+
+def _unpatch_model(model: nn.Module) -> None:
+    """Remove ``_LayerHook`` wrappers from the target. Safe to call twice."""
+    if not hasattr(model, "_hidden_states"):
+        return
+    layers = _get_layers(model)
+    for i, layer in enumerate(layers):
+        if isinstance(layer, _LayerHook):
+            layers[i] = layer._layer
+    delattr(model, "_hidden_states")
+
+
+def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
+    """Trim trailing ``num_tokens`` from each layer's KV cache.
+
+    Special-cases ``RotatingKVCache`` (must reorder before slicing).
+    Skips entries with no ``trim`` method — the GDN rollback path
+    handles those separately.
+    """
+    if num_tokens <= 0:
+        return
+    for c in cache:
+        n = min(getattr(c, "offset", num_tokens), num_tokens)
+        if n <= 0:
+            continue
+        if isinstance(c, RotatingKVCache) and c.keys is not None:
+            c.keys = c._temporal_order(c.keys)
+            c.values = c._temporal_order(c.values)
+            c.keys = c.keys[..., :-n, :]
+            c.values = c.values[..., :-n, :]
+            c.offset -= n
+            c._idx = c.keys.shape[2]
+        elif hasattr(c, "trim"):
+            c.trim(n)
+
+
+# ---------------------------------------------------------------------------
+# Gated-delta rollback (Qwen3.5 / Qwen3-Coder-Next)
+# ---------------------------------------------------------------------------
+
+
+class _GDNStateCapture:
+    """Monkey-patch ``GatedDeltaNet.__call__`` to enable rejection rollback.
+
+    Snapshots ``(q, k, v, a, b, A_log, dt_bias, init_state, mask)`` and
+    the conv input per layer call. ``rollback`` re-runs
+    ``gated_delta_update`` on the first ``accepted + 1`` tokens to
+    reconstruct the post-acceptance state, then writes it back into the
+    cache. Holds ``_GDN_PATCH_LOCK`` for the lifetime of the capture so
+    only one instance is active at a time.
+    """
+
+    def __init__(self) -> None:
+        if not _HAS_GDN:
+            raise RuntimeError(
+                "mlx_lm.models.gated_delta is unavailable; cannot capture "
+                "GatedDeltaNet state for DFlash rollback"
+            )
+        self.conv_data: list[tuple[mx.array, int]] = []
+        self._gdn_inputs: list[tuple[Any, ...]] = []
+        self._gdn_cls: Any = None
+        self._orig_call: Any = None
+        self._patched_call: Any = None
+        self._closed = False
+        _GDN_PATCH_LOCK.acquire()
+        try:
+            self._patch()
+        except Exception:
+            _GDN_PATCH_LOCK.release()
+            raise
+
+    def _patch(self) -> None:
+        from mlx_lm.models.qwen3_5 import GatedDeltaNet  # type: ignore[import-not-found]
+
+        self._gdn_cls = GatedDeltaNet
+        self._orig_call = GatedDeltaNet.__call__
+        capture = self
+        assert _gd_mod is not None  # guarded by _HAS_GDN
+
+        def _capturing_gdn_call(self_layer, inputs, mask=None, cache=None):  # type: ignore[no-untyped-def]
+            B, S, _ = inputs.shape
+            if self_layer.sharding_group is not None:
+                from mlx_lm.models.qwen3_5 import sum_gradients  # type: ignore[import-not-found]
+
+                inputs = sum_gradients(self_layer.sharding_group)(inputs)
+            qkv = self_layer.in_proj_qkv(inputs)
+            z = self_layer.in_proj_z(inputs).reshape(
+                B, S, self_layer.num_v_heads, self_layer.head_v_dim
+            )
+            b, a = self_layer.in_proj_b(inputs), self_layer.in_proj_a(inputs)
+            conv_state = (
+                cache[0]
+                if (cache is not None and cache[0] is not None)
+                else mx.zeros(
+                    (B, self_layer.conv_kernel_size - 1, self_layer.conv_dim),
+                    dtype=inputs.dtype,
+                )
+            )
+            if mask is not None:
+                qkv = mx.where(mask[..., None], qkv, 0)
+            conv_input = mx.concatenate([conv_state, qkv], axis=1)
+            capture.conv_data.append((conv_input, self_layer.conv_kernel_size))
+            if cache is not None:
+                cache[0] = conv_input[:, -(self_layer.conv_kernel_size - 1) :]
+            conv_out = nn.silu(self_layer.conv1d(conv_input))
+            q, k, v = (
+                t.reshape(B, S, h, d)
+                for t, h, d in zip(
+                    mx.split(
+                        conv_out,
+                        [self_layer.key_dim, 2 * self_layer.key_dim],
+                        -1,
+                    ),
+                    [
+                        self_layer.num_k_heads,
+                        self_layer.num_k_heads,
+                        self_layer.num_v_heads,
+                    ],
+                    [
+                        self_layer.head_k_dim,
+                        self_layer.head_k_dim,
+                        self_layer.head_v_dim,
+                    ],
+                    strict=True,
+                )
+            )
+            state = cache[1] if cache else None
+            inv_scale = k.shape[-1] ** -0.5
+            q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+            k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+            capture._gdn_inputs.append(
+                (q, k, v, a, b, self_layer.A_log, self_layer.dt_bias, state, mask)
+            )
+            out, new_state = _gd_mod.gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self_layer.A_log,
+                self_layer.dt_bias,
+                state,
+                mask,
+                use_kernel=True,
+            )
+            if cache is not None:
+                cache[1] = new_state
+            out = self_layer.norm(out, z)
+            out = self_layer.out_proj(out.reshape(B, S, -1))
+            if self_layer.sharding_group is not None:
+                out = mx.distributed.all_sum(out, group=self_layer.sharding_group)
+            return out
+
+        self._patched_call = _capturing_gdn_call
+        GatedDeltaNet.__call__ = _capturing_gdn_call
+
+    def clear(self) -> None:
+        self.conv_data.clear()
+        self._gdn_inputs.clear()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            if (
+                self._gdn_cls is not None
+                and self._gdn_cls.__call__ is self._patched_call
+            ):
+                self._gdn_cls.__call__ = self._orig_call
+        finally:
+            self._closed = True
+            self._gdn_cls = None
+            self._orig_call = None
+            self._patched_call = None
+            _GDN_PATCH_LOCK.release()
+
+    def rollback(self, cache: list[Any], accepted: int, trim: int) -> None:
+        """Restore the GDN state to reflect ``accepted + 1`` accepted tokens."""
+        assert _gd_mod is not None
+        n_non_trimmable = sum(1 for c in cache if not c.is_trimmable())
+        assert n_non_trimmable == len(self._gdn_inputs), (
+            f"non-trimmable cache count ({n_non_trimmable}) != "
+            f"captured GDN inputs ({len(self._gdn_inputs)}); "
+            "DFlash rollback assumes every non-trimmable cache is a "
+            "GatedDeltaNet layer"
+        )
+        j = 0
+        for c in cache:
+            if c.is_trimmable():
+                c.trim(trim)
+            else:
+                q, k, v, a, b, A_log, dt_bias, init_state, mask = self._gdn_inputs[j]
+                n = accepted + 1
+                _, state = _gd_mod.gated_delta_update(
+                    q[:, :n],
+                    k[:, :n],
+                    v[:, :n],
+                    a[:, :n],
+                    b[:, :n],
+                    A_log,
+                    dt_bias,
+                    init_state,
+                    None if mask is None else mask[:, :n],
+                    use_kernel=True,
+                )
+                c.cache[1] = state
+                conv_input, K = self.conv_data[j]
+                c.cache[0] = conv_input[:, accepted + 1 : accepted + K]
+                j += 1
+
+
+# ---------------------------------------------------------------------------
+# Decoder
+# ---------------------------------------------------------------------------
 
 
 class DFlashDecoder:
     """Block-diffusion speculative decoder.
 
-    Implements the same prefill/step/reset interface as SpeculativeDecoder
-    so it can be used interchangeably with the streaming pipeline.
+    Each ``step()`` builds a masked block ``[pending_token, MASK,
+    MASK, ...]`` of length ``block_size + 1``, runs one parallel draft
+    forward pass to produce ``block_size`` candidate tokens, then runs
+    one verification forward pass through the target. Greedy verification
+    accepts the longest matching prefix; the bonus token comes from the
+    target. On rejection the target cache (or GDN state for hybrid
+    models) is rolled back.
 
-    Uses trim_prompt_cache for cache rollback (like SpeculativeDecoder)
-    instead of snapshot/restore, avoiding redundant target forward passes
-    and KV cache re-allocation on partial rejection.
+    ``block_size`` is the number of *draft* tokens per step (matches
+    ``SpeculativeDecoder``'s ``num_speculative_tokens``). The total
+    block length passed through the draft is ``block_size + 1`` because
+    the pending token occupies position 0 (sliced off via ``logits_start=1``).
     """
 
     def __init__(
         self,
         target_model: nn.Module,
         draft_model: DFlashDraftModel,
-        adapter: TargetAdapter,
         draft_config: DraftConfig,
         block_size: int = 4,
     ):
-        if trim_prompt_cache is None or make_prompt_cache is None:
-            raise RuntimeError(
-                "mlx_lm.models.cache (make_prompt_cache, trim_prompt_cache) "
-                "is unavailable; dflash decoding requires it"
-            )
-
         self._target = target_model
         self._draft = draft_model
-        self._adapter = adapter
         self._config = draft_config
         self._block_size = block_size
 
-        # State
-        self._cache: list | None = None
-        self._cache_seq_len: int = 0
-        self._last_hidden_states: dict[int, mx.array] = {}
-        self._last_target_logit: mx.array | None = None
+        # State (populated by prefill())
+        self._target_cache: list[Any] | None = None
+        self._draft_cache: list[Any] | None = None
+        self._target_can_trim: bool = True
+        self._capture: _GDNStateCapture | None = None
+        self._hidden: mx.array | None = None
         self._pending_token: int | None = None
+        self._prompt_size: int = 0
+        # Counts the *generated* tokens (matching upstream's ``n``);
+        # used to compute draft-cache trim amounts.
+        self._n_generated: int = 0
+
+        # Diagnostic counters (reset on prefill, mirrors SpeculativeDecoder)
+        self._stats_steps: int = 0
+        self._stats_proposed: int = 0
+        self._stats_accepted_draft: int = 0
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        self._cache = None
-        self._cache_seq_len = 0
-        self._last_hidden_states = {}
-        self._last_target_logit = None
+        if self._capture is not None:
+            self._capture.close()
+            self._capture = None
+        if hasattr(self._target, "_hidden_states"):
+            _unpatch_model(self._target)
+        self._draft.unbind()
+        self._target_cache = None
+        self._draft_cache = None
+        self._target_can_trim = True
+        self._hidden = None
         self._pending_token = None
+        self._prompt_size = 0
+        self._n_generated = 0
+        self._stats_steps = 0
+        self._stats_proposed = 0
+        self._stats_accepted_draft = 0
+
+    def stats_summary(self) -> dict[str, Any]:
+        steps = self._stats_steps
+        proposed = self._stats_proposed
+        accepted_draft = self._stats_accepted_draft
+        acceptance_rate = accepted_draft / proposed if proposed else 0.0
+        avg_tokens_per_step = (accepted_draft + steps) / steps if steps else 0.0
+        return {
+            "steps": steps,
+            "proposed": proposed,
+            "accepted_draft": accepted_draft,
+            "acceptance_rate": acceptance_rate,
+            "avg_tokens_per_step": avg_tokens_per_step,
+            "lambda": self._block_size,
+        }
+
+    # ------------------------------------------------------------------
+    # Main API
+    # ------------------------------------------------------------------
 
     def prefill(self, prompt: mx.array) -> int:
-        """Process prompt through target, extract hidden states, return first token.
+        """Process the prompt through the target, capturing hidden states.
 
-        Args:
-            prompt: (1, seq_len) input token IDs.
-
-        Returns:
-            First generated token from target's greedy argmax.
+        Returns the first generated token (target greedy argmax).
         """
         self.reset()
-        self._cache = make_prompt_cache(self._target)
 
-        logits, hidden_states, _ = self._adapter.forward_with_hidden(
-            self._target,
-            prompt,
-            cache=self._cache,
-            target_layer_ids=self._config.target_layer_ids,
-        )
+        target_layer_ids = list(self._config.target_layer_ids)
+        _patch_model(self._target, target_layer_ids)
+        self._draft.bind(self._target)
 
-        self._last_target_logit = logits[0, -1, :]
-        mx.eval(self._last_target_logit)
+        self._target_cache = make_prompt_cache(self._target)
+        self._draft_cache = make_prompt_cache(self._draft)
+        self._target_can_trim = can_trim_prompt_cache(self._target_cache)
+        if not self._target_can_trim:
+            if not _HAS_GDN:
+                raise RuntimeError(
+                    "Target model has non-trimmable KV cache (likely "
+                    "GatedDeltaNet linear-attention layers) but "
+                    "mlx_lm.models.gated_delta is unavailable. Cannot "
+                    "perform DFlash rejection rollback."
+                )
+            self._capture = _GDNStateCapture()
 
-        self._last_hidden_states = hidden_states
-        self._cache_seq_len = prompt.shape[1]
+        target_out = self._target(prompt, cache=self._target_cache)
+        logits = _logits(target_out)
+        captured = list(self._target._hidden_states)  # type: ignore[attr-defined]
+        if any(h is None for h in captured):
+            raise RuntimeError(
+                "Target forward did not populate all configured "
+                "target_layer_ids — check that the layer indices exist on "
+                f"this model (got {target_layer_ids})."
+            )
+        self._hidden = mx.concatenate(captured, axis=-1)
+        last_logit = logits[:, -1, :]
+        mx.eval(last_logit, self._hidden)
 
-        first_token = int(mx.argmax(self._last_target_logit).item())
+        self._prompt_size = int(prompt.shape[1])
+        first_token = int(mx.argmax(last_logit, axis=-1).item())
         self._pending_token = first_token
+        self._n_generated = 1
         return first_token
 
     def step(self) -> tuple[list[int], int]:
-        """One block-diffusion speculative decoding step.
-
-        Returns:
-            (accepted_tokens, block_size).
-        """
-        assert self._cache is not None, "Call prefill() before step()"
-        assert self._pending_token is not None
+        """One block-diffusion speculative step."""
+        assert self._target_cache is not None, "Call prefill() before step()"
+        assert self._draft_cache is not None, "Call prefill() before step()"
+        assert self._pending_token is not None, "Call prefill() before step()"
+        assert self._hidden is not None, "Call prefill() before step()"
 
         pending = self._pending_token
+        bs_total = self._block_size + 1  # block length including pending token
+        mask_id = int(self._config.mask_token_id)
 
-        # 1. Draft: propose block_size candidate tokens
-        draft_tokens = self._draft_block(pending)
-
-        # 2. Target: verify [pending, D1, ..., D_block_size] in one pass
-        all_tokens = mx.array([[pending] + draft_tokens])
-        logits, hidden_states, _ = self._adapter.forward_with_hidden(
-            self._target,
-            all_tokens,
-            cache=self._cache,
-            target_layer_ids=self._config.target_layer_ids,
+        # 1. Draft a block in one parallel forward pass.
+        block = mx.array([[pending] + [mask_id] * self._block_size])
+        draft_logits = self._draft(
+            block, self._hidden, self._draft_cache, logits_start=1
         )
+        # Trim draft cache so its offset matches `prompt_size + n_generated - 1`.
+        # Past tokens whose hiddens were partially rejected get dropped.
+        draft_offset = self._draft_cache[0].offset
+        target_offset = self._prompt_size + self._n_generated - 1
+        if draft_offset > target_offset:
+            _trim_recent_cache(self._draft_cache, draft_offset - target_offset)
+        draft_tokens_arr = mx.argmax(draft_logits, axis=-1)
+        mx.eval(draft_tokens_arr)
+        draft_tokens: list[int] = draft_tokens_arr[0].tolist()
 
-        verification_logits = logits[0]  # (block_size+1, vocab)
+        # 2. Verify with the target in one parallel forward pass.
+        if self._capture is not None:
+            self._capture.clear()
+        verify_input = mx.array([[pending] + draft_tokens])
+        target_out = self._target(verify_input, cache=self._target_cache)
+        logits = _logits(target_out)
+        captured = list(self._target._hidden_states)  # type: ignore[attr-defined]
+        new_hidden = mx.concatenate(captured, axis=-1)
+        mx.eval(logits, new_hidden)
 
-        # 3. Verify: greedy comparison
+        # 3. Greedy verification.
+        verification_logits = logits[0]  # (block_size + 1, vocab)
         accepted = verify_draft_greedy(draft_tokens, verification_logits)
-        num_accepted = len(accepted)
+        num_accepted = len(accepted)  # 1..block_size+1
+        # accepted_drafts is the count BEFORE the bonus position
+        # (excludes the target's correction or all-accepted bonus).
+        accepted_drafts = num_accepted - 1
 
-        assert num_accepted >= 1, "verify_draft_greedy must return at least 1 token"
+        # 4. Roll back caches: remove the unused tail of the verify block.
+        trim = bs_total - num_accepted  # 0..block_size
+        if trim > 0:
+            if self._target_can_trim:
+                _trim_recent_cache(self._target_cache, trim)
+            else:
+                assert self._capture is not None
+                self._capture.rollback(self._target_cache, accepted_drafts, trim)
 
-        # 4. Trim cache to remove rejected tokens (like SpeculativeDecoder)
-        trim_amount = self._block_size + 1 - num_accepted
-        if trim_amount > 0:
-            self._adapter.trim_cache(self._cache, trim_amount)
+        # 5. Slice hidden state to the accepted prefix; this becomes the
+        # new "ctx" length for the next draft call. Length = num_accepted
+        # which spans positions [pending_token, accepted_drafts...].
+        self._hidden = new_hidden[:, :num_accepted, :]
 
-        # 5. Slice hidden states to accepted prefix for next draft
-        sliced_hidden = {}
-        for layer_id, h in hidden_states.items():
-            sliced_hidden[layer_id] = h[:, :num_accepted, :]
-        self._last_hidden_states = sliced_hidden
+        # 6. Update state.
+        self._pending_token = accepted[-1]
+        self._n_generated += num_accepted
 
-        # 6. Update state
-        self._last_target_logit = verification_logits[num_accepted - 1]
-        mx.eval(self._last_target_logit)
-        self._cache_seq_len += num_accepted
-        self._pending_token = int(mx.argmax(self._last_target_logit).item())
+        # Diagnostics.
+        self._stats_steps += 1
+        self._stats_proposed += self._block_size
+        self._stats_accepted_draft += accepted_drafts
 
         return accepted, self._block_size
 
-    def _draft_block(self, pending_token: int) -> list[int]:
-        """Use the draft model to propose a block of candidate tokens.
 
-        Each token is fed as input to the next step (autoregressive), but
-        unlike SpeculativeDecoder there is no KV cache accumulating across
-        draft steps — the draft model's self-attention sees only [context,
-        current_token] each time, not the full history of draft tokens.
-        This is by design: the block-diffusion approach relies on the
-        target's hidden states as the primary conditioning signal.
-        """
-        inp = mx.array([[pending_token]])
-
-        # Extract last-position hidden states and pre-compute context once
-        last_hidden = {}
-        for layer_id, h in self._last_hidden_states.items():
-            last_hidden[layer_id] = h[:, -1:, :]
-        context = self._draft.build_context(last_hidden)
-
-        tokens: list[int] = []
-        for _ in range(self._block_size):
-            logits = self._draft.forward_with_context(inp, context)
-            next_logits = logits[:, -1, :]
-            mx.eval(next_logits)
-            next_token = int(mx.argmax(next_logits, axis=-1).item())
-            tokens.append(next_token)
-            inp = mx.array([[next_token]])
-
-        return tokens
+def _logits(out: Any) -> mx.array:
+    """Unwrap mlx-vlm ``LanguageModelOutput`` if needed."""
+    return getattr(out, "logits", out)

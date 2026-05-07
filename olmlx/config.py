@@ -79,7 +79,15 @@ class Settings(BaseSettings):
     # ``min_length=1`` rejects ``OLMLX_SPECULATIVE_DRAFT_MODEL=""`` at parse
     # time so the load process doesn't surface a misleading "draft not set"
     # error for an empty string.
+    #
+    # ``speculative_strategy`` selects the algorithm:
+    # - ``classic``: standalone draft LM (autoregressive lambda candidates).
+    # - ``dflash``: block-diffusion draft conditioned on target hidden states
+    #   (mask-token parallel block prediction). Requires a draft model whose
+    #   ``config.json`` carries the upstream z-lab ``dflash_config`` schema.
+    # ``speculative_tokens`` is reused as DFlash's ``block_size``.
     speculative: bool = False
+    speculative_strategy: Literal["classic", "dflash"] = "classic"
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
@@ -161,11 +169,6 @@ class ExperimentalSettings(BaseSettings):
     flash_speculative: bool = False
     flash_speculative_draft_model: str | None = None
     flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
-
-    # DFlash block-diffusion speculative decoding
-    dflash: bool = False
-    dflash_draft_model: str | None = None
-    dflash_block_size: Annotated[int, Field(gt=0)] = 4
 
     # Flash MoE (SSD-based expert offloading for MoE models)
     flash_moe: bool = False

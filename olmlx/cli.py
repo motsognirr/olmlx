@@ -266,6 +266,64 @@ def _forward_legacy_speculative_env(
             )
 
 
+_DEPRECATED_DFLASH_ENV_VARS = (
+    "OLMLX_EXPERIMENTAL_DFLASH",
+    "OLMLX_EXPERIMENTAL_DFLASH_DRAFT_MODEL",
+    "OLMLX_EXPERIMENTAL_DFLASH_BLOCK_SIZE",
+)
+
+
+def _surface_legacy_dflash_env() -> None:
+    """Detect and forward legacy ``OLMLX_EXPERIMENTAL_DFLASH*`` env vars.
+
+    DFlash has been folded into the unified speculative path
+    (``OLMLX_SPECULATIVE`` + ``OLMLX_SPECULATIVE_STRATEGY=dflash`` +
+    ``OLMLX_SPECULATIVE_DRAFT_MODEL`` + ``OLMLX_SPECULATIVE_TOKENS``).
+    Honour the old env vars for one release, with a warning, then drop
+    them in the next promotion cycle.
+    """
+    from olmlx.config import settings as _settings
+
+    legacy_dflash = os.environ.get("OLMLX_EXPERIMENTAL_DFLASH", "").strip().lower()
+    legacy_draft = os.environ.get("OLMLX_EXPERIMENTAL_DFLASH_DRAFT_MODEL")
+    legacy_block = os.environ.get("OLMLX_EXPERIMENTAL_DFLASH_BLOCK_SIZE")
+
+    stale = [v for v in _DEPRECATED_DFLASH_ENV_VARS if os.environ.get(v)]
+    if not stale:
+        return
+    logger.warning(
+        "Deprecated env vars detected: %s. DFlash is now a strategy of the "
+        "unified speculative path. Set OLMLX_SPECULATIVE=true, "
+        "OLMLX_SPECULATIVE_STRATEGY=dflash, "
+        "OLMLX_SPECULATIVE_DRAFT_MODEL=<hf-path>, and (optionally) "
+        "OLMLX_SPECULATIVE_TOKENS=<N> instead. The old vars will be removed "
+        "in a future release.",
+        ", ".join(stale),
+    )
+
+    if legacy_dflash in ("1", "true", "yes", "on"):
+        if not os.environ.get("OLMLX_SPECULATIVE"):
+            try:
+                _settings.speculative = True
+                _settings.speculative_strategy = "dflash"
+            except Exception as exc:
+                logger.warning("Could not forward legacy DFlash settings: %s", exc)
+    if legacy_draft and not os.environ.get("OLMLX_SPECULATIVE_DRAFT_MODEL"):
+        try:
+            _settings.speculative_draft_model = legacy_draft
+        except Exception as exc:
+            logger.warning("Could not forward legacy DFlash draft model: %s", exc)
+    if legacy_block and not os.environ.get("OLMLX_SPECULATIVE_TOKENS"):
+        try:
+            _settings.speculative_tokens = int(legacy_block)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Could not forward OLMLX_EXPERIMENTAL_DFLASH_BLOCK_SIZE=%r: %s",
+                legacy_block,
+                exc,
+            )
+
+
 def _surface_legacy_speculative_env() -> None:
     """Warn about and forward legacy ``OLMLX_EXPERIMENTAL_SPECULATIVE*``
     env vars (shell or ``.env``) to the new Settings.
@@ -405,16 +463,20 @@ def _apply_serve_overrides(args) -> None:
     from olmlx.config import settings as _settings
 
     _surface_legacy_speculative_env()
+    _surface_legacy_dflash_env()
 
     # ``getattr`` defends programmatic callers that hand a bare
     # ``argparse.Namespace`` (e.g. tests) without populating these
     # attributes. The parser-derived defaults already cover bare
     # ``olmlx`` invocation; this is just a safety net.
     spec = getattr(args, "speculative", None)
+    spec_strategy = getattr(args, "speculative_strategy", None)
     spec_draft = getattr(args, "speculative_draft_model", None)
     spec_tokens = getattr(args, "speculative_tokens", None)
     if spec is not None:
         _settings.speculative = spec
+    if spec_strategy is not None:
+        _settings.speculative_strategy = spec_strategy
     if spec_draft is not None:
         _settings.speculative_draft_model = spec_draft
     if spec_tokens is not None:
@@ -615,7 +677,7 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
     global_draft_used = False
     for name, mc in registry.list_models().items():
         try:
-            enabled, draft, _ = mc.resolved_speculative()
+            enabled, draft, _, _ = mc.resolved_speculative()
         except Exception as exc:
             # ``resolved_speculative`` reads ``settings`` and could
             # raise if the runtime ``Settings`` is in an unexpected
@@ -2080,6 +2142,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable speculative decoding (overrides OLMLX_SPECULATIVE)",
     )
     serve_p.add_argument(
+        "--speculative-strategy",
+        dest="speculative_strategy",
+        choices=("classic", "dflash"),
+        default=None,
+        help=(
+            "Speculative decoding strategy: 'classic' (standalone draft LM) "
+            "or 'dflash' (block-diffusion draft conditioned on target hidden "
+            "states). Default: classic."
+        ),
+    )
+    serve_p.add_argument(
         "--speculative-draft-model",
         dest="speculative_draft_model",
         type=_non_empty_str,
@@ -2091,7 +2164,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="speculative_tokens",
         type=_positive_int,
         default=None,
-        help="Number of tokens drafted per verification step (default: 4)",
+        help=(
+            "Number of tokens drafted per verification step (default: 4). "
+            "For DFlash this is the block size (excluding the pending token)."
+        ),
     )
     serve_p.add_argument(
         "--kv-cache-quant",
