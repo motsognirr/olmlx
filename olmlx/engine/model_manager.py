@@ -1837,31 +1837,38 @@ class ModelManager:
                 "must be trained against a target with the same vocabulary."
             )
 
-        # ``speculative_tokens`` overrides the draft config's ``block_size``
-        # so users can shrink the block at inference time without
-        # re-training. The draft's positional encoding is unaffected.
-        # ``None`` (no user override) inherits the draft's pre-trained block.
+        # ``DFlashDecoder.block_size`` is the *draft token count* (matches
+        # ``SpeculativeDecoder``'s ``num_speculative_tokens``). The
+        # upstream draft ``config.json`` stores ``block_size`` as the
+        # *total* block length (pending token + draft tokens), so we
+        # convert with ``-1`` when inheriting from the draft config.
+        # ``speculative_tokens`` already uses the draft-count convention
+        # so an explicit override passes through directly. ``None`` (no
+        # user override) inherits the draft's pre-trained block.
+        trained_draft_count = max(draft_config.block_size - 1, 1)
         block_size = (
             spec_config.num_tokens
             if spec_config.num_tokens is not None
-            else draft_config.block_size
+            else trained_draft_count
         )
-        # Going *above* the trained ``block_size`` runs the draft on
-        # block lengths it has never seen; the positional encoding and
+        # Going *above* the trained draft count runs the draft on block
+        # lengths it has never seen; the positional encoding and
         # block-diffusion training are bound to the trained length.
         # Warn (don't fail) — users may experiment.
         if (
             spec_config.num_tokens is not None
-            and spec_config.num_tokens > draft_config.block_size
+            and spec_config.num_tokens > trained_draft_count
         ):
             logger.warning(
-                "speculative_tokens=%d exceeds the draft's pre-trained "
-                "block_size=%d; output quality may degrade. Omit "
+                "speculative_tokens=%d exceeds the draft's trained "
+                "draft-count=%d (config.json block_size=%d minus the "
+                "pending-token slot); output quality may degrade. Omit "
                 "speculative_tokens (or pass <= %d) to stay within the "
                 "trained block length.",
                 spec_config.num_tokens,
+                trained_draft_count,
                 draft_config.block_size,
-                draft_config.block_size,
+                trained_draft_count,
             )
         return DFlashDecoder(
             target_model=target_model,

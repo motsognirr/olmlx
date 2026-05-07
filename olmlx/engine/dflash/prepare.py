@@ -1,0 +1,466 @@
+"""Train a DFlash draft model for a given target.
+
+Pipeline mirrors ``engine/flash/prepare.py``:
+
+1. Load the target via mlx-lm; freeze it.
+2. Build a ``DraftConfig`` from the target's config + CLI overrides.
+3. Construct ``DFlashDraftModel`` and ``bind()`` it to the target.
+4. Stream training batches from a HuggingFace dataset (default:
+   UltraChat) via ``training_data.stream_training_batches``.
+5. For each batch: run target (no grad) to capture hidden states via
+   the same ``_patch_model`` used at inference; pick a random pivot
+   ``p`` shared across the batch; build a masked draft window
+   ``[tokens[p], MASK*block_size]``; compute cross-entropy on the
+   ``block_size`` masked positions vs. the original tokens.
+6. AdamW + cosine schedule. Save to ``<model_dir>/dflash/{config.json,
+   model-00001-of-00001.safetensors}`` in the upstream-compatible
+   schema so ``_load_dflash_decoder`` can consume the result without
+   any further translation.
+
+This v1 trains on **one random window per sequence per step**. That
+under-uses each target forward pass (one window vs. potentially
+``L - block_size`` windows) but keeps the loss/grad surface tiny and
+debuggable. Sharded hidden-state precompute and KL distillation land
+in PR #3.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+import mlx.utils as mx_utils
+
+from olmlx.engine.dflash.decoder import _patch_model, _unpatch_model
+from olmlx.engine.dflash.draft_model import DFlashDraftModel, DraftConfig
+from olmlx.engine.dflash.training_data import stream_training_batches
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+
+DEFAULT_NUM_HIDDEN_LAYERS = 4
+DEFAULT_BLOCK_SIZE = 4  # number of draft tokens per step (== MASK count)
+DEFAULT_STEPS = 2000
+DEFAULT_BATCH_SIZE = 4
+DEFAULT_SEQ_LEN = 2048
+DEFAULT_LR = 5e-4
+DEFAULT_WARMUP_FRAC = 0.05
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _read_target_config(model_path: Path) -> dict[str, Any]:
+    cfg_path = model_path / "config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Target config not found at {cfg_path}")
+    return json.loads(cfg_path.read_text())
+
+
+def _evenly_spaced(num_layers: int, k: int) -> list[int]:
+    """Pick ``k`` layer indices from ``[0, num_layers)`` evenly spaced.
+
+    For the default ``num_target_layers=4`` and a 32-layer target this
+    gives ``[3, 11, 19, 27]`` — the upstream papers show middle/late
+    layers carry the most useful signal. Edge layers are intentionally
+    avoided (the draft already sees the input via embed_tokens, and
+    the final-layer hidden is roughly equivalent to the LM head's
+    pre-projection signal).
+    """
+    if k <= 0:
+        return []
+    if k >= num_layers:
+        return list(range(num_layers))
+    step = (num_layers - 1) / (k + 1)
+    return [int(round((i + 1) * step)) for i in range(k)]
+
+
+def _resolve_target_layer_ids(
+    requested: list[int] | None,
+    num_target_layers: int | None,
+    target_num_layers: int,
+) -> list[int]:
+    """Pick the target_layer_ids list.
+
+    Precedence: explicit list > evenly-spaced derivation from the
+    ``num_target_layers`` count > 4 evenly-spaced layers.
+    """
+    if requested:
+        for lid in requested:
+            if not 0 <= lid < target_num_layers:
+                raise ValueError(
+                    f"target_layer_ids contains {lid}, out of range "
+                    f"[0, {target_num_layers})"
+                )
+        return list(requested)
+    k = num_target_layers or DEFAULT_NUM_HIDDEN_LAYERS
+    return _evenly_spaced(target_num_layers, k)
+
+
+def _build_draft_config(
+    target_cfg: dict[str, Any],
+    *,
+    target_layer_ids: list[int],
+    num_hidden_layers: int,
+    block_size: int,
+    mask_token_id: int,
+) -> DraftConfig:
+    """Derive a DraftConfig from the target's config.json.
+
+    Falls back to sensible defaults for fields the target doesn't
+    expose. The draft inherits hidden_size, head_dim, GQA shape,
+    rope_theta, and vocab_size from the target so weights are
+    dimensionally compatible at inference time.
+    """
+    hidden_size = int(target_cfg["hidden_size"])
+    num_attention_heads = int(
+        target_cfg.get("num_attention_heads") or target_cfg["hidden_size"] // 64
+    )
+    num_kv_heads = int(target_cfg.get("num_key_value_heads") or num_attention_heads)
+    head_dim = int(target_cfg.get("head_dim") or hidden_size // num_attention_heads)
+    intermediate_size = int(target_cfg.get("intermediate_size") or hidden_size * 4)
+    rms_norm_eps = float(target_cfg.get("rms_norm_eps") or 1e-6)
+    rope_theta = float(target_cfg.get("rope_theta") or 10000.0)
+    max_position_embeddings = int(target_cfg.get("max_position_embeddings") or 4096)
+
+    # Stored on disk in the upstream wire format: ``block_size`` is the
+    # *total* block length (pending + drafts). The decoder converts back
+    # at load time via ``max(block_size - 1, 1)``.
+    return DraftConfig(
+        hidden_size=hidden_size,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_kv_heads,
+        head_dim=head_dim,
+        intermediate_size=intermediate_size,
+        vocab_size=int(target_cfg["vocab_size"]),
+        rms_norm_eps=rms_norm_eps,
+        rope_theta=rope_theta,
+        max_position_embeddings=max_position_embeddings,
+        block_size=block_size + 1,
+        num_target_layers=len(target_layer_ids),
+        target_layer_ids=list(target_layer_ids),
+        mask_token_id=mask_token_id,
+        rope_scaling=target_cfg.get("rope_scaling"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Training step
+# ---------------------------------------------------------------------------
+
+
+def _capture_target_hidden(
+    target: nn.Module,
+    inputs: mx.array,
+    cache: list[Any] | None,
+) -> mx.array:
+    """Run target on ``inputs`` and return the concatenated hidden states.
+
+    Assumes ``_patch_model`` has been installed. The returned tensor has
+    shape ``(B, L, num_target_layers * hidden_size)`` and is detached
+    via ``mx.stop_gradient`` — the target is frozen during draft
+    training.
+    """
+    target(inputs, cache=cache)
+    captured = list(target._hidden_states)  # type: ignore[attr-defined]
+    if any(h is None for h in captured):
+        raise RuntimeError(
+            "Target forward did not populate all configured target_layer_ids"
+        )
+    hidden = mx.concatenate(captured, axis=-1)
+    return mx.stop_gradient(hidden)
+
+
+def _draft_loss(
+    draft: DFlashDraftModel,
+    block_input: mx.array,
+    target_hidden: mx.array,
+    targets: mx.array,
+    cache: list[Any],
+) -> mx.array:
+    """Cross-entropy loss on the masked positions only.
+
+    ``block_input`` has shape ``(B, block_size + 1)`` — position 0 is
+    the visible pending token, positions 1..block_size are MASK.
+    ``logits_start=1`` slices the position-0 logit out so logits has
+    shape ``(B, block_size, vocab)``. ``targets`` has shape
+    ``(B, block_size)`` and contains the original (unmasked) tokens.
+    """
+    logits = draft(block_input, target_hidden, cache, logits_start=1)
+    # Numerically stable cross-entropy: log_softmax + gather.
+    log_probs = nn.log_softmax(logits, axis=-1)
+    nll = -mx.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
+    return mx.mean(nll)
+
+
+def _cosine_lr(step: int, total: int, peak: float, warmup: int) -> float:
+    """Linear warmup followed by cosine decay to 10% of peak."""
+    if step < warmup:
+        return peak * (step + 1) / max(warmup, 1)
+    if step >= total:
+        return peak * 0.1
+    progress = (step - warmup) / max(total - warmup, 1)
+    return peak * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+
+# ---------------------------------------------------------------------------
+# Main entry
+# ---------------------------------------------------------------------------
+
+
+def prepare_dflash_draft(
+    model_path: str | Path,
+    *,
+    dataset: str | None = None,
+    dataset_split: str | None = None,
+    steps: int = DEFAULT_STEPS,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    seq_len: int = DEFAULT_SEQ_LEN,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    num_hidden_layers: int = DEFAULT_NUM_HIDDEN_LAYERS,
+    target_layer_ids: list[int] | None = None,
+    num_target_layers: int | None = None,
+    lr: float = DEFAULT_LR,
+    mask_token_id: int | None = None,
+    output_dir: str | Path | None = None,
+    progress_callback: Callable[[str, float], None] | None = None,
+    log_every: int = 50,
+    _target_loader: Callable[[str], tuple[Any, Any]] | None = None,
+    _batch_iterator: Any = None,
+) -> Path:
+    """Train a DFlash draft model and write it to disk.
+
+    ``_target_loader`` is an injection hook for tests so the trainer
+    can run without downloading a multi-GB target. In normal use it
+    defaults to ``mlx_lm.load``.
+    """
+    model_path = Path(model_path)
+    target_cfg = _read_target_config(model_path)
+
+    if _target_loader is None:
+        from mlx_lm import load as _mlx_lm_load
+
+        target, tokenizer = _mlx_lm_load(str(model_path))
+    else:
+        target, tokenizer = _target_loader(str(model_path))
+
+    # Freeze target params — frozen tensors still flow through forward
+    # but ``nn.value_and_grad(draft, ...)`` only differentiates draft
+    # parameters, so the target is implicitly frozen by virtue of not
+    # being inside the closure. We additionally call ``.freeze()`` to
+    # prevent dropout/training-mode side effects.
+    target.eval()  # type: ignore[attr-defined]
+    if hasattr(target, "freeze"):
+        target.freeze()
+
+    target_layers_attr = (
+        target.layers if hasattr(target, "layers") else target.model.layers
+    )
+    target_num_layers = len(target_layers_attr)
+
+    layer_ids = _resolve_target_layer_ids(
+        target_layer_ids, num_target_layers, target_num_layers
+    )
+    logger.info("DFlash target_layer_ids = %s", layer_ids)
+
+    if mask_token_id is None:
+        mask_token_id = (
+            getattr(tokenizer, "pad_token_id", None)
+            or getattr(tokenizer, "eos_token_id", None)
+            or 0
+        )
+
+    draft_config = _build_draft_config(
+        target_cfg,
+        target_layer_ids=layer_ids,
+        num_hidden_layers=num_hidden_layers,
+        block_size=block_size,
+        mask_token_id=int(mask_token_id),
+    )
+
+    draft = DFlashDraftModel(draft_config)
+    draft.bind(target)
+    mx.eval(draft.parameters())
+
+    _patch_model(target, layer_ids)
+
+    # Optimizer + LR schedule.
+    optimizer = optim.AdamW(learning_rate=lr)
+    warmup = max(int(steps * DEFAULT_WARMUP_FRAC), 1)
+
+    # Closure that ``nn.value_and_grad`` differentiates wrt ``draft``
+    # parameters only. ``cache`` is passed positionally so it's not
+    # treated as a parameter; ``target_hidden`` is detached upstream.
+    def loss_fn(
+        model: DFlashDraftModel,
+        block_input: mx.array,
+        target_hidden: mx.array,
+        targets: mx.array,
+        cache: list[Any],
+    ) -> mx.array:
+        return _draft_loss(model, block_input, target_hidden, targets, cache)
+
+    loss_and_grad = nn.value_and_grad(draft, loss_fn)
+
+    def _step(
+        block_input: mx.array,
+        target_hidden: mx.array,
+        targets: mx.array,
+        cache: list[Any],
+    ) -> mx.array:
+        loss, grads = loss_and_grad(draft, block_input, target_hidden, targets, cache)
+        optimizer.update(draft, grads)
+        return loss
+
+    # Streaming data loop — each iteration produces one (B, seq_len) batch.
+    # ``_batch_iterator`` is a test-only injection hook so the trainer
+    # can run against synthetic data without hitting the network.
+    if _batch_iterator is not None:
+        batches = _batch_iterator
+    else:
+        batches = stream_training_batches(
+            tokenizer,
+            dataset=dataset or "HuggingFaceH4/ultrachat_200k",
+            split=dataset_split or "train_sft",
+            batch_size=batch_size,
+            seq_len=seq_len,
+            max_examples=steps,
+        )
+
+    losses: list[float] = []
+    try:
+        for step, input_ids in enumerate(batches):
+            if step >= steps:
+                break
+
+            optimizer.learning_rate = _cosine_lr(step, steps, lr, warmup)
+
+            # Capture target hidden states (frozen).
+            cache = None  # one-shot prefill; no cross-step caching for now.
+            target_hidden_full = _capture_target_hidden(target, input_ids, cache)
+
+            # Pick a random pivot p in [block_size, seq_len - block_size - 1).
+            # Using the same p across the batch keeps shapes static; cycling
+            # the pivot across steps gives diverse training windows.
+            seq = input_ids.shape[1]
+            lo = block_size
+            hi = seq - block_size - 1
+            if hi <= lo:
+                raise ValueError(
+                    f"seq_len={seq} too small for block_size={block_size}; "
+                    f"need at least 2*block_size + 2 tokens per sequence"
+                )
+            p = int(mx.random.randint(lo, hi, shape=()).item())
+
+            pending = input_ids[:, p : p + 1]  # (B, 1)
+            mask_block = mx.full(
+                (input_ids.shape[0], block_size),
+                int(draft_config.mask_token_id),
+                dtype=input_ids.dtype,
+            )
+            block_input = mx.concatenate([pending, mask_block], axis=1)
+            targets = input_ids[:, p + 1 : p + 1 + block_size]
+            target_hidden = target_hidden_full[:, : p + 1, :]
+
+            # Fresh draft cache per step — block-diffusion training does
+            # not cross step boundaries (each window is independent).
+            draft_cache = draft.make_cache()
+
+            loss = _step(block_input, target_hidden, targets, draft_cache)
+            mx.eval(loss, draft.parameters(), optimizer.state)
+            losses.append(float(loss.item()))
+
+            if (step + 1) % log_every == 0 or step == 0:
+                avg = sum(losses[-log_every:]) / max(min(log_every, len(losses)), 1)
+                logger.info(
+                    "step %d/%d  loss=%.4f  avg(%d)=%.4f  lr=%.2e",
+                    step + 1,
+                    steps,
+                    losses[-1],
+                    log_every,
+                    avg,
+                    optimizer.learning_rate,
+                )
+            if progress_callback:
+                progress_callback(
+                    f"Training step {step + 1}/{steps} loss={losses[-1]:.4f}",
+                    (step + 1) / steps,
+                )
+    finally:
+        _unpatch_model(target)
+        draft.unbind()
+
+    # Save: <output>/{config.json, model-00001-of-00001.safetensors}.
+    if output_dir is None:
+        output_dir = model_path / "dflash"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    config_dict = _draft_config_to_disk(draft_config)
+    (output_dir / "config.json").write_text(json.dumps(config_dict, indent=2))
+
+    weights = dict(mx_utils.tree_flatten(draft.parameters()))
+    # Drop the bound embed/lm_head references — they live on the target
+    # and are re-bound on load. ``DFlashDraftModel`` stores them as
+    # plain attributes, but if a future change made them ``Module``
+    # children they would leak into the saved weights here.
+    weights = {
+        k: v
+        for k, v in weights.items()
+        if not k.startswith("embed_tokens.") and not k.startswith("lm_head.")
+    }
+    mx.save_safetensors(str(output_dir / "model-00001-of-00001.safetensors"), weights)
+
+    logger.info(
+        "Saved DFlash draft to %s (%d weight tensors)", output_dir, len(weights)
+    )
+    return output_dir
+
+
+def _draft_config_to_disk(cfg: DraftConfig) -> dict[str, Any]:
+    """Serialize ``DraftConfig`` to the upstream-compatible JSON schema.
+
+    Mirrors what ``_load_dflash_decoder`` parses on the way in:
+    top-level scalars + nested ``dflash_config`` block carrying
+    ``target_layer_ids`` and ``mask_token_id``.
+    """
+    out: dict[str, Any] = {
+        "hidden_size": cfg.hidden_size,
+        "num_hidden_layers": cfg.num_hidden_layers,
+        "num_attention_heads": cfg.num_attention_heads,
+        "num_key_value_heads": cfg.num_key_value_heads,
+        "head_dim": cfg.head_dim,
+        "intermediate_size": cfg.intermediate_size,
+        "vocab_size": cfg.vocab_size,
+        "rms_norm_eps": cfg.rms_norm_eps,
+        "rope_theta": cfg.rope_theta,
+        "max_position_embeddings": cfg.max_position_embeddings,
+        "block_size": cfg.block_size,
+        "num_target_layers": cfg.num_target_layers,
+        "layer_types": list(cfg.layer_types),
+        "dflash_config": {
+            "target_layer_ids": list(cfg.target_layer_ids),
+            "mask_token_id": cfg.mask_token_id,
+        },
+    }
+    if cfg.rope_scaling is not None:
+        out["rope_scaling"] = cfg.rope_scaling
+    if cfg.sliding_window is not None:
+        out["sliding_window"] = cfg.sliding_window
+    if cfg.final_logit_softcapping is not None:
+        out["final_logit_softcapping"] = cfg.final_logit_softcapping
+    return out
