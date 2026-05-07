@@ -24,7 +24,8 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache, RotatingKVCache, create_causal_mask
+from mlx_lm.models.base import create_causal_mask
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.rope_utils import initialize_rope
 
 

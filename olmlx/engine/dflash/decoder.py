@@ -235,7 +235,10 @@ class _GDNStateCapture:
         def _capturing_gdn_call(self_layer, inputs, mask=None, cache=None):  # type: ignore[no-untyped-def]
             B, S, _ = inputs.shape
             if self_layer.sharding_group is not None:
-                inputs = sum_gradients(self_layer.sharding_group)(inputs)
+                # ``sum_gradients`` returns an ``mx.custom_function``-decorated
+                # callable whose pyright-inferred signature picks up the inner
+                # ``vjp(x, dx, _)``; the runtime call takes a single tensor.
+                inputs = sum_gradients(self_layer.sharding_group)(inputs)  # type: ignore[call-arg]
             qkv = self_layer.in_proj_qkv(inputs)
             z = self_layer.in_proj_z(inputs).reshape(
                 B, S, self_layer.num_v_heads, self_layer.head_v_dim
@@ -528,7 +531,9 @@ class DFlashDecoder:
             _trim_recent_cache(self._draft_cache, draft_offset - target_offset)
         draft_tokens_arr = mx.argmax(draft_logits, axis=-1)
         mx.eval(draft_tokens_arr)
-        draft_tokens: list[int] = draft_tokens_arr[0].tolist()
+        # ``mx.array.tolist()`` is typed as ``list_or_scalar``; for a 1-D
+        # array of ints it always returns ``list[int]`` at runtime.
+        draft_tokens: list[int] = draft_tokens_arr[0].tolist()  # type: ignore[assignment]
 
         # 2. Verify with the target in one parallel forward pass.
         if self._capture is not None:
