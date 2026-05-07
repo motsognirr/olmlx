@@ -1300,11 +1300,16 @@ class ModelManager:
                         # WARNING because vision capability is permanently
                         # lost for this model load — image inputs would
                         # produce confusing errors with no other signal.
+                        # Log both the top-level VLM type and the mlx-lm
+                        # text-path type that the routing decision was
+                        # made on, since they typically differ for
+                        # hybrid VLMs (e.g. "qwen3_5_vl" → "qwen3_5").
                         logger.warning(
                             "Routing hybrid linear-attention VLM '%s' "
-                            "through mlx-lm text path (issue #284). "
+                            "through mlx-lm text path '%s' (issue #284). "
                             "Vision capability is disabled for this load.",
                             model_type,
+                            text_model_type,
                         )
                         return "text"
                     # mlx-lm has no module for this model_type.  The mlx-vlm

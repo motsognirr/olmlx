@@ -3923,10 +3923,12 @@ class TestKvCachePreflightCheckHelper:
         # still runs so other in-memory entries are flushed.
         mock_lm.prompt_cache_store.async_set.assert_not_awaited()
         mock_lm.prompt_cache_store.async_evict_all_to_disk.assert_awaited_once()
-        # Critical: remove(cache_id) must be called so any stale on-disk
-        # entry is gone before evict_all_to_disk runs — otherwise the
-        # eviction would persist the stale ArraysCache state and the
-        # next request would load it and crash (regressing the fix).
+        # Defensive: remove(cache_id) is called on the OOM path even
+        # though clear_disk() at load time should have wiped any pre-PR
+        # stale entry already.  Belt-and-suspenders against a stale
+        # entry created mid-session (e.g. probe ran before persistence
+        # was correctly classified, or a future code path that bypasses
+        # _setup_prompt_cache reaches this branch).
         mock_lm.prompt_cache_store.remove.assert_called_once_with("test")
 
 
