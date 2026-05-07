@@ -1260,9 +1260,13 @@ class ModelManager:
                         importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}")
                         is not None
                     ):
-                        logger.info(
+                        # WARNING because vision capability is permanently
+                        # lost for this model load — image inputs would
+                        # produce confusing errors with no other signal.
+                        logger.warning(
                             "Routing hybrid linear-attention VLM '%s' "
-                            "through mlx-lm text path (issue #284)",
+                            "through mlx-lm text path (issue #284). "
+                            "Vision capability is disabled for this load.",
                             model_type,
                         )
                         return "text"

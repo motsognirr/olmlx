@@ -1850,12 +1850,18 @@ async def _setup_prompt_cache(
         return result
 
     # Issue #284: for non-persistable models (hybrid SSM-style ArraysCache),
-    # any stored entry is unsafe to reuse — pre-PR data on disk would crash
-    # mlx-lm on prefill.  Skip the lookup and clean up any stale entry so
-    # it doesn't survive across process restarts and ambush the next
-    # request.  remove() is idempotent on a missing entry.
+    # any stored entry is unsafe to reuse — loading from disk and feeding it
+    # to mlx-lm would crash the next prefill.  We never store for these
+    # models post-PR, so the only path to a stale entry is pre-PR data.
+    # Skip the disk lookup entirely and clear any in-memory entry.  Gated
+    # on peek() so we don't pay a blocking unlink(ENOENT) syscall on every
+    # request.  Pre-PR on-disk files for non-persistable models can persist
+    # indefinitely — that's harmless because nothing reads from disk for
+    # these models — but they're cleaned up by the disk cache size eviction
+    # in PromptCacheStore eventually.
     if not lm.supports_cache_persistence:
-        lm.prompt_cache_store.remove(cache_id)
+        if lm.prompt_cache_store.peek(cache_id) is not None:
+            lm.prompt_cache_store.remove(cache_id)
         cached = None
     else:
         cached = await lm.prompt_cache_store.async_get(cache_id)
