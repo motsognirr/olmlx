@@ -205,6 +205,82 @@ def _cache_supports_trim(cache_list: list) -> bool:
     return all(type(layer).__name__ in _TRIMMABLE_CACHE_CLASSES for layer in cache_list)
 
 
+# Cache layer classes whose stored state CAN be safely reused on a later
+# request.  Allowlist (not denylist) so that any new mlx-lm cache class
+# defaults to non-persistable: a false negative here just means a missed
+# cache hit, while a false positive (treating an unknown SSM-style cache
+# as persistable) crashes mlx-lm during the next prefill with "RuntimeError:
+# There is no Stream(gpu, N) in current thread".  Issue #284.
+#
+# ArraysCache (gated-delta SSM state used by Qwen3.5, Qwen3-Next) is the
+# motivating exclusion: its stored arrays carry a lazy graph that
+# references a Metal stream from the previous worker thread; re-evaluating
+# them in a fresh worker thread fails.  Within-request cache reuse during
+# a single generation works fine; only cross-request persistence is unsafe.
+#
+# Verified safe against mlx-lm by inspection of mlx_lm/models/cache.py:
+# the failure mode in #284 is that ArraysCache stores arrays produced by
+# the ``gated_delta_kernel`` (mx.fast.metal_kernel) whose lazy graph
+# carries a Metal stream reference from the generating worker thread,
+# and re-evaluating that graph in a different worker thread raises
+# "There is no Stream(gpu, N)".  The classes in the allowlist below
+# all store keys/values produced by stock matmul/attention ops only —
+# no metal_kernel outputs, no generator-thread-bound state — so their
+# arrays are reusable across worker threads:
+# - KVCache: bare keys + values, mx.concatenate at update boundaries.
+# - QuantizedKVCache: same, with mx.quantize/dequantize wrappers.
+# - ConcatenateKVCache: same, used by AFM-7 family.
+# - RotatingKVCache: ring buffer over fixed window (Gemma 4); writes
+#   in place via mx.assign at modular offsets.
+# - ChunkedKVCache: chunked layout (afm7); same semantics as KVCache
+#   bounded by chunk_size.
+# If a future mlx-lm release adds metal_kernel-style state to any of
+# these, that class must be removed from the allowlist.
+#
+# Deliberately excluded:
+# - ArraysCache: gated-delta SSM state — see issue #284.
+# - CacheList: wraps other caches, would need recursion to classify safely.
+# - BatchKVCache / BatchRotatingKVCache: batch path, untested in olmlx
+#   (single-user server) — disable persistence rather than risk a crash.
+_PERSISTABLE_CACHE_CLASSES = frozenset(
+    {
+        "KVCache",
+        "QuantizedKVCache",
+        "ConcatenateKVCache",
+        "RotatingKVCache",
+        "ChunkedKVCache",
+    }
+)
+
+
+def _cache_supports_persistence(cache_list: list) -> bool:
+    """True iff every layer is a cache type known to be safe for
+    cross-request persistence.
+
+    See ``_PERSISTABLE_CACHE_CLASSES`` for the allowlist.  Models that fail
+    this check still get within-request cache reuse — just not the
+    cross-request strict-extension reuse the prompt cache store normally
+    provides.
+
+    Exact class-name match (no MRO walk).  With allowlist semantics an MRO
+    walk would invert the safety guarantee: a future ``BadSSMCache(KVCache)``
+    that has unsafe state but inherits from an allowlisted class would
+    silently pass.  Subclasses must be added to the allowlist explicitly.
+    A false-negative just costs a cache miss; a false-positive crashes
+    mlx-lm with a Metal stream error on the next request.
+
+    Empty ``cache_list`` returns False (no evidence of safety).  Unlike the
+    trim probe — where a false-positive falls back gracefully — a stray
+    True here would crash the next request.
+    """
+    if not cache_list:
+        return False
+    for layer in cache_list:
+        if type(layer).__name__ not in _PERSISTABLE_CACHE_CLASSES:
+            return False
+    return True
+
+
 class ModelLoadTimeoutError(TimeoutError):
     """Raised when model loading exceeds OLMLX_MODEL_LOAD_TIMEOUT."""
 
@@ -403,6 +479,28 @@ class PromptCacheStore:
         if self._disk_enabled:
             self._disk_file_path(cache_id).unlink(missing_ok=True)
 
+    def clear_disk(self) -> int:
+        """Remove all on-disk entries for this store's model namespace.
+
+        Returns the number of files removed.  Used at probe time for
+        non-persistable models to clean up stale pre-PR data that would
+        otherwise sit on disk indefinitely (issue #284).  Caller must
+        also call ``clear()`` if they want to drop the in-memory entries.
+        """
+        if not self._disk_enabled or self._disk_path is None:
+            return 0
+        disk_dir = self._disk_dir()
+        if not disk_dir.exists():
+            return 0
+        removed = 0
+        for f in disk_dir.glob("*.safetensors"):
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                logger.debug("Failed to remove stale disk cache %s", f, exc_info=True)
+        return removed
+
     def evict_all_to_disk(self) -> None:
         """Save all in-memory entries to disk, then clear memory.
 
@@ -565,6 +663,17 @@ class LoadedModel:
     # False for hybrid sliding-window models (RotatingKVCache layers).
     # Set by the loader; default True covers direct construction in tests.
     supports_cache_trim: bool = True
+    # False for hybrid SSM-style models (ArraysCache layers, e.g. Qwen3.5,
+    # Qwen3-Next).  When False, prompt cache state is not persisted across
+    # requests because cross-request reuse crashes mlx-lm with a Metal
+    # stream error.  Set by the loader's _probe_cache_capabilities call.
+    # Issue #284.
+    #
+    # Defaults to False (unsafe-by-default) — unlike supports_cache_trim,
+    # a false-positive here crashes the next request rather than wasting a
+    # trim_prompt_cache() call.  Direct LoadedModel construction must
+    # explicitly opt in if the model's cache layout is known to be safe.
+    supports_cache_persistence: bool = False
     spectral_calibration_dir: Any = None  # Path | None, typed as Any to avoid import
     default_options: dict = field(default_factory=dict)
     inference_queue_timeout: float | None = None
@@ -966,7 +1075,7 @@ class ModelManager:
                         inference_timeout=model_config.inference_timeout,
                         sync_mode=model_config.sync_mode,
                     )
-                    self._probe_cache_trim_support(lm)
+                    self._probe_cache_capabilities(lm)
                     self._loaded[normalized] = lm
                     return lm
                 except BaseException:
@@ -1130,6 +1239,113 @@ class ModelManager:
         # of whether the base model_type also exists in mlx-lm
         has_vision_keys = bool(self._VLM_CONFIG_KEYS & config.keys())
         if has_vision_keys:
+            # Issue #284: hybrid SSM+attention VLMs (Qwen3.5, Qwen3_5_moe)
+            # crash in mlx-vlm with "There is no Stream(gpu, N) in current
+            # thread" on text-only inference.  These models ship with a
+            # dedicated text-only module in mlx-lm — route through it.
+            # Discriminator: text_config.layer_types contains
+            # "linear_attention", which also signals the gated-delta
+            # ArraysCache layout that triggers the persistence bug.
+            #
+            # Heuristic — known limitations:
+            # - Over-fires: a future VLM that uses "linear_attention" but
+            #   loads correctly through mlx-vlm would be silently rerouted
+            #   to the text path, losing vision.
+            # - Under-fires: a new hybrid SSM model that names its layers
+            #   differently (e.g. "gated_delta", "mamba") wouldn't trigger
+            #   this guard and would still crash through mlx-vlm.
+            # Update this matcher (or replace with a model_type allowlist)
+            # as new hybrid families appear.
+            text_cfg = config.get("text_config")
+            if isinstance(text_cfg, dict):
+                layer_types = text_cfg.get("layer_types")
+                if isinstance(layer_types, list) and "linear_attention" in layer_types:
+                    # Resolve the mlx-lm module name in the try/except so the
+                    # ImportError/AttributeError handler only catches errors
+                    # from that resolution — not from find_spec or the
+                    # raise-on-no-module path below — to keep error
+                    # attribution unambiguous.
+                    text_model_type = text_cfg.get("model_type", model_type)
+                    try:
+                        from mlx_lm.utils import MODEL_REMAPPING as LM_REMAP
+
+                        mapped_lm = LM_REMAP.get(text_model_type, text_model_type)
+                    except (ImportError, AttributeError) as exc:
+                        # mlx-lm absent or restructured.  Catching
+                        # AttributeError too because if MODEL_REMAPPING
+                        # imports as something that isn't a dict, the
+                        # ``LM_REMAP.get(...)`` call would raise
+                        # AttributeError uncaught — defeating the
+                        # discriminator the same way an ImportError
+                        # would.  Either way: raise at load time rather
+                        # than defer to a known-broken loader.
+                        raise ValueError(
+                            f"Model '{hf_path}' (model_type '{model_type}') "
+                            f"uses hybrid linear-attention layers (issue "
+                            f"#284) but mlx_lm.utils.MODEL_REMAPPING is "
+                            f"unavailable or not a mapping. Loading "
+                            f"through mlx-vlm would crash with a Metal "
+                            f"stream error."
+                        ) from exc
+
+                    # Hybrid VLMs (Qwen3.5) carry the model architecture in
+                    # text_config.model_type; the top-level model_type may be
+                    # VLM-specific (e.g. "qwen3_5_vl") with no mlx-lm module,
+                    # while text_config.model_type ("qwen3_5") does.  We
+                    # already resolved using text_model_type above.
+                    if (
+                        importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}")
+                        is not None
+                    ):
+                        # WARNING because vision capability is permanently
+                        # lost for this model load — image inputs would
+                        # produce confusing errors with no other signal.
+                        # Log both the top-level VLM type and the mlx-lm
+                        # text-path type that the routing decision was
+                        # made on, since they typically differ for
+                        # hybrid VLMs (e.g. "qwen3_5_vl" → "qwen3_5").
+                        logger.warning(
+                            "Routing hybrid linear-attention VLM '%s' "
+                            "through mlx-lm text path '%s' (issue #284). "
+                            "Vision capability is disabled for this load.",
+                            model_type,
+                            text_model_type,
+                        )
+                        return "text"
+                    # mlx-lm has no module for this model_type.  The mlx-vlm
+                    # fallback chain is the known-crashing path for these
+                    # models; raise at detection time so the user sees a
+                    # clear load-time error rather than a silent Metal
+                    # stream crash mid-inference.
+                    text_mt_present = "model_type" in text_cfg
+                    raise ValueError(
+                        f"Cannot load '{hf_path}': it has hybrid "
+                        f"linear-attention layers (model_type "
+                        f"'{model_type}', "
+                        + (
+                            f"text_config.model_type '{text_model_type}'"
+                            if text_mt_present
+                            else f"text_config.model_type missing — fell "
+                            f"back to top-level '{text_model_type}'"
+                        )
+                        + f") but mlx-lm has no module named "
+                        f"'mlx_lm.models.{mapped_lm}'.  Loading through "
+                        f"mlx-vlm would crash with a Metal stream error "
+                        f"(issue #284).  Upgrade mlx-lm to a version "
+                        f"that ships the matching text-only module"
+                        + (
+                            ""
+                            if text_mt_present
+                            else " (or add 'model_type' to text_config "
+                            "in the model's config.json if it points to "
+                            "a different mlx-lm architecture)"
+                        )
+                        + ", or — if a future mlx-vlm release has fixed "
+                        "this for the model — relax the discriminator "
+                        "in olmlx/engine/model_manager.py "
+                        "_detect_model_kind."
+                    )
+
             # Verify mlx-vlm can handle it
             try:
                 from mlx_vlm.utils import MODEL_REMAPPING as VLM_REMAP
@@ -1138,7 +1354,7 @@ class ModelManager:
                 spec = importlib.util.find_spec(f"mlx_vlm.models.{mapped}")
                 if spec is not None:
                     return "vlm"
-            except (ImportError, ModuleNotFoundError):
+            except ImportError:
                 pass
             # Has vision keys but mlx-vlm can't handle it — check mlx-lm
             try:
@@ -1153,7 +1369,7 @@ class ModelManager:
                         model_type,
                     )
                     return "text"
-            except (ImportError, ModuleNotFoundError):
+            except ImportError:
                 pass
             # Neither library explicitly supports it — try both via fallback
             logger.info(
@@ -1170,7 +1386,7 @@ class ModelManager:
             spec = importlib.util.find_spec(f"mlx_lm.models.{mapped}")
             if spec is not None:
                 return "text"
-        except (ImportError, ModuleNotFoundError):
+        except ImportError:
             pass
 
         # Fallback: check mlx-vlm even without vision keys
@@ -1181,7 +1397,7 @@ class ModelManager:
             spec = importlib.util.find_spec(f"mlx_vlm.models.{mapped}")
             if spec is not None:
                 return "vlm"
-        except (ImportError, ModuleNotFoundError):
+        except ImportError:
             pass
 
         return "unknown"
@@ -1300,15 +1516,21 @@ class ModelManager:
             return flash_path
         return None
 
-    def _probe_cache_trim_support(self, lm: LoadedModel) -> None:
-        """Probe whether `trim_prompt_cache` will work on this model and
-        record the result on `lm.supports_cache_trim`.
+    def _probe_cache_capabilities(self, lm: LoadedModel) -> None:
+        """Probe how the model's prompt cache can be safely reused, recording
+        the result on ``lm.supports_cache_trim`` and ``lm.supports_cache_persistence``.
 
         Hybrid sliding-window models (Gemma 4, Qwen3-Next) include
         `RotatingKVCache` layers which become non-trimmable once the
         rotating buffer fills.  Detecting this once at load time lets the
         request path skip a doomed `trim_prompt_cache()` call (which
         would silently return 0 and force a full prefill).
+
+        Hybrid SSM-style models (Qwen3.5, Qwen3-Next gated-delta layers) use
+        ``ArraysCache`` whose stored state cannot be reused across requests
+        without crashing mlx-lm during the next prefill — see issue #284.
+        Such models keep within-request cache reuse but skip the cross-
+        request store/load path.
 
         Always probes the bare mlx-lm cache — trim behaviour is determined
         by the underlying layer classes, not the quantization wrapper, and
@@ -1324,18 +1546,38 @@ class ModelManager:
             getattr(lm.model, "language_model", lm.model) if lm.is_vlm else lm.model
         )
         probe_cache: list | None = None
+        probe_succeeded = False
         try:
             probe_cache = make_prompt_cache(cache_model)
-            lm.supports_cache_trim = _cache_supports_trim(probe_cache)
+            # Stage both results before assigning so a hypothetical raise
+            # in either probe doesn't leave one flag set and the other
+            # falling into the except handler's defaults.  Currently both
+            # probes are pure string-set lookups that can't raise, but the
+            # pattern is cheap and removes the ordering dependency.
+            trim_ok = _cache_supports_trim(probe_cache)
+            persist_ok = _cache_supports_persistence(probe_cache)
+            lm.supports_cache_trim = trim_ok
+            lm.supports_cache_persistence = persist_ok
+            probe_succeeded = True
         except Exception:
             # Best-effort probe; on failure assume trim works so the
             # request path's existing partial-trim fallback handles it.
-            logger.debug(
-                "Cache-trim probe failed for %s; assuming trimmable",
+            # Persistence has no equivalent fallback — store + reload of an
+            # ArraysCache crashes the next request (issue #284) — so default
+            # to False on probe failure.  Worst case we lose cross-request
+            # cache reuse for a model that didn't need protection.
+            # Logged at WARNING because the consequence — cross-request
+            # cache reuse silently disabled for this model — would be hard
+            # to diagnose from DEBUG output alone.
+            logger.warning(
+                "Cache probe raised an exception for %s; defaulting to "
+                "trimmable, non-persistable. Cross-request prompt cache "
+                "reuse is disabled for this model.",
                 lm.name,
                 exc_info=True,
             )
             lm.supports_cache_trim = True
+            lm.supports_cache_persistence = False
         finally:
             if probe_cache is not None:
                 del probe_cache
@@ -1348,6 +1590,46 @@ class ModelManager:
                 "prompt cache will only be reused for strict-extension turns.",
                 lm.name,
             )
+        # Only log the layout reason when the probe actually inspected
+        # the cache.  The probe-failure path already emits its own WARNING
+        # above with the real cause.  Message is generic ("hybrid
+        # SSM/ArraysCache or unclassified") because an empty cache_list
+        # also returns False from the persistence check — the message
+        # would otherwise misattribute the disable to ArraysCache when
+        # the layout had nothing to do with it.
+        if not lm.supports_cache_persistence and probe_succeeded:
+            logger.info(
+                "Model %s uses a non-persistable cache (hybrid SSM/"
+                "ArraysCache or unclassified); prompt cache will not be "
+                "stored across requests (issue #284).",
+                lm.name,
+            )
+        # One-pass cleanup of any stale pre-PR on-disk entries for this
+        # model.  Gated on BOTH probe_succeeded and not-persistable so we
+        # only wipe disk when we KNOW the model is non-persistable.  On a
+        # probe-failure path, supports_cache_persistence is False as a
+        # safe default but the model may be genuinely persistable —
+        # deleting its disk cache because of a transient probe failure
+        # (e.g. import error during make_prompt_cache, OOM) would
+        # destroy valid cached prefixes.  Stale pre-PR files on a probe-
+        # failure model are handled by the existing disk-size eviction.
+        if probe_succeeded and not lm.supports_cache_persistence:
+            try:
+                removed = lm.prompt_cache_store.clear_disk()
+                if removed:
+                    logger.info(
+                        "Removed %d stale on-disk prompt cache file(s) for "
+                        "non-persistable model %s",
+                        removed,
+                        lm.name,
+                    )
+            except Exception:
+                logger.debug(
+                    "clear_disk failed for %s; non-persistable cleanup "
+                    "deferred to disk-size eviction",
+                    lm.name,
+                    exc_info=True,
+                )
 
     def _find_spectral_dir(
         self, hf_path: str, kv_cache_quant: str | None

@@ -312,6 +312,260 @@ class TestDetectModelKind:
         assert kind == "text"
         mock_dl.assert_not_called()
 
+    def test_hybrid_linear_attention_vlm_routes_to_text(
+        self, tmp_path, registry, mock_store
+    ):
+        """Issue #284: VLMs with hybrid SSM+attention layers (Qwen3.5,
+        Qwen3_5_moe) must route through mlx-lm's text path.  The mlx-vlm
+        path crashes on stream synchronization for these models even on
+        text-only requests; mlx-lm has dedicated text-only modules
+        (qwen3_5.py, qwen3_5_moe.py) that work correctly.
+
+        Discriminator: ``text_config.layer_types`` containing
+        ``"linear_attention"`` signals the hybrid architecture.  Standard
+        VLMs (Gemma 4, Qwen2-VL) lack this field and continue to route
+        through mlx-vlm.
+        """
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "qwen3_5",  # mlx-lm has qwen3_5.py
+                "vision_config": {"hidden_size": 1024},
+                "image_token_id": 248056,
+                "text_config": {
+                    "layer_types": [
+                        "linear_attention",
+                        "linear_attention",
+                        "linear_attention",
+                        "full_attention",
+                    ],
+                },
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        # Mock find_spec so the test doesn't depend on the installed mlx-lm
+        # version actually shipping mlx_lm.models.qwen3_5 — without the
+        # mock, an older install would silently route through mlx-vlm and
+        # the assertion would mask a regression.
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec_with_qwen3_5(name, *args, **kwargs):
+            if name == "mlx_lm.models.qwen3_5":
+                return object()  # truthy sentinel
+            return real_find_spec(name, *args, **kwargs)
+
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            with patch("importlib.util.find_spec", side_effect=find_spec_with_qwen3_5):
+                kind = manager._detect_model_kind("test/qwen3_5")
+        assert kind == "text"
+
+    def test_hybrid_linear_attention_vlm_raises_when_no_mlx_lm_module(
+        self, tmp_path, registry, mock_store
+    ):
+        """Issue #284: when the discriminator fires (linear_attention layers
+        present) but mlx-lm has no module for the model_type, raise a
+        clear ValueError at detection time rather than falling through to
+        the mlx-vlm path that we know crashes."""
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "future_hybrid_vlm",
+                "vision_config": {"hidden_size": 1024},
+                "text_config": {"layer_types": ["linear_attention", "full_attention"]},
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def no_mlx_lm_module(name, *args, **kwargs):
+            if name.startswith("mlx_lm.models."):
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        with (
+            patch("huggingface_hub.hf_hub_download", return_value=config_path),
+            patch("importlib.util.find_spec", side_effect=no_mlx_lm_module),
+            pytest.raises(ValueError, match="hybrid linear-attention"),
+        ):
+            manager._detect_model_kind("test/future_hybrid_vlm")
+
+    def test_hybrid_linear_attention_vlm_uses_text_config_model_type(
+        self, tmp_path, registry, mock_store
+    ):
+        """Issue #284: when the top-level model_type is VLM-specific (e.g.
+        a hypothetical ``qwen3_5_vl``) but ``text_config.model_type`` names
+        the architecture mlx-lm actually has a module for (``qwen3_5``),
+        the lookup should prefer the text_config key.  Otherwise the
+        routing falls through to ``unknown`` and the model fails to load.
+        """
+        config_path = self._make_config(
+            tmp_path,
+            {
+                # Top-level: VLM-specific name with no mlx-lm module.
+                "model_type": "qwen3_5_vl",
+                "vision_config": {"hidden_size": 1024},
+                "text_config": {
+                    # Inner: the architecture name mlx-lm has a module for.
+                    "model_type": "qwen3_5",
+                    "layer_types": ["linear_attention", "full_attention"],
+                },
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec_with_qwen3_5_only(name, *args, **kwargs):
+            if name == "mlx_lm.models.qwen3_5":
+                return object()
+            if name == "mlx_lm.models.qwen3_5_vl":
+                return None  # mlx-lm has no qwen3_5_vl module
+            return real_find_spec(name, *args, **kwargs)
+
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            with patch(
+                "importlib.util.find_spec", side_effect=find_spec_with_qwen3_5_only
+            ):
+                kind = manager._detect_model_kind("test/qwen3_5_vl")
+        assert kind == "text"
+
+    def test_hybrid_linear_attention_vlm_raises_when_mlx_lm_import_fails(
+        self, tmp_path, registry, mock_store
+    ):
+        """Issue #284: when ``from mlx_lm.utils import MODEL_REMAPPING``
+        raises ImportError (older mlx-lm without that export, or mlx-lm
+        absent), the discriminator has already fired — raise a clear
+        ValueError at detection time rather than fall through to the
+        mlx-vlm path that we know crashes."""
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "qwen3_5",
+                "vision_config": {"hidden_size": 1024},
+                "text_config": {"layer_types": ["linear_attention", "full_attention"]},
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        # Setting sys.modules["mlx_lm.utils"] = None makes Python raise
+        # ImportError on subsequent ``from mlx_lm.utils import ...``
+        # statements, regardless of whether mlx_lm.utils was already
+        # imported in the test environment.
+        with (
+            patch("huggingface_hub.hf_hub_download", return_value=config_path),
+            patch.dict("sys.modules", {"mlx_lm.utils": None}),
+            pytest.raises(ValueError, match="hybrid linear-attention"),
+        ):
+            manager._detect_model_kind("test/qwen3_5")
+
+    def test_standard_vlm_without_linear_attention_stays_vlm(
+        self, tmp_path, registry, mock_store
+    ):
+        """Regression fence: standard VLMs (no linear_attention) must
+        continue to load through mlx-vlm.  Only the hybrid SSM bug warrants
+        the mlx-lm detour."""
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "qwen2_vl",  # known mlx-vlm model
+                "vision_config": {"hidden_size": 1024},
+                "image_token_id": 151655,
+                # No layer_types — standard transformer.
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        # Mock find_spec for the mlx-vlm verification block so the test
+        # doesn't depend on the installed mlx-vlm version actually shipping
+        # mlx_vlm.models.qwen2_vl.
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec_with_qwen2_vl(name, *args, **kwargs):
+            if name == "mlx_vlm.models.qwen2_vl":
+                return object()  # truthy sentinel
+            return real_find_spec(name, *args, **kwargs)
+
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            with patch("importlib.util.find_spec", side_effect=find_spec_with_qwen2_vl):
+                kind = manager._detect_model_kind("test/qwen2_vl")
+        assert kind == "vlm"
+
+
+class TestProbeCacheCapabilities:
+    """Exercise _probe_cache_capabilities, including the probe-failure path
+    promoted to WARNING + non-persistable default in issue #284."""
+
+    def _make_lm(self):
+        from olmlx.engine.model_manager import LoadedModel
+
+        lm = LoadedModel(
+            name="probe-test:latest",
+            hf_path="test/probe",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            template_caps=TemplateCaps(),
+        )
+        # Default for the dataclass is False (issue #284 safety default);
+        # set True here so the test can verify the failure path explicitly
+        # flips it back to False.
+        lm.supports_cache_persistence = True
+        lm.supports_cache_trim = False
+        return lm
+
+    def test_probe_empty_cache_list_disables_persistence(self, registry, mock_store):
+        """If ``make_prompt_cache`` returns an empty list (a degenerate model
+        with no cache layers), ``_cache_supports_persistence`` returns
+        False — there's no evidence the cache layout is safe — and the
+        probe leaves persistence disabled.  Trim's vacuous-True for the
+        same input is fine because trim has a graceful fallback;
+        persistence does not."""
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+
+        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]):
+            manager._probe_cache_capabilities(lm)
+
+        # Trim is vacuously True — trim of an empty cache is a no-op
+        # that mlx-lm handles cleanly, so leaving the flag True is fine.
+        assert lm.supports_cache_trim is True
+        # Persistence: no evidence of safety → False.
+        assert lm.supports_cache_persistence is False
+
+    def test_probe_failure_warns_and_disables_persistence(
+        self, registry, mock_store, caplog
+    ):
+        """When ``make_prompt_cache`` raises, the probe must log at WARNING,
+        force ``supports_cache_persistence = False`` (no graceful fallback
+        for cache reuse), and force ``supports_cache_trim = True`` (the
+        request path's existing partial-trim fallback handles it)."""
+        import logging
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+
+        with (
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                side_effect=RuntimeError("simulated probe failure"),
+            ),
+            caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"),
+        ):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is True
+        assert lm.supports_cache_persistence is False
+        assert "Cache probe raised an exception" in caplog.text
+
 
 class TestLoadModel:
     def _make_manager(self, registry, mock_store):

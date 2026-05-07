@@ -1849,7 +1849,22 @@ async def _setup_prompt_cache(
     if memory_too_high or prompt_tokens is None or make_prompt_cache is None:
         return result
 
-    cached = await lm.prompt_cache_store.async_get(cache_id)
+    # Issue #284: for non-persistable models (hybrid SSM-style ArraysCache),
+    # any stored entry is unsafe to reuse — loading from disk and feeding it
+    # to mlx-lm would crash the next prefill.  We never store for these
+    # models post-PR, so the only path to a stale entry is pre-PR data.
+    # Skip the disk lookup entirely and clear any in-memory entry.  Gated
+    # on peek() so we don't pay a blocking unlink(ENOENT) syscall on every
+    # request.  Pre-PR on-disk files for non-persistable models can persist
+    # indefinitely — that's harmless because nothing reads from disk for
+    # these models — but they're cleaned up by the disk cache size eviction
+    # in PromptCacheStore eventually.
+    if not lm.supports_cache_persistence:
+        if lm.prompt_cache_store.peek(cache_id) is not None:
+            lm.prompt_cache_store.remove(cache_id)
+        cached = None
+    else:
+        cached = await lm.prompt_cache_store.async_get(cache_id)
     logger.debug(
         "Cache lookup: cached=%s, new prompt=%d tokens",
         (
@@ -1966,8 +1981,12 @@ async def _setup_prompt_cache(
         # (b) trim-fallback above.  In the trim-fallback path the
         # cache was already removed before the trim attempt — this
         # remove is then a harmless no-op (PromptCacheStore.remove
-        # is idempotent).  Kept for the cache-miss path.
-        lm.prompt_cache_store.remove(cache_id)
+        # is idempotent).  Kept for the cache-miss path.  Skip for
+        # non-persistable models — the lookup branch above already
+        # ran the (peek-gated) cleanup, so any further remove() here
+        # would be redundant disk I/O on the event loop hot path.
+        if lm.supports_cache_persistence:
+            lm.prompt_cache_store.remove(cache_id)
         new_cache = _make_prompt_cache_for_lm(lm)
         gen_kwargs["prompt_cache"] = new_cache
         result.cache_creation_tokens = len(prompt_tokens)
@@ -2056,15 +2075,25 @@ async def _kv_cache_preflight_check(
             had_cache = working is not None
             gen_kwargs.pop("input_ids", None)
             # Re-add cache temporarily so evict_all_to_disk() can persist it.
-            # Use cache_read_tokens to match the trimmed KV state.
-            if had_cache and full_prompt_tokens is not None:
-                await lm.prompt_cache_store.async_set(
-                    cache_id,
-                    CachedPromptState(
-                        tokens=list(full_prompt_tokens[:cache_read_tokens]),
-                        cache=working,
-                    ),
-                )
+            # Use cache_read_tokens to match the trimmed KV state.  Issue
+            # #284: for non-persistable models we skip the re-store and
+            # clean up any stale entry instead — re-storing would
+            # re-introduce the cross-request reuse path the persistence
+            # guard exists to prevent, and _store_prompt_cache_after_generation
+            # (which normally cleans up) isn't reached on the MemoryError
+            # path.  Dropping the working reference still frees memory;
+            # the eviction below runs regardless to flush other entries.
+            if had_cache:
+                if not lm.supports_cache_persistence:
+                    lm.prompt_cache_store.remove(cache_id)
+                elif full_prompt_tokens is not None:
+                    await lm.prompt_cache_store.async_set(
+                        cache_id,
+                        CachedPromptState(
+                            tokens=list(full_prompt_tokens[:cache_read_tokens]),
+                            cache=working,
+                        ),
+                    )
             working = None
             await lm.prompt_cache_store.async_evict_all_to_disk()
             gc.collect()
@@ -2123,6 +2152,22 @@ async def _store_prompt_cache_after_generation(
     """
     prompt_cache = gen_kwargs.get("prompt_cache")
     if prompt_cache is None or full_prompt_tokens is None:
+        return
+
+    # Issue #284: hybrid SSM-style models (Qwen3.5, Qwen3-Next gated-delta
+    # layers using ArraysCache) cannot have their cache safely persisted
+    # across requests — the next prefill crashes mlx-lm with a Metal stream
+    # error.  Skip storage entirely; the next request will run a fresh
+    # prefill.  No remove() call here: _setup_prompt_cache already removed
+    # any stale entry at request setup time, and we never stored anything
+    # between then and now, so a second remove() would be a guaranteed
+    # no-op disk stat on the event loop.
+    if not lm.supports_cache_persistence:
+        logger.debug(
+            "Cache not persistable (hybrid SSM/ArraysCache); "
+            "skipping cross-request storage for %s",
+            cache_id,
+        )
         return
 
     stored_tokens = list(full_prompt_tokens) + generated_tokens

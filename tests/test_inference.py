@@ -3874,6 +3874,63 @@ class TestKvCachePreflightCheckHelper:
             )
         assert result.memory_limit > 0
 
+    @pytest.mark.asyncio
+    async def test_does_not_re_store_cache_for_non_persistable_model(self, mock_lm):
+        """Issue #284: under memory pressure the preflight check temporarily
+        re-stores the working cache so ``async_evict_all_to_disk`` can flush
+        it.  For non-persistable models this would re-introduce the
+        cross-request reuse path the persistence guard exists to prevent —
+        the disk-stored cache would be picked up on the next request and
+        crash mlx-lm.  Skip the re-store; eviction still runs to flush
+        other in-memory entries."""
+        from olmlx.engine.inference import _kv_cache_preflight_check
+
+        mock_lm.supports_cache_persistence = False
+        cache = MagicMock()
+        gen_kwargs = {"prompt_cache": cache}
+        with (
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=24 * 1024**3,
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                return_value=10 * 1024**3,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference.estimate_kv_cache_bytes",
+                return_value=3 * 1024**3,
+            ),
+            patch("olmlx.engine.inference._safe_sync"),
+            patch("olmlx.engine.inference.mx"),
+        ):
+            mock_settings.memory_limit_fraction = 0.5
+            with pytest.raises(MemoryError, match="prompt too long"):
+                await _kv_cache_preflight_check(
+                    mock_lm,
+                    [1, 2, 3],
+                    100,
+                    gen_kwargs,
+                    cache_read_tokens=2,
+                    cache_creation_tokens=1,
+                    full_prompt_tokens=[1, 2, 3],
+                    cache_id="test",
+                )
+
+        # The non-persistable cache must NOT be re-stored, even though
+        # had_cache=True and full_prompt_tokens is provided.  Eviction
+        # still runs so other in-memory entries are flushed.
+        mock_lm.prompt_cache_store.async_set.assert_not_awaited()
+        mock_lm.prompt_cache_store.async_evict_all_to_disk.assert_awaited_once()
+        # Defensive: remove(cache_id) is called on the OOM path even
+        # though clear_disk() at load time should have wiped any pre-PR
+        # stale entry already.  Belt-and-suspenders against a stale
+        # entry created mid-session (e.g. probe ran before persistence
+        # was correctly classified, or a future code path that bypasses
+        # _setup_prompt_cache reaches this branch).
+        mock_lm.prompt_cache_store.remove.assert_called_once_with("test")
+
 
 class TestStorePromptCacheAfterGeneration:
     """Tests for the extracted _store_prompt_cache_after_generation helper."""
@@ -4041,6 +4098,77 @@ class TestStorePromptCacheAfterGeneration:
         assert call_args[0][0] == "test"
         stored = call_args[0][1]
         assert stored.tokens == [1, 2, 3, 4, 5]
+
+    @pytest.mark.asyncio
+    async def test_lookup_skipped_for_non_persistable_model(self, mock_manager):
+        """Issue #284: at request time, models with
+        supports_cache_persistence=False must not load any prior cache
+        (even from disk).  Pre-PR olmlx may have left ArraysCache state on
+        disk; loading it would crash the next prefill.  Skip the lookup
+        and remove any stale entry so it doesn't survive process restart.
+        """
+        from olmlx.engine.inference import _setup_prompt_cache
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.supports_cache_persistence = False
+        # Stash a stale entry that mimics pre-PR storage.
+        stale_cache = [MagicMock()]
+        lm.prompt_cache_store.set(
+            "stale-key",
+            CachedPromptState(tokens=[1, 2, 3], cache=stale_cache),
+        )
+        # Spy on async_get to confirm it isn't called.
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        lm.prompt_cache_store.async_get = _AsyncMock(
+            side_effect=AssertionError("async_get must not be called")
+        )
+
+        gen_kwargs: dict = {}
+        with patch("olmlx.engine.inference.settings") as mock_settings:
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.memory_limit_fraction = 0.9
+            await _setup_prompt_cache(
+                lm,
+                "the prompt",
+                gen_kwargs,
+                prompt_tokens=[1, 2, 3, 4, 5],
+                cache_id="stale-key",
+            )
+
+        # Stale entry must be removed so it doesn't survive a restart.
+        assert lm.prompt_cache_store.peek("stale-key") is None
+
+    @pytest.mark.asyncio
+    async def test_skips_storage_when_cache_not_persistable(self, mock_lm):
+        """Issue #284: hybrid SSM-style models (Qwen3.5/Qwen3-Next, ArraysCache
+        layers) cannot have their cache safely persisted across requests —
+        cross-request reuse crashes mlx-lm with a GPU stream error.
+
+        When supports_cache_persistence=False, skip storage entirely.
+        Within-request cache reuse during generation continues to work
+        normally.  No remove() call: _setup_prompt_cache already removed
+        any stale entry at request setup time and we never stored
+        anything between then and now.
+        """
+        from olmlx.engine.inference import _store_prompt_cache_after_generation
+
+        # supports_cache_trim is irrelevant: the persistence guard returns
+        # before the trim branch is reached.
+        mock_lm.supports_cache_persistence = False
+        cache = MagicMock()
+        gen_kwargs = {"prompt_cache": cache}
+        with patch("olmlx.engine.inference.settings") as mock_settings:
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.memory_limit_fraction = 0.9
+            await _store_prompt_cache_after_generation(
+                mock_lm, gen_kwargs, [1, 2, 3], [4, 5], 2, "test"
+            )
+
+        mock_lm.prompt_cache_store.async_set.assert_not_awaited()
+        mock_lm.prompt_cache_store.remove.assert_not_called()
 
 
 class TestInferenceTimeout:
