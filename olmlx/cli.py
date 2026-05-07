@@ -2043,6 +2043,68 @@ def _cmd_flash_dense_prepare(args, model_path):
     print("  OLMLX_EXPERIMENTAL_FLASH=true olmlx serve")
 
 
+def cmd_dflash_prepare(args):
+    """Train a DFlash draft model for a target."""
+    _configure_logging()
+
+    store = _create_store()
+    _resolved = store.registry.resolve(args.model)
+    hf_path = _resolved.hf_path if _resolved is not None else args.model
+    local_dir = store.ensure_downloaded(hf_path)
+    model_path = str(local_dir)
+
+    target_layer_ids: list[int] | None = None
+    if args.target_layer_ids:
+        try:
+            target_layer_ids = [int(x) for x in args.target_layer_ids.split(",")]
+        except ValueError as exc:
+            raise SystemExit(
+                f"--target-layer-ids must be a comma-separated list of "
+                f"integers, got {args.target_layer_ids!r}: {exc}"
+            ) from exc
+
+    print(f"Training DFlash draft for {args.model}...")
+    print(f"  Target path: {model_path}")
+    print(f"  Steps: {args.steps}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Seq len: {args.seq_len}")
+    print(f"  Block size (draft tokens): {args.block_size}")
+    print(f"  Draft layers: {args.num_hidden_layers}")
+    if target_layer_ids:
+        print(f"  Target layer ids: {target_layer_ids}")
+    else:
+        print(f"  Target layers: {args.num_target_layers} (evenly spaced)")
+    print(f"  Dataset: {args.data}")
+    print(f"  LR: {args.lr}")
+    print()
+
+    from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+    output_dir = prepare_dflash_draft(
+        model_path=model_path,
+        dataset=args.data,
+        dataset_split=args.split,
+        steps=args.steps,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        block_size=args.block_size,
+        num_hidden_layers=args.num_hidden_layers,
+        target_layer_ids=target_layer_ids,
+        num_target_layers=args.num_target_layers,
+        lr=args.lr,
+        output_dir=args.output,
+        progress_callback=_flash_progress,
+    )
+
+    print("\nDFlash draft training complete!")
+    print(f"  Output: {output_dir}")
+    print("\nTo use the trained draft:")
+    print("  OLMLX_SPECULATIVE=true \\")
+    print("  OLMLX_SPECULATIVE_STRATEGY=dflash \\")
+    print(f"  OLMLX_SPECULATIVE_DRAFT_MODEL={output_dir} \\")
+    print("  olmlx serve")
+
+
 def cmd_flash_info(args):
     """Show flash preparation info for a model."""
     store = _create_store()
@@ -2335,6 +2397,74 @@ def build_parser() -> argparse.ArgumentParser:
     )
     info_p.add_argument("model", help="Model name or HF path")
 
+    # DFlash draft training
+    dflash = sub.add_parser("dflash", help="DFlash block-diffusion draft training")
+    dflash_sub = dflash.add_subparsers(dest="dflash_command")
+    dflash_prepare_p = dflash_sub.add_parser(
+        "prepare", help="Train a DFlash draft model for a target"
+    )
+    dflash_prepare_p.add_argument("model", help="Target model name or HF path")
+    dflash_prepare_p.add_argument(
+        "--data",
+        type=str,
+        default=None,
+        help="HuggingFace dataset path (default: HuggingFaceH4/ultrachat_200k)",
+    )
+    dflash_prepare_p.add_argument(
+        "--split",
+        type=str,
+        default=None,
+        help="Dataset split (default: train_sft)",
+    )
+    dflash_prepare_p.add_argument(
+        "--steps", type=int, default=2000, help="Training steps (default: 2000)"
+    )
+    dflash_prepare_p.add_argument(
+        "--batch-size", type=int, default=4, help="Batch size (default: 4)"
+    )
+    dflash_prepare_p.add_argument(
+        "--seq-len", type=int, default=2048, help="Sequence length (default: 2048)"
+    )
+    dflash_prepare_p.add_argument(
+        "--block-size",
+        type=int,
+        default=4,
+        help="Number of draft tokens per step (default: 4)",
+    )
+    dflash_prepare_p.add_argument(
+        "--num-hidden-layers",
+        type=int,
+        default=4,
+        help="Draft model hidden layer count (default: 4)",
+    )
+    dflash_prepare_p.add_argument(
+        "--num-target-layers",
+        type=int,
+        default=4,
+        help=(
+            "Number of target hidden states to extract (default: 4). "
+            "Ignored when --target-layer-ids is set."
+        ),
+    )
+    dflash_prepare_p.add_argument(
+        "--target-layer-ids",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated target layer indices to extract hidden states "
+            "from (e.g. '5,11,17,23'). Defaults to evenly spaced layers."
+        ),
+    )
+    dflash_prepare_p.add_argument(
+        "--lr", type=float, default=5e-4, help="Peak learning rate (default: 5e-4)"
+    )
+    dflash_prepare_p.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output directory (default: <target-model-dir>/dflash)",
+    )
+
     # Spectral quant calibration
     spectral = sub.add_parser("spectral", help="SpectralQuant KV cache compression")
     spectral_sub = spectral.add_subparsers(dest="spectral_command")
@@ -2464,6 +2594,7 @@ _COMMAND_HANDLERS: dict[tuple[str, str | None], str] = {
     ("models", "search"): "cmd_models_search",
     ("flash", "prepare"): "cmd_flash_prepare",
     ("flash", "info"): "cmd_flash_info",
+    ("dflash", "prepare"): "cmd_dflash_prepare",
     ("spectral", "prepare"): "cmd_spectral_prepare",
     ("bench", "run"): "cmd_bench_run",
     ("bench", "compare"): "cmd_bench_compare",

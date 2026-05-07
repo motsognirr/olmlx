@@ -1790,13 +1790,16 @@ class ModelManager:
             len(weight_files),
         )
 
-        # ``speculative_tokens`` overrides the draft config's ``block_size``
-        # so users can shrink the block at inference time without
-        # re-training. The draft's positional encoding is unaffected.
+        # ``DFlashDecoder.block_size`` is the *draft token count*
+        # (matches ``SpeculativeDecoder``'s ``num_speculative_tokens``).
+        # The upstream draft ``config.json`` stores ``block_size`` as the
+        # *total* block length (pending token + draft tokens), so we
+        # convert with ``-1``. ``speculative_tokens``, when set, already
+        # uses the draft-count convention and overrides directly.
         block_size = (
             spec_config.num_tokens
             if spec_config.num_tokens
-            else draft_config.block_size
+            else max(draft_config.block_size - 1, 1)
         )
         return DFlashDecoder(
             target_model=target_model,
