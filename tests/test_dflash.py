@@ -19,6 +19,7 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from olmlx.engine.dflash.decoder import (
     DFlashDecoder,
+    _find_gdn_class,
     _LayerHook,
     _get_layers,
     _patch_model,
@@ -236,6 +237,44 @@ class TestTrimRecentCache:
         _trim_recent_cache(cache, 0)
         _trim_recent_cache(cache, -5)
         assert cache[0].offset == original
+
+
+# ---------------------------------------------------------------------------
+# Dynamic GatedDeltaNet discovery
+# ---------------------------------------------------------------------------
+
+
+class TestFindGDNClass:
+    """Verify ``_find_gdn_class`` discovers the GDN class from the model
+    rather than relying on a hardcoded import path. Targets that define
+    ``GatedDeltaNet`` in different modules (e.g. ``qwen3_5`` vs.
+    ``qwen3_5_moe`` vs. some future hybrid) must all be supported."""
+
+    def test_returns_none_when_no_gdn_layer(self):
+        target = _Target(vocab_size=8, hidden_size=8, num_layers=2)
+        assert _find_gdn_class(target) is None
+
+    def test_finds_gdn_class_by_name(self):
+        # Define a fresh GDN class in a fresh "module" — class name is
+        # what the discovery matches on, not the import path.
+        class GatedDeltaNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(4, 4, bias=False)
+
+        class _GDNLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear_attn = GatedDeltaNet()
+
+        class _GDNTarget(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = [_GDNLayer()]
+
+        target = _GDNTarget()
+        found = _find_gdn_class(target)
+        assert found is GatedDeltaNet
 
 
 # ---------------------------------------------------------------------------

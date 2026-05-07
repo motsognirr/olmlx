@@ -336,7 +336,7 @@ class TestBuildParser:
         # Settings is at default; the .env scan supplies the legacy values.
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
-        monkeypatch.setattr(_settings, "speculative_tokens", 4)
+        monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
             lambda: ([], [], [], False),
@@ -371,7 +371,7 @@ class TestBuildParser:
         # Snapshot settings so other tests don't see leakage.
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
-        monkeypatch.setattr(_settings, "speculative_tokens", 4)
+        monkeypatch.setattr(_settings, "speculative_tokens", None)
         # Stub out registry-walking helpers so the test is hermetic.
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
@@ -415,7 +415,7 @@ class TestBuildParser:
 
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
-        monkeypatch.setattr(_settings, "speculative_tokens", 4)
+        monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
             lambda: ([], [], [], False),
@@ -432,8 +432,8 @@ class TestBuildParser:
         with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
             _apply_serve_overrides(args)
         assert "Could not forward legacy env var" in caplog.text
-        # Settings keeps its prior default.
-        assert _settings.speculative_tokens == 4
+        # Settings keeps its prior default (None means "use strategy default").
+        assert _settings.speculative_tokens is None
 
     def test_apply_serve_overrides_new_env_var_wins_over_legacy(self, monkeypatch):
         """When both legacy and new env vars are set, the new one wins."""

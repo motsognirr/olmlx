@@ -43,6 +43,13 @@ except ImportError:
     _gd_mod = None  # type: ignore[assignment]
     _HAS_GDN = False
 
+# ``_trim_recent_cache`` reaches into ``RotatingKVCache._temporal_order`` and
+# ``._idx`` to reorder + slice the rotating buffer. These are private to mlx-lm
+# and may be renamed without a semver bump. Probe at import time so an
+# incompatible mlx-lm release fails fast (rather than mid-generation when
+# DFlash first hits a sliding-window draft cache).
+_HAS_ROTATING_KV_PRIVATES = hasattr(RotatingKVCache, "_temporal_order")
+
 logger = logging.getLogger(__name__)
 
 # Module-level lock guarding the GatedDeltaNet monkey-patch. Prevents
@@ -134,6 +141,14 @@ def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
         if n <= 0:
             continue
         if isinstance(c, RotatingKVCache) and c.keys is not None:
+            if not _HAS_ROTATING_KV_PRIVATES:
+                raise RuntimeError(
+                    "DFlash rollback for sliding-window draft caches relies "
+                    "on the private mlx-lm API ``RotatingKVCache._temporal_order`` "
+                    "/ ``._idx``. The installed mlx-lm version no longer "
+                    "exposes them — pin a compatible version or file an "
+                    "olmlx bug to update the private-API access pattern."
+                )
             c.keys = c._temporal_order(c.keys)
             c.values = c._temporal_order(c.values)
             c.keys = c.keys[..., :-n, :]
@@ -149,6 +164,23 @@ def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _find_gdn_class(model: nn.Module) -> type | None:
+    """Locate the ``GatedDeltaNet`` class actually used by *model*.
+
+    Hybrid linear-attention layers in mlx-lm are conventionally named
+    ``GatedDeltaNet`` and live in the model's module file. Walking the
+    target's submodules and matching by class name avoids hardcoding a
+    single source module (e.g. ``qwen3_5``) and transparently covers
+    future hybrid models that subclass or redefine the layer in their
+    own module. Returns the first match, or ``None`` if no GDN-style
+    layer is in the model.
+    """
+    for _name, mod in model.named_modules():
+        if type(mod).__name__ == "GatedDeltaNet":
+            return type(mod)
+    return None
+
+
 class _GDNStateCapture:
     """Monkey-patch ``GatedDeltaNet.__call__`` to enable rejection rollback.
 
@@ -158,17 +190,30 @@ class _GDNStateCapture:
     reconstruct the post-acceptance state, then writes it back into the
     cache. Holds ``_GDN_PATCH_LOCK`` for the lifetime of the capture so
     only one instance is active at a time.
+
+    The actual ``GatedDeltaNet`` class is discovered from *model* via
+    ``_find_gdn_class`` rather than imported from a fixed module — this
+    keeps the patch correct when a hybrid model defines its own subclass
+    in a different module (e.g. a future Qwen3.5-MoE variant).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model: nn.Module) -> None:
         if not _HAS_GDN:
             raise RuntimeError(
                 "mlx_lm.models.gated_delta is unavailable; cannot capture "
                 "GatedDeltaNet state for DFlash rollback"
             )
+        gdn_cls = _find_gdn_class(model)
+        if gdn_cls is None:
+            raise RuntimeError(
+                "Target model declares non-trimmable KV caches but no "
+                "``GatedDeltaNet`` submodule was found — DFlash rollback "
+                "currently only supports GDN-based hybrid linear-attention "
+                "models. Open an olmlx issue with the model's class name."
+            )
+        self._gdn_cls: type = gdn_cls
         self.conv_data: list[tuple[mx.array, int]] = []
         self._gdn_inputs: list[tuple[Any, ...]] = []
-        self._gdn_cls: Any = None
         self._orig_call: Any = None
         self._patched_call: Any = None
         self._closed = False
@@ -180,18 +225,16 @@ class _GDNStateCapture:
             raise
 
     def _patch(self) -> None:
-        from mlx_lm.models.qwen3_5 import GatedDeltaNet  # type: ignore[import-not-found]
+        from mlx.nn.layers.distributed import sum_gradients
 
-        self._gdn_cls = GatedDeltaNet
-        self._orig_call = GatedDeltaNet.__call__
+        gdn_cls = self._gdn_cls
+        self._orig_call = gdn_cls.__call__
         capture = self
         assert _gd_mod is not None  # guarded by _HAS_GDN
 
         def _capturing_gdn_call(self_layer, inputs, mask=None, cache=None):  # type: ignore[no-untyped-def]
             B, S, _ = inputs.shape
             if self_layer.sharding_group is not None:
-                from mlx_lm.models.qwen3_5 import sum_gradients  # type: ignore[import-not-found]
-
                 inputs = sum_gradients(self_layer.sharding_group)(inputs)
             qkv = self_layer.in_proj_qkv(inputs)
             z = self_layer.in_proj_z(inputs).reshape(
@@ -262,7 +305,7 @@ class _GDNStateCapture:
             return out
 
         self._patched_call = _capturing_gdn_call
-        GatedDeltaNet.__call__ = _capturing_gdn_call
+        gdn_cls.__call__ = _capturing_gdn_call
 
     def clear(self) -> None:
         self.conv_data.clear()
@@ -272,28 +315,35 @@ class _GDNStateCapture:
         if self._closed:
             return
         try:
-            if (
-                self._gdn_cls is not None
-                and self._gdn_cls.__call__ is self._patched_call
-            ):
+            if self._gdn_cls.__call__ is self._patched_call:
                 self._gdn_cls.__call__ = self._orig_call
         finally:
             self._closed = True
-            self._gdn_cls = None
             self._orig_call = None
             self._patched_call = None
             _GDN_PATCH_LOCK.release()
 
     def rollback(self, cache: list[Any], accepted: int, trim: int) -> None:
         """Restore the GDN state to reflect ``accepted + 1`` accepted tokens."""
-        assert _gd_mod is not None
+        if _gd_mod is None:
+            raise RuntimeError(
+                "mlx_lm.models.gated_delta is unavailable; cannot perform "
+                "DFlash rollback (this should have been caught at prefill)."
+            )
         n_non_trimmable = sum(1 for c in cache if not c.is_trimmable())
-        assert n_non_trimmable == len(self._gdn_inputs), (
-            f"non-trimmable cache count ({n_non_trimmable}) != "
-            f"captured GDN inputs ({len(self._gdn_inputs)}); "
-            "DFlash rollback assumes every non-trimmable cache is a "
-            "GatedDeltaNet layer"
-        )
+        # Use ``RuntimeError`` rather than ``assert`` — ``assert`` is stripped
+        # under ``python -O`` and a count mismatch must surface as a hard
+        # error, not silently corrupt KV state. The structural assumption
+        # (every non-trimmable cache is a GatedDeltaNet layer) holds today;
+        # any future hybrid SSM that adds another non-trimmable cache type
+        # will trip this check and need its own rollback path.
+        if n_non_trimmable != len(self._gdn_inputs):
+            raise RuntimeError(
+                f"non-trimmable cache count ({n_non_trimmable}) != "
+                f"captured GDN inputs ({len(self._gdn_inputs)}); "
+                "DFlash rollback assumes every non-trimmable cache is a "
+                "GatedDeltaNet layer"
+            )
         j = 0
         for c in cache:
             if c.is_trimmable():
@@ -433,7 +483,7 @@ class DFlashDecoder:
                     "mlx_lm.models.gated_delta is unavailable. Cannot "
                     "perform DFlash rejection rollback."
                 )
-            self._capture = _GDNStateCapture()
+            self._capture = _GDNStateCapture(self._target)
 
         target_out = self._target(prompt, cache=self._target_cache)
         logits = _logits(target_out)

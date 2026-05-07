@@ -225,7 +225,9 @@ class SpeculativeConfig(NamedTuple):
 
     enabled: bool
     draft_model: str | None
-    num_tokens: int
+    #: ``None`` means "use the strategy default" — 4 for classic speculative
+    #: decoding, the draft model's pre-trained ``block_size`` for DFlash.
+    num_tokens: int | None
     strategy: SpeculativeStrategy = "classic"
 
 

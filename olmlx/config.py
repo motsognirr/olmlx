@@ -85,11 +85,13 @@ class Settings(BaseSettings):
     # - ``dflash``: block-diffusion draft conditioned on target hidden states
     #   (mask-token parallel block prediction). Requires a draft model whose
     #   ``config.json`` carries the upstream z-lab ``dflash_config`` schema.
-    # ``speculative_tokens`` is reused as DFlash's ``block_size``.
+    # ``speculative_tokens`` is reused as DFlash's ``block_size``. ``None``
+    # means "use the strategy default": 4 for classic speculative decoding,
+    # the draft model's pre-trained ``block_size`` for DFlash.
     speculative: bool = False
     speculative_strategy: Literal["classic", "dflash"] = "classic"
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
-    speculative_tokens: Annotated[int, Field(gt=0)] = 4
+    speculative_tokens: Annotated[int, Field(gt=0)] | None = None
 
     @field_validator("kv_cache_quant")
     @classmethod

@@ -180,7 +180,9 @@ class TestSpeculativeConfig:
         s = Settings()
         assert s.speculative is False
         assert s.speculative_draft_model is None
-        assert s.speculative_tokens == 4
+        # ``None`` means "use the strategy default" (4 for classic, the
+        # draft's pre-trained block_size for DFlash) — see Settings docs.
+        assert s.speculative_tokens is None
 
     def test_speculative_env_override(self, monkeypatch):
         monkeypatch.setenv("OLMLX_SPECULATIVE", "true")

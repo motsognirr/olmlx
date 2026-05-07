@@ -1793,9 +1793,10 @@ class ModelManager:
         # ``speculative_tokens`` overrides the draft config's ``block_size``
         # so users can shrink the block at inference time without
         # re-training. The draft's positional encoding is unaffected.
+        # ``None`` (no user override) inherits the draft's pre-trained block.
         block_size = (
             spec_config.num_tokens
-            if spec_config.num_tokens
+            if spec_config.num_tokens is not None
             else draft_config.block_size
         )
         return DFlashDecoder(
@@ -1829,7 +1830,9 @@ class ModelManager:
                 "_load_speculative_decoder called with spec_config.enabled=False"
             )
         draft_model_path = spec_config.draft_model
-        num_tokens = spec_config.num_tokens
+        # ``None`` means "no user override"; classic speculative decoding
+        # uses 4 as its strategy default.
+        num_tokens = spec_config.num_tokens if spec_config.num_tokens is not None else 4
         if not draft_model_path:
             raise ValueError(
                 "speculative requires speculative_draft_model to be set "
