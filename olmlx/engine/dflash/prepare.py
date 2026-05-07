@@ -511,16 +511,19 @@ def prepare_dflash_draft(
                     capture_logits=distill,
                 )
 
-            # Pick a random pivot p in [block_size, seq_len - block_size - 1).
+            # Pick a random pivot p in [block_size, seq - block_size - 1]
+            # (inclusive). ``mx.random.randint(lo, hi)`` is exclusive on
+            # the upper bound, so we set ``hi = seq - block_size`` to make
+            # the maximum valid pivot ``seq - block_size - 1`` reachable.
             # Using the same p across the batch keeps shapes static; cycling
             # the pivot across steps gives diverse training windows.
             seq = input_ids.shape[1]
             lo = block_size
-            hi = seq - block_size - 1
+            hi = seq - block_size
             if hi <= lo:
                 raise ValueError(
                     f"seq_len={seq} too small for block_size={block_size}; "
-                    f"need at least 2*block_size + 2 tokens per sequence"
+                    f"need at least 2*block_size + 1 tokens per sequence"
                 )
             p = int(mx.random.randint(lo, hi, shape=()).item())
 
