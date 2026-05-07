@@ -273,10 +273,18 @@ class TestFindGDNClass:
                 self.in_proj_z = nn.Linear(4, 4, bias=False)
                 self.in_proj_b = nn.Linear(4, 4, bias=False)
                 self.in_proj_a = nn.Linear(4, 4, bias=False)
+                self.out_proj = nn.Linear(4, 4, bias=False)
                 self.conv1d = nn.Conv1d(4, 4, kernel_size=3)
+                self.conv_kernel_size = 3
+                self.conv_dim = 4
                 self.A_log = mx.zeros((4,))
                 self.dt_bias = mx.zeros((4,))
-                self.out_proj = nn.Linear(4, 4, bias=False)
+                self.norm = nn.RMSNorm(4)
+                self.num_k_heads = 1
+                self.num_v_heads = 1
+                self.head_k_dim = 4
+                self.head_v_dim = 4
+                self.key_dim = 4
 
         class _GDNLayer(nn.Module):
             def __init__(self):
@@ -398,6 +406,39 @@ class TestDraftModelBind:
         draft.bind(target)
         assert draft.embed_tokens is target.model.embed_tokens
         assert draft.lm_head is target.lm_head
+
+    def test_bind_does_not_register_borrowed_weights_as_children(self):
+        """Borrowed ``embed_tokens`` and ``lm_head`` must stay invisible
+        to ``draft.parameters()`` / ``draft.named_modules()``. mlx's
+        ``Module.__setattr__`` registers any ``dict``-typed value (which
+        ``nn.Module`` is, via inheritance) as a tracked child by default
+        — ``bind()`` uses ``object.__setattr__`` to bypass that so
+        ``mx.eval(draft.parameters())`` and ``draft.save_weights()``
+        don't pull in the target's tensors."""
+        target = _Target(vocab_size=32, hidden_size=8, num_layers=2)
+        cfg = _make_draft_config(32, 8, [0])
+        draft = DFlashDraftModel(cfg)
+
+        params_before = set(draft.parameters().keys())
+        modules_before = {n for n, _ in draft.named_modules()}
+
+        draft.bind(target)
+        params_after = set(draft.parameters().keys())
+        modules_after = {n for n, _ in draft.named_modules()}
+
+        # No new parameter-tree entries appeared.
+        assert params_after == params_before
+        # No new sub-modules either.
+        assert modules_after == modules_before
+        # Attribute access still works.
+        assert draft.embed_tokens is target.model.embed_tokens
+        assert draft.lm_head is target.lm_head
+
+        draft.unbind()
+        # State cleared; tree still pristine.
+        assert draft.embed_tokens is None
+        assert draft.lm_head is None
+        assert set(draft.parameters().keys()) == params_before
 
     def test_bind_via_flat_chain(self):
         class Flat(nn.Module):

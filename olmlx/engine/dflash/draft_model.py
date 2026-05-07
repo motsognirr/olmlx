@@ -273,10 +273,13 @@ class DFlashDraftModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = _build_rope(config)
 
-        # Populated by ``bind()``. Kept as plain attributes (not
-        # ``nn.Module`` children) so they don't show up under
-        # ``self.parameters()`` and never get saved with the draft
-        # weights.
+        # Populated by ``bind()``. We use ``object.__setattr__`` there to
+        # bypass mlx's ``Module.__setattr__`` — assigning an
+        # ``nn.Module`` (which is also a ``dict``) registers it as a
+        # tracked child, so the borrowed ``embed_tokens`` / ``lm_head``
+        # would otherwise appear in ``self.parameters()`` and serialise
+        # via ``save_weights``. Initial ``None`` assignments are safe
+        # (``None`` isn't tracked) but we mirror the bypass for symmetry.
         self.embed_tokens: nn.Embedding | None = None
         self.embed_scale: float = 1.0
         self.lm_head: nn.Module | None = None
@@ -291,6 +294,9 @@ class DFlashDraftModel(nn.Module):
         ``target.language_model.model.embed_tokens``. The lm_head chain
         is the same with ``embed_tokens.as_linear`` as a tied-embeddings
         fallback for models that share input/output projections.
+
+        Borrowed modules are stored via ``object.__setattr__`` so they
+        do not enter the draft's parameter tree.
         """
         embed = self._find_embed(target_model)
         if embed is None:
@@ -299,21 +305,23 @@ class DFlashDraftModel(nn.Module):
                 f"{type(target_model).__name__}; tried .embed_tokens, "
                 ".model.embed_tokens, .language_model.model.embed_tokens"
             )
-        self.embed_tokens = embed
-        self.embed_scale = self._find_embed_scale(target_model, embed)
-        self.lm_head = self._find_lm_head(target_model, embed)
-        if self.lm_head is None:
+        scale = self._find_embed_scale(target_model, embed)
+        lm_head = self._find_lm_head(target_model, embed)
+        if lm_head is None:
             raise ValueError(
                 f"Cannot find lm_head on target model "
                 f"{type(target_model).__name__}; tried .lm_head, "
                 ".language_model.lm_head, embed.as_linear (tied embeddings)"
             )
+        object.__setattr__(self, "embed_tokens", embed)
+        object.__setattr__(self, "embed_scale", scale)
+        object.__setattr__(self, "lm_head", lm_head)
         self._bound = True
 
     def unbind(self) -> None:
-        self.embed_tokens = None
-        self.embed_scale = 1.0
-        self.lm_head = None
+        object.__setattr__(self, "embed_tokens", None)
+        object.__setattr__(self, "embed_scale", 1.0)
+        object.__setattr__(self, "lm_head", None)
         self._bound = False
 
     @staticmethod

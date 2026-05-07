@@ -192,16 +192,30 @@ def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
 # Attributes that ``_capturing_gdn_call`` reads off the patched layer.
 # Used by ``_find_gdn_class`` as a structural check so the patch only
 # attaches to a class that actually exposes the GDN interface — a
-# same-named but unrelated class would be skipped.
+# same-named but unrelated class would be skipped at discovery time
+# rather than crashing mid-inference on a missing attribute.
 _GDN_REQUIRED_ATTRS = (
+    # Projections.
     "in_proj_qkv",
     "in_proj_z",
     "in_proj_b",
     "in_proj_a",
+    "out_proj",
+    # Conv stack.
     "conv1d",
+    "conv_kernel_size",
+    "conv_dim",
+    # State / bias tensors.
     "A_log",
     "dt_bias",
-    "out_proj",
+    # Output norm (called as ``self_layer.norm(out, z)``).
+    "norm",
+    # Head-shape metadata used to reshape the conv output.
+    "num_k_heads",
+    "num_v_heads",
+    "head_k_dim",
+    "head_v_dim",
+    "key_dim",
 )
 
 
