@@ -114,29 +114,33 @@ def _get_layers(model: nn.Module) -> list[Any]:
     )
 
 
-def _patch_model(model: nn.Module, layer_ids: list[int]) -> None:
+def _patch_model(model: nn.Module, layer_ids: list[int], storage: list[Any]) -> None:
     """Install ``_LayerHook`` on the target's selected layers (idempotent).
 
-    Storage list ``model._hidden_states`` is allocated; each hook writes
-    into the slot matching its position in ``layer_ids``.
+    The caller owns *storage* — a pre-allocated list of length
+    ``len(layer_ids)`` that each hook writes its slot into. Keeping the
+    storage off the ``nn.Module`` avoids contaminating ``model.parameters()``
+    once captured ``mx.array``s land in it (mlx's ``Module.__setattr__``
+    puts ``list`` attributes into the parameter tree, which would corrupt
+    ``mx.eval(model.parameters())`` in distributed setups and serialize
+    transient tensors via ``save_weights``).
+
+    Idempotency is detected by checking whether any layer is already a
+    ``_LayerHook``; the second call is a no-op.
     """
-    if hasattr(model, "_hidden_states"):
-        return
-    model._hidden_states = [None] * len(layer_ids)  # type: ignore[attr-defined]
     layers = _get_layers(model)
+    if any(isinstance(layers[lid], _LayerHook) for lid in layer_ids):
+        return
     for i, lid in enumerate(layer_ids):
-        layers[lid] = _LayerHook(layers[lid], i, model._hidden_states)
+        layers[lid] = _LayerHook(layers[lid], i, storage)
 
 
 def _unpatch_model(model: nn.Module) -> None:
     """Remove ``_LayerHook`` wrappers from the target. Safe to call twice."""
-    if not hasattr(model, "_hidden_states"):
-        return
     layers = _get_layers(model)
     for i, layer in enumerate(layers):
         if isinstance(layer, _LayerHook):
             layers[i] = layer._layer
-    delattr(model, "_hidden_states")
 
 
 def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
@@ -161,11 +165,20 @@ def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
                     "exposes them — pin a compatible version or file an "
                     "olmlx bug to update the private-API access pattern."
                 )
+            # When the cache has been in rotating mode (``offset > max_size``),
+            # the underlying buffer holds at most ``max_size`` entries even
+            # though ``offset`` is larger. Trimming requires us to drop back
+            # to non-rotating mode with a consistent ``offset == _idx ==
+            # keys.shape[2]``; otherwise ``update_and_fetch`` would write at
+            # a stale ``_idx`` into a buffer it believes is full and corrupt
+            # the KV state.
+            actual_stored = min(c.offset, c.keys.shape[2])
+            n = min(n, actual_stored)
             c.keys = c._temporal_order(c.keys)
             c.values = c._temporal_order(c.values)
             c.keys = c.keys[..., :-n, :]
             c.values = c.values[..., :-n, :]
-            c.offset -= n
+            c.offset = actual_stored - n
             c._idx = c.keys.shape[2]
         elif hasattr(c, "trim"):
             c.trim(n)
@@ -254,6 +267,12 @@ class _GDNStateCapture:
         try:
             self._patch()
         except Exception:
+            # Mark closed *before* releasing so a subsequent ``close()``
+            # (e.g. via ``DFlashDecoder.reset()`` or ``__del__``) is a
+            # no-op rather than calling ``release()`` on the now-unlocked
+            # ``RLock`` — that would raise ``RuntimeError`` in ``reset``
+            # and be silently swallowed by ``__del__``.
+            self._closed = True
             _GDN_PATCH_LOCK.release()
             raise
 
@@ -499,6 +518,10 @@ class DFlashDecoder:
         self._hidden: mx.array | None = None
         self._pending_token: int | None = None
         self._prompt_size: int = 0
+        # Per-layer hidden state captured by ``_LayerHook``. Owned by the
+        # decoder (not the target ``nn.Module``) so captured ``mx.array``s
+        # never appear in ``target.parameters()``.
+        self._hidden_capture: list[Any] = []
         # Counts the *generated* tokens (matching upstream's ``n``);
         # used to compute draft-cache trim amounts.
         self._n_generated: int = 0
@@ -516,8 +539,7 @@ class DFlashDecoder:
         if self._capture is not None:
             self._capture.close()
             self._capture = None
-        if hasattr(self._target, "_hidden_states"):
-            _unpatch_model(self._target)
+        _unpatch_model(self._target)
         self._draft.unbind()
         self._target_cache = None
         self._draft_cache = None
@@ -525,6 +547,7 @@ class DFlashDecoder:
         self._hidden = None
         self._pending_token = None
         self._prompt_size = 0
+        self._hidden_capture = []
         self._n_generated = 0
         self._stats_steps = 0
         self._stats_proposed = 0
@@ -565,7 +588,8 @@ class DFlashDecoder:
         # cache type for patched layers. Doing the cache build first
         # decouples cache selection from the patch.
         self._target_cache = make_prompt_cache(self._target)
-        _patch_model(self._target, target_layer_ids)
+        self._hidden_capture = [None] * len(target_layer_ids)
+        _patch_model(self._target, target_layer_ids, self._hidden_capture)
         self._draft.bind(self._target)
 
         # Call the draft's own ``make_cache`` directly. ``make_prompt_cache``
@@ -588,7 +612,7 @@ class DFlashDecoder:
 
         target_out = self._target(prompt, cache=self._target_cache)
         logits = _logits(target_out)
-        captured = list(self._target._hidden_states)  # type: ignore[attr-defined]
+        captured = list(self._hidden_capture)
         if any(h is None for h in captured):
             raise RuntimeError(
                 "Target forward did not populate all configured "
@@ -647,7 +671,7 @@ class DFlashDecoder:
         verify_input = mx.array([[pending] + draft_tokens])
         target_out = self._target(verify_input, cache=self._target_cache)
         logits = _logits(target_out)
-        captured = list(self._target._hidden_states)  # type: ignore[attr-defined]
+        captured = list(self._hidden_capture)
         new_hidden = mx.concatenate(captured, axis=-1)
         mx.eval(logits, new_hidden)
 

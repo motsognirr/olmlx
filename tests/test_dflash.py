@@ -185,24 +185,32 @@ class TestPatchModel:
     def test_idempotent(self):
         target = _Target(vocab_size=8, hidden_size=8, num_layers=4)
         original_layers = list(target.model.layers)
-        _patch_model(target, [1, 3])
+        storage: list = [None, None]
+        _patch_model(target, [1, 3], storage)
         first_hook = target.model.layers[1]
-        _patch_model(target, [1, 3])  # second call is a no-op
+        # Second call detects existing hooks and is a no-op.
+        _patch_model(target, [1, 3], storage)
         assert target.model.layers[1] is first_hook
         _unpatch_model(target)
         assert target.model.layers == original_layers
+        # Storage stays caller-owned; the target ``nn.Module`` never
+        # receives a ``_hidden_states`` attribute (would otherwise leak
+        # into ``model.parameters()`` and corrupt distributed eval).
         assert not hasattr(target, "_hidden_states")
 
     def test_captures_at_configured_indices(self):
         target = _Target(vocab_size=16, hidden_size=8, num_layers=4)
         target_layer_ids = [1, 3]
-        _patch_model(target, target_layer_ids)
+        storage: list = [None, None]
+        _patch_model(target, target_layer_ids, storage)
         out = target(mx.array([[1, 2, 3, 4]]))
         mx.eval(out)
-        assert target._hidden_states[0] is not None
-        assert target._hidden_states[1] is not None
-        assert target._hidden_states[0].shape == (1, 4, 8)
+        assert storage[0] is not None
+        assert storage[1] is not None
+        assert storage[0].shape == (1, 4, 8)
         _unpatch_model(target)
+        # The target should remain free of decoder-owned state.
+        assert not hasattr(target, "_hidden_states")
 
 
 # ---------------------------------------------------------------------------
