@@ -43,12 +43,24 @@ except ImportError:
     _gd_mod = None  # type: ignore[assignment]
     _HAS_GDN = False
 
+
 # ``_trim_recent_cache`` reaches into ``RotatingKVCache._temporal_order`` and
 # ``._idx`` to reorder + slice the rotating buffer. These are private to mlx-lm
 # and may be renamed without a semver bump. Probe at import time so an
 # incompatible mlx-lm release fails fast (rather than mid-generation when
-# DFlash first hits a sliding-window draft cache).
-_HAS_ROTATING_KV_PRIVATES = hasattr(RotatingKVCache, "_temporal_order")
+# DFlash first hits a sliding-window draft cache). ``_temporal_order`` is a
+# method (class-level), but ``_idx`` is set in ``__init__`` (instance-level),
+# so it must be probed via a sentinel instance.
+def _probe_rotating_kv_privates() -> bool:
+    if not hasattr(RotatingKVCache, "_temporal_order"):
+        return False
+    try:
+        return hasattr(RotatingKVCache(max_size=1, keep=0), "_idx")
+    except Exception:
+        return False
+
+
+_HAS_ROTATING_KV_PRIVATES = _probe_rotating_kv_privates()
 
 logger = logging.getLogger(__name__)
 

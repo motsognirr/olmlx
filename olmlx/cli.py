@@ -302,7 +302,13 @@ def _surface_legacy_dflash_env() -> None:
     )
 
     if legacy_dflash in ("1", "true", "yes", "on"):
-        if not os.environ.get("OLMLX_SPECULATIVE"):
+        # Also gate on ``_settings.speculative`` so that
+        # ``_surface_legacy_speculative_env`` (which runs first and may
+        # have already forwarded a legacy ``OLMLX_EXPERIMENTAL_SPECULATIVE
+        # =true`` to enable classic speculative) is not silently
+        # overridden to dflash by a coexisting legacy DFlash var. Explicit
+        # speculative wins over implicit dflash.
+        if not os.environ.get("OLMLX_SPECULATIVE") and not _settings.speculative:
             try:
                 _settings.speculative = True
                 _settings.speculative_strategy = "dflash"
