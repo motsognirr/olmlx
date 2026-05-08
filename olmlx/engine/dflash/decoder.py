@@ -43,6 +43,25 @@ except ImportError:
     _gd_mod = None  # type: ignore[assignment]
     _HAS_GDN = False
 
+# ``_capturing_gdn_call`` reproduces ``GatedDeltaNet.__call__`` verbatim
+# and calls ``gated_delta_update`` with a fixed positional+keyword
+# signature. If mlx-lm renames or reorders parameters, the captured
+# tensors no longer reflect what ran and ``rollback`` silently replays
+# the wrong operation. These are the parameter names we depend on; any
+# mismatch raises at ``_patch()`` time rather than corrupting state.
+_GATED_DELTA_UPDATE_EXPECTED_PARAMS: tuple[str, ...] = (
+    "q",
+    "k",
+    "v",
+    "a",
+    "b",
+    "A_log",
+    "dt_bias",
+    "state",
+    "mask",
+    "use_kernel",
+)
+
 
 # ``_trim_recent_cache`` reaches into ``RotatingKVCache._temporal_order`` and
 # ``._idx`` to reorder + slice the rotating buffer. These are private to mlx-lm
@@ -50,12 +69,25 @@ except ImportError:
 # incompatible mlx-lm release fails fast (rather than mid-generation when
 # DFlash first hits a sliding-window draft cache). ``_temporal_order`` is a
 # method (class-level), but ``_idx`` is set in ``__init__`` (instance-level),
-# so it must be probed via a sentinel instance.
+# so it must be probed via a sentinel instance — and its semantic (integer
+# write-position counter that advances with ``update_and_fetch``) must hold
+# too, otherwise the trim writes a corrupt value back.
 def _probe_rotating_kv_privates() -> bool:
     if not hasattr(RotatingKVCache, "_temporal_order"):
         return False
     try:
-        return hasattr(RotatingKVCache(max_size=1, keep=0), "_idx")
+        c = RotatingKVCache(max_size=4, keep=0)
+        if not hasattr(c, "_idx"):
+            return False
+        if not isinstance(c._idx, int) or c._idx != 0:
+            return False
+        # One ``update_and_fetch`` should advance ``_idx`` by exactly the
+        # number of tokens written. If the semantic changed (e.g. it
+        # became a ring-buffer wrap counter or a bool flag), the trim
+        # math in ``_trim_recent_cache`` would silently corrupt state.
+        k = v = mx.zeros((1, 1, 1, 4))
+        c.update_and_fetch(k, v)
+        return isinstance(c._idx, int) and c._idx == 1
     except Exception:
         return False
 
@@ -202,6 +234,40 @@ def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _validate_gated_delta_update_signature() -> None:
+    """Raise if mlx-lm's ``gated_delta_update`` no longer accepts the
+    parameter names ``_capturing_gdn_call`` and ``rollback`` use.
+
+    Without this probe, a parameter rename in mlx-lm would let
+    inference continue with the captured tensors stored under stale
+    keys; ``rollback`` would then call ``gated_delta_update`` with
+    keyword arguments the function doesn't accept (or, worse, accept
+    silently if the rename only shuffled positions). Fail loudly at
+    patch-install time instead.
+    """
+    import inspect
+
+    assert _gd_mod is not None  # guarded by ``_HAS_GDN`` at call sites
+    try:
+        sig = inspect.signature(_gd_mod.gated_delta_update)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Cannot introspect ``gated_delta_update`` signature; the "
+            "DFlash GDN patch can't validate upstream compatibility."
+        ) from exc
+    actual = set(sig.parameters)
+    expected = set(_GATED_DELTA_UPDATE_EXPECTED_PARAMS)
+    missing = expected - actual
+    if missing:
+        raise RuntimeError(
+            "mlx-lm's ``gated_delta_update`` is missing parameters that "
+            "DFlash's capture/rollback path depends on: "
+            f"{sorted(missing)}. The pinned mlx-lm contract changed; "
+            "update ``_capturing_gdn_call`` / ``rollback`` and "
+            "``_GATED_DELTA_UPDATE_EXPECTED_PARAMS`` together."
+        )
+
+
 # Attributes that ``_capturing_gdn_call`` reads off the patched layer.
 # Used by ``_find_gdn_class`` as a structural check so the patch only
 # attaches to a class that actually exposes the GDN interface — a
@@ -276,6 +342,11 @@ class _GDNStateCapture:
                 "mlx_lm.models.gated_delta is unavailable; cannot capture "
                 "GatedDeltaNet state for DFlash rollback"
             )
+        # Validate ``gated_delta_update``'s signature before installing
+        # the patch. The closure passes positional + keyword args in a
+        # fixed order; an upstream rename or reorder would silently
+        # produce wrong captured tensors. Fail loudly here instead.
+        _validate_gated_delta_update_signature()
         gdn_cls = _find_gdn_class(model)
         if gdn_cls is None:
             raise RuntimeError(
@@ -729,11 +800,16 @@ class DFlashDecoder:
             draft_offset = self._draft_cache[ft_idx].offset
             target_offset = self._prompt_size + self._n_generated - 1
             if draft_offset != target_offset:
-                raise RuntimeError(
-                    f"Draft cache offset ({draft_offset}) at full-attention "
-                    f"layer {ft_idx} drifted from expected target offset "
-                    f"({target_offset}); DFlash bookkeeping bug."
+                msg = (
+                    f"DFlash internal invariant violated: draft cache offset "
+                    f"({draft_offset}) at full-attention layer {ft_idx} does "
+                    f"not match expected target offset ({target_offset}). "
+                    "This is an olmlx bug — please report at "
+                    "https://github.com/motsognirr/olmlx/issues with the "
+                    "model name and prompt details."
                 )
+                logger.error(msg)
+                raise RuntimeError(msg)
         draft_tokens_arr = mx.argmax(draft_logits, axis=-1)
         mx.eval(draft_tokens_arr)
         # ``mx.array.tolist()`` is typed as ``list_or_scalar``; for a 1-D

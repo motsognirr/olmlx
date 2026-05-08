@@ -84,13 +84,15 @@ class DraftConfig:
                 "Only 'full_attention' and 'sliding_attention' are supported."
             )
         if any(t == "sliding_attention" for t in self.layer_types) and (
-            self.sliding_window is None or self.sliding_window <= 0
+            self.sliding_window is None or self.sliding_window < 2
         ):
-            # ``sliding_window <= 0`` would make ``DFlashAttention``'s
-            # ``keep = sliding_window - 1`` go negative and silently
-            # discard the entire context every step — must reject.
+            # ``sliding_window <= 0`` makes ``DFlashAttention``'s
+            # ``keep = sliding_window - 1`` go negative; ``sliding_window
+            # == 1`` makes ``keep = 0`` so every context token is
+            # discarded the moment it's produced and the draft attends
+            # to nothing. Both are silent failure modes — reject early.
             raise ValueError(
-                "sliding_window must be a positive int when any layer uses "
+                "sliding_window must be >= 2 when any layer uses "
                 f"'sliding_attention'; got {self.sliding_window!r}"
             )
         if len(self.target_layer_ids) != self.num_target_layers:

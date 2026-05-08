@@ -373,10 +373,12 @@ class TestDraftConfig:
                 sliding_window=None,
             )
 
-    def test_sliding_window_must_be_positive(self):
-        # ``sliding_window=0`` would push ``DFlashAttention.keep`` to -1
-        # and silently empty x_ctx every step — reject at config build.
-        for bad in (0, -1):
+    def test_sliding_window_must_be_at_least_two(self):
+        # ``sliding_window <= 0`` pushes ``DFlashAttention.keep`` to -1
+        # and silently empties x_ctx; ``sliding_window == 1`` pushes
+        # ``keep`` to 0 so context is evicted as soon as it's produced.
+        # Both reject at config build.
+        for bad in (-1, 0, 1):
             with pytest.raises(ValueError, match="sliding_window must be"):
                 _make_draft_config(
                     vocab_size=64,
