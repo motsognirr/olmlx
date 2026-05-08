@@ -737,6 +737,16 @@ class DFlashDecoder:
         # 2. Verify with the target in one parallel forward pass.
         if self._capture is not None:
             self._capture.clear()
+        # Zero the capture slots before the verification forward. Each
+        # hook fires once per ``__call__`` and overwrites its slot, but
+        # a hook that *stops* firing mid-generation (e.g. layer skipped
+        # by a future model change) would otherwise leave the previous
+        # step's tensor in the slot — the ``None``-check below would
+        # pass and we would silently feed stale hiddens to the next
+        # draft step. ``prefill`` allocates the list fresh; ``step``
+        # has to clear it explicitly.
+        for i in range(len(self._hidden_capture)):
+            self._hidden_capture[i] = None
         verify_input = mx.array([[pending] + draft_tokens])
         target_out = self._target(verify_input, cache=self._target_cache)
         logits = _logits(target_out)

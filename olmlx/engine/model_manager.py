@@ -1770,7 +1770,15 @@ class ModelManager:
 
         draft_model = DFlashDraftModel(draft_config)
         draft_dir = Path(load_path)
-        weight_files = sorted(draft_dir.glob("*.safetensors"))
+        # Prefer the conventional ``model*.safetensors`` (HF/mlx-lm
+        # convention, also covers sharded ``model-00001-of-N``). Only
+        # fall back to ``*.safetensors`` if no conventional file is
+        # present, so a co-located ``adapter_model.safetensors`` (LoRA)
+        # or tokenizer projection file can't silently overwrite draft
+        # weights via shared key names under ``strict=False``.
+        weight_files = sorted(draft_dir.glob("model*.safetensors"))
+        if not weight_files:
+            weight_files = sorted(draft_dir.glob("*.safetensors"))
         if not weight_files:
             raise FileNotFoundError(
                 f"DFlash draft model weights not found in {draft_dir}. "
