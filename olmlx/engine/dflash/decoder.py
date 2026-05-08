@@ -403,10 +403,16 @@ class _GDNStateCapture:
         # natural index order instead and recurse into each layer to
         # find its GDN submodule(s).
         self._expected_gdn_modules: list[Any] = []
-        try:
-            ordered_layers = _get_layers(model)
-        except AttributeError:
-            ordered_layers = []
+        # ``_get_layers`` raises ``AttributeError`` only when the model
+        # has none of the recognised layers attribute paths, which is a
+        # real configuration problem the operator should know about.
+        # Don't swallow it — let it propagate with the original message
+        # ("Cannot find layers in <ModelClass>; tried .model.layers,
+        # .language_model.layers, .layers"), which points directly at
+        # the cause. Wrapping in a generic catch-all would hide it
+        # behind the orphaned-modules / pure-full-attention diagnostic
+        # below.
+        ordered_layers = _get_layers(model)
         for layer in ordered_layers:
             for _name, mod in layer.named_modules():
                 if isinstance(mod, gdn_cls):

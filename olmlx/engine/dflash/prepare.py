@@ -229,7 +229,21 @@ def _build_draft_config(
     elif isinstance(rope_params, dict) and rope_params.get("rope_theta") is not None:
         rope_theta = float(rope_params["rope_theta"])
     else:
+        # Fall through silently with the legacy 10000.0 only as a last
+        # resort, but log loudly: modern long-context targets
+        # (Qwen3.5+, Qwen3.6) use 10_000_000 — three orders of
+        # magnitude higher — and a misconfigured RoPE base produces a
+        # draft whose attention frequencies are incompatible with the
+        # positions the target was trained on. The acceptance failure
+        # only shows up at inference time, far from the cause.
         rope_theta = 10000.0
+        logger.warning(
+            "No 'rope_theta' found at the top level or under "
+            "'rope_parameters' in the target config — falling back to "
+            "10000.0. Long-context targets (Qwen3.5+, Qwen3.6) typically "
+            "use ~10_000_000; verify the target's config.json or pass "
+            "the correct value explicitly."
+        )
     max_position_embeddings = int(_get("max_position_embeddings", 4096))
 
     # Stored on disk as the draft-token count directly (the same
@@ -557,21 +571,35 @@ def prepare_dflash_draft(
     )
     logger.info("DFlash target_layer_ids = %s", layer_ids)
 
-    # ``pad_for_loss`` mirrors the data loader's right-pad token (see
-    # ``training_data.py``) so the loss/pivot logic agrees with the
-    # loader on what counts as "padding". Held distinct from
-    # ``mask_token_id`` because operators can pass --mask-token-id to
-    # disambiguate; the pad token is whatever the loader stuffed at the
-    # end of short sequences regardless.
+    # Two related but semantically distinct pad-token notions:
+    #
+    # ``pad_for_pivot`` mirrors the data loader's right-pad token
+    # (see ``training_data.py``). The loader pads short sequences with
+    # ``tokenizer.pad_token_id`` and falls back to ``eos_token_id`` if
+    # that's missing, so the pivot-selection helper needs to recognise
+    # both — only with this match does ``_select_pivot`` correctly find
+    # the trailing-pad boundary on right-padded data.
+    #
+    # ``pad_for_loss`` is the value flowed into ``_draft_loss`` to
+    # zero-weight padding *targets* in CE/KL. Here we deliberately
+    # *do not* fall back to ``eos_token_id``: in multi-turn
+    # instruction-tuning data each turn ends with EOS as a real
+    # content token, and zero-weighting those would teach the draft to
+    # never predict EOS at turn boundaries. Since ``_select_pivot``
+    # already restricts the pivot to the unpadded prefix, pad targets
+    # can no longer reach ``_draft_loss`` via the trained path; the
+    # mask is defensive belt-and-suspenders for genuine pad tokens
+    # only.
     _tok_pad = getattr(tokenizer, "pad_token_id", None)
     _tok_eos = getattr(tokenizer, "eos_token_id", None)
-    pad_for_loss: int | None
+    pad_for_pivot: int | None
     if _tok_pad is not None:
-        pad_for_loss = int(_tok_pad)
+        pad_for_pivot = int(_tok_pad)
     elif _tok_eos is not None:
-        pad_for_loss = int(_tok_eos)
+        pad_for_pivot = int(_tok_eos)
     else:
-        pad_for_loss = None
+        pad_for_pivot = None
+    pad_for_loss: int | None = int(_tok_pad) if _tok_pad is not None else None
 
     if mask_token_id is None:
         # ``or`` would short-circuit on token ID 0 (a valid pad id for
@@ -784,23 +812,25 @@ def prepare_dflash_draft(
             # Pick a random pivot p. Two regimes:
             #
             # - When we know the loader's pad token (the common path,
-            #   ``pad_for_loss is not None``), restrict the pivot to the
-            #   unpadded prefix shared by every batch row. Otherwise the
-            #   pivot can land where ``pending`` and ``targets`` are all
-            #   pad tokens — and with ``mask_token_id == pad_token_id``
-            #   the bound lm_head trivially predicts pad-after-pad,
-            #   producing exact-zero CE that contaminates the running
-            #   average without contributing gradient. ``_select_pivot``
-            #   syncs once per batch (``min().item()``) but spares us
-            #   the per-step waste those degenerate windows would impose
-            #   on a real-data run.
+            #   ``pad_for_pivot is not None``), restrict the pivot to
+            #   the unpadded prefix shared by every batch row. Otherwise
+            #   the pivot can land where ``pending`` and ``targets`` are
+            #   all pad tokens — and with ``mask_token_id ==
+            #   pad_token_id`` the bound lm_head trivially predicts
+            #   pad-after-pad, producing exact-zero CE that
+            #   contaminates the running average without contributing
+            #   gradient. ``_select_pivot`` syncs once per batch
+            #   (``min().item()``) but spares us the per-step waste
+            #   those degenerate windows would impose on a real-data
+            #   run.
             #
-            # - When ``pad_for_loss is None`` (test fixtures with
-            #   no-padding tokenizers, custom batch iterators), keep the
-            #   legacy uniform sampler so the unit tests that wire in
-            #   synthetic batches don't suddenly start skipping windows.
+            # - When ``pad_for_pivot is None`` (test fixtures with
+            #   no-padding tokenizers, custom batch iterators), keep
+            #   the legacy uniform sampler so the unit tests that wire
+            #   in synthetic batches don't suddenly start skipping
+            #   windows.
             seq = input_ids.shape[1]
-            if pad_for_loss is None:
+            if pad_for_pivot is None:
                 lo = block_size
                 hi_inclusive = seq - block_size - 1
                 if hi_inclusive < lo:
@@ -810,7 +840,7 @@ def prepare_dflash_draft(
                     )
                 p = random.randint(lo, hi_inclusive)
             else:
-                pivot = _select_pivot(input_ids, pad_for_loss, block_size)
+                pivot = _select_pivot(input_ids, pad_for_pivot, block_size)
                 if pivot is None:
                     # Every row in this batch was padded shorter than
                     # ``2*block_size + 1`` real tokens; no valid window
