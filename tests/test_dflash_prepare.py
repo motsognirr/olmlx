@@ -553,14 +553,14 @@ class TestSkippedBatchesPreserveStepBudget:
                 _batch_iterator=all_pad_batches(),
             )
         # Operator must see a clear signal that no real updates ran.
+        # Use ``caplog.messages`` (the formatted-message property) rather
+        # than ``rec.message`` directly: ``LogRecord.message`` is only set
+        # after ``Formatter.format()`` runs, which pytest's
+        # ``LogCaptureHandler`` does not guarantee to call.
         assert any(
-            "no real gradient steps" in rec.message.lower()
-            or "0/20" in rec.message
-            or "0 of 20" in rec.message
-            for rec in caplog.records
-        ), (
-            f"expected an under-training warning, got: {[r.message for r in caplog.records]}"
-        )
+            "no real gradient steps" in msg.lower() or "0/20" in msg or "0 of 20" in msg
+            for msg in caplog.messages
+        ), f"expected an under-training warning, got: {caplog.messages}"
 
     def test_skipped_batches_do_not_eat_step_budget(self, tmp_path):
         from olmlx.engine.dflash.prepare import prepare_dflash_draft

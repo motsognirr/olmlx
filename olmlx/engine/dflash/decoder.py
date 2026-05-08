@@ -408,18 +408,37 @@ class _GDNStateCapture:
                 if isinstance(mod, gdn_cls):
                     self._expected_gdn_modules.append(mod)
         if not self._expected_gdn_modules:
-            # Fallback: GDN modules exist in the model but are not
-            # reachable via ``_get_layers``. ``_patch_model`` also uses
-            # ``_get_layers``, so it won't install ``_capturing_gdn_call``
-            # on those modules either — ``_captured_modules`` will be empty
-            # at rollback time. Populating ``_expected_gdn_modules`` with a
-            # non-empty list (even in LIFO order) ensures the subsequent
-            # cardinality check in ``rollback()`` fires and raises a clear
-            # error rather than silently passing via
-            # ``_order_matches([], []) == True``.
-            self._expected_gdn_modules = [
+            # ``_get_layers`` returned nothing relevant to GDN. Two
+            # sub-cases, distinguished by whether ``named_modules()``
+            # finds any GDN modules at all:
+            #
+            # (a) Orphaned GDN modules exist somewhere else in the tree.
+            #     ``_patch_model`` also uses ``_get_layers``, so it
+            #     can't install ``_capturing_gdn_call`` on them — the
+            #     forward pass will visit the patched code with cache
+            #     entries but ``_captured_modules`` stays empty.
+            #     Previously the cardinality mismatch surfaced via a
+            #     misleading "ordering invariant violated" error from
+            #     ``rollback()``. Raise here instead with the actual
+            #     cause so the operator gets a useful diagnostic.
+            #
+            # (b) No GDN modules anywhere — pure full-attention model.
+            #     Leave ``_expected_gdn_modules`` empty; ``rollback()``
+            #     won't be called (no non-trimmable caches), and even if
+            #     it were, ``_order_matches([], [])`` correctly returns
+            #     True.
+            orphaned = [
                 mod for _name, mod in model.named_modules() if isinstance(mod, gdn_cls)
             ]
+            if orphaned:
+                raise RuntimeError(
+                    f"Found {len(orphaned)} GatedDeltaNet module(s) in the "
+                    "model but none are reachable via ``_get_layers``. "
+                    "``_patch_model`` uses the same helper to install "
+                    "capture hooks, so DFlash rollback cannot work for "
+                    "this configuration. File an olmlx issue with the "
+                    "model class name."
+                )
         self.conv_data: list[tuple[mx.array, int]] = []
         self._gdn_inputs: list[tuple[Any, ...]] = []
         # Parallel list of layer instances ``_capturing_gdn_call`` saw

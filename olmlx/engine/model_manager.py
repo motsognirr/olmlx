@@ -1303,11 +1303,20 @@ class ModelManager:
                     # resolves via top-level model_type and handles these
                     # configs successfully.
                     mapped_top = LM_REMAP.get(model_type, model_type)
+                    # Belt-and-suspenders: re-assert the
+                    # ``linear_attention`` discriminant from the outer
+                    # guard so the warning's "hybrid linear-attention"
+                    # label is verifiable from this block alone. A
+                    # future refactor that hoists this fallback out of
+                    # the outer guard could otherwise silently route a
+                    # full-attention VLM with a missing ``_text``-
+                    # suffixed inner type to mlx-lm and lose vision.
                     if (
                         importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}") is None
                         and mapped_top != mapped_lm
                         and importlib.util.find_spec(f"mlx_lm.models.{mapped_top}")
                         is not None
+                        and "linear_attention" in layer_types
                     ):
                         logger.warning(
                             "Routing hybrid linear-attention VLM '%s' through "
