@@ -434,8 +434,12 @@ class _GDNStateCapture:
                     "because ``layer.named_modules()`` uses mlx's LIFO "
                     "stack traversal — multiple GDNs would come back in "
                     "the reverse of definition order and be mis-aligned "
-                    "with the forward pass. File an olmlx issue with the "
-                    "model class name."
+                    "with the forward pass. To support a multi-GDN-per-"
+                    "layer architecture, replace this collection with a "
+                    "manual depth-first walk over the layer's children "
+                    "in declaration order (e.g. ``vars(layer).values()`` "
+                    "with recursion into containers). File an olmlx "
+                    "issue with the model class name."
                 )
             self._expected_gdn_modules.extend(per_layer_gdns)
         if not self._expected_gdn_modules:
@@ -682,8 +686,19 @@ class _GDNStateCapture:
             # but cheap to fix.
             captured_set = set(captured_ids)
             expected_set = set(expected_ids)
-            captured_only = [i for i in captured_ids if i not in expected_set]
-            expected_only = [i for i in expected_ids if i not in captured_set]
+            captured_only = [
+                m for m in self._captured_modules if id(m) not in expected_set
+            ]
+            expected_only = [
+                m for m in self._expected_gdn_modules if id(m) not in captured_set
+            ]
+            # Surface the actual class names of the misaligned modules
+            # so the operator gets an actionable hint at the layer
+            # type rather than just a count of memory addresses.
+            captured_types = [type(m).__name__ for m in self._captured_modules]
+            expected_types = [type(m).__name__ for m in self._expected_gdn_modules]
+            captured_only_types = [type(m).__name__ for m in captured_only]
+            expected_only_types = [type(m).__name__ for m in expected_only]
             raise RuntimeError(
                 "DFlash rollback ordering invariant violated: forward pass "
                 "visited GDN layers in a different order than "
@@ -691,10 +706,10 @@ class _GDNStateCapture:
                 "and would be applied to the wrong cache slots. This is "
                 "an olmlx bug — please report at "
                 "https://github.com/motsognirr/olmlx/issues with the model "
-                f"name. Diagnostic: captured={len(captured_ids)} "
-                f"expected={len(expected_ids)} "
-                f"captured_only={len(captured_only)} "
-                f"expected_only={len(expected_only)}."
+                f"name. Diagnostic: captured order={captured_types}, "
+                f"expected order={expected_types}, "
+                f"captured-only types={captured_only_types}, "
+                f"expected-only types={expected_only_types}."
             )
         # Ordering invariant: ``_gdn_inputs`` and ``conv_data`` are
         # populated in the order the verification forward pass invokes
