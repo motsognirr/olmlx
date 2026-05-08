@@ -2680,8 +2680,9 @@ class TestDFlashLoading:
     """Tests for dflash decoder loading in _load_model."""
 
     def test_load_model_requires_dflash_draft_model(self, monkeypatch):
-        """Should raise ValueError when dflash is enabled but no draft model."""
+        """speculative_strategy='dflash' without a draft model should raise."""
         from olmlx.config import ExperimentalSettings
+        from olmlx.engine.registry import SpeculativeConfig
 
         registry = MagicMock()
         store = MagicMock()
@@ -2696,19 +2697,26 @@ class TestDFlashLoading:
         monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: False)
         monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
 
-        model_exp = ExperimentalSettings(
-            dflash=True,
-            dflash_draft_model=None,
-            _env_file=None,
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = SpeculativeConfig(
+            enabled=True,
+            draft_model=None,
+            num_tokens=4,
+            strategy="dflash",
         )
 
-        with pytest.raises(ValueError, match="dflash_draft_model"):
-            manager._load_model("test/target-model", model_exp=model_exp)
+        with pytest.raises(ValueError, match="speculative_draft_model"):
+            manager._load_model(
+                "test/target-model",
+                model_exp=model_exp,
+                spec_config=spec_config,
+            )
 
     def test_load_model_creates_dflash_decoder(self, monkeypatch):
-        """When dflash is enabled, _load_model should return a DFlashDecoder."""
+        """speculative_strategy='dflash' should route through _load_dflash_decoder."""
         from olmlx.config import ExperimentalSettings
         from olmlx.engine.dflash.decoder import DFlashDecoder
+        from olmlx.engine.registry import SpeculativeConfig
 
         target_model = MagicMock()
         target_model.args.vocab_size = 32000
@@ -2736,14 +2744,18 @@ class TestDFlashLoading:
             lambda *a, **kw: mock_decoder,
         )
 
-        model_exp = ExperimentalSettings(
-            dflash=True,
-            dflash_draft_model="test/dflash-draft",
-            _env_file=None,
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = SpeculativeConfig(
+            enabled=True,
+            draft_model="test/dflash-draft",
+            num_tokens=4,
+            strategy="dflash",
         )
 
         model, tok, is_vlm, caps_out, decoder = manager._load_model(
-            "test/target-model", model_exp=model_exp
+            "test/target-model",
+            model_exp=model_exp,
+            spec_config=spec_config,
         )
 
         assert decoder is mock_decoder
