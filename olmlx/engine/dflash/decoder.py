@@ -131,7 +131,11 @@ def _order_matches(captured: list[Any], expected: list[Any]) -> bool:
     """
     if len(captured) != len(expected):
         return False
-    return all(a is b for a, b in zip(captured, expected, strict=True))
+    # ``strict=True`` would be unreachable here — the length check
+    # above already short-circuits on mismatch, so plain ``zip`` is
+    # equivalent and avoids implying an additional safety net that
+    # never fires.
+    return all(a is b for a, b in zip(captured, expected))
 
 
 # ---------------------------------------------------------------------------

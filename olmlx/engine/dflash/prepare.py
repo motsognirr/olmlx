@@ -367,11 +367,15 @@ def _draft_loss(
     target_probs = mx.exp(target_log_probs)
     draft_log_probs_t = nn.log_softmax(draft_logits / t, axis=-1)
     kl = mx.sum(target_probs * (target_log_probs - draft_log_probs_t), axis=-1)
-    if valid is not None and denom is not None:
-        # ``denom`` was computed in the CE branch above; reuse it instead of
-        # re-running ``valid.sum()`` and the maximum-with-1.0 floor a second
-        # time. The two ``valid.sum()`` calls produce the same value, only
-        # differing in dtype, so an ``astype`` cast is sufficient.
+    if valid is not None:
+        # ``valid`` and ``denom`` are co-assigned in the
+        # ``pad_token_id is not None`` branch above, so checking
+        # ``valid`` alone implies ``denom`` is non-None. ``denom`` is
+        # reused here instead of re-running ``valid.sum()`` and the
+        # maximum-with-1.0 floor a second time — the two
+        # ``valid.sum()`` calls would produce the same value differing
+        # only in dtype, so an ``astype`` cast is sufficient.
+        assert denom is not None  # type narrowing for the checker
         kl_loss = (kl * valid).sum() / denom.astype(kl.dtype) * (t * t)
     else:
         kl_loss = mx.mean(kl) * (t * t)
@@ -384,21 +388,50 @@ def _select_pivot(
     pad_token_id: int,
     block_size: int,
 ) -> int | None:
-    """Pick a pivot inside the unpadded prefix shared by every batch row.
+    """Pick a pivot inside the right-padded prefix shared by every batch row.
 
     Returns ``None`` when no row has at least ``2 * block_size + 1`` real
-    tokens — the caller should skip the batch in that case rather than
-    forcing a degenerate pivot. The pivot range is
+    tokens in its prefix — the caller should skip the batch in that case
+    rather than forcing a degenerate pivot. The pivot range is
     ``[block_size, min_real_len - block_size - 1]`` (inclusive) so that
     every row has both a real ``pending`` token at position ``p`` and
     real targets at positions ``p+1..p+block_size``.
+
+    Uses the index of the first pad token (the right-padded prefix
+    boundary) rather than the count of non-pad tokens. The two are
+    only equal if ``pad_token_id`` never appears as real content — and
+    with ``mask_token_id == pad_token_id == eos_token_id`` (the
+    Qwen3.x default) multi-turn sequences carry EOS markers mid-stream
+    that are content, not padding. A naive non-pad count miscounts
+    those as padding and shrinks the pivot range, silently skipping
+    batches with valid windows.
 
     Costs one CPU sync per call (``min().item()``) — unavoidable because
     Python's ``random.randint`` requires a host int. We accept that
     rather than calling ``mx.random.randint(...).item()`` in the hot
     loop, which would also sync but additionally drain the lazy graph.
     """
-    real_lens = (input_ids != pad_token_id).astype(mx.int32).sum(axis=1)
+    seq_len = input_ids.shape[1]
+    # Find the right-padded prefix boundary by counting *trailing* pads,
+    # not the position of the first pad anywhere. The latter conflates
+    # mid-stream EOS markers (real content) with right-pad: with
+    # ``mask_token_id == pad_token_id == eos_token_id`` (the Qwen3.x
+    # default) a multi-turn row carries EOS at every turn boundary,
+    # and using ``argmax`` on the pad mask would return the first
+    # mid-stream EOS — collapsing the apparent prefix to a tiny
+    # window. Reversing along the sequence axis and locating the first
+    # non-pad gives the trailing-pad count directly.
+    reversed_ids = input_ids[:, ::-1]
+    not_pad_rev = reversed_ids != pad_token_id
+    has_real = not_pad_rev.any(axis=1)
+    first_real_rev = not_pad_rev.astype(mx.int32).argmax(axis=1)
+    # All-pad rows: ``any(axis=1) == False``, so ``argmax`` returns 0
+    # (which is meaningless); fall back to ``seq_len`` so trailing pads
+    # = whole length and ``real_lens`` = 0.
+    trailing_pads = mx.where(
+        has_real, first_real_rev, mx.array(seq_len, dtype=mx.int32)
+    )
+    real_lens = mx.array(seq_len, dtype=mx.int32) - trailing_pads
     min_real = int(real_lens.min().item())
     if min_real < 2 * block_size + 1:
         return None

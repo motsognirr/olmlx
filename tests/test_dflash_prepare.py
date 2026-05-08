@@ -472,6 +472,84 @@ class TestPivotSelection:
         ids = mx.array(rows)
         assert _select_pivot(ids, pad_token_id=pad, block_size=4) is None
 
+    def test_handles_pad_token_appearing_mid_content(self):
+        """The pivot range must reflect the right-padded *prefix* length,
+        not the count of non-pad tokens. With ``mask_token_id ==
+        pad_token_id == eos_token_id`` (the Qwen3.x default), multi-turn
+        sequences contain EOS markers mid-stream that are content, not
+        padding. Counting non-pad tokens globally undercounts the prefix
+        and narrows the pivot range below what's actually safe.
+
+        Construct a row of 30 real tokens (some equal to ``pad_token_id``
+        because they're EOS markers ending intermediate turns), with the
+        last 2 positions being trailing pad. The right-padded prefix
+        boundary is at index 30; the global non-pad count is < 30. The
+        helper must use the prefix boundary.
+        """
+        from olmlx.engine.dflash.prepare import _select_pivot
+
+        pad = 0
+        block_size = 2
+        # 30-token "real" prefix that contains 3 EOS=pad markers
+        # mid-stream (positions 5, 11, 17), then trailing pad to len 32.
+        real_prefix = [
+            1,
+            2,
+            3,
+            4,
+            5,
+            pad,
+            6,
+            7,
+            8,
+            9,
+            10,
+            pad,
+            11,
+            12,
+            13,
+            14,
+            15,
+            pad,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+        ]
+        assert len(real_prefix) == 30
+        row = real_prefix + [pad, pad]  # seq_len = 32
+        ids = mx.array([row, row])
+
+        # The correct unpadded-prefix length is 30 (first trailing pad
+        # at index 30). Pivot must be allowed up to 30 - block_size - 1
+        # = 27. The buggy implementation that counts non-pad tokens
+        # globally would see 27 non-pad tokens (30 - 3 EOS markers) and
+        # cap the pivot at 27 - 3 - 1 = 23.
+        import random as _r
+
+        _r.seed(0)
+        max_pivot_seen = 0
+        for _ in range(200):
+            p = _select_pivot(ids, pad_token_id=pad, block_size=block_size)
+            assert p is not None
+            max_pivot_seen = max(max_pivot_seen, p)
+        # If the helper uses the prefix-boundary semantics, ``p`` can
+        # reach 27 with high probability over 200 draws. If it uses the
+        # buggy non-pad count, it caps at 24.
+        assert max_pivot_seen >= 25, (
+            f"max pivot seen = {max_pivot_seen}; helper appears to be "
+            "counting non-pad tokens globally instead of using the "
+            "right-padded prefix boundary"
+        )
+
     def test_uses_min_real_length_across_batch(self):
         # One row has 20 real tokens, the other only 10. The shared
         # pivot must respect the shorter row so that *every* row's
