@@ -2223,6 +2223,7 @@ def cmd_dflash_prepare(args):
         num_hidden_layers=args.num_hidden_layers,
         target_layer_ids=target_layer_ids,
         num_target_layers=args.num_target_layers,
+        mask_token_id=args.mask_token_id,
         lr=args.lr,
         output_dir=args.output,
         distill=args.distill,
@@ -2589,6 +2590,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated target layer indices to extract hidden states "
             "from (e.g. '5,11,17,23'). Defaults to evenly spaced layers."
+        ),
+    )
+    dflash_prepare_p.add_argument(
+        "--mask-token-id",
+        type=int,
+        default=None,
+        help=(
+            "Token id used as MASK in the block-diffusion draft input. "
+            "Defaults to the tokenizer's pad_token_id (or eos_token_id if "
+            "no pad). For tokenizers with neither, this flag is required — "
+            "token 0 is not a safe fallback (often <bos>/<unk>)."
         ),
     )
     dflash_prepare_p.add_argument(

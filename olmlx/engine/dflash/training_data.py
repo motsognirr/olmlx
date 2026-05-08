@@ -171,9 +171,14 @@ def stream_training_batches(
             yield _emit(batch)
         return
 
-    # Fallback path — synthetic prompts cycled until max_examples hit.
-    target_examples = max_examples if max_examples is not None else 64
-    while yielded < target_examples:
+    # Fallback path — synthetic prompts cycled until ``max_examples``
+    # batches have been yielded. ``max_examples is None`` means
+    # "uncapped" — let the consumer (e.g. ``precompute_target_hiddens``
+    # capping via ``num_shards``) decide when to stop iterating. A
+    # previous version hardcoded a 64-batch cap when ``max_examples``
+    # was None, silently truncating ``--shards 500`` precompute runs
+    # whose HF dataset was unavailable.
+    while max_examples is None or yielded < max_examples:
         # Detect a full pass with no usable prompts so a caller that
         # raises ``min_seq_len`` above every fallback's tokenized length
         # gets a clear error instead of an infinite loop.
@@ -188,7 +193,7 @@ def stream_training_batches(
                 yield _emit(batch)
                 batch = []
                 yielded += 1
-                if yielded >= target_examples:
+                if max_examples is not None and yielded >= max_examples:
                     return
         if not made_progress:
             raise RuntimeError(

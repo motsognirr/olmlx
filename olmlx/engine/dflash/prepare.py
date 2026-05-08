@@ -102,7 +102,23 @@ def _evenly_spaced(num_layers: int, k: int) -> list[int]:
     # ``[1, 2, 2, 3]``). Duplicates would double-wrap the repeated
     # layer in ``_LayerHook`` and ``_unpatch_model`` only strips one
     # level — the dangling hook would corrupt subsequent captures.
-    return sorted({int(round((i + 1) * step)) for i in range(k)})
+    result = sorted({int(round((i + 1) * step)) for i in range(k)})
+    if len(result) < k:
+        # Operator surprise: ``--num-target-layers`` won't match the
+        # final ``num_target_layers`` baked into the saved
+        # ``config.json``. Surface the rounding collision so
+        # debugging is straightforward.
+        logger.warning(
+            "_evenly_spaced: requested %d layers from a %d-layer target "
+            "but rounding collisions reduced the result to %d unique "
+            "indices: %s. The saved config will reflect the deduplicated "
+            "count.",
+            k,
+            num_layers,
+            len(result),
+            result,
+        )
+    return result
 
 
 def _resolve_target_layer_ids(
@@ -420,7 +436,23 @@ def prepare_dflash_draft(
         # mask id and misaligning training vs. inference.
         _pad = getattr(tokenizer, "pad_token_id", None)
         _eos = getattr(tokenizer, "eos_token_id", None)
-        mask_token_id = _pad if _pad is not None else (_eos if _eos is not None else 0)
+        if _pad is not None:
+            mask_token_id = _pad
+        elif _eos is not None:
+            mask_token_id = _eos
+        else:
+            # Token 0 is not a safe fallback — for many tokenizers it's
+            # ``<bos>`` or ``<unk>``, which the model has strong priors
+            # about; using it as the MASK token at training time
+            # confuses the loss and degrades inference quality. Refuse
+            # the run rather than silently saving a poorly-trained
+            # checkpoint.
+            raise ValueError(
+                "Could not derive a mask token id: tokenizer has no "
+                "pad_token_id and no eos_token_id, and token 0 is not "
+                "a safe default (often <bos>/<unk>). Pass an explicit "
+                "mask_token_id (CLI: --mask-token-id N) for this target."
+            )
 
     draft_config = _build_draft_config(
         target_cfg,
