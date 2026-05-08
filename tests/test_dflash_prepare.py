@@ -325,6 +325,37 @@ class TestDraftConfigDerivation:
         assert cfg.hidden_size == 2048
         assert cfg.vocab_size == 248320
 
+    def test_rope_scaling_falls_back_to_top_level_for_vlm(self):
+        """``rope_scaling`` regression guard. After ``_build_draft_config``
+        was switched to read everything from ``text_config`` for VLMs,
+        a config that carries ``rope_scaling`` at the *top level*
+        (without mirroring it inside ``text_config``) would silently
+        drop scaling, producing a draft whose RoPE doesn't match the
+        target's effective frequencies.
+        """
+        from olmlx.engine.dflash.prepare import _build_draft_config
+
+        target_cfg = {
+            "model_type": "qwen3_5_moe",
+            "rope_scaling": {"type": "yarn", "factor": 4.0},
+            "text_config": {
+                "vocab_size": 32000,
+                "hidden_size": 4096,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "rope_theta": 10000.0,
+            },
+        }
+        cfg = _build_draft_config(
+            target_cfg,
+            target_layer_ids=[0],
+            num_hidden_layers=1,
+            block_size=4,
+            mask_token_id=0,
+        )
+        assert cfg.rope_scaling == {"type": "yarn", "factor": 4.0}
+
     def test_picks_up_rope_theta_from_rope_parameters_block(self):
         # Newer config schemas (Qwen3.5+, Qwen3.6) replace the flat
         # ``rope_theta`` field with a nested ``rope_parameters`` block

@@ -266,7 +266,11 @@ def _build_draft_config(
         num_target_layers=len(target_layer_ids),
         target_layer_ids=list(target_layer_ids),
         mask_token_id=mask_token_id,
-        rope_scaling=text_cfg.get("rope_scaling"),
+        # Fall back to the top-level when ``rope_scaling`` isn't
+        # mirrored inside ``text_config``. ``or`` is safe because
+        # ``rope_scaling`` is a dict — falsy only when ``None`` or
+        # ``{}`` (and ``{}`` carries no useful information either).
+        rope_scaling=text_cfg.get("rope_scaling") or target_cfg.get("rope_scaling"),
     )
 
 

@@ -431,8 +431,11 @@ class _GDNStateCapture:
                     f"Layer {type(layer).__name__} contains "
                     f"{len(per_layer_gdns)} GatedDeltaNet submodules; "
                     "DFlash currently assumes at most one GDN per layer "
-                    "and relies on traversal-order alignment that is not "
-                    "preserved for multi-GDN layers. File an olmlx issue."
+                    "because ``layer.named_modules()`` uses mlx's LIFO "
+                    "stack traversal — multiple GDNs would come back in "
+                    "the reverse of definition order and be mis-aligned "
+                    "with the forward pass. File an olmlx issue with the "
+                    "model class name."
                 )
             self._expected_gdn_modules.extend(per_layer_gdns)
         if not self._expected_gdn_modules:
