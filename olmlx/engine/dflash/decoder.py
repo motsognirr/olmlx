@@ -414,9 +414,27 @@ class _GDNStateCapture:
         # below.
         ordered_layers = _get_layers(model)
         for layer in ordered_layers:
-            for _name, mod in layer.named_modules():
-                if isinstance(mod, gdn_cls):
-                    self._expected_gdn_modules.append(mod)
+            # Per-layer GDN collection: today every hybrid architecture
+            # we know about ships at most one ``GatedDeltaNet`` per
+            # decoder layer, so list ordering within the layer doesn't
+            # matter. If a future layer carries multiple GDNs,
+            # ``layer.named_modules()`` would return them in mlx's LIFO
+            # traversal order — the inverse of the forward-pass order —
+            # reproducing the original ordering bug at sub-layer
+            # granularity. Surface that future violation instead of
+            # silently miswiring the rollback.
+            per_layer_gdns = [
+                mod for _name, mod in layer.named_modules() if isinstance(mod, gdn_cls)
+            ]
+            if len(per_layer_gdns) > 1:
+                raise RuntimeError(
+                    f"Layer {type(layer).__name__} contains "
+                    f"{len(per_layer_gdns)} GatedDeltaNet submodules; "
+                    "DFlash currently assumes at most one GDN per layer "
+                    "and relies on traversal-order alignment that is not "
+                    "preserved for multi-GDN layers. File an olmlx issue."
+                )
+            self._expected_gdn_modules.extend(per_layer_gdns)
         if not self._expected_gdn_modules:
             # ``_get_layers`` returned nothing relevant to GDN. Two
             # sub-cases, distinguished by whether ``named_modules()``

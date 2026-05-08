@@ -414,14 +414,18 @@ def _select_pivot(
     every row has both a real ``pending`` token at position ``p`` and
     real targets at positions ``p+1..p+block_size``.
 
-    Uses the index of the first pad token (the right-padded prefix
-    boundary) rather than the count of non-pad tokens. The two are
-    only equal if ``pad_token_id`` never appears as real content — and
-    with ``mask_token_id == pad_token_id == eos_token_id`` (the
+    Scans from the right to find the trailing-pad boundary (reversed
+    argmax for the first non-pad position) rather than counting
+    non-pad tokens globally. A non-pad count is only equal to the
+    prefix length when ``pad_token_id`` never appears as real content
+    — and with ``mask_token_id == pad_token_id == eos_token_id`` (the
     Qwen3.x default) multi-turn sequences carry EOS markers mid-stream
     that are content, not padding. A naive non-pad count miscounts
     those as padding and shrinks the pivot range, silently skipping
-    batches with valid windows.
+    batches with valid windows. A naive left-to-right
+    ``argmax(ids == pad)`` returns the first mid-stream EOS instead
+    of the trailing-pad boundary, which is even more wrong for that
+    case.
 
     Edge case: when a row's *final* real token equals ``pad_token_id``
     (e.g. an end-of-conversation EOS that happens to alias the loader's

@@ -1699,7 +1699,18 @@ class ModelManager:
         'namespace/repo_name'").
         """
         candidate = Path(hf_path).expanduser()
-        if candidate.is_absolute() and candidate.is_dir():
+        if candidate.is_absolute():
+            # Absolute paths are unambiguous local references — they
+            # cannot be HF repo ids. If the directory is missing, fall
+            # through to ``ensure_downloaded`` would surface as an
+            # ``HFValidationError`` ("Repo id must be in the form
+            # 'repo_name' or 'namespace/repo_name'") which is actively
+            # misleading for someone who passed e.g.
+            # ``/Users/.../dflash`` and made a typo or pointed at a
+            # path before training finished. Raise a clear
+            # ``FileNotFoundError`` with the actual path instead.
+            if not candidate.is_dir():
+                raise FileNotFoundError(f"Draft model directory not found: {candidate}")
             return str(candidate)
         if self.store is not None:
             local_dir = self.store.ensure_downloaded(hf_path)

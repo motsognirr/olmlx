@@ -221,6 +221,28 @@ class TestResolveDraftPath:
         mock_dl.assert_called_once_with("namespace/repo_name")
         assert resolved == str(expected)
 
+    def test_absolute_missing_path_raises_file_not_found(
+        self, tmp_path, registry, mock_store
+    ):
+        """Absolute paths are unambiguous local references; they
+        cannot also be valid HF repo ids. Falling through to
+        ``ensure_downloaded`` for a missing absolute path would raise
+        ``HFValidationError`` ("Repo id must be in the form
+        'repo_name' or 'namespace/repo_name'") which is actively
+        misleading. Raise ``FileNotFoundError`` with the actual path
+        so a typo or a path pointing at a not-yet-trained draft
+        produces a clear, actionable error.
+        """
+        manager = ModelManager(registry, mock_store)
+        missing = tmp_path / "definitely-not-here"
+        # Make sure ``ensure_downloaded`` is NOT consulted for a
+        # missing absolute path.
+        with patch.object(
+            mock_store, "ensure_downloaded", side_effect=AssertionError("called")
+        ):
+            with pytest.raises(FileNotFoundError, match="definitely-not-here"):
+                manager._resolve_draft_path(str(missing))
+
     def test_relative_path_collision_does_not_short_circuit(
         self, tmp_path, registry, mock_store, monkeypatch
     ):
