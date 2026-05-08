@@ -1805,8 +1805,24 @@ class ModelManager:
         # surface it here at load time with a clear message instead.
         # ``DFlashDraftModel`` doesn't expose ``args.vocab_size``
         # (config lives on ``draft_config``), so we read the two
-        # values directly rather than via ``_check_vocab_match``.
-        target_vocab = getattr(getattr(target_model, "args", None), "vocab_size", None)
+        # values directly rather than via ``_check_vocab_match``. Probe
+        # the same locations ``_get_layers`` walks (top-level,
+        # ``.model``, ``.language_model``) so VLM/wrapped targets that
+        # don't expose ``args`` at the outer level still get the check.
+        target_vocab: int | None = None
+        for chain in ((), ("model",), ("language_model",), ("language_model", "model")):
+            obj: Any = target_model
+            for attr in chain:
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is None:
+                continue
+            args = getattr(obj, "args", None) or getattr(obj, "config", None)
+            v = getattr(args, "vocab_size", None) if args is not None else None
+            if v is not None:
+                target_vocab = int(v)
+                break
         if target_vocab is not None and target_vocab != draft_config.vocab_size:
             raise ValueError(
                 f"DFlash draft vocab_size ({draft_config.vocab_size}) does "

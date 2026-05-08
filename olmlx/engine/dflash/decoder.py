@@ -21,7 +21,7 @@ state on rejection.
 from __future__ import annotations
 
 import logging
-from threading import RLock
+from threading import Lock
 from typing import Any
 
 import mlx.core as mx
@@ -66,8 +66,14 @@ logger = logging.getLogger(__name__)
 
 # Module-level lock guarding the GatedDeltaNet monkey-patch. Prevents
 # two ``_GDNStateCapture`` instances from racing on the class-level
-# ``__call__`` attribute.
-_GDN_PATCH_LOCK = RLock()
+# ``__call__`` attribute. We use ``threading.Lock`` (not ``RLock``)
+# because the lock can be released by a different thread than the one
+# that acquired it — specifically, ``__del__`` runs on whichever thread
+# drops the last reference (often the asyncio event-loop thread, while
+# ``acquire`` happened on a worker thread via ``asyncio.to_thread``).
+# ``RLock.release`` raises on a non-owner thread; ``Lock.release`` does
+# not. Recursive acquisition is unused.
+_GDN_PATCH_LOCK = Lock()
 
 
 # ---------------------------------------------------------------------------
