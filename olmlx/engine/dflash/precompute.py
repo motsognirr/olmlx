@@ -190,7 +190,16 @@ def read_precomputed_index(shard_dir: str | Path) -> dict[str, Any]:
         index = json.loads(index_path.read_text())
     except json.JSONDecodeError as exc:
         raise ValueError(f"Corrupt precompute index at {index_path}: {exc}") from exc
-    missing = [k for k in _REQUIRED_INDEX_KEYS if index.get(k) is None]
+    # Treat both absent keys and explicit ``null``/empty values as
+    # missing. ``index.get(k) is None`` alone would accept
+    # ``"target_layer_ids": null`` from a hand-edited JSON, and
+    # ``"target_layer_ids": []`` would slip through the shape-check
+    # downstream and surface as a confusing ``mx.array`` shape error.
+    missing = [
+        k
+        for k in _REQUIRED_INDEX_KEYS
+        if k not in index or index[k] is None or index[k] == [] or index[k] == ""
+    ]
     if missing:
         raise ValueError(
             f"Precompute index at {index_path} missing required keys: {missing}"
