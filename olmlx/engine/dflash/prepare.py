@@ -159,7 +159,25 @@ def _build_draft_config(
         return v if v is not None else default
 
     hidden_size = int(target_cfg["hidden_size"])
-    num_attention_heads = int(_get("num_attention_heads", hidden_size // 64))
+    # ``num_attention_heads`` has no safe default: the prior fallback
+    # ``hidden_size // 64`` assumed 64-dim heads (correct for some
+    # Gemma variants but wrong for the dominant 128-dim convention of
+    # Qwen3 / Llama 3 / Mistral, which would silently get 2× too many
+    # heads and a mis-sized ``head_dim`` derived from it). Modern
+    # config.json files virtually always include this field; raise on
+    # the missing case rather than silently producing a draft
+    # architecture incompatible with the target.
+    raw_num_heads = target_cfg.get("num_attention_heads")
+    if raw_num_heads is None:
+        raise ValueError(
+            "target config.json is missing 'num_attention_heads'. "
+            "There is no safe default — the head count drives "
+            "head_dim derivation and a wrong value silently produces "
+            "an architecturally-mismatched draft. Add the field to "
+            "the target config or open an olmlx issue if your model "
+            "encodes it differently."
+        )
+    num_attention_heads = int(raw_num_heads)
     num_kv_heads = int(_get("num_key_value_heads", num_attention_heads))
     head_dim = int(_get("head_dim", hidden_size // num_attention_heads))
     intermediate_size = int(_get("intermediate_size", hidden_size * 4))

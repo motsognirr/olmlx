@@ -211,6 +211,29 @@ class TestDraftConfigDerivation:
         assert cfg.block_size == 4
         assert cfg.mask_token_id == 0
 
+    def test_requires_num_attention_heads(self):
+        # Missing ``num_attention_heads`` previously fell back to
+        # ``hidden_size // 64``, silently producing 2× too many heads
+        # for the dominant 128-dim head convention. The field is now
+        # required so a malformed/minimal config fails loudly.
+        from olmlx.engine.dflash.prepare import _build_draft_config
+
+        target_cfg = {
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            # num_attention_heads intentionally omitted
+            "head_dim": 128,
+            "intermediate_size": 11008,
+        }
+        with pytest.raises(ValueError, match="num_attention_heads"):
+            _build_draft_config(
+                target_cfg,
+                target_layer_ids=[0],
+                num_hidden_layers=1,
+                block_size=4,
+                mask_token_id=0,
+            )
+
 
 # ---------------------------------------------------------------------------
 # End-to-end training
