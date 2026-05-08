@@ -365,7 +365,15 @@ class DFlashDraftModel(nn.Module):
 
     @staticmethod
     def _find_lm_head(target: nn.Module, embed: nn.Module) -> nn.Module | None:
-        for path in (("lm_head",), ("language_model", "lm_head")):
+        # Mirror ``_find_embed``'s walk so VLMs that bury the head under
+        # ``language_model.model`` (next to ``embed_tokens``) still
+        # resolve. Order matters: top-level wins over the same attribute
+        # under a wrapper, matching mlx-lm's lookup convention.
+        for path in (
+            ("lm_head",),
+            ("language_model", "lm_head"),
+            ("language_model", "model", "lm_head"),
+        ):
             obj: Any = target
             for attr in path:
                 obj = getattr(obj, attr, None)

@@ -1823,7 +1823,14 @@ class ModelManager:
             if v is not None:
                 target_vocab = int(v)
                 break
-        if target_vocab is not None and target_vocab != draft_config.vocab_size:
+        if target_vocab is None:
+            logger.warning(
+                "Could not determine target vocab_size for DFlash draft "
+                "compatibility check (target has no .args/.config at the "
+                "probed locations). A mismatch will surface as an mx.array "
+                "shape error at the first draft forward pass."
+            )
+        elif target_vocab != draft_config.vocab_size:
             raise ValueError(
                 f"DFlash draft vocab_size ({draft_config.vocab_size}) does "
                 f"not match target vocab_size ({target_vocab}). The draft "

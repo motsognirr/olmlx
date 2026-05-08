@@ -49,6 +49,13 @@ except ImportError:
 # tensors no longer reflect what ran and ``rollback`` silently replays
 # the wrong operation. These are the parameter names we depend on; any
 # mismatch raises at ``_patch()`` time rather than corrupting state.
+#
+# **Sync point**: this contract was last verified against mlx-lm 0.31.2
+# (``mlx_lm.models.qwen3_5.GatedDeltaNet.__call__`` and
+# ``mlx_lm.models.gated_delta.gated_delta_update``). When bumping
+# mlx-lm, diff both functions against the current copies and update
+# this list, ``_capturing_gdn_call``, and ``_GDN_REQUIRED_ATTRS``
+# together.
 _GATED_DELTA_UPDATE_EXPECTED_PARAMS: tuple[str, ...] = (
     "q",
     "k",
@@ -357,8 +364,19 @@ class _GDNStateCapture:
                 "models. Open an olmlx issue with the model's class name."
             )
         self._gdn_cls: type = gdn_cls
+        # Record the GDN module instances in traversal order so
+        # ``rollback`` can verify the captured forward pass visited
+        # them in the same order as the cache list. Catches ordering
+        # bugs from tied layers / model-parallel reordering that the
+        # cardinality check would miss.
+        self._expected_gdn_modules: list[Any] = [
+            mod for _name, mod in model.named_modules() if isinstance(mod, gdn_cls)
+        ]
         self.conv_data: list[tuple[mx.array, int]] = []
         self._gdn_inputs: list[tuple[Any, ...]] = []
+        # Parallel list of layer instances ``_capturing_gdn_call`` saw
+        # at each step, used by ``rollback`` to verify ordering.
+        self._captured_modules: list[Any] = []
         self._orig_call: Any = None
         self._patched_call: Any = None
         self._closed = False
@@ -461,6 +479,7 @@ class _GDNStateCapture:
             # training-mode forward followed by an inference-mode replay
             # would produce mismatched GDN states and corrupt the cache.
             use_kernel = not getattr(self_layer, "training", False)
+            capture._captured_modules.append(self_layer)
             capture._gdn_inputs.append(
                 (
                     q,
@@ -501,6 +520,7 @@ class _GDNStateCapture:
     def clear(self) -> None:
         self.conv_data.clear()
         self._gdn_inputs.clear()
+        self._captured_modules.clear()
 
     def close(self) -> None:
         if self._closed:
@@ -547,6 +567,24 @@ class _GDNStateCapture:
                 f"captured GDN inputs ({len(self._gdn_inputs)}); "
                 "DFlash rollback assumes every non-trimmable cache is a "
                 "GatedDeltaNet layer"
+            )
+        # Ordering check: the forward pass must have visited GDN
+        # modules in the same traversal order they appear in
+        # ``model.named_modules()``. mlx-lm normally visits layers in
+        # index order, but a hybrid model with tied layers or
+        # model-parallel reordering could break this invariant. The
+        # cardinality check above doesn't catch reordering — without
+        # this check, ``_gdn_inputs[j]`` could be silently applied to
+        # the wrong cache slot.
+        if self._captured_modules != self._expected_gdn_modules:
+            raise RuntimeError(
+                "DFlash rollback ordering invariant violated: forward pass "
+                "visited GDN layers in a different order than "
+                "``model.named_modules()``. ``_gdn_inputs`` is positional "
+                "and would be applied to the wrong cache slots. This is "
+                "an olmlx bug — please report at "
+                "https://github.com/motsognirr/olmlx/issues with the model "
+                "name."
             )
         # Ordering invariant: ``_gdn_inputs`` and ``conv_data`` are
         # populated in the order the verification forward pass invokes
@@ -853,9 +891,9 @@ class DFlashDecoder:
         # step's tensor in the slot — the ``None``-check below would
         # pass and we would silently feed stale hiddens to the next
         # draft step. ``prefill`` allocates the list fresh; ``step``
-        # has to clear it explicitly.
-        for i in range(len(self._hidden_capture)):
-            self._hidden_capture[i] = None
+        # has to clear it explicitly. Slice-assign so the same list
+        # object stays referenced by the installed hooks.
+        self._hidden_capture[:] = [None] * len(self._hidden_capture)
         verify_input = mx.array([[pending] + draft_tokens])
         target_out = self._target(verify_input, cache=self._target_cache)
         logits = _logits(target_out)
