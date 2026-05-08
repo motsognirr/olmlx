@@ -1837,17 +1837,20 @@ class ModelManager:
                 "must be trained against a target with the same vocabulary."
             )
 
-        # ``speculative_tokens`` overrides the draft config's ``block_size``
-        # so users can shrink the block at inference time without
-        # re-training. The draft's positional encoding is unaffected.
-        # ``None`` (no user override) inherits the draft's pre-trained block.
+        # ``draft_config.block_size`` is treated as the *draft token
+        # count* directly (matching the convention #287 ships with —
+        # the value used verbatim by ``SpeculativeDecoder``). Local
+        # ``olmlx dflash prepare`` writes the same convention to disk
+        # so a checkpoint trained here loads back without translation.
+        # ``None`` (no user override) inherits the draft's pre-trained
+        # block.
         block_size = (
             spec_config.num_tokens
             if spec_config.num_tokens is not None
             else draft_config.block_size
         )
-        # Going *above* the trained ``block_size`` runs the draft on
-        # block lengths it has never seen; the positional encoding and
+        # Going *above* the trained draft count runs the draft on block
+        # lengths it has never seen; the positional encoding and
         # block-diffusion training are bound to the trained length.
         # Warn (don't fail) — users may experiment.
         if (
