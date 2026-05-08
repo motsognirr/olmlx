@@ -85,11 +85,11 @@ def _evenly_spaced(num_layers: int, k: int) -> list[int]:
     """Pick ``k`` layer indices from ``[0, num_layers)`` evenly spaced.
 
     For the default ``num_target_layers=4`` and a 32-layer target this
-    gives ``[3, 11, 19, 27]`` — the upstream papers show middle/late
-    layers carry the most useful signal. Edge layers are intentionally
-    avoided (the draft already sees the input via embed_tokens, and
-    the final-layer hidden is roughly equivalent to the LM head's
-    pre-projection signal).
+    gives ``[6, 12, 19, 25]`` (``step = 31/5 = 6.2``, positions rounded)
+    — the upstream papers show middle/late layers carry the most useful
+    signal. Edge layers are intentionally avoided (the draft already
+    sees the input via embed_tokens, and the final-layer hidden is
+    roughly equivalent to the LM head's pre-projection signal).
     """
     if k <= 0:
         return []
@@ -331,6 +331,12 @@ def prepare_dflash_draft(
         raise ValueError(f"distill_alpha must be in [0, 1], got {distill_alpha}")
     if distill_temp <= 0:
         raise ValueError(f"distill_temp must be > 0, got {distill_temp}")
+    if block_size < 1:
+        # ``block_size == 0`` builds zero-length mask/target tensors,
+        # ``_draft_loss`` then returns 0 with no gradient, and the
+        # optimizer sees zeros every step — silently producing a
+        # worthless checkpoint after the full ``--steps`` run.
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
     model_path = Path(model_path)
     target_cfg = _read_target_config(model_path)
 

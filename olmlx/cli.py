@@ -2589,7 +2589,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Enable Hinton-style KL distillation against the target's "
             "logits at the masked positions. Incompatible with "
-            "--use-precomputed (precomputed shards do not store logits)."
+            "--use-precomputed (precomputed shards do not store logits). "
+            "Memory note: peak usage ~2x the CE-only path because both "
+            "target and draft probability tensors of shape "
+            "(batch_size, block_size, vocab_size) are live during the "
+            "KL reduction. For high-vocab targets (e.g. Gemma, Command R "
+            "at ~256k vocab) lower --batch-size accordingly."
         ),
     )
     dflash_prepare_p.add_argument(

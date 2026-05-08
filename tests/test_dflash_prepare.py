@@ -349,7 +349,16 @@ class TestPrepareDflashDraft:
                 _batch_iterator=_synthetic_batches(vocab, 2, 32, n=5),
             )
 
+        # The post-merge ``_patch_model`` API never sets
+        # ``_hidden_states`` on the model (storage is caller-owned), so
+        # the meaningful invariant is that no layer remains wrapped.
+        from olmlx.engine.dflash.decoder import _LayerHook, _get_layers
+
         target = target_holder["target"]
-        assert not hasattr(target, "_hidden_states"), (
-            "Target hooks must be uninstalled even when training raises"
-        )
+        layers = _get_layers(target)
+        for i, layer in enumerate(layers):
+            assert not isinstance(layer, _LayerHook), (
+                f"Target layer {i} still wrapped in _LayerHook after a "
+                "training run that raised — _unpatch_model must run in the "
+                "exception path"
+            )
