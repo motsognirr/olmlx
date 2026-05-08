@@ -423,6 +423,15 @@ def _select_pivot(
     those as padding and shrinks the pivot range, silently skipping
     batches with valid windows.
 
+    Edge case: when a row's *final* real token equals ``pad_token_id``
+    (e.g. an end-of-conversation EOS that happens to alias the loader's
+    pad), the trailing-pad scan absorbs it into the pad count, reporting
+    ``real_lens`` as one shorter than the true content boundary. The
+    direction of the error is safe (more conservative pivot range, no
+    invalid windows) but loses one valid pivot slot per such row. We
+    accept that conservatism rather than carry per-row metadata about
+    "true" sequence length through the loader.
+
     Costs one CPU sync per call (``min().item()``) — unavoidable because
     Python's ``random.randint`` requires a host int. We accept that
     rather than calling ``mx.random.randint(...).item()`` in the hot
@@ -774,9 +783,33 @@ def prepare_dflash_draft(
         # of the operator's ``steps`` budget and produce an under-trained
         # checkpoint.
         real_step = 0
+        # Guard against an infinite-iterator + all-padding scenario.
+        # HuggingFace streaming datasets are typically infinite, and a
+        # misconfigured ``block_size`` (or a dataset of uniformly very
+        # short sequences) can produce a stream where every batch is
+        # rejected by ``_select_pivot``. Without this guard the loop
+        # would spin forever — never advancing ``real_step``, never
+        # reaching the under-training warning after the loop. Cap the
+        # consecutive-skip count at a multiple of the requested
+        # ``steps`` so a few rough patches don't trigger a false
+        # positive on a real run.
+        consecutive_skips = 0
+        max_consecutive_skips = max(steps * 4, 1000)
         for batch in batches:
             if real_step >= steps:
                 break
+            if consecutive_skips >= max_consecutive_skips:
+                raise RuntimeError(
+                    f"DFlash training aborted: {consecutive_skips} consecutive "
+                    f"batches skipped without a real gradient update before "
+                    f"reaching {real_step}/{steps} steps. Every batch had at "
+                    f"least one row shorter than 2*block_size + 1 = "
+                    f"{2 * block_size + 1} real tokens. Likely causes: a "
+                    "dataset of uniformly short sequences, a misconfigured "
+                    "--block-size, or a tokenizer whose pad token coincides "
+                    "with the loader's actual pad. Inspect the dataset or "
+                    "lower --block-size."
+                )
 
             optimizer.learning_rate = _cosine_lr(real_step, steps, lr, warmup)
 
@@ -854,8 +887,13 @@ def prepare_dflash_draft(
                         real_step + 1,
                         2 * block_size + 1,
                     )
+                    consecutive_skips += 1
                     continue
                 p = pivot
+            # Reset the skip counter as soon as we know this batch is
+            # going to do real work, so the infinite-loop guard only
+            # measures *consecutive* skips.
+            consecutive_skips = 0
 
             # Pivot accepted: now run the target forward (online) or
             # consume the precomputed hidden state.
