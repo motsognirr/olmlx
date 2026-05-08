@@ -279,6 +279,52 @@ class TestDraftConfigDerivation:
         assert cfg.vocab_size == 248320
         assert cfg.max_position_embeddings == 262144
 
+    def test_vlm_config_with_rope_parameters_nested_under_text_config(self):
+        """The actual Qwen3.6-35B-A3B config shape: ``rope_parameters``
+        lives *inside* ``text_config``, not at the top level. Both
+        descent paths (``_text_config()`` to find the text-tower
+        block, then the nested ``rope_parameters`` lookup) must
+        compose. The two are individually covered by
+        ``test_descends_into_text_config_for_vlm_targets`` and
+        ``test_picks_up_rope_theta_from_rope_parameters_block``, but
+        only the end-to-end training run actually exercises both
+        together. With the fallback wrong by 3 orders of magnitude
+        (10_000 vs 10_000_000), a regression that broke composition
+        would produce a silently misconfigured draft and only show up
+        as poor acceptance at inference time.
+        """
+        from olmlx.engine.dflash.prepare import _build_draft_config
+
+        target_cfg = {
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "text_config": {
+                "vocab_size": 248320,
+                "hidden_size": 2048,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 262144,
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "rope_theta": 10000000,
+                },
+            },
+            "vision_config": {"hidden_size": 1024},
+        }
+        cfg = _build_draft_config(
+            target_cfg,
+            target_layer_ids=[8, 16, 23, 31],
+            num_hidden_layers=4,
+            block_size=4,
+            mask_token_id=151643,
+        )
+        assert cfg.rope_theta == 10000000.0
+        # Sanity: the other text_config fields also resolved.
+        assert cfg.hidden_size == 2048
+        assert cfg.vocab_size == 248320
+
     def test_picks_up_rope_theta_from_rope_parameters_block(self):
         # Newer config schemas (Qwen3.5+, Qwen3.6) replace the flat
         # ``rope_theta`` field with a nested ``rope_parameters`` block

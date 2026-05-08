@@ -798,7 +798,15 @@ def prepare_dflash_draft(
         # ``steps`` so a few rough patches don't trigger a false
         # positive on a real run.
         consecutive_skips = 0
-        max_consecutive_skips = max(steps * 4, 1000)
+        # Cap consecutive skips at ``2 * steps`` (with a 500 floor for
+        # short runs). Each skipped batch costs one CPU sync via
+        # ``_select_pivot``'s ``min().item()``, so large multipliers
+        # turn a degenerate dataset into a multi-second stall before
+        # the error fires. ``2 * steps`` still covers a comfortable
+        # buffer against legitimate short-sequence patches in normal
+        # training while keeping misconfigured-dataset runs failing
+        # within a couple of seconds.
+        max_consecutive_skips = max(steps * 2, 500)
         for batch in batches:
             if real_step >= steps:
                 break

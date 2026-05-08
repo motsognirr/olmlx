@@ -1316,6 +1316,10 @@ class ModelManager:
                         and mapped_top != mapped_lm
                         and importlib.util.find_spec(f"mlx_lm.models.{mapped_top}")
                         is not None
+                        # Redundant with the outer ``"linear_attention" in
+                        # layer_types`` guard at line 1262; kept so this
+                        # block stays self-contained against future
+                        # refactoring.
                         and "linear_attention" in layer_types
                     ):
                         logger.warning(
