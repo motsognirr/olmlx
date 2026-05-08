@@ -6,18 +6,29 @@ the dominant cost when training a draft for a large target.
 
 Shard format: each shard contains a single batch as
 ``{"input_ids": (B, L) int32, "target_hidden": (B, L, num_target_layers
-* hidden_size)}``. One batch per shard keeps the on-disk layout
+* model_hidden_size)}``. One batch per shard keeps the on-disk layout
 trivial; multi-batch packing is unnecessary because shard count
 follows ``steps`` directly. ``index.json`` in the output directory
-records ``{batch_size, seq_len, hidden_size, num_shards}`` so the
-reader can validate shape compatibility before training starts.
+records ``{batch_size, seq_len, concat_hidden_size, num_shards}``
+(the ``concat_`` prefix on the hidden dim is intentional: this is
+``num_target_layers * model_hidden_size``, not the per-layer dim
+written to ``config.json``) so the reader can validate shape
+compatibility before training starts.
 
 Storage cost (rough): ``shards * batch_size * seq_len *
-num_target_layers * hidden_size * 2`` bytes for bf16 hiddens. A 27B
-target with ``num_target_layers=4`` and ``hidden_size=4096`` consumes
-~32 KB per token of hiddens — tractable for ~100k tokens (~3 GB), gets
-unwieldy past 1M tokens. The CLI exposes ``--precompute-shards`` so
-users can scope the precompute pass to what fits.
+num_target_layers * model_hidden_size * 2`` bytes for bf16 hiddens. A
+27B target with ``num_target_layers=4`` and ``model_hidden_size=4096``
+consumes ~32 KB per token of hiddens — tractable for ~100k tokens
+(~3 GB), gets unwieldy past 1M tokens. The CLI exposes
+``--precompute-shards`` so users can scope the precompute pass to
+what fits.
+
+I/O efficiency note: the training loop currently reads each shard
+fully but only consumes the ``[:, :p+1, :]`` prefix where ``p`` is a
+random pivot. With a uniform pivot and the default ``seq_len=2048``
+that wastes ~50% of every read on average. A future improvement
+would store fixed-pivot windows so each read is fully consumed; for
+now, the trade-off pays off when target forwards dominate cost.
 
 Distillation (``--distill``) is incompatible with precomputed shards
 because storing vocab-size logits per token blows up the storage cost
@@ -90,10 +101,11 @@ def precompute_target_hiddens(
                 "Target forward did not populate all configured target_layer_ids"
             )
         hidden = mx.concatenate(captured, axis=-1)
-        # Detach and force evaluation so the safetensors writer sees a
-        # materialized array rather than a lazy expression that would
-        # rerun the target forward.
-        hidden = mx.stop_gradient(hidden)
+        # Force evaluation so the safetensors writer sees a materialized
+        # array rather than a lazy expression that would rerun the
+        # target forward. (No ``stop_gradient`` needed — there's no
+        # value_and_grad tape active in this function, so nothing
+        # would propagate through ``hidden`` anyway.)
         mx.eval(hidden, input_ids)
 
         # Capture shape metadata from the first shard so the reader can
@@ -121,10 +133,10 @@ def precompute_target_hiddens(
 
     if written == 0:
         # Refuse to write an index with ``null`` for ``batch_size`` /
-        # ``seq_len`` / ``hidden_size`` (their initial value): the file
-        # would land on disk and confuse anyone inspecting it, and a
-        # subsequent ``read_precomputed_index`` would reject it on
-        # missing-key grounds anyway.
+        # ``seq_len`` / ``concat_hidden_size`` (their initial value):
+        # the file would land on disk and confuse anyone inspecting
+        # it, and a subsequent ``read_precomputed_index`` would reject
+        # it on missing-key grounds anyway.
         raise RuntimeError(
             "precompute_target_hiddens produced no shards — check that "
             "the 'batches' iterator yields at least one item (an exhausted "
@@ -135,14 +147,18 @@ def precompute_target_hiddens(
         "num_shards": written,
         "batch_size": batch_size,
         "seq_len": seq_len,
-        "hidden_size": hidden_size,
+        # Named ``concat_hidden_size`` (not ``hidden_size``) so it
+        # cannot be confused with the per-layer model dimension stored
+        # in ``config.json``. This value is
+        # ``num_target_layers * model_hidden_size``.
+        "concat_hidden_size": hidden_size,
     }
     (output_dir / INDEX_FILENAME).write_text(json.dumps(index, indent=2))
     logger.info("Wrote %d precomputed shards to %s", written, output_dir)
     return output_dir
 
 
-_REQUIRED_INDEX_KEYS = ("num_shards", "batch_size", "seq_len", "hidden_size")
+_REQUIRED_INDEX_KEYS = ("num_shards", "batch_size", "seq_len", "concat_hidden_size")
 
 
 def read_precomputed_index(shard_dir: str | Path) -> dict[str, Any]:

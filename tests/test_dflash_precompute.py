@@ -50,8 +50,9 @@ class TestPrecomputeWriter:
         assert index["num_shards"] == 4
         assert index["batch_size"] == 2
         assert index["seq_len"] == 32
-        # 2 target layers * hidden_size 16 = concat 32
-        assert index["hidden_size"] == 32
+        # 2 target layers * model hidden_size 16 = concat 32 (this is
+        # the on-disk concatenated dim, not the per-layer model dim).
+        assert index["concat_hidden_size"] == 32
 
     def test_caps_at_num_shards(self, tmp_path):
         target = _Target(vocab_size=64, hidden_size=16, num_layers=2)

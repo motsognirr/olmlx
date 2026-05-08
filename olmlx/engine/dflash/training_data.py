@@ -72,9 +72,16 @@ def _stream_hf_dataset(
     try:
         ds = _ds.load_dataset(dataset, split=split, streaming=True)
     except Exception as exc:  # noqa: BLE001
+        # Only fall back when the user accepted the default dataset.
+        # If they passed ``--data foo/bar`` and that fails, re-raise:
+        # silently swapping in 8 synthetic prompts would otherwise let
+        # a multi-thousand-step training run produce a real-looking
+        # checkpoint that trained on essentially nothing.
+        if dataset != DEFAULT_DATASET:
+            raise
         logger.warning(
-            "Failed to open dataset %s split=%s: %s. Falling back to "
-            "synthetic prompts.",
+            "Failed to open default dataset %s split=%s: %s. Falling "
+            "back to synthetic prompts.",
             dataset,
             split,
             exc,

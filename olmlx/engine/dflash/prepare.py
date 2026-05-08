@@ -392,7 +392,10 @@ def prepare_dflash_draft(
     )
 
     draft = DFlashDraftModel(draft_config)
-    draft.bind(target)
+    # Defer ``draft.bind(target)`` until inside the try/finally below so
+    # any exception in batch-iterator validation (e.g. missing precompute
+    # shards) cannot leave the draft holding live references to the
+    # target's ``embed_tokens`` / ``lm_head`` weights.
     mx.eval(draft.parameters())
 
     # Optimizer + LR schedule.
@@ -458,7 +461,7 @@ def prepare_dflash_draft(
         # mismatches surface as a clear error here rather than as an
         # obscure shape crash inside ``_draft_loss``.
         meta = read_precomputed_index(use_precomputed)
-        expected_hidden = len(layer_ids) * int(target_cfg["hidden_size"])
+        expected_concat_hidden = len(layer_ids) * int(target_cfg["hidden_size"])
         mismatches = []
         if meta["batch_size"] != batch_size:
             mismatches.append(
@@ -466,10 +469,10 @@ def prepare_dflash_draft(
             )
         if meta["seq_len"] != seq_len:
             mismatches.append(f"seq_len: shard={meta['seq_len']} requested={seq_len}")
-        if meta["hidden_size"] != expected_hidden:
+        if meta["concat_hidden_size"] != expected_concat_hidden:
             mismatches.append(
-                f"hidden_size: shard={meta['hidden_size']} expected="
-                f"{expected_hidden} (num_target_layers * target hidden_size)"
+                f"concat_hidden_size: shard={meta['concat_hidden_size']} expected="
+                f"{expected_concat_hidden} (num_target_layers * target hidden_size)"
             )
         if mismatches:
             raise ValueError(
@@ -500,6 +503,9 @@ def prepare_dflash_draft(
 
     losses: list[float] = []
     try:
+        # Bind the draft inside the try so ``unbind()`` below runs even
+        # if the bind itself or the first training step raises.
+        draft.bind(target)
         for step, batch in enumerate(batches):
             if step >= steps:
                 break
