@@ -83,12 +83,15 @@ class DraftConfig:
                 f"Unsupported layer_types: {sorted(unsupported)}. "
                 "Only 'full_attention' and 'sliding_attention' are supported."
             )
-        if (
-            any(t == "sliding_attention" for t in self.layer_types)
-            and self.sliding_window is None
+        if any(t == "sliding_attention" for t in self.layer_types) and (
+            self.sliding_window is None or self.sliding_window <= 0
         ):
+            # ``sliding_window <= 0`` would make ``DFlashAttention``'s
+            # ``keep = sliding_window - 1`` go negative and silently
+            # discard the entire context every step — must reject.
             raise ValueError(
-                "sliding_window must be set when any layer uses 'sliding_attention'"
+                "sliding_window must be a positive int when any layer uses "
+                f"'sliding_attention'; got {self.sliding_window!r}"
             )
         if len(self.target_layer_ids) != self.num_target_layers:
             raise ValueError(

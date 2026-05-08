@@ -363,7 +363,7 @@ class TestDraftConfig:
             )
 
     def test_sliding_requires_window(self):
-        with pytest.raises(ValueError, match="sliding_window must be set"):
+        with pytest.raises(ValueError, match="sliding_window must be"):
             _make_draft_config(
                 vocab_size=64,
                 hidden_size=32,
@@ -372,6 +372,20 @@ class TestDraftConfig:
                 layer_types=("full_attention", "sliding_attention"),
                 sliding_window=None,
             )
+
+    def test_sliding_window_must_be_positive(self):
+        # ``sliding_window=0`` would push ``DFlashAttention.keep`` to -1
+        # and silently empty x_ctx every step — reject at config build.
+        for bad in (0, -1):
+            with pytest.raises(ValueError, match="sliding_window must be"):
+                _make_draft_config(
+                    vocab_size=64,
+                    hidden_size=32,
+                    target_layer_ids=[0],
+                    num_hidden_layers=2,
+                    layer_types=("full_attention", "sliding_attention"),
+                    sliding_window=bad,
+                )
 
     def test_target_layer_ids_length_mismatch(self):
         with pytest.raises(ValueError, match="target_layer_ids has length"):

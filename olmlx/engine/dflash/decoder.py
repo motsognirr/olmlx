@@ -371,6 +371,10 @@ class _GDNStateCapture:
             capture._gdn_inputs.append(
                 (q, k, v, a, b, self_layer.A_log, self_layer.dt_bias, state, mask)
             )
+            # Mirror upstream's ``use_kernel=not self.training`` so any
+            # future eval/train switch on the layer instance flows through
+            # both the patched forward and the rollback replay below.
+            use_kernel = not getattr(self_layer, "training", False)
             out, new_state = _gd_mod.gated_delta_update(
                 q,
                 k,
@@ -381,7 +385,7 @@ class _GDNStateCapture:
                 self_layer.dt_bias,
                 state,
                 mask,
-                use_kernel=True,
+                use_kernel=use_kernel,
             )
             if cache is not None:
                 cache[1] = new_state
@@ -459,6 +463,11 @@ class _GDNStateCapture:
             if c.is_trimmable():
                 c.trim(trim)
             else:
+                # Rollback only runs during decode (model in eval mode)
+                # so ``use_kernel=True`` matches the captured forward's
+                # ``not training`` decision. If we ever need to support
+                # rollback during training, capture the flag in
+                # ``_capturing_gdn_call`` and replay it here.
                 q, k, v, a, b, A_log, dt_bias, init_state, mask = self._gdn_inputs[j]
                 n = accepted + 1
                 _, state = _gd_mod.gated_delta_update(
