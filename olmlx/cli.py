@@ -2104,7 +2104,11 @@ def cmd_dflash_precompute(args):
     from olmlx.engine.dflash.prepare import _resolve_target_layer_ids
     from olmlx.engine.dflash.training_data import stream_training_batches
 
-    target, tokenizer = _mlx_lm_load(model_path)
+    # ``mlx_lm.load`` returns a 2-tuple in current versions; older
+    # variants returned 3-tuples. Slice to the first two so either
+    # works.
+    loaded = _mlx_lm_load(model_path)
+    target, tokenizer = loaded[0], loaded[1]
     target.eval()
     if hasattr(target, "freeze"):
         target.freeze()
@@ -2117,7 +2121,10 @@ def cmd_dflash_precompute(args):
     )
     print(f"  Resolved target_layer_ids: {layer_ids}\n")
 
-    _patch_model(target, layer_ids)
+    # Caller-owned hidden-state storage — kept off the ``nn.Module`` so
+    # mlx's parameter tracker doesn't pick the captures up.
+    hidden_capture: list[Any] = [None] * len(layer_ids)
+    _patch_model(target, layer_ids, hidden_capture)
     try:
         batches = stream_training_batches(
             tokenizer,
@@ -2131,6 +2138,7 @@ def cmd_dflash_precompute(args):
             target,
             batches,
             output_dir,
+            hidden_capture,
             num_shards=args.shards,
             progress_callback=_flash_progress,
         )

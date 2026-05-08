@@ -185,12 +185,14 @@ def _capture_target_outputs(
     target: nn.Module,
     inputs: mx.array,
     cache: list[Any] | None,
+    storage: list[Any],
     *,
     capture_logits: bool,
 ) -> tuple[mx.array, mx.array | None]:
     """Run target on ``inputs`` and return ``(hidden, logits | None)``.
 
-    Assumes ``_patch_model`` has been installed. ``hidden`` has shape
+    Assumes ``_patch_model`` has been installed with the same *storage*
+    list this function reads from. ``hidden`` has shape
     ``(B, L, num_target_layers * hidden_size)``. ``logits`` is captured
     only when ``capture_logits=True`` (KL distillation needs them); the
     pure-CE path skips it to avoid materializing the vocab-size tensor.
@@ -199,11 +201,11 @@ def _capture_target_outputs(
     """
     # Reset slots before each forward — the ``any(h is None ...)`` guard
     # below only catches hooks that *never* fired, not hooks that fired
-    # on a previous step but were skipped this step.
-    for i in range(len(target._hidden_states)):  # type: ignore[attr-defined]
-        target._hidden_states[i] = None  # type: ignore[attr-defined]
+    # on a previous step but were skipped this step. Slice-assign keeps
+    # the same list object the installed hooks reference.
+    storage[:] = [None] * len(storage)
     out = target(inputs, cache=cache)
-    captured = list(target._hidden_states)  # type: ignore[attr-defined]
+    captured = list(storage)
     if any(h is None for h in captured):
         raise RuntimeError(
             "Target forward did not populate all configured target_layer_ids"
@@ -335,7 +337,11 @@ def prepare_dflash_draft(
     if _target_loader is None:
         from mlx_lm import load as _mlx_lm_load
 
-        target, tokenizer = _mlx_lm_load(str(model_path))
+        # ``mlx_lm.load`` returns a 2-tuple in current versions; older
+        # variants returned 3-tuples. Slice to the first two so either
+        # works.
+        loaded = _mlx_lm_load(str(model_path))
+        target, tokenizer = loaded[0], loaded[1]
     else:
         target, tokenizer = _target_loader(str(model_path))
 
@@ -383,7 +389,12 @@ def prepare_dflash_draft(
     draft.bind(target)
     mx.eval(draft.parameters())
 
-    _patch_model(target, layer_ids)
+    # Caller-owned hidden-state storage passed into both the patch and
+    # ``_capture_target_outputs`` — keeps captured ``mx.array``s out of
+    # ``target.parameters()`` (mlx tracks ``list``-typed attributes as
+    # parameters once they hold arrays).
+    hidden_capture: list[Any] = [None] * len(layer_ids)
+    _patch_model(target, layer_ids, hidden_capture)
 
     # Optimizer + LR schedule.
     optimizer = optim.AdamW(learning_rate=lr)
@@ -451,7 +462,9 @@ def prepare_dflash_draft(
         expected_hidden = len(layer_ids) * int(target_cfg["hidden_size"])
         mismatches = []
         if meta["batch_size"] != batch_size:
-            mismatches.append(f"batch_size: shard={meta['batch_size']} requested={batch_size}")
+            mismatches.append(
+                f"batch_size: shard={meta['batch_size']} requested={batch_size}"
+            )
         if meta["seq_len"] != seq_len:
             mismatches.append(f"seq_len: shard={meta['seq_len']} requested={seq_len}")
         if meta["hidden_size"] != expected_hidden:
@@ -494,6 +507,7 @@ def prepare_dflash_draft(
                     target,
                     input_ids,
                     cache=None,
+                    storage=hidden_capture,
                     capture_logits=distill,
                 )
 

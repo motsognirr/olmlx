@@ -45,6 +45,7 @@ def precompute_target_hiddens(
     target: nn.Module,
     batches: Iterable[mx.array],
     output_dir: str | Path,
+    storage: list[Any],
     *,
     num_shards: int | None = None,
     progress_callback: Any = None,
@@ -52,9 +53,9 @@ def precompute_target_hiddens(
     """Run the target on each batch and dump ``(input_ids, hidden)`` shards.
 
     ``target`` must already have ``_patch_model`` installed by the
-    caller — this function does not own the hook lifecycle so the
-    caller can also use the same patched target for online training in
-    the same session.
+    caller, with the same *storage* list passed here — this function
+    does not own the hook lifecycle so the caller can also use the same
+    patched target for online training in the same session.
 
     ``num_shards``, if set, caps the number of shards written; the
     function returns early once the cap is hit. ``None`` consumes the
@@ -66,11 +67,6 @@ def precompute_target_hiddens(
         )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if not hasattr(target, "_hidden_states"):
-        raise RuntimeError(
-            "precompute_target_hiddens requires _patch_model(target, ...) "
-            "to be installed before calling"
-        )
 
     written = 0
     batch_size: int | None = None
@@ -84,11 +80,11 @@ def precompute_target_hiddens(
         # Reset slots before each forward so a hook that fires zero times
         # this iteration cannot leak a stale tensor from the previous one
         # — the ``any(h is None ...)`` guard below only catches hooks
-        # that *never* fired.
-        for i in range(len(target._hidden_states)):  # type: ignore[attr-defined]
-            target._hidden_states[i] = None  # type: ignore[attr-defined]
+        # that *never* fired. Slice-assign to keep the same list object
+        # the installed hooks reference.
+        storage[:] = [None] * len(storage)
         target(input_ids, cache=None)
-        captured = list(target._hidden_states)  # type: ignore[attr-defined]
+        captured = list(storage)
         if any(h is None for h in captured):
             raise RuntimeError(
                 "Target forward did not populate all configured target_layer_ids"
@@ -197,7 +193,10 @@ def iter_precomputed_shards(
     yielded = 0
     while True:
         for shard_path in shard_paths:
-            tensors = mx.load(str(shard_path))
+            # ``mx.load`` is overloaded to return either a dict (safetensors)
+            # or a single ``mx.array`` (npy); we always write safetensors,
+            # so narrow the type for pyright.
+            tensors: dict[str, mx.array] = mx.load(str(shard_path))  # type: ignore[assignment]
             try:
                 input_ids = tensors["input_ids"]
                 target_hidden = tensors["target_hidden"]

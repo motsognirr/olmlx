@@ -33,11 +33,12 @@ class TestPrecomputeWriter:
     def test_writes_shards_and_index(self, tmp_path):
         target = _Target(vocab_size=64, hidden_size=16, num_layers=4)
         layer_ids = [1, 3]
-        _patch_model(target, layer_ids)
+        storage: list = [None] * len(layer_ids)
+        _patch_model(target, layer_ids, storage)
         try:
             batches = _synthetic_batches(vocab=64, batch_size=2, seq_len=32, n=4)
             out = precompute_target_hiddens(
-                target, batches, tmp_path / "cache", num_shards=4
+                target, batches, tmp_path / "cache", storage, num_shards=4
             )
         finally:
             _unpatch_model(target)
@@ -52,20 +53,17 @@ class TestPrecomputeWriter:
         # 2 target layers * hidden_size 16 = concat 32
         assert index["hidden_size"] == 32
 
-    def test_requires_patched_target(self, tmp_path):
-        target = _Target(vocab_size=64, hidden_size=16, num_layers=2)
-        # Intentionally NOT patched.
-        batches = _synthetic_batches(vocab=64, batch_size=2, seq_len=32, n=1)
-        with pytest.raises(RuntimeError, match="_patch_model"):
-            precompute_target_hiddens(target, batches, tmp_path / "cache")
-
     def test_caps_at_num_shards(self, tmp_path):
         target = _Target(vocab_size=64, hidden_size=16, num_layers=2)
-        _patch_model(target, [0, 1])
+        layer_ids = [0, 1]
+        storage: list = [None] * len(layer_ids)
+        _patch_model(target, layer_ids, storage)
         try:
             # Iterator yields 10 but cap at 3.
             batches = _synthetic_batches(vocab=64, batch_size=2, seq_len=32, n=10)
-            precompute_target_hiddens(target, batches, tmp_path / "cache", num_shards=3)
+            precompute_target_hiddens(
+                target, batches, tmp_path / "cache", storage, num_shards=3
+            )
         finally:
             _unpatch_model(target)
         assert len(list((tmp_path / "cache").glob("shard-*.safetensors"))) == 3
@@ -79,10 +77,14 @@ class TestPrecomputeWriter:
 class TestPrecomputeReader:
     def _write_two_shards(self, tmp_path) -> Path:
         target = _Target(vocab_size=64, hidden_size=16, num_layers=2)
-        _patch_model(target, [0, 1])
+        layer_ids = [0, 1]
+        storage: list = [None] * len(layer_ids)
+        _patch_model(target, layer_ids, storage)
         try:
             batches = _synthetic_batches(vocab=64, batch_size=2, seq_len=32, n=2)
-            precompute_target_hiddens(target, batches, tmp_path / "cache", num_shards=2)
+            precompute_target_hiddens(
+                target, batches, tmp_path / "cache", storage, num_shards=2
+            )
         finally:
             _unpatch_model(target)
         return tmp_path / "cache"
@@ -127,11 +129,12 @@ class TestPrepareWithPrecomputed:
         # 1) Precompute shards using the test target.
         target = _Target(vocab_size=vocab, hidden_size=hidden, num_layers=num_layers)
         layer_ids = [1, 3]  # matches num_target_layers=2 below
-        _patch_model(target, layer_ids)
+        storage: list = [None] * len(layer_ids)
+        _patch_model(target, layer_ids, storage)
         try:
             batches = _synthetic_batches(vocab=vocab, batch_size=2, seq_len=32, n=8)
             shard_dir = precompute_target_hiddens(
-                target, batches, tmp_path / "cache", num_shards=8
+                target, batches, tmp_path / "cache", storage, num_shards=8
             )
         finally:
             _unpatch_model(target)
