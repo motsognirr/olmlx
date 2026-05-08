@@ -136,9 +136,17 @@ class TestDraftLossDistillation:
 
 class TestPrepareDistill:
     def test_distill_loss_decreases(self, tmp_path):
+        import random as _stdlib_random
+
         from olmlx.engine.dflash.prepare import prepare_dflash_draft
 
+        # Seed both RNGs: ``mx.random`` for data init, Python ``random``
+        # for pivot sampling (see ``prepare.py`` for why we don't use
+        # ``mx.random.randint`` for the pivot). Without the stdlib seed
+        # the test is flaky across processes whose Python RNG state
+        # differs (e.g. CI vs. local).
         mx.random.seed(0)
+        _stdlib_random.seed(0)
         vocab, hidden, num_layers = 64, 16, 4
         _write_target_config(tmp_path, vocab, hidden)
 
