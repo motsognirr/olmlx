@@ -1293,6 +1293,33 @@ class ModelManager:
                     # VLM-specific (e.g. "qwen3_5_vl") with no mlx-lm module,
                     # while text_config.model_type ("qwen3_5") does.  We
                     # already resolved using text_model_type above.
+                    #
+                    # Inverse case (Qwen3.6+): ``text_config.model_type`` is
+                    # the ``_text``-suffixed name (``qwen3_5_moe_text``)
+                    # with no mlx-lm module, but the top-level type
+                    # (``qwen3_5_moe``) does have one. Fall back to the
+                    # top-level type before raising — ``mlx_lm.load()``
+                    # (which the engine actually invokes downstream)
+                    # resolves via top-level model_type and handles these
+                    # configs successfully.
+                    mapped_top = LM_REMAP.get(model_type, model_type)
+                    if (
+                        importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}") is None
+                        and mapped_top != mapped_lm
+                        and importlib.util.find_spec(f"mlx_lm.models.{mapped_top}")
+                        is not None
+                    ):
+                        logger.warning(
+                            "Routing hybrid linear-attention VLM '%s' through "
+                            "mlx-lm text path '%s' (issue #284) — text_config "
+                            "model_type '%s' has no matching mlx-lm module, "
+                            "falling back to top-level model_type. Vision "
+                            "capability is disabled for this load.",
+                            model_type,
+                            mapped_top,
+                            text_model_type,
+                        )
+                        return "text"
                     if (
                         importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}")
                         is not None
@@ -1648,7 +1675,18 @@ class ModelManager:
         )
 
     def _resolve_draft_path(self, hf_path: str) -> str:
-        """Download a draft model if needed and return the local path."""
+        """Download a draft model if needed and return the local path.
+
+        Accepts either a HuggingFace repo id (``"namespace/repo_name"``)
+        or an absolute/relative filesystem path to a local draft
+        directory. Local paths short-circuit the ``ensure_downloaded``
+        machinery — feeding ``"/Users/.../dflash"`` into the HF repo-id
+        validator otherwise raises ``HFValidationError`` ("Repo id must
+        be in the form 'repo_name' or 'namespace/repo_name'").
+        """
+        candidate = Path(hf_path).expanduser()
+        if candidate.is_dir():
+            return str(candidate)
         if self.store is not None:
             local_dir = self.store.ensure_downloaded(hf_path)
             return str(local_dir)

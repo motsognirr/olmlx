@@ -109,11 +109,19 @@ def _mock_target_loader(vocab_size: int, hidden_size: int, num_layers: int):
 
 
 def _synthetic_batches(vocab: int, batch_size: int, seq_len: int, n: int):
-    """Deterministic batch iterator so tests don't hit the network."""
+    """Deterministic batch iterator so tests don't hit the network.
+
+    Emits tokens in ``[1, vocab)`` rather than ``[0, vocab)`` because
+    ``_MockTokenizer.pad_token_id == 0`` and the trainer's pad-aware
+    pivot helper would otherwise treat any random 0 as padding and
+    shrink the valid pivot range. Tests that need to exercise the
+    pad-aware path build batches explicitly with pad tokens (see
+    ``TestPivotSelection``).
+    """
     rng = mx.random.key(0)
     for _ in range(n):
         rng, sub = mx.random.split(rng)
-        yield mx.random.randint(0, vocab, (batch_size, seq_len), key=sub)
+        yield mx.random.randint(1, vocab, (batch_size, seq_len), key=sub)
 
 
 def _write_target_config(tmp_path: Path, vocab_size: int, hidden_size: int) -> Path:
@@ -233,6 +241,257 @@ class TestDraftConfigDerivation:
                 block_size=4,
                 mask_token_id=0,
             )
+
+    def test_descends_into_text_config_for_vlm_targets(self):
+        # Multimodal targets (e.g. Qwen3.6-35B-A3B's
+        # ``Qwen3_5MoeForConditionalGeneration``) nest text-tower fields
+        # under a ``text_config`` block. A flat ``target_cfg["hidden_size"]``
+        # read KeyErrors. The builder must descend into ``text_config`` when
+        # present, otherwise the only Qwen3.6 target on disk can't have a
+        # DFlash draft trained for it at all.
+        from olmlx.engine.dflash.prepare import _build_draft_config
+
+        target_cfg = {
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "text_config": {
+                "vocab_size": 248320,
+                "hidden_size": 2048,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 262144,
+            },
+            "vision_config": {"hidden_size": 1024},
+        }
+        cfg = _build_draft_config(
+            target_cfg,
+            target_layer_ids=[8, 16, 23, 31],
+            num_hidden_layers=4,
+            block_size=4,
+            mask_token_id=151643,
+        )
+        assert cfg.hidden_size == 2048
+        assert cfg.head_dim == 256
+        assert cfg.num_attention_heads == 16
+        assert cfg.num_key_value_heads == 2
+        assert cfg.vocab_size == 248320
+        assert cfg.max_position_embeddings == 262144
+
+    def test_picks_up_rope_theta_from_rope_parameters_block(self):
+        # Newer config schemas (Qwen3.5+, Qwen3.6) replace the flat
+        # ``rope_theta`` field with a nested ``rope_parameters`` block
+        # carrying ``rope_theta``, ``rope_type``, and friends. The
+        # default 10000.0 is wildly off from the 10_000_000 base these
+        # long-context targets actually use, so silently falling back
+        # to it produces a draft whose RoPE is incompatible with the
+        # context positions the target was trained on.
+        from olmlx.engine.dflash.prepare import _build_draft_config
+
+        target_cfg = {
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "intermediate_size": 11008,
+            # No top-level rope_theta — only the nested block.
+            "rope_parameters": {
+                "rope_type": "default",
+                "rope_theta": 10000000,
+            },
+        }
+        cfg = _build_draft_config(
+            target_cfg,
+            target_layer_ids=[0],
+            num_hidden_layers=1,
+            block_size=4,
+            mask_token_id=0,
+        )
+        assert cfg.rope_theta == 10000000.0
+
+
+class _FakeDraft:
+    """Stand-in for ``DFlashDraftModel`` that returns pre-baked logits.
+
+    Lets us drive ``_draft_loss`` without instantiating the real draft
+    (which would require building a target, capturing hidden states, and
+    walking RoPE). Mirrors the call signature used in ``prepare.py``:
+    ``draft(block_input, target_hidden, cache, logits_start=1)``.
+    """
+
+    def __init__(self, logits: mx.array):
+        self._logits = logits
+
+    def __call__(self, block_input, target_hidden, cache, logits_start=1):
+        return self._logits
+
+
+def _logits_with_target_at_index(
+    batch_size: int, block_size: int, vocab: int, target_id: int, peak: float
+) -> mx.array:
+    """Return logits whose softmax peaks sharply at ``target_id``.
+
+    Filling the row with 0 except a positive value at ``target_id`` gives
+    a known closed-form CE: ``-log_softmax(logits)[target_id] = -peak +
+    log(exp(peak) + (vocab - 1))``.
+    """
+    arr = mx.zeros((batch_size, block_size, vocab))
+    one_hot = mx.full((batch_size, block_size), peak)
+    indices = mx.full((batch_size, block_size), target_id, dtype=mx.int32)
+    arr = mx.put_along_axis(arr, indices[..., None], one_hot[..., None], axis=-1)
+    return arr
+
+
+class TestDraftLossPadMasking:
+    """Loss-mask behavior for padding-collision targets.
+
+    When the data loader right-pads sequences with ``pad_token_id`` AND
+    the trainer aliases ``mask_token_id == pad_token_id`` (the upstream
+    convention for tokenizers without a dedicated MASK token, which is
+    the common case for Qwen3.x), pivots that land in the padding region
+    construct a window of ``[PAD, MASK*N]`` whose targets are also all
+    PAD. The ``bind()``-tied lm_head then trivially predicts PAD with
+    near-1.0 probability, producing exact-zero CE that contaminates the
+    running average without giving any gradient signal.
+
+    The fix passes ``pad_token_id`` into ``_draft_loss`` and zero-weights
+    pad-target positions in the CE reduction. With no pad targets in the
+    batch the behavior is unchanged; with all-pad targets the loss is
+    exactly zero (genuine no-op step rather than misleading sub-epsilon
+    value).
+    """
+
+    def test_no_pad_id_preserves_legacy_behavior(self):
+        # Backward compat: callers that don't supply pad_token_id still
+        # see the old uniform-mean reduction.
+        from olmlx.engine.dflash.prepare import _draft_loss
+
+        vocab = 8
+        # Logits sharply peak at index 1 in every batch position.
+        logits = _logits_with_target_at_index(1, 3, vocab, target_id=1, peak=20.0)
+        targets = mx.array([[1, 1, 1]])
+        loss = _draft_loss(
+            _FakeDraft(logits),
+            block_input=mx.zeros((1, 4), dtype=mx.int32),
+            target_hidden=mx.zeros((1, 1, 1)),
+            targets=targets,
+            cache=[],
+        )
+        # Sharp logit at the right index gives loss ≈ 0; no masking
+        # kwarg means we exercise the legacy path.
+        assert float(loss) < 1e-3
+
+    def test_all_pad_targets_yield_zero_loss(self):
+        # Every target is the pad id → no real positions → loss is
+        # exactly 0 (vs. the unmasked path, which would also approach 0
+        # via lm_head's identity-bias and look misleadingly identical).
+        from olmlx.engine.dflash.prepare import _draft_loss
+
+        vocab = 8
+        # Pick a logit shape that would *not* trivially zero-out without
+        # masking: huge nll at every position. If the mask isn't applied
+        # the mean would be large.
+        bad_logits = _logits_with_target_at_index(1, 3, vocab, target_id=1, peak=20.0)
+        targets = mx.array([[5, 5, 5]])  # all pad
+        loss = _draft_loss(
+            _FakeDraft(bad_logits),
+            block_input=mx.zeros((1, 4), dtype=mx.int32),
+            target_hidden=mx.zeros((1, 1, 1)),
+            targets=targets,
+            cache=[],
+            pad_token_id=5,
+        )
+        assert float(loss) == 0.0
+
+    def test_mixed_targets_average_only_real_positions(self):
+        # Real target at position 0 (loss ~0), pad at positions 1-2.
+        # Without masking, mean is dragged toward (real_loss + 2*pad_loss)/3.
+        # With masking, mean equals real_loss alone.
+        from olmlx.engine.dflash.prepare import _draft_loss
+
+        vocab = 8
+        # Logits peak at id=1 sharply; real target uses id=1 → near-zero
+        # nll there. Pad positions use id=5 → very high nll (~20).
+        logits = _logits_with_target_at_index(1, 3, vocab, target_id=1, peak=20.0)
+        targets = mx.array([[1, 5, 5]])
+        loss = _draft_loss(
+            _FakeDraft(logits),
+            block_input=mx.zeros((1, 4), dtype=mx.int32),
+            target_hidden=mx.zeros((1, 1, 1)),
+            targets=targets,
+            cache=[],
+            pad_token_id=5,
+        )
+        # If masking works, only position 0 contributes; loss ≈ 0.
+        # Without masking the unweighted mean would be ~13.3 (one near-zero
+        # plus two ~20s averaged).
+        assert float(loss) < 1e-3
+
+
+class TestPivotSelection:
+    """The pivot must land inside the unpadded prefix shared by all batch
+    rows; otherwise the trainer wastes a forward+backward pass on a
+    window where every target is pad. The selector returns ``None`` when
+    no row has enough real content to fit a ``2*block_size + 1``
+    window."""
+
+    def test_returns_pivot_inside_real_content(self):
+        from olmlx.engine.dflash.prepare import _select_pivot
+
+        # 2 rows, both with 20 real tokens then padding to 32.
+        pad = 0
+        real_len = 20
+        seq_len = 32
+        rows = []
+        for _ in range(2):
+            row = list(range(1, real_len + 1)) + [pad] * (seq_len - real_len)
+            rows.append(row)
+        ids = mx.array(rows)
+        block_size = 4
+        # Run several times; every pivot must satisfy the constraint.
+        import random as _r
+
+        _r.seed(0)
+        for _ in range(20):
+            p = _select_pivot(ids, pad_token_id=pad, block_size=block_size)
+            assert p is not None
+            assert block_size <= p <= real_len - block_size - 1
+
+    def test_returns_none_when_all_rows_too_short(self):
+        # Every row has fewer real tokens than ``2 * block_size + 1`` so
+        # no pivot fits. The selector signals "skip" rather than picking
+        # a degenerate position.
+        from olmlx.engine.dflash.prepare import _select_pivot
+
+        pad = 0
+        seq_len = 32
+        # 4 real tokens, rest padding.
+        rows = [[1, 2, 3, 4] + [pad] * (seq_len - 4) for _ in range(2)]
+        ids = mx.array(rows)
+        assert _select_pivot(ids, pad_token_id=pad, block_size=4) is None
+
+    def test_uses_min_real_length_across_batch(self):
+        # One row has 20 real tokens, the other only 10. The shared
+        # pivot must respect the shorter row so that *every* row's
+        # targets are real content.
+        from olmlx.engine.dflash.prepare import _select_pivot
+
+        pad = 0
+        seq_len = 32
+        block_size = 2
+        long_row = list(range(1, 21)) + [pad] * (seq_len - 20)
+        short_row = list(range(1, 11)) + [pad] * (seq_len - 10)
+        ids = mx.array([long_row, short_row])
+        import random as _r
+
+        _r.seed(0)
+        for _ in range(20):
+            p = _select_pivot(ids, pad_token_id=pad, block_size=block_size)
+            assert p is not None
+            # Must fit inside the SHORT row's real content.
+            assert block_size <= p <= 10 - block_size - 1
 
 
 # ---------------------------------------------------------------------------

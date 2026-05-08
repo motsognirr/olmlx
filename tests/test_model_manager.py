@@ -187,6 +187,41 @@ class TestModelManager:
         assert mock_manager._expiry_task.cancelled()
 
 
+class TestResolveDraftPath:
+    """``_resolve_draft_path`` accepts both HF repo ids and local paths.
+
+    Operators training drafts via ``olmlx dflash prepare`` end up with a
+    directory under ``~/.olmlx/models/<target>/dflash/`` and configure
+    ``--speculative-draft-model /abs/path/to/dflash``. Without
+    short-circuiting local paths, the resolver passes the absolute path
+    into ``store.ensure_downloaded`` → ``huggingface_hub.HfApi`` →
+    ``HFValidationError`` ("Repo id must be in the form 'repo_name' or
+    'namespace/repo_name'") and the request fails with a confusing 400.
+    """
+
+    def test_local_directory_returns_as_is(self, tmp_path, registry, mock_store):
+        local = tmp_path / "my-draft"
+        local.mkdir()
+        manager = ModelManager(registry, mock_store)
+        # Should not call ``store.ensure_downloaded`` — the path exists.
+        with patch.object(
+            mock_store, "ensure_downloaded", side_effect=AssertionError("called")
+        ):
+            resolved = manager._resolve_draft_path(str(local))
+        assert resolved == str(local)
+
+    def test_hf_repo_id_goes_through_store(self, tmp_path, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
+        expected = tmp_path / "downloaded"
+        expected.mkdir()
+        with patch.object(
+            mock_store, "ensure_downloaded", return_value=expected
+        ) as mock_dl:
+            resolved = manager._resolve_draft_path("namespace/repo_name")
+        mock_dl.assert_called_once_with("namespace/repo_name")
+        assert resolved == str(expected)
+
+
 class TestDetectModelKind:
     def _make_config(self, tmp_path, config_data):
         config_path = tmp_path / "config.json"
@@ -435,6 +470,52 @@ class TestDetectModelKind:
                 "importlib.util.find_spec", side_effect=find_spec_with_qwen3_5_only
             ):
                 kind = manager._detect_model_kind("test/qwen3_5_vl")
+        assert kind == "text"
+
+    def test_hybrid_linear_attention_vlm_falls_back_to_top_level_model_type(
+        self, tmp_path, registry, mock_store
+    ):
+        """Inverse of the previous case: ``text_config.model_type`` names a
+        module mlx-lm doesn't ship (e.g. Qwen3.6's ``qwen3_5_moe_text``),
+        but the top-level ``model_type`` does (``qwen3_5_moe``). The
+        discriminator should fall back to the top-level type instead of
+        raising — otherwise olmlx serve refuses to load any
+        ``_text``-suffixed hybrid VLM, even though ``mlx_lm.load()`` (which
+        the rest of the engine actually uses) handles them via the
+        top-level type without issue.
+        """
+        config_path = self._make_config(
+            tmp_path,
+            {
+                # Top-level: the name mlx-lm has a module for.
+                "model_type": "qwen3_5_moe",
+                "vision_config": {"hidden_size": 1024},
+                "text_config": {
+                    # Inner: the new ``_text``-suffixed convention with no
+                    # matching mlx-lm module.
+                    "model_type": "qwen3_5_moe_text",
+                    "layer_types": ["linear_attention", "full_attention"],
+                },
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec_with_top_level_only(name, *args, **kwargs):
+            if name == "mlx_lm.models.qwen3_5_moe":
+                return object()
+            if name == "mlx_lm.models.qwen3_5_moe_text":
+                return None  # mlx-lm has no _text-suffixed module
+            return real_find_spec(name, *args, **kwargs)
+
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            with patch(
+                "importlib.util.find_spec", side_effect=find_spec_with_top_level_only
+            ):
+                kind = manager._detect_model_kind("test/qwen3_5_moe")
         assert kind == "text"
 
     def test_hybrid_linear_attention_vlm_raises_when_mlx_lm_import_fails(

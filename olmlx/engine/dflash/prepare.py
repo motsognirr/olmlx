@@ -82,6 +82,21 @@ def _read_target_config(model_path: Path) -> dict[str, Any]:
     return json.loads(cfg_path.read_text())
 
 
+def _text_config(target_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return the text-tower portion of a target config.
+
+    Multimodal targets (e.g. Qwen3.6's ``Qwen3_5MoeForConditionalGeneration``)
+    nest text-tower fields under ``text_config`` and reserve the top level for
+    cross-modal metadata (``vision_config``, image/video token ids, etc.). The
+    DFlash draft only models text, so it should consume the nested block when
+    present and fall through to the flat config otherwise.
+    """
+    nested = target_cfg.get("text_config")
+    if isinstance(nested, dict):
+        return nested
+    return target_cfg
+
+
 def _evenly_spaced(num_layers: int, k: int) -> list[int]:
     """Pick ``k`` layer indices from ``[0, num_layers)`` evenly spaced.
 
@@ -166,15 +181,19 @@ def _build_draft_config(
     dimensionally compatible at inference time.
     """
 
+    # Multimodal targets put text-tower fields under ``text_config``; descend
+    # into that block before reading any field.
+    text_cfg = _text_config(target_cfg)
+
     # ``or`` would short-circuit on a degenerate-but-valid ``0.0`` /
     # ``0`` value (e.g. ``rms_norm_eps=0.0``); use ``is not None``
     # ternaries to fall back only on genuinely missing keys, matching
     # CLAUDE.md's stated convention.
     def _get(key: str, default: Any) -> Any:
-        v = target_cfg.get(key)
+        v = text_cfg.get(key)
         return v if v is not None else default
 
-    hidden_size = int(target_cfg["hidden_size"])
+    hidden_size = int(text_cfg["hidden_size"])
     # ``num_attention_heads`` has no safe default: the prior fallback
     # ``hidden_size // 64`` assumed 64-dim heads (correct for some
     # Gemma variants but wrong for the dominant 128-dim convention of
@@ -183,7 +202,7 @@ def _build_draft_config(
     # config.json files virtually always include this field; raise on
     # the missing case rather than silently producing a draft
     # architecture incompatible with the target.
-    raw_num_heads = target_cfg.get("num_attention_heads")
+    raw_num_heads = text_cfg.get("num_attention_heads")
     if raw_num_heads is None:
         raise ValueError(
             "target config.json is missing 'num_attention_heads'. "
@@ -198,7 +217,19 @@ def _build_draft_config(
     head_dim = int(_get("head_dim", hidden_size // num_attention_heads))
     intermediate_size = int(_get("intermediate_size", hidden_size * 4))
     rms_norm_eps = float(_get("rms_norm_eps", 1e-6))
-    rope_theta = float(_get("rope_theta", 10000.0))
+    # Newer config schemas (Qwen3.5+, Qwen3.6) drop the flat ``rope_theta`` in
+    # favor of a nested ``rope_parameters`` block. The default 10000.0 is
+    # off by 1000× from the long-context bases these targets use, so a
+    # silent fallback would produce a draft whose RoPE frequencies are
+    # incompatible with the positions the target was trained on. Prefer the
+    # flat field when present; otherwise descend.
+    rope_params = text_cfg.get("rope_parameters")
+    if text_cfg.get("rope_theta") is not None:
+        rope_theta = float(text_cfg["rope_theta"])
+    elif isinstance(rope_params, dict) and rope_params.get("rope_theta") is not None:
+        rope_theta = float(rope_params["rope_theta"])
+    else:
+        rope_theta = 10000.0
     max_position_embeddings = int(_get("max_position_embeddings", 4096))
 
     # Stored on disk as the draft-token count directly (the same
@@ -213,7 +244,7 @@ def _build_draft_config(
         num_key_value_heads=num_kv_heads,
         head_dim=head_dim,
         intermediate_size=intermediate_size,
-        vocab_size=int(target_cfg["vocab_size"]),
+        vocab_size=int(text_cfg["vocab_size"]),
         rms_norm_eps=rms_norm_eps,
         rope_theta=rope_theta,
         max_position_embeddings=max_position_embeddings,
@@ -221,7 +252,7 @@ def _build_draft_config(
         num_target_layers=len(target_layer_ids),
         target_layer_ids=list(target_layer_ids),
         mask_token_id=mask_token_id,
-        rope_scaling=target_cfg.get("rope_scaling"),
+        rope_scaling=text_cfg.get("rope_scaling"),
     )
 
 
@@ -277,6 +308,7 @@ def _draft_loss(
     target_logits_window: mx.array | None = None,
     distill_alpha: float = 0.0,
     distill_temp: float = 1.0,
+    pad_token_id: int | None = None,
 ) -> mx.array:
     """Loss on the masked positions: cross-entropy + optional KL distillation.
 
@@ -292,11 +324,32 @@ def _draft_loss(
     Hinton-style distillation recipe. The ``T^2`` factor restores the
     gradient magnitude lost to the temperature softening so distillation
     stays comparable to CE in scale.
+
+    When ``pad_token_id`` is provided, positions where ``targets ==
+    pad_token_id`` are zero-weighted in both CE and KL reductions and
+    the divisor switches from total-position-count to non-pad-count.
+    Without this, batches whose pivot lands in the padding region of a
+    right-padded sequence trivially solve to ``CE ≈ 0`` (the
+    ``bind()``-tied lm_head predicts the input token, which equals pad,
+    which equals the target after MASK==PAD aliasing) — contaminating
+    the running average without contributing any gradient. The mask
+    makes such batches deliver an honest no-op step instead.
     """
     draft_logits = draft(block_input, target_hidden, cache, logits_start=1)
     log_probs = nn.log_softmax(draft_logits, axis=-1)
     nll = -mx.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
-    ce = mx.mean(nll)
+
+    if pad_token_id is not None:
+        valid = (targets != pad_token_id).astype(nll.dtype)
+        # ``valid.sum().clip(1.0, ...)`` keeps the divisor from hitting
+        # zero when the entire window is pad. Combined with the
+        # zero-weighted nll the result is an exact 0.0 — the optimizer
+        # update then has zero gradient (flowing back through 0/1).
+        denom = mx.maximum(valid.sum(), mx.array(1.0, dtype=nll.dtype))
+        ce = (nll * valid).sum() / denom
+    else:
+        valid = None
+        ce = mx.mean(nll)
 
     if target_logits_window is None or distill_alpha <= 0.0:
         return ce
@@ -309,9 +362,39 @@ def _draft_loss(
     target_probs = mx.exp(target_log_probs)
     draft_log_probs_t = nn.log_softmax(draft_logits / t, axis=-1)
     kl = mx.sum(target_probs * (target_log_probs - draft_log_probs_t), axis=-1)
-    kl_loss = mx.mean(kl) * (t * t)
+    if valid is not None:
+        denom_kl = mx.maximum(valid.sum(), mx.array(1.0, dtype=kl.dtype))
+        kl_loss = (kl * valid).sum() / denom_kl * (t * t)
+    else:
+        kl_loss = mx.mean(kl) * (t * t)
 
     return (1.0 - distill_alpha) * ce + distill_alpha * kl_loss
+
+
+def _select_pivot(
+    input_ids: mx.array,
+    pad_token_id: int,
+    block_size: int,
+) -> int | None:
+    """Pick a pivot inside the unpadded prefix shared by every batch row.
+
+    Returns ``None`` when no row has at least ``2 * block_size + 1`` real
+    tokens — the caller should skip the batch in that case rather than
+    forcing a degenerate pivot. The pivot range is
+    ``[block_size, min_real_len - block_size - 1]`` (inclusive) so that
+    every row has both a real ``pending`` token at position ``p`` and
+    real targets at positions ``p+1..p+block_size``.
+
+    Costs one CPU sync per call (``min().item()``) — unavoidable because
+    Python's ``random.randint`` requires a host int. We accept that
+    rather than calling ``mx.random.randint(...).item()`` in the hot
+    loop, which would also sync but additionally drain the lazy graph.
+    """
+    real_lens = (input_ids != pad_token_id).astype(mx.int32).sum(axis=1)
+    min_real = int(real_lens.min().item())
+    if min_real < 2 * block_size + 1:
+        return None
+    return random.randint(block_size, min_real - block_size - 1)
 
 
 def _cosine_lr(step: int, total: int, peak: float, warmup: int) -> float:
@@ -430,6 +513,22 @@ def prepare_dflash_draft(
     )
     logger.info("DFlash target_layer_ids = %s", layer_ids)
 
+    # ``pad_for_loss`` mirrors the data loader's right-pad token (see
+    # ``training_data.py``) so the loss/pivot logic agrees with the
+    # loader on what counts as "padding". Held distinct from
+    # ``mask_token_id`` because operators can pass --mask-token-id to
+    # disambiguate; the pad token is whatever the loader stuffed at the
+    # end of short sequences regardless.
+    _tok_pad = getattr(tokenizer, "pad_token_id", None)
+    _tok_eos = getattr(tokenizer, "eos_token_id", None)
+    pad_for_loss: int | None
+    if _tok_pad is not None:
+        pad_for_loss = int(_tok_pad)
+    elif _tok_eos is not None:
+        pad_for_loss = int(_tok_eos)
+    else:
+        pad_for_loss = None
+
     if mask_token_id is None:
         # ``or`` would short-circuit on token ID 0 (a valid pad id for
         # Llama 2 / Mistral / Qwen 1.x), silently picking EOS as the
@@ -494,6 +593,7 @@ def prepare_dflash_draft(
             target_logits_window=target_logits_window,
             distill_alpha=distill_alpha if distill else 0.0,
             distill_temp=distill_temp,
+            pad_token_id=pad_for_loss,
         )
 
     loss_and_grad = nn.value_and_grad(draft, loss_fn)
@@ -532,7 +632,9 @@ def prepare_dflash_draft(
         # mismatches surface as a clear error here rather than as an
         # obscure shape crash inside ``_draft_loss``.
         meta = read_precomputed_index(use_precomputed)
-        expected_concat_hidden = len(layer_ids) * int(target_cfg["hidden_size"])
+        expected_concat_hidden = len(layer_ids) * int(
+            _text_config(target_cfg)["hidden_size"]
+        )
         mismatches = []
         if meta["batch_size"] != batch_size:
             mismatches.append(
@@ -629,26 +731,50 @@ def prepare_dflash_draft(
                     capture_logits=distill,
                 )
 
-            # Pick a random pivot p in [block_size, seq_len - block_size - 1).
-            # Using the same p across the batch keeps shapes static; cycling
-            # the pivot across steps gives diverse training windows.
+            # Pick a random pivot p. Two regimes:
+            #
+            # - When we know the loader's pad token (the common path,
+            #   ``pad_for_loss is not None``), restrict the pivot to the
+            #   unpadded prefix shared by every batch row. Otherwise the
+            #   pivot can land where ``pending`` and ``targets`` are all
+            #   pad tokens — and with ``mask_token_id == pad_token_id``
+            #   the bound lm_head trivially predicts pad-after-pad,
+            #   producing exact-zero CE that contaminates the running
+            #   average without contributing gradient. ``_select_pivot``
+            #   syncs once per batch (``min().item()``) but spares us
+            #   the per-step waste those degenerate windows would impose
+            #   on a real-data run.
+            #
+            # - When ``pad_for_loss is None`` (test fixtures with
+            #   no-padding tokenizers, custom batch iterators), keep the
+            #   legacy uniform sampler so the unit tests that wire in
+            #   synthetic batches don't suddenly start skipping windows.
             seq = input_ids.shape[1]
-            # Valid pivots: ``p ∈ [block_size, seq - block_size - 1]``
-            # (inclusive). The targets slice is
-            # ``input_ids[:, p+1 : p+1+block_size]`` so we need
-            # ``p + 1 + block_size <= seq``. We use Python's ``random``
-            # rather than ``mx.random.randint(...).item()`` because
-            # ``.item()`` forces a CPU/GPU sync that drains the lazy
-            # graph 2000+ times per run; pivot selection is just a
-            # uniform integer and doesn't need GPU randomness.
-            lo = block_size
-            hi_inclusive = seq - block_size - 1
-            if hi_inclusive < lo:
-                raise ValueError(
-                    f"seq_len={seq} too small for block_size={block_size}; "
-                    f"need at least 2*block_size + 1 tokens per sequence"
-                )
-            p = random.randint(lo, hi_inclusive)
+            if pad_for_loss is None:
+                lo = block_size
+                hi_inclusive = seq - block_size - 1
+                if hi_inclusive < lo:
+                    raise ValueError(
+                        f"seq_len={seq} too small for block_size={block_size}; "
+                        f"need at least 2*block_size + 1 tokens per sequence"
+                    )
+                p = random.randint(lo, hi_inclusive)
+            else:
+                pivot = _select_pivot(input_ids, pad_for_loss, block_size)
+                if pivot is None:
+                    # Every row in this batch was padded shorter than
+                    # ``2*block_size + 1`` real tokens; no valid window
+                    # exists. Skip rather than train on a degenerate
+                    # all-pad target — the next batch will most likely
+                    # be longer.
+                    logger.debug(
+                        "step %d: skipping all-padding batch (no row has "
+                        "%d+ real tokens)",
+                        step + 1,
+                        2 * block_size + 1,
+                    )
+                    continue
+                p = pivot
 
             pending = input_ids[:, p : p + 1]  # (B, 1)
             mask_block = mx.full(

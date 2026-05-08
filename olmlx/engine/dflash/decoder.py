@@ -115,6 +115,25 @@ logger = logging.getLogger(__name__)
 _GDN_PATCH_LOCK = Lock()
 
 
+def _order_matches(captured: list[Any], expected: list[Any]) -> bool:
+    """Identity-based equality for two ordered module lists.
+
+    Replaces ``captured == expected``. The natural Python list ``==``
+    falls through to elementwise ``__eq__`` on the contained ``nn.Module``
+    instances; mlx's ``Module.__eq__`` returns an ``mx.array`` (broadcast
+    over its array attributes) and Python then tries to coerce that
+    array to a scalar via ``bool()``, which raises
+    ``ValueError: [convert] Only length-1 arrays can be converted to
+    Python scalars`` for any module holding a multi-element tensor —
+    which is every real ``GatedDeltaNet``. Identity comparison sidesteps
+    the overload entirely and matches the actual invariant we want
+    (the forward visited the same module instances in the same order).
+    """
+    if len(captured) != len(expected):
+        return False
+    return all(a is b for a, b in zip(captured, expected, strict=True))
+
+
 # ---------------------------------------------------------------------------
 # Layer hooks
 # ---------------------------------------------------------------------------
@@ -368,14 +387,34 @@ class _GDNStateCapture:
                 "models. Open an olmlx issue with the model's class name."
             )
         self._gdn_cls: type = gdn_cls
-        # Record the GDN module instances in traversal order so
-        # ``rollback`` can verify the captured forward pass visited
-        # them in the same order as the cache list. Catches ordering
-        # bugs from tied layers / model-parallel reordering that the
-        # cardinality check would miss.
-        self._expected_gdn_modules: list[Any] = [
-            mod for _name, mod in model.named_modules() if isinstance(mod, gdn_cls)
-        ]
+        # Record the GDN module instances in *forward-pass* traversal
+        # order so ``rollback`` can verify the captured forward pass
+        # visited them in the same order as the cache list. mlx's
+        # ``Module.named_modules`` walks the tree via a LIFO stack
+        # (``module_stack.pop()``) so list-typed children like
+        # ``model.layers`` get visited in reverse order — using its
+        # output directly produces a list that's the *reverse* of what
+        # the forward pass sees, and the identity ordering check fails
+        # for every hybrid model. Walk ``_get_layers(model)`` in
+        # natural index order instead and recurse into each layer to
+        # find its GDN submodule(s).
+        self._expected_gdn_modules: list[Any] = []
+        try:
+            ordered_layers = _get_layers(model)
+        except AttributeError:
+            ordered_layers = []
+        for layer in ordered_layers:
+            for _name, mod in layer.named_modules():
+                if isinstance(mod, gdn_cls):
+                    self._expected_gdn_modules.append(mod)
+        if not self._expected_gdn_modules:
+            # Fallback: a model with GDNs that aren't reachable from
+            # ``_get_layers`` (e.g. tied layers under a different
+            # attribute). Preserve the original behavior so the
+            # cardinality check still meaningfully fires downstream.
+            self._expected_gdn_modules = [
+                mod for _name, mod in model.named_modules() if isinstance(mod, gdn_cls)
+            ]
         self.conv_data: list[tuple[mx.array, int]] = []
         self._gdn_inputs: list[tuple[Any, ...]] = []
         # Parallel list of layer instances ``_capturing_gdn_call`` saw
@@ -580,7 +619,11 @@ class _GDNStateCapture:
         # cardinality check above doesn't catch reordering — without
         # this check, ``_gdn_inputs[j]`` could be silently applied to
         # the wrong cache slot.
-        if self._captured_modules != self._expected_gdn_modules:
+        if not _order_matches(self._captured_modules, self._expected_gdn_modules):
+            captured_ids = [id(m) for m in self._captured_modules]
+            expected_ids = [id(m) for m in self._expected_gdn_modules]
+            captured_only = [i for i in captured_ids if i not in expected_ids]
+            expected_only = [i for i in expected_ids if i not in captured_ids]
             raise RuntimeError(
                 "DFlash rollback ordering invariant violated: forward pass "
                 "visited GDN layers in a different order than "
@@ -588,7 +631,10 @@ class _GDNStateCapture:
                 "and would be applied to the wrong cache slots. This is "
                 "an olmlx bug — please report at "
                 "https://github.com/motsognirr/olmlx/issues with the model "
-                "name."
+                f"name. Diagnostic: captured={len(captured_ids)} "
+                f"expected={len(expected_ids)} "
+                f"captured_only={len(captured_only)} "
+                f"expected_only={len(expected_only)}."
             )
         # Ordering invariant: ``_gdn_inputs`` and ``conv_data`` are
         # populated in the order the verification forward pass invokes
