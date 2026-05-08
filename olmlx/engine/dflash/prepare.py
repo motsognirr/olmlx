@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import random
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -515,6 +516,23 @@ def prepare_dflash_draft(
             # Resolve the per-batch target signal: either freshly
             # computed (online) or read from disk (precomputed).
             if isinstance(batch, tuple):
+                # Tuple batches come from precomputed shards or a
+                # ``_batch_iterator`` test hook; neither carries logits,
+                # so distillation can't run. The
+                # ``use_precomputed``-aware guard at the top of
+                # ``prepare_dflash_draft`` rejects the production
+                # combination, but a test passing
+                # ``distill=True, _batch_iterator=tuples`` would
+                # otherwise silently degrade to CE-only without any
+                # KL signal — surface that here.
+                if distill:
+                    raise RuntimeError(
+                        "distill=True requires online target logits, but the "
+                        "current batch is a (input_ids, hidden) tuple (from "
+                        "precomputed shards or a tuple-yielding "
+                        "_batch_iterator). Pass raw input_ids batches or "
+                        "drop --distill."
+                    )
                 input_ids, target_hidden_full = batch
                 target_logits_full: mx.array | None = None
             else:
@@ -534,18 +552,19 @@ def prepare_dflash_draft(
             # Valid pivots: ``p ∈ [block_size, seq - block_size - 1]``
             # (inclusive). The targets slice is
             # ``input_ids[:, p+1 : p+1+block_size]`` so we need
-            # ``p + 1 + block_size <= seq``. ``mx.random.randint`` draws
-            # from a half-open interval, so ``hi = seq - block_size``
-            # makes the maximum valid pivot ``seq - block_size - 1``
-            # reachable.
+            # ``p + 1 + block_size <= seq``. We use Python's ``random``
+            # rather than ``mx.random.randint(...).item()`` because
+            # ``.item()`` forces a CPU/GPU sync that drains the lazy
+            # graph 2000+ times per run; pivot selection is just a
+            # uniform integer and doesn't need GPU randomness.
             lo = block_size
-            hi = seq - block_size
-            if hi <= lo:
+            hi_inclusive = seq - block_size - 1
+            if hi_inclusive < lo:
                 raise ValueError(
                     f"seq_len={seq} too small for block_size={block_size}; "
                     f"need at least 2*block_size + 1 tokens per sequence"
                 )
-            p = int(mx.random.randint(lo, hi, shape=()).item())
+            p = random.randint(lo, hi_inclusive)
 
             pending = input_ids[:, p : p + 1]  # (B, 1)
             mask_block = mx.full(

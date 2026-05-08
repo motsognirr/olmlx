@@ -223,8 +223,14 @@ class TestPrepareDflashDraft:
 
         # Seed for determinism; the synthetic-data + tiny-target setup
         # is noisy enough that an unseeded run occasionally fails to
-        # show monotone descent in 20 steps.
+        # show monotone descent in 20 steps. Both ``mx.random`` (data
+        # init) and Python ``random`` (pivot sampling — see
+        # ``prepare.py`` for why we don't use ``mx.random.randint``)
+        # need seeding.
+        import random as _stdlib_random
+
         mx.random.seed(0)
+        _stdlib_random.seed(0)
         vocab, hidden, num_layers = 64, 16, 4
         _write_target_config(tmp_path, vocab, hidden)
 
@@ -396,14 +402,17 @@ class TestPrepareDflashDraft:
         )
 
     def test_pivot_upper_bound_reaches_last_window(self, tmp_path, monkeypatch):
-        """Pivot sampling must call ``randint`` with ``hi = seq - block_size``.
+        """Pivot sampling must reach the last valid window position.
 
-        ``mx.random.randint(lo, hi)`` is exclusive on ``hi``; the
-        regression was ``hi = seq - block_size - 1``, which made the
+        The original regression was ``hi = seq - block_size - 1`` with
+        ``mx.random.randint`` (exclusive upper bound), which made the
         last valid window position ``seq - block_size - 1`` unreachable.
-        We assert the call site passes the corrected upper bound so a
-        future regression is caught even if no run happens to sample
-        the boundary value.
+        The pivot sampler now uses Python's ``random.randint`` (which
+        is *inclusive* on both ends) with ``hi_inclusive = seq -
+        block_size - 1``, so the last window position is reachable. We
+        assert the call site passes the corrected upper bound — catches
+        a future regression even if no run happens to sample the
+        boundary value.
         """
         from olmlx.engine.dflash import prepare as prepare_mod
         from olmlx.engine.dflash.prepare import prepare_dflash_draft
@@ -413,22 +422,16 @@ class TestPrepareDflashDraft:
         seq_len = 16
         _write_target_config(tmp_path, vocab, hidden)
 
-        original_randint = prepare_mod.mx.random.randint
+        original_randint = prepare_mod.random.randint
         pivot_calls: list[tuple[int, int]] = []
 
-        def recording_randint(lo, hi, *args, **kwargs):
-            # The pivot call passes scalar ints with ``shape=()``; other
-            # call sites in the dependency graph (data sampling, etc.)
-            # use array bounds. Filter to the scalar-int form.
-            if (
-                isinstance(lo, int)
-                and isinstance(hi, int)
-                and kwargs.get("shape") == ()
-            ):
-                pivot_calls.append((lo, hi))
-            return original_randint(lo, hi, *args, **kwargs)
+        def recording_randint(lo, hi):
+            # ``random.randint`` is only used by the pivot sampler in
+            # this module today — record every call.
+            pivot_calls.append((lo, hi))
+            return original_randint(lo, hi)
 
-        monkeypatch.setattr(prepare_mod.mx.random, "randint", recording_randint)
+        monkeypatch.setattr(prepare_mod.random, "randint", recording_randint)
 
         prepare_dflash_draft(
             tmp_path,
@@ -448,7 +451,10 @@ class TestPrepareDflashDraft:
         assert pivot_calls, "expected pivot randint call to be recorded"
         for lo, hi in pivot_calls:
             assert lo == block_size, f"pivot lo={lo}, expected {block_size}"
-            assert hi == seq_len - block_size, (
-                f"pivot hi={hi}, expected {seq_len - block_size} "
-                f"(seq_len - block_size, exclusive upper bound)"
+            # ``random.randint`` is inclusive on the upper bound, so we
+            # pass ``seq_len - block_size - 1`` (the last valid pivot).
+            assert hi == seq_len - block_size - 1, (
+                f"pivot hi={hi}, expected {seq_len - block_size - 1} "
+                "(last valid window position; random.randint is "
+                "inclusive on the upper bound)"
             )

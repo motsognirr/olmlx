@@ -2126,13 +2126,16 @@ def cmd_dflash_precompute(args):
     hidden_capture: list[Any] = [None] * len(layer_ids)
     _patch_model(target, layer_ids, hidden_capture)
     try:
+        # ``max_examples`` is intentionally omitted — ``num_shards``
+        # below is the load-bearing cap (it's also what writes the
+        # correct count into ``index.json``); a duplicate cap on the
+        # iterator side would just mask off-by-one issues.
         batches = stream_training_batches(
             tokenizer,
             dataset=args.data or "HuggingFaceH4/ultrachat_200k",
             split=args.split or "train_sft",
             batch_size=args.batch_size,
             seq_len=args.seq_len,
-            max_examples=args.shards,
         )
         precompute_target_hiddens(
             target,
