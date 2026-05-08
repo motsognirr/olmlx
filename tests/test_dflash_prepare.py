@@ -206,9 +206,9 @@ class TestDraftConfigDerivation:
         assert cfg.num_key_value_heads == 8
         assert cfg.vocab_size == 32000
         assert cfg.target_layer_ids == [5, 11, 17, 23]
-        # ``block_size`` on disk is the *total* upstream length:
-        # ``draft tokens + 1`` for the visible pending token.
-        assert cfg.block_size == 5
+        # ``block_size`` on disk is the draft-token count directly,
+        # matching #287's ``_load_dflash_decoder`` consumer.
+        assert cfg.block_size == 4
         assert cfg.mask_token_id == 0
 
 

@@ -167,9 +167,11 @@ def _build_draft_config(
     rope_theta = float(_get("rope_theta", 10000.0))
     max_position_embeddings = int(_get("max_position_embeddings", 4096))
 
-    # Stored on disk in the upstream wire format: ``block_size`` is the
-    # *total* block length (pending + drafts). The decoder converts back
-    # at load time via ``max(block_size - 1, 1)``.
+    # Stored on disk as the draft-token count directly (the same
+    # convention #287's ``_load_dflash_decoder`` consumes verbatim).
+    # If a future investigation confirms z-lab uses a different
+    # convention, both the writer here and the loader in model_manager
+    # would need to flip together.
     return DraftConfig(
         hidden_size=hidden_size,
         num_hidden_layers=num_hidden_layers,
@@ -181,7 +183,7 @@ def _build_draft_config(
         rms_norm_eps=rms_norm_eps,
         rope_theta=rope_theta,
         max_position_embeddings=max_position_embeddings,
-        block_size=block_size + 1,
+        block_size=block_size,
         num_target_layers=len(target_layer_ids),
         target_layer_ids=list(target_layer_ids),
         mask_token_id=mask_token_id,
