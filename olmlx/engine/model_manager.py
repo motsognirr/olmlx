@@ -1839,6 +1839,23 @@ class ModelManager:
             if spec_config.num_tokens is not None
             else draft_config.block_size
         )
+        # Going *above* the trained ``block_size`` runs the draft on
+        # block lengths it has never seen; the positional encoding and
+        # block-diffusion training are bound to the trained length.
+        # Warn (don't fail) — users may experiment.
+        if (
+            spec_config.num_tokens is not None
+            and spec_config.num_tokens > draft_config.block_size
+        ):
+            logger.warning(
+                "speculative_tokens=%d exceeds the draft's pre-trained "
+                "block_size=%d; output quality may degrade. Omit "
+                "speculative_tokens (or pass <= %d) to stay within the "
+                "trained block length.",
+                spec_config.num_tokens,
+                draft_config.block_size,
+                draft_config.block_size,
+            )
         return DFlashDecoder(
             target_model=target_model,
             draft_model=draft_model,

@@ -204,11 +204,12 @@ def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
         if isinstance(c, RotatingKVCache) and c.keys is not None:
             if not _HAS_ROTATING_KV_PRIVATES:
                 raise RuntimeError(
-                    "DFlash rollback for sliding-window draft caches relies "
-                    "on the private mlx-lm API ``RotatingKVCache._temporal_order`` "
-                    "/ ``._idx``. The installed mlx-lm version no longer "
-                    "exposes them — pin a compatible version or file an "
-                    "olmlx bug to update the private-API access pattern."
+                    "DFlash trims target or draft KV caches with rotating "
+                    "windows via the private mlx-lm API "
+                    "``RotatingKVCache._temporal_order`` / ``._idx``. The "
+                    "installed mlx-lm version no longer exposes them — pin "
+                    "a compatible version or file an olmlx bug to update "
+                    "the private-API access pattern."
                 )
             # When the cache has been in rotating mode (``offset > max_size``),
             # the underlying buffer holds at most ``max_size`` entries even
@@ -685,6 +686,26 @@ class DFlashDecoder:
         self._stats_proposed = 0
         self._stats_accepted_draft = 0
 
+    def __del__(self) -> None:
+        # Without this finalizer, a decoder dropped without explicit
+        # ``reset()`` (e.g. cancelled request, exception unwinding past
+        # the streaming pipeline's cleanup) would leak the GDN patch
+        # and ``_GDN_PATCH_LOCK`` indefinitely. Reason: the patched
+        # ``gdn_cls.__call__`` closure holds a strong reference to the
+        # ``_GDNStateCapture`` instance through ``capture = self``. That
+        # external class-level reference can't be broken by Python's
+        # cyclic GC, so ``_GDNStateCapture.__del__`` never fires on its
+        # own. Calling ``reset()`` here invokes ``_capture.close()``,
+        # which restores the original ``__call__`` and breaks the
+        # reference. ``DFlashDecoder`` itself has no cycle preventing
+        # its own ``__del__`` from running.
+        try:
+            self.reset()
+        except Exception:
+            # Finalizers must never raise — interpreter may already be
+            # tearing down at this point.
+            pass
+
     def stats_summary(self) -> dict[str, Any]:
         steps = self._stats_steps
         proposed = self._stats_proposed
@@ -763,10 +784,16 @@ class DFlashDecoder:
 
     def step(self) -> tuple[list[int], int]:
         """One block-diffusion speculative step."""
-        assert self._target_cache is not None, "Call prefill() before step()"
-        assert self._draft_cache is not None, "Call prefill() before step()"
-        assert self._pending_token is not None, "Call prefill() before step()"
-        assert self._hidden is not None, "Call prefill() before step()"
+        # ``raise`` rather than ``assert`` — these are API-contract
+        # guards, not debug checks, and ``assert`` is stripped under
+        # ``python -O``.
+        if (
+            self._target_cache is None
+            or self._draft_cache is None
+            or self._pending_token is None
+            or self._hidden is None
+        ):
+            raise RuntimeError("Call prefill() before step()")
 
         pending = self._pending_token
         bs_total = self._block_size + 1  # block length including pending token
@@ -860,7 +887,15 @@ class DFlashDecoder:
             if self._target_can_trim:
                 _trim_recent_cache(self._target_cache, trim)
             else:
-                assert self._capture is not None
+                # Same control-flow invariant as the prefill setup
+                # (``_target_can_trim is False`` ⇒ ``_capture`` was
+                # created), but use a hard error since ``assert`` is
+                # stripped under ``python -O``.
+                if self._capture is None:
+                    raise RuntimeError(
+                        "DFlash internal invariant violated: target cache "
+                        "is non-trimmable but no GDN capture was installed."
+                    )
                 self._capture.rollback(self._target_cache, accepted_drafts, trim)
 
         # 5. Slice hidden state to the accepted prefix; this becomes the

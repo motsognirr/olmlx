@@ -314,6 +314,20 @@ def _surface_legacy_dflash_env() -> None:
                 _settings.speculative_strategy = "dflash"
             except Exception as exc:
                 logger.warning("Could not forward legacy DFlash settings: %s", exc)
+        elif _settings.speculative and _settings.speculative_strategy != "dflash":
+            # Both ``OLMLX_EXPERIMENTAL_SPECULATIVE=true`` and
+            # ``OLMLX_EXPERIMENTAL_DFLASH=true`` were set; the former
+            # already forwarded into classic speculative. Surface the
+            # conflict so the operator knows their DFlash flag was
+            # dropped (the deprecation banner alone doesn't say which
+            # of the two won).
+            logger.warning(
+                "Conflicting legacy flags: OLMLX_EXPERIMENTAL_SPECULATIVE "
+                "(forwarded to classic speculative) takes precedence over "
+                "OLMLX_EXPERIMENTAL_DFLASH. The DFlash strategy was NOT "
+                "applied. Set OLMLX_SPECULATIVE_STRATEGY=dflash explicitly "
+                "if DFlash is what you want."
+            )
     if legacy_draft and not os.environ.get("OLMLX_SPECULATIVE_DRAFT_MODEL"):
         try:
             _settings.speculative_draft_model = legacy_draft
