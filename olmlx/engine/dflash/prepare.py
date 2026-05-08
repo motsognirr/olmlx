@@ -524,18 +524,20 @@ def prepare_dflash_draft(
     # Caller-owned hidden-state storage passed into both the patch and
     # ``_capture_target_outputs`` — keeps captured ``mx.array``s out of
     # ``target.parameters()`` (mlx tracks ``list``-typed attributes as
-    # parameters once they hold arrays). Installed *after* batch-iterator
+    # parameters once they hold arrays). Allocated *after* batch-iterator
     # setup so an exception there (e.g. ``read_precomputed_index``
     # raising on a missing shard directory) cannot leave the target
-    # permanently patched — a subsequent call would then double-wrap
-    # the layers and corrupt the captures.
+    # permanently patched.
     hidden_capture: list[Any] = [None] * len(layer_ids)
-    _patch_model(target, layer_ids, hidden_capture)
 
     losses: list[float] = []
     try:
-        # Bind the draft inside the try so ``unbind()`` below runs even
-        # if the bind itself or the first training step raises.
+        # ``_patch_model`` is the *first* statement inside the try so a
+        # partial-hook-install failure (e.g. on an unexpected layer
+        # structure) still triggers ``_unpatch_model`` in the finally
+        # block. Bind the draft inside the try too so ``unbind()`` runs
+        # even if the bind itself or the first training step raises.
+        _patch_model(target, layer_ids, hidden_capture)
         draft.bind(target)
         for step, batch in enumerate(batches):
             if step >= steps:
