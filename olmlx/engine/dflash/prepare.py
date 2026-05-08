@@ -350,6 +350,12 @@ def prepare_dflash_draft(
         # optimizer sees zeros every step — silently producing a
         # worthless checkpoint after the full ``--steps`` run.
         raise ValueError(f"block_size must be >= 1, got {block_size}")
+    if steps < 1:
+        # ``steps == 0`` means the training loop's ``if step >= steps:
+        # break`` fires immediately on the first iteration; the function
+        # then falls through to the checkpoint-save block and writes a
+        # random-initialized draft as if it had been trained. Reject.
+        raise ValueError(f"steps must be >= 1, got {steps}")
     model_path = Path(model_path)
     target_cfg = _read_target_config(model_path)
 
