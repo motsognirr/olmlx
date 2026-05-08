@@ -325,6 +325,37 @@ class TestDraftConfigDerivation:
         assert cfg.hidden_size == 2048
         assert cfg.vocab_size == 248320
 
+    def test_rope_parameters_falls_back_to_top_level_for_vlm(self):
+        """Symmetric to ``rope_scaling``: a VLM that carries
+        ``rope_parameters`` at the *top level* of ``config.json``
+        (without mirroring it inside ``text_config``) must still be
+        discoverable. Otherwise the lookup falls through to the
+        legacy 10000.0 default — three orders of magnitude wrong for
+        long-context targets — silently producing a misconfigured
+        draft.
+        """
+        from olmlx.engine.dflash.prepare import _build_draft_config
+
+        target_cfg = {
+            "model_type": "future_vlm",
+            "rope_parameters": {"rope_type": "default", "rope_theta": 10000000},
+            "text_config": {
+                "vocab_size": 32000,
+                "hidden_size": 4096,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+            },
+        }
+        cfg = _build_draft_config(
+            target_cfg,
+            target_layer_ids=[0],
+            num_hidden_layers=1,
+            block_size=4,
+            mask_token_id=0,
+        )
+        assert cfg.rope_theta == 10000000.0
+
     def test_rope_scaling_falls_back_to_top_level_for_vlm(self):
         """``rope_scaling`` regression guard. After ``_build_draft_config``
         was switched to read everything from ``text_config`` for VLMs,

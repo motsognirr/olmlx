@@ -223,7 +223,11 @@ def _build_draft_config(
     # silent fallback would produce a draft whose RoPE frequencies are
     # incompatible with the positions the target was trained on. Prefer the
     # flat field when present; otherwise descend.
-    rope_params = text_cfg.get("rope_parameters")
+    # Fall back to the top-level when ``rope_parameters`` isn't mirrored
+    # inside ``text_config`` (parallel to the ``rope_scaling`` fallback
+    # below). ``or`` is safe because ``rope_parameters`` is a dict —
+    # falsy only when ``None`` or ``{}``.
+    rope_params = text_cfg.get("rope_parameters") or target_cfg.get("rope_parameters")
     if text_cfg.get("rope_theta") is not None:
         rope_theta = float(text_cfg["rope_theta"])
     elif isinstance(rope_params, dict) and rope_params.get("rope_theta") is not None:
