@@ -362,3 +362,93 @@ class TestPrepareDflashDraft:
                 "training run that raised — _unpatch_model must run in the "
                 "exception path"
             )
+
+    def test_min_seq_len_runs(self, tmp_path):
+        """``seq_len == 2*block_size + 1`` must not trip the pivot guard.
+
+        Regression test for the off-by-one fixed in this PR: with
+        ``hi = seq - block_size`` the guard ``hi <= lo`` triggers only
+        when ``seq <= 2*block_size``, so the minimum runnable sequence
+        length drops to ``2*block_size + 1``. If a future change
+        restores the old ``hi = seq - block_size - 1``, this test fails
+        with ``ValueError: seq_len=... too small``.
+        """
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        vocab, hidden, num_layers = 64, 16, 4
+        block_size = 2
+        seq_len = 2 * block_size + 1  # 5
+        _write_target_config(tmp_path, vocab, hidden)
+
+        prepare_dflash_draft(
+            tmp_path,
+            steps=3,
+            batch_size=2,
+            seq_len=seq_len,
+            block_size=block_size,
+            num_hidden_layers=1,
+            num_target_layers=2,
+            output_dir=tmp_path / "dflash_out",
+            _target_loader=_mock_target_loader(vocab, hidden, num_layers),
+            _batch_iterator=_synthetic_batches(
+                vocab, batch_size=2, seq_len=seq_len, n=3
+            ),
+        )
+
+    def test_pivot_upper_bound_reaches_last_window(self, tmp_path, monkeypatch):
+        """Pivot sampling must call ``randint`` with ``hi = seq - block_size``.
+
+        ``mx.random.randint(lo, hi)`` is exclusive on ``hi``; the
+        regression was ``hi = seq - block_size - 1``, which made the
+        last valid window position ``seq - block_size - 1`` unreachable.
+        We assert the call site passes the corrected upper bound so a
+        future regression is caught even if no run happens to sample
+        the boundary value.
+        """
+        from olmlx.engine.dflash import prepare as prepare_mod
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        vocab, hidden, num_layers = 64, 16, 4
+        block_size = 2
+        seq_len = 16
+        _write_target_config(tmp_path, vocab, hidden)
+
+        original_randint = prepare_mod.mx.random.randint
+        pivot_calls: list[tuple[int, int]] = []
+
+        def recording_randint(lo, hi, *args, **kwargs):
+            # The pivot call passes scalar ints with ``shape=()``; other
+            # call sites in the dependency graph (data sampling, etc.)
+            # use array bounds. Filter to the scalar-int form.
+            if (
+                isinstance(lo, int)
+                and isinstance(hi, int)
+                and kwargs.get("shape") == ()
+            ):
+                pivot_calls.append((lo, hi))
+            return original_randint(lo, hi, *args, **kwargs)
+
+        monkeypatch.setattr(prepare_mod.mx.random, "randint", recording_randint)
+
+        prepare_dflash_draft(
+            tmp_path,
+            steps=3,
+            batch_size=2,
+            seq_len=seq_len,
+            block_size=block_size,
+            num_hidden_layers=1,
+            num_target_layers=2,
+            output_dir=tmp_path / "dflash_out",
+            _target_loader=_mock_target_loader(vocab, hidden, num_layers),
+            _batch_iterator=_synthetic_batches(
+                vocab, batch_size=2, seq_len=seq_len, n=3
+            ),
+        )
+
+        assert pivot_calls, "expected pivot randint call to be recorded"
+        for lo, hi in pivot_calls:
+            assert lo == block_size, f"pivot lo={lo}, expected {block_size}"
+            assert hi == seq_len - block_size, (
+                f"pivot hi={hi}, expected {seq_len - block_size} "
+                f"(seq_len - block_size, exclusive upper bound)"
+            )
