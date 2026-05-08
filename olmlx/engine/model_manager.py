@@ -1303,6 +1303,13 @@ class ModelManager:
                     # resolves via top-level model_type and handles these
                     # configs successfully.
                     mapped_top = LM_REMAP.get(model_type, model_type)
+                    # Resolve module-availability once for both the
+                    # fallback condition and the primary check below to
+                    # avoid duplicate ``find_spec`` import-system walks.
+                    mapped_lm_present = (
+                        importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}")
+                        is not None
+                    )
                     # Belt-and-suspenders: re-assert the
                     # ``linear_attention`` discriminant from the outer
                     # guard so the warning's "hybrid linear-attention"
@@ -1312,7 +1319,7 @@ class ModelManager:
                     # full-attention VLM with a missing ``_text``-
                     # suffixed inner type to mlx-lm and lose vision.
                     if (
-                        importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}") is None
+                        not mapped_lm_present
                         and mapped_top != mapped_lm
                         and importlib.util.find_spec(f"mlx_lm.models.{mapped_top}")
                         is not None
@@ -1333,10 +1340,7 @@ class ModelManager:
                             text_model_type,
                         )
                         return "text"
-                    if (
-                        importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}")
-                        is not None
-                    ):
+                    if mapped_lm_present:
                         # WARNING because vision capability is permanently
                         # lost for this model load — image inputs would
                         # produce confusing errors with no other signal.
