@@ -90,9 +90,15 @@ def _text_config(target_cfg: dict[str, Any]) -> dict[str, Any]:
     cross-modal metadata (``vision_config``, image/video token ids, etc.). The
     DFlash draft only models text, so it should consume the nested block when
     present and fall through to the flat config otherwise.
+
+    Defensive against unrelated ``text_config`` shapes: descend only when the
+    nested block actually carries text-tower fields (``hidden_size`` is the
+    canonical marker). A non-VLM model that happens to use the
+    ``text_config`` key for an unrelated purpose would otherwise regress
+    from a working flat lookup to a ``KeyError`` on the descent.
     """
     nested = target_cfg.get("text_config")
-    if isinstance(nested, dict):
+    if isinstance(nested, dict) and "hidden_size" in nested:
         return nested
     return target_cfg
 
@@ -245,8 +251,7 @@ def _build_draft_config(
             "No 'rope_theta' found at the top level or under "
             "'rope_parameters' in the target config — falling back to "
             "10000.0. Long-context targets (Qwen3.5+, Qwen3.6) typically "
-            "use ~10_000_000; verify the target's config.json or pass "
-            "the correct value explicitly."
+            "use ~10_000_000; verify the target's config.json."
         )
     max_position_embeddings = int(_get("max_position_embeddings", 4096))
 
@@ -611,6 +616,16 @@ def prepare_dflash_draft(
     # can no longer reach ``_draft_loss`` via the trained path; the
     # mask is defensive belt-and-suspenders for genuine pad tokens
     # only.
+    #
+    # **Qwen3.x aliasing**: ``tokenizer.pad_token_id`` is sometimes set
+    # to the *same value* as ``eos_token_id`` (e.g. Qwen3.x's
+    # ``<|endoftext|>`` for both). Using that shared id as
+    # ``pad_for_loss`` masks every mid-stream EOS turn separator —
+    # exactly the failure mode the comment above warns about. Disable
+    # the loss-mask (set to ``None``) when the two ids collide so the
+    # loss falls through to the unmasked mean reduction. The
+    # ``pad_for_pivot`` value still uses the loader's actual pad token
+    # so trailing-pad detection works.
     _tok_pad = getattr(tokenizer, "pad_token_id", None)
     _tok_eos = getattr(tokenizer, "eos_token_id", None)
     pad_for_pivot: int | None
@@ -620,7 +635,14 @@ def prepare_dflash_draft(
         pad_for_pivot = int(_tok_eos)
     else:
         pad_for_pivot = None
-    pad_for_loss: int | None = int(_tok_pad) if _tok_pad is not None else None
+    pad_for_loss: int | None = (
+        int(_tok_pad)
+        if (
+            _tok_pad is not None
+            and (_tok_eos is None or int(_tok_pad) != int(_tok_eos))
+        )
+        else None
+    )
 
     if mask_token_id is None:
         # ``or`` would short-circuit on token ID 0 (a valid pad id for
@@ -806,15 +828,14 @@ def prepare_dflash_draft(
         # ``steps`` so a few rough patches don't trigger a false
         # positive on a real run.
         consecutive_skips = 0
-        # Cap consecutive skips at ``2 * steps`` (with a 500 floor for
-        # short runs). Each skipped batch costs one CPU sync via
-        # ``_select_pivot``'s ``min().item()``, so large multipliers
-        # turn a degenerate dataset into a multi-second stall before
-        # the error fires. ``2 * steps`` still covers a comfortable
-        # buffer against legitimate short-sequence patches in normal
-        # training while keeping misconfigured-dataset runs failing
-        # within a couple of seconds.
-        max_consecutive_skips = max(steps * 2, 500)
+        # Cap consecutive skips at ``2 * steps + 50`` so the guard
+        # scales tightly with the requested budget while preserving a
+        # small absolute floor for very short runs (test fixtures with
+        # ``steps=20`` shouldn't need 500 forced syncs to fail).
+        # Each skipped batch costs one CPU sync via ``_select_pivot``'s
+        # ``min().item()``, so a large multiplier turns a degenerate
+        # dataset into a multi-second stall before the error fires.
+        max_consecutive_skips = steps * 2 + 50
         for batch in batches:
             if real_step >= steps:
                 break

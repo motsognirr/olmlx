@@ -569,6 +569,96 @@ class TestDraftLossPadMasking:
         )
         assert float(loss) == 0.0
 
+    def test_pad_for_loss_disabled_when_pad_aliases_eos(self, tmp_path):
+        """Qwen3.x tokenizers set ``pad_token_id == eos_token_id ==
+        151643``. Until now ``pad_for_loss = int(_tok_pad)`` flowed
+        that value into ``_draft_loss``, where ``valid = (targets !=
+        pad_token_id)`` zero-weighted every mid-stream EOS marker —
+        not just trailing pad. In multi-turn instruction-tuning data
+        each turn ends with EOS, so the draft would receive zero
+        gradient at turn boundaries and never learn to predict them.
+
+        The fix: if the tokenizer's pad_token_id is the same value as
+        eos_token_id, set ``pad_for_loss = None`` so ``_draft_loss``
+        skips the mask entirely. ``_select_pivot`` (which uses
+        ``pad_for_pivot``) already keeps the targets inside the
+        unpadded prefix, so trailing-pad windows can't reach the loss
+        and the mask is redundant.
+        """
+        from olmlx.engine.dflash import prepare as prepare_mod
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        vocab, hidden, num_layers = 64, 16, 4
+        _write_target_config(tmp_path, vocab, hidden)
+
+        # Tokenizer with pad == eos (the Qwen3.x default).
+        class _Qwen3xTokenizer(_MockTokenizer):
+            pad_token_id = 7
+            eos_token_id = 7
+
+        # Capture every ``pad_token_id`` argument fed into
+        # ``_draft_loss``.
+        original_loss = prepare_mod._draft_loss
+        seen_pad_token_ids: list[int | None] = []
+
+        def recording_loss(*args, **kwargs):
+            seen_pad_token_ids.append(kwargs.get("pad_token_id"))
+            return original_loss(*args, **kwargs)
+
+        target = _Target(vocab, hidden, num_layers)
+        tokenizer = _Qwen3xTokenizer(vocab_size=vocab, seq_len=64)
+
+        prepare_dflash_draft(
+            tmp_path,
+            steps=1,
+            batch_size=2,
+            seq_len=32,
+            block_size=2,
+            num_hidden_layers=1,
+            num_target_layers=2,
+            lr=1e-2,
+            output_dir=tmp_path / "dflash_out",
+            _target_loader=lambda _path: (target, tokenizer),
+            _batch_iterator=_synthetic_batches(vocab, batch_size=2, seq_len=32, n=3),
+        )
+        # Patch happens after the loader, so recording_loss may not be
+        # in scope. Verify via the resolved variable in the prepare
+        # module instead — re-import and inspect the closure that
+        # built the step. Simpler: re-run with monkeypatching the loss.
+        # Since the above run already completed, do a second invocation
+        # with the monkeypatch in place to capture the kwarg.
+        seen_pad_token_ids.clear()
+        prepare_mod._draft_loss = recording_loss  # type: ignore[assignment]
+        try:
+            prepare_dflash_draft(
+                tmp_path,
+                steps=1,
+                batch_size=2,
+                seq_len=32,
+                block_size=2,
+                num_hidden_layers=1,
+                num_target_layers=2,
+                lr=1e-2,
+                output_dir=tmp_path / "dflash_out2",
+                _target_loader=lambda _path: (
+                    _Target(vocab, hidden, num_layers),
+                    tokenizer,
+                ),
+                _batch_iterator=_synthetic_batches(
+                    vocab, batch_size=2, seq_len=32, n=3
+                ),
+            )
+        finally:
+            prepare_mod._draft_loss = original_loss  # type: ignore[assignment]
+        # When pad == eos, ``pad_for_loss`` must be None so the loss
+        # falls through to the unmasked mean reduction.
+        assert seen_pad_token_ids, "expected at least one _draft_loss call"
+        for pid in seen_pad_token_ids:
+            assert pid is None, (
+                f"pad_for_loss = {pid} when pad_token_id == eos_token_id; "
+                "must be None to avoid zero-weighting mid-stream EOS markers"
+            )
+
     def test_kl_distillation_with_mixed_targets_masks_pad_positions(self):
         # Distillation path with one real position and two pad
         # positions. The KL contribution from the pad positions must be
