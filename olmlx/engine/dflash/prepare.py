@@ -487,6 +487,18 @@ def prepare_dflash_draft(
                 f"concat_hidden_size: shard={meta['concat_hidden_size']} expected="
                 f"{expected_concat_hidden} (num_target_layers * target hidden_size)"
             )
+        # Two precompute runs with the same *number* of target layers
+        # but different *indices* both produce identical
+        # ``concat_hidden_size`` values, so the shape check above can't
+        # tell them apart. Compare ``target_layer_ids`` exactly to
+        # surface the mismatch — without this the draft would silently
+        # consume hiddens from the wrong layers and only show degraded
+        # acceptance rates at inference time.
+        shard_layer_ids = list(meta.get("target_layer_ids", []))
+        if shard_layer_ids != list(layer_ids):
+            mismatches.append(
+                f"target_layer_ids: shard={shard_layer_ids} requested={list(layer_ids)}"
+            )
         if mismatches:
             raise ValueError(
                 "Precompute shard shape does not match current training config: "

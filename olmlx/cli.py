@@ -2142,6 +2142,7 @@ def cmd_dflash_precompute(args):
             batches,
             output_dir,
             hidden_capture,
+            target_layer_ids=layer_ids,
             num_shards=args.shards,
             progress_callback=_flash_progress,
         )

@@ -58,6 +58,7 @@ def precompute_target_hiddens(
     output_dir: str | Path,
     storage: list[Any],
     *,
+    target_layer_ids: list[int],
     num_shards: int | None = None,
     progress_callback: Any = None,
 ) -> Path:
@@ -152,13 +153,26 @@ def precompute_target_hiddens(
         # in ``config.json``. This value is
         # ``num_target_layers * model_hidden_size``.
         "concat_hidden_size": hidden_size,
+        # The exact layer indices that produced the captures.
+        # ``concat_hidden_size`` alone can't tell two runs with the
+        # same *count* but different *indices* apart (e.g.
+        # ``[6,12,19,25]`` vs ``[1,2,3,4]`` both yield ``4 *
+        # model_hidden_size``); without this key the training loop
+        # would silently consume hiddens from the wrong layers.
+        "target_layer_ids": list(target_layer_ids),
     }
     (output_dir / INDEX_FILENAME).write_text(json.dumps(index, indent=2))
     logger.info("Wrote %d precomputed shards to %s", written, output_dir)
     return output_dir
 
 
-_REQUIRED_INDEX_KEYS = ("num_shards", "batch_size", "seq_len", "concat_hidden_size")
+_REQUIRED_INDEX_KEYS = (
+    "num_shards",
+    "batch_size",
+    "seq_len",
+    "concat_hidden_size",
+    "target_layer_ids",
+)
 
 
 def read_precomputed_index(shard_dir: str | Path) -> dict[str, Any]:

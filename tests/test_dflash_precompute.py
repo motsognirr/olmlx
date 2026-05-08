@@ -38,7 +38,12 @@ class TestPrecomputeWriter:
         try:
             batches = _synthetic_batches(vocab=64, batch_size=2, seq_len=32, n=4)
             out = precompute_target_hiddens(
-                target, batches, tmp_path / "cache", storage, num_shards=4
+                target,
+                batches,
+                tmp_path / "cache",
+                storage,
+                target_layer_ids=layer_ids,
+                num_shards=4,
             )
         finally:
             _unpatch_model(target)
@@ -53,6 +58,10 @@ class TestPrecomputeWriter:
         # 2 target layers * model hidden_size 16 = concat 32 (this is
         # the on-disk concatenated dim, not the per-layer model dim).
         assert index["concat_hidden_size"] == 32
+        # Exact indices stored so the training-time validation can
+        # distinguish two precompute runs with the same *count* but
+        # different *layers*.
+        assert index["target_layer_ids"] == [1, 3]
 
     def test_caps_at_num_shards(self, tmp_path):
         target = _Target(vocab_size=64, hidden_size=16, num_layers=2)
@@ -63,7 +72,12 @@ class TestPrecomputeWriter:
             # Iterator yields 10 but cap at 3.
             batches = _synthetic_batches(vocab=64, batch_size=2, seq_len=32, n=10)
             precompute_target_hiddens(
-                target, batches, tmp_path / "cache", storage, num_shards=3
+                target,
+                batches,
+                tmp_path / "cache",
+                storage,
+                target_layer_ids=layer_ids,
+                num_shards=3,
             )
         finally:
             _unpatch_model(target)
@@ -84,7 +98,12 @@ class TestPrecomputeReader:
         try:
             batches = _synthetic_batches(vocab=64, batch_size=2, seq_len=32, n=2)
             precompute_target_hiddens(
-                target, batches, tmp_path / "cache", storage, num_shards=2
+                target,
+                batches,
+                tmp_path / "cache",
+                storage,
+                target_layer_ids=layer_ids,
+                num_shards=2,
             )
         finally:
             _unpatch_model(target)
@@ -135,7 +154,12 @@ class TestPrepareWithPrecomputed:
         try:
             batches = _synthetic_batches(vocab=vocab, batch_size=2, seq_len=32, n=8)
             shard_dir = precompute_target_hiddens(
-                target, batches, tmp_path / "cache", storage, num_shards=8
+                target,
+                batches,
+                tmp_path / "cache",
+                storage,
+                target_layer_ids=layer_ids,
+                num_shards=8,
             )
         finally:
             _unpatch_model(target)
