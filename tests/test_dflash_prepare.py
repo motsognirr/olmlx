@@ -537,6 +537,75 @@ class TestDraftLossPadMasking:
         # plus two ~20s averaged).
         assert float(loss) < 1e-3
 
+    def test_kl_distillation_with_all_pad_targets_yields_zero_loss(self):
+        # Distillation path with every target marked as pad. Both the CE
+        # and KL terms must zero-weight all positions, so the combined
+        # loss is exactly 0.0 — even though a non-zero KL would
+        # otherwise dominate via the (1 - alpha) * CE + alpha * T^2 *
+        # KL mix.
+        from olmlx.engine.dflash.prepare import _draft_loss
+
+        vocab = 8
+        # Logits sharply favor id=1 in both draft and target — CE is
+        # tiny but non-zero in absolute terms; without masking, the KL
+        # term contributes the dominant share of any apparent loss.
+        draft_logits = _logits_with_target_at_index(1, 3, vocab, target_id=1, peak=20.0)
+        # Target softmax peaks at id=2 — disagrees with draft, so an
+        # unmasked KL would be very large.
+        target_logits = _logits_with_target_at_index(
+            1, 3, vocab, target_id=2, peak=20.0
+        )
+        targets = mx.array([[5, 5, 5]])  # all pad
+        loss = _draft_loss(
+            _FakeDraft(draft_logits),
+            block_input=mx.zeros((1, 4), dtype=mx.int32),
+            target_hidden=mx.zeros((1, 1, 1)),
+            targets=targets,
+            cache=[],
+            target_logits_window=target_logits,
+            distill_alpha=0.5,
+            distill_temp=2.0,
+            pad_token_id=5,
+        )
+        assert float(loss) == 0.0
+
+    def test_kl_distillation_with_mixed_targets_masks_pad_positions(self):
+        # Distillation path with one real position and two pad
+        # positions. The KL contribution from the pad positions must be
+        # zero-weighted; only the real position contributes to either
+        # term. With ``alpha = 0.5`` and ``T = 1.0``, ``T^2 == 1`` so
+        # the loss is ``0.5 * CE_real + 0.5 * KL_real``. Both pieces
+        # individually approach zero when draft and target both peak at
+        # the real target id.
+        from olmlx.engine.dflash.prepare import _draft_loss
+
+        vocab = 8
+        # Both draft and target sharply favor id=1 at every position.
+        # At the real position (target=1) the predictions agree → both
+        # CE and KL ≈ 0.  At the pad positions (target=5) draft+target
+        # still agree; an unmasked CE would be huge (~20) while KL
+        # would be ~0. Masking must suppress the CE explosion.
+        draft_logits = _logits_with_target_at_index(1, 3, vocab, target_id=1, peak=20.0)
+        target_logits = _logits_with_target_at_index(
+            1, 3, vocab, target_id=1, peak=20.0
+        )
+        targets = mx.array([[1, 5, 5]])
+        loss = _draft_loss(
+            _FakeDraft(draft_logits),
+            block_input=mx.zeros((1, 4), dtype=mx.int32),
+            target_hidden=mx.zeros((1, 1, 1)),
+            targets=targets,
+            cache=[],
+            target_logits_window=target_logits,
+            distill_alpha=0.5,
+            distill_temp=1.0,
+            pad_token_id=5,
+        )
+        # If masking works, only the agreeing position 0 contributes;
+        # both CE and KL → 0. Without masking, CE would be ~13.3
+        # (one near-zero + two ~20s averaged).
+        assert float(loss) < 1e-3
+
 
 class TestPivotSelection:
     """The pivot must land inside the unpadded prefix shared by all batch
