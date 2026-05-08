@@ -430,8 +430,16 @@ class DFlashDraftModel(nn.Module):
                 "DFlashDraftModel.bind(target_model) must be called before "
                 "running the draft"
             )
-        assert self.embed_tokens is not None
-        assert self.lm_head is not None
+        # Hard guards rather than ``assert`` — ``assert`` is stripped
+        # under ``python -O``, and the closely-related ``_bound`` check
+        # above is a ``raise`` for the same reason. ``_bound`` should
+        # imply both attributes are set, but we surface a loud error
+        # anyway in case of programmatic misuse.
+        if self.embed_tokens is None or self.lm_head is None:
+            raise RuntimeError(
+                "DFlashDraftModel ``_bound`` is True but ``embed_tokens`` / "
+                "``lm_head`` are unset; bind() invariant violated."
+            )
         h = self.embed_tokens(inputs) * self.embed_scale
         h_ctx = self.hidden_norm(self.fc(target_hidden))
         for layer, layer_cache in zip(self.layers, cache, strict=True):

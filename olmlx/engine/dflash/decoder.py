@@ -218,20 +218,24 @@ def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
                     "a compatible version or file an olmlx bug to update "
                     "the private-API access pattern."
                 )
-            # When the cache has been in rotating mode (``offset > max_size``),
-            # the underlying buffer holds at most ``max_size`` entries even
-            # though ``offset`` is larger. Trimming requires us to drop back
-            # to non-rotating mode with a consistent ``offset == _idx ==
-            # keys.shape[2]``; otherwise ``update_and_fetch`` would write at
-            # a stale ``_idx`` into a buffer it believes is full and corrupt
-            # the KV state.
+            # ``cache.offset`` is the *absolute* token counter mlx-lm
+            # passes to RoPE as the next-write base position — not the
+            # buffer size. A previous version set ``c.offset =
+            # actual_stored - n``, which threw away the absolute count
+            # and applied wrong RoPE positions to all subsequent
+            # writes for sliding-window targets that had already
+            # rotated. Decrementing ``c.offset`` by exactly ``n``
+            # preserves the absolute-position semantic. ``c._idx`` is
+            # the in-buffer write pointer; setting it to the new buffer
+            # length leaves ``update_and_fetch`` to grow / rotate the
+            # buffer normally on the next write.
             actual_stored = min(c.offset, c.keys.shape[2])
             n = min(n, actual_stored)
             c.keys = c._temporal_order(c.keys)
             c.values = c._temporal_order(c.values)
             c.keys = c.keys[..., :-n, :]
             c.values = c.values[..., :-n, :]
-            c.offset = actual_stored - n
+            c.offset = c.offset - n
             c._idx = c.keys.shape[2]
         elif hasattr(c, "trim"):
             c.trim(n)
