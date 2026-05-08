@@ -363,8 +363,11 @@ def _draft_loss(
     draft_log_probs_t = nn.log_softmax(draft_logits / t, axis=-1)
     kl = mx.sum(target_probs * (target_log_probs - draft_log_probs_t), axis=-1)
     if valid is not None:
-        denom_kl = mx.maximum(valid.sum(), mx.array(1.0, dtype=kl.dtype))
-        kl_loss = (kl * valid).sum() / denom_kl * (t * t)
+        # ``denom`` was computed in the CE branch above; reuse it instead of
+        # re-running ``valid.sum()`` and the maximum-with-1.0 floor a second
+        # time. The two ``valid.sum()`` calls produce the same value, only
+        # differing in dtype, so an ``astype`` cast is sufficient.
+        kl_loss = (kl * valid).sum() / denom.astype(kl.dtype) * (t * t)
     else:
         kl_loss = mx.mean(kl) * (t * t)
 
@@ -693,11 +696,20 @@ def prepare_dflash_draft(
         # even if the bind itself or the first training step raises.
         _patch_model(target, layer_ids, hidden_capture)
         draft.bind(target)
-        for step, batch in enumerate(batches):
-            if step >= steps:
+        # ``step`` from ``enumerate(batches)`` advances on *every* iteration,
+        # including the ones we ``continue`` past via ``_select_pivot is None``.
+        # Track real (non-skipped) gradient steps separately so the LR schedule,
+        # progress-bar fraction, log-every cadence, and termination condition
+        # reflect actual training progress rather than batch iteration count.
+        # Without this counter, skipped pad-only batches silently retire slots
+        # of the operator's ``steps`` budget and produce an under-trained
+        # checkpoint.
+        real_step = 0
+        for batch in batches:
+            if real_step >= steps:
                 break
 
-            optimizer.learning_rate = _cosine_lr(step, steps, lr, warmup)
+            optimizer.learning_rate = _cosine_lr(real_step, steps, lr, warmup)
 
             # Resolve the per-batch target signal: either freshly
             # computed (online) or read from disk (precomputed).
@@ -768,9 +780,9 @@ def prepare_dflash_draft(
                     # all-pad target — the next batch will most likely
                     # be longer.
                     logger.debug(
-                        "step %d: skipping all-padding batch (no row has "
-                        "%d+ real tokens)",
-                        step + 1,
+                        "skipping all-padding batch before real step %d "
+                        "(no row has %d+ real tokens)",
+                        real_step + 1,
                         2 * block_size + 1,
                     )
                     continue
@@ -803,12 +815,13 @@ def prepare_dflash_draft(
             )
             mx.eval(loss, draft.parameters(), optimizer.state)
             losses.append(float(loss.item()))
+            real_step += 1
 
-            if (step + 1) % log_every == 0 or step == 0:
+            if real_step % log_every == 0 or real_step == 1:
                 avg = sum(losses[-log_every:]) / max(min(log_every, len(losses)), 1)
                 logger.info(
                     "step %d/%d  loss=%.4f  avg(%d)=%.4f  lr=%.2e",
-                    step + 1,
+                    real_step,
                     steps,
                     losses[-1],
                     log_every,
@@ -817,8 +830,8 @@ def prepare_dflash_draft(
                 )
             if progress_callback:
                 progress_callback(
-                    f"Training step {step + 1}/{steps} loss={losses[-1]:.4f}",
-                    (step + 1) / steps,
+                    f"Training step {real_step}/{steps} loss={losses[-1]:.4f}",
+                    real_step / steps,
                 )
     finally:
         _unpatch_model(target)

@@ -499,6 +499,75 @@ class TestPivotSelection:
 # ---------------------------------------------------------------------------
 
 
+class TestSkippedBatchesPreserveStepBudget:
+    """Skipped (all-padding) batches must NOT reduce the gradient-step
+    count. ``enumerate(batches)`` advances ``step`` on every iteration,
+    including the ones the pivot-selector rejects via ``continue``;
+    without a separate counter the loop exits with fewer real gradient
+    updates than the operator asked for, producing a quietly
+    under-trained checkpoint.
+
+    Test strategy: feed an iterator that alternates pad-only batches
+    (which trigger ``_select_pivot is None``) with real-content
+    batches. Assert that the number of progress-callback ``loss=``
+    messages equals ``steps`` — i.e. every requested step ran a real
+    optimizer update.
+    """
+
+    def test_skipped_batches_do_not_eat_step_budget(self, tmp_path):
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        vocab, hidden, num_layers = 64, 16, 4
+        _write_target_config(tmp_path, vocab, hidden)
+
+        # ``_MockTokenizer.pad_token_id == 0``; build alternating
+        # all-pad-only and real-content batches. The training loop
+        # should ``continue`` past pad-only batches without consuming
+        # one of its ``steps`` real gradient updates.
+        seq_len = 32
+        batch_size = 2
+
+        def alternating_batches():
+            real = mx.full((batch_size, seq_len), 5, dtype=mx.int32)  # all id=5
+            pad_only = mx.zeros((batch_size, seq_len), dtype=mx.int32)
+            i = 0
+            while True:
+                yield pad_only if (i % 2 == 0) else real
+                i += 1
+
+        steps = 5
+        log_every = 1
+        loss_lines: list[str] = []
+
+        def cb(msg: str, _frac: float) -> None:
+            if "loss=" in msg:
+                loss_lines.append(msg)
+
+        prepare_dflash_draft(
+            tmp_path,
+            steps=steps,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            block_size=2,
+            num_hidden_layers=1,
+            num_target_layers=2,
+            lr=1e-2,
+            output_dir=tmp_path / "dflash_out",
+            progress_callback=cb,
+            log_every=log_every,
+            _target_loader=_mock_target_loader(vocab, hidden, num_layers),
+            _batch_iterator=alternating_batches(),
+        )
+        # Every requested step must have run a real gradient update.
+        # Bug behavior: only ``ceil(steps/2)`` lines because half the
+        # iterations were skipped pad-only batches that still consumed
+        # a slot.
+        assert len(loss_lines) == steps, (
+            f"got {len(loss_lines)} real gradient steps, expected {steps}; "
+            "skipped batches are eating into the step budget"
+        )
+
+
 class TestPrepareDflashDraft:
     def test_loss_decreases(self, tmp_path):
         from olmlx.engine.dflash.prepare import prepare_dflash_draft

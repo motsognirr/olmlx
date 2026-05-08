@@ -408,10 +408,15 @@ class _GDNStateCapture:
                 if isinstance(mod, gdn_cls):
                     self._expected_gdn_modules.append(mod)
         if not self._expected_gdn_modules:
-            # Fallback: a model with GDNs that aren't reachable from
-            # ``_get_layers`` (e.g. tied layers under a different
-            # attribute). Preserve the original behavior so the
-            # cardinality check still meaningfully fires downstream.
+            # Fallback: GDN modules exist in the model but are not
+            # reachable via ``_get_layers``. ``_patch_model`` also uses
+            # ``_get_layers``, so it won't install ``_capturing_gdn_call``
+            # on those modules either — ``_captured_modules`` will be empty
+            # at rollback time. Populating ``_expected_gdn_modules`` with a
+            # non-empty list (even in LIFO order) ensures the subsequent
+            # cardinality check in ``rollback()`` fires and raises a clear
+            # error rather than silently passing via
+            # ``_order_matches([], []) == True``.
             self._expected_gdn_modules = [
                 mod for _name, mod in model.named_modules() if isinstance(mod, gdn_cls)
             ]
