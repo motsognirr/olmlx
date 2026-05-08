@@ -162,10 +162,15 @@ def stream_training_batches(
     # Fallback path — synthetic prompts cycled until max_examples hit.
     target_examples = max_examples if max_examples is not None else 64
     while yielded < target_examples:
+        # Detect a full pass with no usable prompts so a caller that
+        # raises ``min_seq_len`` above every fallback's tokenized length
+        # gets a clear error instead of an infinite loop.
+        made_progress = False
         for prompt in _FALLBACK_PROMPTS:
             ids = _tokenize(prompt)
             if ids is None:
                 continue
+            made_progress = True
             batch.append(ids)
             if len(batch) == batch_size:
                 yield _emit(batch)
@@ -173,3 +178,9 @@ def stream_training_batches(
                 yielded += 1
                 if yielded >= target_examples:
                     return
+        if not made_progress:
+            raise RuntimeError(
+                f"All fallback prompts tokenize to fewer than "
+                f"min_seq_len={min_seq_len} tokens; lower min_seq_len or "
+                "provide a real dataset via --data."
+            )

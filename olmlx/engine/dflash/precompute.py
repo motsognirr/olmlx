@@ -119,6 +119,18 @@ def precompute_target_hiddens(
                 written / num_shards,
             )
 
+    if written == 0:
+        # Refuse to write an index with ``null`` for ``batch_size`` /
+        # ``seq_len`` / ``hidden_size`` (their initial value): the file
+        # would land on disk and confuse anyone inspecting it, and a
+        # subsequent ``read_precomputed_index`` would reject it on
+        # missing-key grounds anyway.
+        raise RuntimeError(
+            "precompute_target_hiddens produced no shards — check that "
+            "the 'batches' iterator yields at least one item (an exhausted "
+            "iterator, an empty dataset, or all examples filtered out "
+            "would all lead here)."
+        )
     index = {
         "num_shards": written,
         "batch_size": batch_size,

@@ -395,13 +395,6 @@ def prepare_dflash_draft(
     draft.bind(target)
     mx.eval(draft.parameters())
 
-    # Caller-owned hidden-state storage passed into both the patch and
-    # ``_capture_target_outputs`` — keeps captured ``mx.array``s out of
-    # ``target.parameters()`` (mlx tracks ``list``-typed attributes as
-    # parameters once they hold arrays).
-    hidden_capture: list[Any] = [None] * len(layer_ids)
-    _patch_model(target, layer_ids, hidden_capture)
-
     # Optimizer + LR schedule.
     optimizer = optim.AdamW(learning_rate=lr)
     warmup = max(int(steps * DEFAULT_WARMUP_FRAC), 1)
@@ -494,6 +487,17 @@ def prepare_dflash_draft(
             max_examples=steps,
         )
 
+    # Caller-owned hidden-state storage passed into both the patch and
+    # ``_capture_target_outputs`` — keeps captured ``mx.array``s out of
+    # ``target.parameters()`` (mlx tracks ``list``-typed attributes as
+    # parameters once they hold arrays). Installed *after* batch-iterator
+    # setup so an exception there (e.g. ``read_precomputed_index``
+    # raising on a missing shard directory) cannot leave the target
+    # permanently patched — a subsequent call would then double-wrap
+    # the layers and corrupt the captures.
+    hidden_capture: list[Any] = [None] * len(layer_ids)
+    _patch_model(target, layer_ids, hidden_capture)
+
     losses: list[float] = []
     try:
         for step, batch in enumerate(batches):
@@ -521,12 +525,19 @@ def prepare_dflash_draft(
             # Using the same p across the batch keeps shapes static; cycling
             # the pivot across steps gives diverse training windows.
             seq = input_ids.shape[1]
+            # Valid pivots: ``p ∈ [block_size, seq - block_size - 1]``
+            # (inclusive). The targets slice is
+            # ``input_ids[:, p+1 : p+1+block_size]`` so we need
+            # ``p + 1 + block_size <= seq``. ``mx.random.randint`` draws
+            # from a half-open interval, so ``hi = seq - block_size``
+            # makes the maximum valid pivot ``seq - block_size - 1``
+            # reachable.
             lo = block_size
-            hi = seq - block_size - 1
+            hi = seq - block_size
             if hi <= lo:
                 raise ValueError(
                     f"seq_len={seq} too small for block_size={block_size}; "
-                    f"need at least 2*block_size + 2 tokens per sequence"
+                    f"need at least 2*block_size + 1 tokens per sequence"
                 )
             p = int(mx.random.randint(lo, hi, shape=()).item())
 
