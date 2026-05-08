@@ -205,18 +205,28 @@ def iter_precomputed_shards(
     if not shard_dir.exists():
         raise FileNotFoundError(f"Precomputed shard directory not found: {shard_dir}")
 
-    index_path = shard_dir / INDEX_FILENAME
-    if index_path.exists():
-        # Parsed for validation only — callers needing the metadata
-        # should call ``read_precomputed_index`` directly.
-        read_precomputed_index(shard_dir)
-
     shard_paths = sorted(shard_dir.glob("shard-*.safetensors"))
     if not shard_paths:
         raise FileNotFoundError(
             f"No shard-*.safetensors files in {shard_dir}; was "
             "precompute_target_hiddens run?"
         )
+
+    index_path = shard_dir / INDEX_FILENAME
+    if index_path.exists():
+        # Validate format AND cross-check the recorded shard count
+        # against the actual files. A stale ``index.json`` (e.g. left
+        # over after a manual shard delete) would otherwise let the
+        # iterator silently cycle through fewer shards than the
+        # training loop expects.
+        meta = read_precomputed_index(shard_dir)
+        if meta["num_shards"] != len(shard_paths):
+            raise ValueError(
+                f"Shard directory {shard_dir} is inconsistent: "
+                f"index.json records num_shards={meta['num_shards']} but "
+                f"found {len(shard_paths)} shard-*.safetensors files. "
+                "Re-run precompute or delete the stale index.json."
+            )
 
     yielded = 0
     while True:

@@ -157,9 +157,14 @@ def stream_training_batches(
             if hasattr(stream, "close"):
                 stream.close()
         if batch:
-            # Top up the final partial batch by recycling earlier examples
-            # rather than emitting an undersized batch (which would break
-            # static-shape assumptions in the training loop).
+            # Top up the final partial batch by cycling through the
+            # *current partial batch's* examples (not earlier examples
+            # in the stream, which we no longer have references to)
+            # rather than emitting an undersized batch — that would
+            # break the static-shape assumptions in the training loop.
+            # If ``orig == 1`` the final batch is one example repeated;
+            # acceptable for one step out of thousands but worth knowing
+            # for short test runs.
             orig = len(batch)
             while len(batch) < batch_size:
                 batch.append(batch[len(batch) % orig])

@@ -97,7 +97,12 @@ def _evenly_spaced(num_layers: int, k: int) -> list[int]:
     if k >= num_layers:
         return list(range(num_layers))
     step = (num_layers - 1) / (k + 1)
-    return [int(round((i + 1) * step)) for i in range(k)]
+    # Dedupe + sort: rounding can collide for small ``num_layers``
+    # close to ``k`` (e.g. ``num_layers=5, k=4`` → step 0.8 →
+    # ``[1, 2, 2, 3]``). Duplicates would double-wrap the repeated
+    # layer in ``_LayerHook`` and ``_unpatch_model`` only strips one
+    # level — the dangling hook would corrupt subsequent captures.
+    return sorted({int(round((i + 1) * step)) for i in range(k)})
 
 
 def _resolve_target_layer_ids(
@@ -144,16 +149,23 @@ def _build_draft_config(
     rope_theta, and vocab_size from the target so weights are
     dimensionally compatible at inference time.
     """
+
+    # ``or`` would short-circuit on a degenerate-but-valid ``0.0`` /
+    # ``0`` value (e.g. ``rms_norm_eps=0.0``); use ``is not None``
+    # ternaries to fall back only on genuinely missing keys, matching
+    # CLAUDE.md's stated convention.
+    def _get(key: str, default: Any) -> Any:
+        v = target_cfg.get(key)
+        return v if v is not None else default
+
     hidden_size = int(target_cfg["hidden_size"])
-    num_attention_heads = int(
-        target_cfg.get("num_attention_heads") or target_cfg["hidden_size"] // 64
-    )
-    num_kv_heads = int(target_cfg.get("num_key_value_heads") or num_attention_heads)
-    head_dim = int(target_cfg.get("head_dim") or hidden_size // num_attention_heads)
-    intermediate_size = int(target_cfg.get("intermediate_size") or hidden_size * 4)
-    rms_norm_eps = float(target_cfg.get("rms_norm_eps") or 1e-6)
-    rope_theta = float(target_cfg.get("rope_theta") or 10000.0)
-    max_position_embeddings = int(target_cfg.get("max_position_embeddings") or 4096)
+    num_attention_heads = int(_get("num_attention_heads", hidden_size // 64))
+    num_kv_heads = int(_get("num_key_value_heads", num_attention_heads))
+    head_dim = int(_get("head_dim", hidden_size // num_attention_heads))
+    intermediate_size = int(_get("intermediate_size", hidden_size * 4))
+    rms_norm_eps = float(_get("rms_norm_eps", 1e-6))
+    rope_theta = float(_get("rope_theta", 10000.0))
+    max_position_embeddings = int(_get("max_position_embeddings", 4096))
 
     # Stored on disk in the upstream wire format: ``block_size`` is the
     # *total* block length (pending + drafts). The decoder converts back

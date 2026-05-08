@@ -2160,6 +2160,20 @@ def cmd_dflash_prepare(args):
     """Train a DFlash draft model for a target."""
     _configure_logging()
 
+    # Validate up-front so the user gets a clear message before we
+    # download the target and run hook-installation. The same check
+    # exists deep inside the training loop, but surfacing it after a
+    # multi-GB download is a poor UX.
+    if args.block_size < 1:
+        raise SystemExit(f"--block-size must be >= 1, got {args.block_size}")
+    min_seq_len = 2 * args.block_size + 1
+    if args.seq_len < min_seq_len:
+        raise SystemExit(
+            f"--seq-len ({args.seq_len}) too small for --block-size "
+            f"({args.block_size}); need at least 2*block_size + 1 = "
+            f"{min_seq_len} tokens per sequence."
+        )
+
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
     hf_path = _resolved.hf_path if _resolved is not None else args.model
