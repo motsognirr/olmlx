@@ -339,6 +339,12 @@ def _draft_loss(
     log_probs = nn.log_softmax(draft_logits, axis=-1)
     nll = -mx.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
 
+    # Initialise upfront so the type checker can see ``denom`` is in
+    # scope when the KL branch reaches for it (it's only meaningful when
+    # ``valid is not None``, which is equivalent to ``pad_token_id is not
+    # None``, but the type narrowing isn't trivially derivable).
+    valid: mx.array | None = None
+    denom: mx.array | None = None
     if pad_token_id is not None:
         valid = (targets != pad_token_id).astype(nll.dtype)
         # ``valid.sum().clip(1.0, ...)`` keeps the divisor from hitting
@@ -348,7 +354,6 @@ def _draft_loss(
         denom = mx.maximum(valid.sum(), mx.array(1.0, dtype=nll.dtype))
         ce = (nll * valid).sum() / denom
     else:
-        valid = None
         ce = mx.mean(nll)
 
     if target_logits_window is None or distill_alpha <= 0.0:
@@ -362,7 +367,7 @@ def _draft_loss(
     target_probs = mx.exp(target_log_probs)
     draft_log_probs_t = nn.log_softmax(draft_logits / t, axis=-1)
     kl = mx.sum(target_probs * (target_log_probs - draft_log_probs_t), axis=-1)
-    if valid is not None:
+    if valid is not None and denom is not None:
         # ``denom`` was computed in the CE branch above; reuse it instead of
         # re-running ``valid.sum()`` and the maximum-with-1.0 floor a second
         # time. The two ``valid.sum()`` calls produce the same value, only
@@ -836,6 +841,33 @@ def prepare_dflash_draft(
     finally:
         _unpatch_model(target)
         draft.unbind()
+
+    # If the batch stream ran out before the operator's ``steps`` budget
+    # of real gradient updates was hit, the saved checkpoint is silently
+    # under-trained (or, in the all-pad-skip degenerate case, untrained
+    # entirely). Surface the discrepancy on the way out so the operator
+    # knows to investigate the dataset / block_size combination rather
+    # than discovering the problem only at inference time when
+    # acceptance is poor.
+    if real_step == 0:
+        logger.warning(
+            "No real gradient steps completed for %s — every batch was "
+            "skipped (each row had fewer than %d real tokens). The saved "
+            "checkpoint is essentially the random init. Check the dataset "
+            "and --block-size (currently %d).",
+            model_path,
+            2 * block_size + 1,
+            block_size,
+        )
+    elif real_step < steps:
+        logger.warning(
+            "Only %d of %d requested steps completed for %s; the batch "
+            "stream was exhausted before the budget was hit. Saved "
+            "checkpoint is under-trained relative to --steps.",
+            real_step,
+            steps,
+            model_path,
+        )
 
     # Save: <output>/{config.json, model-00001-of-00001.safetensors}.
     if output_dir is None:

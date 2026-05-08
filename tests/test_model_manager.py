@@ -221,6 +221,33 @@ class TestResolveDraftPath:
         mock_dl.assert_called_once_with("namespace/repo_name")
         assert resolved == str(expected)
 
+    def test_relative_path_collision_does_not_short_circuit(
+        self, tmp_path, registry, mock_store, monkeypatch
+    ):
+        """Relative paths must NOT short-circuit even if a directory by
+        that name happens to exist relative to CWD. Otherwise a valid HF
+        repo id like ``"my-org/dflash-draft"`` is silently swapped for
+        whatever the current working directory contains under that path.
+        Only absolute paths are unambiguous local references.
+        """
+        # Set CWD to tmp_path and create a directory matching a plausible
+        # HF repo id within it.
+        monkeypatch.chdir(tmp_path)
+        collision = tmp_path / "namespace" / "repo_name"
+        collision.mkdir(parents=True)
+
+        manager = ModelManager(registry, mock_store)
+        downloaded = tmp_path / "downloaded"
+        downloaded.mkdir()
+        with patch.object(
+            mock_store, "ensure_downloaded", return_value=downloaded
+        ) as mock_dl:
+            resolved = manager._resolve_draft_path("namespace/repo_name")
+        # Must have gone through ``ensure_downloaded`` rather than
+        # picking up the colliding local directory.
+        mock_dl.assert_called_once_with("namespace/repo_name")
+        assert resolved == str(downloaded)
+
 
 class TestDetectModelKind:
     def _make_config(self, tmp_path, config_data):

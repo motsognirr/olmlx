@@ -627,8 +627,13 @@ class _GDNStateCapture:
         if not _order_matches(self._captured_modules, self._expected_gdn_modules):
             captured_ids = [id(m) for m in self._captured_modules]
             expected_ids = [id(m) for m in self._expected_gdn_modules]
-            captured_only = [i for i in captured_ids if i not in expected_ids]
-            expected_only = [i for i in expected_ids if i not in captured_ids]
+            # Use sets for membership; ``in`` on a list is O(n), so the two
+            # comprehensions below would be O(n²) without these. Cold path
+            # but cheap to fix.
+            captured_set = set(captured_ids)
+            expected_set = set(expected_ids)
+            captured_only = [i for i in captured_ids if i not in expected_set]
+            expected_only = [i for i in expected_ids if i not in captured_set]
             raise RuntimeError(
                 "DFlash rollback ordering invariant violated: forward pass "
                 "visited GDN layers in a different order than "

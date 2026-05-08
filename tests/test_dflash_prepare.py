@@ -514,6 +514,54 @@ class TestSkippedBatchesPreserveStepBudget:
     optimizer update.
     """
 
+    def test_warns_when_batch_stream_exhausts_before_steps(self, tmp_path, caplog):
+        """If the batch iterator ends before ``steps`` real updates ran
+        (every batch was a pad-only skip, or finite dataset short of the
+        budget), the operator gets a saved checkpoint that's quietly
+        under-trained or completely untrained. Surface that as a warning
+        on the way out so it isn't silent.
+        """
+        import logging
+
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        vocab, hidden, num_layers = 64, 16, 4
+        _write_target_config(tmp_path, vocab, hidden)
+
+        # All-pad batches → every step is skipped → real_step never
+        # advances → loop exits when the iterator drains.
+        seq_len = 32
+        batch_size = 2
+
+        def all_pad_batches():
+            pad_only = mx.zeros((batch_size, seq_len), dtype=mx.int32)
+            for _ in range(10):
+                yield pad_only
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.dflash.prepare"):
+            prepare_dflash_draft(
+                tmp_path,
+                steps=20,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                block_size=2,
+                num_hidden_layers=1,
+                num_target_layers=2,
+                lr=1e-2,
+                output_dir=tmp_path / "dflash_out",
+                _target_loader=_mock_target_loader(vocab, hidden, num_layers),
+                _batch_iterator=all_pad_batches(),
+            )
+        # Operator must see a clear signal that no real updates ran.
+        assert any(
+            "no real gradient steps" in rec.message.lower()
+            or "0/20" in rec.message
+            or "0 of 20" in rec.message
+            for rec in caplog.records
+        ), (
+            f"expected an under-training warning, got: {[r.message for r in caplog.records]}"
+        )
+
     def test_skipped_batches_do_not_eat_step_budget(self, tmp_path):
         from olmlx.engine.dflash.prepare import prepare_dflash_draft
 

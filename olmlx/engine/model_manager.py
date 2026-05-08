@@ -1678,14 +1678,19 @@ class ModelManager:
         """Download a draft model if needed and return the local path.
 
         Accepts either a HuggingFace repo id (``"namespace/repo_name"``)
-        or an absolute/relative filesystem path to a local draft
-        directory. Local paths short-circuit the ``ensure_downloaded``
-        machinery — feeding ``"/Users/.../dflash"`` into the HF repo-id
-        validator otherwise raises ``HFValidationError`` ("Repo id must
-        be in the form 'repo_name' or 'namespace/repo_name'").
+        or an *absolute* filesystem path to a local draft directory.
+        Local-path short-circuiting is gated on ``is_absolute()`` to
+        avoid a false positive where a valid HF repo id (e.g.
+        ``"my-org/dflash-draft"``) happens to match a directory under
+        the server's CWD; that would silently swap the operator's
+        intended remote artifact for whatever the working directory
+        contains. Without short-circuiting, feeding an absolute path
+        through ``ensure_downloaded`` raises ``HFValidationError``
+        ("Repo id must be in the form 'repo_name' or
+        'namespace/repo_name'").
         """
         candidate = Path(hf_path).expanduser()
-        if candidate.is_dir():
+        if candidate.is_absolute() and candidate.is_dir():
             return str(candidate)
         if self.store is not None:
             local_dir = self.store.ensure_downloaded(hf_path)
