@@ -126,15 +126,19 @@ def _patch_model(model: nn.Module, layer_ids: list[int], storage: list[Any]) -> 
     transient tensors via ``save_weights``).
 
     Idempotency is detected by checking whether all requested layers
-    are already ``_LayerHook``; the second call is a no-op. ``all`` (not
-    ``any``) is correct here — a partial state with some layers patched
-    and others not is a bug we want to recover from rather than
-    short-circuit.
+    are already ``_LayerHook``; the second call is a no-op. When
+    partially patched (some indices wrapped, others not — e.g. a prior
+    call raised mid-loop), only the unwrapped indices are wrapped. We
+    must avoid double-wrapping (``_LayerHook(_LayerHook(layer))``)
+    because ``_unpatch_model`` peels exactly one level and would leave
+    a stale outer hook writing into a dead storage slot.
     """
     layers = _get_layers(model)
     if all(isinstance(layers[lid], _LayerHook) for lid in layer_ids):
         return
     for i, lid in enumerate(layer_ids):
+        if isinstance(layers[lid], _LayerHook):
+            continue
         layers[lid] = _LayerHook(layers[lid], i, storage)
 
 
@@ -371,13 +375,28 @@ class _GDNStateCapture:
             inv_scale = k.shape[-1] ** -0.5
             q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
             k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-            capture._gdn_inputs.append(
-                (q, k, v, a, b, self_layer.A_log, self_layer.dt_bias, state, mask)
-            )
             # Mirror upstream's ``use_kernel=not self.training`` so any
             # future eval/train switch on the layer instance flows through
             # both the patched forward and the rollback replay below.
+            # Capturing it alongside the inputs guarantees the rollback
+            # replays with the exact same kernel choice — otherwise a
+            # training-mode forward followed by an inference-mode replay
+            # would produce mismatched GDN states and corrupt the cache.
             use_kernel = not getattr(self_layer, "training", False)
+            capture._gdn_inputs.append(
+                (
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    self_layer.A_log,
+                    self_layer.dt_bias,
+                    state,
+                    mask,
+                    use_kernel,
+                )
+            )
             out, new_state = _gd_mod.gated_delta_update(
                 q,
                 k,
@@ -466,12 +485,22 @@ class _GDNStateCapture:
             if c.is_trimmable():
                 c.trim(trim)
             else:
-                # Rollback only runs during decode (model in eval mode)
-                # so ``use_kernel=True`` matches the captured forward's
-                # ``not training`` decision. If we ever need to support
-                # rollback during training, capture the flag in
-                # ``_capturing_gdn_call`` and replay it here.
-                q, k, v, a, b, A_log, dt_bias, init_state, mask = self._gdn_inputs[j]
+                # Replay with the same ``use_kernel`` flag the forward
+                # used; the value was captured alongside the inputs in
+                # ``_capturing_gdn_call`` so a training-mode forward
+                # followed by an inference-mode replay can't drift.
+                (
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    A_log,
+                    dt_bias,
+                    init_state,
+                    mask,
+                    use_kernel,
+                ) = self._gdn_inputs[j]
                 n = accepted + 1
                 _, state = _gd_mod.gated_delta_update(
                     q[:, :n],
@@ -483,7 +512,7 @@ class _GDNStateCapture:
                     dt_bias,
                     init_state,
                     None if mask is None else mask[:, :n],
-                    use_kernel=True,
+                    use_kernel=use_kernel,
                 )
                 # Cache layout: mlx-lm's GDN models build the per-layer
                 # cache as ``ArraysCache(size=2)`` with index 0 holding
@@ -712,6 +741,16 @@ class DFlashDecoder:
         target_out = self._target(verify_input, cache=self._target_cache)
         logits = _logits(target_out)
         captured = list(self._hidden_capture)
+        # Same guard as ``prefill``: an unfired hook here would surface
+        # downstream as a cryptic ``mx.concatenate`` type error rather
+        # than an actionable message.
+        if any(h is None for h in captured):
+            raise RuntimeError(
+                "Target verification forward did not populate all "
+                f"configured target_layer_ids "
+                f"({list(self._config.target_layer_ids)}); a layer hook may "
+                "have been removed mid-generation."
+            )
         new_hidden = mx.concatenate(captured, axis=-1)
         mx.eval(logits, new_hidden)
 

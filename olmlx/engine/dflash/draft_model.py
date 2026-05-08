@@ -431,6 +431,10 @@ class DFlashDraftModel(nn.Module):
             h = h[:, logits_start:, :]
         logits = self.lm_head(h)
         cap = self.config.final_logit_softcapping
-        if cap:
+        # ``cap is not None and cap > 0.0`` rather than ``if cap`` so a
+        # config with ``final_logit_softcapping: 0.0`` is rejected
+        # (would otherwise silently skip softcapping AND become a
+        # divide-by-zero if someone later flips this to ``is not None``).
+        if cap is not None and cap > 0.0:
             logits = mx.tanh(logits / cap) * cap
         return logits
