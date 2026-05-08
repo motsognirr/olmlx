@@ -43,7 +43,7 @@ import math
 import random
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -375,8 +375,11 @@ def _draft_loss(
         # maximum-with-1.0 floor a second time — the two
         # ``valid.sum()`` calls would produce the same value differing
         # only in dtype, so an ``astype`` cast is sufficient.
-        assert denom is not None  # type narrowing for the checker
-        kl_loss = (kl * valid).sum() / denom.astype(kl.dtype) * (t * t)
+        # Use ``typing.cast`` rather than an ``assert`` for type
+        # narrowing because Python ``-O`` strips assertions, and a
+        # training pipeline can plausibly run optimised.
+        denom_kl = cast(mx.array, denom)
+        kl_loss = (kl * valid).sum() / denom_kl.astype(kl.dtype) * (t * t)
     else:
         kl_loss = mx.mean(kl) * (t * t)
 
@@ -749,8 +752,12 @@ def prepare_dflash_draft(
 
             optimizer.learning_rate = _cosine_lr(real_step, steps, lr, warmup)
 
-            # Resolve the per-batch target signal: either freshly
-            # computed (online) or read from disk (precomputed).
+            # Resolve ``input_ids`` and (if precomputed) ``target_hidden_full``
+            # from the batch *without* running the target forward yet — the
+            # target forward is the dominant cost on a frozen 35B target, and
+            # ``_select_pivot`` below may reject the batch entirely. Running
+            # the target before the pivot check would burn a full forward pass
+            # for every pad-only batch.
             if isinstance(batch, tuple):
                 # Tuple batches come from precomputed shards or a
                 # ``_batch_iterator`` test hook; neither carries logits,
@@ -769,17 +776,10 @@ def prepare_dflash_draft(
                         "_batch_iterator). Pass raw input_ids batches or "
                         "drop --distill."
                     )
-                input_ids, target_hidden_full = batch
-                target_logits_full: mx.array | None = None
+                input_ids, precomputed_hidden = batch
             else:
                 input_ids = batch
-                target_hidden_full, target_logits_full = _capture_target_outputs(
-                    target,
-                    input_ids,
-                    cache=None,
-                    storage=hidden_capture,
-                    capture_logits=distill,
-                )
+                precomputed_hidden = None
 
             # Pick a random pivot p. Two regimes:
             #
@@ -816,7 +816,8 @@ def prepare_dflash_draft(
                     # ``2*block_size + 1`` real tokens; no valid window
                     # exists. Skip rather than train on a degenerate
                     # all-pad target — the next batch will most likely
-                    # be longer.
+                    # be longer. Skipping happens BEFORE the target
+                    # forward, so this costs almost nothing.
                     logger.debug(
                         "skipping all-padding batch before real step %d "
                         "(no row has %d+ real tokens)",
@@ -825,6 +826,20 @@ def prepare_dflash_draft(
                     )
                     continue
                 p = pivot
+
+            # Pivot accepted: now run the target forward (online) or
+            # consume the precomputed hidden state.
+            target_logits_full: mx.array | None = None
+            if precomputed_hidden is not None:
+                target_hidden_full = precomputed_hidden
+            else:
+                target_hidden_full, target_logits_full = _capture_target_outputs(
+                    target,
+                    input_ids,
+                    cache=None,
+                    storage=hidden_capture,
+                    capture_logits=distill,
+                )
 
             pending = input_ids[:, p : p + 1]  # (B, 1)
             mask_block = mx.full(

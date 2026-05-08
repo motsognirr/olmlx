@@ -592,6 +592,66 @@ class TestSkippedBatchesPreserveStepBudget:
     optimizer update.
     """
 
+    def test_skipped_batches_do_not_run_target_forward(self, tmp_path, monkeypatch):
+        """Performance: when ``_select_pivot`` returns ``None`` the
+        batch is discarded, so the (dominant) target forward pass for
+        that batch must be skipped too. Otherwise every pad-only batch
+        burns the same compute as a real training step on a frozen
+        target — a 35B-A3B forward thrown away for nothing.
+
+        Count invocations of ``_capture_target_outputs`` (the wrapper
+        that runs the target forward and harvests captured hiddens).
+        With one real-content batch followed by one pad-only batch and
+        ``steps=1``, it must run exactly once: the pad-only batch
+        should be rejected before any target compute is spent.
+        """
+        from olmlx.engine.dflash import prepare as prepare_mod
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        vocab, hidden, num_layers = 64, 16, 4
+        _write_target_config(tmp_path, vocab, hidden)
+
+        original_capture = prepare_mod._capture_target_outputs
+        call_count = {"n": 0}
+
+        def counting_capture(*args, **kwargs):
+            call_count["n"] += 1
+            return original_capture(*args, **kwargs)
+
+        monkeypatch.setattr(prepare_mod, "_capture_target_outputs", counting_capture)
+
+        seq_len = 32
+        batch_size = 2
+
+        # First batch is real content (avoids id 0 = pad), second is
+        # all-pad and must be skipped without a target forward.
+        def first_real_then_pad():
+            real = mx.full((batch_size, seq_len), 5, dtype=mx.int32)
+            pad_only = mx.zeros((batch_size, seq_len), dtype=mx.int32)
+            yield real
+            yield pad_only
+
+        prepare_dflash_draft(
+            tmp_path,
+            steps=1,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            block_size=2,
+            num_hidden_layers=1,
+            num_target_layers=2,
+            lr=1e-2,
+            output_dir=tmp_path / "dflash_out",
+            _target_loader=_mock_target_loader(vocab, hidden, num_layers),
+            _batch_iterator=first_real_then_pad(),
+        )
+        # Exactly one target forward — for the real-content batch.
+        # The pad-only batch must have been skipped before
+        # ``_capture_target_outputs`` ran.
+        assert call_count["n"] == 1, (
+            f"target forward ran {call_count['n']} times, expected 1; "
+            "pad-only batches are wasting target forward compute"
+        )
+
     def test_warns_when_batch_stream_exhausts_before_steps(self, tmp_path, caplog):
         """If the batch iterator ends before ``steps`` real updates ran
         (every batch was a pad-only skip, or finite dataset short of the
