@@ -1790,6 +1790,22 @@ class ModelManager:
             len(weight_files),
         )
 
+        # Vocab-size check: ``DFlashDraftModel.bind`` borrows the
+        # target's ``embed_tokens`` / ``lm_head``, so a mismatch between
+        # the draft's pre-trained vocab and the target produces an
+        # ``mx.array`` shape error at the first draft forward pass —
+        # surface it here at load time with a clear message instead.
+        # ``DFlashDraftModel`` doesn't expose ``args.vocab_size``
+        # (config lives on ``draft_config``), so we read the two
+        # values directly rather than via ``_check_vocab_match``.
+        target_vocab = getattr(getattr(target_model, "args", None), "vocab_size", None)
+        if target_vocab is not None and target_vocab != draft_config.vocab_size:
+            raise ValueError(
+                f"DFlash draft vocab_size ({draft_config.vocab_size}) does "
+                f"not match target vocab_size ({target_vocab}). The draft "
+                "must be trained against a target with the same vocabulary."
+            )
+
         # ``speculative_tokens`` overrides the draft config's ``block_size``
         # so users can shrink the block at inference time without
         # re-training. The draft's positional encoding is unaffected.

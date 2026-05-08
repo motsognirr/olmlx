@@ -125,11 +125,14 @@ def _patch_model(model: nn.Module, layer_ids: list[int], storage: list[Any]) -> 
     ``mx.eval(model.parameters())`` in distributed setups and serialize
     transient tensors via ``save_weights``).
 
-    Idempotency is detected by checking whether any layer is already a
-    ``_LayerHook``; the second call is a no-op.
+    Idempotency is detected by checking whether all requested layers
+    are already ``_LayerHook``; the second call is a no-op. ``all`` (not
+    ``any``) is correct here — a partial state with some layers patched
+    and others not is a bug we want to recover from rather than
+    short-circuit.
     """
     layers = _get_layers(model)
-    if any(isinstance(layers[lid], _LayerHook) for lid in layer_ids):
+    if all(isinstance(layers[lid], _LayerHook) for lid in layer_ids):
         return
     for i, lid in enumerate(layer_ids):
         layers[lid] = _LayerHook(layers[lid], i, storage)
@@ -668,20 +671,34 @@ class DFlashDecoder:
         draft_logits = self._draft(
             block, self._hidden, self._draft_cache, logits_start=1
         )
-        # Invariant: the draft cache stores exactly the context tokens
-        # corresponding to ``prompt_size + n_generated - 1`` target
-        # positions (the draft processes ``S = _hidden.shape[1]`` ctx
-        # tokens per step, equal to the previous step's ``num_accepted``,
-        # so its offset advances in lockstep with ``_n_generated``). If
-        # it ever drifts, it is a bookkeeping bug — surface loudly
-        # rather than silently masking with a trim.
-        draft_offset = self._draft_cache[0].offset
-        target_offset = self._prompt_size + self._n_generated - 1
-        if draft_offset != target_offset:
-            raise RuntimeError(
-                f"Draft cache offset ({draft_offset}) drifted from expected "
-                f"target offset ({target_offset}); DFlash bookkeeping bug."
-            )
+        # Invariant (full-attention layers only): the draft cache stores
+        # exactly the context tokens corresponding to ``prompt_size +
+        # n_generated - 1`` target positions. The draft processes
+        # ``S = _hidden.shape[1]`` ctx tokens per step (= previous
+        # step's ``num_accepted``), so a full-attention layer's offset
+        # advances in lockstep with ``_n_generated``. Sliding-window
+        # layers truncate ``x_ctx`` to ``window - 1`` before
+        # ``update_and_fetch`` and grow by ``min(S, window-1)`` instead,
+        # so the invariant doesn't apply there. We only check the first
+        # full-attention layer if one exists; the assertion catches
+        # bookkeeping bugs without firing falsely on sliding drafts.
+        ft_idx = next(
+            (
+                i
+                for i, t in enumerate(self._config.layer_types)
+                if t == "full_attention"
+            ),
+            None,
+        )
+        if ft_idx is not None:
+            draft_offset = self._draft_cache[ft_idx].offset
+            target_offset = self._prompt_size + self._n_generated - 1
+            if draft_offset != target_offset:
+                raise RuntimeError(
+                    f"Draft cache offset ({draft_offset}) at full-attention "
+                    f"layer {ft_idx} drifted from expected target offset "
+                    f"({target_offset}); DFlash bookkeeping bug."
+                )
         draft_tokens_arr = mx.argmax(draft_logits, axis=-1)
         mx.eval(draft_tokens_arr)
         # ``mx.array.tolist()`` is typed as ``list_or_scalar``; for a 1-D
