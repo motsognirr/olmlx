@@ -2268,6 +2268,67 @@ def cmd_dflash_prepare(args):
     print("  olmlx serve")
 
 
+def cmd_eagle_prepare(args):
+    """Train an EAGLE draft model for a target.
+
+    Phase D supports only ``--use-precomputed`` mode: pass the
+    directory of (input_ids, target_hidden) shards produced by
+    ``olmlx dflash precompute`` (the shard format is shared between
+    DFlash and EAGLE — EAGLE consumes the deepest captured layer).
+    """
+    _configure_logging()
+
+    if args.block_size < 1:
+        raise SystemExit(f"--block-size must be >= 1, got {args.block_size}")
+    if not args.use_precomputed:
+        raise SystemExit(
+            "--use-precomputed is required for EAGLE training. Run "
+            "`olmlx dflash precompute <target>` first to dump target hidden "
+            "states; the same shards work for EAGLE (it just slices the "
+            "deepest layer from the concatenated ladder)."
+        )
+
+    store = _create_store()
+    _resolved = store.registry.resolve(args.model)
+    hf_path = _resolved.hf_path if _resolved is not None else args.model
+    local_dir = store.ensure_downloaded(hf_path)
+    model_path = str(local_dir)
+
+    print(f"Training EAGLE draft for {args.model}...")
+    print(f"  Target path: {model_path}")
+    print(f"  Steps: {args.steps}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Seq len: {args.seq_len}")
+    print(f"  Block size (draft tokens): {args.block_size}")
+    print(f"  Draft layers: {args.num_hidden_layers}")
+    print(f"  LR: {args.lr}")
+    print(f"  Precomputed shards: {args.use_precomputed}")
+    print()
+
+    from olmlx.engine.eagle.prepare import prepare_eagle_draft
+
+    output_dir = prepare_eagle_draft(
+        model_path=model_path,
+        use_precomputed=args.use_precomputed,
+        steps=args.steps,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        block_size=args.block_size,
+        num_hidden_layers=args.num_hidden_layers,
+        lr=args.lr,
+        output_dir=args.output,
+        progress_callback=_flash_progress,
+    )
+
+    print("\nEAGLE draft training complete!")
+    print(f"  Output: {output_dir}")
+    print("\nTo use the trained draft:")
+    print("  OLMLX_SPECULATIVE=true \\")
+    print("  OLMLX_SPECULATIVE_STRATEGY=eagle \\")
+    print(f"  OLMLX_SPECULATIVE_DRAFT_MODEL={output_dir} \\")
+    print("  olmlx serve")
+
+
 def cmd_flash_info(args):
     """Show flash preparation info for a model."""
     store = _create_store()
@@ -2369,12 +2430,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument(
         "--speculative-strategy",
         dest="speculative_strategy",
-        choices=("classic", "dflash"),
+        choices=("classic", "dflash", "eagle"),
         default=None,
         help=(
-            "Speculative decoding strategy: 'classic' (standalone draft LM) "
-            "or 'dflash' (block-diffusion draft conditioned on target hidden "
-            "states). Default: classic."
+            "Speculative decoding strategy: 'classic' (standalone draft LM), "
+            "'dflash' (block-diffusion draft conditioned on target hidden "
+            "states), or 'eagle' (autoregressive draft head conditioned on "
+            "target last-layer hidden, arxiv 2401.15077). Default: classic."
         ),
     )
     serve_p.add_argument(
@@ -2721,6 +2783,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory (default: <target-model-dir>/dflash_cache)",
     )
 
+    # EAGLE draft training (arxiv 2401.15077)
+    eagle = sub.add_parser(
+        "eagle", help="EAGLE autoregressive speculative draft training"
+    )
+    eagle_sub = eagle.add_subparsers(dest="eagle_command")
+    eagle_prepare_p = eagle_sub.add_parser(
+        "prepare", help="Train an EAGLE draft model for a target"
+    )
+    eagle_prepare_p.add_argument("model", help="Target model name or HF path")
+    eagle_prepare_p.add_argument(
+        "--use-precomputed",
+        type=str,
+        required=True,
+        help=(
+            "Directory of (input_ids, target_hidden) shards produced by "
+            "`olmlx dflash precompute`. EAGLE consumes the deepest captured "
+            "layer; the same shards work for both DFlash and EAGLE."
+        ),
+    )
+    eagle_prepare_p.add_argument(
+        "--steps", type=int, default=2000, help="Training steps (default: 2000)"
+    )
+    eagle_prepare_p.add_argument(
+        "--batch-size", type=int, default=4, help="Batch size (default: 4)"
+    )
+    eagle_prepare_p.add_argument(
+        "--seq-len", type=int, default=2048, help="Sequence length (default: 2048)"
+    )
+    eagle_prepare_p.add_argument(
+        "--block-size",
+        type=int,
+        default=4,
+        help="Number of draft tokens per verify (default: 4)",
+    )
+    eagle_prepare_p.add_argument(
+        "--num-hidden-layers",
+        type=int,
+        default=1,
+        help="Draft model decoder layer count (default: 1, EAGLE-1 default)",
+    )
+    eagle_prepare_p.add_argument(
+        "--lr", type=float, default=5e-4, help="Peak learning rate (default: 5e-4)"
+    )
+    eagle_prepare_p.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output directory (default: <target-model-dir>/eagle)",
+    )
+
     # Spectral quant calibration
     spectral = sub.add_parser("spectral", help="SpectralQuant KV cache compression")
     spectral_sub = spectral.add_subparsers(dest="spectral_command")
@@ -2852,6 +2964,7 @@ _COMMAND_HANDLERS: dict[tuple[str, str | None], str] = {
     ("flash", "info"): "cmd_flash_info",
     ("dflash", "prepare"): "cmd_dflash_prepare",
     ("dflash", "precompute"): "cmd_dflash_precompute",
+    ("eagle", "prepare"): "cmd_eagle_prepare",
     ("spectral", "prepare"): "cmd_spectral_prepare",
     ("bench", "run"): "cmd_bench_run",
     ("bench", "compare"): "cmd_bench_compare",

@@ -1977,6 +1977,156 @@ class ModelManager:
             block_size=block_size,
         )
 
+    def _load_eagle_decoder(
+        self,
+        target_model: Any,
+        spec_config: SpeculativeConfig,
+    ) -> Any:
+        """Load an EAGLE draft model and create an EagleDecoder.
+
+        Mirrors ``_load_dflash_decoder`` but consumes the EAGLE saved
+        schema (flat target dims plus a top-level ``eagle_config``
+        block carrying ``block_size``). The EAGLE draft has no
+        ``mask_token_id`` or ``target_layer_ids`` — EAGLE conditions
+        on a single target hidden state per step (typically the
+        deepest layer), and the layer is chosen by the decoder
+        (``EagleDecoder.target_layer_id`` defaults to
+        ``num_layers - 1``).
+        """
+        from olmlx.engine.eagle.decoder import EagleDecoder
+        from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
+
+        if not spec_config.enabled:
+            raise RuntimeError(
+                "_load_eagle_decoder called with spec_config.enabled=False"
+            )
+        if not spec_config.draft_model:
+            raise ValueError(
+                "speculative_strategy='eagle' requires speculative_draft_model "
+                "to be set (OLMLX_SPECULATIVE_DRAFT_MODEL or per-model "
+                "'speculative_draft_model' in models.json)"
+            )
+
+        logger.info("Loading EAGLE draft model %s", spec_config.draft_model)
+        load_path = self._resolve_draft_path(spec_config.draft_model)
+
+        config_file = Path(load_path) / "config.json"
+        if not config_file.exists():
+            raise FileNotFoundError(
+                f"EAGLE draft model config not found at {config_file}"
+            )
+
+        draft_cfg_dict = json.loads(config_file.read_text())
+        eagle_cfg = draft_cfg_dict.get("eagle_config")
+        if not isinstance(eagle_cfg, dict):
+            raise ValueError(
+                f"EAGLE draft config at {config_file} is missing the "
+                "'eagle_config' object (must contain 'block_size'). The "
+                "saved checkpoint may be a DFlash draft — pass "
+                "speculative_strategy='dflash' instead, or retrain via "
+                "`olmlx eagle prepare`."
+            )
+        _required_top = [
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "intermediate_size",
+            "vocab_size",
+            "rms_norm_eps",
+            "rope_theta",
+            "max_position_embeddings",
+        ]
+        missing = [k for k in _required_top if k not in draft_cfg_dict]
+        if "block_size" not in eagle_cfg:
+            missing.append("eagle_config.block_size")
+        if missing:
+            raise ValueError(
+                f"EAGLE draft config at {config_file} is missing required "
+                f"keys: {missing}"
+            )
+
+        draft_config = EagleConfig(
+            hidden_size=draft_cfg_dict["hidden_size"],
+            num_hidden_layers=draft_cfg_dict["num_hidden_layers"],
+            num_attention_heads=draft_cfg_dict["num_attention_heads"],
+            num_key_value_heads=draft_cfg_dict["num_key_value_heads"],
+            head_dim=draft_cfg_dict["head_dim"],
+            intermediate_size=draft_cfg_dict["intermediate_size"],
+            vocab_size=draft_cfg_dict["vocab_size"],
+            rms_norm_eps=draft_cfg_dict["rms_norm_eps"],
+            rope_theta=draft_cfg_dict["rope_theta"],
+            max_position_embeddings=draft_cfg_dict["max_position_embeddings"],
+            block_size=int(eagle_cfg["block_size"]),
+            rope_scaling=draft_cfg_dict.get("rope_scaling"),
+        )
+
+        draft_model = EagleDraftModel(draft_config)
+        draft_dir = Path(load_path)
+        # Same conventional-then-fallback search ``_load_dflash_decoder``
+        # uses; comment there explains the precedence rationale.
+        weight_files = sorted(draft_dir.glob("model*.safetensors"))
+        if not weight_files:
+            weight_files = sorted(draft_dir.glob("*.safetensors"))
+        if not weight_files:
+            raise FileNotFoundError(
+                f"EAGLE draft model weights not found in {draft_dir}. "
+                "Train one via `olmlx eagle prepare <target>`."
+            )
+        weights: list[tuple[str, Any]] = []
+        for wf in weight_files:
+            weights.extend(mx.load(str(wf)).items())
+        # ``strict=False`` permits the absent ``embed_tokens`` /
+        # ``lm_head`` (re-bound from target on every prefill).
+        draft_model.load_weights(weights, strict=False)
+        logger.info(
+            "Loaded EAGLE draft weights from %s (%d file(s))",
+            draft_dir,
+            len(weight_files),
+        )
+
+        # Vocab-size check, mirroring the DFlash loader so a
+        # cross-target draft surfaces here rather than at the first
+        # forward pass.
+        target_vocab: int | None = None
+        for chain in ((), ("model",), ("language_model",), ("language_model", "model")):
+            obj: Any = target_model
+            for attr in chain:
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is None:
+                continue
+            args = getattr(obj, "args", None) or getattr(obj, "config", None)
+            v = getattr(args, "vocab_size", None) if args is not None else None
+            if v is not None:
+                target_vocab = int(v)
+                break
+        if target_vocab is None:
+            logger.warning(
+                "Could not determine target vocab_size for EAGLE draft "
+                "compatibility check. A mismatch will surface as an mx.array "
+                "shape error at the first draft forward pass."
+            )
+        elif target_vocab != draft_config.vocab_size:
+            raise ValueError(
+                f"EAGLE draft vocab_size ({draft_config.vocab_size}) does "
+                f"not match target vocab_size ({target_vocab}). The draft "
+                "must be trained against a target with the same vocabulary."
+            )
+
+        block_size = (
+            spec_config.num_tokens
+            if spec_config.num_tokens is not None
+            else draft_config.block_size
+        )
+        return EagleDecoder(
+            target_model=target_model,
+            draft_model=draft_model,
+            block_size=block_size,
+        )
+
     def _load_speculative_decoder(
         self,
         target_model: Any,
@@ -2341,11 +2491,12 @@ class ModelManager:
                 )
                 self._load_chat_template(tok, load_path, hf_path)
                 caps = detect_caps(tok)
-                if spec_enabled and spec_config.strategy == "dflash":
+                if spec_enabled and spec_config.strategy in ("dflash", "eagle"):
                     raise ValueError(
-                        "speculative_strategy='dflash' is not supported on "
-                        "VLM targets. Use speculative_strategy='classic' or "
-                        "remove the speculative settings."
+                        f"speculative_strategy={spec_config.strategy!r} is not "
+                        "supported on VLM targets. Use "
+                        "speculative_strategy='classic' or remove the "
+                        "speculative settings."
                     )
                 if model_exp.flash_speculative:
                     raise ValueError(
@@ -2379,6 +2530,8 @@ class ModelManager:
         if spec_enabled:
             if spec_config.strategy == "dflash":
                 decoder = self._load_dflash_decoder(model, spec_config)
+            elif spec_config.strategy == "eagle":
+                decoder = self._load_eagle_decoder(model, spec_config)
             else:
                 decoder = self._load_speculative_decoder(model, hf_path, spec_config)
             return model, tokenizer, is_vlm, caps, decoder
