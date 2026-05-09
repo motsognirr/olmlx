@@ -219,12 +219,17 @@ class EagleDraftModel(nn.Module):
         self.input_proj = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
         self.layers = [_DecoderLayer(args) for _ in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        # Borrowed at bind() time from the target. Keep as plain
-        # attributes so they don't appear in the saved-weights tree
-        # (would otherwise duplicate the target's huge embed/lm_head
-        # tensors on disk).
-        self.embed_tokens: nn.Module | None = None
-        self.lm_head: nn.Module | None = None
+        # Borrowed at bind() time from the target. Set via
+        # ``object.__setattr__`` (in ``bind``/``unbind``) to bypass
+        # ``nn.Module.__setattr__``, which would register them as
+        # tracked children — that would (a) duplicate the target's huge
+        # embed/lm_head tensors in the draft's saved checkpoint, and
+        # (b) include them in ``draft.parameters()`` so
+        # ``nn.value_and_grad(draft, ...)`` would compute gradients
+        # against the target's frozen weights. Both are silent
+        # correctness/scale failures we want to avoid.
+        object.__setattr__(self, "embed_tokens", None)
+        object.__setattr__(self, "lm_head", None)
 
     def make_cache(self) -> list[KVCache]:
         return [KVCache() for _ in self.layers]
@@ -253,20 +258,22 @@ class EagleDraftModel(nn.Module):
             raise AttributeError(
                 f"Cannot find lm_head on {type(target_model).__name__}"
             )
-        self.embed_tokens = embed
-        self.lm_head = target_model.lm_head
+        # ``object.__setattr__`` keeps these out of the parameter tree
+        # (see ``__init__`` comment) — DO NOT switch to plain ``self.x =``.
+        object.__setattr__(self, "embed_tokens", embed)
+        object.__setattr__(self, "lm_head", target_model.lm_head)
 
     def bind_via_modules(self, embed_tokens: nn.Module, lm_head: nn.Module) -> None:
         """Test-only entry point: bind to externally-provided modules
         without going through a target wrapper. Useful in unit tests
         that want to drive forward without instantiating a fake target.
         """
-        self.embed_tokens = embed_tokens
-        self.lm_head = lm_head
+        object.__setattr__(self, "embed_tokens", embed_tokens)
+        object.__setattr__(self, "lm_head", lm_head)
 
     def unbind(self) -> None:
-        self.embed_tokens = None
-        self.lm_head = None
+        object.__setattr__(self, "embed_tokens", None)
+        object.__setattr__(self, "lm_head", None)
 
     def __call__(
         self,

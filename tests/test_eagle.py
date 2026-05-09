@@ -206,6 +206,35 @@ class TestEagleDraftModelForward:
         assert m.embed_tokens is None
         assert m.lm_head is None
 
+    def test_bound_modules_stay_out_of_parameter_tree(self):
+        # ``bind()`` uses ``object.__setattr__`` so the borrowed modules
+        # don't get registered as nn.Module children. Crucial for
+        # training: if they were tracked, ``nn.value_and_grad(draft,
+        # ...)`` would compute gradients against the target's frozen
+        # weights and ``mlx.utils.tree_flatten(draft.parameters())``
+        # would dump them into the saved checkpoint — duplicating the
+        # ~250M-parameter embed and lm_head tensors. Lock the
+        # invariant in tests.
+        import mlx.utils as mx_utils
+
+        m = self._cfg_and_model()
+        target_embed = nn.Embedding(m.args.vocab_size, m.args.hidden_size)
+        target_lm = nn.Linear(m.args.hidden_size, m.args.vocab_size, bias=False)
+
+        class _FakeInner:
+            embed_tokens = target_embed
+
+        class _FakeTarget:
+            model = _FakeInner()
+            lm_head = target_lm
+
+        m.bind(_FakeTarget())
+        param_keys = {k for k, _ in mx_utils.tree_flatten(m.parameters())}
+        leaked = [k for k in param_keys if k.startswith(("embed_tokens.", "lm_head."))]
+        assert leaked == [], (
+            f"borrowed modules leaked into draft.parameters(): {leaked}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # EagleDecoder synthetic target + tests
