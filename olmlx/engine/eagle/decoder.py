@@ -7,14 +7,24 @@ difference is that EAGLE's draft is **autoregressive in feature
 space** — it consumes ``(token_prev, h_prev)`` and produces ``(logits,
 h_new)``, recursing for ``block_size`` draft tokens before each verify.
 
-Phase B scope
--------------
+Cache management
+----------------
 
-Targets with **trim-able** prompt caches (standard attention; not the
-``GatedDeltaNet`` linear-attention layers in Qwen3.5/3.6 hybrids) are
-fully supported. Hybrid linear-attention targets need ``rollback``
-machinery analogous to DFlash's ``_GDNStateCapture``; that's a Phase C
-follow-up.
+Two regimes, picked at prefill time based on
+``can_trim_prompt_cache``:
+
+- **Trim-able caches** (standard attention; most non-hybrid LMs):
+  ``trim_prompt_cache`` lops the rejected suffix off both target and
+  draft caches at the end of each ``step()``.
+
+- **Non-trim-able caches** (``GatedDeltaNet`` linear-attention layers
+  in Qwen3.5/3.6 hybrids): we install DFlash's ``_GDNStateCapture``
+  to monkey-patch ``GatedDeltaNet.__call__`` and snapshot the
+  recurrent state per layer. After a partial-acceptance verify,
+  ``rollback`` replays ``gated_delta_update`` on the accepted prefix
+  to restore the correct state. The draft cache is always trim-able
+  (the draft is a small standard-attention transformer), so we trim
+  it directly.
 
 Layer hooking is shared with DFlash via ``_patch_model`` /
 ``_get_layers`` / ``_LayerHook`` so we don't reimplement the universal
@@ -29,7 +39,13 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from olmlx.engine.dflash.decoder import _get_layers, _patch_model, _unpatch_model
+from olmlx.engine.dflash.decoder import (
+    _GDNStateCapture,
+    _get_layers,
+    _HAS_GDN,
+    _patch_model,
+    _unpatch_model,
+)
 from olmlx.engine.eagle.draft_model import EagleDraftModel
 from olmlx.engine.speculative import verify_draft_greedy
 
@@ -121,6 +137,12 @@ class EagleDecoder:
         self._seed_hidden: mx.array | None = None
         self._patched: bool = False
         self._bound: bool = False
+        # GDN state capture for non-trim-able targets. Created in
+        # ``prefill`` only when the target cache is non-trim-able
+        # (Qwen3.5/3.6 hybrid linear-attention case). ``None`` for
+        # standard-attention targets that take the trim path.
+        self._capture: _GDNStateCapture | None = None
+        self._target_can_trim: bool = True
 
         # Stats (reset on prefill).
         self._stats_steps = 0
@@ -130,6 +152,14 @@ class EagleDecoder:
     # ----- lifecycle -------------------------------------------------------
 
     def reset(self) -> None:
+        # Close the GDN capture *first* — it holds ``_GDN_PATCH_LOCK``,
+        # and if any of the steps below raises we still want the lock
+        # released so subsequent decoder instances can use the patch.
+        if self._capture is not None:
+            try:
+                self._capture.close()
+            finally:
+                self._capture = None
         if self._patched:
             try:
                 _unpatch_model(self._target)
@@ -144,10 +174,21 @@ class EagleDecoder:
         self._draft_cache = None
         self._seed_token = None
         self._seed_hidden = None
+        self._target_can_trim = True
         self._hidden_storage = [None]
         self._stats_steps = 0
         self._stats_proposed = 0
         self._stats_accepted_draft = 0
+
+    def __del__(self) -> None:
+        # Belt-and-braces: if the decoder is dropped without explicit
+        # ``reset()`` (cancelled request, exception unwinding past the
+        # streaming bridge), the GDN patch lock would otherwise leak.
+        # Mirrors DFlashDecoder's finalizer.
+        try:
+            self.reset()
+        except Exception:
+            pass
 
     def stats_summary(self) -> dict[str, Any]:
         steps = self._stats_steps
@@ -190,19 +231,28 @@ class EagleDecoder:
             if hasattr(self._target, attr):
                 setattr(self._target, attr, None)
 
-        # Reject untrimmable caches up front — this Phase B doesn't
-        # support GDN-style rollback.
-        if can_trim_prompt_cache is not None and not can_trim_prompt_cache(
+        # Pick the cache-trimming regime: trim_prompt_cache for
+        # standard attention, or _GDNStateCapture for hybrid linear-
+        # attention targets whose caches are non-trim-able.
+        self._target_can_trim = can_trim_prompt_cache is None or can_trim_prompt_cache(
             self._target_cache
-        ):
-            self.reset()
-            raise NotImplementedError(
-                "EagleDecoder Phase B requires trim-able prompt caches; "
-                "the target appears to use a non-trimmable cache "
-                "(e.g. GatedDeltaNet linear-attention layers in "
-                "Qwen3.5/3.6 hybrids). GDN rollback support is a Phase "
-                "C follow-up."
-            )
+        )
+        if not self._target_can_trim:
+            if not _HAS_GDN:
+                self.reset()
+                raise RuntimeError(
+                    "Target model has non-trim-able KV cache (likely "
+                    "GatedDeltaNet linear-attention layers) but "
+                    "mlx_lm.models.gated_delta is unavailable. Cannot "
+                    "perform EAGLE rejection rollback."
+                )
+            # Install the patch — must happen *before* the prompt
+            # forward so the patched ``__call__`` records the prompt's
+            # GDN state, which subsequent rollbacks may need to replay
+            # against. ``_GDNStateCapture.__init__`` acquires
+            # ``_GDN_PATCH_LOCK``; ``reset()`` releases it via
+            # ``capture.close()``.
+            self._capture = _GDNStateCapture(self._target)
 
         # Run the target on the prompt and capture its last-layer hidden.
         target_out = self._target(prompt, cache=self._target_cache)
@@ -266,6 +316,12 @@ class EagleDecoder:
         # prediction for position i+1, so logits[0] predicts what
         # *should* follow seed_token (i.e. should match draft[0]),
         # logits[1] should match draft[1], etc.
+        # Clear the GDN capture's per-step state so this verify's
+        # snapshots don't pile on top of last step's. ``rollback``
+        # replays positionally over ``self._capture._gdn_inputs``, so
+        # leftover entries would be applied to the wrong layer.
+        if self._capture is not None:
+            self._capture.clear()
         verify_input = mx.array([[self._seed_token, *draft_tokens]], dtype=mx.int32)
         target_out = self._target(verify_input, cache=self._target_cache)
         target_logits = _logits(target_out)
@@ -294,10 +350,32 @@ class EagleDecoder:
         # (the draft only emits drafts, not the seed). Trim away
         # (block_size - (num_accepted - 1)) = (block_size + 1 - num_accepted).
         draft_trim = (self._block_size + 1) - num_accepted
-        if trim_prompt_cache is not None and target_trim > 0:
-            trim_prompt_cache(self._target_cache, target_trim)
-        # Draft cache trim — same primitive works because it's a list of
-        # KVCache and trim_prompt_cache handles them generically.
+        if target_trim > 0:
+            if self._target_can_trim:
+                if trim_prompt_cache is not None:
+                    trim_prompt_cache(self._target_cache, target_trim)
+            else:
+                # Hybrid linear-attention path. ``_capture`` was created
+                # in prefill; same control-flow invariant guards as
+                # DFlash's ``step``.
+                if self._capture is None:
+                    raise RuntimeError(
+                        "EagleDecoder internal invariant violated: target "
+                        "cache is non-trim-able but no GDN capture was "
+                        "installed. This is an olmlx bug."
+                    )
+                # ``rollback(cache, accepted, trim)``: ``accepted`` is
+                # the count of *draft* tokens accepted (excluding the
+                # seed and the bonus position) — for EAGLE that's
+                # ``num_accepted - 1`` because the seed is included in
+                # the verify input but is also already in the cache
+                # from the previous step's accepted tail.
+                self._capture.rollback(
+                    self._target_cache, num_accepted - 1, target_trim
+                )
+        # Draft cache trim — the draft is always a standard-attention
+        # transformer with trim-able KVCache, so this path is the same
+        # regardless of target architecture.
         if trim_prompt_cache is not None and draft_trim > 0:
             trim_prompt_cache(self._draft_cache, draft_trim)
 
