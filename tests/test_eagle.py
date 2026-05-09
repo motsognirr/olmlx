@@ -6,6 +6,8 @@ Covers:
 - ``EagleDraftModel`` construction, forward pass, and weight shapes
 - ``bind`` / ``unbind`` for sharing target's ``embed_tokens`` and
   ``lm_head`` (mirrors the DFlash pattern)
+- ``EagleDecoder`` prefill / step / reset against a synthetic
+  trim-able target (Phase B scope)
 """
 
 from __future__ import annotations
@@ -203,3 +205,212 @@ class TestEagleDraftModelForward:
         m.unbind()
         assert m.embed_tokens is None
         assert m.lm_head is None
+
+
+# ---------------------------------------------------------------------------
+# EagleDecoder synthetic target + tests
+# ---------------------------------------------------------------------------
+
+
+class _SimpleAttn(nn.Module):
+    """Minimal self-attention shim for the synthetic target.
+
+    Just enough to populate a ``KVCache`` so ``trim_prompt_cache`` has
+    something to trim. Returns ``Linear(x)`` regardless of attention
+    arithmetic; the synthetic test doesn't exercise correctness of
+    attention outputs, only the cache lifecycle and the
+    layer-output-capture path.
+    """
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.n_heads = 1
+        self.n_kv_heads = 1
+        self.head_dim = hidden_size
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def __call__(self, x, mask=None, cache=None):
+        if cache is not None:
+            B, L, D = x.shape
+            kv = x.reshape(B, 1, L, D)
+            cache.update_and_fetch(kv, kv)
+        return self.proj(x)
+
+
+class _SimpleLayer(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.self_attn = _SimpleAttn(hidden_size)
+
+    def __call__(self, x, mask=None, cache=None):
+        return x + self.self_attn(x, mask=mask, cache=cache)
+
+
+class _Inner(nn.Module):
+    def __init__(self, vocab, hidden, num_layers):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab, hidden)
+        self.layers = [_SimpleLayer(hidden) for _ in range(num_layers)]
+        self.norm = nn.RMSNorm(hidden)
+
+
+class _SyntheticTarget(nn.Module):
+    """Tiny target with a layers list (so ``_patch_model`` works) and a
+    trim-able prompt cache (one ``KVCache`` per layer)."""
+
+    def __init__(self, vocab=64, hidden=32, num_layers=3):
+        super().__init__()
+        self.model = _Inner(vocab, hidden, num_layers)
+        self.lm_head = nn.Linear(hidden, vocab, bias=False)
+
+    @property
+    def layers(self):
+        # Used by mlx_lm.models.cache.make_prompt_cache to introspect
+        # the layer count.
+        return self.model.layers
+
+    def __call__(self, input_ids, cache=None):
+        h = self.model.embed_tokens(input_ids)
+        for i, layer in enumerate(self.model.layers):
+            layer_cache = cache[i] if cache is not None else None
+            h = layer(h, cache=layer_cache)
+        h = self.model.norm(h)
+        return self.lm_head(h)
+
+
+def _make_decoder(vocab=64, hidden=32, num_layers=3, block_size=2):
+    """Construct (decoder, target, draft) with bound weights."""
+    from olmlx.engine.eagle.decoder import EagleDecoder
+    from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
+
+    target = _SyntheticTarget(vocab=vocab, hidden=hidden, num_layers=num_layers)
+    cfg = EagleConfig(
+        hidden_size=hidden,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=hidden // 2,
+        intermediate_size=hidden * 2,
+        vocab_size=vocab,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        max_position_embeddings=512,
+        block_size=block_size,
+    )
+    draft = EagleDraftModel(cfg)
+    decoder = EagleDecoder(target, draft, block_size=block_size)
+    return decoder, target, draft
+
+
+class TestEagleDecoderLifecycle:
+    """Construction + reset semantics. No prefill yet."""
+
+    def test_construction_uses_last_layer_by_default(self):
+        decoder, target, _ = _make_decoder(num_layers=4)
+        # 4 layers → default capture id is 3.
+        assert decoder._target_layer_id == 3
+
+    def test_construction_rejects_zero_block_size(self):
+        from olmlx.engine.eagle.decoder import EagleDecoder
+        from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
+
+        target = _SyntheticTarget()
+        cfg = EagleConfig(
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            intermediate_size=64,
+            vocab_size=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            max_position_embeddings=512,
+            block_size=4,
+        )
+        with pytest.raises(ValueError, match="block_size"):
+            EagleDecoder(target, EagleDraftModel(cfg), block_size=0)
+
+    def test_step_before_prefill_raises(self):
+        decoder, _, _ = _make_decoder()
+        with pytest.raises(RuntimeError, match="prefill"):
+            decoder.step()
+
+    def test_reset_clears_state(self):
+        decoder, _, _ = _make_decoder()
+        prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+        decoder.prefill(prompt)
+        # Caches are populated.
+        assert decoder._target_cache is not None
+        assert decoder._draft_cache is not None
+        decoder.reset()
+        assert decoder._target_cache is None
+        assert decoder._draft_cache is None
+        assert decoder._seed_token is None
+        assert decoder._seed_hidden is None
+        assert not decoder._patched
+        assert not decoder._bound
+
+
+class TestEagleDecoderPrefillStep:
+    """End-to-end protocol: prefill, then step produces accepted tokens."""
+
+    def test_prefill_returns_token_id(self):
+        decoder, target, _ = _make_decoder()
+        prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+        first = decoder.prefill(prompt)
+        assert isinstance(first, int)
+        # vocab is 64 in the synthetic target.
+        assert 0 <= first < 64
+
+    def test_prefill_captures_target_hidden(self):
+        decoder, _, _ = _make_decoder(hidden=32)
+        prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+        decoder.prefill(prompt)
+        # Seed hidden has shape (1, 1, hidden_size).
+        assert decoder._seed_hidden is not None
+        assert decoder._seed_hidden.shape == (1, 1, 32)
+
+    def test_step_returns_at_least_one_token(self):
+        # ``verify_draft_greedy`` always returns at least one token (the
+        # target's preferred token at the first mismatch, or a bonus if
+        # all drafts accepted).
+        decoder, _, _ = _make_decoder(block_size=2)
+        prompt = mx.array([[5, 7, 9]], dtype=mx.int32)
+        decoder.prefill(prompt)
+        accepted, num_drafts = decoder.step()
+        assert 1 <= len(accepted) <= 3  # block_size + 1
+        assert 0 <= num_drafts <= 2  # block_size
+
+    def test_step_advances_seed_state(self):
+        # The seed token must rotate to the last accepted token after
+        # each step; the seed hidden must change shape-wise stay (1,1,H)
+        # but the contents should differ from prefill.
+        decoder, _, _ = _make_decoder(block_size=2)
+        prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+        first_token = decoder.prefill(prompt)
+        seed_h_before = decoder._seed_hidden
+        accepted, _ = decoder.step()
+        assert decoder._seed_token == accepted[-1]
+        assert decoder._seed_hidden is not None
+        assert decoder._seed_hidden.shape == seed_h_before.shape
+        # If the very first step produced 1 accepted token (= target's
+        # first prediction), and that matched ``first_token``, we'd
+        # not rotate. Avoid asserting strict change; just confirm the
+        # decoder stayed consistent.
+        _ = first_token
+
+    def test_two_consecutive_steps(self):
+        # Two back-to-back steps must not crash and must return
+        # consistently-shaped accepted lists.
+        decoder, _, _ = _make_decoder(block_size=2)
+        prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+        decoder.prefill(prompt)
+        a1, _ = decoder.step()
+        a2, _ = decoder.step()
+        assert len(a1) >= 1
+        assert len(a2) >= 1
+        # Stats accumulate.
+        s = decoder.stats_summary()
+        assert s["steps"] == 2
+        assert s["proposed"] == 4  # 2 * block_size

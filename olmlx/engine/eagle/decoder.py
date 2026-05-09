@@ -1,0 +1,316 @@
+"""EAGLE decoder: prefill / step / reset protocol over an EAGLE draft.
+
+Mirrors the same ``SpeculativeDecoder`` protocol used by classic
+speculative decoding and DFlash, so the existing
+``speculative_stream_generate`` bridge works unchanged. The crucial
+difference is that EAGLE's draft is **autoregressive in feature
+space** — it consumes ``(token_prev, h_prev)`` and produces ``(logits,
+h_new)``, recursing for ``block_size`` draft tokens before each verify.
+
+Phase B scope
+-------------
+
+Targets with **trim-able** prompt caches (standard attention; not the
+``GatedDeltaNet`` linear-attention layers in Qwen3.5/3.6 hybrids) are
+fully supported. Hybrid linear-attention targets need ``rollback``
+machinery analogous to DFlash's ``_GDNStateCapture``; that's a Phase C
+follow-up.
+
+Layer hooking is shared with DFlash via ``_patch_model`` /
+``_get_layers`` / ``_LayerHook`` so we don't reimplement the universal
+target-layer-output capture pattern.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from olmlx.engine.dflash.decoder import _get_layers, _patch_model, _unpatch_model
+from olmlx.engine.eagle.draft_model import EagleDraftModel
+from olmlx.engine.speculative import verify_draft_greedy
+
+try:
+    from mlx_lm.models.cache import (
+        can_trim_prompt_cache,
+        make_prompt_cache,
+        trim_prompt_cache,
+    )
+except ImportError:  # pragma: no cover - mlx-lm always installed in production
+    make_prompt_cache = None  # type: ignore[assignment]
+    trim_prompt_cache = None  # type: ignore[assignment]
+    can_trim_prompt_cache = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
+
+
+def _logits(out: Any) -> mx.array:
+    # mlx-vlm wraps logits in a dataclass; mlx-lm returns the raw array.
+    return getattr(out, "logits", out)
+
+
+class EagleDecoder:
+    """Autoregressive draft + verify protocol for EAGLE.
+
+    State transitions
+    -----------------
+
+    ``prefill(prompt_tokens)``:
+        1. Patch the target's chosen layer with a capture hook.
+        2. Run the target on the full prompt; record its last-layer
+           hidden states and final logits.
+        3. Sample a first token from the target's logits at the
+           prompt-tail position. Hold that token + the corresponding
+           hidden as the seed for ``step()``.
+
+    ``step()``:
+        1. Run the draft autoregressively for ``block_size`` iterations,
+           seeding from the held ``(token, hidden)`` and feeding each
+           subsequent step its own ``(sampled_token, h_new)``. Collect
+           ``block_size`` candidate tokens.
+        2. Run the target on
+           ``[seed_token, *candidates]`` (length ``block_size + 1``),
+           capturing logits and the target's last-layer hidden via the
+           hook installed in prefill.
+        3. ``verify_draft_greedy`` over the captured logits → list of
+           accepted tokens.
+        4. Trim both caches back to the accepted prefix; rotate
+           ``(seed_token, seed_hidden)`` to the last accepted token
+           and the target's hidden at that position.
+        5. Return the accepted tokens.
+
+    ``reset()``:
+        Clear caches, unpatch the target, unbind the draft.
+    """
+
+    def __init__(
+        self,
+        target_model: nn.Module,
+        draft_model: EagleDraftModel,
+        block_size: int = 4,
+        target_layer_id: int | None = None,
+    ):
+        if make_prompt_cache is None:
+            raise RuntimeError(
+                "mlx_lm.models.cache is unavailable; EagleDecoder requires it "
+                "for prompt-cache management."
+            )
+        if block_size < 1:
+            raise ValueError(f"block_size must be >= 1; got {block_size}")
+        self._target = target_model
+        self._draft = draft_model
+        self._block_size = block_size
+        # Default to the deepest layer minus one (penultimate). The very
+        # last decoder block in mlx-lm's text models often runs the
+        # final RMSNorm internally before lm_head; capturing one layer
+        # earlier yields a cleaner conditioning signal in practice.
+        # Operators can override via ``target_layer_id``.
+        if target_layer_id is None:
+            num = len(_get_layers(target_model))
+            target_layer_id = num - 1
+        self._target_layer_id = target_layer_id
+        self._hidden_storage: list[Any] = [None]
+
+        # Per-request state populated by ``prefill``.
+        self._target_cache: list | None = None
+        self._draft_cache: list | None = None
+        self._seed_token: int | None = None
+        self._seed_hidden: mx.array | None = None
+        self._patched: bool = False
+        self._bound: bool = False
+
+        # Stats (reset on prefill).
+        self._stats_steps = 0
+        self._stats_proposed = 0
+        self._stats_accepted_draft = 0
+
+    # ----- lifecycle -------------------------------------------------------
+
+    def reset(self) -> None:
+        if self._patched:
+            try:
+                _unpatch_model(self._target)
+            finally:
+                self._patched = False
+        if self._bound:
+            try:
+                self._draft.unbind()
+            finally:
+                self._bound = False
+        self._target_cache = None
+        self._draft_cache = None
+        self._seed_token = None
+        self._seed_hidden = None
+        self._hidden_storage = [None]
+        self._stats_steps = 0
+        self._stats_proposed = 0
+        self._stats_accepted_draft = 0
+
+    def stats_summary(self) -> dict[str, Any]:
+        steps = self._stats_steps
+        proposed = self._stats_proposed
+        accepted_draft = self._stats_accepted_draft
+        return {
+            "steps": steps,
+            "proposed": proposed,
+            "accepted_draft": accepted_draft,
+            "acceptance_rate": accepted_draft / proposed if proposed else 0.0,
+            "avg_tokens_per_step": (accepted_draft + steps) / steps if steps else 0.0,
+            "block_size": self._block_size,
+        }
+
+    # ----- prefill ---------------------------------------------------------
+
+    def prefill(self, prompt: mx.array) -> int:
+        """Run the target on the prompt; return the first sampled token.
+
+        ``prompt`` shape: ``(1, seq_len)`` int tokens. After prefill the
+        decoder holds the target's last-layer hidden at position
+        ``seq_len - 1`` and the greedily-sampled first token.
+        """
+        self.reset()
+
+        # Hook the chosen target layer so its output is captured into
+        # ``_hidden_storage[0]`` on every target forward.
+        _patch_model(self._target, [self._target_layer_id], self._hidden_storage)
+        self._patched = True
+        self._draft.bind(self._target)
+        self._bound = True
+
+        # Build fresh caches for both models.
+        self._target_cache = make_prompt_cache(self._target)
+        self._draft_cache = self._draft.make_cache()
+
+        # Reset transient mlx-vlm state if present (mirrors classic
+        # SpeculativeDecoder).
+        for attr in ("_position_ids", "_rope_deltas"):
+            if hasattr(self._target, attr):
+                setattr(self._target, attr, None)
+
+        # Reject untrimmable caches up front — this Phase B doesn't
+        # support GDN-style rollback.
+        if can_trim_prompt_cache is not None and not can_trim_prompt_cache(
+            self._target_cache
+        ):
+            self.reset()
+            raise NotImplementedError(
+                "EagleDecoder Phase B requires trim-able prompt caches; "
+                "the target appears to use a non-trimmable cache "
+                "(e.g. GatedDeltaNet linear-attention layers in "
+                "Qwen3.5/3.6 hybrids). GDN rollback support is a Phase "
+                "C follow-up."
+            )
+
+        # Run the target on the prompt and capture its last-layer hidden.
+        target_out = self._target(prompt, cache=self._target_cache)
+        target_logits = _logits(target_out)
+        captured = self._hidden_storage[0]
+        if captured is None:
+            self.reset()
+            raise RuntimeError(
+                "EagleDecoder prefill: target forward did not populate the "
+                f"hidden capture slot for layer {self._target_layer_id}. "
+                "Either ``_patch_model`` is incompatible with this target "
+                "structure, or the chosen layer wasn't visited."
+            )
+
+        # Greedy sample at the prompt-tail position.
+        last_logits = target_logits[:, -1:, :]
+        seed_token = int(mx.argmax(last_logits, axis=-1).item())
+        # Hidden at the prompt-tail position becomes the conditioning
+        # for the first draft step.
+        self._seed_hidden = captured[:, -1:, :]
+        self._seed_token = seed_token
+        return seed_token
+
+    # ----- step ------------------------------------------------------------
+
+    def step(self) -> tuple[list[int], int]:
+        """Generate ``block_size`` draft candidates, verify against the
+        target, return ``(accepted_tokens, num_accepted_draft)``.
+
+        ``num_accepted_draft`` is the number of *draft* tokens accepted
+        (between 0 and ``block_size``). The returned ``accepted_tokens``
+        list always has length ``num_accepted_draft + 1``: zero or more
+        accepted draft tokens followed by the target's preferred token
+        at the first mismatch (or the target's bonus token if all
+        drafts were accepted).
+        """
+        if self._target_cache is None or self._draft_cache is None:
+            raise RuntimeError(
+                "EagleDecoder.step() called before prefill(); call "
+                "prefill(prompt) to populate caches first."
+            )
+        if self._seed_token is None or self._seed_hidden is None:
+            raise RuntimeError("EagleDecoder.step(): seed state is unset")
+
+        # ---- Draft phase: produce block_size candidates autoregressively.
+        draft_tokens: list[int] = []
+        cur_token = self._seed_token
+        cur_hidden = self._seed_hidden
+        for _ in range(self._block_size):
+            tok_in = mx.array([[cur_token]], dtype=mx.int32)
+            logits, h_new = self._draft(
+                token_ids=tok_in, h_prev=cur_hidden, cache=self._draft_cache
+            )
+            sampled = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+            draft_tokens.append(sampled)
+            cur_token = sampled
+            cur_hidden = h_new
+
+        # ---- Verify phase: target forward on [seed_token, *drafts].
+        # Length is block_size + 1; target's logit at position i is its
+        # prediction for position i+1, so logits[0] predicts what
+        # *should* follow seed_token (i.e. should match draft[0]),
+        # logits[1] should match draft[1], etc.
+        verify_input = mx.array([[self._seed_token, *draft_tokens]], dtype=mx.int32)
+        target_out = self._target(verify_input, cache=self._target_cache)
+        target_logits = _logits(target_out)
+        captured = self._hidden_storage[0]
+        if captured is None:
+            raise RuntimeError(
+                "EagleDecoder.step: target verify did not populate the "
+                "hidden capture slot."
+            )
+
+        # ``verify_draft_greedy`` expects the per-position-prediction
+        # logits, i.e. shape (n+1, vocab) where n = len(draft_tokens).
+        # ``target_logits`` is (B=1, n+1, vocab); squeeze batch.
+        flat_logits = target_logits[0]
+        accepted = verify_draft_greedy(draft_tokens, flat_logits)
+
+        # ---- Cache trimming + state rotation.
+        # We accepted ``num_accepted = len(accepted)`` tokens. The
+        # caches grew by block_size+1 (target) and block_size (draft)
+        # during this step. Trim them back to the accepted prefix.
+        num_accepted = len(accepted)
+        # Target cache grew by block_size + 1; we keep num_accepted
+        # tokens; trim away (block_size + 1 - num_accepted).
+        target_trim = (self._block_size + 1) - num_accepted
+        # Draft cache grew by block_size; we keep num_accepted - 1
+        # (the draft only emits drafts, not the seed). Trim away
+        # (block_size - (num_accepted - 1)) = (block_size + 1 - num_accepted).
+        draft_trim = (self._block_size + 1) - num_accepted
+        if trim_prompt_cache is not None and target_trim > 0:
+            trim_prompt_cache(self._target_cache, target_trim)
+        # Draft cache trim — same primitive works because it's a list of
+        # KVCache and trim_prompt_cache handles them generically.
+        if trim_prompt_cache is not None and draft_trim > 0:
+            trim_prompt_cache(self._draft_cache, draft_trim)
+
+        # New seed: the last accepted token, with target's hidden at
+        # the corresponding position. captured spans positions
+        # [0..block_size]; the last accepted-draft position is
+        # num_accepted - 1.
+        self._seed_token = accepted[-1]
+        self._seed_hidden = captured[:, num_accepted - 1 : num_accepted, :]
+
+        # Stats.
+        self._stats_steps += 1
+        self._stats_proposed += self._block_size
+        self._stats_accepted_draft += max(num_accepted - 1, 0)
+
+        return accepted, max(num_accepted - 1, 0)
