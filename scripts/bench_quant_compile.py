@@ -251,14 +251,30 @@ def bench_spectralquant(
 
         b_d = _bench(
             lambda: _sq_dequantize_baseline(
-                ps, pt, nrm, rot, cb_sem, cb_tail, d_eff, bits_high, bits_low,
+                ps,
+                pt,
+                nrm,
+                rot,
+                cb_sem,
+                cb_tail,
+                d_eff,
+                bits_high,
+                bits_low,
                 mx.float16,
             ),
             iters,
         )
         c_d = _bench(
             lambda: spectral_dequantize(
-                ps, pt, nrm, rot, cb_sem, cb_tail, d_eff, bits_high, bits_low,
+                ps,
+                pt,
+                nrm,
+                rot,
+                cb_sem,
+                cb_tail,
+                d_eff,
+                bits_high,
+                bits_low,
                 dtype=mx.float16,
             ),
             iters,

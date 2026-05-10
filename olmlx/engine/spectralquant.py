@@ -193,10 +193,10 @@ def _make_codebook_argmin(n_levels: int, dim_outer: int):
     already specialized for the chosen strategy.
     """
     use_loop = (
-        n_levels <= _LOOP_ARGMIN_CUTOFF
-        or dim_outer * n_levels > _ARGMIN_BROADCAST_CAP
+        n_levels <= _LOOP_ARGMIN_CUTOFF or dim_outer * n_levels > _ARGMIN_BROADCAST_CAP
     )
     if use_loop:
+
         def _loop(y: mx.array, codebook: mx.array) -> mx.array:
             best_dist = mx.abs(y - codebook[0])
             best_idx = mx.array(0, dtype=mx.uint8)
@@ -206,11 +206,13 @@ def _make_codebook_argmin(n_levels: int, dim_outer: int):
                 best_idx = mx.where(better, ci, best_idx).astype(mx.uint8)
                 best_dist = mx.where(better, d, best_dist)
             return best_idx
+
         return _loop
 
     def _vec(y: mx.array, codebook: mx.array) -> mx.array:
         dists = mx.abs(y[..., None] - codebook)
         return mx.argmin(dists, axis=-1).astype(mx.uint8)
+
     return _vec
 
 
@@ -328,9 +330,7 @@ def spectral_dequantize(
     idx_sem = unpack_indices(packed_sem, bits_high, d_eff)
     idx_tail = unpack_indices(packed_tail, bits_low, d_tail)
 
-    fn = _compiled_spectral_dequant_core(
-        idx_sem.shape, idx_tail.shape, norms.dtype
-    )
+    fn = _compiled_spectral_dequant_core(idx_sem.shape, idx_tail.shape, norms.dtype)
     result = fn(idx_sem, idx_tail, norms, rotation.V, codebook_sem, codebook_tail)
     return result.astype(dtype) if dtype is not None else result
 

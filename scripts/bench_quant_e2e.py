@@ -150,10 +150,10 @@ def _run(
     decode_tps = (n_decoded - 1) / decode_elapsed if decode_elapsed > 0 else 0.0
 
     print(
-        f"  prefill: {first_token_latency*1000:8.1f} ms  ({prefill_tps:7.1f} tok/s)\n"
-        f"  decode : {decode_elapsed*1000:8.1f} ms over {n_decoded - 1} tokens"
+        f"  prefill: {first_token_latency * 1000:8.1f} ms  ({prefill_tps:7.1f} tok/s)\n"
+        f"  decode : {decode_elapsed * 1000:8.1f} ms over {n_decoded - 1} tokens"
         f"  ({decode_tps:7.1f} tok/s)\n"
-        f"  total  : {total*1000:8.1f} ms"
+        f"  total  : {total * 1000:8.1f} ms"
     )
     return {
         "prefill_ms": first_token_latency * 1000 if first_token_latency else 0.0,
@@ -196,7 +196,7 @@ def main() -> None:
                 prompt,
                 args.gen_tokens,
                 args.bits,
-                f"compiled #{i+1}",
+                f"compiled #{i + 1}",
             )
         )
     with use_baseline():
@@ -208,7 +208,7 @@ def main() -> None:
                     prompt,
                     args.gen_tokens,
                     args.bits,
-                    f"baseline #{i+1}",
+                    f"baseline #{i + 1}",
                 )
             )
 
