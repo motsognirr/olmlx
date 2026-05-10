@@ -64,6 +64,10 @@ class TurboQuantRotation:
         random_matrix = rng.randn(head_dim, head_dim).astype(np.float32)
         q, _ = np.linalg.qr(random_matrix)
         self.matrix: mx.array = mx.array(q)
+        # Precompute the transpose once; the quantize hot path (every layer,
+        # every step) would otherwise allocate a fresh transposed view per
+        # call. Mirrors what SpectralRotation already does for V_T.
+        self.matrix_T: mx.array = self.matrix.T
 
 
 def pack_indices(indices: mx.array, bits: int) -> mx.array:
@@ -165,7 +169,7 @@ def turboquant_quantize(
     codebook = get_codebook(bits, head_dim)
     n_levels = 1 << bits
     fn = _compiled_quantize_core(n_levels, x.shape, x.dtype)
-    best_idx, norms = fn(x, rotation.matrix.T, codebook)
+    best_idx, norms = fn(x, rotation.matrix_T, codebook)
     return pack_indices(best_idx, bits), norms
 
 

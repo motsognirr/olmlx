@@ -226,10 +226,14 @@ def main() -> None:
     comp_decode_tps = mean(runs_compiled, "decode_tps")
     base_prefill_tps = mean(runs_baseline, "prefill_tps")
     comp_prefill_tps = mean(runs_compiled, "prefill_tps")
+
+    def _speedup(comp: float, base: float) -> str:
+        return f"{comp / base:5.2f}×" if base > 0 else "  n/a "
+
     print(
-        f"\n  decode  speedup: {comp_decode_tps / base_decode_tps:5.2f}× "
+        f"\n  decode  speedup: {_speedup(comp_decode_tps, base_decode_tps)} "
         f"({base_decode_tps:.1f} → {comp_decode_tps:.1f} tok/s)\n"
-        f"  prefill speedup: {comp_prefill_tps / base_prefill_tps:5.2f}× "
+        f"  prefill speedup: {_speedup(comp_prefill_tps, base_prefill_tps)} "
         f"({base_prefill_tps:.1f} → {comp_prefill_tps:.1f} tok/s)"
     )
 
