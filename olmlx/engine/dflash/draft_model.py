@@ -58,6 +58,7 @@ class DraftConfig:
     layer_types: tuple[str, ...] = field(default_factory=tuple)
     sliding_window: int | None = None
     final_logit_softcapping: float | None = None
+    attention_causal: bool = False
 
     def __post_init__(self) -> None:
         if not self.layer_types:
@@ -131,6 +132,7 @@ class DFlashAttention(nn.Module):
         self.scale = self.head_dim**-0.5
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
+        self.causal = config.attention_causal
 
         self.q_proj = nn.Linear(
             config.hidden_size, self.n_heads * self.head_dim, bias=False
@@ -198,7 +200,7 @@ class DFlashAttention(nn.Module):
         values = mx.concatenate([values, prop_values], axis=2)
 
         ctx_len = keys.shape[2] - L
-        mask = None
+        mask = "causal" if self.causal else None
         if self.is_sliding and ctx_len + L > (self.sliding_window or 0):
             mask = create_causal_mask(
                 L, offset=ctx_len, window_size=self.sliding_window

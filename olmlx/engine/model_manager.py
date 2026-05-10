@@ -739,6 +739,29 @@ def parse_keep_alive(value: str | int) -> float | None:
     return float(num * multipliers[unit])
 
 
+def _resolve_attention_causal(dflash_cfg: dict) -> bool:
+    """Detect legacy draft checkpoints that were trained with causal attention.
+
+    DFlash draft attention switched from causal to bidirectional (mask=None)
+    in v2. Checkpoints carrying ``dflash_attention_version`` >= 2 use
+    bidirectional; version 1 or missing defaults to causal with a warning
+    so operators know to re-train.
+    """
+    version = dflash_cfg.get("dflash_attention_version", 1)
+    if not isinstance(version, int):
+        version = 1
+    if version >= 2:
+        return False
+    logger.warning(
+        "DFlash draft checkpoint was trained with causal attention "
+        "(dflash_attention_version=%s < 2). Re-training with the current "
+        "code is recommended — running an old checkpoint produces a "
+        "distribution mismatch that degrades acceptance rate.",
+        version,
+    )
+    return True
+
+
 class ModelManager:
     """Manages loading/unloading of MLX models with LRU eviction."""
 
@@ -1837,6 +1860,7 @@ class ModelManager:
             layer_types=tuple(layer_types_raw),
             sliding_window=draft_cfg_dict.get("sliding_window"),
             final_logit_softcapping=draft_cfg_dict.get("final_logit_softcapping"),
+            attention_causal=_resolve_attention_causal(dflash_cfg),
         )
 
         draft_model = DFlashDraftModel(draft_config)

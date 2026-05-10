@@ -236,23 +236,31 @@ def _build_draft_config(
     # the correct value. Read ``rope_theta`` from each source in priority
     # order instead.
     rope_params_inner = text_cfg.get("rope_parameters")
-    rope_params_outer = target_cfg.get("rope_parameters") if text_cfg is not target_cfg else None
+    rope_params_outer = (
+        target_cfg.get("rope_parameters") if text_cfg is not target_cfg else None
+    )
     if text_cfg.get("rope_theta") is not None:
         rope_theta = float(text_cfg["rope_theta"])
-    elif isinstance(rope_params_inner, dict) and rope_params_inner.get("rope_theta") is not None:
+    elif (
+        isinstance(rope_params_inner, dict)
+        and rope_params_inner.get("rope_theta") is not None
+    ):
         rope_theta = float(rope_params_inner["rope_theta"])
-    elif isinstance(rope_params_outer, dict) and rope_params_outer.get("rope_theta") is not None:
+    elif (
+        isinstance(rope_params_outer, dict)
+        and rope_params_outer.get("rope_theta") is not None
+    ):
         rope_theta = float(rope_params_outer["rope_theta"])
     else:
-        # Fall through silently with the legacy 10000.0 only as a last
-        # resort, but log loudly: modern long-context targets
-        # (Qwen3.5+, Qwen3.6) use 10_000_000 — three orders of
-        # magnitude higher — and a misconfigured RoPE base produces a
-        # draft whose attention frequencies are incompatible with the
-        # positions the target was trained on. The acceptance failure
-        # only shows up at inference time, far from the cause.
+        # ``logger.error`` rather than just ``warning``: the fallback
+        # value is off by 1000× for modern long-context targets
+        # (Qwen3.5+, Qwen3.6 use 10_000_000), producing a draft whose
+        # RoPE frequencies are incompatible with the positions the
+        # target was trained on. The near-zero acceptance rate only
+        # shows up at inference time, far from the cause, so surface
+        # this loudly.
         rope_theta = 10000.0
-        logger.warning(
+        logger.error(
             "No 'rope_theta' found at the top level or under "
             "'rope_parameters' in the target config — falling back to "
             "10000.0. Long-context targets (Qwen3.5+, Qwen3.6) typically "
@@ -458,6 +466,10 @@ def _select_pivot(
     Python's ``random.randint`` requires a host int. We accept that
     rather than calling ``mx.random.randint(...).item()`` in the hot
     loop, which would also sync but additionally drain the lazy graph.
+    This is an intentional trade-off vs. the original design that
+    avoided MLX syncs entirely; the sync cost is amortised by the
+    dominant target-forward-pass time and the correctness gain from
+    precise trailing-pad detection.
     """
     seq_len = input_ids.shape[1]
     # Find the right-padded prefix boundary by counting *trailing* pads,
@@ -1081,6 +1093,7 @@ def _draft_config_to_disk(cfg: DraftConfig) -> dict[str, Any]:
         "dflash_config": {
             "target_layer_ids": list(cfg.target_layer_ids),
             "mask_token_id": cfg.mask_token_id,
+            "dflash_attention_version": 2,
         },
     }
     if cfg.rope_scaling is not None:
