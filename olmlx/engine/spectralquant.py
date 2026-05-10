@@ -216,7 +216,7 @@ def _make_codebook_argmin(n_levels: int, dim_outer: int):
     return _vec
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=128)
 def _compiled_spectral_quantize_full(
     n_levels_sem: int,
     n_levels_tail: int,
@@ -227,7 +227,9 @@ def _compiled_spectral_quantize_full(
     """Compiled (norm + rotate + split + per-regime argmin) kernel.
 
     Cached per full input signature because mlx 0.31's compile bakes leading
-    tensor dims into the trace.
+    tensor dims into the trace. Decode (``seq_len=1``) is one stable entry on
+    the latency-critical path; ``maxsize`` is sized to absorb varied prefill
+    lengths before LRU eviction forces recompile.
     """
     head_dim = x_shape[-1]
     d_tail = head_dim - d_eff
@@ -330,18 +332,32 @@ def spectral_dequantize(
     idx_sem = unpack_indices(packed_sem, bits_high, d_eff)
     idx_tail = unpack_indices(packed_tail, bits_low, d_tail)
 
-    fn = _compiled_spectral_dequant_core(idx_sem.shape, idx_tail.shape, norms.dtype)
+    fn = _compiled_spectral_dequant_core(
+        idx_sem.shape,
+        idx_tail.shape,
+        norms.dtype,
+        codebook_sem.shape[0],
+        codebook_tail.shape[0],
+    )
     result = fn(idx_sem, idx_tail, norms, rotation.V, codebook_sem, codebook_tail)
     return result.astype(dtype) if dtype is not None else result
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=128)
 def _compiled_spectral_dequant_core(
-    sem_shape: tuple, tail_shape: tuple, norms_dtype: mx.Dtype
+    sem_shape: tuple,
+    tail_shape: tuple,
+    norms_dtype: mx.Dtype,
+    n_levels_sem: int,
+    n_levels_tail: int,
 ):
     """Compiled (gather both regimes + concat + inverse rotate + rescale).
 
-    Cached per shape signature for the same reason as the quantize kernel.
+    Cached per shape signature plus codebook sizes. ``unpack_indices`` strips
+    the bit-width from the index shape, so without explicit ``n_levels_*``
+    keys two models with different ``bits_high``/``bits_low`` but matching
+    ``d_eff`` would alias to one compiled trace and force re-tracing under
+    multi-model LRU loading.
     """
 
     @mx.compile

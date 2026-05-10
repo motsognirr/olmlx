@@ -100,11 +100,9 @@ def _build_prompt(tokenizer, target_tokens: int) -> str:
         "consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et "
         "dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation. "
     )
-    text = ""
-    while len(tokenizer.encode(text)) < target_tokens:
-        text += base
-    # Trim back to roughly the requested length
-    ids = tokenizer.encode(text)[:target_tokens]
+    base_ids = tokenizer.encode(base)
+    repeats = (target_tokens // max(len(base_ids), 1)) + 2
+    ids = (base_ids * repeats)[:target_tokens]
     return tokenizer.decode(ids)
 
 

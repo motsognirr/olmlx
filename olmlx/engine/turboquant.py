@@ -105,7 +105,7 @@ def unpack_indices(packed: mx.array, bits: int, head_dim: int) -> mx.array:
     raise ValueError(f"Unsupported bits={bits}")
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=128)
 def _compiled_quantize_core(n_levels: int, x_shape: tuple, x_dtype: mx.Dtype):
     """Return a compiled (rotate + scalar quantize) kernel.
 
@@ -113,6 +113,10 @@ def _compiled_quantize_core(n_levels: int, x_shape: tuple, x_dtype: mx.Dtype):
     ``shapeless=True`` only handles last-axis changes for matmul-style ops
     (other dims get baked into the trace), so caching per full shape ensures
     correctness across prefill (seq_len=N) and decode (seq_len=1) calls.
+
+    Decode (``seq_len=1``) is a single stable entry and is the latency-critical
+    path. Prefill churns one entry per distinct prompt length; ``maxsize=128``
+    leaves headroom for varied workloads before LRU eviction forces recompile.
     """
 
     @mx.compile
@@ -161,12 +165,16 @@ def turboquant_quantize(
     return pack_indices(best_idx, bits), norms
 
 
-@lru_cache(maxsize=32)
-def _compiled_dequant_core(indices_shape: tuple, norms_dtype: mx.Dtype):
+@lru_cache(maxsize=128)
+def _compiled_dequant_core(indices_shape: tuple, norms_dtype: mx.Dtype, n_levels: int):
     """Return a compiled (gather + inverse rotate + rescale) kernel.
 
-    Cached per ``(indices_shape, norms_dtype)`` because mlx 0.31's compile
-    bakes leading dims into the trace (see ``_compiled_quantize_core``).
+    Cached per ``(indices_shape, norms_dtype, n_levels)``. ``indices_shape``
+    is identical for any ``bits`` (always ``(..., head_dim)``) because
+    ``unpack_indices`` undoes the bit-packing, so ``n_levels`` (=
+    ``codebook.shape[0]``) is required to keep models with different
+    bit-widths from aliasing onto the same compiled trace under LRU
+    multi-model loading.
     """
 
     @mx.compile
@@ -204,6 +212,6 @@ def turboquant_dequantize(
     head_dim = rotation.matrix.shape[0]
     codebook = get_codebook(bits, head_dim)
     indices = unpack_indices(packed_indices, bits, head_dim)
-    fn = _compiled_dequant_core(indices.shape, norms.dtype)
+    fn = _compiled_dequant_core(indices.shape, norms.dtype, 1 << bits)
     result = fn(indices, norms, rotation.matrix, codebook)
     return result.astype(dtype) if dtype is not None else result
