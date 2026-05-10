@@ -660,6 +660,13 @@ def prepare_dflash_draft(
         )
         else None
     )
+    # When ``pad_for_loss is None`` (Qwen3.x aliasing, or no pad token
+    # at all), ``_draft_loss`` falls through to the unmasked mean
+    # reduction.  ``_select_pivot`` is the sole guard: it restricts
+    # every pivot to the unpadded prefix, so pad targets cannot reach
+    # the loss in the first place.  See ``_select_pivot``'s docstring
+    # for the one conservative edge case (trailing real-EOS absorbed
+    # into the pad count).
 
     if mask_token_id is None:
         # ``or`` would short-circuit on token ID 0 (a valid pad id for
@@ -850,7 +857,11 @@ def prepare_dflash_draft(
         # CPU syncs. Each skipped batch costs one sync via
         # ``_select_pivot``. ``min(…, 500)`` bounds the worst-case
         # stall while preserving the ``2*n + 50`` budget for short
-        # runs where it's proportional and inexpensive.
+        # runs where it's proportional and inexpensive. The ceiling
+        # of 500 is chosen as ~10× the largest reasonable batch-window
+        # of consecutive short sequences in real datasets; a run that
+        # hits it is almost certainly misconfigured (block_size too
+        # large for the dataset, or wrong pad token).
         max_consecutive_skips = min(steps * 2 + 50, 500)
         for batch in batches:
             if real_step >= steps:

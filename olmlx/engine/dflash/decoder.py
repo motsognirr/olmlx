@@ -462,6 +462,9 @@ class _GDNStateCapture:
             #     won't be called (no non-trimmable caches), and even if
             #     it were, ``_order_matches([], [])`` correctly returns
             #     True.
+            # ``model.named_modules()`` uses LIFO traversal here, but
+            # the list is diagnostic-only — order doesn't matter for
+            # error reporting.
             orphaned = [
                 mod for _name, mod in model.named_modules() if isinstance(mod, gdn_cls)
             ]
@@ -989,6 +992,16 @@ class DFlashDecoder:
         if ft_idx is not None:
             draft_offset = self._draft_cache[ft_idx].offset
             target_offset = self._prompt_size + self._n_generated - 1
+            # If the draft model has sliding-window attention layers and
+            # the prompt exceeds the sliding window, the first draft
+            # step advances ``cache.offset`` by ``skip + S`` (see
+            # ``DFlashAttention.__call__``).  If ALL draft tokens from
+            # that first step are rejected, ``self._n_generated`` stays
+            # at 1 (the prefill token) while the draft cache offset is
+            # ``prompt_size``, and the next step's check trips.  This is
+            # an extremely narrow window (requires a sliding-window draft
+            # *and* 0-for-block_size acceptance on the first step) and no
+            # known draft model hits it today.
             if draft_offset != target_offset:
                 msg = (
                     f"DFlash internal invariant violated: draft cache offset "

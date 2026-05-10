@@ -749,20 +749,22 @@ def _resolve_attention_causal(dflash_cfg: dict) -> bool:
     """
     version = dflash_cfg.get("dflash_attention_version", 1)
     # Accept int, float, and string: JSON doesn't distinguish ``2``
-    # from ``2.0`` at the wire level, and some serialisers emit
-    # ``2.0``. A hand-edited config might also store ``"2"``.
+    # from ``2.0`` at the wire level, and a hand-edited config might
+    # store ``\"2\"``.  Convert to int so fractional values like
+    # ``1.5`` are treated as v1 rather than silently misclassified —
+    # version bumps are integers; fractional values are misconfigs.
     try:
-        version = float(version)
+        version_int = int(float(version))
     except (TypeError, ValueError):
-        version = 1.0
-    if version >= 2:
+        version_int = 1
+    if version_int >= 2:
         return False
     logger.warning(
         "DFlash draft checkpoint was trained with causal attention "
         "(dflash_attention_version=%s < 2). Re-training with the current "
         "code is recommended — running an old checkpoint produces a "
         "distribution mismatch that degrades acceptance rate.",
-        version,
+        version_int,
     )
     return True
 
