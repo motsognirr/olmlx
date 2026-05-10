@@ -125,7 +125,11 @@ def _compiled_quantize_core(n_levels: int, x_shape: tuple, x_dtype: mx.Dtype):
     ) -> tuple[mx.array, mx.array]:
         x32 = x.astype(mx.float32)
         norms = mx.sqrt(mx.sum(x32 * x32, axis=-1, keepdims=True))
-        x_norm = (x32 / mx.maximum(norms, 1e-8)).astype(x.dtype)
+        # Explicit float32 epsilon — bare Python literals would let MLX
+        # promotion rules pick the dtype, which is brittle if those rules
+        # ever change.
+        eps = mx.array(1e-8, dtype=mx.float32)
+        x_norm = (x32 / mx.maximum(norms, eps)).astype(x.dtype)
         y = x_norm @ rotation_T
 
         # Initialize from centroid 0; subsequent centroids update via mx.where.

@@ -251,7 +251,11 @@ def _compiled_spectral_quantize_full(
     ) -> tuple[mx.array, mx.array, mx.array]:
         x32 = x.astype(mx.float32)
         norms = mx.sqrt(mx.sum(x32 * x32, axis=-1, keepdims=True))
-        x_norm = (x32 / mx.maximum(norms, 1e-8)).astype(x.dtype)
+        # Explicit float32 epsilon — bare Python literals would let MLX
+        # promotion rules pick the dtype, which is brittle if those rules
+        # ever change.
+        eps = mx.array(1e-8, dtype=mx.float32)
+        x_norm = (x32 / mx.maximum(norms, eps)).astype(x.dtype)
         y = x_norm @ rotation_T
 
         y_sem = y[..., :d_eff]
@@ -293,6 +297,41 @@ def spectral_quantize(
     packed_sem = pack_indices(idx_sem, bits_high)
     packed_tail = pack_indices(idx_tail, bits_low)
     return packed_sem, packed_tail, norms
+
+
+@lru_cache(maxsize=128)
+def _compiled_spectral_dequant_core(
+    sem_shape: tuple,
+    tail_shape: tuple,
+    norms_dtype: mx.Dtype,
+    n_levels_sem: int,
+    n_levels_tail: int,
+):
+    """Compiled (gather both regimes + concat + inverse rotate + rescale).
+
+    Cached per shape signature plus codebook sizes. ``unpack_indices`` strips
+    the bit-width from the index shape, so without explicit ``n_levels_*``
+    keys two models with different ``bits_high``/``bits_low`` but matching
+    ``d_eff`` would alias to one compiled trace and force re-tracing under
+    multi-model LRU loading.
+    """
+
+    @mx.compile
+    def _fn(
+        idx_sem: mx.array,
+        idx_tail: mx.array,
+        norms: mx.array,
+        rotation_V: mx.array,
+        codebook_sem: mx.array,
+        codebook_tail: mx.array,
+    ) -> mx.array:
+        y_sem = codebook_sem[idx_sem.astype(mx.uint32)]
+        y_tail = codebook_tail[idx_tail.astype(mx.uint32)]
+        y_hat = mx.concatenate([y_sem, y_tail], axis=-1)
+        x_hat = y_hat @ rotation_V
+        return x_hat * norms.astype(x_hat.dtype)
+
+    return _fn
 
 
 def spectral_dequantize(
@@ -341,38 +380,3 @@ def spectral_dequantize(
     )
     result = fn(idx_sem, idx_tail, norms, rotation.V, codebook_sem, codebook_tail)
     return result.astype(dtype) if dtype is not None else result
-
-
-@lru_cache(maxsize=128)
-def _compiled_spectral_dequant_core(
-    sem_shape: tuple,
-    tail_shape: tuple,
-    norms_dtype: mx.Dtype,
-    n_levels_sem: int,
-    n_levels_tail: int,
-):
-    """Compiled (gather both regimes + concat + inverse rotate + rescale).
-
-    Cached per shape signature plus codebook sizes. ``unpack_indices`` strips
-    the bit-width from the index shape, so without explicit ``n_levels_*``
-    keys two models with different ``bits_high``/``bits_low`` but matching
-    ``d_eff`` would alias to one compiled trace and force re-tracing under
-    multi-model LRU loading.
-    """
-
-    @mx.compile
-    def _fn(
-        idx_sem: mx.array,
-        idx_tail: mx.array,
-        norms: mx.array,
-        rotation_V: mx.array,
-        codebook_sem: mx.array,
-        codebook_tail: mx.array,
-    ) -> mx.array:
-        y_sem = codebook_sem[idx_sem.astype(mx.uint32)]
-        y_tail = codebook_tail[idx_tail.astype(mx.uint32)]
-        y_hat = mx.concatenate([y_sem, y_tail], axis=-1)
-        x_hat = y_hat @ rotation_V
-        return x_hat * norms.astype(x_hat.dtype)
-
-    return _fn
