@@ -201,7 +201,7 @@ class DFlashAttention(nn.Module):
 
         ctx_len = keys.shape[2] - L
         mask = "causal" if self.causal else None
-        if self.is_sliding and ctx_len + L > (self.sliding_window or 0):
+        if self.is_sliding and self.causal and ctx_len + L > (self.sliding_window or 0):
             mask = create_causal_mask(
                 L, offset=ctx_len, window_size=self.sliding_window
             )
