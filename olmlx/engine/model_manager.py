@@ -748,10 +748,13 @@ def _resolve_attention_causal(dflash_cfg: dict) -> bool:
     so operators know to re-train.
     """
     version = dflash_cfg.get("dflash_attention_version", 1)
-    # Accept both int and float: JSON doesn't distinguish ``2`` from
-    # ``2.0`` at the wire level, and some serialisers emit ``2.0``.
-    if not isinstance(version, (int, float)):
-        version = 1
+    # Accept int, float, and string: JSON doesn't distinguish ``2``
+    # from ``2.0`` at the wire level, and some serialisers emit
+    # ``2.0``. A hand-edited config might also store ``"2"``.
+    try:
+        version = float(version)
+    except (TypeError, ValueError):
+        version = 1.0
     if version >= 2:
         return False
     logger.warning(

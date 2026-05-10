@@ -856,17 +856,27 @@ def prepare_dflash_draft(
             if real_step >= steps:
                 break
             if consecutive_skips >= max_consecutive_skips:
-                raise RuntimeError(
-                    f"DFlash training aborted: {consecutive_skips} consecutive "
-                    f"batches skipped without a real gradient update before "
-                    f"reaching {real_step}/{steps} steps. Every batch had at "
-                    f"least one row shorter than 2*block_size + 1 = "
-                    f"{2 * block_size + 1} real tokens. Likely causes: a "
-                    "dataset of uniformly short sequences, a misconfigured "
-                    "--block-size, or a tokenizer whose pad token coincides "
-                    "with the loader's actual pad. Inspect the dataset or "
-                    "lower --block-size."
+                # ``logger.error + break`` rather than ``raise RuntimeError``:
+                # the latter skips the checkpoint save below (which runs
+                # after the try/finally block), silently discarding all
+                # progress from real gradient steps already completed.
+                # Breaking lets the post-loop warnings and checkpoint save
+                # still execute, preserving partial progress.
+                logger.error(
+                    "DFlash training aborted: %d consecutive batches "
+                    "skipped without a real gradient update before "
+                    "reaching %d/%d steps. Every batch had at least one "
+                    "row shorter than 2*block_size + 1 = %d real tokens. "
+                    "Likely causes: a dataset of uniformly short sequences, "
+                    "a misconfigured --block-size, or a tokenizer whose "
+                    "pad token coincides with the loader's actual pad. "
+                    "Inspect the dataset or lower --block-size.",
+                    consecutive_skips,
+                    real_step,
+                    steps,
+                    2 * block_size + 1,
                 )
+                break
 
             optimizer.learning_rate = _cosine_lr(real_step, steps, lr, warmup)
 

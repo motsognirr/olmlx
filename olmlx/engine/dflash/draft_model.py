@@ -122,6 +122,12 @@ class DFlashAttention(nn.Module):
     projections and QK-RMSNorm. RoPE is applied to Q (offset by the
     context length), proposal-K (offset by the context length), and
     context-K (offset by the prior cache offset).
+
+    When ``config.attention_causal`` is ``False`` (bidirectional), the
+    mask is ``None`` for both full- and sliding-attention layers.
+    Bidirectional sliding layers rely on ``RotatingKVCache`` eviction
+    (enforced by ``make_cache()`` via ``layer_types``) to limit the
+    effective receptive field — no explicit spatial mask is needed.
     """
 
     def __init__(self, config: DraftConfig, layer_idx: int):

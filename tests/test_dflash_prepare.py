@@ -944,23 +944,30 @@ class TestSkippedBatchesPreserveStepBudget:
                 yield pad_only
 
         with caplog.at_level(logging.WARNING, logger="olmlx.engine.dflash.prepare"):
-            # Should terminate (via raise or warning + early exit), not hang.
-            # pad_token_id=0 is wired through _MockTokenizer so the pad_for_pivot
-            # path is active — only RuntimeError (consecutive_skips guard) fires.
-            with pytest.raises(RuntimeError):
-                prepare_dflash_draft(
-                    tmp_path,
-                    steps=20,
-                    batch_size=batch_size,
-                    seq_len=seq_len,
-                    block_size=2,
-                    num_hidden_layers=1,
-                    num_target_layers=2,
-                    lr=1e-2,
-                    output_dir=tmp_path / "dflash_out",
-                    _target_loader=_mock_target_loader(vocab, hidden, num_layers),
-                    _batch_iterator=infinite_pad_batches(),
-                )
+            # Should terminate (via error log + break), not hang.
+            # pad_token_id=0 is wired through _MockTokenizer so pad_for_pivot
+            # is active — the consecutive_skips guard fires with an ERROR log
+            # and breaks out, letting the post-loop warning + checkpoint save
+            # run (preserving any partial progress from real steps).
+            prepare_dflash_draft(
+                tmp_path,
+                steps=20,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                block_size=2,
+                num_hidden_layers=1,
+                num_target_layers=2,
+                lr=1e-2,
+                output_dir=tmp_path / "dflash_out",
+                _target_loader=_mock_target_loader(vocab, hidden, num_layers),
+                _batch_iterator=infinite_pad_batches(),
+            )
+        # Verify the abort error was logged.
+        assert any(
+            "aborted" in rec.message
+            for rec in caplog.records
+            if rec.levelno >= logging.ERROR
+        )
 
     def test_warns_when_batch_stream_exhausts_before_steps(self, tmp_path, caplog):
         """If the batch iterator ends before ``steps`` real updates ran
