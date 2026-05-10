@@ -170,6 +170,14 @@ class DFlashAttention(nn.Module):
         # pick up the correct RoPE base — the skipped tokens leave a
         # phantom positional gap that must be tracked across calls.
         # ``update_and_fetch`` then advances from this corrected base.
+        #
+        # This relies on the current mlx-lm invariant that
+        # ``RotatingKVCache.update_and_fetch`` uses ``self.offset`` as
+        # both the ring-buffer write pointer and the RoPE position
+        # accumulator, and increments it by exactly ``S`` (the number of
+        # tokens written, *not* ``S + skip``). If mlx-lm ever changes
+        # this, the rollback trim in ``_trim_recent_cache`` would also
+        # break — the invariant is observable at the protocol level.
         if self.is_sliding and S > (self.sliding_window or 0) - 1:
             keep = (self.sliding_window or 0) - 1
             skip = S - keep

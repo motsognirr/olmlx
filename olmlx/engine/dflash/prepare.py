@@ -484,7 +484,7 @@ def _select_pivot(
     reversed_ids = input_ids[:, ::-1]
     not_pad_rev = reversed_ids != pad_token_id
     has_real = not_pad_rev.any(axis=1)
-    first_real_rev = not_pad_rev.astype(mx.int32).argmax(axis=1)
+    first_real_rev = not_pad_rev.argmax(axis=1)
     # All-pad rows: ``any(axis=1) == False``, so ``argmax`` returns 0
     # (which is meaningless); fall back to ``seq_len`` so trailing pads
     # = whole length and ``real_lens`` = 0.
@@ -1103,7 +1103,7 @@ def _draft_config_to_disk(cfg: DraftConfig) -> dict[str, Any]:
         "dflash_config": {
             "target_layer_ids": list(cfg.target_layer_ids),
             "mask_token_id": cfg.mask_token_id,
-            "dflash_attention_version": 2,
+            "dflash_attention_version": 1 if cfg.attention_causal else 2,
         },
     }
     if cfg.rope_scaling is not None:
