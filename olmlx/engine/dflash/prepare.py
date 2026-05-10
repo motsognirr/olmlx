@@ -229,15 +229,20 @@ def _build_draft_config(
     # silent fallback would produce a draft whose RoPE frequencies are
     # incompatible with the positions the target was trained on. Prefer the
     # flat field when present; otherwise descend.
-    # Fall back to the top-level when ``rope_parameters`` isn't mirrored
-    # inside ``text_config`` (parallel to the ``rope_scaling`` fallback
-    # below). ``or`` is safe because ``rope_parameters`` is a dict —
-    # falsy only when ``None`` or ``{}``.
-    rope_params = text_cfg.get("rope_parameters") or target_cfg.get("rope_parameters")
+    # Cascade at the ``rope_theta`` level rather than the dict level: a
+    # partial ``rope_parameters`` block in ``text_config`` (e.g.
+    # ``{"rope_type": "yarn"}`` with no theta) is truthy and would
+    # short-circuit the ``or``, swallowing a top-level block that carries
+    # the correct value. Read ``rope_theta`` from each source in priority
+    # order instead.
+    rope_params_inner = text_cfg.get("rope_parameters")
+    rope_params_outer = target_cfg.get("rope_parameters") if text_cfg is not target_cfg else None
     if text_cfg.get("rope_theta") is not None:
         rope_theta = float(text_cfg["rope_theta"])
-    elif isinstance(rope_params, dict) and rope_params.get("rope_theta") is not None:
-        rope_theta = float(rope_params["rope_theta"])
+    elif isinstance(rope_params_inner, dict) and rope_params_inner.get("rope_theta") is not None:
+        rope_theta = float(rope_params_inner["rope_theta"])
+    elif isinstance(rope_params_outer, dict) and rope_params_outer.get("rope_theta") is not None:
+        rope_theta = float(rope_params_outer["rope_theta"])
     else:
         # Fall through silently with the legacy 10000.0 only as a last
         # resort, but log loudly: modern long-context targets
@@ -828,14 +833,13 @@ def prepare_dflash_draft(
         # ``steps`` so a few rough patches don't trigger a false
         # positive on a real run.
         consecutive_skips = 0
-        # Cap consecutive skips at ``2 * steps + 50`` so the guard
-        # scales tightly with the requested budget while preserving a
-        # small absolute floor for very short runs (test fixtures with
-        # ``steps=20`` shouldn't need 500 forced syncs to fail).
-        # Each skipped batch costs one CPU sync via ``_select_pivot``'s
-        # ``min().item()``, so a large multiplier turns a degenerate
-        # dataset into a multi-second stall before the error fires.
-        max_consecutive_skips = steps * 2 + 50
+        # Cap consecutive skips with a hard ceiling so degenerate
+        # datasets fail fast instead of chewing through thousands of
+        # CPU syncs. Each skipped batch costs one sync via
+        # ``_select_pivot``. ``min(…, 500)`` bounds the worst-case
+        # stall while preserving the ``2*n + 50`` budget for short
+        # runs where it's proportional and inexpensive.
+        max_consecutive_skips = min(steps * 2 + 50, 500)
         for batch in batches:
             if real_step >= steps:
                 break

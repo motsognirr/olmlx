@@ -945,7 +945,9 @@ class TestSkippedBatchesPreserveStepBudget:
 
         with caplog.at_level(logging.WARNING, logger="olmlx.engine.dflash.prepare"):
             # Should terminate (via raise or warning + early exit), not hang.
-            with pytest.raises((RuntimeError, ValueError)):
+            # pad_token_id=0 is wired through _MockTokenizer so the pad_for_pivot
+            # path is active — only RuntimeError (consecutive_skips guard) fires.
+            with pytest.raises(RuntimeError):
                 prepare_dflash_draft(
                     tmp_path,
                     steps=20,
