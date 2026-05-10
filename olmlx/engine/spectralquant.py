@@ -5,6 +5,8 @@ instead of random rotations, enabling non-uniform bit allocation across
 semantic (high-variance) and tail (low-variance) coordinate regimes.
 """
 
+from functools import lru_cache, partial
+
 import mlx.core as mx
 import numpy as np
 
@@ -170,6 +172,93 @@ def fit_codebook(
     return mx.array(centroids)
 
 
+# Above this many centroids, the unrolled where-loop becomes slower than
+# building the (..., dim, n_centroids) distance tensor and reducing with
+# ``argmin`` — measured on Apple Silicon for small (decode) shapes. For larger
+# (prefill) shapes the broadcast tensor is too big and the loop wins again,
+# so the dispatch in ``_compiled_spectral_quantize_full`` also weighs shape.
+_LOOP_ARGMIN_CUTOFF = 32
+
+# Per-element cap on the (..., dim, n_centroids) broadcast tensor. Above this,
+# fall back to the loop even when ``n_levels`` is large. Tuned to keep
+# intermediate float32 allocations under ~256 MB on Apple Silicon.
+_ARGMIN_BROADCAST_CAP = 64 * 1024 * 1024
+
+
+def _make_codebook_argmin(n_levels: int, dim_outer: int):
+    """Pick loop-unroll vs broadcast-argmin once per compiled trace.
+
+    Returns a closure that takes ``(y, codebook)`` and returns ``best_idx``.
+    The branch fires at trace time (Python-side); the produced graph is
+    already specialized for the chosen strategy.
+    """
+    use_loop = (
+        n_levels <= _LOOP_ARGMIN_CUTOFF
+        or dim_outer * n_levels > _ARGMIN_BROADCAST_CAP
+    )
+    if use_loop:
+        def _loop(y: mx.array, codebook: mx.array) -> mx.array:
+            best_dist = mx.abs(y - codebook[0])
+            best_idx = mx.array(0, dtype=mx.uint8)
+            for ci in range(1, n_levels):
+                d = mx.abs(y - codebook[ci])
+                better = d < best_dist
+                best_idx = mx.where(better, ci, best_idx).astype(mx.uint8)
+                best_dist = mx.where(better, d, best_dist)
+            return best_idx
+        return _loop
+
+    def _vec(y: mx.array, codebook: mx.array) -> mx.array:
+        dists = mx.abs(y[..., None] - codebook)
+        return mx.argmin(dists, axis=-1).astype(mx.uint8)
+    return _vec
+
+
+@lru_cache(maxsize=64)
+def _compiled_spectral_quantize_full(
+    n_levels_sem: int,
+    n_levels_tail: int,
+    x_shape: tuple,
+    x_dtype: mx.Dtype,
+    d_eff: int,
+):
+    """Compiled (norm + rotate + split + per-regime argmin) kernel.
+
+    Cached per full input signature because mlx 0.31's compile bakes leading
+    tensor dims into the trace.
+    """
+    head_dim = x_shape[-1]
+    d_tail = head_dim - d_eff
+    # ``outer`` = product of leading dims times the regime's slice width;
+    # used to estimate the size of the broadcast distance tensor and pick
+    # loop vs argmin per regime.
+    outer = 1
+    for d in x_shape[:-1]:
+        outer *= d
+    sem_argmin = _make_codebook_argmin(n_levels_sem, outer * d_eff)
+    tail_argmin = _make_codebook_argmin(n_levels_tail, outer * d_tail)
+
+    @mx.compile
+    def _fn(
+        x: mx.array,
+        rotation_T: mx.array,
+        codebook_sem: mx.array,
+        codebook_tail: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        x32 = x.astype(mx.float32)
+        norms = mx.sqrt(mx.sum(x32 * x32, axis=-1, keepdims=True))
+        x_norm = (x32 / mx.maximum(norms, 1e-8)).astype(x.dtype)
+        y = x_norm @ rotation_T
+
+        y_sem = y[..., :d_eff]
+        y_tail = y[..., d_eff:]
+        idx_sem = sem_argmin(y_sem, codebook_sem)
+        idx_tail = tail_argmin(y_tail, codebook_tail)
+        return idx_sem, idx_tail, norms
+
+    return _fn
+
+
 def spectral_quantize(
     x: mx.array,
     rotation: SpectralRotation,
@@ -193,30 +282,12 @@ def spectral_quantize(
     Returns:
         (packed_sem, packed_tail, norms): bit-packed indices + float32 norms.
     """
-    # Compute norms in float32 to avoid overflow
-    norms = mx.sqrt(mx.sum(x.astype(mx.float32) ** 2, axis=-1, keepdims=True))
-    # Normalize in float32 — 1e-8 underflows to 0.0 in float16
-    x_norm = (
-        x.astype(mx.float32) / mx.maximum(norms, mx.array(1e-8, dtype=mx.float32))
-    ).astype(x.dtype)
-
-    # Rotate into spectral basis
-    y = rotation.rotate(x_norm)
-
-    # Split into semantic and tail regimes
-    y_sem = y[..., :d_eff]
-    y_tail = y[..., d_eff:]
-
-    # Quantize each regime: find nearest centroid via vectorized broadcast
-    def _quantize_regime(data, codebook, bits):
-        # (..., dim, 1) vs (n_centroids,) → (..., dim, n_centroids)
-        dists = mx.abs(data[..., None] - codebook)
-        best_idx = mx.argmin(dists, axis=-1).astype(mx.uint8)
-        return pack_indices(best_idx, bits)
-
-    packed_sem = _quantize_regime(y_sem, codebook_sem, bits_high)
-    packed_tail = _quantize_regime(y_tail, codebook_tail, bits_low)
-
+    fn = _compiled_spectral_quantize_full(
+        1 << bits_high, 1 << bits_low, x.shape, x.dtype, d_eff
+    )
+    idx_sem, idx_tail, norms = fn(x, rotation.V_T, codebook_sem, codebook_tail)
+    packed_sem = pack_indices(idx_sem, bits_high)
+    packed_tail = pack_indices(idx_tail, bits_low)
     return packed_sem, packed_tail, norms
 
 
@@ -252,17 +323,40 @@ def spectral_dequantize(
     head_dim = rotation.V.shape[0]
     d_tail = head_dim - d_eff
 
-    # Unpack and lookup centroids for each regime
+    # Unpacking branches on bits and includes Python control flow; keep it
+    # outside the compiled inner kernel.
     idx_sem = unpack_indices(packed_sem, bits_high, d_eff)
-    y_sem = codebook_sem[idx_sem.astype(mx.uint32)]
-
     idx_tail = unpack_indices(packed_tail, bits_low, d_tail)
-    y_tail = codebook_tail[idx_tail.astype(mx.uint32)]
 
-    # Concatenate and inverse rotate
-    y_hat = mx.concatenate([y_sem, y_tail], axis=-1)
-    x_hat = rotation.unrotate(y_hat)
-
-    # Rescale by original norms
-    result = x_hat * norms.astype(x_hat.dtype)
+    fn = _compiled_spectral_dequant_core(
+        idx_sem.shape, idx_tail.shape, norms.dtype
+    )
+    result = fn(idx_sem, idx_tail, norms, rotation.V, codebook_sem, codebook_tail)
     return result.astype(dtype) if dtype is not None else result
+
+
+@lru_cache(maxsize=64)
+def _compiled_spectral_dequant_core(
+    sem_shape: tuple, tail_shape: tuple, norms_dtype: mx.Dtype
+):
+    """Compiled (gather both regimes + concat + inverse rotate + rescale).
+
+    Cached per shape signature for the same reason as the quantize kernel.
+    """
+
+    @mx.compile
+    def _fn(
+        idx_sem: mx.array,
+        idx_tail: mx.array,
+        norms: mx.array,
+        rotation_V: mx.array,
+        codebook_sem: mx.array,
+        codebook_tail: mx.array,
+    ) -> mx.array:
+        y_sem = codebook_sem[idx_sem.astype(mx.uint32)]
+        y_tail = codebook_tail[idx_tail.astype(mx.uint32)]
+        y_hat = mx.concatenate([y_sem, y_tail], axis=-1)
+        x_hat = y_hat @ rotation_V
+        return x_hat * norms.astype(x_hat.dtype)
+
+    return _fn
