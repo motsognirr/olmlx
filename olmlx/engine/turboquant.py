@@ -4,7 +4,7 @@ Implements TurboQuant_mse from https://arxiv.org/abs/2504.19874.
 Algorithm: random rotation → scalar quantization per coordinate → inverse rotation.
 """
 
-from functools import lru_cache, partial
+from functools import lru_cache
 
 import mlx.core as mx
 import numpy as np

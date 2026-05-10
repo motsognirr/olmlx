@@ -180,10 +180,10 @@ def main() -> None:
 
     prompt = _build_prompt(tokenizer, args.prompt_tokens)
 
-    print(f"\n=== Warmup (compiled) ===")
+    print("\n=== Warmup (compiled) ===")
     _run(model, tokenizer, prompt, gen_tokens=8, bits=args.bits, label="warmup")
     with use_baseline():
-        print(f"\n=== Warmup (baseline) ===")
+        print("\n=== Warmup (baseline) ===")
         _run(model, tokenizer, prompt, gen_tokens=8, bits=args.bits, label="warmup")
 
     runs_compiled = []

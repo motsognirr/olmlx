@@ -5,7 +5,7 @@ instead of random rotations, enabling non-uniform bit allocation across
 semantic (high-variance) and tail (low-variance) coordinate regimes.
 """
 
-from functools import lru_cache, partial
+from functools import lru_cache
 
 import mlx.core as mx
 import numpy as np
