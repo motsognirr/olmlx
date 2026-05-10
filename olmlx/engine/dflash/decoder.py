@@ -1002,6 +1002,9 @@ class DFlashDecoder:
             # an extremely narrow window (requires a sliding-window draft
             # *and* 0-for-block_size acceptance on the first step) and no
             # known draft model hits it today.
+            # FIXME: undo the ``cache.offset += skip`` pre-advance on
+            # rejection rollback so the draft cache offset stays correct
+            # across steps even in this edge case.
             if draft_offset != target_offset:
                 msg = (
                     f"DFlash internal invariant violated: draft cache offset "

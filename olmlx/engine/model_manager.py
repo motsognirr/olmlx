@@ -761,9 +761,10 @@ def _resolve_attention_causal(dflash_cfg: dict) -> bool:
         return False
     logger.warning(
         "DFlash draft checkpoint was trained with causal attention "
-        "(dflash_attention_version=%s < 2). Re-training with the current "
-        "code is recommended — running an old checkpoint produces a "
-        "distribution mismatch that degrades acceptance rate.",
+        "(dflash_attention_version=%r → %d < 2). Re-training with the "
+        "current code is recommended — running an old checkpoint "
+        "produces a distribution mismatch that degrades acceptance rate.",
+        version,
         version_int,
     )
     return True

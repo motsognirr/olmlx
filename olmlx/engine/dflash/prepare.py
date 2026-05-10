@@ -485,6 +485,11 @@ def _select_pivot(
     not_pad_rev = reversed_ids != pad_token_id
     has_real = not_pad_rev.any(axis=1)
     first_real_rev = not_pad_rev.argmax(axis=1)
+    # ``argmax`` on booleans returns ``uint32``; cast to ``int32`` for
+    # explicit type agreement with the ``seq_len`` fallback below.
+    # MLX's type promotion handles the mixed ``mx.where`` today, but the
+    # promotion rules are not part of the stable API contract.
+    first_real_rev = first_real_rev.astype(mx.int32)
     # All-pad rows: ``any(axis=1) == False``, so ``argmax`` returns 0
     # (which is meaningless); fall back to ``seq_len`` so trailing pads
     # = whole length and ``real_lens`` = 0.
