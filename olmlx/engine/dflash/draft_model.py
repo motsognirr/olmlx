@@ -158,20 +158,16 @@ class DFlashAttention(nn.Module):
         S = x_ctx.shape[1]
 
         # When sliding, drop ctx tokens that would fall outside the window.
-        # ``ctx_rope_offset`` shifts the RoPE base position so the surviving
-        # context tokens get their original position IDs (skipped tokens
-        # leave a phantom gap in position space). The cache's own
-        # ``update_and_fetch`` advances ``offset`` correctly for the kept
-        # keys; mutating ``cache.offset`` from outside would reach into
-        # mlx-lm's internal bookkeeping and break if the attribute ever
-        # becomes read-only.
-        skip = 0
+        # Advance ``cache.offset`` by the skip amount so subsequent steps
+        # pick up the correct RoPE base — the skipped tokens leave a
+        # phantom positional gap that must be tracked across calls.
+        # ``update_and_fetch`` then advances from this corrected base.
         if self.is_sliding and S > (self.sliding_window or 0) - 1:
             keep = (self.sliding_window or 0) - 1
             skip = S - keep
             x_ctx = x_ctx[:, skip:]
             S = x_ctx.shape[1]
-        ctx_rope_offset = cache.offset + skip
+            cache.offset += skip
 
         queries = self.q_proj(x)
         ctx_keys = self.k_proj(x_ctx)
@@ -193,21 +189,20 @@ class DFlashAttention(nn.Module):
             0, 2, 1, 3
         )
 
-        queries = rope(queries, offset=ctx_rope_offset + S)
-        ctx_keys = rope(ctx_keys, offset=ctx_rope_offset)
-        prop_keys = rope(prop_keys, offset=ctx_rope_offset + S)
+        queries = rope(queries, offset=cache.offset + S)
+        ctx_keys = rope(ctx_keys, offset=cache.offset)
+        prop_keys = rope(prop_keys, offset=cache.offset + S)
 
         keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
 
         ctx_len = keys.shape[2] - L
+        mask = None
         if self.is_sliding and ctx_len + L > (self.sliding_window or 0):
             mask = create_causal_mask(
                 L, offset=ctx_len, window_size=self.sliding_window
             )
-        else:
-            mask = "causal"
 
         out = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
