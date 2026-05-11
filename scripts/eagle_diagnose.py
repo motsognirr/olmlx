@@ -207,9 +207,21 @@ def main() -> int:
             label = target_tokens[t + 1]
 
             tok_in = mx.array([[token_t]], dtype=mx.int32)
-            # Fresh draft cache for each position so the comparison is a
-            # pure single-step prediction (matches the very first draft
-            # call of each speculative step in the decoder).
+            # Fresh draft cache for each position so the comparison is
+            # a pure single-step prediction. This matches the *first*
+            # draft call of each speculative verify step in the real
+            # decoder — when the draft cache holds only what survived
+            # the previous step's trim, which for step 1 is empty.
+            #
+            # SCOPE: this measures cold-cache top-1 agreement. The
+            # real decoder feeds its own predicted hidden into
+            # subsequent positions of the same verify, and a draft
+            # whose accuracy degrades as the draft KV cache fills
+            # would look fine in this diagnostic. The actual bench
+            # numbers (~6% acceptance vs 24% teacher-forced top-1
+            # here) capture that degradation. For a fuller picture,
+            # see ``stats_summary()`` from a real ``EagleDecoder``
+            # run.
             draft_cache = draft.make_cache()
             logits, _h_new = draft(token_ids=tok_in, h_prev=h_prev, cache=draft_cache)
             draft_top1 = int(mx.argmax(logits[:, -1, :], axis=-1).item())

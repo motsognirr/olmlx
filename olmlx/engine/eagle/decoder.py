@@ -40,6 +40,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from olmlx.engine.dflash.decoder import (
+    _find_gdn_class,
     _GDNStateCapture,
     _get_layers,
     _HAS_GDN,
@@ -264,6 +265,36 @@ class EagleDecoder:
                     "mlx_lm.models.gated_delta is unavailable. Cannot "
                     "perform EAGLE rejection rollback."
                 )
+            # Defensive guard: the non-trim branch assumes the
+            # non-trim caches are GDN/SSM state owned by linear-
+            # attention layers. If the target has no GDN modules at
+            # all, then some *other* cache type returned
+            # ``is_trimmable() == False`` — e.g. a future quantised
+            # KV cache that decides not to support trim, or a model
+            # mixing pure-attention layers with an unfamiliar
+            # stateful cache. The rollback path would either
+            # silently mis-trim (if the orphan check inside
+            # ``_GDNStateCapture.__init__`` doesn't catch it) or
+            # crash cryptically later. Reject up front with a
+            # clear message that names the configuration mismatch.
+            #
+            # Today's quant caches (``TurboQuantKVCache``,
+            # ``SpectralQuantKVCache``) both return
+            # ``is_trimmable() == True`` so they take the trim
+            # path and never reach this branch — this is a
+            # forward-compatibility guard, not a current-bug fix.
+            if _find_gdn_class(self._target) is None:
+                self.reset()
+                raise RuntimeError(
+                    "Target reports a non-trim-able KV cache but no "
+                    "``GatedDeltaNet`` submodule is present. EAGLE's "
+                    "non-trim rollback path is GDN-specific; some other "
+                    "cache type (custom quant cache that doesn't "
+                    "support trim, mixed-architecture model with an "
+                    "unfamiliar stateful cache) must be at play. "
+                    "Disable EAGLE for this target or replace the "
+                    "non-trim cache with a trim-able variant."
+                )
             # Install the patch — must happen *before* the prompt
             # forward so the patched ``__call__`` records the prompt's
             # GDN state, which subsequent rollbacks may need to replay
@@ -381,17 +412,24 @@ class EagleDecoder:
         # caches grew by block_size+1 (target) and block_size (draft)
         # during this step. Trim them back to the accepted prefix.
         num_accepted = len(accepted)
-        # Target cache grew by block_size + 1; we keep num_accepted
-        # tokens; trim away (block_size + 1 - num_accepted).
-        target_trim = (self._block_size + 1) - num_accepted
-        # Draft cache grew by block_size; we keep num_accepted - 1
-        # (the draft only emits drafts, not the seed). Trim away
-        # (block_size - (num_accepted - 1)) = (block_size + 1 - num_accepted).
-        draft_trim = (self._block_size + 1) - num_accepted
-        if target_trim > 0:
+        # Target and draft caches trim by the same amount.
+        # - Target grew by block_size + 1; we keep num_accepted; trim
+        #   away (block_size + 1 - num_accepted).
+        # - Draft grew by block_size; we keep num_accepted - 1 (the
+        #   draft emits drafts, not the seed); trim away
+        #   (block_size - (num_accepted - 1)) = (block_size + 1 -
+        #   num_accepted).
+        # Both algebra paths land at the same value. Keep one
+        # variable so a future change to either side has to update
+        # the trim formula in one spot — two identically-computed
+        # variables would be a maintenance trap (e.g. EAGLE-2 tree
+        # speculation could change the draft accounting while target
+        # stays the same).
+        trim = (self._block_size + 1) - num_accepted
+        if trim > 0:
             if self._target_can_trim:
                 if trim_prompt_cache is not None:
-                    trim_prompt_cache(self._target_cache, target_trim)
+                    trim_prompt_cache(self._target_cache, trim)
             else:
                 # Hybrid linear-attention path. ``_capture`` was created
                 # in prefill; same control-flow invariant guards as
@@ -422,14 +460,12 @@ class EagleDecoder:
                 # arithmetic for the same reason — its verify input
                 # is ``[pending, MASK*bs]`` where ``pending`` plays
                 # the same position-0 role as our ``seed_token``.
-                self._capture.rollback(
-                    self._target_cache, num_accepted - 1, target_trim
-                )
+                self._capture.rollback(self._target_cache, num_accepted - 1, trim)
         # Draft cache trim — the draft is always a standard-attention
         # transformer with trim-able KVCache, so this path is the same
         # regardless of target architecture.
-        if trim_prompt_cache is not None and draft_trim > 0:
-            trim_prompt_cache(self._draft_cache, draft_trim)
+        if trim_prompt_cache is not None and trim > 0:
+            trim_prompt_cache(self._draft_cache, trim)
 
         # New seed: the last accepted token, with target's hidden at
         # the corresponding position. captured spans positions

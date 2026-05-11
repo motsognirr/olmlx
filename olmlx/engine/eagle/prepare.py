@@ -218,6 +218,13 @@ def _eagle_loss(
         # Full path: lm_head over every position. Cheap on tests with
         # tiny vocabs; expensive on real targets.
         logits, _h_new = draft(token_ids=tokens, h_prev=h)
+        # ``logits`` is annotated ``mx.array | None`` because the
+        # subsampled path passes ``compute_logits=False``. In this
+        # branch we pass the default ``compute_logits=True``, so it
+        # must be a real array. Make the type narrowing explicit so a
+        # future refactor that flips ``compute_logits`` here crashes
+        # at the call site rather than mid-softmax.
+        assert logits is not None
         log_probs = nn.log_softmax(logits, axis=-1)
         nll = -mx.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
         return mx.mean(nll)
@@ -402,6 +409,22 @@ def prepare_eagle_draft(
     # Set up batch source.
     eagle_target_layer_id: int | None = None
     if _batch_iterator is not None:
+        # ``_batch_iterator`` is a test-only injection hook. Combining
+        # it with ``use_precomputed`` would silently take the
+        # iterator path and *not* derive ``eagle_target_layer_id``
+        # from the shard index, producing a saved config without
+        # ``target_layer_id`` — a misconfigured checkpoint that
+        # would later collapse bench acceptance to the level
+        # observed before the target_layer_id fix landed. Forbid
+        # the combination so future callers can't trip on it.
+        if use_precomputed is not None:
+            raise ValueError(
+                "prepare_eagle_draft: ``_batch_iterator`` (test injection) "
+                "and ``use_precomputed`` are mutually exclusive — passing "
+                "both would produce a saved checkpoint without "
+                "``target_layer_id``, leading to a layer-mismatch at "
+                "inference. Pick one path."
+            )
         batches = _batch_iterator
     else:
         if use_precomputed is None:

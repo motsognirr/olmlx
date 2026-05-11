@@ -569,6 +569,28 @@ class TestEagleDecoderGDNPath:
     correctness with real hybrid models is covered by Phase F bench.
     """
 
+    def test_prefill_rejects_non_trim_cache_without_gdn(self, monkeypatch):
+        """Defensive guard: if the target's KV cache reports non-trim
+        but the target has no ``GatedDeltaNet`` module, EAGLE's
+        rollback path doesn't apply (some other cache type is at
+        play). Reject up front with a clear error rather than crash
+        cryptically inside ``rollback`` later. Today's quant caches
+        all report ``is_trimmable() == True`` so they don't trip
+        this; it's a forward-compatibility guard for future cache
+        types that might not.
+        """
+        from olmlx.engine.eagle import decoder as decoder_mod
+
+        monkeypatch.setattr(decoder_mod, "can_trim_prompt_cache", lambda _: False)
+        monkeypatch.setattr(decoder_mod, "_HAS_GDN", True)
+        # Pretend the target has no GDN module — what a pure-attention
+        # model with a custom non-trim cache would look like.
+        monkeypatch.setattr(decoder_mod, "_find_gdn_class", lambda _m: None)
+
+        decoder, _, _ = _make_decoder(block_size=2)
+        with pytest.raises(RuntimeError, match="no ``GatedDeltaNet`` submodule"):
+            decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
+
     def test_prefill_installs_capture_when_cache_is_non_trimmable(self, monkeypatch):
         from olmlx.engine.eagle import decoder as decoder_mod
 
@@ -600,6 +622,12 @@ class TestEagleDecoderGDNPath:
         # Force _HAS_GDN to True so the ``not _HAS_GDN`` early-error
         # path doesn't fire.
         monkeypatch.setattr(decoder_mod, "_HAS_GDN", True)
+        # Defeat the "no GDN module on target" guard that fires when
+        # we synthesise a non-trim cache without a real
+        # ``GatedDeltaNet`` underneath. Return a sentinel class so
+        # the guard sees "found one" — it's only checking presence,
+        # not type identity.
+        monkeypatch.setattr(decoder_mod, "_find_gdn_class", lambda _m: object)
 
         decoder, _, _ = _make_decoder(block_size=2)
         decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
@@ -616,6 +644,10 @@ class TestEagleDecoderGDNPath:
 
         monkeypatch.setattr(decoder_mod, "can_trim_prompt_cache", lambda _: False)
         monkeypatch.setattr(decoder_mod, "_HAS_GDN", True)
+        # Defeat the "no GDN module on target" guard (see
+        # ``test_prefill_installs_capture_when_cache_is_non_trimmable``
+        # for rationale). Sentinel class — guard only checks presence.
+        monkeypatch.setattr(decoder_mod, "_find_gdn_class", lambda _m: object)
 
         captured_calls = {"clear": 0, "close": 0, "rollback": []}
 
