@@ -329,12 +329,13 @@ class DFlashDecoder:
         self._draft_cache = self._draft.make_cache()
         self._target_can_trim = can_trim_prompt_cache(self._target_cache)
         if not self._target_can_trim:
-            # ``GDNStateCapture.__init__`` raises with a clear message if
-            # mlx_lm.models.gated_delta is unavailable or if the target
-            # has no ``GatedDeltaNet`` submodule, so a separate pre-check
-            # would just duplicate the same error.
-            self._capture = GDNStateCapture(self._target)
-            self._capture_buffer = GDNBuffer()
+            # ``GDNStateCapture.for_model`` raises with a clear message
+            # if mlx_lm.models.gated_delta is unavailable or if the
+            # target has no ``GatedDeltaNet`` submodule, so a separate
+            # pre-check would just duplicate the same error.
+            self._capture, self._capture_buffer = GDNStateCapture.for_model(
+                self._target
+            )
             self._capture.use_buffer(self._capture_buffer)
 
         target_out = self._target(prompt, cache=self._target_cache)

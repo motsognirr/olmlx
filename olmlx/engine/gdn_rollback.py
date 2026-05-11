@@ -210,22 +210,84 @@ def find_gdn_class(model: nn.Module) -> type | None:
     return None
 
 
-class GDNBuffer:
-    """Per-forward-pass storage of GDN inputs for rollback.
+def collect_gdn_modules(model: nn.Module, gdn_cls: type) -> list[Any]:
+    """Collect *model*'s GDN module instances in forward-pass order.
 
-    One buffer per logical "scope" — e.g. one for the target's verify
-    forward and one for the draft's autoregressive loop in classic
-    speculative. Captures are appended in the order
-    ``_capturing_gdn_call`` is invoked, which mirrors the cache layout
-    (mlx-lm walks layers in index order).
+    Walks ``get_model_layers(model)`` in natural index order — NOT
+    ``model.named_modules()``, which uses mlx's LIFO stack traversal and
+    visits list children in reverse, producing a sequence that
+    contradicts the forward pass. Recurses into each layer to find its
+    GDN submodule(s).
+
+    Raises ``RuntimeError`` if any layer contains more than one GDN
+    submodule (every hybrid family we know about ships at most one
+    per layer; multi-GDN layouts would expose the same LIFO-traversal
+    bug at sub-layer granularity).
+
+    Raises ``RuntimeError`` if no GDN modules are reachable via
+    ``get_model_layers`` while ``model.named_modules()`` does find some
+    — that means GDN modules live outside the layers list and rollback
+    can't address them.
+    """
+    out: list[Any] = []
+    ordered_layers = get_model_layers(model)
+    for layer in ordered_layers:
+        per_layer_gdns = [
+            mod for _name, mod in layer.named_modules() if isinstance(mod, gdn_cls)
+        ]
+        if len(per_layer_gdns) > 1:
+            raise RuntimeError(
+                f"Layer {type(layer).__name__} contains "
+                f"{len(per_layer_gdns)} GatedDeltaNet submodules; "
+                "GDN rollback currently assumes at most one GDN per "
+                "layer because ``layer.named_modules()`` uses mlx's "
+                "LIFO stack traversal — multiple GDNs would come back "
+                "in the reverse of definition order and be mis-aligned "
+                "with the forward pass. File an olmlx issue with the "
+                "model class name."
+            )
+        out.extend(per_layer_gdns)
+    if not out:
+        orphaned = [
+            mod for _name, mod in model.named_modules() if isinstance(mod, gdn_cls)
+        ]
+        if orphaned:
+            raise RuntimeError(
+                f"Found {len(orphaned)} GatedDeltaNet module(s) in the "
+                "model but none are reachable via ``get_model_layers``. "
+                "Layer-hook installation uses the same helper, so "
+                "rollback cannot work for this configuration. File an "
+                "olmlx issue with the model class name."
+            )
+    return out
+
+
+class GDNBuffer:
+    """Per-model storage of GDN inputs for rollback.
+
+    One buffer per (model, logical-scope) pair — e.g. one buffer for the
+    target's verify forward and another for the draft's autoregressive
+    loop in classic speculative, even when both share the same
+    ``GDNStateCapture`` because they use the same GDN class.
+
+    ``expected_modules`` is the list of GDN module instances belonging
+    to this model (in forward-pass order). Captures land in
+    ``gdn_inputs``/``conv_data``/``captured_modules`` in the order
+    ``_capturing_gdn_call`` is invoked — matching the cache layout
+    because mlx-lm walks layers in index order.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, expected_modules: list[Any]) -> None:
+        self.expected_modules: list[Any] = expected_modules
         self.conv_data: list[tuple[mx.array, int]] = []
         self.gdn_inputs: list[tuple[Any, ...]] = []
         # Parallel list of layer instances ``_capturing_gdn_call`` saw
         # at each step; used by rollback to verify ordering.
         self.captured_modules: list[Any] = []
+
+    @property
+    def num_gdn_layers(self) -> int:
+        return len(self.expected_modules)
 
     def clear(self) -> None:
         self.conv_data.clear()
@@ -252,41 +314,14 @@ class GDNStateCapture:
     between target and draft when both use the same GDN class).
     """
 
-    def __init__(self, model: nn.Module) -> None:
+    def __init__(self, gdn_cls: type) -> None:
         if not _HAS_GDN:
             raise RuntimeError(
                 "mlx_lm.models.gated_delta is unavailable; cannot capture "
                 "GatedDeltaNet state for rollback"
             )
         validate_gated_delta_update_signature()
-        gdn_cls = find_gdn_class(model)
-        if gdn_cls is None:
-            raise RuntimeError(
-                "Model declares non-trimmable KV caches but no "
-                "``GatedDeltaNet`` submodule was found — GDN rollback "
-                "currently only supports GDN-based hybrid linear-attention "
-                "models. Open an olmlx issue with the model's class name."
-            )
         self._gdn_cls: type = gdn_cls
-        # Record GDN module instances in forward-pass traversal order
-        # so rollback can verify the captured forward visited them in
-        # the same order as the cache list. ``Module.named_modules``
-        # walks via a LIFO stack and lists like ``model.layers`` come
-        # back in reverse order — use ``get_model_layers`` in natural
-        # index order and recurse into each layer instead.
-        self._expected_gdn_modules: list[Any] = self._collect_gdn_modules(model)
-        if not self._expected_gdn_modules:
-            orphaned = [
-                mod for _name, mod in model.named_modules() if isinstance(mod, gdn_cls)
-            ]
-            if orphaned:
-                raise RuntimeError(
-                    f"Found {len(orphaned)} GatedDeltaNet module(s) in the "
-                    "model but none are reachable via ``get_model_layers``. "
-                    "Layer-hook installation uses the same helper, so "
-                    "rollback cannot work for this configuration. File an "
-                    "olmlx issue with the model class name."
-                )
         self._active_buffer: GDNBuffer | None = None
         self._orig_call: Any = None
         self._patched_call: Any = None
@@ -302,27 +337,42 @@ class GDNStateCapture:
             _GDN_PATCH_LOCK.release()
             raise
 
-    def _collect_gdn_modules(self, model: nn.Module) -> list[Any]:
-        gdn_cls = self._gdn_cls
-        out: list[Any] = []
-        ordered_layers = get_model_layers(model)
-        for layer in ordered_layers:
-            per_layer_gdns = [
-                mod for _name, mod in layer.named_modules() if isinstance(mod, gdn_cls)
-            ]
-            if len(per_layer_gdns) > 1:
-                raise RuntimeError(
-                    f"Layer {type(layer).__name__} contains "
-                    f"{len(per_layer_gdns)} GatedDeltaNet submodules; "
-                    "GDN rollback currently assumes at most one GDN per "
-                    "layer because ``layer.named_modules()`` uses mlx's "
-                    "LIFO stack traversal — multiple GDNs would come back "
-                    "in the reverse of definition order and be mis-aligned "
-                    "with the forward pass. File an olmlx issue with the "
-                    "model class name."
-                )
-            out.extend(per_layer_gdns)
-        return out
+    @classmethod
+    def for_model(cls, model: nn.Module) -> tuple["GDNStateCapture", GDNBuffer]:
+        """Convenience: locate the GDN class in *model*, create a capture
+        and a buffer pre-populated with *model*'s expected modules.
+
+        Use when only one model needs rollback (DFlash's target).
+        For classic speculative with hybrid target+draft sharing the
+        same GDN class, construct one ``GDNStateCapture(gdn_cls)``
+        directly and call ``create_buffer(model)`` per model.
+
+        Raises ``RuntimeError`` if *model* has no ``GatedDeltaNet`` submodule.
+        """
+        gdn_cls = find_gdn_class(model)
+        if gdn_cls is None:
+            raise RuntimeError(
+                "Model declares non-trimmable KV caches but no "
+                "``GatedDeltaNet`` submodule was found — GDN rollback "
+                "currently only supports GDN-based hybrid linear-attention "
+                "models. Open an olmlx issue with the model's class name."
+            )
+        capture = cls(gdn_cls)
+        try:
+            buffer = capture.create_buffer(model)
+        except Exception:
+            capture.close()
+            raise
+        return capture, buffer
+
+    def create_buffer(self, model: nn.Module) -> GDNBuffer:
+        """Create a fresh buffer pre-populated with *model*'s GDN modules.
+
+        Each model gets its own buffer because the expected-module list
+        is model-specific (different instances for target vs draft, even
+        when they share the GDN class).
+        """
+        return GDNBuffer(collect_gdn_modules(model, self._gdn_cls))
 
     # ------------------------------------------------------------------
     # Buffer routing
@@ -340,14 +390,6 @@ class GDNStateCapture:
     @property
     def gdn_cls(self) -> type:
         return self._gdn_cls
-
-    @property
-    def num_gdn_layers(self) -> int:
-        return len(self._expected_gdn_modules)
-
-    @property
-    def expected_modules(self) -> list[Any]:
-        return list(self._expected_gdn_modules)
 
     # ------------------------------------------------------------------
     # Patch lifecycle
@@ -602,7 +644,7 @@ class GDNStateCapture:
                 "mlx_lm.models.gated_delta is unavailable; cannot perform "
                 "GDN rollback (should have been caught at patch install)."
             )
-        N = self.num_gdn_layers
+        N = buffer.num_gdn_layers
         j_gdn = 0  # index into the per-layer GDN sequence (0 .. N-1)
         for c in cache:
             if c.is_trimmable():
@@ -671,11 +713,12 @@ class GDNStateCapture:
     def _check_buffer_alignment(
         self, buffer: GDNBuffer, single: bool, num_steps: int = 1
     ) -> None:
-        expected = self.num_gdn_layers * num_steps
+        n_layers = buffer.num_gdn_layers
+        expected = n_layers * num_steps
         if len(buffer.gdn_inputs) != expected:
             raise RuntimeError(
                 f"GDN capture buffer size mismatch: expected {expected} "
-                f"entries ({self.num_gdn_layers} layers × {num_steps} "
+                f"entries ({n_layers} layers × {num_steps} "
                 f"forward call{'s' if num_steps != 1 else ''}), got "
                 f"{len(buffer.gdn_inputs)}. Either capture missed some "
                 "GDN calls or extra calls were made outside the "
@@ -685,18 +728,19 @@ class GDNStateCapture:
             # Identity ordering check identical to DFlash's existing
             # invariant: forward must visit GDN modules in the same
             # order they appear in ``get_model_layers(model)``.
-            if not _order_matches(buffer.captured_modules, self._expected_gdn_modules):
+            if not _order_matches(buffer.captured_modules, buffer.expected_modules):
                 self._raise_ordering_error(buffer)
         else:
             # For autoregressive: each step should visit the same
             # modules in the same order. Check the first step's
             # ordering and that subsequent steps match it.
-            N = self.num_gdn_layers
-            first_step = buffer.captured_modules[:N]
-            if not _order_matches(first_step, self._expected_gdn_modules):
+            first_step = buffer.captured_modules[:n_layers]
+            if not _order_matches(first_step, buffer.expected_modules):
                 self._raise_ordering_error(buffer)
             for step in range(1, num_steps):
-                this_step = buffer.captured_modules[step * N : (step + 1) * N]
+                this_step = buffer.captured_modules[
+                    step * n_layers : (step + 1) * n_layers
+                ]
                 if not all(a is b for a, b in zip(this_step, first_step)):
                     raise RuntimeError(
                         f"GDN autoregressive rollback: step {step} visited "
@@ -707,7 +751,7 @@ class GDNStateCapture:
 
     def _raise_ordering_error(self, buffer: GDNBuffer) -> None:
         captured_types = [type(m).__name__ for m in buffer.captured_modules]
-        expected_types = [type(m).__name__ for m in self._expected_gdn_modules]
+        expected_types = [type(m).__name__ for m in buffer.expected_modules]
         raise RuntimeError(
             "GDN rollback ordering invariant violated: forward pass "
             "visited GDN layers in a different order than "
