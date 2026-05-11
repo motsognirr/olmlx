@@ -2302,6 +2302,8 @@ def cmd_eagle_prepare(args):
     print(f"  Block size (draft tokens): {args.block_size}")
     print(f"  Draft layers: {args.num_hidden_layers}")
     print(f"  LR: {args.lr}")
+    sample_positions = args.sample_positions if args.sample_positions > 0 else None
+    print(f"  Sample positions/step: {sample_positions or 'all'}")
     print(f"  Precomputed shards: {args.use_precomputed}")
     print()
 
@@ -2316,6 +2318,7 @@ def cmd_eagle_prepare(args):
         block_size=args.block_size,
         num_hidden_layers=args.num_hidden_layers,
         lr=args.lr,
+        sample_positions=sample_positions,
         output_dir=args.output,
         progress_callback=_flash_progress,
     )
@@ -2825,6 +2828,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     eagle_prepare_p.add_argument(
         "--lr", type=float, default=5e-4, help="Peak learning rate (default: 5e-4)"
+    )
+    eagle_prepare_p.add_argument(
+        "--sample-positions",
+        type=int,
+        default=256,
+        help=(
+            "Per-step subsample of positions where lm_head is applied "
+            "during loss computation. The full sequence still runs through "
+            "draft self-attention; only the final vocab projection is "
+            "subsampled. Set to 0 to disable subsampling and score every "
+            "position (~10x slower on large vocabs). Default: 256."
+        ),
     )
     eagle_prepare_p.add_argument(
         "--output",

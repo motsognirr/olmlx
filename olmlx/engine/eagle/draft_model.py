@@ -237,31 +237,76 @@ class EagleDraftModel(nn.Module):
     def bind(self, target_model: Any) -> None:
         """Borrow ``embed_tokens`` and ``lm_head`` from the target.
 
-        Tries ``target.model.embed_tokens`` then ``target.embed_tokens``
-        for the embedding (mirrors mlx-lm conventions for Qwen-family
-        and llama-family targets). The lm_head is always at
-        ``target.lm_head``.
+        Walks several attribute chains so VLM and other wrapped
+        targets are supported (mirrors DFlash's lookup pattern):
+
+        - embed: ``.embed_tokens``, ``.model.embed_tokens``,
+          ``.language_model.model.embed_tokens``,
+          ``.language_model.embed_tokens``
+        - lm_head: ``.lm_head``, ``.language_model.lm_head``,
+          ``.model.lm_head``, ``.language_model.model.lm_head``,
+          and finally ``embed.as_linear`` for tied-embeddings models
         """
-        embed = None
-        if hasattr(target_model, "model") and hasattr(
-            target_model.model, "embed_tokens"
-        ):
-            embed = target_model.model.embed_tokens
-        elif hasattr(target_model, "embed_tokens"):
-            embed = target_model.embed_tokens
+        embed = self._find_embed(target_model)
         if embed is None:
             raise AttributeError(
-                f"Cannot find embed_tokens on {type(target_model).__name__}; "
-                "tried .model.embed_tokens and .embed_tokens"
+                f"Cannot find embed_tokens on target model "
+                f"{type(target_model).__name__}; tried .embed_tokens, "
+                ".model.embed_tokens, .language_model.model.embed_tokens, "
+                ".language_model.embed_tokens"
             )
-        if not hasattr(target_model, "lm_head"):
+        lm_head = self._find_lm_head(target_model, embed)
+        if lm_head is None:
             raise AttributeError(
-                f"Cannot find lm_head on {type(target_model).__name__}"
+                f"Cannot find lm_head on target model "
+                f"{type(target_model).__name__}; tried .lm_head, "
+                ".language_model.lm_head, .model.lm_head, "
+                ".language_model.model.lm_head, embed.as_linear"
             )
         # ``object.__setattr__`` keeps these out of the parameter tree
         # (see ``__init__`` comment) — DO NOT switch to plain ``self.x =``.
         object.__setattr__(self, "embed_tokens", embed)
-        object.__setattr__(self, "lm_head", target_model.lm_head)
+        object.__setattr__(self, "lm_head", lm_head)
+
+    @staticmethod
+    def _find_embed(target: Any) -> nn.Module | None:
+        for path in (
+            ("embed_tokens",),
+            ("model", "embed_tokens"),
+            ("language_model", "model", "embed_tokens"),
+            ("language_model", "embed_tokens"),
+        ):
+            obj: Any = target
+            for attr in path:
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return obj
+        return None
+
+    @staticmethod
+    def _find_lm_head(target: Any, embed: nn.Module) -> nn.Module | None:
+        for path in (
+            ("lm_head",),
+            ("language_model", "lm_head"),
+            ("model", "lm_head"),
+            ("language_model", "model", "lm_head"),
+        ):
+            obj: Any = target
+            for attr in path:
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return obj
+        # Tied-embeddings fallback: many small Qwen variants share the
+        # input embedding with the lm_head and expose
+        # ``embed_tokens.as_linear``.
+        as_linear = getattr(embed, "as_linear", None)
+        if callable(as_linear):
+            return as_linear  # type: ignore[no-any-return]
+        return None
 
     def bind_via_modules(self, embed_tokens: nn.Module, lm_head: nn.Module) -> None:
         """Test-only entry point: bind to externally-provided modules
@@ -280,11 +325,26 @@ class EagleDraftModel(nn.Module):
         token_ids: mx.array,
         h_prev: mx.array,
         cache: list[KVCache] | None = None,
-    ) -> tuple[mx.array, mx.array]:
-        if self.embed_tokens is None or self.lm_head is None:
+        compute_logits: bool = True,
+    ) -> tuple[mx.array | None, mx.array]:
+        """Forward pass.
+
+        ``compute_logits=False`` skips the final ``lm_head`` projection
+        and returns ``(None, h_new)``. Training uses this to apply
+        ``lm_head`` only at a small subset of sampled positions —
+        materialising the full ``(B, L, vocab_size)`` logits tensor on
+        a 250k-vocab × 2048-token sequence is the dominant cost (~4 GB
+        per forward) and dwarfs the rest of the draft.
+        """
+        if self.embed_tokens is None:
             raise RuntimeError(
                 "EagleDraftModel.__call__ requires bind() to attach the "
-                "target's embed_tokens and lm_head before forward."
+                "target's embed_tokens before forward."
+            )
+        if compute_logits and self.lm_head is None:
+            raise RuntimeError(
+                "EagleDraftModel.__call__(compute_logits=True) requires "
+                "bind() to attach the target's lm_head."
             )
         # Embed tokens, concat with h_prev along feature axis, project
         # back down to hidden_size.
@@ -303,5 +363,7 @@ class EagleDraftModel(nn.Module):
             x = layer(x, mask=mask, cache=layer_cache)
 
         h_new = self.norm(x)
-        logits = self.lm_head(h_new)
-        return logits, h_new
+        if compute_logits:
+            assert self.lm_head is not None  # narrow for type checker
+            return self.lm_head(h_new), h_new
+        return None, h_new

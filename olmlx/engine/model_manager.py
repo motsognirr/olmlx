@@ -1389,6 +1389,31 @@ class ModelManager:
                             text_model_type,
                         )
                         return "text"
+                    # Fallback: some hybrid model variants flip the convention
+                    # — top-level model_type is the bare arch ("qwen3_5") and
+                    # text_config.model_type is a derivative tag with no
+                    # mlx-lm module ("qwen3_5_text"). mlx-lm's own loader
+                    # uses the top-level model_type for module resolution
+                    # (mlx_lm.utils._get_classes), so when the text path
+                    # lookup misses we should try the top-level before
+                    # giving up.
+                    if text_model_type != model_type:
+                        mapped_top = LM_REMAP.get(model_type, model_type)
+                        if (
+                            importlib.util.find_spec(f"mlx_lm.models.{mapped_top}")
+                            is not None
+                        ):
+                            logger.warning(
+                                "Routing hybrid linear-attention VLM '%s' "
+                                "through mlx-lm text path '%s' (issue #284, "
+                                "via top-level fallback because "
+                                "text_config.model_type '%s' has no mlx-lm "
+                                "module). Vision capability disabled.",
+                                model_type,
+                                mapped_top,
+                                text_model_type,
+                            )
+                            return "text"
                     # mlx-lm has no module for this model_type.  The mlx-vlm
                     # fallback chain is the known-crashing path for these
                     # models; raise at detection time so the user sees a
@@ -2121,10 +2146,24 @@ class ModelManager:
             if spec_config.num_tokens is not None
             else draft_config.block_size
         )
+        # ``target_layer_id`` (optional, recorded by ``olmlx eagle prepare``
+        # at training time) tells the decoder which target layer to hook.
+        # MUST match the layer the draft was trained against — feeding
+        # the draft hiddens from a different layer at inference produces
+        # ~5% acceptance even for an otherwise well-converged draft, since
+        # mid-network and post-final-norm hiddens have very different
+        # distributions. ``None`` falls back to the decoder's default
+        # (last layer) — appropriate for older checkpoints from before
+        # this field was recorded.
+        target_layer_id_raw = eagle_cfg.get("target_layer_id")
+        target_layer_id = (
+            int(target_layer_id_raw) if target_layer_id_raw is not None else None
+        )
         return EagleDecoder(
             target_model=target_model,
             draft_model=draft_model,
             block_size=block_size,
+            target_layer_id=target_layer_id,
         )
 
     def _load_speculative_decoder(

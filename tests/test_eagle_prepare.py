@@ -347,3 +347,71 @@ class TestEagleLossSignature:
         loss = _eagle_loss(draft, h, ids)
         assert loss.ndim == 0  # scalar
         assert mx.isfinite(loss).item()
+
+    def test_subsampled_loss_is_scalar_and_finite(self):
+        """``sample_positions`` skips lm_head over un-sampled positions
+        but still produces a finite scalar loss. We don't assert
+        equality with the full path because position sampling is random
+        and per-position CE varies — instead we verify the path runs
+        end-to-end and produces a sensible value within ~3 sigma of the
+        full-sequence loss."""
+        from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
+        from olmlx.engine.eagle.prepare import _eagle_loss
+
+        cfg = EagleConfig(
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            intermediate_size=32,
+            vocab_size=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            max_position_embeddings=512,
+            block_size=4,
+        )
+        draft = EagleDraftModel(cfg)
+        embed = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        lm = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        draft.bind_via_modules(embed, lm)
+
+        ids = mx.random.randint(0, cfg.vocab_size, (2, 32))
+        h = mx.random.normal((2, 32, cfg.hidden_size))
+        loss_full = _eagle_loss(draft, h, ids)
+        loss_sub = _eagle_loss(draft, h, ids, sample_positions=8)
+        assert loss_sub.ndim == 0
+        assert mx.isfinite(loss_sub).item()
+        # An untrained tied-embedding draft on a 64-vocab batch sits
+        # near ln(64) ≈ 4.16; both paths should land in the same
+        # ballpark.
+        assert abs(float(loss_sub.item()) - float(loss_full.item())) < 2.0
+
+    def test_subsampled_loss_clamps_to_seq_len(self):
+        """Asking for more sampled positions than the sequence has
+        should not crash — it just scores every available position."""
+        from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
+        from olmlx.engine.eagle.prepare import _eagle_loss
+
+        cfg = EagleConfig(
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            intermediate_size=32,
+            vocab_size=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            max_position_embeddings=512,
+            block_size=4,
+        )
+        draft = EagleDraftModel(cfg)
+        embed = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        lm = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        draft.bind_via_modules(embed, lm)
+
+        ids = mx.random.randint(0, cfg.vocab_size, (1, 4))
+        h = mx.random.normal((1, 4, cfg.hidden_size))
+        loss = _eagle_loss(draft, h, ids, sample_positions=1024)
+        assert mx.isfinite(loss).item()

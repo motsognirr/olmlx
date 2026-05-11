@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import random
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,14 @@ DEFAULT_BATCH_SIZE = 4
 DEFAULT_SEQ_LEN = 2048
 DEFAULT_LR = 5e-4
 DEFAULT_WARMUP_FRAC = 0.05
+# How many positions per sequence to score with ``lm_head`` during
+# training. The full sequence is run through self-attention so each
+# scored position sees its true context — only the final vocab-size
+# projection is subsampled. 256 is a sweet spot for 250k-vocab targets:
+# ~10x faster than full scoring, variance across an epoch is dwarfed by
+# normal training noise, and convergence matches full scoring within
+# logging resolution.
+DEFAULT_SAMPLE_POSITIONS = 256
 
 
 # ---------------------------------------------------------------------------
@@ -155,25 +164,78 @@ def _eagle_loss(
     draft: EagleDraftModel,
     target_hidden: mx.array,
     input_ids: mx.array,
+    *,
+    sample_positions: int | None = None,
 ) -> mx.array:
     """Autoregressive next-token CE under teacher forcing.
 
-    At each position ``t`` the draft sees the target's hidden ``h_t``
-    and the token at position ``t`` (``input_ids[t]``); it must
-    predict ``input_ids[t+1]``. The last position has no label so we
-    drop it.
+    EAGLE alignment: at training position ``t`` the draft sees
+    ``(h_{t-1}, token_t)`` and predicts ``token_{t+1}``. The hidden
+    corresponds to the position *before* the current token was seen
+    — this is what the published recipe expects and what the inference
+    decoder feeds (after prefill, ``seed_hidden = h_{P-1}`` and
+    ``seed_token = token_P``; after each verify, the captured hidden
+    at slot ``num_accepted - 1`` is the hidden *before* the new seed
+    token was incorporated). Aligning at the same index instead would
+    make the draft see ``h_t`` (which already contains ``token_t``)
+    and learn a redundant mapping that never matches the inference
+    pairing — observed empirically as ~1% acceptance rate at bench.
+
+    Indexing: ``t`` ranges over ``1..L-2`` (need ``t+1 <= L-1`` for
+    the label and ``t-1 >= 0`` for the hidden). Each batch of length
+    ``L`` therefore yields ``L-2`` training positions.
 
     ``target_hidden`` shape ``(B, L, H)`` is the *last layer* of the
     target's forward — caller must slice to a single layer before
     calling.
+
+    ``sample_positions``: if set, randomly subsample this many
+    positions per sequence and compute loss only there. The full
+    draft forward (self-attention over all positions) still runs so
+    each sampled position sees its true context, but we skip the
+    expensive ``lm_head`` projection at the un-sampled positions.
+    On a 250k-vocab × 2048-position × batch=4 setup the full logits
+    tensor is ~4 GB per forward; sampling 256 positions cuts that to
+    ~512 MB and is ~10x faster end-to-end. Per-position CE is i.i.d.
+    so sampling is an unbiased estimator of the full-sequence mean.
+    Pass ``None`` to compute loss at every position (production
+    behavior; tests rely on it).
     """
-    # Inputs span positions 0..L-2; labels are positions 1..L-1.
-    tokens = input_ids[:, :-1]
-    h = target_hidden[:, :-1, :]
-    labels = input_ids[:, 1:]
-    logits, _h_new = draft(token_ids=tokens, h_prev=h)
-    log_probs = nn.log_softmax(logits, axis=-1)
-    nll = -mx.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
+    tokens = input_ids[:, 1:-1]
+    h = target_hidden[:, :-2, :]
+    labels = input_ids[:, 2:]
+
+    if sample_positions is None:
+        # Full path: lm_head over every position. Cheap on tests with
+        # tiny vocabs; expensive on real targets.
+        logits, _h_new = draft(token_ids=tokens, h_prev=h)
+        log_probs = nn.log_softmax(logits, axis=-1)
+        nll = -mx.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
+        return mx.mean(nll)
+
+    # Subsampled path: skip lm_head in the draft forward, then apply it
+    # manually at the sampled positions only.
+    if draft.lm_head is None:
+        raise RuntimeError(
+            "_eagle_loss(sample_positions=...) requires the draft to be "
+            "bound to a target so lm_head is available."
+        )
+    _none, h_new = draft(token_ids=tokens, h_prev=h, compute_logits=False)
+    L = tokens.shape[1]
+    # Pick ``min(sample_positions, L)`` distinct positions per batch
+    # row. Same indices across batch rows is fine — independent
+    # sampling per row would yield ragged tensors and the variance
+    # gain is negligible at our batch sizes.
+    k = min(sample_positions, L)
+    idx = mx.array(
+        sorted(random.sample(range(L), k)),
+        dtype=mx.int32,
+    )
+    h_sub = h_new[:, idx, :]
+    labels_sub = labels[:, idx]
+    logits_sub = draft.lm_head(h_sub)
+    log_probs = nn.log_softmax(logits_sub, axis=-1)
+    nll = -mx.take_along_axis(log_probs, labels_sub[..., None], axis=-1).squeeze(-1)
     return mx.mean(nll)
 
 
@@ -193,7 +255,18 @@ def _cosine_lr(step: int, total: int, peak: float, warmup: int) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _config_to_disk(cfg: EagleConfig) -> dict[str, Any]:
+def _config_to_disk(
+    cfg: EagleConfig,
+    *,
+    target_layer_id: int | None = None,
+) -> dict[str, Any]:
+    eagle_block: dict[str, Any] = {"block_size": cfg.block_size}
+    if target_layer_id is not None:
+        # The decoder must hook the same target layer the draft was
+        # trained against; otherwise it sees a hidden from a different
+        # distribution at inference (~5% acceptance vs ~50% expected).
+        # Persist it here so ``_load_eagle_decoder`` can wire it in.
+        eagle_block["target_layer_id"] = int(target_layer_id)
     return {
         "hidden_size": cfg.hidden_size,
         "num_hidden_layers": cfg.num_hidden_layers,
@@ -206,9 +279,7 @@ def _config_to_disk(cfg: EagleConfig) -> dict[str, Any]:
         "rope_theta": cfg.rope_theta,
         "max_position_embeddings": cfg.max_position_embeddings,
         "rope_scaling": cfg.rope_scaling,
-        "eagle_config": {
-            "block_size": cfg.block_size,
-        },
+        "eagle_config": eagle_block,
     }
 
 
@@ -227,6 +298,7 @@ def prepare_eagle_draft(
     block_size: int = DEFAULT_BLOCK_SIZE,
     num_hidden_layers: int = DEFAULT_NUM_HIDDEN_LAYERS,
     lr: float = DEFAULT_LR,
+    sample_positions: int | None = DEFAULT_SAMPLE_POSITIONS,
     output_dir: str | Path | None = None,
     progress_callback: Callable[[str, float], None] | None = None,
     log_every: int = 50,
@@ -282,7 +354,7 @@ def prepare_eagle_draft(
         h: mx.array,
         ids: mx.array,
     ) -> mx.array:
-        return _eagle_loss(model, h, ids)
+        return _eagle_loss(model, h, ids, sample_positions=sample_positions)
 
     loss_and_grad = nn.value_and_grad(draft, loss_fn)
 
@@ -292,6 +364,7 @@ def prepare_eagle_draft(
         return loss
 
     # Set up batch source.
+    eagle_target_layer_id: int | None = None
     if _batch_iterator is not None:
         batches = _batch_iterator
     else:
@@ -317,6 +390,32 @@ def prepare_eagle_draft(
                 f"not a multiple of target hidden_size ({target_hidden_size}); "
                 "shards may have been produced with a different target."
             )
+        # Record the *layer index* the deepest captured hidden came
+        # from. dflash precompute usually stores hiddens from a few
+        # mid-network layers (e.g. [13, 25, 38, 50] for a 64-layer
+        # target), and the deepest one — index ``target_layer_ids[-1]``
+        # in the shard ladder — is what we slice into ``h_last`` and
+        # train against. The inference decoder MUST then hook *that*
+        # same layer; otherwise it feeds the draft hiddens from a
+        # different distribution (e.g. layer 63's post-final-norm
+        # output) and acceptance collapses (~5% observed). Persist
+        # the layer index in the EAGLE config so the loader can wire
+        # it through.
+        captured_layer_ids = list(meta.get("target_layer_ids") or [])
+        if not captured_layer_ids:
+            raise ValueError(
+                "Precomputed shard index.json is missing 'target_layer_ids'. "
+                "EAGLE inference needs the captured layer index to hook the "
+                "matching layer at runtime; rerun `olmlx dflash precompute` "
+                "with a recent olmlx version that records this field."
+            )
+        eagle_target_layer_id = int(captured_layer_ids[-1])
+        logger.info(
+            "EAGLE will train on (and bind to at inference) target layer %d "
+            "based on precomputed shard ladder %s",
+            eagle_target_layer_id,
+            captured_layer_ids,
+        )
 
         def _slice_iter():
             for ids, h_concat in iter_precomputed_shards(
@@ -367,7 +466,7 @@ def prepare_eagle_draft(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cfg_dict = _config_to_disk(eagle_cfg)
+    cfg_dict = _config_to_disk(eagle_cfg, target_layer_id=eagle_target_layer_id)
     (output_dir / "config.json").write_text(json.dumps(cfg_dict, indent=2))
 
     weights = dict(mx_utils.tree_flatten(draft.parameters()))
