@@ -381,6 +381,22 @@ class EagleDraftModel(nn.Module):
 
         h_new = self.norm(x)
         if compute_logits:
-            assert self.lm_head is not None  # narrow for type checker
-            return self.lm_head(h_new), h_new
+            # ``self.lm_head is not None`` was checked at the top of
+            # this function (line ~361, the ``compute_logits and
+            # self.lm_head is None`` guard), so the call below is
+            # safe at runtime. The type checker can't carry that
+            # narrowing across the intervening ``self.lm_head =
+            # object.__setattr__(...)`` plumbing, so we rebind to a
+            # local. ``assert`` would also satisfy pyright but
+            # ``-O`` strips asserts — ``prepare.py`` uses an
+            # explicit ``if x is None: raise`` for the same reason
+            # and we mirror that pattern here.
+            lm_head = self.lm_head
+            if lm_head is None:
+                raise RuntimeError(
+                    "EagleDraftModel.__call__ internal invariant: "
+                    "self.lm_head became None between top-of-function "
+                    "guard and lm_head invocation. This is an olmlx bug."
+                )
+            return lm_head(h_new), h_new
         return None, h_new

@@ -719,6 +719,20 @@ class TestEagleDecoderGDNPath:
         # ``test_prefill_installs_capture_when_cache_is_non_trimmable``
         # for rationale). Sentinel class — guard only checks presence.
         monkeypatch.setattr(decoder_mod, "_find_gdn_class", lambda _m: object)
+        # Force a deterministic partial acceptance so the rollback
+        # assertion below is guaranteed to fire. Without this, the
+        # synthetic target's argmax could (by chance with a small
+        # vocab) accept all block_size+1 candidates, giving trim=0
+        # and silently skipping the rollback path — the test name
+        # would promise coverage it doesn't deliver. We patch
+        # ``verify_draft_greedy`` rather than tweaking the target's
+        # weights because patching is explicit and the verify
+        # helper is the right surface for "what was accepted".
+        monkeypatch.setattr(
+            decoder_mod,
+            "verify_draft_greedy",
+            lambda drafts, _logits: [drafts[0], 99],  # accept 1 draft + 1 substitute
+        )
 
         captured_calls = {"clear": 0, "close": 0, "rollback": []}
 
@@ -754,16 +768,17 @@ class TestEagleDecoderGDNPath:
         accepted, _ = decoder.step()
         # capture.clear must run before verify
         assert captured_calls["clear"] == 1
-        # rollback must run after verify (only if there was something
-        # to trim, which is true unless all block_size+1 candidates
-        # were accepted and thus 0 trim — assert at least once with
-        # this synthetic setup acceptance is not 100%)
-        if (self._block_size_plus_one(decoder) - len(accepted)) > 0:
-            assert len(captured_calls["rollback"]) == 1
-            # accepted-draft-count argument should be num_accepted - 1
-            recorded_acc, recorded_trim = captured_calls["rollback"][0]
-            assert recorded_acc == len(accepted) - 1
-            assert recorded_trim == decoder._block_size + 1 - len(accepted)
+        # rollback must run after verify. With the
+        # ``verify_draft_greedy`` patch above we deterministically
+        # get a 2-token accepted list against a block_size=2 verify
+        # (3 candidate positions), so trim = 3 - 2 = 1 > 0 and the
+        # rollback branch is guaranteed to fire.
+        assert len(accepted) == 2
+        assert len(captured_calls["rollback"]) == 1
+        # accepted-draft-count argument should be num_accepted - 1
+        recorded_acc, recorded_trim = captured_calls["rollback"][0]
+        assert recorded_acc == len(accepted) - 1
+        assert recorded_trim == decoder._block_size + 1 - len(accepted)
         # The draft cache trim still goes through trim_prompt_cache,
         # but the target cache trim should NOT have called it. Hard
         # to assert exact count here without distinguishing target vs
@@ -775,7 +790,3 @@ class TestEagleDecoderGDNPath:
         decoder.reset()
         # close should fire on reset
         assert captured_calls["close"] == 1
-
-    @staticmethod
-    def _block_size_plus_one(decoder) -> int:
-        return decoder._block_size + 1

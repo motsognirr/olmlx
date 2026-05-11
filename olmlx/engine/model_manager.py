@@ -2111,10 +2111,19 @@ class ModelManager:
             len(weight_files),
         )
 
-        # Vocab-size check, mirroring the DFlash loader so a
-        # cross-target draft surfaces here rather than at the first
-        # forward pass.
+        # Vocab-size + hidden-size cross-checks, mirroring the DFlash
+        # loader so a cross-target draft surfaces here rather than at
+        # the first forward pass.
+        #
+        # ``hidden_size`` matters because EAGLE's input projection is
+        # shape ``(2 * hidden_size, hidden_size)`` — it concatenates
+        # the target's hidden (shape ``hidden_size``) with the
+        # embedding (shape ``hidden_size``). A draft trained against
+        # Qwen3.5-7B (hidden=3584) loaded against Qwen3.5-27B
+        # (hidden=5120) would pass vocab and crash with a cryptic
+        # shape error inside ``input_proj`` on the first prefill.
         target_vocab: int | None = None
+        target_hidden: int | None = None
         for chain in ((), ("model",), ("language_model",), ("language_model", "model")):
             obj: Any = target_model
             for attr in chain:
@@ -2124,9 +2133,16 @@ class ModelManager:
             if obj is None:
                 continue
             args = getattr(obj, "args", None) or getattr(obj, "config", None)
-            v = getattr(args, "vocab_size", None) if args is not None else None
-            if v is not None:
-                target_vocab = int(v)
+            if args is not None:
+                if target_vocab is None:
+                    v = getattr(args, "vocab_size", None)
+                    if v is not None:
+                        target_vocab = int(v)
+                if target_hidden is None:
+                    h = getattr(args, "hidden_size", None)
+                    if h is not None:
+                        target_hidden = int(h)
+            if target_vocab is not None and target_hidden is not None:
                 break
         if target_vocab is None:
             logger.warning(
@@ -2139,6 +2155,21 @@ class ModelManager:
                 f"EAGLE draft vocab_size ({draft_config.vocab_size}) does "
                 f"not match target vocab_size ({target_vocab}). The draft "
                 "must be trained against a target with the same vocabulary."
+            )
+        if target_hidden is None:
+            logger.warning(
+                "Could not determine target hidden_size for EAGLE draft "
+                "compatibility check. A mismatch will surface as an mx.array "
+                "shape error inside the draft's input_proj on the first "
+                "prefill."
+            )
+        elif target_hidden != draft_config.hidden_size:
+            raise ValueError(
+                f"EAGLE draft hidden_size ({draft_config.hidden_size}) does "
+                f"not match target hidden_size ({target_hidden}). The draft's "
+                "input_proj is shaped (2 * hidden_size, hidden_size); a "
+                "mismatch would crash inside input_proj at the first "
+                "prefill. Retrain the draft against the current target."
             )
 
         block_size = (
