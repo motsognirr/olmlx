@@ -582,8 +582,11 @@ def _apply_serve_overrides(args) -> None:
         )
     # dflash on Flash-MoE models will raise ValueError at load time once
     # the Flash-MoE bundle is prepared and loaded; warn at startup so
-    # users see the incompatibility early.
-    if dflash_moe_conflicts:
+    # users see the incompatibility early. Filter models also in ``bad``
+    # (missing draft) — the "use classic strategy" suggestion is
+    # misleading when there is no draft model configured at all.
+    dflash_moe_actionable = [m for m in dflash_moe_conflicts if m not in set(bad)]
+    if dflash_moe_actionable:
         logger.warning(
             "The following models combine speculative_strategy='dflash' "
             "with Flash-MoE. Once Flash-MoE is prepared and loads, this "
@@ -591,7 +594,7 @@ def _apply_serve_overrides(args) -> None:
             "hidden-state capture that does not generalize to MoE "
             "routing): %s. Use speculative_strategy='classic' or set "
             "speculative=false.",
-            ", ".join(dflash_moe_conflicts),
+            ", ".join(dflash_moe_actionable),
         )
     if bad:
         print(
