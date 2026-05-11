@@ -972,6 +972,36 @@ class TestBuildParser:
         # No model in this fixture uses the global draft (good/a has its own).
         assert global_used is False
 
+    def test_audit_dflags_flash_moe_conflicts(self, monkeypatch, tmp_path):
+        """dflash + Flash-MoE populates the dflash_moe_conflicts bucket."""
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "moe-dflash/m:latest": {
+                        "hf_path": "moe-dflash/m",
+                        "speculative": True,
+                        "speculative_strategy": "dflash",
+                        "speculative_draft_model": "moe-dflash/draft",
+                        "experimental": {"flash_moe": True},
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+
+        bad, dormant, flash, dflash_moe, global_used = _audit_speculative_config()
+        assert bad == []
+        assert dormant == []
+        assert flash == []
+        assert dflash_moe == ["moe-dflash/m:latest"]
+        assert global_used is False
+
     def test_service_install(self):
         parser = build_parser()
         args = parser.parse_args(["service", "install"])

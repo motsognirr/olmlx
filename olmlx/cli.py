@@ -580,17 +580,18 @@ def _apply_serve_overrides(args) -> None:
             "Note: flash-speculative is still experimental.",
             ", ".join(flash_conflicts_actionable),
         )
-    # dflash on Flash-MoE models will raise ValueError at load time;
-    # warn at startup so users see the incompatibility early.
-    dflash_moe_actionable = [m for m in dflash_moe_conflicts if m not in set(bad)]
-    if dflash_moe_actionable:
+    # dflash on Flash-MoE models will raise ValueError at load time once
+    # the Flash-MoE bundle is prepared and loaded; warn at startup so
+    # users see the incompatibility early.
+    if dflash_moe_conflicts:
         logger.warning(
             "The following models combine speculative_strategy='dflash' "
-            "with Flash-MoE, which is unsupported (dflash requires "
+            "with Flash-MoE. Once Flash-MoE is prepared and loads, this "
+            "will raise a ValueError at load time (dflash requires "
             "hidden-state capture that does not generalize to MoE "
             "routing): %s. Use speculative_strategy='classic' or set "
             "speculative=false.",
-            ", ".join(dflash_moe_actionable),
+            ", ".join(dflash_moe_conflicts),
         )
     if bad:
         print(
@@ -717,7 +718,7 @@ def _audit_speculative_config() -> tuple[
     global_draft_used = False
     for name, mc in registry.list_models().items():
         try:
-            enabled, draft, strategy, _ = mc.resolved_speculative()
+            enabled, draft, _, strategy = mc.resolved_speculative()
         except Exception as exc:
             # ``resolved_speculative`` reads ``settings`` and could
             # raise if the runtime ``Settings`` is in an unexpected

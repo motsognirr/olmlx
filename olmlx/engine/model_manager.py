@@ -2292,17 +2292,19 @@ class ModelManager:
                         "Flash-MoE targets. Use speculative_strategy='classic' "
                         "or remove the speculative settings."
                     )
-                if spec_enabled and model_exp.flash_speculative:
+                if model_exp.flash_speculative:
                     raise ValueError(
-                        "Only one speculative decoder can be active at a time; "
-                        "got both 'speculative' and 'flash_speculative'."
+                        "flash_speculative is not supported on Flash-MoE "
+                        "targets. Remove flash_speculative from models.json "
+                        "(or unset OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE) and "
+                        "use speculative instead."
                     )
                 model, tokenizer, is_vlm, caps = self._load_flash_moe_model(
                     hf_path, load_path, flash_moe_dir, model_exp=model_exp
                 )
                 if spec_enabled:
                     decoder = self._load_speculative_decoder(
-                        model, hf_path, spec_config, is_vlm=is_vlm
+                        model, hf_path, spec_config, is_vlm=False
                     )
                     return model, tokenizer, is_vlm, caps, decoder
                 return model, tokenizer, is_vlm, caps, None

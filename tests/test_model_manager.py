@@ -2829,6 +2829,30 @@ class TestSpeculativeLoading:
                 "test/moe-model", model_exp=model_exp, spec_config=spec_config
             )
 
+    def test_flash_moe_path_rejects_flash_speculative(self, monkeypatch):
+        """Flash-MoE + flash_speculative should raise ValueError."""
+        from olmlx.config import ExperimentalSettings
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-moe")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: True)
+        monkeypatch.setattr(
+            manager, "_flash_moe_dir", lambda hf_path: Path("/tmp/test-moe/flash_moe")
+        )
+
+        model_exp = ExperimentalSettings(_env_file=None, flash_speculative=True)
+        spec_config = SpeculativeConfig(False, None, 4)
+
+        with pytest.raises(
+            ValueError, match="flash_speculative.*not supported on Flash-MoE"
+        ):
+            manager._load_model(
+                "test/moe-model", model_exp=model_exp, spec_config=spec_config
+            )
+
 
 class TestDFlashLoading:
     """Tests for dflash decoder loading in _load_model."""
