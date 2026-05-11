@@ -54,8 +54,9 @@ SHARD_PATTERN = "shard-{:05d}.safetensors"
 
 # Transient mx.load() failures under sustained mmap / file-descriptor
 # pressure on macOS are rare but real (observed mid-run during a 2000-
-# step EAGLE training). Retry a few times with linear backoff before
-# giving up. 3 attempts × ~500ms each is plenty for a transient hiccup
+# step EAGLE training). Retry up to 3 times with linear backoff
+# (0s → 0.5s → 1.0s sleeps; ~1.5s total wait across 2 sleeps before
+# the 3rd attempt) before giving up — plenty for a transient hiccup
 # and trivial vs. losing an 8h training run.
 _SHARD_OPEN_RETRIES = 3
 _SHARD_OPEN_BACKOFF_S = 0.5
@@ -303,6 +304,22 @@ def iter_precomputed_shards(
                         raise
                     last_exc = exc
                     if attempt < _SHARD_OPEN_RETRIES - 1:
+                        # Log every retry so an operator running an 8h
+                        # training session can see degraded-storage
+                        # behaviour as it happens instead of only on
+                        # final failure. ``warning`` level so it
+                        # surfaces under default log config without
+                        # spamming under ``DEBUG``.
+                        logger.warning(
+                            "iter_precomputed_shards: transient open "
+                            "failure on %s (attempt %d/%d): %s — "
+                            "sleeping %.1fs before retry",
+                            shard_path,
+                            attempt + 1,
+                            _SHARD_OPEN_RETRIES,
+                            exc,
+                            _SHARD_OPEN_BACKOFF_S * (attempt + 1),
+                        )
                         time.sleep(_SHARD_OPEN_BACKOFF_S * (attempt + 1))
             if tensors is None:
                 raise RuntimeError(

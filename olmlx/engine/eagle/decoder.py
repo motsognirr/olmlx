@@ -295,28 +295,32 @@ class EagleDecoder:
                     "Disable EAGLE for this target or replace the "
                     "non-trim cache with a trim-able variant."
                 )
-            # Install the patch — must happen *before* the prompt
-            # forward so the patched ``__call__`` records the prompt's
-            # GDN state, which subsequent rollbacks may need to replay
-            # against. ``_GDNStateCapture.__init__`` acquires
-            # ``_GDN_PATCH_LOCK``; ``reset()`` releases it via
-            # ``capture.close()``.
-            self._capture = _GDNStateCapture(self._target)
-
-        # Run the target on the prompt and capture its last-layer hidden.
-        # Wrap in try/reset so an exception inside the forward (OOM,
-        # Metal stream error, shape mismatch on a freshly-loaded
-        # checkpoint) doesn't leave the model patched and the GDN
-        # capture lock held. Without this, ``_patched=True`` and the
-        # ``_GDN_PATCH_LOCK`` are held until the next ``prefill()``
-        # self-heals via ``reset()`` (called at its top) or until
-        # ``__del__`` fires — a window during which another in-flight
-        # request inspecting the target's layers sees the monkey-
-        # patched ``__call__`` and (for GDN targets) blocks on the
-        # lock. ``self._target_can_trim`` is set before the forward,
-        # so reset() can find the right cleanup path; same for
-        # ``_capture`` and ``_patched``.
+        # Wrap the GDN capture install + the prompt forward in
+        # try/reset so any exception (lock contention or unexpected
+        # state inside ``_GDNStateCapture.__init__``; OOM / Metal
+        # stream / shape mismatch inside the forward) doesn't leave
+        # the model patched and (for GDN targets) the
+        # ``_GDN_PATCH_LOCK`` held. Without this, ``_patched=True``
+        # and the patch lock are retained until the next
+        # ``prefill()`` self-heals via ``reset()`` (called at its
+        # top) or until ``__del__`` fires — a window during which
+        # another in-flight request inspecting the target's layers
+        # sees the monkey-patched ``__call__`` and (for GDN targets)
+        # blocks on the lock. The capture install in particular is
+        # not covered by the "after the forward" wrapper because
+        # ``__init__`` acquires the lock — if that itself raises,
+        # the lock state has to be cleaned up here.
         try:
+            if not self._target_can_trim:
+                # Install the patch — must happen *before* the prompt
+                # forward so the patched ``__call__`` records the prompt's
+                # GDN state, which subsequent rollbacks may need to replay
+                # against. ``_GDNStateCapture.__init__`` acquires
+                # ``_GDN_PATCH_LOCK``; ``reset()`` releases it via
+                # ``capture.close()``.
+                self._capture = _GDNStateCapture(self._target)
+
+            # Run the target on the prompt and capture its last-layer hidden.
             target_out = self._target(prompt, cache=self._target_cache)
             target_logits = _logits(target_out)
             captured = self._hidden_storage[0]
