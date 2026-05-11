@@ -145,7 +145,17 @@ class SpeculativeDecoder:
                     "lock. File an olmlx issue if you hit this."
                 )
             gdn_cls = target_gdn_cls if target_gdn_cls is not None else draft_gdn_cls
-            assert gdn_cls is not None  # at least one is non-None
+            # ``assert`` is stripped under ``python -O``; the outer ``if``
+            # guarantees at least one of the two is non-None, but a
+            # future refactor of that check could silently violate the
+            # invariant. Use ``RuntimeError`` so the failure surfaces
+            # in production builds too.
+            if gdn_cls is None:
+                raise RuntimeError(
+                    "SpeculativeDecoder GDN-setup invariant violated: "
+                    "outer ``if`` branch entered but both target and "
+                    "draft GDN classes are None. Please file an olmlx bug."
+                )
             self._gdn_capture = GDNStateCapture(gdn_cls)
             # ``create_buffer`` walks the model and can raise (e.g. orphaned
             # GDN modules outside ``get_model_layers``). Close the capture
@@ -324,6 +334,15 @@ class SpeculativeDecoder:
         target_out = _logits(self._target(all_tokens, cache=self._target_cache))
         mx.eval(target_out)
 
+        # Capture is done: no more model forwards in this step should
+        # write to either buffer. Subclass hooks (``_after_verify``) and
+        # rollback replays (``rollback_single`` invokes
+        # ``gated_delta_update`` directly, not ``GatedDeltaNet.__call__``)
+        # would otherwise append spurious captures and fail the next
+        # step's buffer-size check.
+        if self._gdn_capture is not None:
+            self._gdn_capture.use_buffer(None)
+
         verification_logits = target_out[0]  # (lambda+1, vocab)
 
         # 3. Verify draft tokens against target logits
@@ -381,12 +400,11 @@ class SpeculativeDecoder:
                 trim_prompt_cache(self._draft_cache, trim_draft)
 
         # On full acceptance, align draft cache with target cache.
-        # Suppress GDN capture for this single-token align — the buffer
-        # was sized for ``num_steps=λ``, and an extra capture would
-        # break the next step's alignment checks.
+        # ``use_buffer(None)`` was already called after the target
+        # forward, so the align step's draft forward — which DOES
+        # invoke ``GatedDeltaNet.__call__`` on a hybrid draft — won't
+        # write to either buffer.
         if num_accepted > self._lambda:
-            if self._gdn_capture is not None:
-                self._gdn_capture.use_buffer(None)
             last_draft = mx.array([[draft_tokens[-1]]])
             align_logits = _logits(self._draft(last_draft, cache=self._draft_cache))
             mx.eval(align_logits)

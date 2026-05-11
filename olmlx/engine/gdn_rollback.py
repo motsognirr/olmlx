@@ -122,8 +122,10 @@ _GDN_PATCH_LOCK = Lock()
 # pointer used by test fixtures and diagnostics to find the active
 # capture without scanning ``gc.get_objects()``. Set in ``_patch()``
 # and cleared in ``close()`` — both paths hold the lock when they
-# mutate this.
-_active_capture: GDNStateCapture | None = None  # type: ignore[name-defined]
+# mutate this. The forward-reference annotation is fine here because
+# ``from __future__ import annotations`` (top of file) makes all
+# annotations lazy strings — no ``NameError`` at import time.
+_active_capture: GDNStateCapture | None = None
 
 
 def get_active_capture() -> "GDNStateCapture | None":
@@ -184,7 +186,16 @@ def validate_gated_delta_update_signature() -> None:
     """
     import inspect
 
-    assert _gd_mod is not None  # guarded by ``_HAS_GDN`` at call sites
+    # ``assert`` is stripped under ``python -O``. ``_HAS_GDN`` gates
+    # call sites today, but a future direct caller could violate the
+    # invariant — surface a clear ``RuntimeError`` instead of a
+    # ``NoneType.gated_delta_update`` ``AttributeError`` further down.
+    if _gd_mod is None:
+        raise RuntimeError(
+            "validate_gated_delta_update_signature: ``mlx_lm.models.gated_delta`` "
+            "is unavailable. This function should only be called when "
+            "``_HAS_GDN`` is True."
+        )
     try:
         sig = inspect.signature(_gd_mod.gated_delta_update)
     except (TypeError, ValueError) as exc:
@@ -416,7 +427,15 @@ class GDNStateCapture:
         gdn_cls = self._gdn_cls
         self._orig_call = gdn_cls.__call__
         capture = self
-        assert _gd_mod is not None  # guarded by _HAS_GDN
+        # ``__init__`` already raises if ``_HAS_GDN`` is False, but a
+        # subclass that overrides ``__init__`` without that check would
+        # reach here with ``_gd_mod is None`` — use ``RuntimeError``
+        # rather than a stripped-under-``-O`` ``assert``.
+        if _gd_mod is None:
+            raise RuntimeError(
+                "GDNStateCapture._patch: ``mlx_lm.models.gated_delta`` is "
+                "unavailable. ``__init__`` should have already raised."
+            )
 
         # WARNING: ``_capturing_gdn_call`` MUST stay bit-for-bit in sync
         # with ``mlx_lm.models.qwen3_5.GatedDeltaNet.__call__`` (which
@@ -834,11 +853,20 @@ class GDNStateCapture:
                     step * n_layers : (step + 1) * n_layers
                 ]
                 if not all(a is b for a, b in zip(this_step, first_step, strict=True)):
+                    # Match ``_raise_ordering_error``'s diagnostic
+                    # richness — surface the actual layer types on each
+                    # side so post-mortem debugging can identify which
+                    # GDN layers got reordered.
+                    step0_types = [type(m).__name__ for m in first_step]
+                    stepK_types = [type(m).__name__ for m in this_step]
                     raise RuntimeError(
-                        f"GDN autoregressive rollback: step {step} visited "
-                        "GDN layers in a different order than step 0. "
-                        "Cache slot assignment would be wrong. Please "
-                        "report as an olmlx bug."
+                        f"GDN autoregressive rollback ordering invariant "
+                        f"violated: step {step} visited GDN layers in a "
+                        "different order than step 0. Cache slot assignment "
+                        "would be wrong. This is an olmlx bug — please "
+                        "report at https://github.com/motsognirr/olmlx/issues "
+                        f"with the model name. Diagnostic: step 0 order="
+                        f"{step0_types}, step {step} order={stepK_types}."
                     )
 
     def _raise_ordering_error(self, buffer: GDNBuffer) -> None:
