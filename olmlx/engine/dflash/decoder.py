@@ -242,6 +242,14 @@ class DFlashDecoder:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def close(self) -> None:
+        """Alias for :meth:`reset` so callers can use the same
+        ``close()`` lifecycle name as :class:`SpeculativeDecoder` —
+        important because ``ModelManager`` holds whichever decoder type
+        the strategy resolved to and treats them uniformly at unload.
+        """
+        self.reset()
+
     def reset(self) -> None:
         if self._capture is not None:
             self._capture.close()

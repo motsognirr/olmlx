@@ -687,8 +687,6 @@ class TestOrderMatches:
     """
 
     def test_same_identities_match(self):
-        from olmlx.engine.gdn_rollback import _order_matches
-
         class _Mod(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -702,8 +700,6 @@ class TestOrderMatches:
         assert _order_matches([a, b, c], [a, b, c])
 
     def test_different_identities_do_not_match(self):
-        from olmlx.engine.gdn_rollback import _order_matches
-
         class _Mod(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -713,15 +709,11 @@ class TestOrderMatches:
         assert not _order_matches([a, b], [b, a])
 
     def test_length_mismatch_does_not_match(self):
-        from olmlx.engine.gdn_rollback import _order_matches
-
         a = nn.Module()
         assert not _order_matches([a], [a, a])
         assert not _order_matches([a, a], [a])
 
     def test_empty_lists_match(self):
-        from olmlx.engine.gdn_rollback import _order_matches
-
         # Trivial case but rollback() reaches this branch with empty
         # lists when the target has no GDN layers at all. Must not raise.
         assert _order_matches([], [])

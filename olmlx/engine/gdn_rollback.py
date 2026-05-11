@@ -563,11 +563,25 @@ class GDNStateCapture:
                 "mlx_lm.models.gated_delta is unavailable; cannot perform "
                 "GDN rollback (should have been caught at patch install)."
             )
+        n_gdn = buffer.num_gdn_layers
         j = 0
         for c in cache:
             if c.is_trimmable():
                 c.trim(trim)
             else:
+                # Bail on the (today-impossible) case of a non-trimmable,
+                # non-GDN cache type: we would consume a GDN capture for
+                # an unrelated layer and silently write the wrong state
+                # back. Use ``RuntimeError`` rather than ``assert`` —
+                # ``assert`` is stripped under ``python -O``.
+                if j >= n_gdn:
+                    raise RuntimeError(
+                        f"Non-trimmable cache entry at index {j} has no "
+                        f"corresponding GDN capture (buffer has {n_gdn} "
+                        "GDN layers). A non-GDN, non-trimmable cache type "
+                        "is present — rollback cannot handle it correctly. "
+                        "Please file an olmlx issue."
+                    )
                 (
                     q,
                     k,
@@ -636,7 +650,13 @@ class GDNStateCapture:
             )
         if num_keep_steps == num_steps:
             # No rollback needed; trim is also 0 in this case. Buffer
-            # already reflects the final state.
+            # already reflects the final state. Note: we intentionally
+            # skip ``_check_buffer_alignment`` on this branch because
+            # callers reach it only when ``trim==0``, but that means a
+            # corrupted buffer would slip past the guard here. Today
+            # unreachable in production callers (classic speculative
+            # only invokes rollback when ``trim_draft > 0``); revisit if
+            # the contract changes.
             return
         self._check_buffer_alignment(buffer, single=False, num_steps=num_steps)
         if _gd_mod is None:
@@ -650,6 +670,19 @@ class GDNStateCapture:
             if c.is_trimmable():
                 c.trim(trim)
                 continue
+            # Bail on a non-trimmable, non-GDN cache entry (today
+            # impossible — every non-trimmable mlx-lm cache type is
+            # GDN-based — but a future hybrid SSM that adds a different
+            # non-trimmable cache class would otherwise have its state
+            # silently overwritten with the wrong GDN capture's output).
+            if j_gdn >= N:
+                raise RuntimeError(
+                    f"Non-trimmable cache entry has no corresponding GDN "
+                    f"capture (buffer has {N} GDN layers, already consumed "
+                    f"{j_gdn}). A non-GDN, non-trimmable cache type is "
+                    "present — rollback cannot handle it correctly. Please "
+                    "file an olmlx issue."
+                )
             # Gather the first ``num_keep_steps`` captures for this GDN
             # layer. Each capture is one autoregressive step with S=1.
             captures = [
@@ -723,6 +756,21 @@ class GDNStateCapture:
                 f"{len(buffer.gdn_inputs)}. Either capture missed some "
                 "GDN calls or extra calls were made outside the "
                 "expected scope."
+            )
+        # ``conv_data.append`` and ``gdn_inputs.append`` are two separate
+        # statements in ``_capturing_gdn_call`` with computation in
+        # between. An exception fired between them (e.g. mid-forward
+        # Metal OOM) would leave the buffer with ``len(conv_data) !=
+        # len(gdn_inputs)`` and the position-based indexing below would
+        # silently read a conv state for the wrong step. Cross-check the
+        # two lists here so the corruption surfaces as a clear error
+        # rather than a generation-quality regression.
+        if len(buffer.conv_data) != expected:
+            raise RuntimeError(
+                f"GDN capture buffer conv_data size mismatch: expected "
+                f"{expected} entries, got {len(buffer.conv_data)}. Likely "
+                "a partial capture failure (exception mid-forward between "
+                "the two append calls)."
             )
         if single:
             # Identity ordering check identical to DFlash's existing

@@ -255,3 +255,83 @@ class TestRollbackAutoregressive:
                 num_keep_steps=1,
                 trim=0,
             )
+
+    def test_conv_data_length_mismatch_raises(self, fake_capture):
+        """Partial capture failure (gdn_inputs and conv_data
+        out-of-sync) is caught by the alignment check rather than
+        producing silently corrupted state."""
+        layer_a = MagicMock(name="layer_a")
+        buf = GDNBuffer(expected_modules=[layer_a])
+        buf.gdn_inputs = [_make_capture_tuple(1.0, 1.0, 1.0, 1.0)] * 2
+        # Simulate exception fired between conv_data.append and
+        # gdn_inputs.append: conv_data is short by one entry.
+        buf.conv_data = [_make_conv_data(1.0)]
+        buf.captured_modules = [layer_a, layer_a]
+
+        with pytest.raises(RuntimeError, match="conv_data size mismatch"):
+            fake_capture.rollback_autoregressive(
+                buf,
+                cache=[_StubLayer("g")],
+                num_steps=2,
+                num_keep_steps=1,
+                trim=0,
+            )
+
+    def test_non_trimmable_non_gdn_cache_raises_autoregressive(self, fake_capture):
+        """Two non-trimmable cache entries but only one GDN layer:
+        rollback must refuse rather than consume the wrong capture."""
+        layer_a = MagicMock(name="layer_a")
+        buf = GDNBuffer(expected_modules=[layer_a])
+        buf.gdn_inputs = [_make_capture_tuple(1.0, 1.0, 1.0, 1.0)] * 2
+        buf.conv_data = [_make_conv_data(1.0)] * 2
+        buf.captured_modules = [layer_a, layer_a]
+
+        # Two non-trimmable cache entries — only one matches a GDN
+        # capture. The second one would be silently corrupted.
+        cache = [_StubLayer("gdn"), _StubLayer("rogue")]
+
+        with patch("olmlx.engine.gdn_rollback._gd_mod") as mock_gd:
+            mock_gd.gated_delta_update.return_value = (None, mx.array([0.0]))
+            with pytest.raises(RuntimeError, match="no corresponding GDN capture"):
+                fake_capture.rollback_autoregressive(
+                    buf,
+                    cache=cache,
+                    num_steps=2,
+                    num_keep_steps=1,
+                    trim=0,
+                )
+
+
+class TestRollbackSingle:
+    """Targeted tests for the new guards added to rollback_single
+    (existing behaviour is covered by DFlash's integration tests)."""
+
+    def test_non_trimmable_non_gdn_cache_raises_single(self, fake_capture):
+        """rollback_single mirrors rollback_autoregressive's guard for
+        non-GDN, non-trimmable cache entries."""
+        layer_a = MagicMock(name="layer_a")
+        buf = GDNBuffer(expected_modules=[layer_a])
+        buf.gdn_inputs = [_make_capture_tuple(1.0, 1.0, 1.0, 1.0)]
+        buf.conv_data = [_make_conv_data(1.0, K=3, S_total=5)]
+        buf.captured_modules = [layer_a]
+
+        cache = [_StubLayer("gdn"), _StubLayer("rogue")]
+
+        with patch("olmlx.engine.gdn_rollback._gd_mod") as mock_gd:
+            mock_gd.gated_delta_update.return_value = (None, mx.array([0.0]))
+            with pytest.raises(RuntimeError, match="no corresponding GDN capture"):
+                fake_capture.rollback_single(buf, cache=cache, accepted=2, trim=0)
+
+    def test_conv_data_length_mismatch_raises_single(self, fake_capture):
+        """Same partial-capture corruption check applies to single."""
+        layer_a = MagicMock(name="layer_a")
+        buf = GDNBuffer(expected_modules=[layer_a])
+        buf.gdn_inputs = [_make_capture_tuple(1.0, 1.0, 1.0, 1.0)]
+        # conv_data missing entirely — the second append never ran.
+        buf.conv_data = []
+        buf.captured_modules = [layer_a]
+
+        with pytest.raises(RuntimeError, match="conv_data size mismatch"):
+            fake_capture.rollback_single(
+                buf, cache=[_StubLayer("g")], accepted=0, trim=0
+            )
