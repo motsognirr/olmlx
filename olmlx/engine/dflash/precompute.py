@@ -306,23 +306,41 @@ def iter_precomputed_shards(
                         # final failure. ``warning`` level so it
                         # surfaces under default log config without
                         # spamming under ``DEBUG``.
+                        #
+                        # Phrasing: we catch any ``RuntimeError`` from
+                        # ``mx.load`` (transient I/O is the common
+                        # case but the catch is intentionally wide —
+                        # see comment above). The message names the
+                        # likely cause without claiming it: a corrupt
+                        # safetensors header or shape mismatch would
+                        # also surface as ``RuntimeError`` and would
+                        # fail identically all 3 attempts before
+                        # propagating, so the retry is harmless either
+                        # way.
                         logger.warning(
-                            "iter_precomputed_shards: transient open "
-                            "failure on %s (attempt %d/%d): %s — "
-                            "sleeping %.1fs before retry",
+                            "iter_precomputed_shards: mx.load(%s) raised "
+                            "RuntimeError on attempt %d/%d: %s — sleeping "
+                            "%.1fs before retry (likely transient I/O "
+                            "pressure; a persistent failure will propagate "
+                            "after %d attempts)",
                             shard_path,
                             attempt + 1,
                             _SHARD_OPEN_RETRIES,
                             exc,
                             _SHARD_OPEN_BACKOFF_S * (attempt + 1),
+                            _SHARD_OPEN_RETRIES,
                         )
                         time.sleep(_SHARD_OPEN_BACKOFF_S * (attempt + 1))
             if tensors is None:
                 raise RuntimeError(
-                    f"Failed to open shard {shard_path} after "
-                    f"{_SHARD_OPEN_RETRIES} attempts (likely sustained "
-                    "macOS mmap/fd pressure). Reduce concurrent workload "
-                    "or split the shard set."
+                    f"Failed to load shard {shard_path} after "
+                    f"{_SHARD_OPEN_RETRIES} attempts (see prior warnings "
+                    "for the underlying ``RuntimeError``). Common causes: "
+                    "sustained macOS mmap/fd pressure on the I/O subsystem, "
+                    "a corrupt safetensors header, or a shape mismatch in "
+                    "the shard payload. The retry loop has exhausted; "
+                    "reduce concurrent workload, re-run precompute, or "
+                    "check the shard directory for damage."
                 ) from last_exc
             try:
                 input_ids = tensors["input_ids"]

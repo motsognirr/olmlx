@@ -2190,6 +2190,24 @@ class ModelManager:
         target_layer_id = (
             int(target_layer_id_raw) if target_layer_id_raw is not None else None
         )
+        if target_layer_id is None:
+            # Pre-fix checkpoints (trained before
+            # ``olmlx eagle prepare`` persisted the layer ID) silently
+            # fall back to ``len(layers) - 1``. If the precompute
+            # captured a mid-network layer (e.g. 50 of 64), this is the
+            # exact configuration that collapsed bench acceptance to
+            # ~5% in the original Phase F bench — the operator gets a
+            # working-looking but mis-routed checkpoint. Surface it.
+            logger.warning(
+                "EAGLE draft at %s has no 'target_layer_id' in its "
+                "config (likely a pre-fix checkpoint). The decoder will "
+                "fall back to the target's last layer; if the draft was "
+                "actually trained against a mid-network layer, bench "
+                "acceptance will be significantly degraded. Retrain "
+                "with `olmlx eagle prepare` against the current target "
+                "to get the field persisted into the saved config.",
+                config_file,
+            )
         return EagleDecoder(
             target_model=target_model,
             draft_model=draft_model,

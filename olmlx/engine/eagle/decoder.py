@@ -244,11 +244,11 @@ class EagleDecoder:
         self._target_cache = make_prompt_cache(self._target)
         self._draft_cache = self._draft.make_cache()
 
-        # Reset transient mlx-vlm state if present (mirrors classic
-        # SpeculativeDecoder).
-        for attr in ("_position_ids", "_rope_deltas"):
-            if hasattr(self._target, attr):
-                setattr(self._target, attr, None)
+        # (Classic ``SpeculativeDecoder.prefill`` resets ``_position_ids``
+        # / ``_rope_deltas`` on the target here for mlx-vlm targets,
+        # but EAGLE blocks VLM targets at load time in
+        # ``_load_eagle_decoder`` — those attrs are unreachable from
+        # this path and we don't replicate the reset.)
 
         # Pick the cache-trimming regime: trim_prompt_cache for
         # standard attention, or _GDNStateCapture for hybrid linear-
@@ -413,6 +413,20 @@ class EagleDecoder:
             logits, h_new = self._draft(
                 token_ids=tok_in, h_prev=cur_hidden, cache=self._draft_cache
             )
+            # ``logits`` is typed ``mx.array | None`` because the draft's
+            # ``compute_logits=False`` path returns None. We pass the
+            # default ``compute_logits=True`` here so logits must be an
+            # array, but pyright can't narrow across the union and a
+            # future refactor that flipped the flag would crash on the
+            # ``logits[:, -1, :]`` slice with a confusing ``NoneType``
+            # error rather than at the call site. Match the explicit-
+            # raise pattern used in ``_eagle_loss``.
+            if logits is None:
+                raise RuntimeError(
+                    "EagleDraftModel returned None logits in the draft "
+                    "loop despite compute_logits=True (default). This is "
+                    "an olmlx bug — please file an issue."
+                )
             sampled = int(mx.argmax(logits[:, -1, :], axis=-1).item())
             draft_tokens.append(sampled)
             cur_token = sampled
