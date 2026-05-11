@@ -151,7 +151,16 @@ def _build_eagle_config(
         rope_theta=rope_theta,
         max_position_embeddings=max_position_embeddings,
         block_size=block_size,
-        rope_scaling=text_cfg.get("rope_scaling") or target_cfg.get("rope_scaling"),
+        # Prefer ``text_cfg`` when present; only fall back to the
+        # top-level when ``text_cfg`` lacks the key entirely. ``or``
+        # would treat an explicitly empty dict ``{}`` as "missing" and
+        # silently fall through to the top-level value — same class of
+        # foot-gun the ``rope_theta`` path explicitly defends against.
+        rope_scaling=(
+            text_cfg["rope_scaling"]
+            if "rope_scaling" in text_cfg
+            else target_cfg.get("rope_scaling")
+        ),
     )
 
 

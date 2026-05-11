@@ -232,9 +232,16 @@ class TestPrepareEagleDraft:
             )
 
     def test_loss_decreases(self, tmp_path):
+        import random as _stdlib_random
+
         from olmlx.engine.eagle.prepare import prepare_eagle_draft
 
+        # ``_eagle_loss(sample_positions=...)`` uses stdlib ``random.sample``
+        # to pick which positions get the lm_head projection per step.
+        # Seeding ``mx.random`` alone leaves that draw non-deterministic,
+        # which would make this loss-decrease assertion flaky. Seed both.
         mx.random.seed(0)
+        _stdlib_random.seed(0)
         vocab, hidden, num_layers = 64, 16, 4
         _write_target_config(tmp_path, vocab, hidden)
 

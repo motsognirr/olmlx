@@ -102,7 +102,13 @@ try:
 
     target_cache = make_prompt_cache(target)
     out = target(prompt_ids, cache=target_cache)
-    logits = out if isinstance(out, mx.array) else out["logits"]
+    # Mirrors ``_logits`` in the production decoder: mlx-lm targets
+    # return a raw ``mx.array``, mlx-vlm targets return a dataclass with
+    # a ``logits`` attribute. ``out["logits"]`` would TypeError on the
+    # dataclass case (latent here because we typically run against
+    # mlx-lm Qwen3.5 — but the diagnostic should work for any target
+    # the production loader accepts).
+    logits = getattr(out, "logits", out)
     h_at_last = storage[0]
     if h_at_last is None:
         print("ERROR: layer hook did not populate hidden after prompt forward.")
@@ -117,7 +123,7 @@ try:
         target_tokens.append(next_tok)
         tok_in = mx.array([[next_tok]], dtype=mx.int32)
         out = target(tok_in, cache=target_cache)
-        logits = out if isinstance(out, mx.array) else out["logits"]
+        logits = getattr(out, "logits", out)
         target_hiddens.append(storage[0][:, -1:, :])
         last_logits = logits[:, -1:, :]
         next_tok = int(mx.argmax(last_logits, axis=-1).item())
