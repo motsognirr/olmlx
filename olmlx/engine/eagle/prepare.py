@@ -308,6 +308,7 @@ def prepare_eagle_draft(
     num_hidden_layers: int = DEFAULT_NUM_HIDDEN_LAYERS,
     lr: float = DEFAULT_LR,
     sample_positions: int | None = DEFAULT_SAMPLE_POSITIONS,
+    seed: int = 0,
     output_dir: str | Path | None = None,
     progress_callback: Callable[[str, float], None] | None = None,
     log_every: int = 50,
@@ -320,11 +321,22 @@ def prepare_eagle_draft(
     ``olmlx dflash precompute`` (EAGLE and DFlash share the same
     shard format; EAGLE consumes only the deepest captured layer).
 
+    ``seed`` makes the training run reproducible. We seed *both* mlx's
+    PRNG (drives weight init, dropout, etc.) and Python's stdlib
+    ``random`` (drives the position subsample inside
+    ``_eagle_loss(sample_positions=...)`` via ``random.sample``).
+    Seeding only ``mx.random`` would leave the position draw
+    non-deterministic and identical hyperparameter runs would converge
+    to slightly different checkpoints, making regressions hard to
+    bisect.
+
     ``_target_loader`` and ``_batch_iterator`` are injection hooks for
     tests so the trainer can run without downloading a multi-GB target
     or hitting disk. In normal use the trainer defaults to
     ``mlx_lm.load`` and ``iter_precomputed_shards``.
     """
+    mx.random.seed(seed)
+    random.seed(seed)
     if block_size < 1:
         raise ValueError(f"block_size must be >= 1; got {block_size}")
     if steps < 1:

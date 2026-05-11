@@ -2319,6 +2319,7 @@ def cmd_eagle_prepare(args):
         num_hidden_layers=args.num_hidden_layers,
         lr=args.lr,
         sample_positions=sample_positions,
+        seed=args.seed,
         output_dir=args.output,
         progress_callback=_flash_progress,
     )
@@ -2839,6 +2840,16 @@ def build_parser() -> argparse.ArgumentParser:
             "draft self-attention; only the final vocab projection is "
             "subsampled. Set to 0 to disable subsampling and score every "
             "position (~10x slower on large vocabs). Default: 256."
+        ),
+    )
+    eagle_prepare_p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "PRNG seed for reproducible training. Seeds both mlx (weight "
+            "init etc.) and stdlib random (the per-step position subsample "
+            "used by sample-positions). Default: 0."
         ),
     )
     eagle_prepare_p.add_argument(

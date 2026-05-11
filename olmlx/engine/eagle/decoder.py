@@ -383,6 +383,29 @@ class EagleDecoder:
                 # ``num_accepted - 1`` because the seed is included in
                 # the verify input but is also already in the cache
                 # from the previous step's accepted tail.
+                #
+                # Invariant the ``num_accepted - 1`` accounting relies
+                # on: when ``step()`` begins, the GDN recurrent state
+                # in ``self._target_cache`` *already incorporates* the
+                # seed_token's update — the previous step's verify
+                # ran with ``verify_input = [old_seed, *prev_drafts]``,
+                # the trim path replayed
+                # ``gated_delta_update(q[:, :num_accepted_prev], ...)``
+                # which includes the slot we now call ``seed_token``,
+                # and ``_seed_token = accepted[-1]`` (line ~404) names
+                # that already-incorporated tail. So the *new* GDN
+                # positions this step contributes are exactly the
+                # accepted drafts (1..num_accepted - 1), not the seed
+                # at position 0 — replaying with ``accepted + 1 = n``
+                # where ``accepted = num_accepted - 1`` slices
+                # ``q[:, :num_accepted]`` of this step's capture, which
+                # is the right prefix: it stops *before* the rejected
+                # draft and yields the GDN state that matches the
+                # trimmed token sequence. If a future change moves
+                # the seed-token's GDN update out of the previous
+                # step's replay (e.g. by emitting the seed *outside*
+                # the verify input), the ``accepted - 1`` accounting
+                # here must be revisited.
                 self._capture.rollback(
                     self._target_cache, num_accepted - 1, target_trim
                 )
