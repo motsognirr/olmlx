@@ -2767,9 +2767,7 @@ class TestSpeculativeLoading:
         assert "OLMLX_SPECULATIVE" in caplog.text
         assert "Flash" in caplog.text
 
-    def test_flash_moe_path_supports_classic_speculative(
-        self, monkeypatch, caplog
-    ):
+    def test_flash_moe_path_supports_classic_speculative(self, monkeypatch, caplog):
         """Flash-MoE + classic speculative should load the decoder (not drop it)."""
         import logging
 
@@ -2825,9 +2823,7 @@ class TestSpeculativeLoading:
         model_exp = ExperimentalSettings(_env_file=None)
         spec_config = SpeculativeConfig(True, "test/draft", 4, strategy="dflash")
 
-        with pytest.raises(
-            ValueError, match="dflash.*not supported on Flash-MoE"
-        ):
+        with pytest.raises(ValueError, match="dflash.*not supported on Flash-MoE"):
             manager._load_model(
                 "test/moe-model", model_exp=model_exp, spec_config=spec_config
             )

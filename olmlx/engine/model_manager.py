@@ -2297,7 +2297,7 @@ class ModelManager:
                 )
                 if spec_enabled:
                     decoder = self._load_speculative_decoder(
-                        model, hf_path, spec_config
+                        model, hf_path, spec_config, is_vlm=is_vlm
                     )
                     return model, tokenizer, is_vlm, caps, decoder
                 return model, tokenizer, is_vlm, caps, None
