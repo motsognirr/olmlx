@@ -652,7 +652,7 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
     return bad
 
 
-def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
+def _audit_speculative_config() -> tuple[list[str], list[str], list[str], list[str], bool]:
     """Walk the registry and audit each model's resolved speculative
     config.
 
