@@ -4,6 +4,8 @@ Implements TurboQuant_mse from https://arxiv.org/abs/2504.19874.
 Algorithm: random rotation → scalar quantization per coordinate → inverse rotation.
 """
 
+from functools import lru_cache
+
 import mlx.core as mx
 import numpy as np
 
@@ -62,6 +64,10 @@ class TurboQuantRotation:
         random_matrix = rng.randn(head_dim, head_dim).astype(np.float32)
         q, _ = np.linalg.qr(random_matrix)
         self.matrix: mx.array = mx.array(q)
+        # Precompute the transpose once; the quantize hot path (every layer,
+        # every step) would otherwise allocate a fresh transposed view per
+        # call. Mirrors what SpectralRotation already does for V_T.
+        self.matrix_T: mx.array = self.matrix.T
 
 
 def pack_indices(indices: mx.array, bits: int) -> mx.array:
@@ -103,6 +109,46 @@ def unpack_indices(packed: mx.array, bits: int, head_dim: int) -> mx.array:
     raise ValueError(f"Unsupported bits={bits}")
 
 
+@lru_cache(maxsize=128)
+def _compiled_quantize_core(n_levels: int, x_shape: tuple, x_dtype: mx.Dtype):
+    """Return a compiled (rotate + scalar quantize) kernel.
+
+    Cached per ``(n_levels, input_shape, input_dtype)``. mlx 0.31's
+    ``shapeless=True`` only handles last-axis changes for matmul-style ops
+    (other dims get baked into the trace), so caching per full shape ensures
+    correctness across prefill (seq_len=N) and decode (seq_len=1) calls.
+
+    Decode (``seq_len=1``) is a single stable entry and is the latency-critical
+    path. Prefill churns one entry per distinct prompt length; ``maxsize=128``
+    leaves headroom for varied workloads before LRU eviction forces recompile.
+    """
+
+    @mx.compile
+    def _fn(
+        x: mx.array, rotation_T: mx.array, codebook: mx.array
+    ) -> tuple[mx.array, mx.array]:
+        x32 = x.astype(mx.float32)
+        norms = mx.sqrt(mx.sum(x32 * x32, axis=-1, keepdims=True))
+        # Explicit float32 epsilon — bare Python literals would let MLX
+        # promotion rules pick the dtype, which is brittle if those rules
+        # ever change.
+        eps = mx.array(1e-8, dtype=mx.float32)
+        x_norm = (x32 / mx.maximum(norms, eps)).astype(x.dtype)
+        y = x_norm @ rotation_T
+
+        # Initialize from centroid 0; subsequent centroids update via mx.where.
+        best_dist = mx.abs(y - codebook[0])
+        best_idx = mx.array(0, dtype=mx.uint8)
+        for ci in range(1, n_levels):
+            d = mx.abs(y - codebook[ci])
+            better = d < best_dist
+            best_idx = mx.where(better, ci, best_idx).astype(mx.uint8)
+            best_dist = mx.where(better, d, best_dist)
+        return best_idx, norms
+
+    return _fn
+
+
 def turboquant_quantize(
     x: mx.array,
     rotation: TurboQuantRotation,
@@ -121,30 +167,36 @@ def turboquant_quantize(
     """
     head_dim = x.shape[-1]
     codebook = get_codebook(bits, head_dim)
-
-    # Compute norms in float32 to avoid overflow (float16 max ~65504)
-    norms = mx.sqrt(mx.sum(x.astype(mx.float32) ** 2, axis=-1, keepdims=True))
-    # Normalize in float32 — 1e-8 underflows to 0.0 in float16, so the
-    # clamp would vanish and zero-norm rows would produce NaN via 0/0.
-    x_norm = (
-        x.astype(mx.float32) / mx.maximum(norms, mx.array(1e-8, dtype=mx.float32))
-    ).astype(x.dtype)
-
-    # Rotate: y = x_norm @ Πᵀ  (equivalent to Π @ x_norm per vector)
-    y = x_norm @ rotation.matrix.T
-
-    # Scalar quantize: find nearest centroid per coordinate.
-    # Iterate over centroids to avoid materializing the full distances tensor
-    # which would be (B, heads, seq, head_dim, n_centroids) — OOM on long prefills.
-    best_idx = mx.zeros(y.shape, dtype=mx.uint8)
-    best_dist = mx.full(y.shape, float("inf"))
-    for ci in range(len(codebook)):
-        d = mx.abs(y - codebook[ci])
-        better = d < best_dist
-        best_idx = mx.where(better, mx.array(ci, dtype=mx.uint8), best_idx)
-        best_dist = mx.minimum(best_dist, d)
-
+    n_levels = 1 << bits
+    fn = _compiled_quantize_core(n_levels, x.shape, x.dtype)
+    best_idx, norms = fn(x, rotation.matrix_T, codebook)
     return pack_indices(best_idx, bits), norms
+
+
+@lru_cache(maxsize=128)
+def _compiled_dequant_core(indices_shape: tuple, norms_dtype: mx.Dtype, n_levels: int):
+    """Return a compiled (gather + inverse rotate + rescale) kernel.
+
+    Cached per ``(indices_shape, norms_dtype, n_levels)``. ``indices_shape``
+    is identical for any ``bits`` (always ``(..., head_dim)``) because
+    ``unpack_indices`` undoes the bit-packing, so ``n_levels`` (=
+    ``codebook.shape[0]``) is required to keep models with different
+    bit-widths from aliasing onto the same compiled trace under LRU
+    multi-model loading.
+    """
+
+    @mx.compile
+    def _fn(
+        indices: mx.array,
+        norms: mx.array,
+        rotation: mx.array,
+        codebook: mx.array,
+    ) -> mx.array:
+        y_hat = codebook[indices.astype(mx.uint32)]
+        x_hat = y_hat @ rotation
+        return x_hat * norms.astype(x_hat.dtype)
+
+    return _fn
 
 
 def turboquant_dequantize(
@@ -167,14 +219,7 @@ def turboquant_dequantize(
     """
     head_dim = rotation.matrix.shape[0]
     codebook = get_codebook(bits, head_dim)
-
-    # Unpack indices and lookup centroids
     indices = unpack_indices(packed_indices, bits, head_dim)
-    y_hat = codebook[indices.astype(mx.uint32)]
-
-    # Inverse rotate: x_hat = y_hat @ Π
-    x_hat = y_hat @ rotation.matrix
-
-    # Rescale by original norms
-    result = x_hat * norms.astype(x_hat.dtype)
+    fn = _compiled_dequant_core(indices.shape, norms.dtype, 1 << bits)
+    result = fn(indices, norms, rotation.matrix, codebook)
     return result.astype(dtype) if dtype is not None else result
