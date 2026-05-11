@@ -249,11 +249,15 @@ def _eagle_loss(
 
 
 def _cosine_lr(step: int, total: int, peak: float, warmup: int) -> float:
-    """Linear warmup then cosine decay to 10% of peak."""
+    """Linear warmup then cosine decay to 10% of peak.
+
+    Caller invariant: ``0 <= step < total`` (the training loop breaks
+    at ``step >= total`` before calling this), so we don't need a
+    ``step >= total`` guard. ``progress`` is bounded by ``1`` for
+    the same reason.
+    """
     if step < warmup:
         return peak * (step + 1) / max(warmup, 1)
-    if step >= total:
-        return peak * 0.1
     progress = (step - warmup) / max(total - warmup, 1)
     cosine = 0.5 * (1 + math.cos(math.pi * progress))
     return peak * (0.1 + 0.9 * cosine)

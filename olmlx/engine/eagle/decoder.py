@@ -128,9 +128,23 @@ class EagleDecoder:
         # this against the layer the draft was trained on collapses
         # bench acceptance to ~5% — operators wanting a non-default
         # layer must pass ``target_layer_id`` explicitly.
+        num_target_layers = len(_get_layers(target_model))
         if target_layer_id is None:
-            num = len(_get_layers(target_model))
-            target_layer_id = num - 1
+            target_layer_id = num_target_layers - 1
+        # Bounds-check explicitly. ``_patch_model`` indexes the layers
+        # list with this value; an out-of-range index would surface as
+        # ``IndexError`` at the first prefill, far from the load site.
+        # Catch the cross-target-size mismatch case (e.g. checkpoint
+        # trained on a 64-layer target, loaded against a 32-layer
+        # target) here with an actionable error.
+        if not 0 <= target_layer_id < num_target_layers:
+            raise ValueError(
+                f"target_layer_id={target_layer_id} is out of range for a "
+                f"target with {num_target_layers} layers (valid indices: "
+                f"0..{num_target_layers - 1}). The EAGLE draft was likely "
+                f"trained against a target of a different depth; retrain "
+                f"with `olmlx eagle prepare` against the current target."
+            )
         self._target_layer_id = target_layer_id
         self._hidden_storage: list[Any] = [None]
 
@@ -302,6 +316,17 @@ class EagleDecoder:
             raise RuntimeError("EagleDecoder.step(): seed state is unset")
 
         # ---- Draft phase: produce block_size candidates autoregressively.
+        #
+        # Note: the ``.item()`` below forces an MLX eval each draft
+        # step because the *next* draft iteration needs the integer
+        # token id to build its input. That's one sync per draft
+        # position — ``block_size=4`` means 4 sync points per verify.
+        # This is inherent to autoregressive feature-space drafting
+        # (you can't speculate position k+1 without knowing the token
+        # at position k), so doubling ``block_size`` doubles sync
+        # count, not just compute. Worth keeping in mind when tuning.
+        # The classic-speculative path avoids this by letting the
+        # draft LM hold the integer token in its own KV cache.
         draft_tokens: list[int] = []
         cur_token = self._seed_token
         cur_hidden = self._seed_hidden
@@ -377,35 +402,26 @@ class EagleDecoder:
                         "cache is non-trim-able but no GDN capture was "
                         "installed. This is an olmlx bug."
                     )
-                # ``rollback(cache, accepted, trim)``: ``accepted`` is
-                # the count of *draft* tokens accepted (excluding the
-                # seed and the bonus position) — for EAGLE that's
-                # ``num_accepted - 1`` because the seed is included in
-                # the verify input but is also already in the cache
-                # from the previous step's accepted tail.
+                # ``rollback(cache, accepted, trim)`` internally slices
+                # the captured GDN inputs to ``q[:, :accepted + 1]``
+                # — i.e. the first ``accepted + 1`` positions of *this
+                # step's* capture. The capture is populated by the
+                # verify forward over ``verify_input = [seed_token,
+                # *draft_tokens]`` (length ``block_size + 1``), so its
+                # position 0 is the seed_token regardless of whether
+                # the seed came from prefill (step 1) or from the
+                # previous step's accepted tail (step 2+).
                 #
-                # Invariant the ``num_accepted - 1`` accounting relies
-                # on: when ``step()`` begins, the GDN recurrent state
-                # in ``self._target_cache`` *already incorporates* the
-                # seed_token's update — the previous step's verify
-                # ran with ``verify_input = [old_seed, *prev_drafts]``,
-                # the trim path replayed
-                # ``gated_delta_update(q[:, :num_accepted_prev], ...)``
-                # which includes the slot we now call ``seed_token``,
-                # and ``_seed_token = accepted[-1]`` (line ~404) names
-                # that already-incorporated tail. So the *new* GDN
-                # positions this step contributes are exactly the
-                # accepted drafts (1..num_accepted - 1), not the seed
-                # at position 0 — replaying with ``accepted + 1 = n``
-                # where ``accepted = num_accepted - 1`` slices
-                # ``q[:, :num_accepted]`` of this step's capture, which
-                # is the right prefix: it stops *before* the rejected
-                # draft and yields the GDN state that matches the
-                # trimmed token sequence. If a future change moves
-                # the seed-token's GDN update out of the previous
-                # step's replay (e.g. by emitting the seed *outside*
-                # the verify input), the ``accepted - 1`` accounting
-                # here must be revisited.
+                # We want to keep ``num_accepted`` positions of this
+                # step's verify in the cache. Passing
+                # ``accepted = num_accepted - 1`` yields the slice
+                # ``q[:, :num_accepted]`` = positions 0..num_accepted-1
+                # of [seed, draft_1, ..., draft_{bs}], which is
+                # exactly the prefix that stays in the cache after
+                # ``target_trim``. The DFlash caller uses the same
+                # arithmetic for the same reason — its verify input
+                # is ``[pending, MASK*bs]`` where ``pending`` plays
+                # the same position-0 role as our ``seed_token``.
                 self._capture.rollback(
                     self._target_cache, num_accepted - 1, target_trim
                 )

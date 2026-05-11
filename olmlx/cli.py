@@ -2810,10 +2810,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--steps", type=int, default=2000, help="Training steps (default: 2000)"
     )
     eagle_prepare_p.add_argument(
-        "--batch-size", type=int, default=4, help="Batch size (default: 4)"
+        "--batch-size",
+        type=int,
+        default=4,
+        help=(
+            "Batch size (default: 4). Under --use-precomputed this is "
+            "validated against the shard layout (shards are written at a "
+            "fixed batch shape; pass the value that matches or rerun "
+            "`olmlx dflash precompute` at the desired batch size)."
+        ),
     )
     eagle_prepare_p.add_argument(
-        "--seq-len", type=int, default=2048, help="Sequence length (default: 2048)"
+        "--seq-len",
+        type=int,
+        default=2048,
+        help=(
+            "Sequence length (default: 2048). Under --use-precomputed "
+            "this is validated against the shard layout (shards are "
+            "written at a fixed sequence length; pass the value that "
+            "matches or rerun precompute at the desired length)."
+        ),
     )
     eagle_prepare_p.add_argument(
         "--block-size",

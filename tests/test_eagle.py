@@ -484,6 +484,47 @@ class TestEagleDecoderPrefillStep:
         assert s["steps"] == 2
         assert s["proposed"] == 4  # 2 * block_size
 
+    def test_rejects_out_of_range_target_layer_id(self):
+        """If an EAGLE checkpoint was trained against a target of a
+        different depth, ``target_layer_id`` from its saved config can
+        be out of range for the currently loaded target. ``_patch_model``
+        would surface this as an ``IndexError`` at the first prefill,
+        far from the load site. Reject up front in the constructor.
+        """
+        from olmlx.engine.eagle.decoder import EagleDecoder
+        from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
+
+        from olmlx.engine.dflash.decoder import _get_layers
+
+        # Real target from ``_make_decoder`` helper; ask it for the
+        # layer count rather than hardcoding (the helper may change).
+        decoder, target, _ = _make_decoder(hidden=16)
+        n = len(_get_layers(target))
+
+        # Construct a fresh draft + cfg to reuse below.
+        cfg = EagleConfig(
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            intermediate_size=32,
+            vocab_size=decoder._draft.args.vocab_size,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            max_position_embeddings=512,
+            block_size=2,
+        )
+        draft = EagleDraftModel(cfg)
+
+        with pytest.raises(ValueError, match="out of range"):
+            EagleDecoder(target_model=target, draft_model=draft, target_layer_id=n)
+        with pytest.raises(ValueError, match="out of range"):
+            EagleDecoder(target_model=target, draft_model=draft, target_layer_id=-1)
+        # Valid indices construct cleanly.
+        EagleDecoder(target_model=target, draft_model=draft, target_layer_id=0)
+        EagleDecoder(target_model=target, draft_model=draft, target_layer_id=n - 1)
+
     def test_step_clears_hidden_storage_before_verify(self):
         """Regression: from step 2 onward, the decoder must clear
         ``_hidden_storage[0]`` before the verify forward. Otherwise a
