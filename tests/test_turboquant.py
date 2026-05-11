@@ -83,6 +83,13 @@ class TestRotation:
         rot = TurboQuantRotation(head_dim=128, seed=0)
         assert rot.matrix.shape == (128, 128)
 
+    def test_matrix_T_equals_transpose(self):
+        """Cached transpose used by the compiled hot path must match matrix.T."""
+        from olmlx.engine.turboquant import TurboQuantRotation
+
+        rot = TurboQuantRotation(head_dim=64, seed=0)
+        np.testing.assert_array_equal(np.array(rot.matrix_T), np.array(rot.matrix.T))
+
 
 class TestQuantizeDequantize:
     """Tests for quantize/dequantize roundtrip."""

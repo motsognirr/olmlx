@@ -70,15 +70,15 @@ def _baseline_dequantize(packed, norms, rotation, bits, dtype=None):
 @contextmanager
 def use_baseline():
     """Swap in the pre-compile baseline implementations for the duration."""
-    real_q = tq.turboquant_quantize
-    real_d = tq.turboquant_dequantize
-    tq.turboquant_quantize = _baseline_quantize
-    tq.turboquant_dequantize = _baseline_dequantize
     # turboquant_cache imports the names at module load — patch there too.
     from olmlx.engine import turboquant_cache as tqc
 
+    real_q = tq.turboquant_quantize
+    real_d = tq.turboquant_dequantize
     real_qc = tqc.turboquant_quantize
     real_dc = tqc.turboquant_dequantize
+    tq.turboquant_quantize = _baseline_quantize
+    tq.turboquant_dequantize = _baseline_dequantize
     tqc.turboquant_quantize = _baseline_quantize
     tqc.turboquant_dequantize = _baseline_dequantize
     try:

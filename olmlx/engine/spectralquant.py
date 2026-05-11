@@ -185,7 +185,7 @@ _LOOP_ARGMIN_CUTOFF = 32
 _ARGMIN_BROADCAST_CAP = 64 * 1024 * 1024
 
 
-def _make_codebook_argmin(n_levels: int, dim_outer: int):
+def _make_codebook_argmin(n_levels: int, n_regime_elements: int):
     """Pick loop-unroll vs broadcast-argmin once per compiled trace.
 
     Returns a closure that takes ``(y, codebook)`` and returns ``best_idx``.
@@ -193,7 +193,8 @@ def _make_codebook_argmin(n_levels: int, dim_outer: int):
     already specialized for the chosen strategy.
     """
     use_loop = (
-        n_levels <= _LOOP_ARGMIN_CUTOFF or dim_outer * n_levels > _ARGMIN_BROADCAST_CAP
+        n_levels <= _LOOP_ARGMIN_CUTOFF
+        or n_regime_elements * n_levels > _ARGMIN_BROADCAST_CAP
     )
     if use_loop:
 
