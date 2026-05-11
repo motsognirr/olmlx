@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,14 @@ logger = logging.getLogger(__name__)
 
 INDEX_FILENAME = "index.json"
 SHARD_PATTERN = "shard-{:05d}.safetensors"
+
+# Transient mx.load() failures under sustained mmap / file-descriptor
+# pressure on macOS are rare but real (observed mid-run during a 2000-
+# step EAGLE training). Retry a few times with linear backoff before
+# giving up. 3 attempts × ~500ms each is plenty for a transient hiccup
+# and trivial vs. losing an 8h training run.
+_SHARD_OPEN_RETRIES = 3
+_SHARD_OPEN_BACKOFF_S = 0.5
 
 
 def precompute_target_hiddens(
@@ -257,7 +266,36 @@ def iter_precomputed_shards(
             # ``mx.load`` is overloaded to return either a dict (safetensors)
             # or a single ``mx.array`` (npy); we always write safetensors,
             # so narrow the type for pyright.
-            tensors: dict[str, mx.array] = mx.load(str(shard_path))  # type: ignore[assignment]
+            #
+            # Retry transient open() failures. mlx's ``mx.load`` on macOS
+            # has been observed to spuriously fail to open a valid shard
+            # under sustained mmap / file-descriptor pressure mid-run
+            # (single-shot reload of the same file via the same API
+            # succeeds). Don't kill an 8h training run for a transient
+            # I/O hiccup — retry a few times with backoff. Truly missing
+            # / corrupt shards still surface after the retries are
+            # exhausted, with the original RuntimeError.
+            tensors: dict[str, mx.array] | None = None
+            last_exc: Exception | None = None
+            for attempt in range(_SHARD_OPEN_RETRIES):
+                try:
+                    tensors = mx.load(str(shard_path))  # type: ignore[assignment]
+                    break
+                except RuntimeError as exc:
+                    # mx.load wraps file-open errors in RuntimeError;
+                    # only retry the "Failed to open file" variant.
+                    if "Failed to open file" not in str(exc):
+                        raise
+                    last_exc = exc
+                    if attempt < _SHARD_OPEN_RETRIES - 1:
+                        time.sleep(_SHARD_OPEN_BACKOFF_S * (attempt + 1))
+            if tensors is None:
+                raise RuntimeError(
+                    f"Failed to open shard {shard_path} after "
+                    f"{_SHARD_OPEN_RETRIES} attempts (likely sustained "
+                    "macOS mmap/fd pressure). Reduce concurrent workload "
+                    "or split the shard set."
+                ) from last_exc
             try:
                 input_ids = tensors["input_ids"]
                 target_hidden = tensors["target_hidden"]
