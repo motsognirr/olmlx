@@ -570,8 +570,8 @@ def _apply_serve_overrides(args) -> None:
         # warning is advisory; the authoritative runtime warning lives
         # in ``_load_model`` for the case where Flash actually wins.
         logger.warning(
-            "The following models combine speculative=true with Flash or "
-            "Flash-MoE: %s. Once Flash is prepared and loads, standalone "
+            "The following models combine speculative=true with Flash: "
+            "%s. Once Flash is prepared and loads, standalone "
             "speculative decoding is dropped — use the per-model "
             "``flash_speculative`` field (or "
             "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE / "
@@ -651,10 +651,11 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
       set but the resolved ``enabled`` flag is False. Triggers a
       warning so users don't silently lose the draft they configured.
     - ``flash_conflicts`` — models that combine ``speculative=True``
-      with Flash or Flash-MoE in the same entry. Standalone speculative
-      decoding is silently dropped on the Flash load path; the model's
-      own ``flash_speculative`` knob is the right one. Triggers a
-      warning so users see the redirect.
+      with Flash in the same entry. Standalone speculative decoding is
+      silently dropped on the Flash load path; the model's own
+      ``flash_speculative`` knob is the right one. Triggers a warning
+      so users see the redirect. Flash-MoE supports standalone speculative
+      (classic strategy only) and is excluded from this check.
     - ``global_draft_used`` — True if at least one model resolves to
       the global ``speculative_draft_model`` (i.e. has ``speculative=True``
       and no per-model draft override). Used to suppress the global
@@ -742,7 +743,7 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
                     exc_info=True,
                 )
                 continue
-            if resolved_exp.flash or resolved_exp.flash_moe:
+            if resolved_exp.flash:
                 flash_conflicts.append(name)
     return bad, dormant, flash_conflicts, global_draft_used
 

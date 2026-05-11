@@ -2767,11 +2767,10 @@ class TestSpeculativeLoading:
         assert "OLMLX_SPECULATIVE" in caplog.text
         assert "Flash" in caplog.text
 
-    def test_flash_moe_path_warns_when_standalone_speculative_set(
+    def test_flash_moe_path_supports_classic_speculative(
         self, monkeypatch, caplog
     ):
-        """Symmetric to the Flash test: a Flash-MoE model with the
-        standalone speculative flag must log a warning."""
+        """Flash-MoE + classic speculative should load the decoder (not drop it)."""
         import logging
 
         from olmlx.config import ExperimentalSettings
@@ -2791,6 +2790,12 @@ class TestSpeculativeLoading:
             "_load_flash_moe_model",
             lambda hf_path, load_path, flash_moe_dir, *, model_exp: sentinel_load,
         )
+        sentinel_decoder = object()
+        monkeypatch.setattr(
+            manager,
+            "_load_speculative_decoder",
+            lambda model, hf_path, spec_config, *, is_vlm=False: sentinel_decoder,
+        )
 
         model_exp = ExperimentalSettings(_env_file=None)
         spec_config = SpeculativeConfig(True, "test/draft", 4)
@@ -2799,11 +2804,33 @@ class TestSpeculativeLoading:
             model, tokenizer, is_vlm, caps, decoder = manager._load_model(
                 "test/moe-model", model_exp=model_exp, spec_config=spec_config
             )
-        # Flash-MoE path returns the sentinel followed by None.
+        # Flash-MoE now supports classic speculative; decoder is loaded.
         assert (model, tokenizer, is_vlm, caps) == sentinel_load
-        assert decoder is None
-        assert "OLMLX_SPECULATIVE" in caplog.text
-        assert "Flash-MoE" in caplog.text
+        assert decoder is sentinel_decoder
+
+    def test_flash_moe_path_rejects_dflash(self, monkeypatch):
+        """Flash-MoE + dflash should raise ValueError."""
+        from olmlx.config import ExperimentalSettings
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-moe")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: True)
+        monkeypatch.setattr(
+            manager, "_flash_moe_dir", lambda hf_path: Path("/tmp/test-moe/flash_moe")
+        )
+
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = SpeculativeConfig(True, "test/draft", 4, strategy="dflash")
+
+        with pytest.raises(
+            ValueError, match="dflash.*not supported on Flash-MoE"
+        ):
+            manager._load_model(
+                "test/moe-model", model_exp=model_exp, spec_config=spec_config
+            )
 
 
 class TestDFlashLoading:

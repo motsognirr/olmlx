@@ -2286,19 +2286,21 @@ class ModelManager:
         if self._is_flash_moe_enabled(model_exp):
             flash_moe_dir = self._flash_moe_dir(hf_path)
             if flash_moe_dir is not None:
-                if spec_enabled:
-                    logger.warning(
-                        "OLMLX_SPECULATIVE is enabled but %s is loaded via "
-                        "Flash-MoE, which does not support standalone "
-                        "speculative decoding; the setting will be ignored.",
-                        hf_path,
+                if spec_enabled and spec_config.strategy == "dflash":
+                    raise ValueError(
+                        "speculative_strategy='dflash' is not supported on "
+                        "Flash-MoE targets. Use speculative_strategy='classic' "
+                        "or remove the speculative settings."
                     )
-                return (
-                    *self._load_flash_moe_model(
-                        hf_path, load_path, flash_moe_dir, model_exp=model_exp
-                    ),
-                    None,
+                model, tokenizer, is_vlm, caps = self._load_flash_moe_model(
+                    hf_path, load_path, flash_moe_dir, model_exp=model_exp
                 )
+                if spec_enabled:
+                    decoder = self._load_speculative_decoder(
+                        model, hf_path, spec_config
+                    )
+                    return model, tokenizer, is_vlm, caps, decoder
+                return model, tokenizer, is_vlm, caps, None
 
         # Check for flash-prepared model
         if self._is_flash_enabled(model_exp):
