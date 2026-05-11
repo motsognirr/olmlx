@@ -532,9 +532,14 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(1)
 
-    bad, dormant_drafts, flash_conflicts, dflash_moe_conflicts, global_draft_used = (
-        _audit_speculative_config()
-    )
+    (
+        bad,
+        dormant_drafts,
+        flash_conflicts,
+        dflash_moe_conflicts,
+        hybrid_classic_conflicts,
+        global_draft_used,
+    ) = _audit_speculative_config()
     if dormant_drafts:
         logger.warning(
             "speculative_draft_model is configured for the following "
@@ -596,6 +601,27 @@ def _apply_serve_overrides(args) -> None:
             "speculative=false.",
             ", ".join(dflash_moe_actionable),
         )
+    # Classic speculative on hybrid linear-attention targets produces
+    # silent output corruption (special vocab tokens leak mid-content;
+    # generation often runs to max_tokens). Suppress for models in
+    # ``bad`` — the missing-draft error is the actionable fix there.
+    hybrid_classic_actionable = [
+        m for m in hybrid_classic_conflicts if m not in set(bad)
+    ]
+    if hybrid_classic_actionable:
+        logger.warning(
+            "The following models combine classic speculative decoding "
+            "with a hybrid linear-attention target (Qwen3.5 / Qwen3.6 / "
+            "Qwen3-Coder-Next family): %s. Classic speculative cannot "
+            "roll back the GatedDeltaNet recurrent state on draft "
+            "rejection (mlx-lm's trim_prompt_cache is a no-op for any "
+            "CacheList containing ArraysCache), so output silently "
+            "corrupts: special vocab tokens leak mid-content and "
+            "generation often runs to max_tokens. Set "
+            "speculative_strategy='dflash' (requires a trained DFlash "
+            "draft; see `olmlx dflash prepare`) or speculative=false.",
+            ", ".join(hybrid_classic_actionable),
+        )
     if bad:
         print(
             "Error: the following models in models.json enable speculative "
@@ -656,13 +682,68 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
     return bad
 
 
+def _is_hybrid_linear_attention_target(hf_path: str) -> bool:
+    """Detect whether a target model uses hybrid linear-attention layers
+    (mlx-lm ``GatedDeltaNet`` / ``ArraysCache``).
+
+    Classic speculative decoding cannot roll back ``ArraysCache`` recurrent
+    state on draft rejection: ``trim_prompt_cache`` is a no-op for any
+    ``CacheList`` containing an ``ArraysCache`` layer (``is_trimmable()``
+    returns False), so the cache stays desynced from the accepted token
+    sequence after the first rejection. The model then emits special
+    vocab tokens (``<|im_start|>``, ``<|im_end|>``) mid-content and either
+    terminates randomly or runs to ``max_tokens`` producing garbage.
+    DFlash works because ``_GDNStateCapture`` replays
+    ``gated_delta_update`` on the accepted prefix.
+
+    Heuristics, read from the downloaded ``config.json``:
+
+    - ``text_config.layer_types`` contains ``"linear_attention"`` —
+      Qwen3.5 / Qwen3.6 / Qwen3.5_moe family.
+    - Top-level ``model_type == "qwen3_next"`` — Qwen3-Coder-Next, which
+      declares its hybrid layout via ``full_attention_interval`` rather
+      than ``layer_types``.
+    - Top-level ``layer_types`` contains ``"linear_attention"`` —
+      forward-compat for hybrid models that ship without a nested
+      ``text_config``.
+
+    Returns False (rather than raising) when the model has not been
+    downloaded yet — the audit will fire on the first server startup
+    after the model is pulled. Returns False on unparseable config too;
+    a malformed ``config.json`` is an operator error that surfaces at
+    load time.
+    """
+    from olmlx.models.store import _safe_dir_name
+
+    cfg_path = settings.models_dir / _safe_dir_name(hf_path) / "config.json"
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False
+    if not isinstance(cfg, dict):
+        return False
+    if cfg.get("model_type") == "qwen3_next":
+        return True
+    text_cfg = cfg.get("text_config")
+    if isinstance(text_cfg, dict):
+        lt = text_cfg.get("layer_types")
+        if isinstance(lt, list) and "linear_attention" in lt:
+            return True
+    lt_top = cfg.get("layer_types")
+    if isinstance(lt_top, list) and "linear_attention" in lt_top:
+        return True
+    return False
+
+
 def _audit_speculative_config() -> tuple[
-    list[str], list[str], list[str], list[str], bool
+    list[str], list[str], list[str], list[str], list[str], bool
 ]:
     """Walk the registry and audit each model's resolved speculative
     config.
 
-    Returns ``(bad, dormant_drafts, flash_conflicts, global_draft_used)``:
+    Returns ``(bad, dormant_drafts, flash_conflicts, dflash_moe_conflicts,
+    hybrid_classic_conflicts, global_draft_used)``:
     - ``bad`` — models with ``speculative=True`` but no draft model
       anywhere. Triggers a startup error.
     - ``dormant_drafts`` — models with a per-model ``speculative_draft_model``
@@ -678,6 +759,12 @@ def _audit_speculative_config() -> tuple[
       ``speculative_strategy='dflash'`` with Flash-MoE. Triggers a
       warning since dflash is unsupported on MoE targets (raises
       ValueError at load time).
+    - ``hybrid_classic_conflicts`` — models that combine
+      ``speculative_strategy='classic'`` (the default) with a hybrid
+      linear-attention target (Qwen3.5 / Qwen3.6 / Qwen3-Coder-Next).
+      Triggers a warning since the cache cannot be rolled back on draft
+      rejection, producing silent output corruption. See
+      ``_is_hybrid_linear_attention_target`` for the discriminator.
     - ``global_draft_used`` — True if at least one model resolves to
       the global ``speculative_draft_model`` (i.e. has ``speculative=True``
       and no per-model draft override). Used to suppress the global
@@ -704,7 +791,7 @@ def _audit_speculative_config() -> tuple[
             "Skipping speculative config validation: invalid models.json entry: %s",
             exc,
         )
-        return [], [], [], [], False
+        return [], [], [], [], [], False
     except OSError as exc:
         # I/O failures: never block startup. The catch is narrow so
         # programming errors (typos, missing attributes, etc.) inside
@@ -713,11 +800,12 @@ def _audit_speculative_config() -> tuple[
             "Skipping speculative config validation: could not load registry: %s",
             exc,
         )
-        return [], [], [], [], False
+        return [], [], [], [], [], False
     bad: list[str] = []
     dormant: list[str] = []
     flash_conflicts: list[str] = []
     dflash_moe_conflicts: list[str] = []
+    hybrid_classic_conflicts: list[str] = []
     global_draft_used = False
     for name, mc in registry.list_models().items():
         try:
@@ -770,7 +858,28 @@ def _audit_speculative_config() -> tuple[
                 flash_conflicts.append(name)
             if resolved_exp.flash_moe and strategy == "dflash":
                 dflash_moe_conflicts.append(name)
-    return bad, dormant, flash_conflicts, dflash_moe_conflicts, global_draft_used
+            # Classic speculative + hybrid linear-attention target is
+            # silent-corruption territory. Skip when Flash / Flash-MoE
+            # is also configured: Flash dense uses the
+            # ``flash_speculative`` knob (caught above), and Flash-MoE
+            # speculative is classic-only on a separate code path. The
+            # hybrid-trim bug is specific to the standalone speculative
+            # decoder.
+            if (
+                strategy == "classic"
+                and not resolved_exp.flash
+                and not resolved_exp.flash_moe
+                and _is_hybrid_linear_attention_target(mc.hf_path)
+            ):
+                hybrid_classic_conflicts.append(name)
+    return (
+        bad,
+        dormant,
+        flash_conflicts,
+        dflash_moe_conflicts,
+        hybrid_classic_conflicts,
+        global_draft_used,
+    )
 
 
 # Module-level state set by cmd_serve() for the app lifespan to retrieve.

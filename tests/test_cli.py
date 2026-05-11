@@ -339,7 +339,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda: ([], [], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -375,7 +375,7 @@ class TestBuildParser:
         # Stub out registry-walking helpers so the test is hermetic.
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda: ([], [], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -418,7 +418,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda: ([], [], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -445,7 +445,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda: ([], [], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -473,7 +473,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda: ([], [], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -510,7 +510,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda: ([], [], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -540,7 +540,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda: ([], [], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -564,7 +564,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], [], False)
+            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], [], [], False)
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -592,7 +592,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: (["bad/model:latest"], [], [], [], False),
+            lambda: (["bad/model:latest"], [], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -648,7 +648,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], [], False)
+            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], [], [], False)
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -693,7 +693,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: (["m:latest"], [], ["m:latest"], [], False),
+            lambda: (["m:latest"], [], ["m:latest"], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -721,7 +721,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], ["flash/model:latest"], [], False),
+            lambda: ([], [], ["flash/model:latest"], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -745,7 +745,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], ["dormant/model:latest"], [], [], False),
+            lambda: ([], ["dormant/model:latest"], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -916,13 +916,19 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(_exp, "flash", True)
 
-        bad, dormant, flash_conflicts, dflash_moe_conflicts, _global_used = (
-            _audit_speculative_config()
-        )
+        (
+            bad,
+            dormant,
+            flash_conflicts,
+            dflash_moe_conflicts,
+            hybrid_classic_conflicts,
+            _global_used,
+        ) = _audit_speculative_config()
         assert bad == []
         assert dormant == []
         assert flash_conflicts == ["global-flash/m:latest"]
         assert dflash_moe_conflicts == []
+        assert hybrid_classic_conflicts == []
 
     def test_audit_speculative_config_classifies_models(self, monkeypatch, tmp_path):
         """End-to-end: registry walk classifies models into bad / dormant /
@@ -960,15 +966,21 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
 
-        bad, dormant, flash_conflicts, dflash_moe_conflicts, global_used = (
-            _audit_speculative_config()
-        )
+        (
+            bad,
+            dormant,
+            flash_conflicts,
+            dflash_moe_conflicts,
+            hybrid_classic_conflicts,
+            global_used,
+        ) = _audit_speculative_config()
         # Compare as sets so the test isn't coupled to the registry's
         # internal iteration order.
         assert set(bad) == {"bad/no-draft:latest"}
         assert set(dormant) == {"dormant/has-draft:latest"}
         assert set(flash_conflicts) == {"conflict/flash-and-spec:latest"}
         assert dflash_moe_conflicts == []
+        assert hybrid_classic_conflicts == []
         # No model in this fixture uses the global draft (good/a has its own).
         assert global_used is False
 
@@ -995,12 +1007,193 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
 
-        bad, dormant, flash, dflash_moe, global_used = _audit_speculative_config()
+        (
+            bad,
+            dormant,
+            flash,
+            dflash_moe,
+            hybrid_classic,
+            global_used,
+        ) = _audit_speculative_config()
         assert bad == []
         assert dormant == []
         assert flash == []
         assert dflash_moe == ["moe-dflash/m:latest"]
+        assert hybrid_classic == []
         assert global_used is False
+
+    def test_is_hybrid_linear_attention_target_detects_each_format(
+        self, monkeypatch, tmp_path
+    ):
+        """The helper recognizes all three hybrid layouts seen in the wild."""
+        from olmlx.cli import _is_hybrid_linear_attention_target
+        from olmlx.config import settings as _settings
+        from olmlx.models.store import _safe_dir_name
+
+        monkeypatch.setattr(_settings, "models_dir", tmp_path)
+
+        def write_config(hf_path: str, cfg: dict) -> None:
+            d = tmp_path / _safe_dir_name(hf_path)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "config.json").write_text(json.dumps(cfg))
+
+        # Qwen3.5 family: text_config.layer_types
+        write_config(
+            "qwen3_5/hybrid",
+            {
+                "model_type": "qwen3_5",
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "layer_types": ["full_attention", "linear_attention"],
+                },
+            },
+        )
+        # Qwen3-Coder-Next: top-level model_type, no layer_types array
+        write_config(
+            "qwen/coder-next",
+            {"model_type": "qwen3_next", "full_attention_interval": 4},
+        )
+        # Forward-compat: top-level layer_types
+        write_config(
+            "hybrid/top-level",
+            {
+                "model_type": "future_hybrid",
+                "layer_types": ["full_attention", "linear_attention"],
+            },
+        )
+        # Non-hybrid (plain qwen3 dense)
+        write_config("plain/qwen3", {"model_type": "qwen3"})
+        # Non-hybrid VLM (vision keys + layer_types without linear_attention)
+        write_config(
+            "vlm/full-attn",
+            {
+                "model_type": "qwen2_5_vl",
+                "text_config": {"layer_types": ["full_attention"]},
+            },
+        )
+
+        assert _is_hybrid_linear_attention_target("qwen3_5/hybrid") is True
+        assert _is_hybrid_linear_attention_target("qwen/coder-next") is True
+        assert _is_hybrid_linear_attention_target("hybrid/top-level") is True
+        assert _is_hybrid_linear_attention_target("plain/qwen3") is False
+        assert _is_hybrid_linear_attention_target("vlm/full-attn") is False
+        # Model not downloaded yet — returns False rather than raising.
+        assert _is_hybrid_linear_attention_target("never/pulled") is False
+
+    def test_audit_flags_classic_speculative_on_hybrid_target(
+        self, monkeypatch, tmp_path
+    ):
+        """Classic speculative (the default strategy) on a hybrid
+        linear-attention target lands in hybrid_classic_conflicts. The
+        rationale: ``trim_prompt_cache`` is a no-op on ``CacheList``
+        containing ``ArraysCache``, so the cache desyncs after the first
+        draft rejection and the model emits garbage."""
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.config import settings as _settings
+        from olmlx.models.store import _safe_dir_name
+
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        # Hybrid target with classic speculative (strategy defaults to
+        # classic when not specified explicitly).
+        hybrid_dir = models_dir / _safe_dir_name("qwen3_5/27b")
+        hybrid_dir.mkdir()
+        (hybrid_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5",
+                    "text_config": {
+                        "layer_types": ["full_attention", "linear_attention"],
+                    },
+                }
+            )
+        )
+        # Non-hybrid target with classic speculative — should NOT be
+        # flagged.
+        dense_dir = models_dir / _safe_dir_name("qwen3/8b")
+        dense_dir.mkdir()
+        (dense_dir / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "qwen3_5/27b:latest": {
+                        "hf_path": "qwen3_5/27b",
+                        "speculative": True,
+                        "speculative_draft_model": "qwen3_5/draft",
+                    },
+                    "qwen3/8b:latest": {
+                        "hf_path": "qwen3/8b",
+                        "speculative": True,
+                        "speculative_draft_model": "qwen3/draft",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "models_dir", models_dir)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+
+        (
+            bad,
+            dormant,
+            flash,
+            dflash_moe,
+            hybrid_classic,
+            _global_used,
+        ) = _audit_speculative_config()
+        assert bad == []
+        assert dormant == []
+        assert flash == []
+        assert dflash_moe == []
+        assert hybrid_classic == ["qwen3_5/27b:latest"]
+
+    def test_audit_does_not_flag_dflash_strategy_on_hybrid_target(
+        self, monkeypatch, tmp_path
+    ):
+        """dflash on a hybrid target is the supported combination
+        (``_GDNStateCapture`` rolls back recurrent state). It must NOT
+        land in hybrid_classic_conflicts."""
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.config import settings as _settings
+        from olmlx.models.store import _safe_dir_name
+
+        models_dir = tmp_path / "models"
+        hybrid_dir = models_dir / _safe_dir_name("qwen3_5/27b")
+        hybrid_dir.mkdir(parents=True)
+        (hybrid_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5",
+                    "text_config": {
+                        "layer_types": ["full_attention", "linear_attention"],
+                    },
+                }
+            )
+        )
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "qwen3_5/27b:latest": {
+                        "hf_path": "qwen3_5/27b",
+                        "speculative": True,
+                        "speculative_strategy": "dflash",
+                        "speculative_draft_model": "qwen3_5/dflash-draft",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "models_dir", models_dir)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+
+        (_, _, _, _, hybrid_classic, _) = _audit_speculative_config()
+        assert hybrid_classic == []
 
     def test_service_install(self):
         parser = build_parser()
