@@ -667,3 +667,58 @@ class TestSpeculativeStrategyConfig:
         round_trip = cfg.to_entry()
         assert isinstance(round_trip, dict)
         assert round_trip["speculative_strategy"] == "dflash"
+
+
+class TestOrderMatches:
+    """Identity-based equality check for rollback's ordering invariant.
+
+    The previous implementation used
+    ``self._captured_modules != self._expected_gdn_modules``. Python's
+    list ``!=`` falls through to elementwise ``==`` between the contained
+    ``nn.Module`` instances. mlx's ``Module.__eq__`` returns an
+    ``mx.array`` (broadcast over its array attributes) and Python then
+    tries to coerce that array to a scalar via ``bool()``, which raises
+    ``ValueError: [convert] Only length-1 arrays can be converted to
+    Python scalars`` for any module holding a multi-element tensor.
+    Identity comparison sidesteps the overload entirely.
+    """
+
+    def test_same_identities_match(self):
+        from olmlx.engine.dflash.decoder import _order_matches
+
+        class _Mod(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Multi-element array attribute — matches the tensors a
+                # real ``GatedDeltaNet`` carries. With the old ``==``
+                # comparison this attribute is what makes the bool()
+                # coercion fail.
+                self.x = mx.array([1.0, 2.0, 3.0])
+
+        a, b, c = _Mod(), _Mod(), _Mod()
+        assert _order_matches([a, b, c], [a, b, c])
+
+    def test_different_identities_do_not_match(self):
+        from olmlx.engine.dflash.decoder import _order_matches
+
+        class _Mod(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.x = mx.array([1.0, 2.0, 3.0])
+
+        a, b = _Mod(), _Mod()
+        assert not _order_matches([a, b], [b, a])
+
+    def test_length_mismatch_does_not_match(self):
+        from olmlx.engine.dflash.decoder import _order_matches
+
+        a = nn.Module()
+        assert not _order_matches([a], [a, a])
+        assert not _order_matches([a, a], [a])
+
+    def test_empty_lists_match(self):
+        from olmlx.engine.dflash.decoder import _order_matches
+
+        # Trivial case but rollback() reaches this branch with empty
+        # lists when the target has no GDN layers at all. Must not raise.
+        assert _order_matches([], [])
