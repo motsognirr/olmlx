@@ -284,6 +284,21 @@ def iter_precomputed_shards(
                 except RuntimeError as exc:
                     # mx.load wraps file-open errors in RuntimeError;
                     # only retry the "Failed to open file" variant.
+                    #
+                    # Substring pinned against mlx 0.30.x (observed
+                    # 2026-05-09 against mlx 0.30.2 during EAGLE
+                    # training): the C++ side raises
+                    # ``std::runtime_error("[load_safetensors] Failed
+                    # to open file <path>")`` from
+                    # ``mlx/io/safetensors.cpp``. If a future mlx
+                    # rephrases this message, the retry quietly stops
+                    # firing and the original ``RuntimeError`` is
+                    # re-raised on the first attempt — surfacing as
+                    # the same crash this function was meant to
+                    # absorb. Re-check the substring whenever bumping
+                    # the mlx pin; ideally MLX would publish a more
+                    # specific exception subclass we could catch by
+                    # type instead.
                     if "Failed to open file" not in str(exc):
                         raise
                     last_exc = exc

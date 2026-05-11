@@ -410,6 +410,31 @@ def prepare_eagle_draft(
                 f"not a multiple of target hidden_size ({target_hidden_size}); "
                 "shards may have been produced with a different target."
             )
+        # The shards' batch_size and seq_len are baked in at precompute
+        # time and override the caller's ``batch_size`` / ``seq_len``
+        # — neither is consulted again in this branch. Surface that
+        # silently-ignored config rather than letting an operator
+        # believe ``--batch-size 8`` had any effect.
+        shard_batch_size = int(meta["batch_size"])
+        shard_seq_len = int(meta["seq_len"])
+        if shard_batch_size != batch_size:
+            raise ValueError(
+                f"Precomputed shards were written with batch_size="
+                f"{shard_batch_size} but ``--batch-size {batch_size}`` was "
+                "requested. The shard batch shape is the effective batch "
+                "size during training; rerun `olmlx dflash precompute` "
+                f"with --batch-size {batch_size}, or pass --batch-size "
+                f"{shard_batch_size} to acknowledge the shard layout."
+            )
+        if shard_seq_len != seq_len:
+            raise ValueError(
+                f"Precomputed shards were written with seq_len="
+                f"{shard_seq_len} but ``--seq-len {seq_len}`` was "
+                "requested. The shard sequence length is the effective "
+                "training context; rerun `olmlx dflash precompute` "
+                f"with --seq-len {seq_len}, or pass --seq-len "
+                f"{shard_seq_len} to acknowledge the shard layout."
+            )
         # Record the *layer index* the deepest captured hidden came
         # from. dflash precompute usually stores hiddens from a few
         # mid-network layers (e.g. [13, 25, 38, 50] for a 64-layer
@@ -428,6 +453,21 @@ def prepare_eagle_draft(
                 "EAGLE inference needs the captured layer index to hook the "
                 "matching layer at runtime; rerun `olmlx dflash precompute` "
                 "with a recent olmlx version that records this field."
+            )
+        # The slice ``h_concat[:, :, -target_hidden_size:]`` below assumes
+        # layers are concatenated in *ascending* order with the deepest
+        # layer at the end of the feature axis. DFlash's precompute today
+        # preserves this order (it concatenates ``storage`` in the same
+        # order ``target_layer_ids`` was passed), but if a future shard
+        # writer reorders or shuffles, training would silently consume
+        # the wrong layer's hiddens and persist a misleading
+        # ``target_layer_id``. Validate explicitly.
+        if captured_layer_ids != sorted(captured_layer_ids):
+            raise ValueError(
+                f"Precomputed shard 'target_layer_ids' must be sorted "
+                f"ascending so the slice ``h_concat[:, :, -hidden_size:]`` "
+                f"yields the deepest captured layer; got {captured_layer_ids}. "
+                "Rerun `olmlx dflash precompute` with sorted --target-layer-ids."
             )
         eagle_target_layer_id = int(captured_layer_ids[-1])
         logger.info(

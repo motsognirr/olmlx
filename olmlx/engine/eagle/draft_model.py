@@ -27,6 +27,7 @@ checkpoint.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -286,7 +287,23 @@ class EagleDraftModel(nn.Module):
         return None
 
     @staticmethod
-    def _find_lm_head(target: Any, embed: nn.Module) -> nn.Module | None:
+    def _find_lm_head(
+        target: Any, embed: nn.Module
+    ) -> nn.Module | Callable[..., Any] | None:
+        """Resolve the target's ``lm_head``.
+
+        Returns either an ``nn.Module`` (the standard case — a
+        dedicated ``Linear`` layer somewhere under
+        ``target.model`` / ``language_model``) or a *callable*
+        (the tied-embeddings fallback for models like Qwen3.5-0.8B
+        that expose ``embed_tokens.as_linear``, a bound method). The
+        callable form isn't an ``nn.Module``; we widen the annotation
+        to make that explicit rather than smuggling it through with a
+        ``# type: ignore``. Both forms are consumed identically by
+        ``self.lm_head(x)`` at the call site, and both are stored via
+        ``object.__setattr__`` so they stay out of the parameter tree
+        regardless.
+        """
         for path in (
             ("lm_head",),
             ("language_model", "lm_head"),
@@ -305,7 +322,7 @@ class EagleDraftModel(nn.Module):
         # ``embed_tokens.as_linear``.
         as_linear = getattr(embed, "as_linear", None)
         if callable(as_linear):
-            return as_linear  # type: ignore[no-any-return]
+            return as_linear
         return None
 
     def bind_via_modules(self, embed_tokens: nn.Module, lm_head: nn.Module) -> None:

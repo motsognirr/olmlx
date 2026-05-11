@@ -184,6 +184,46 @@ class TestEagleDraftModelForward:
         assert logits.shape == (1, 2, 128)
         assert h_new.shape == (1, 2, 32)
 
+    def test_bind_uses_tied_embeddings_fallback(self):
+        # When the target lacks a dedicated lm_head module (small Qwen
+        # variants like Qwen3.5-0.8B tie input/output embeddings and
+        # expose ``embed_tokens.as_linear`` instead), ``bind()`` must
+        # fall back to that callable. Regression: ``as_linear`` is a
+        # bound method, not an ``nn.Module``; an over-narrow
+        # ``_find_lm_head -> nn.Module | None`` annotation would mask
+        # this. Forward through the bound draft to confirm the
+        # callable lm_head is actually invoked.
+        m = self._cfg_and_model()
+        target_embed = nn.Embedding(m.args.vocab_size, m.args.hidden_size)
+
+        # mlx ``Embedding`` ships ``as_linear``; verify the fixture
+        # actually exposes it so the test exercises the intended path.
+        assert callable(getattr(target_embed, "as_linear", None))
+
+        class _FakeInner:
+            embed_tokens = target_embed
+            # No ``lm_head`` — forces the as_linear fallback.
+
+        class _FakeTarget:
+            model = _FakeInner()
+            # No top-level ``lm_head`` either.
+
+        m.bind(_FakeTarget())
+        assert m.embed_tokens is target_embed
+        # ``lm_head`` is the bound method, not the embedding itself.
+        assert callable(m.lm_head)
+        assert m.lm_head is not target_embed
+
+        # End-to-end: a forward must run without raising and produce
+        # logits of the expected shape.
+        ids = mx.array([[0, 1, 2]], dtype=mx.int32)
+        h = mx.zeros((1, 3, m.args.hidden_size))
+        logits, _h_new = m(token_ids=ids, h_prev=h)
+        assert logits.shape == (1, 3, m.args.vocab_size)
+
+        m.unbind()
+        assert m.lm_head is None
+
     def test_bind_borrows_target_weights(self):
         # ``bind(target)`` must borrow the target's ``embed_tokens`` and
         # ``lm_head`` modules (not copy weights). Verify identity.

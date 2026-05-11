@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -29,10 +30,40 @@ from mlx_lm import load as mlx_lm_load
 from olmlx.engine.dflash.decoder import _get_layers, _patch_model, _unpatch_model
 from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
 
-TARGET_PATH = Path.home() / ".olmlx/models/mlx-community_Qwen3.5-27B-4bit"
-DRAFT_PATH = TARGET_PATH / "eagle"
-PROMPT = "Here is a brief explanation of how photosynthesis works:\n\n"
-N_CONTINUE = 64
+_DEFAULT_TARGET = Path.home() / ".olmlx/models/mlx-community_Qwen3.5-27B-4bit"
+
+_parser = argparse.ArgumentParser(
+    description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+)
+_parser.add_argument(
+    "--target",
+    type=Path,
+    default=_DEFAULT_TARGET,
+    help="Path to the local target model directory (default: %(default)s)",
+)
+_parser.add_argument(
+    "--draft",
+    type=Path,
+    default=None,
+    help="Path to the EAGLE draft directory (default: <target>/eagle)",
+)
+_parser.add_argument(
+    "--prompt",
+    type=str,
+    default="Here is a brief explanation of how photosynthesis works:\n\n",
+    help="Prompt for the diagnostic. Default is a benign coding-prose seed.",
+)
+_parser.add_argument(
+    "--n-continue",
+    type=int,
+    default=64,
+    help="Number of greedy continuation tokens to measure (default: %(default)s)",
+)
+_args = _parser.parse_args()
+TARGET_PATH = _args.target
+DRAFT_PATH = _args.draft if _args.draft is not None else TARGET_PATH / "eagle"
+PROMPT = _args.prompt
+N_CONTINUE = _args.n_continue
 
 print(f"Target: {TARGET_PATH}")
 print(f"Draft:  {DRAFT_PATH}")

@@ -206,6 +206,127 @@ class TestBuildEagleConfig:
 
 
 class TestPrepareEagleDraft:
+    def _write_fake_shards(
+        self,
+        shard_dir: Path,
+        *,
+        batch_size: int,
+        seq_len: int,
+        hidden: int,
+        target_layer_ids: list[int],
+    ) -> Path:
+        """Write a one-shard precompute directory just for validation
+        tests. The shard payload is dummy data — these tests fail
+        before iteration starts (at the meta-validation step), so the
+        contents don't matter."""
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        concat = hidden * len(target_layer_ids)
+        meta = {
+            "num_shards": 1,
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "concat_hidden_size": concat,
+            "target_layer_ids": target_layer_ids,
+        }
+        (shard_dir / "index.json").write_text(json.dumps(meta))
+        mx.save_safetensors(
+            str(shard_dir / "shard-00000.safetensors"),
+            {
+                "input_ids": mx.zeros((batch_size, seq_len), dtype=mx.int32),
+                "target_hidden": mx.zeros((batch_size, seq_len, concat)),
+            },
+        )
+        return shard_dir
+
+    def test_rejects_shard_batch_size_mismatch(self, tmp_path):
+        """Shard ``batch_size`` is the effective training batch shape;
+        ``--batch-size`` is no-op under ``--use-precomputed`` (the
+        review caught this as a dead-parameter footgun). Validate
+        explicitly so an operator who passes ``--batch-size 8`` against
+        shards written at batch_size=4 sees an error, not silent
+        ignore."""
+        from olmlx.engine.eagle.prepare import prepare_eagle_draft
+
+        vocab, hidden = 64, 16
+        _write_target_config(tmp_path, vocab, hidden)
+        shards = self._write_fake_shards(
+            tmp_path / "shards",
+            batch_size=4,
+            seq_len=32,
+            hidden=hidden,
+            target_layer_ids=[2],
+        )
+        with pytest.raises(ValueError, match=r"batch_size=4"):
+            prepare_eagle_draft(
+                tmp_path,
+                use_precomputed=shards,
+                steps=1,
+                batch_size=8,  # mismatch
+                seq_len=32,
+                block_size=1,
+                num_hidden_layers=1,
+                output_dir=tmp_path / "eagle_out",
+                _target_loader=_mock_target_loader(vocab, hidden, 2),
+            )
+
+    def test_rejects_shard_seq_len_mismatch(self, tmp_path):
+        """Same reasoning as batch_size — pin the seq_len contract."""
+        from olmlx.engine.eagle.prepare import prepare_eagle_draft
+
+        vocab, hidden = 64, 16
+        _write_target_config(tmp_path, vocab, hidden)
+        shards = self._write_fake_shards(
+            tmp_path / "shards",
+            batch_size=2,
+            seq_len=32,
+            hidden=hidden,
+            target_layer_ids=[2],
+        )
+        with pytest.raises(ValueError, match=r"seq_len=32"):
+            prepare_eagle_draft(
+                tmp_path,
+                use_precomputed=shards,
+                steps=1,
+                batch_size=2,
+                seq_len=64,  # mismatch
+                block_size=1,
+                num_hidden_layers=1,
+                output_dir=tmp_path / "eagle_out",
+                _target_loader=_mock_target_loader(vocab, hidden, 2),
+            )
+
+    def test_rejects_unsorted_target_layer_ids(self, tmp_path):
+        """``h_concat[:, :, -hidden_size:]`` slices the *last*
+        contiguous ``hidden_size`` features along the feature axis.
+        That's only the deepest layer if ``target_layer_ids`` was
+        ascending at precompute time. A future shard writer that
+        shuffled the order would silently train on the wrong layer
+        and persist a misleading ``target_layer_id``. Validate the
+        ordering up front."""
+        from olmlx.engine.eagle.prepare import prepare_eagle_draft
+
+        vocab, hidden = 64, 16
+        _write_target_config(tmp_path, vocab, hidden)
+        shards = self._write_fake_shards(
+            tmp_path / "shards",
+            batch_size=2,
+            seq_len=32,
+            hidden=hidden,
+            target_layer_ids=[10, 5, 2],  # unsorted
+        )
+        with pytest.raises(ValueError, match=r"sorted ascending"):
+            prepare_eagle_draft(
+                tmp_path,
+                use_precomputed=shards,
+                steps=1,
+                batch_size=2,
+                seq_len=32,
+                block_size=1,
+                num_hidden_layers=1,
+                output_dir=tmp_path / "eagle_out",
+                _target_loader=_mock_target_loader(vocab, hidden, 2),
+            )
+
     def test_rejects_short_seq_len(self, tmp_path):
         """``seq_len < 3`` leaves zero training positions after the
         EAGLE-pairing slices and would silently produce NaN losses.
