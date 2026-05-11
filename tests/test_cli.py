@@ -339,7 +339,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], False),
+            lambda: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -375,7 +375,7 @@ class TestBuildParser:
         # Stub out registry-walking helpers so the test is hermetic.
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], False),
+            lambda: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -418,7 +418,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], False),
+            lambda: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -445,7 +445,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], False),
+            lambda: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -473,7 +473,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], False),
+            lambda: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -510,7 +510,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], False),
+            lambda: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -540,7 +540,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], False),
+            lambda: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -564,7 +564,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], False)
+            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], [], False)
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -648,7 +648,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], False)
+            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], [], False)
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -916,10 +916,13 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(_exp, "flash", True)
 
-        bad, dormant, flash_conflicts, _global_used = _audit_speculative_config()
+        bad, dormant, flash_conflicts, dflash_moe_conflicts, _global_used = (
+            _audit_speculative_config()
+        )
         assert bad == []
         assert dormant == []
         assert flash_conflicts == ["global-flash/m:latest"]
+        assert dflash_moe_conflicts == []
 
     def test_audit_speculative_config_classifies_models(self, monkeypatch, tmp_path):
         """End-to-end: registry walk classifies models into bad / dormant /
@@ -957,12 +960,15 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
 
-        bad, dormant, flash_conflicts, global_used = _audit_speculative_config()
+        bad, dormant, flash_conflicts, dflash_moe_conflicts, global_used = (
+            _audit_speculative_config()
+        )
         # Compare as sets so the test isn't coupled to the registry's
         # internal iteration order.
         assert set(bad) == {"bad/no-draft:latest"}
         assert set(dormant) == {"dormant/has-draft:latest"}
         assert set(flash_conflicts) == {"conflict/flash-and-spec:latest"}
+        assert dflash_moe_conflicts == []
         # No model in this fixture uses the global draft (good/a has its own).
         assert global_used is False
 
