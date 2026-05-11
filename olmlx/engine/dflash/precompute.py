@@ -283,25 +283,21 @@ def iter_precomputed_shards(
                     tensors = mx.load(str(shard_path))  # type: ignore[assignment]
                     break
                 except RuntimeError as exc:
-                    # mx.load wraps file-open errors in RuntimeError;
-                    # only retry the "Failed to open file" variant.
-                    #
-                    # Substring pinned against mlx 0.30.x (observed
-                    # 2026-05-09 against mlx 0.30.2 during EAGLE
-                    # training): the C++ side raises
-                    # ``std::runtime_error("[load_safetensors] Failed
-                    # to open file <path>")`` from
-                    # ``mlx/io/safetensors.cpp``. If a future mlx
-                    # rephrases this message, the retry quietly stops
-                    # firing and the original ``RuntimeError`` is
-                    # re-raised on the first attempt — surfacing as
-                    # the same crash this function was meant to
-                    # absorb. Re-check the substring whenever bumping
-                    # the mlx pin; ideally MLX would publish a more
-                    # specific exception subclass we could catch by
-                    # type instead.
-                    if "Failed to open file" not in str(exc):
-                        raise
+                    # Retry any ``RuntimeError`` from ``mx.load``. The
+                    # backoff + retry-count protect against infinite
+                    # loops on genuinely corrupt shards: a real
+                    # corruption fails identically all 3 attempts and
+                    # propagates after the loop. We previously gated
+                    # this on ``"Failed to open file" in str(exc)``
+                    # pinned against mlx 0.30.x's safetensors error
+                    # message, but that substring is fragile across
+                    # mlx versions — a phrasing change would silently
+                    # stop the retry from firing and the training run
+                    # would die on the first transient hiccup as if
+                    # the retry logic weren't there at all. Widening
+                    # the catch trades a small amount of redundant
+                    # retry work on genuinely-broken shards for
+                    # robustness against mlx error-message churn.
                     last_exc = exc
                     if attempt < _SHARD_OPEN_RETRIES - 1:
                         # Log every retry so an operator running an 8h

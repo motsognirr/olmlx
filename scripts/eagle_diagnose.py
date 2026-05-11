@@ -30,8 +30,6 @@ from mlx_lm import load as mlx_lm_load
 from olmlx.engine.dflash.decoder import _get_layers, _patch_model, _unpatch_model
 from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
 
-_DEFAULT_TARGET = Path.home() / ".olmlx/models/mlx-community_Qwen3.5-27B-4bit"
-
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -40,8 +38,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--target",
         type=Path,
-        default=_DEFAULT_TARGET,
-        help="Path to the local target model directory (default: %(default)s)",
+        required=True,
+        help=(
+            "Path to the local target model directory (e.g. "
+            "``~/.olmlx/models/mlx-community_Qwen3.5-27B-4bit``). Required — "
+            "no default so the script doesn't silently fail on a missing "
+            "hardcoded path when run on a different machine."
+        ),
     )
     p.add_argument(
         "--draft",

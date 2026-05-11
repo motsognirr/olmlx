@@ -2506,11 +2506,21 @@ class ModelManager:
         if self._is_flash_moe_enabled(model_exp):
             flash_moe_dir = self._flash_moe_dir(hf_path)
             if flash_moe_dir is not None:
-                if spec_enabled and spec_config.strategy == "dflash":
+                if spec_enabled and spec_config.strategy in ("dflash", "eagle"):
+                    # Both feature-conditioned strategies route through
+                    # ``_load_dflash_decoder`` / ``_load_eagle_decoder``
+                    # which expect a dense target; the Flash-MoE wrapper
+                    # changes the forward path enough that the hidden-
+                    # state hooks and GDN-rollback assumptions don't
+                    # apply. Without this guard, ``eagle`` would silently
+                    # fall through to ``_load_speculative_decoder`` and
+                    # run classic speculative instead — a confusing
+                    # behavioural mismatch with the user's setting.
                     raise ValueError(
-                        "speculative_strategy='dflash' is not supported on "
-                        "Flash-MoE targets. Use speculative_strategy='classic' "
-                        "or remove the speculative settings."
+                        f"speculative_strategy={spec_config.strategy!r} is "
+                        "not supported on Flash-MoE targets. Use "
+                        "speculative_strategy='classic' or remove the "
+                        "speculative settings."
                     )
                 if model_exp.flash_speculative:
                     raise ValueError(
