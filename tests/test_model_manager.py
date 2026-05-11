@@ -2805,6 +2805,7 @@ class TestSpeculativeLoading:
         # Flash-MoE now supports classic speculative; decoder is loaded.
         assert (model, tokenizer, is_vlm, caps) == sentinel_load
         assert decoder is sentinel_decoder
+        assert "OLMLX_SPECULATIVE" not in caplog.text
 
     def test_flash_moe_path_rejects_dflash(self, monkeypatch):
         """Flash-MoE + dflash should raise ValueError."""

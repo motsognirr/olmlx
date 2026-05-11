@@ -2295,6 +2295,11 @@ class ModelManager:
                 model, tokenizer, is_vlm, caps = self._load_flash_moe_model(
                     hf_path, load_path, flash_moe_dir, model_exp=model_exp
                 )
+                if spec_enabled and model_exp.flash_speculative:
+                    raise ValueError(
+                        "Only one speculative decoder can be active at a time; "
+                        "got both 'speculative' and 'flash_speculative'."
+                    )
                 if spec_enabled:
                     decoder = self._load_speculative_decoder(
                         model, hf_path, spec_config, is_vlm=is_vlm
