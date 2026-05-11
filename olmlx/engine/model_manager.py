@@ -739,6 +739,37 @@ def parse_keep_alive(value: str | int) -> float | None:
     return float(num * multipliers[unit])
 
 
+def _resolve_attention_causal(dflash_cfg: dict) -> bool:
+    """Detect legacy draft checkpoints that were trained with causal attention.
+
+    DFlash draft attention switched from causal to bidirectional (mask=None)
+    in v2. Checkpoints carrying ``dflash_attention_version`` >= 2 use
+    bidirectional; version 1 or missing defaults to causal with a warning
+    so operators know to re-train.
+    """
+    version = dflash_cfg.get("dflash_attention_version", 1)
+    # Accept int, float, and string: JSON doesn't distinguish ``2``
+    # from ``2.0`` at the wire level, and a hand-edited config might
+    # store ``\"2\"``.  Convert to int so fractional values like
+    # ``1.5`` are treated as v1 rather than silently misclassified —
+    # version bumps are integers; fractional values are misconfigs.
+    try:
+        version_int = int(float(version))
+    except (TypeError, ValueError):
+        version_int = 1
+    if version_int >= 2:
+        return False
+    logger.warning(
+        "DFlash draft checkpoint was trained with causal attention "
+        "(dflash_attention_version=%r → %d < 2). Re-training with the "
+        "current code is recommended — running an old checkpoint "
+        "produces a distribution mismatch that degrades acceptance rate.",
+        version,
+        version_int,
+    )
+    return True
+
+
 class ModelManager:
     """Manages loading/unloading of MLX models with LRU eviction."""
 
@@ -1293,10 +1324,54 @@ class ModelManager:
                     # VLM-specific (e.g. "qwen3_5_vl") with no mlx-lm module,
                     # while text_config.model_type ("qwen3_5") does.  We
                     # already resolved using text_model_type above.
-                    if (
+                    #
+                    # Inverse case (Qwen3.6+): ``text_config.model_type`` is
+                    # the ``_text``-suffixed name (``qwen3_5_moe_text``)
+                    # with no mlx-lm module, but the top-level type
+                    # (``qwen3_5_moe``) does have one. Fall back to the
+                    # top-level type before raising — ``mlx_lm.load()``
+                    # (which the engine actually invokes downstream)
+                    # resolves via top-level model_type and handles these
+                    # configs successfully.
+                    mapped_top = LM_REMAP.get(model_type, model_type)
+                    # Resolve module-availability once for both the
+                    # fallback condition and the primary check below to
+                    # avoid duplicate ``find_spec`` import-system walks.
+                    mapped_lm_present = (
                         importlib.util.find_spec(f"mlx_lm.models.{mapped_lm}")
                         is not None
+                    )
+                    # Belt-and-suspenders: re-assert the
+                    # ``linear_attention`` discriminant from the outer
+                    # guard so the warning's "hybrid linear-attention"
+                    # label is verifiable from this block alone. A
+                    # future refactor that hoists this fallback out of
+                    # the outer guard could otherwise silently route a
+                    # full-attention VLM with a missing ``_text``-
+                    # suffixed inner type to mlx-lm and lose vision.
+                    if (
+                        not mapped_lm_present
+                        and mapped_top != mapped_lm
+                        and importlib.util.find_spec(f"mlx_lm.models.{mapped_top}")
+                        is not None
+                        # Redundant with the outer ``"linear_attention" in
+                        # layer_types`` guard at line 1262; kept so this
+                        # block stays self-contained against future
+                        # refactoring.
+                        and "linear_attention" in layer_types
                     ):
+                        logger.warning(
+                            "Routing hybrid linear-attention VLM '%s' through "
+                            "mlx-lm text path '%s' (issue #284) — text_config "
+                            "model_type '%s' has no matching mlx-lm module, "
+                            "falling back to top-level model_type. Vision "
+                            "capability is disabled for this load.",
+                            model_type,
+                            mapped_top,
+                            text_model_type,
+                        )
+                        return "text"
+                    if mapped_lm_present:
                         # WARNING because vision capability is permanently
                         # lost for this model load — image inputs would
                         # produce confusing errors with no other signal.
@@ -1648,7 +1723,34 @@ class ModelManager:
         )
 
     def _resolve_draft_path(self, hf_path: str) -> str:
-        """Download a draft model if needed and return the local path."""
+        """Download a draft model if needed and return the local path.
+
+        Accepts either a HuggingFace repo id (``"namespace/repo_name"``)
+        or an *absolute* filesystem path to a local draft directory.
+        Local-path short-circuiting is gated on ``is_absolute()`` to
+        avoid a false positive where a valid HF repo id (e.g.
+        ``"my-org/dflash-draft"``) happens to match a directory under
+        the server's CWD; that would silently swap the operator's
+        intended remote artifact for whatever the working directory
+        contains. Without short-circuiting, feeding an absolute path
+        through ``ensure_downloaded`` raises ``HFValidationError``
+        ("Repo id must be in the form 'repo_name' or
+        'namespace/repo_name'").
+        """
+        candidate = Path(hf_path).expanduser()
+        if candidate.is_absolute():
+            # Absolute paths are unambiguous local references — they
+            # cannot be HF repo ids. If the directory is missing, fall
+            # through to ``ensure_downloaded`` would surface as an
+            # ``HFValidationError`` ("Repo id must be in the form
+            # 'repo_name' or 'namespace/repo_name'") which is actively
+            # misleading for someone who passed e.g.
+            # ``/Users/.../dflash`` and made a typo or pointed at a
+            # path before training finished. Raise a clear
+            # ``FileNotFoundError`` with the actual path instead.
+            if not candidate.is_dir():
+                raise FileNotFoundError(f"Draft model directory not found: {candidate}")
+            return str(candidate)
         if self.store is not None:
             local_dir = self.store.ensure_downloaded(hf_path)
             return str(local_dir)
@@ -1766,6 +1868,7 @@ class ModelManager:
             layer_types=tuple(layer_types_raw),
             sliding_window=draft_cfg_dict.get("sliding_window"),
             final_logit_softcapping=draft_cfg_dict.get("final_logit_softcapping"),
+            attention_causal=_resolve_attention_causal(dflash_cfg),
         )
 
         draft_model = DFlashDraftModel(draft_config)

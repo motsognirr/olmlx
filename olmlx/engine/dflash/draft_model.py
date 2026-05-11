@@ -58,6 +58,7 @@ class DraftConfig:
     layer_types: tuple[str, ...] = field(default_factory=tuple)
     sliding_window: int | None = None
     final_logit_softcapping: float | None = None
+    attention_causal: bool = False
 
     def __post_init__(self) -> None:
         if not self.layer_types:
@@ -121,6 +122,12 @@ class DFlashAttention(nn.Module):
     projections and QK-RMSNorm. RoPE is applied to Q (offset by the
     context length), proposal-K (offset by the context length), and
     context-K (offset by the prior cache offset).
+
+    When ``config.attention_causal`` is ``False`` (bidirectional), the
+    mask is ``None`` for both full- and sliding-attention layers.
+    Bidirectional sliding layers rely on ``RotatingKVCache`` eviction
+    (enforced by ``make_cache()`` via ``layer_types``) to limit the
+    effective receptive field — no explicit spatial mask is needed.
     """
 
     def __init__(self, config: DraftConfig, layer_idx: int):
@@ -131,6 +138,7 @@ class DFlashAttention(nn.Module):
         self.scale = self.head_dim**-0.5
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
+        self.causal = config.attention_causal
 
         self.q_proj = nn.Linear(
             config.hidden_size, self.n_heads * self.head_dim, bias=False
@@ -158,20 +166,24 @@ class DFlashAttention(nn.Module):
         S = x_ctx.shape[1]
 
         # When sliding, drop ctx tokens that would fall outside the window.
-        # ``ctx_rope_offset`` shifts the RoPE base position so the surviving
-        # context tokens get their original position IDs (skipped tokens
-        # leave a phantom gap in position space). The cache's own
-        # ``update_and_fetch`` advances ``offset`` correctly for the kept
-        # keys; mutating ``cache.offset`` from outside would reach into
-        # mlx-lm's internal bookkeeping and break if the attribute ever
-        # becomes read-only.
-        skip = 0
+        # Advance ``cache.offset`` by the skip amount so subsequent steps
+        # pick up the correct RoPE base — the skipped tokens leave a
+        # phantom positional gap that must be tracked across calls.
+        # ``update_and_fetch`` then advances from this corrected base.
+        #
+        # This relies on the current mlx-lm invariant that
+        # ``RotatingKVCache.update_and_fetch`` uses ``self.offset`` as
+        # both the ring-buffer write pointer and the RoPE position
+        # accumulator, and increments it by exactly ``S`` (the number of
+        # tokens written, *not* ``S + skip``). If mlx-lm ever changes
+        # this, the rollback trim in ``_trim_recent_cache`` would also
+        # break — the invariant is observable at the protocol level.
         if self.is_sliding and S > (self.sliding_window or 0) - 1:
             keep = (self.sliding_window or 0) - 1
             skip = S - keep
             x_ctx = x_ctx[:, skip:]
             S = x_ctx.shape[1]
-        ctx_rope_offset = cache.offset + skip
+            cache.offset += skip
 
         queries = self.q_proj(x)
         ctx_keys = self.k_proj(x_ctx)
@@ -193,21 +205,20 @@ class DFlashAttention(nn.Module):
             0, 2, 1, 3
         )
 
-        queries = rope(queries, offset=ctx_rope_offset + S)
-        ctx_keys = rope(ctx_keys, offset=ctx_rope_offset)
-        prop_keys = rope(prop_keys, offset=ctx_rope_offset + S)
+        queries = rope(queries, offset=cache.offset + S)
+        ctx_keys = rope(ctx_keys, offset=cache.offset)
+        prop_keys = rope(prop_keys, offset=cache.offset + S)
 
         keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
 
         ctx_len = keys.shape[2] - L
-        if self.is_sliding and ctx_len + L > (self.sliding_window or 0):
+        mask = "causal" if self.causal else None
+        if self.is_sliding and self.causal and ctx_len + L > (self.sliding_window or 0):
             mask = create_causal_mask(
                 L, offset=ctx_len, window_size=self.sliding_window
             )
-        else:
-            mask = "causal"
 
         out = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask

@@ -115,6 +115,29 @@ logger = logging.getLogger(__name__)
 _GDN_PATCH_LOCK = Lock()
 
 
+def _order_matches(captured: list[Any], expected: list[Any]) -> bool:
+    """Identity-based equality for two ordered module lists.
+
+    Replaces ``captured == expected``. The natural Python list ``==``
+    falls through to elementwise ``__eq__`` on the contained ``nn.Module``
+    instances; mlx's ``Module.__eq__`` returns an ``mx.array`` (broadcast
+    over its array attributes) and Python then tries to coerce that
+    array to a scalar via ``bool()``, which raises
+    ``ValueError: [convert] Only length-1 arrays can be converted to
+    Python scalars`` for any module holding a multi-element tensor —
+    which is every real ``GatedDeltaNet``. Identity comparison sidesteps
+    the overload entirely and matches the actual invariant we want
+    (the forward visited the same module instances in the same order).
+    """
+    if len(captured) != len(expected):
+        return False
+    # ``strict=True`` would be unreachable here — the length check
+    # above already short-circuits on mismatch, so plain ``zip`` is
+    # equivalent and avoids implying an additional safety net that
+    # never fires.
+    return all(a is b for a, b in zip(captured, expected))
+
+
 # ---------------------------------------------------------------------------
 # Layer hooks
 # ---------------------------------------------------------------------------
@@ -368,14 +391,92 @@ class _GDNStateCapture:
                 "models. Open an olmlx issue with the model's class name."
             )
         self._gdn_cls: type = gdn_cls
-        # Record the GDN module instances in traversal order so
-        # ``rollback`` can verify the captured forward pass visited
-        # them in the same order as the cache list. Catches ordering
-        # bugs from tied layers / model-parallel reordering that the
-        # cardinality check would miss.
-        self._expected_gdn_modules: list[Any] = [
-            mod for _name, mod in model.named_modules() if isinstance(mod, gdn_cls)
-        ]
+        # Record the GDN module instances in *forward-pass* traversal
+        # order so ``rollback`` can verify the captured forward pass
+        # visited them in the same order as the cache list. mlx's
+        # ``Module.named_modules`` walks the tree via a LIFO stack
+        # (``module_stack.pop()``) so list-typed children like
+        # ``model.layers`` get visited in reverse order — using its
+        # output directly produces a list that's the *reverse* of what
+        # the forward pass sees, and the identity ordering check fails
+        # for every hybrid model. Walk ``_get_layers(model)`` in
+        # natural index order instead and recurse into each layer to
+        # find its GDN submodule(s).
+        self._expected_gdn_modules: list[Any] = []
+        # ``_get_layers`` raises ``AttributeError`` only when the model
+        # has none of the recognised layers attribute paths, which is a
+        # real configuration problem the operator should know about.
+        # Don't swallow it — let it propagate with the original message
+        # ("Cannot find layers in <ModelClass>; tried .model.layers,
+        # .language_model.layers, .layers"), which points directly at
+        # the cause. Wrapping in a generic catch-all would hide it
+        # behind the orphaned-modules / pure-full-attention diagnostic
+        # below.
+        ordered_layers = _get_layers(model)
+        for layer in ordered_layers:
+            # Per-layer GDN collection: today every hybrid architecture
+            # we know about ships at most one ``GatedDeltaNet`` per
+            # decoder layer, so list ordering within the layer doesn't
+            # matter. If a future layer carries multiple GDNs,
+            # ``layer.named_modules()`` would return them in mlx's LIFO
+            # traversal order — the inverse of the forward-pass order —
+            # reproducing the original ordering bug at sub-layer
+            # granularity. Surface that future violation instead of
+            # silently miswiring the rollback.
+            per_layer_gdns = [
+                mod for _name, mod in layer.named_modules() if isinstance(mod, gdn_cls)
+            ]
+            if len(per_layer_gdns) > 1:
+                raise RuntimeError(
+                    f"Layer {type(layer).__name__} contains "
+                    f"{len(per_layer_gdns)} GatedDeltaNet submodules; "
+                    "DFlash currently assumes at most one GDN per layer "
+                    "because ``layer.named_modules()`` uses mlx's LIFO "
+                    "stack traversal — multiple GDNs would come back in "
+                    "the reverse of definition order and be mis-aligned "
+                    "with the forward pass. To support a multi-GDN-per-"
+                    "layer architecture, replace this collection with a "
+                    "manual depth-first walk over the layer's children "
+                    "in declaration order (e.g. ``vars(layer).values()`` "
+                    "with recursion into containers). File an olmlx "
+                    "issue with the model class name."
+                )
+            self._expected_gdn_modules.extend(per_layer_gdns)
+        if not self._expected_gdn_modules:
+            # ``_get_layers`` returned nothing relevant to GDN. Two
+            # sub-cases, distinguished by whether ``named_modules()``
+            # finds any GDN modules at all:
+            #
+            # (a) Orphaned GDN modules exist somewhere else in the tree.
+            #     ``_patch_model`` also uses ``_get_layers``, so it
+            #     can't install ``_capturing_gdn_call`` on them — the
+            #     forward pass will visit the patched code with cache
+            #     entries but ``_captured_modules`` stays empty.
+            #     Previously the cardinality mismatch surfaced via a
+            #     misleading "ordering invariant violated" error from
+            #     ``rollback()``. Raise here instead with the actual
+            #     cause so the operator gets a useful diagnostic.
+            #
+            # (b) No GDN modules anywhere — pure full-attention model.
+            #     Leave ``_expected_gdn_modules`` empty; ``rollback()``
+            #     won't be called (no non-trimmable caches), and even if
+            #     it were, ``_order_matches([], [])`` correctly returns
+            #     True.
+            # ``model.named_modules()`` uses LIFO traversal here, but
+            # the list is diagnostic-only — order doesn't matter for
+            # error reporting.
+            orphaned = [
+                mod for _name, mod in model.named_modules() if isinstance(mod, gdn_cls)
+            ]
+            if orphaned:
+                raise RuntimeError(
+                    f"Found {len(orphaned)} GatedDeltaNet module(s) in the "
+                    "model but none are reachable via ``_get_layers``. "
+                    "``_patch_model`` uses the same helper to install "
+                    "capture hooks, so DFlash rollback cannot work for "
+                    "this configuration. File an olmlx issue with the "
+                    "model class name."
+                )
         self.conv_data: list[tuple[mx.array, int]] = []
         self._gdn_inputs: list[tuple[Any, ...]] = []
         # Parallel list of layer instances ``_capturing_gdn_call`` saw
@@ -580,7 +681,27 @@ class _GDNStateCapture:
         # cardinality check above doesn't catch reordering — without
         # this check, ``_gdn_inputs[j]`` could be silently applied to
         # the wrong cache slot.
-        if self._captured_modules != self._expected_gdn_modules:
+        if not _order_matches(self._captured_modules, self._expected_gdn_modules):
+            captured_ids = [id(m) for m in self._captured_modules]
+            expected_ids = [id(m) for m in self._expected_gdn_modules]
+            # Use sets for membership; ``in`` on a list is O(n), so the two
+            # comprehensions below would be O(n²) without these. Cold path
+            # but cheap to fix.
+            captured_set = set(captured_ids)
+            expected_set = set(expected_ids)
+            captured_only = [
+                m for m in self._captured_modules if id(m) not in expected_set
+            ]
+            expected_only = [
+                m for m in self._expected_gdn_modules if id(m) not in captured_set
+            ]
+            # Surface the actual class names of the misaligned modules
+            # so the operator gets an actionable hint at the layer
+            # type rather than just a count of memory addresses.
+            captured_types = [type(m).__name__ for m in self._captured_modules]
+            expected_types = [type(m).__name__ for m in self._expected_gdn_modules]
+            captured_only_types = [type(m).__name__ for m in captured_only]
+            expected_only_types = [type(m).__name__ for m in expected_only]
             raise RuntimeError(
                 "DFlash rollback ordering invariant violated: forward pass "
                 "visited GDN layers in a different order than "
@@ -588,7 +709,10 @@ class _GDNStateCapture:
                 "and would be applied to the wrong cache slots. This is "
                 "an olmlx bug — please report at "
                 "https://github.com/motsognirr/olmlx/issues with the model "
-                "name."
+                f"name. Diagnostic: captured order={captured_types}, "
+                f"expected order={expected_types}, "
+                f"captured-only types={captured_only_types}, "
+                f"expected-only types={expected_only_types}."
             )
         # Ordering invariant: ``_gdn_inputs`` and ``conv_data`` are
         # populated in the order the verification forward pass invokes
@@ -868,6 +992,19 @@ class DFlashDecoder:
         if ft_idx is not None:
             draft_offset = self._draft_cache[ft_idx].offset
             target_offset = self._prompt_size + self._n_generated - 1
+            # If the draft model has sliding-window attention layers and
+            # the prompt exceeds the sliding window, the first draft
+            # step advances ``cache.offset`` by ``skip + S`` (see
+            # ``DFlashAttention.__call__``).  If ALL draft tokens from
+            # that first step are rejected, ``self._n_generated`` stays
+            # at 1 (the prefill token) while the draft cache offset is
+            # ``prompt_size``, and the next step's check trips.  This is
+            # an extremely narrow window (requires a sliding-window draft
+            # *and* 0-for-block_size acceptance on the first step) and no
+            # known draft model hits it today.
+            # FIXME: undo the ``cache.offset += skip`` pre-advance on
+            # rejection rollback so the draft cache offset stays correct
+            # across steps even in this edge case.
             if draft_offset != target_offset:
                 msg = (
                     f"DFlash internal invariant violated: draft cache offset "
