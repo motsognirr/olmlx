@@ -596,6 +596,42 @@ class TestEagleDecoderPrefillStep:
         EagleDecoder(target_model=target, draft_model=draft, target_layer_id=0)
         EagleDecoder(target_model=target, draft_model=draft, target_layer_id=n - 1)
 
+    def test_draft_cache_growth_is_bounded_per_step(self):
+        """The draft cache must grow by exactly ``num_accepted - 1``
+        positions per ``step()`` — that's the cumulative output count.
+        A regression that skipped the draft trim (e.g. flipped
+        ``if trim > 0``) would let the cache grow by ``block_size``
+        per step instead, accumulating ``block_size - num_accepted``
+        extra positions every verify and blowing up memory on long
+        generations. Lock this in.
+        """
+        decoder, _, _ = _make_decoder(block_size=2)
+        decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
+        assert decoder._draft_cache is not None
+
+        def _cache_offset() -> int:
+            assert decoder._draft_cache is not None
+            return decoder._draft_cache[0].offset
+
+        baseline = _cache_offset()
+        steps = 3
+        total_accepted = 0
+        for _ in range(steps):
+            accepted, _ = decoder.step()
+            total_accepted += len(accepted)
+
+        # Net growth per step = num_accepted - 1 (see step()'s comment
+        # block on trim arithmetic). Cumulative offset growth after N
+        # steps = ``sum_i (num_accepted_i - 1)`` = total_accepted - N.
+        expected = total_accepted - steps
+        actual = _cache_offset() - baseline
+        assert actual == expected, (
+            f"draft cache offset grew by {actual} after {steps} steps "
+            f"with {total_accepted} total accepted tokens; expected "
+            f"{expected}. Regression: the per-step trim no longer "
+            "matches ``num_accepted - 1``."
+        )
+
     def test_step_clears_hidden_storage_before_verify(self):
         """Regression: from step 2 onward, the decoder must clear
         ``_hidden_storage[0]`` before the verify forward. Otherwise a

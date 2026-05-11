@@ -2011,12 +2011,15 @@ class ModelManager:
 
         Mirrors ``_load_dflash_decoder`` but consumes the EAGLE saved
         schema (flat target dims plus a top-level ``eagle_config``
-        block carrying ``block_size``). The EAGLE draft has no
-        ``mask_token_id`` or ``target_layer_ids`` — EAGLE conditions
-        on a single target hidden state per step (typically the
-        deepest layer), and the layer is chosen by the decoder
-        (``EagleDecoder.target_layer_id`` defaults to
-        ``num_layers - 1``).
+        block carrying ``block_size`` and ``target_layer_id``). The
+        EAGLE draft has no ``mask_token_id`` or ``target_layer_ids``
+        — EAGLE conditions on a single target hidden state per step,
+        and ``olmlx eagle prepare`` records the chosen layer in
+        ``eagle_config.target_layer_id`` (the deepest layer of the
+        precomputed shard ladder). When that field is absent
+        (pre-fix checkpoints), the decoder falls back to
+        ``num_layers - 1`` and a ``logger.warning`` surfaces the
+        misconfiguration with a nudge to retrain.
         """
         from olmlx.engine.eagle.decoder import EagleDecoder
         from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel

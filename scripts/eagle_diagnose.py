@@ -12,8 +12,17 @@ rate here means the draft will accept well during real speculative
 decoding. A low rate isolates the mismatch from the verify/rollback
 machinery and tells us the issue is in the conditioning itself.
 
+SCOPE: each position is measured with a *fresh* draft cache (cold-
+cache top-1 agreement). The real decoder's draft cache holds the
+accepted prefix from all prior steps, and a draft whose accuracy
+degrades as that cache fills would look healthy here. On
+Qwen3.5-27B-4bit the diagnostic reports ~24% top-1 while real bench
+acceptance is ~6% — the gap is exactly this warm-cache compounding-
+error effect. Don't read the diagnostic's number as predicting bench
+acceptance; read it as the *upper bound* on per-step agreement.
+
 Usage:
-    uv run python scripts/eagle_diagnose.py
+    uv run python scripts/eagle_diagnose.py --target <path>
 """
 
 from __future__ import annotations

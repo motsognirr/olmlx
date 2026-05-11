@@ -332,6 +332,18 @@ def iter_precomputed_shards(
                         )
                         time.sleep(_SHARD_OPEN_BACKOFF_S * (attempt + 1))
             if tensors is None:
+                # Log at ERROR before raising so an operator parsing
+                # CI/training logs can distinguish a persistent failure
+                # (this message) from the transient hiccups the per-
+                # retry WARNING surfaces. Same ``last_exc`` context is
+                # also preserved via ``raise ... from last_exc``.
+                logger.error(
+                    "iter_precomputed_shards: persistent failure loading "
+                    "shard %s after %d attempts; last exception: %s",
+                    shard_path,
+                    _SHARD_OPEN_RETRIES,
+                    last_exc,
+                )
                 raise RuntimeError(
                     f"Failed to load shard {shard_path} after "
                     f"{_SHARD_OPEN_RETRIES} attempts (see prior warnings "
