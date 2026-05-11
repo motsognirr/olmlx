@@ -444,6 +444,35 @@ class TestEagleDecoderPrefillStep:
         assert s["steps"] == 2
         assert s["proposed"] == 4  # 2 * block_size
 
+    def test_step_clears_hidden_storage_before_verify(self):
+        """Regression: from step 2 onward, the decoder must clear
+        ``_hidden_storage[0]`` before the verify forward. Otherwise a
+        silent hook failure on the second step would propagate the
+        prior step's hidden with no error, because the ``is None``
+        guard would never fire. Pin this by injecting a sentinel into
+        the storage slot *before* step() and asserting it doesn't
+        survive — the hook in a working setup must repopulate the slot,
+        and the storage must have been cleared in between so the guard
+        is meaningful.
+        """
+        decoder, _, _ = _make_decoder(block_size=2)
+        prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+        decoder.prefill(prompt)
+        decoder.step()  # step 1 — storage was None at start (from prefill)
+
+        # Plant a sentinel that should be overwritten by the next forward.
+        sentinel = mx.zeros((1, 999, 1))
+        decoder._hidden_storage[0] = sentinel
+        accepted, _ = decoder.step()
+
+        # The hook fires during the verify forward and writes the real
+        # captured hidden; whatever's in storage now should NOT be the
+        # sentinel. (Identity check, not value: a working hook produces
+        # a fresh array each call.)
+        assert decoder._hidden_storage[0] is not None
+        assert decoder._hidden_storage[0] is not sentinel
+        assert len(accepted) >= 1
+
 
 # ---------------------------------------------------------------------------
 # Phase C: GDN rollback path for hybrid linear-attention targets

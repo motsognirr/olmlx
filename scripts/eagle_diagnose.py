@@ -26,7 +26,7 @@ import mlx.core as mx
 import mlx.nn as nn  # noqa: F401  (used implicitly by mlx_lm.load)
 from mlx_lm import load as mlx_lm_load
 
-from olmlx.engine.dflash.decoder import _patch_model, _unpatch_model
+from olmlx.engine.dflash.decoder import _get_layers, _patch_model, _unpatch_model
 from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
 
 TARGET_PATH = Path.home() / ".olmlx/models/mlx-community_Qwen3.5-27B-4bit"
@@ -70,11 +70,16 @@ draft.load_weights(weights, strict=False)
 draft.bind(target)
 
 # Hook the configured target layer to capture hiddens.
+#
+# Fallback for older checkpoints without ``target_layer_id``: use the
+# *target*'s deepest layer, not the draft's layer count. Earlier
+# revisions of this script used ``eagle_cfg.num_hidden_layers - 1``
+# which is the draft layer count (typically 1) — that hooks target
+# layer 0 instead of layer 63, reproducing the exact conditioning
+# mismatch the training fix was designed to prevent.
 storage: list[mx.array | None] = [None]
 hook_layer = (
-    target_layer_id
-    if target_layer_id is not None
-    else (eagle_cfg.num_hidden_layers - 1)
+    target_layer_id if target_layer_id is not None else (len(_get_layers(target)) - 1)
 )
 print(f"Hooking target layer index: {hook_layer}\n")
 _patch_model(target, [hook_layer], storage)

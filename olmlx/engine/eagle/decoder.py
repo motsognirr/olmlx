@@ -119,11 +119,15 @@ class EagleDecoder:
         self._target = target_model
         self._draft = draft_model
         self._block_size = block_size
-        # Default to the deepest layer minus one (penultimate). The very
-        # last decoder block in mlx-lm's text models often runs the
-        # final RMSNorm internally before lm_head; capturing one layer
-        # earlier yields a cleaner conditioning signal in practice.
-        # Operators can override via ``target_layer_id``.
+        # Default to the deepest (last) layer, i.e. ``len(layers) - 1``.
+        # In practice trained checkpoints always supply
+        # ``target_layer_id`` (recorded by ``olmlx eagle prepare`` from
+        # the precomputed shard ladder), so this default only fires for
+        # hand-constructed ``EagleDecoder`` instances and for legacy
+        # checkpoints from before the field was persisted. Mismatching
+        # this against the layer the draft was trained on collapses
+        # bench acceptance to ~5% — operators wanting a non-default
+        # layer must pass ``target_layer_id`` explicitly.
         if target_layer_id is None:
             num = len(_get_layers(target_model))
             target_layer_id = num - 1
@@ -322,6 +326,15 @@ class EagleDecoder:
         # leftover entries would be applied to the wrong layer.
         if self._capture is not None:
             self._capture.clear()
+        # Reset the hidden-capture slot to ``None`` before the verify
+        # forward. Without this, a silent hook failure on step 2+ would
+        # leave last step's hidden in place and the ``is None`` guard
+        # below would never fire — the decoder would happily seed the
+        # next step with a stale hidden one verify out of date. The
+        # guard only catches step-1 failures (right after ``prefill``
+        # resets storage), which doesn't cover the actual common
+        # mode (transient hook detach mid-stream).
+        self._hidden_storage[0] = None
         verify_input = mx.array([[self._seed_token, *draft_tokens]], dtype=mx.int32)
         target_out = self._target(verify_input, cache=self._target_cache)
         target_logits = _logits(target_out)

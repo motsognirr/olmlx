@@ -22,6 +22,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +206,31 @@ class TestBuildEagleConfig:
 
 
 class TestPrepareEagleDraft:
+    def test_rejects_short_seq_len(self, tmp_path):
+        """``seq_len < 3`` leaves zero training positions after the
+        EAGLE-pairing slices and would silently produce NaN losses.
+        ``prepare_eagle_draft`` rejects this up front with a clear
+        message — pinning the contract here so a future refactor of
+        the loss alignment can't quietly regress it.
+        """
+        from olmlx.engine.eagle.prepare import prepare_eagle_draft
+
+        vocab, hidden = 64, 16
+        _write_target_config(tmp_path, vocab, hidden)
+
+        with pytest.raises(ValueError, match=r"seq_len must be >= 3"):
+            prepare_eagle_draft(
+                tmp_path,
+                steps=1,
+                batch_size=1,
+                seq_len=2,
+                block_size=1,
+                num_hidden_layers=1,
+                output_dir=tmp_path / "eagle_out",
+                _target_loader=_mock_target_loader(vocab, hidden, 2),
+                _batch_iterator=iter([]),
+            )
+
     def test_loss_decreases(self, tmp_path):
         from olmlx.engine.eagle.prepare import prepare_eagle_draft
 

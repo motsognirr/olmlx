@@ -320,6 +320,17 @@ def prepare_eagle_draft(
         raise ValueError(f"block_size must be >= 1; got {block_size}")
     if steps < 1:
         raise ValueError(f"steps must be >= 1; got {steps}")
+    if seq_len < 3:
+        # ``_eagle_loss`` slices ``input_ids[:, 1:-1]`` (length seq_len-2)
+        # under the EAGLE pairing (h_{t-1}, token_t) -> token_{t+1}.
+        # seq_len < 3 leaves zero training positions and ``mx.mean`` over
+        # an empty CE vector returns NaN, which would silently corrupt
+        # the optimizer state. Reject up front with a clear message.
+        raise ValueError(
+            f"seq_len must be >= 3 for EAGLE training (loss needs at least "
+            f"one position with both a preceding hidden and a successor "
+            f"label after slicing); got {seq_len}"
+        )
 
     model_path = Path(model_path)
     target_cfg = _read_target_config(model_path)
