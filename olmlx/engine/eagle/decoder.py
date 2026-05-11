@@ -304,24 +304,44 @@ class EagleDecoder:
             self._capture = _GDNStateCapture(self._target)
 
         # Run the target on the prompt and capture its last-layer hidden.
-        target_out = self._target(prompt, cache=self._target_cache)
-        target_logits = _logits(target_out)
-        captured = self._hidden_storage[0]
-        if captured is None:
-            self.reset()
-            raise RuntimeError(
-                "EagleDecoder prefill: target forward did not populate the "
-                f"hidden capture slot for layer {self._target_layer_id}. "
-                "Either ``_patch_model`` is incompatible with this target "
-                "structure, or the chosen layer wasn't visited."
-            )
+        # Wrap in try/reset so an exception inside the forward (OOM,
+        # Metal stream error, shape mismatch on a freshly-loaded
+        # checkpoint) doesn't leave the model patched and the GDN
+        # capture lock held. Without this, ``_patched=True`` and the
+        # ``_GDN_PATCH_LOCK`` are held until the next ``prefill()``
+        # self-heals via ``reset()`` (called at its top) or until
+        # ``__del__`` fires — a window during which another in-flight
+        # request inspecting the target's layers sees the monkey-
+        # patched ``__call__`` and (for GDN targets) blocks on the
+        # lock. ``self._target_can_trim`` is set before the forward,
+        # so reset() can find the right cleanup path; same for
+        # ``_capture`` and ``_patched``.
+        try:
+            target_out = self._target(prompt, cache=self._target_cache)
+            target_logits = _logits(target_out)
+            captured = self._hidden_storage[0]
+            if captured is None:
+                raise RuntimeError(
+                    "EagleDecoder prefill: target forward did not populate "
+                    f"the hidden capture slot for layer "
+                    f"{self._target_layer_id}. Either ``_patch_model`` is "
+                    "incompatible with this target structure, or the chosen "
+                    "layer wasn't visited."
+                )
 
-        # Greedy sample at the prompt-tail position.
-        last_logits = target_logits[:, -1:, :]
-        seed_token = int(mx.argmax(last_logits, axis=-1).item())
-        # Hidden at the prompt-tail position becomes the conditioning
-        # for the first draft step.
-        self._seed_hidden = captured[:, -1:, :]
+            # Greedy sample at the prompt-tail position.
+            last_logits = target_logits[:, -1:, :]
+            seed_token = int(mx.argmax(last_logits, axis=-1).item())
+            # Hidden at the prompt-tail position becomes the conditioning
+            # for the first draft step.
+            self._seed_hidden = captured[:, -1:, :]
+        except Exception:
+            # Best-effort cleanup. ``reset()`` itself swallows nested
+            # exceptions from each step (unpatch, unbind, capture
+            # close) so the caller sees the original error, not the
+            # cleanup error.
+            self.reset()
+            raise
         self._seed_token = seed_token
         return seed_token
 

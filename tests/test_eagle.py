@@ -484,6 +484,42 @@ class TestEagleDecoderPrefillStep:
         assert s["steps"] == 2
         assert s["proposed"] == 4  # 2 * block_size
 
+    def test_prefill_resets_on_target_forward_exception(self, monkeypatch):
+        """If the target's forward raises (OOM, shape mismatch on a
+        bad checkpoint, Metal stream error), the prefill exception
+        path must call ``reset()`` so the model isn't left patched
+        and the GDN capture lock isn't left held. Otherwise the
+        window between the exception and the next ``prefill()`` self-
+        heal leaks state to any concurrent request inspecting the
+        target's layers.
+
+        Triggering it: monkeypatch the synthetic target's
+        ``embed_tokens`` (called first thing inside ``__call__``) to
+        raise. Patching ``target.__call__`` directly would bind to
+        the instance and Python's descriptor protocol would still
+        resolve through the class — this is a more reliable hook.
+        """
+        from olmlx.engine.dflash.decoder import _LayerHook, _get_layers
+
+        decoder, target, _ = _make_decoder()
+        orig_embed = target.model.embed_tokens
+
+        def raising_embed(*_args, **_kw):
+            raise RuntimeError("simulated target forward failure")
+
+        monkeypatch.setattr(target.model, "embed_tokens", raising_embed)
+        with pytest.raises(RuntimeError, match="simulated target forward"):
+            decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
+        # reset() must have run: patched / bound / capture all cleared.
+        assert decoder._patched is False
+        assert decoder._bound is False
+        assert decoder._capture is None
+        # And the layer hook should have been removed — the original
+        # layer modules should be back in place.
+        layers = _get_layers(target)
+        assert not any(isinstance(layer, _LayerHook) for layer in layers)
+        _ = orig_embed  # silence unused
+
     def test_rejects_out_of_range_target_layer_id(self):
         """If an EAGLE checkpoint was trained against a target of a
         different depth, ``target_layer_id`` from its saved config can

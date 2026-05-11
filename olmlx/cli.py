@@ -2835,7 +2835,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--block-size",
         type=int,
         default=4,
-        help="Number of draft tokens per verify (default: 4)",
+        help=(
+            "Number of draft tokens per verify (default: 4). Note: each "
+            "drafted token forces one Metal command-buffer flush via "
+            "``.item()`` (autoregressive feature-space drafting needs the "
+            "integer token id for the next iteration). On Apple Silicon "
+            "that's ~0.5–1 ms per flush, so block_size=4 adds ~2–4 ms of "
+            "sync overhead per verify before the target's parallel forward. "
+            "If real-bench acceptance is low for your draft, smaller "
+            "block_size (1 or 2) may be Pareto-optimal — it halves/quarters "
+            "the sync overhead and avoids deeper compounding-error positions."
+        ),
     )
     eagle_prepare_p.add_argument(
         "--num-hidden-layers",

@@ -120,6 +120,22 @@ def _build_eagle_config(
     head_dim = int(_get("head_dim", hidden_size // num_attention_heads))
     intermediate_size = int(_get("intermediate_size", hidden_size * 4))
     rms_norm_eps = float(_get("rms_norm_eps", 1e-6))
+    raw_vocab = text_cfg.get("vocab_size")
+    if raw_vocab is None:
+        # Bare ``text_cfg["vocab_size"]`` would surface as a generic
+        # ``KeyError: 'vocab_size'`` traceback. Promote to a
+        # ``ValueError`` with a hint, matching the
+        # ``num_attention_heads`` path's treatment of must-have fields.
+        raise ValueError(
+            "target config.json is missing 'vocab_size'. The draft vocab "
+            "must match the target's; check that the config is for the "
+            "correct model and that 'vocab_size' isn't nested under an "
+            "unexpected key (some VLMs put it exclusively under "
+            "``text_config``, which ``_text_config`` already descends "
+            "into — so this error means the field is absent at both "
+            "levels)."
+        )
+    vocab_size = int(raw_vocab)
 
     rope_params = text_cfg.get("rope_parameters") or target_cfg.get("rope_parameters")
     if text_cfg.get("rope_theta") is not None:
@@ -146,7 +162,7 @@ def _build_eagle_config(
         num_key_value_heads=num_kv_heads,
         head_dim=head_dim,
         intermediate_size=intermediate_size,
-        vocab_size=int(text_cfg["vocab_size"]),
+        vocab_size=vocab_size,
         rms_norm_eps=rms_norm_eps,
         rope_theta=rope_theta,
         max_position_embeddings=max_position_embeddings,

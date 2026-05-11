@@ -129,6 +129,34 @@ def _synthetic_precomputed_batches(
 # ---------------------------------------------------------------------------
 
 
+class TestBuildEagleConfigErrors:
+    """Friendly error messages for must-have target-config fields."""
+
+    def test_rejects_missing_num_attention_heads(self):
+        from olmlx.engine.eagle.prepare import _build_eagle_config
+
+        with pytest.raises(ValueError, match="num_attention_heads"):
+            _build_eagle_config(
+                {"hidden_size": 16, "vocab_size": 64},
+                num_hidden_layers=1,
+                block_size=2,
+            )
+
+    def test_rejects_missing_vocab_size(self):
+        """``vocab_size`` is almost always present, but a malformed
+        config could omit it; the bare ``text_cfg["vocab_size"]``
+        access would surface as a generic ``KeyError`` instead of a
+        helpful ``ValueError``. Pin the friendly path."""
+        from olmlx.engine.eagle.prepare import _build_eagle_config
+
+        with pytest.raises(ValueError, match="vocab_size"):
+            _build_eagle_config(
+                {"hidden_size": 16, "num_attention_heads": 2},
+                num_hidden_layers=1,
+                block_size=2,
+            )
+
+
 class TestBuildEagleConfig:
     def test_inherits_target_dims(self):
         from olmlx.engine.eagle.prepare import _build_eagle_config
