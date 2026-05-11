@@ -117,6 +117,23 @@ _GDN_REQUIRED_ATTRS = (
 _GDN_PATCH_LOCK = Lock()
 
 
+# Reference to the currently-active ``GDNStateCapture`` (if any).
+# Singularity is enforced by ``_GDN_PATCH_LOCK``; this is a convenience
+# pointer used by test fixtures and diagnostics to find the active
+# capture without scanning ``gc.get_objects()``. Set in ``_patch()``
+# and cleared in ``close()`` — both paths hold the lock when they
+# mutate this.
+_active_capture: GDNStateCapture | None = None  # type: ignore[name-defined]
+
+
+def get_active_capture() -> "GDNStateCapture | None":
+    """Return the currently-installed capture, or ``None`` if no patch
+    is active. Intended for test fixtures and diagnostics — production
+    code should pass the capture through explicitly.
+    """
+    return _active_capture
+
+
 def get_model_layers(model: nn.Module) -> list[Any]:
     """Find the layers list on a target model.
 
@@ -505,6 +522,8 @@ class GDNStateCapture:
 
         self._patched_call = _capturing_gdn_call
         gdn_cls.__call__ = _capturing_gdn_call
+        global _active_capture
+        _active_capture = self
 
     def close(self) -> None:
         if self._closed:
@@ -517,6 +536,9 @@ class GDNStateCapture:
             self._orig_call = None
             self._patched_call = None
             self._active_buffer = None
+            global _active_capture
+            if _active_capture is self:
+                _active_capture = None
             _GDN_PATCH_LOCK.release()
 
     def __del__(self) -> None:
@@ -693,6 +715,20 @@ class GDNStateCapture:
                 )
             # Gather the first ``num_keep_steps`` captures for this GDN
             # layer. Each capture is one autoregressive step with S=1.
+            #
+            # **Linearity assumption**: replaying a single batched
+            # ``gated_delta_update`` over the concatenated inputs
+            # produces the same final state as running the steps
+            # one-at-a-time. This holds because GDN's recurrence
+            # processes positions in-order (no across-position
+            # normalization in the kernel) — the same invariant
+            # ``rollback_single`` already relies on for the target's
+            # parallel verify forward, which has been validated in
+            # DFlash production for hybrid models. If a future mlx-lm
+            # GDN kernel adds across-position state mixing (e.g. a
+            # bidirectional or layer-norm pass), this batched replay
+            # would diverge from the captured forward and have to be
+            # replaced with a sequential replay loop.
             captures = [
                 buffer.gdn_inputs[step * N + j_gdn] for step in range(num_keep_steps)
             ]
@@ -797,7 +833,7 @@ class GDNStateCapture:
                 this_step = buffer.captured_modules[
                     step * n_layers : (step + 1) * n_layers
                 ]
-                if not all(a is b for a, b in zip(this_step, first_step)):
+                if not all(a is b for a, b in zip(this_step, first_step, strict=True)):
                     raise RuntimeError(
                         f"GDN autoregressive rollback: step {step} visited "
                         "GDN layers in a different order than step 0. "

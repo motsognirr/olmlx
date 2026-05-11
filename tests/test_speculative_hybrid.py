@@ -24,7 +24,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from olmlx.engine.gdn_rollback import _GDN_PATCH_LOCK
+from olmlx.engine.gdn_rollback import _GDN_PATCH_LOCK, get_active_capture
 from olmlx.engine.speculative import SpeculativeDecoder
 
 
@@ -96,13 +96,27 @@ def _make_hybrid_model(gdn_cls: type | None) -> nn.Module:
 
 @pytest.fixture(autouse=True)
 def _ensure_gdn_lock_released():
-    """Defensively release the class-level patch lock between tests in
-    case a test fails before its decoder's ``close()`` runs. Tests
-    that legitimately hold the lock should release it themselves; this
-    is a backstop so one failure doesn't poison the rest of the suite.
+    """Defensively close any leaked ``GDNStateCapture`` between tests.
+
+    A test that fails with the patch installed would leave the
+    class-level ``GatedDeltaNet.__call__`` pointing at a stale closure
+    AND the lock held. Just releasing the lock would let the next test
+    acquire it, but its ``__init__`` would save the stale patch as
+    ``_orig_call`` — and on close, restore the stale patch instead of
+    the original ``__call__``.
+
+    ``get_active_capture()`` returns the singleton active capture (the
+    patch lock guarantees at most one), so we can close it cleanly
+    rather than scanning ``gc.get_objects()``. Falls back to a bare
+    lock release as a last resort.
     """
     yield
-    # Try to release; ignore if not held (we may not be the owner).
+    active = get_active_capture()
+    if active is not None:
+        try:
+            active.close()
+        except Exception:
+            pass
     try:
         _GDN_PATCH_LOCK.release()
     except RuntimeError:
