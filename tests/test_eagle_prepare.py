@@ -453,6 +453,44 @@ class TestPrepareEagleDraft:
         # loader can distinguish multi-architecture drafts.
         assert cfg_dict["eagle_config"]["block_size"] == 2
 
+    def test_saved_config_persists_target_layer_id(self, tmp_path):
+        """The ``target_layer_id`` round-trip (deepest layer of the
+        shard ladder → saved config → loader passes to
+        ``EagleDecoder``) is the difference between a working
+        checkpoint and one that hooks the wrong layer at inference and
+        collapses bench acceptance to ~5%. The existing test only
+        exercises the field through ``_batch_iterator`` injection,
+        which doesn't populate it. Use real shards here so the
+        precompute → train → save path is exercised end-to-end.
+        """
+        from olmlx.engine.eagle.prepare import prepare_eagle_draft
+
+        vocab, hidden, num_layers = 64, 16, 4
+        _write_target_config(tmp_path, vocab, hidden)
+        # Real shards with a known ladder; deepest layer is 50.
+        ladder = [13, 25, 38, 50]
+        shards = self._write_fake_shards(
+            tmp_path / "shards",
+            batch_size=2,
+            seq_len=32,
+            hidden=hidden,
+            target_layer_ids=ladder,
+        )
+        out_dir = prepare_eagle_draft(
+            tmp_path,
+            use_precomputed=shards,
+            steps=2,
+            batch_size=2,
+            seq_len=32,
+            block_size=2,
+            num_hidden_layers=1,
+            lr=1e-2,
+            output_dir=tmp_path / "eagle_out",
+            _target_loader=_mock_target_loader(vocab, hidden, num_layers),
+        )
+        cfg_dict = json.loads((out_dir / "config.json").read_text())
+        assert cfg_dict["eagle_config"]["target_layer_id"] == ladder[-1]
+
     def test_saved_weights_round_trip(self, tmp_path):
         # A freshly-saved draft loads back through
         # ``EagleDraftModel(EagleConfig(...))`` with matching parameter

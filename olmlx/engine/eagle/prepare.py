@@ -237,10 +237,17 @@ def _eagle_loss(
         # ``logits`` is annotated ``mx.array | None`` because the
         # subsampled path passes ``compute_logits=False``. In this
         # branch we pass the default ``compute_logits=True``, so it
-        # must be a real array. Make the type narrowing explicit so a
-        # future refactor that flips ``compute_logits`` here crashes
-        # at the call site rather than mid-softmax.
-        assert logits is not None
+        # must be a real array. Use a real ``if`` rather than
+        # ``assert`` because ``-O`` strips asserts — this invariant
+        # must hold unconditionally (a future refactor that flips
+        # ``compute_logits`` here would otherwise crash mid-softmax
+        # with a confusing message instead of at the call site).
+        if logits is None:
+            raise RuntimeError(
+                "EagleDraftModel returned None logits in the full-loss "
+                "path despite compute_logits=True (default). This is "
+                "an olmlx bug — please file an issue."
+            )
         log_probs = nn.log_softmax(logits, axis=-1)
         nll = -mx.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
         return mx.mean(nll)

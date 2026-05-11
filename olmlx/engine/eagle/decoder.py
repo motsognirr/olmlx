@@ -366,6 +366,29 @@ class EagleDecoder:
         if self._seed_token is None or self._seed_hidden is None:
             raise RuntimeError("EagleDecoder.step(): seed state is unset")
 
+        # Mirror ``prefill``'s try/reset wrapper. A mid-step exception
+        # in the draft loop (MLX Metal error during ``.item()``) or
+        # the verify forward (OOM, shape mismatch) would otherwise
+        # leave both KV caches in a partially-modified state and the
+        # GDN capture's ``_gdn_inputs`` list with leftover entries
+        # from the failed verify — the next ``step()`` would either
+        # consume corrupt caches or trip the cardinality check
+        # inside ``rollback`` in a confusing way. ``reset()`` here
+        # forces the caller to re-``prefill`` to recover, which is
+        # the right semantic for a hard inference failure.
+        try:
+            return self._step_impl()
+        except Exception:
+            self.reset()
+            raise
+
+    def _step_impl(self) -> tuple[list[int], int]:
+        """Inner body of ``step()``. Wrapped by ``step()`` in a
+        try/reset so any exception forces a clean tear-down. Split
+        into a separate method for readability — the exception-safety
+        boundary stays at the single ``step()`` call site instead of
+        being inlined around every forward.
+        """
         # ---- Draft phase: produce block_size candidates autoregressively.
         #
         # Note: the ``.item()`` below forces an MLX eval each draft

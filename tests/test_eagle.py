@@ -484,6 +484,41 @@ class TestEagleDecoderPrefillStep:
         assert s["steps"] == 2
         assert s["proposed"] == 4  # 2 * block_size
 
+    def test_step_resets_on_target_forward_exception(self, monkeypatch):
+        """Mirror of ``test_prefill_resets_on_target_forward_exception``
+        for ``step()``. A mid-step exception (Metal error, OOM)
+        previously left both KV caches in a partially-modified state
+        and would silently corrupt the next step. The try/reset
+        wrapper forces a clean tear-down so the caller has to
+        re-``prefill`` to recover.
+        """
+        from olmlx.engine.dflash.decoder import _LayerHook, _get_layers
+
+        decoder, target, _ = _make_decoder(block_size=2)
+        decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
+        assert decoder._patched is True
+
+        # Make the verify forward fail by raising from embed_tokens
+        # (called inside the synthetic target's ``__call__``). The
+        # draft forward path is independent, so this only blows up
+        # the verify.
+        def raising_embed(*_a, **_kw):
+            raise RuntimeError("simulated verify forward failure")
+
+        monkeypatch.setattr(target.model, "embed_tokens", raising_embed)
+        with pytest.raises(RuntimeError, match="simulated verify"):
+            decoder.step()
+
+        # reset() ran: patched / bound / capture all cleared.
+        assert decoder._patched is False
+        assert decoder._bound is False
+        assert decoder._capture is None
+        layers = _get_layers(target)
+        assert not any(isinstance(layer, _LayerHook) for layer in layers)
+        # Caches are gone too — caller must re-prefill to use again.
+        assert decoder._target_cache is None
+        assert decoder._draft_cache is None
+
     def test_prefill_resets_on_target_forward_exception(self, monkeypatch):
         """If the target's forward raises (OOM, shape mismatch on a
         bad checkpoint, Metal stream error), the prefill exception
