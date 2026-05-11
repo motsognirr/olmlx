@@ -147,10 +147,27 @@ class SpeculativeDecoder:
             gdn_cls = target_gdn_cls if target_gdn_cls is not None else draft_gdn_cls
             assert gdn_cls is not None  # at least one is non-None
             self._gdn_capture = GDNStateCapture(gdn_cls)
-            if target_gdn_cls is not None:
-                self._target_gdn_buffer = self._gdn_capture.create_buffer(target_model)
-            if draft_gdn_cls is not None:
-                self._draft_gdn_buffer = self._gdn_capture.create_buffer(draft_model)
+            # ``create_buffer`` walks the model and can raise (e.g. orphaned
+            # GDN modules outside ``get_model_layers``). Close the capture
+            # explicitly to release the patch lock — relying on ``__del__``
+            # to clean up a partially-constructed decoder leaks the lock
+            # until CPython's refcount GC fires, which is fragile under
+            # asyncio teardown and blocks any subsequent hybrid load.
+            try:
+                if target_gdn_cls is not None:
+                    self._target_gdn_buffer = self._gdn_capture.create_buffer(
+                        target_model
+                    )
+                if draft_gdn_cls is not None:
+                    self._draft_gdn_buffer = self._gdn_capture.create_buffer(
+                        draft_model
+                    )
+            except Exception:
+                self._gdn_capture.close()
+                self._gdn_capture = None
+                self._target_gdn_buffer = None
+                self._draft_gdn_buffer = None
+                raise
 
         # Diagnostic counters (reset on prefill)
         self._stats_steps: int = 0

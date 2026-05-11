@@ -354,9 +354,10 @@ class TestStepRollbackDispatch:
         finally:
             dec.close()
 
-    def test_both_hybrid_both_rollbacks(self):
-        """The Qwen3.5+Qwen3.5 case: both rollbacks called, no
-        trim_prompt_cache."""
+    def test_both_hybrid_full_acceptance_no_rollback(self):
+        """Qwen3.5+Qwen3.5, full acceptance (num_accepted == λ+1):
+        neither rollback fires because trim_target and trim_draft are 0;
+        the align step advances the draft cache by feeding D_λ."""
         dec = self._make_decoder(target_hybrid=True, draft_hybrid=True)
         try:
             dec._pending_token = 1
@@ -387,5 +388,53 @@ class TestStepRollbackDispatch:
             # Align step ran (full acceptance) — draft was called with
             # the last draft token to bring its cache to position λ+1.
             dec._draft.assert_called_once()
+        finally:
+            dec.close()
+
+    def test_both_hybrid_partial_acceptance(self):
+        """The primary new scenario this PR enables — Qwen3.5+Qwen3.5
+        with partial acceptance. BOTH rollback paths must fire with the
+        right args, no plain ``trim_prompt_cache`` call escapes to the
+        underlying hybrid caches."""
+        dec = self._make_decoder(target_hybrid=True, draft_hybrid=True)
+        try:
+            dec._pending_token = 1
+            dec._target_cache = [MagicMock(is_trimmable=MagicMock(return_value=True))]
+            dec._draft_cache = [MagicMock(is_trimmable=MagicMock(return_value=True))]
+            dec._draft_generate_cached = MagicMock(return_value=([10, 20, 30, 40], []))
+            # First two drafts match, third doesn't → num_accepted=3
+            # (= D_1 + D_2 + correction). verify_draft_greedy needs
+            # argmax at positions 0,1 to match D_1, D_2 and at position 2
+            # to be the correction token (not D_3).
+            target_logits = mx.zeros((1, 5, 50))
+            target_logits[0, 0, 10] = 1.0  # match D_1=10
+            target_logits[0, 1, 20] = 1.0  # match D_2=20
+            target_logits[0, 2, 99] = 1.0  # mismatch D_3=30 → correction=99
+            target_logits[0, 3, 0] = 1.0  # unused after mismatch
+            target_logits[0, 4, 0] = 1.0  # unused
+            dec._target = MagicMock(return_value=target_logits)
+            dec._gdn_capture.rollback_single = MagicMock()
+            dec._gdn_capture.rollback_autoregressive = MagicMock()
+            with patch("olmlx.engine.speculative.trim_prompt_cache") as trim_fn:
+                dec.step()
+            # Partial acceptance: num_accepted=3, λ=4 → trim_target=2,
+            # trim_draft=1.
+            dec._gdn_capture.rollback_single.assert_called_once_with(
+                dec._target_gdn_buffer,
+                dec._target_cache,
+                accepted=2,  # num_accepted - 1
+                trim=2,  # λ+1 - num_accepted
+            )
+            dec._gdn_capture.rollback_autoregressive.assert_called_once_with(
+                dec._draft_gdn_buffer,
+                dec._draft_cache,
+                num_steps=4,  # λ
+                num_keep_steps=3,  # num_accepted
+                trim=1,  # λ - num_accepted
+            )
+            # Crucially: plain ``trim_prompt_cache`` must NOT be called.
+            # If it were, the hybrid caches' ArraysCache layers would
+            # silently desync — exactly the bug this PR fixes.
+            trim_fn.assert_not_called()
         finally:
             dec.close()

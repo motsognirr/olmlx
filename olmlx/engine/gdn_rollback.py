@@ -649,14 +649,22 @@ class GDNStateCapture:
                 f"num_keep_steps ({num_keep_steps}) must be in [1, {num_steps}]"
             )
         if num_keep_steps == num_steps:
-            # No rollback needed; trim is also 0 in this case. Buffer
-            # already reflects the final state. Note: we intentionally
-            # skip ``_check_buffer_alignment`` on this branch because
-            # callers reach it only when ``trim==0``, but that means a
-            # corrupted buffer would slip past the guard here. Today
-            # unreachable in production callers (classic speculative
-            # only invokes rollback when ``trim_draft > 0``); revisit if
-            # the contract changes.
+            # No rollback needed; the buffer already reflects the final
+            # state. Production callers only reach this branch when
+            # ``trim_draft == 0`` (classic speculative only invokes
+            # rollback when ``trim_draft > 0``), so enforce that
+            # invariant rather than silently skip both validation and
+            # the trim — a future direct caller passing ``trim > 0``
+            # with ``num_keep_steps == num_steps`` would otherwise have
+            # their corrupted buffer accepted without an error AND
+            # leave trimmable layers unchanged.
+            if trim != 0:
+                raise ValueError(
+                    f"rollback_autoregressive: num_keep_steps == num_steps "
+                    f"({num_steps}) implies no rollback, but trim={trim} was "
+                    "requested. Either pass trim=0 (correct for the no-op "
+                    "case) or pass num_keep_steps < num_steps."
+                )
             return
         self._check_buffer_alignment(buffer, single=False, num_steps=num_steps)
         if _gd_mod is None:
