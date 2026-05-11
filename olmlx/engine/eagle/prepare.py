@@ -355,6 +355,13 @@ def prepare_eagle_draft(
     ``olmlx dflash precompute`` (EAGLE and DFlash share the same
     shard format; EAGLE consumes only the deepest captured layer).
 
+    Under ``use_precomputed`` (currently the only supported mode),
+    ``batch_size`` and ``seq_len`` are *validation* knobs, not
+    training-shape controls — the shard layout determines both, and
+    mismatched values raise ``ValueError`` up front. Pass the values
+    that match the shards, or rerun ``olmlx dflash precompute`` at
+    the desired layout.
+
     ``seed`` makes the training run reproducible. We seed *both* mlx's
     PRNG (drives weight init, dropout, etc.) and Python's stdlib
     ``random`` (drives the position subsample inside

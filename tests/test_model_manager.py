@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2937,3 +2938,197 @@ class TestDFlashLoading:
         )
 
         assert decoder is mock_decoder
+
+
+class TestEagleLoading:
+    """Tests for ``_load_eagle_decoder`` schema validation and the
+    decoder-construction path.
+
+    Strategy mirrors ``TestDFlashLoading``: mock the heavy lifting
+    (``_try_lm_then_vlm``, kind detection, flash gates) and stub
+    ``_load_eagle_decoder`` itself when we want to verify routing.
+    For schema-validation paths we drive ``_load_eagle_decoder``
+    directly with a synthetic draft directory.
+    """
+
+    def _make_target_with(self, vocab_size: int, hidden_size: int) -> Any:
+        """Build a fake target whose ``.args`` exposes both fields the
+        loader walks for cross-checks. Uses a plain object rather than
+        MagicMock so ``getattr(args, ...)`` returns None for absent
+        fields instead of an auto-generated child mock."""
+        target = MagicMock()
+
+        class _Args:
+            pass
+
+        target.args = _Args()
+        target.args.vocab_size = vocab_size
+        target.args.hidden_size = hidden_size
+        # Strip the chained-attr search paths the loader walks
+        # (``.model``, ``.language_model``) so the first match wins.
+        target.model = None
+        target.language_model = None
+        return target
+
+    def _write_eagle_draft_dir(
+        self,
+        tmp_path: Path,
+        *,
+        vocab_size: int = 64,
+        hidden_size: int = 16,
+        block_size: int = 4,
+        target_layer_id: int | None = 2,
+        omit_eagle_config: bool = False,
+    ) -> Path:
+        """Write a minimal EAGLE draft directory (config + 1 weight
+        shard) that ``_load_eagle_decoder`` can parse. Weight tensors
+        are zero-filled — we only test the loader's metadata path,
+        not real inference."""
+        import mlx.core as mx
+
+        draft_dir = tmp_path / "eagle_draft"
+        draft_dir.mkdir()
+        cfg: dict[str, Any] = {
+            "hidden_size": hidden_size,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": hidden_size // 2,
+            "intermediate_size": hidden_size * 2,
+            "vocab_size": vocab_size,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": 512,
+        }
+        if not omit_eagle_config:
+            eagle_block: dict[str, Any] = {"block_size": block_size}
+            if target_layer_id is not None:
+                eagle_block["target_layer_id"] = target_layer_id
+            cfg["eagle_config"] = eagle_block
+        (draft_dir / "config.json").write_text(json.dumps(cfg))
+
+        from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
+
+        m = EagleDraftModel(
+            EagleConfig(
+                hidden_size=hidden_size,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=hidden_size // 2,
+                intermediate_size=hidden_size * 2,
+                vocab_size=vocab_size,
+                rms_norm_eps=1e-6,
+                rope_theta=10000.0,
+                max_position_embeddings=512,
+                block_size=block_size,
+            )
+        )
+        import mlx.utils as mx_utils
+
+        weights = dict(mx_utils.tree_flatten(m.parameters()))
+        weights = {
+            k: v
+            for k, v in weights.items()
+            if not k.startswith("embed_tokens.") and not k.startswith("lm_head.")
+        }
+        mx.save_safetensors(
+            str(draft_dir / "model-00001-of-00001.safetensors"), weights
+        )
+        return draft_dir
+
+    def test_rejects_missing_eagle_config_block(self, tmp_path, registry, mock_store):
+        from olmlx.engine.registry import SpeculativeConfig
+
+        draft_dir = self._write_eagle_draft_dir(tmp_path, omit_eagle_config=True)
+        manager = ModelManager(registry, mock_store)
+        target = self._make_target_with(vocab_size=64, hidden_size=16)
+        spec = SpeculativeConfig(
+            enabled=True, draft_model=str(draft_dir), num_tokens=4, strategy="eagle"
+        )
+        with pytest.raises(ValueError, match="eagle_config"):
+            manager._load_eagle_decoder(target, spec)
+
+    def test_rejects_vocab_mismatch(self, tmp_path, registry, mock_store):
+        from olmlx.engine.registry import SpeculativeConfig
+
+        draft_dir = self._write_eagle_draft_dir(tmp_path, vocab_size=64)
+        manager = ModelManager(registry, mock_store)
+        # Target's vocab is 128, draft's is 64 — mismatch.
+        target = self._make_target_with(vocab_size=128, hidden_size=16)
+        spec = SpeculativeConfig(
+            enabled=True, draft_model=str(draft_dir), num_tokens=4, strategy="eagle"
+        )
+        with pytest.raises(ValueError, match="vocab_size"):
+            manager._load_eagle_decoder(target, spec)
+
+    def test_rejects_hidden_size_mismatch(self, tmp_path, registry, mock_store):
+        """Cross-target ``hidden_size`` mismatch must be caught at load
+        time, not at the first prefill — the latter surfaces as a
+        cryptic shape error inside ``input_proj``."""
+        from olmlx.engine.registry import SpeculativeConfig
+
+        draft_dir = self._write_eagle_draft_dir(tmp_path, hidden_size=16)
+        manager = ModelManager(registry, mock_store)
+        target = self._make_target_with(vocab_size=64, hidden_size=32)
+        spec = SpeculativeConfig(
+            enabled=True, draft_model=str(draft_dir), num_tokens=4, strategy="eagle"
+        )
+        with pytest.raises(ValueError, match="hidden_size"):
+            manager._load_eagle_decoder(target, spec)
+
+    def test_constructs_decoder_with_block_size_override(
+        self, tmp_path, registry, mock_store
+    ):
+        """``spec_config.num_tokens`` overrides the saved ``block_size``.
+        This is how operators tune block_size at the CLI without
+        retraining."""
+        from olmlx.engine.eagle.decoder import EagleDecoder
+        from olmlx.engine.registry import SpeculativeConfig
+
+        draft_dir = self._write_eagle_draft_dir(
+            tmp_path, vocab_size=64, hidden_size=16, block_size=4
+        )
+        manager = ModelManager(registry, mock_store)
+        # Build a real synthetic target so EagleDecoder's
+        # ``_get_layers(target_model)`` works.
+        from tests.test_dflash import _Target
+
+        target = _Target(vocab_size=64, hidden_size=16, num_layers=4)
+        spec = SpeculativeConfig(
+            enabled=True,
+            draft_model=str(draft_dir),
+            num_tokens=2,  # override the saved 4
+            strategy="eagle",
+        )
+        decoder = manager._load_eagle_decoder(target, spec)
+        assert isinstance(decoder, EagleDecoder)
+        assert decoder._block_size == 2
+        # target_layer_id from saved config (2) should have been threaded.
+        assert decoder._target_layer_id == 2
+
+    def test_warns_on_missing_target_layer_id(
+        self, tmp_path, registry, mock_store, caplog
+    ):
+        """Pre-fix checkpoints have no ``target_layer_id``. The loader
+        must emit a ``logger.warning`` so the operator gets nudged to
+        retrain rather than silently shipping a degraded draft."""
+        import logging
+
+        from olmlx.engine.registry import SpeculativeConfig
+
+        draft_dir = self._write_eagle_draft_dir(
+            tmp_path, vocab_size=64, hidden_size=16, target_layer_id=None
+        )
+        manager = ModelManager(registry, mock_store)
+        from tests.test_dflash import _Target
+
+        target = _Target(vocab_size=64, hidden_size=16, num_layers=4)
+        spec = SpeculativeConfig(
+            enabled=True, draft_model=str(draft_dir), num_tokens=2, strategy="eagle"
+        )
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            decoder = manager._load_eagle_decoder(target, spec)
+        assert any("target_layer_id" in r.message for r in caplog.records)
+        # Falls back to last layer.
+        assert decoder._target_layer_id == 3  # last index of 4 layers

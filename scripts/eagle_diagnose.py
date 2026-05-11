@@ -93,7 +93,21 @@ def main() -> int:
 
     # Load draft + EAGLE config.
     draft_cfg = json.loads((draft_path / "config.json").read_text())
-    target_layer_id = draft_cfg["eagle_config"].get("target_layer_id")
+    # Defensive: ``draft_cfg["eagle_config"]`` would raise ``KeyError``
+    # if the operator accidentally pointed ``--draft`` at a DFlash
+    # directory (or anything else without an ``eagle_config`` block).
+    # Surface the type mismatch up front rather than crash mid-script.
+    # Mirrors the ``isinstance(eagle_cfg, dict)`` check in
+    # ``_load_eagle_decoder``.
+    eagle_block = draft_cfg.get("eagle_config")
+    if not isinstance(eagle_block, dict):
+        print(
+            f"ERROR: {draft_path / 'config.json'} has no 'eagle_config' "
+            "block — this looks like a DFlash draft or an unrelated "
+            "checkpoint. The diagnostic only works against EAGLE drafts."
+        )
+        return 1
+    target_layer_id = eagle_block.get("target_layer_id")
     print(f"EAGLE target_layer_id from config: {target_layer_id}")
 
     eagle_cfg = EagleConfig(
@@ -107,11 +121,22 @@ def main() -> int:
         rms_norm_eps=draft_cfg["rms_norm_eps"],
         rope_theta=draft_cfg["rope_theta"],
         max_position_embeddings=draft_cfg["max_position_embeddings"],
-        block_size=draft_cfg["eagle_config"]["block_size"],
+        block_size=eagle_block["block_size"],
         rope_scaling=draft_cfg.get("rope_scaling"),
     )
     draft = EagleDraftModel(eagle_cfg)
     weight_files = sorted(draft_path.glob("model*.safetensors"))
+    # Defensive: ``load_weights([], strict=False)`` silently succeeds
+    # with all-random weights — the diagnostic would then report
+    # near-zero agreement with no hint why. Mirrors the
+    # ``FileNotFoundError`` in ``_load_eagle_decoder``.
+    if not weight_files:
+        print(
+            f"ERROR: no model-*.safetensors weight files found in "
+            f"{draft_path}. The draft directory must contain at least "
+            "one weight file produced by `olmlx eagle prepare`."
+        )
+        return 1
     weights: list[tuple[str, mx.array]] = []
     for wf in weight_files:
         weights.extend(mx.load(str(wf)).items())
