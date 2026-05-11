@@ -747,16 +747,18 @@ def _resolve_attention_causal(dflash_cfg: dict) -> bool:
     bidirectional; version 1 or missing defaults to causal with a warning
     so operators know to re-train.
     """
-    version = dflash_cfg.get("dflash_attention_version", 1)
+    version = dflash_cfg.get("dflash_attention_version", 2)
     # Accept int, float, and string: JSON doesn't distinguish ``2``
     # from ``2.0`` at the wire level, and a hand-edited config might
     # store ``\"2\"``.  Convert to int so fractional values like
     # ``1.5`` are treated as v1 rather than silently misclassified —
     # version bumps are integers; fractional values are misconfigs.
+    # Default to 2 (bidirectional) when the key is absent — matches
+    # both z-lab pre-trained drafts and current training output.
     try:
         version_int = int(float(version))
     except (TypeError, ValueError):
-        version_int = 1
+        version_int = 2
     if version_int >= 2:
         return False
     logger.warning(
@@ -1831,7 +1833,6 @@ class ModelManager:
             "rope_theta",
             "max_position_embeddings",
             "block_size",
-            "num_target_layers",
         ]
         missing = [k for k in _required_top if k not in draft_cfg_dict]
         _required_dflash = ["target_layer_ids", "mask_token_id"]
@@ -1861,7 +1862,7 @@ class ModelManager:
             rope_theta=draft_cfg_dict["rope_theta"],
             max_position_embeddings=draft_cfg_dict["max_position_embeddings"],
             block_size=draft_cfg_dict["block_size"],
-            num_target_layers=draft_cfg_dict["num_target_layers"],
+            num_target_layers=len(dflash_cfg["target_layer_ids"]),
             target_layer_ids=list(dflash_cfg["target_layer_ids"]),
             mask_token_id=int(dflash_cfg["mask_token_id"]),
             rope_scaling=draft_cfg_dict.get("rope_scaling"),
