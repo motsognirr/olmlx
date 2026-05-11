@@ -532,7 +532,7 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(1)
 
-    bad, dormant_drafts, flash_conflicts, global_draft_used = (
+    bad, dormant_drafts, flash_conflicts, dflash_moe_conflicts, global_draft_used = (
         _audit_speculative_config()
     )
     if dormant_drafts:
@@ -570,8 +570,8 @@ def _apply_serve_overrides(args) -> None:
         # warning is advisory; the authoritative runtime warning lives
         # in ``_load_model`` for the case where Flash actually wins.
         logger.warning(
-            "The following models combine speculative=true with Flash or "
-            "Flash-MoE: %s. Once Flash is prepared and loads, standalone "
+            "The following models combine speculative=true with Flash: "
+            "%s. Once Flash is prepared and loads, standalone "
             "speculative decoding is dropped — use the per-model "
             "``flash_speculative`` field (or "
             "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE / "
@@ -579,6 +579,22 @@ def _apply_serve_overrides(args) -> None:
             "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS) instead. "
             "Note: flash-speculative is still experimental.",
             ", ".join(flash_conflicts_actionable),
+        )
+    # dflash on Flash-MoE models will raise ValueError at load time once
+    # the Flash-MoE bundle is prepared and loaded; warn at startup so
+    # users see the incompatibility early. Filter models also in ``bad``
+    # (missing draft) — the "use classic strategy" suggestion is
+    # misleading when there is no draft model configured at all.
+    dflash_moe_actionable = [m for m in dflash_moe_conflicts if m not in set(bad)]
+    if dflash_moe_actionable:
+        logger.warning(
+            "The following models combine speculative_strategy='dflash' "
+            "with Flash-MoE. Once Flash-MoE is prepared and loads, this "
+            "will raise a ValueError at load time (dflash requires "
+            "hidden-state capture that does not generalize to MoE "
+            "routing): %s. Use speculative_strategy='classic' or set "
+            "speculative=false.",
+            ", ".join(dflash_moe_actionable),
         )
     if bad:
         print(
@@ -640,7 +656,9 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
     return bad
 
 
-def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
+def _audit_speculative_config() -> tuple[
+    list[str], list[str], list[str], list[str], bool
+]:
     """Walk the registry and audit each model's resolved speculative
     config.
 
@@ -651,10 +669,15 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
       set but the resolved ``enabled`` flag is False. Triggers a
       warning so users don't silently lose the draft they configured.
     - ``flash_conflicts`` — models that combine ``speculative=True``
-      with Flash or Flash-MoE in the same entry. Standalone speculative
-      decoding is silently dropped on the Flash load path; the model's
-      own ``flash_speculative`` knob is the right one. Triggers a
-      warning so users see the redirect.
+      with Flash in the same entry. Standalone speculative decoding is
+      silently dropped on the Flash load path; the model's own
+      ``flash_speculative`` knob is the right one. Triggers a warning
+      so users see the redirect. Flash-MoE supports standalone speculative
+      (classic strategy only) and is excluded from this check.
+    - ``dflash_moe_conflicts`` — models that combine
+      ``speculative_strategy='dflash'`` with Flash-MoE. Triggers a
+      warning since dflash is unsupported on MoE targets (raises
+      ValueError at load time).
     - ``global_draft_used`` — True if at least one model resolves to
       the global ``speculative_draft_model`` (i.e. has ``speculative=True``
       and no per-model draft override). Used to suppress the global
@@ -681,7 +704,7 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
             "Skipping speculative config validation: invalid models.json entry: %s",
             exc,
         )
-        return [], [], [], False
+        return [], [], [], [], False
     except OSError as exc:
         # I/O failures: never block startup. The catch is narrow so
         # programming errors (typos, missing attributes, etc.) inside
@@ -690,14 +713,15 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
             "Skipping speculative config validation: could not load registry: %s",
             exc,
         )
-        return [], [], [], False
+        return [], [], [], [], False
     bad: list[str] = []
     dormant: list[str] = []
     flash_conflicts: list[str] = []
+    dflash_moe_conflicts: list[str] = []
     global_draft_used = False
     for name, mc in registry.list_models().items():
         try:
-            enabled, draft, _, _ = mc.resolved_speculative()
+            enabled, draft, _, strategy = mc.resolved_speculative()
         except Exception as exc:
             # ``resolved_speculative`` reads ``settings`` and could
             # raise if the runtime ``Settings`` is in an unexpected
@@ -742,9 +766,11 @@ def _audit_speculative_config() -> tuple[list[str], list[str], list[str], bool]:
                     exc_info=True,
                 )
                 continue
-            if resolved_exp.flash or resolved_exp.flash_moe:
+            if resolved_exp.flash:
                 flash_conflicts.append(name)
-    return bad, dormant, flash_conflicts, global_draft_used
+            if resolved_exp.flash_moe and strategy == "dflash":
+                dflash_moe_conflicts.append(name)
+    return bad, dormant, flash_conflicts, dflash_moe_conflicts, global_draft_used
 
 
 # Module-level state set by cmd_serve() for the app lifespan to retrieve.
