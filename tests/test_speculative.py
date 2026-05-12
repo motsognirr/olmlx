@@ -334,3 +334,75 @@ class TestPrefillLastLogitCausal:
         mx.eval(result)
 
         assert mx.allclose(result, naive, atol=1e-4)
+
+
+class _Qwen3_5StyleModel(_CausalMockModel):
+    """Mock model that mimics mlx-vlm 0.4.4 Qwen3_5/Qwen2-VL position-id
+    caching. Pass 1 (cache_offset==0, _rope_deltas is None) computes positions
+    from scratch and stores _position_ids / _rope_deltas on the instance.
+    Subsequent calls with cache_offset > 0 take the cache-extension code path
+    that builds positions on the fly from cache_offset + _rope_deltas, without
+    consulting (or updating) _position_ids. Resetting _rope_deltas between
+    those calls would force the model back onto the from-scratch code path
+    with the wrong starting position.
+    """
+
+    def __init__(self, vocab_size: int, hidden_size: int):
+        super().__init__(vocab_size, hidden_size)
+        self._position_ids: mx.array | None = None
+        self._rope_deltas: mx.array | None = None
+
+    def __call__(self, input_ids, cache=None):
+        cache_offset = (
+            cache[0].offset if cache is not None and cache[0] is not None else 0
+        )
+        if cache_offset == 0 or self._rope_deltas is None or cache is None:
+            # "Inner" branch (Qwen3_5 language.py:619): compute fresh, cache.
+            seq_length = input_ids.shape[1]
+            self._position_ids = mx.arange(seq_length).reshape(1, -1)
+            self._rope_deltas = mx.array(0)
+        else:
+            # "Else" branch (Qwen3_5 language.py:631): cache-extension. Does
+            # NOT update _position_ids or _rope_deltas — they persist from
+            # the first call. This is the path pass-2 and the draft forward
+            # take.
+            pass
+        return super().__call__(input_ids, cache=cache)
+
+
+class TestVLMStateAcrossPasses:
+    """Regression: the two-pass split must not require resetting cached
+    VLM position state between passes, because Qwen3_5/Qwen2-VL only update
+    that state on the cache_offset==0 call and use it as a delta thereafter.
+    Resetting between passes forces the model onto the wrong code path."""
+
+    def test_two_pass_does_not_overwrite_position_state_at_pass2(self):
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine.speculative import _prefill_last_logit
+
+        model = _Qwen3_5StyleModel(vocab_size=32, hidden_size=16)
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7]])
+
+        # Naive single-pass: pass 1 sets _position_ids with prompt length.
+        naive_cache = [KVCache()]
+        naive = model(prompt, cache=naive_cache)[0, -1, :]
+        mx.eval(naive)
+
+        # Reset model and run the two-pass split: pass 1 is on prompt[:, :-1]
+        # (N-1 tokens, cache_offset=0), pass 2 is on prompt[:, -1:] (1 token,
+        # cache_offset=N-1). Pass 2 must take the cache-extension else branch.
+        model._position_ids = None
+        model._rope_deltas = None
+        two_pass_cache = [KVCache()]
+        result = _prefill_last_logit(model, prompt, two_pass_cache)
+        mx.eval(result)
+
+        # Output matches naive (numerical correctness).
+        assert mx.allclose(result, naive, atol=1e-4)
+        # _position_ids retains its pass-1 shape (N-1 = 6), confirming pass 2
+        # did NOT enter the inner branch (which would have overwritten it
+        # with a 1-element tensor). A reset between passes — as suggested by
+        # reviewers — would force pass 2 into the inner branch and break this.
+        assert model._position_ids is not None
+        assert model._position_ids.shape == (1, prompt.shape[1] - 1)

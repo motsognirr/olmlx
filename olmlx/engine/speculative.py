@@ -80,7 +80,7 @@ def _eval_cache(cache: list) -> None:
         # the gap is visible; do not raise, since hard-failing here would
         # break speculative decoding for every new mlx-lm cache type
         # before its probe lands in this function.
-        logger.warning(
+        logger.error(
             "_eval_cache: no mx.array entries found in %d cache objects "
             "(types: %s); the OOM-avoidance graph break is a no-op for "
             "this cache type — add an explicit probe here if Metal OOMs "
@@ -112,7 +112,10 @@ def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
     prefix, last = prompt[:, :-1], prompt[:, -1:]
     model(prefix, cache=cache)  # output discarded; lm_head never materialised
     _eval_cache(cache)  # materialise KV state before the single-token pass
-    return _logits(model(last, cache=cache))[0, 0, :]
+    result = _logits(model(last, cache=cache))[0, 0, :]
+    # Uniform postcondition: cache materialised on return for either branch.
+    _eval_cache(cache)
+    return result
 
 
 def verify_draft_greedy(
