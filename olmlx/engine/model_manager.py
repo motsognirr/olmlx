@@ -859,7 +859,15 @@ class ModelManager:
             oldest_name = min(evictable, key=lambda k: evictable[k].loaded_at)
             logger.info("Evicting model %s", oldest_name)
             evicted = self._loaded.pop(oldest_name)
-            # Release draft model Metal memory promptly
+            # Release draft model Metal memory promptly. Closing the
+            # decoder (not just dropping the reference) is required when
+            # the decoder owns a ``GDNStateCapture`` for a hybrid
+            # linear-attention target/draft: the class-level monkey-patch
+            # holds a strong reference to the capture instance via its
+            # closure, so ``__del__`` never fires and the patch lock
+            # stays held until ``close()`` is called explicitly.
+            if evicted.speculative_decoder is not None:
+                evicted.speculative_decoder.close()
             evicted.speculative_decoder = None
             del evicted
 
@@ -1222,7 +1230,12 @@ class ModelManager:
             lm.model.prefetcher.close()
         if lm.weight_store is not None:
             lm.weight_store.close()
-        # Release draft model Metal memory promptly
+        # Release draft model Metal memory promptly and unhook the
+        # class-level GatedDeltaNet patch if one is installed (hybrid
+        # target/draft). See the eviction site above for why ``close()``
+        # is required — ``__del__`` cannot break the closure cycle.
+        if lm.speculative_decoder is not None:
+            lm.speculative_decoder.close()
         lm.speculative_decoder = None
         return True
 

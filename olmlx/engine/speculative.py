@@ -22,6 +22,12 @@ except ImportError:
     make_prompt_cache = None  # type: ignore[assignment]
     trim_prompt_cache = None  # type: ignore[assignment]
 
+from olmlx.engine.gdn_rollback import (
+    GDNBuffer,
+    GDNStateCapture,
+    find_gdn_class,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -106,10 +112,99 @@ class SpeculativeDecoder:
         self._last_target_logit: mx.array | None = None
         self._pending_token: int | None = None
 
+        # GDN rollback: install a class-level patch on ``GatedDeltaNet``
+        # if either model has hybrid linear-attention layers. The single
+        # capture instance routes per-call writes to whichever buffer is
+        # currently active (target vs draft), so target and draft can
+        # share the same ``GDNStateCapture`` when they use the same GDN
+        # class (the usual case — e.g. Qwen3.5 target + Qwen3.5 draft).
+        # ``find_gdn_class`` returns ``None`` for non-hybrid models.
+        # If target and draft use *different* GDN classes (unusual but
+        # not impossible — e.g. Qwen3-Coder-Next target + Qwen3.5 draft
+        # if they ever ship distinct subclasses), we raise rather than
+        # patching two classes silently — one capture per class would
+        # require lifting the class-level patch lock.
+        self._gdn_capture: GDNStateCapture | None = None
+        self._target_gdn_buffer: GDNBuffer | None = None
+        self._draft_gdn_buffer: GDNBuffer | None = None
+        target_gdn_cls = find_gdn_class(target_model)
+        draft_gdn_cls = find_gdn_class(draft_model)
+        if target_gdn_cls is not None or draft_gdn_cls is not None:
+            if (
+                target_gdn_cls is not None
+                and draft_gdn_cls is not None
+                and target_gdn_cls is not draft_gdn_cls
+            ):
+                raise NotImplementedError(
+                    "Target and draft use different GatedDeltaNet classes "
+                    f"({target_gdn_cls.__module__}.{target_gdn_cls.__name__} "
+                    f"vs {draft_gdn_cls.__module__}.{draft_gdn_cls.__name__}). "
+                    "Classic speculative GDN rollback currently shares one "
+                    "class-level patch between target and draft; supporting "
+                    "two distinct classes would require lifting the patch "
+                    "lock. File an olmlx issue if you hit this."
+                )
+            gdn_cls = target_gdn_cls if target_gdn_cls is not None else draft_gdn_cls
+            # ``assert`` is stripped under ``python -O``; the outer ``if``
+            # guarantees at least one of the two is non-None, but a
+            # future refactor of that check could silently violate the
+            # invariant. Use ``RuntimeError`` so the failure surfaces
+            # in production builds too.
+            if gdn_cls is None:
+                raise RuntimeError(
+                    "SpeculativeDecoder GDN-setup invariant violated: "
+                    "outer ``if`` branch entered but both target and "
+                    "draft GDN classes are None. Please file an olmlx bug."
+                )
+            self._gdn_capture = GDNStateCapture(gdn_cls)
+            # ``create_buffer`` walks the model and can raise (e.g. orphaned
+            # GDN modules outside ``get_model_layers``). Close the capture
+            # explicitly to release the patch lock — relying on ``__del__``
+            # to clean up a partially-constructed decoder leaks the lock
+            # until CPython's refcount GC fires, which is fragile under
+            # asyncio teardown and blocks any subsequent hybrid load.
+            try:
+                if target_gdn_cls is not None:
+                    self._target_gdn_buffer = self._gdn_capture.create_buffer(
+                        target_model
+                    )
+                if draft_gdn_cls is not None:
+                    self._draft_gdn_buffer = self._gdn_capture.create_buffer(
+                        draft_model
+                    )
+            except Exception:
+                self._gdn_capture.close()
+                self._gdn_capture = None
+                self._target_gdn_buffer = None
+                self._draft_gdn_buffer = None
+                raise
+
         # Diagnostic counters (reset on prefill)
         self._stats_steps: int = 0
         self._stats_proposed: int = 0
         self._stats_accepted_draft: int = 0
+
+    def close(self) -> None:
+        """Release the GDN class-level monkey-patch (idempotent).
+
+        Decoders should be ``close()``-d explicitly when no longer used;
+        the ``__del__`` finaliser is best-effort because the patched
+        ``__call__`` holds a strong reference to ``GDNStateCapture``
+        through its closure, breaking the GC cycle that would otherwise
+        run our finaliser.
+        """
+        if self._gdn_capture is not None:
+            self._gdn_capture.close()
+            self._gdn_capture = None
+            self._target_gdn_buffer = None
+            self._draft_gdn_buffer = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # Finalisers must never raise.
+            pass
 
     def _update_acceptance_rate(self, num_accepted: int) -> int:
         """Update the rolling acceptance rate via EMA and return accepted-draft count."""
@@ -182,6 +277,12 @@ class SpeculativeDecoder:
             if hasattr(self._target, attr):
                 setattr(self._target, attr, None)
 
+        # Suppress GDN capture during prefill: no rollback is needed
+        # for the prompt forward, and recording it would just bloat the
+        # buffers (which are sized for one step's worth of captures).
+        if self._gdn_capture is not None:
+            self._gdn_capture.use_buffer(None)
+
         target_out = _logits(self._target(prompt, cache=self._target_cache))
         self._last_target_logit = target_out[0, -1, :]
         mx.eval(self._last_target_logit)
@@ -210,7 +311,12 @@ class SpeculativeDecoder:
 
         pending_token = self._pending_token
 
-        # 1. Draft: feed pending token, then generate lambda candidates
+        # 1. Draft: feed pending token, then generate lambda candidates.
+        # Route GDN captures to the draft buffer (if draft is hybrid).
+        if self._gdn_capture is not None:
+            if self._draft_gdn_buffer is not None:
+                self._draft_gdn_buffer.clear()
+            self._gdn_capture.use_buffer(self._draft_gdn_buffer)
         draft_tokens, draft_ctx = self._draft_generate_cached(
             pending_token, self._lambda
         )
@@ -219,9 +325,23 @@ class SpeculativeDecoder:
         self._after_draft(draft_ctx)
 
         # 2. Target: feed [pending, D1, ..., D_lambda] in one pass.
+        # Switch GDN capture to the target buffer.
+        if self._gdn_capture is not None:
+            if self._target_gdn_buffer is not None:
+                self._target_gdn_buffer.clear()
+            self._gdn_capture.use_buffer(self._target_gdn_buffer)
         all_tokens = mx.array([[pending_token] + draft_tokens])
         target_out = _logits(self._target(all_tokens, cache=self._target_cache))
         mx.eval(target_out)
+
+        # Capture is done: no more model forwards in this step should
+        # write to either buffer. Subclass hooks (``_after_verify``) and
+        # rollback replays (``rollback_single`` invokes
+        # ``gated_delta_update`` directly, not ``GatedDeltaNet.__call__``)
+        # would otherwise append spurious captures and fail the next
+        # step's buffer-size check.
+        if self._gdn_capture is not None:
+            self._gdn_capture.use_buffer(None)
 
         verification_logits = target_out[0]  # (lambda+1, vocab)
 
@@ -232,16 +352,58 @@ class SpeculativeDecoder:
         # Hook for subclasses (e.g. Flash prefetch cancellation)
         self._after_verify(num_accepted)
 
-        # 4. Trim caches to the position after the last accepted token.
+        # 4. Roll back caches to keep only the accepted prefix.
+        #
+        # Target was fed (λ+1) tokens [pending, D_1..D_λ]; keep
+        # ``num_accepted`` of them, so trim by (λ+1) - num_accepted.
+        # Draft was fed λ tokens autoregressively
+        # [pending, D_1..D_{λ-1}]; keep ``num_accepted`` of those if
+        # partial acceptance (= a-1 draft tokens between pending and
+        # the correction/bonus), so trim by λ - num_accepted.
         trim_target = max(self._lambda + 1 - num_accepted, 0)
         trim_draft = max(self._lambda - num_accepted, 0)
 
-        if trim_target > 0 and trim_prompt_cache is not None:
-            trim_prompt_cache(self._target_cache, trim_target)
-        if trim_draft > 0 and trim_prompt_cache is not None:
-            trim_prompt_cache(self._draft_cache, trim_draft)
+        # Target rollback: GDN replay if hybrid, plain trim otherwise.
+        if trim_target > 0:
+            if self._target_gdn_buffer is not None and self._gdn_capture is not None:
+                # ``rollback_single`` takes ``accepted`` as the number of
+                # *additional* tokens beyond the first to keep
+                # (n = accepted + 1). We want to keep ``num_accepted``
+                # total, so accepted_arg = num_accepted - 1.
+                self._gdn_capture.rollback_single(
+                    self._target_gdn_buffer,
+                    self._target_cache,
+                    accepted=num_accepted - 1,
+                    trim=trim_target,
+                )
+            elif trim_prompt_cache is not None:
+                trim_prompt_cache(self._target_cache, trim_target)
+
+        # Draft rollback: GDN autoregressive replay if hybrid, plain
+        # trim otherwise. On full acceptance (num_accepted == λ+1)
+        # trim_draft is 0 and we skip rollback; the align step below
+        # then advances the draft cache by feeding D_λ.
+        if trim_draft > 0:
+            if self._draft_gdn_buffer is not None and self._gdn_capture is not None:
+                # ``rollback_autoregressive`` keeps the first
+                # ``num_keep_steps`` of ``num_steps`` autoregressive
+                # calls. We fed λ tokens and want to keep
+                # ``num_accepted`` of them.
+                self._gdn_capture.rollback_autoregressive(
+                    self._draft_gdn_buffer,
+                    self._draft_cache,
+                    num_steps=self._lambda,
+                    num_keep_steps=num_accepted,
+                    trim=trim_draft,
+                )
+            elif trim_prompt_cache is not None:
+                trim_prompt_cache(self._draft_cache, trim_draft)
 
         # On full acceptance, align draft cache with target cache.
+        # ``use_buffer(None)`` was already called after the target
+        # forward, so the align step's draft forward — which DOES
+        # invoke ``GatedDeltaNet.__call__`` on a hybrid draft — won't
+        # write to either buffer.
         if num_accepted > self._lambda:
             last_draft = mx.array([[draft_tokens[-1]]])
             align_logits = _logits(self._draft(last_draft, cache=self._draft_cache))
