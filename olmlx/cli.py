@@ -2268,6 +2268,71 @@ def cmd_dflash_prepare(args):
     print("  olmlx serve")
 
 
+def cmd_eagle_prepare(args):
+    """Train an EAGLE draft model for a target.
+
+    Phase D supports only ``--use-precomputed`` mode: pass the
+    directory of (input_ids, target_hidden) shards produced by
+    ``olmlx dflash precompute`` (the shard format is shared between
+    DFlash and EAGLE — EAGLE consumes the deepest captured layer).
+    """
+    _configure_logging()
+
+    if args.block_size < 1:
+        raise SystemExit(f"--block-size must be >= 1, got {args.block_size}")
+    if not args.use_precomputed:
+        raise SystemExit(
+            "--use-precomputed is required for EAGLE training. Run "
+            "`olmlx dflash precompute <target>` first to dump target hidden "
+            "states; the same shards work for EAGLE (it just slices the "
+            "deepest layer from the concatenated ladder)."
+        )
+
+    store = _create_store()
+    _resolved = store.registry.resolve(args.model)
+    hf_path = _resolved.hf_path if _resolved is not None else args.model
+    local_dir = store.ensure_downloaded(hf_path)
+    model_path = str(local_dir)
+
+    print(f"Training EAGLE draft for {args.model}...")
+    print(f"  Target path: {model_path}")
+    print(f"  Steps: {args.steps}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Seq len: {args.seq_len}")
+    print(f"  Block size (draft tokens): {args.block_size}")
+    print(f"  Draft layers: {args.num_hidden_layers}")
+    print(f"  LR: {args.lr}")
+    sample_positions = args.sample_positions if args.sample_positions > 0 else None
+    print(f"  Sample positions/step: {sample_positions or 'all'}")
+    print(f"  Precomputed shards: {args.use_precomputed}")
+    print()
+
+    from olmlx.engine.eagle.prepare import prepare_eagle_draft
+
+    output_dir = prepare_eagle_draft(
+        model_path=model_path,
+        use_precomputed=args.use_precomputed,
+        steps=args.steps,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        block_size=args.block_size,
+        num_hidden_layers=args.num_hidden_layers,
+        lr=args.lr,
+        sample_positions=sample_positions,
+        seed=args.seed,
+        output_dir=args.output,
+        progress_callback=_flash_progress,
+    )
+
+    print("\nEAGLE draft training complete!")
+    print(f"  Output: {output_dir}")
+    print("\nTo use the trained draft:")
+    print("  OLMLX_SPECULATIVE=true \\")
+    print("  OLMLX_SPECULATIVE_STRATEGY=eagle \\")
+    print(f"  OLMLX_SPECULATIVE_DRAFT_MODEL={output_dir} \\")
+    print("  olmlx serve")
+
+
 def cmd_flash_info(args):
     """Show flash preparation info for a model."""
     store = _create_store()
@@ -2369,12 +2434,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument(
         "--speculative-strategy",
         dest="speculative_strategy",
-        choices=("classic", "dflash"),
+        choices=("classic", "dflash", "eagle"),
         default=None,
         help=(
-            "Speculative decoding strategy: 'classic' (standalone draft LM) "
-            "or 'dflash' (block-diffusion draft conditioned on target hidden "
-            "states). Default: classic."
+            "Speculative decoding strategy: 'classic' (standalone draft LM), "
+            "'dflash' (block-diffusion draft conditioned on target hidden "
+            "states), or 'eagle' (autoregressive draft head conditioned on "
+            "target last-layer hidden, arxiv 2401.15077). Default: classic."
         ),
     )
     serve_p.add_argument(
@@ -2721,6 +2787,104 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory (default: <target-model-dir>/dflash_cache)",
     )
 
+    # EAGLE draft training (arxiv 2401.15077)
+    eagle = sub.add_parser(
+        "eagle", help="EAGLE autoregressive speculative draft training"
+    )
+    eagle_sub = eagle.add_subparsers(dest="eagle_command")
+    eagle_prepare_p = eagle_sub.add_parser(
+        "prepare", help="Train an EAGLE draft model for a target"
+    )
+    eagle_prepare_p.add_argument("model", help="Target model name or HF path")
+    eagle_prepare_p.add_argument(
+        "--use-precomputed",
+        type=str,
+        required=True,
+        help=(
+            "Directory of (input_ids, target_hidden) shards produced by "
+            "`olmlx dflash precompute`. EAGLE consumes the deepest captured "
+            "layer; the same shards work for both DFlash and EAGLE."
+        ),
+    )
+    eagle_prepare_p.add_argument(
+        "--steps", type=int, default=2000, help="Training steps (default: 2000)"
+    )
+    eagle_prepare_p.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help=(
+            "Batch size (default: 4). Under --use-precomputed this is "
+            "validated against the shard layout (shards are written at a "
+            "fixed batch shape; pass the value that matches or rerun "
+            "`olmlx dflash precompute` at the desired batch size)."
+        ),
+    )
+    eagle_prepare_p.add_argument(
+        "--seq-len",
+        type=int,
+        default=2048,
+        help=(
+            "Sequence length (default: 2048). Under --use-precomputed "
+            "this is validated against the shard layout (shards are "
+            "written at a fixed sequence length; pass the value that "
+            "matches or rerun precompute at the desired length)."
+        ),
+    )
+    eagle_prepare_p.add_argument(
+        "--block-size",
+        type=int,
+        default=4,
+        help=(
+            "Number of draft tokens per verify (default: 4). Note: each "
+            "drafted token forces one Metal command-buffer flush via "
+            "``.item()`` (autoregressive feature-space drafting needs the "
+            "integer token id for the next iteration). On Apple Silicon "
+            "that's ~0.5–1 ms per flush, so block_size=4 adds ~2–4 ms of "
+            "sync overhead per verify before the target's parallel forward. "
+            "If real-bench acceptance is low for your draft, smaller "
+            "block_size (1 or 2) may be Pareto-optimal — it halves/quarters "
+            "the sync overhead and avoids deeper compounding-error positions."
+        ),
+    )
+    eagle_prepare_p.add_argument(
+        "--num-hidden-layers",
+        type=int,
+        default=1,
+        help="Draft model decoder layer count (default: 1, EAGLE-1 default)",
+    )
+    eagle_prepare_p.add_argument(
+        "--lr", type=float, default=5e-4, help="Peak learning rate (default: 5e-4)"
+    )
+    eagle_prepare_p.add_argument(
+        "--sample-positions",
+        type=int,
+        default=256,
+        help=(
+            "Per-step subsample of positions where lm_head is applied "
+            "during loss computation. The full sequence still runs through "
+            "draft self-attention; only the final vocab projection is "
+            "subsampled. Set to 0 to disable subsampling and score every "
+            "position (~10x slower on large vocabs). Default: 256."
+        ),
+    )
+    eagle_prepare_p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "PRNG seed for reproducible training. Seeds both mlx (weight "
+            "init etc.) and stdlib random (the per-step position subsample "
+            "used by sample-positions). Default: 0."
+        ),
+    )
+    eagle_prepare_p.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output directory (default: <target-model-dir>/eagle)",
+    )
+
     # Spectral quant calibration
     spectral = sub.add_parser("spectral", help="SpectralQuant KV cache compression")
     spectral_sub = spectral.add_subparsers(dest="spectral_command")
@@ -2852,6 +3016,7 @@ _COMMAND_HANDLERS: dict[tuple[str, str | None], str] = {
     ("flash", "info"): "cmd_flash_info",
     ("dflash", "prepare"): "cmd_dflash_prepare",
     ("dflash", "precompute"): "cmd_dflash_precompute",
+    ("eagle", "prepare"): "cmd_eagle_prepare",
     ("spectral", "prepare"): "cmd_spectral_prepare",
     ("bench", "run"): "cmd_bench_run",
     ("bench", "compare"): "cmd_bench_compare",

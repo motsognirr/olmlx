@@ -85,11 +85,20 @@ class Settings(BaseSettings):
     # - ``dflash``: block-diffusion draft conditioned on target hidden states
     #   (mask-token parallel block prediction). Requires a draft model whose
     #   ``config.json`` carries the upstream z-lab ``dflash_config`` schema.
-    # ``speculative_tokens`` is reused as DFlash's ``block_size``. ``None``
-    # means "use the strategy default": 4 for classic speculative decoding,
-    # the draft model's pre-trained ``block_size`` for DFlash.
+    # - ``eagle``: autoregressive draft head conditioned on the target's
+    #   last-layer hidden state (arxiv 2401.15077). Predicts the next
+    #   *hidden* in feature space; the target's lm_head (shared via
+    #   ``bind()``) maps that hidden to the next-token distribution. Higher
+    #   acceptance rate than DFlash for the same draft-parameter budget on
+    #   most targets, at the cost of being autoregressive (one draft
+    #   forward per drafted token). Requires a draft whose ``config.json``
+    #   carries an ``eagle_config`` block.
+    # ``speculative_tokens`` is reused as DFlash's ``block_size`` and as
+    # EAGLE's per-verify draft-token count. ``None`` means "use the
+    # strategy default": 4 for classic, the draft model's pre-trained
+    # ``block_size`` for DFlash and EAGLE.
     speculative: bool = False
-    speculative_strategy: Literal["classic", "dflash"] = "classic"
+    speculative_strategy: Literal["classic", "dflash", "eagle"] = "classic"
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] | None = None
 

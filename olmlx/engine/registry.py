@@ -14,8 +14,10 @@ import logging
 
 from olmlx.config import SyncMode, settings
 
-SpeculativeStrategy = Literal["classic", "dflash"]
-_VALID_SPECULATIVE_STRATEGIES: frozenset[str] = frozenset(("classic", "dflash"))
+SpeculativeStrategy = Literal["classic", "dflash", "eagle"]
+_VALID_SPECULATIVE_STRATEGIES: frozenset[str] = frozenset(
+    ("classic", "dflash", "eagle")
+)
 
 logger = logging.getLogger(__name__)
 
