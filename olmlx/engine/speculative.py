@@ -72,15 +72,21 @@ def _eval_cache(cache: list) -> None:
     if arrs:
         mx.eval(*arrs)
     elif cache:
-        # A non-empty cache produced no arrays to evaluate. The caller's
-        # contract is that pass-2 logits are only meaningful if pass-1's
-        # KV state has been materialised. Continuing would produce silently
-        # wrong tokens for any unrecognised cache type, so fail loudly.
-        raise RuntimeError(
-            f"_eval_cache: no mx.array entries found in {len(cache)} cache "
-            f"objects (types: {sorted({type(c).__name__ for c in cache})}). "
-            "Pass-2 KV state cannot be guaranteed. Add explicit handling "
-            "for this cache type in _eval_cache."
+        # A non-empty cache produced no arrays to evaluate (unrecognised
+        # cache type). MLX's lazy graph chains pass-1's cache mutations
+        # into pass-2's forward regardless, so tokens stay correct — but
+        # the OOM this helper was designed to prevent will resurface
+        # (pass-2's eval pulls pass-1's lm_head graph through). Warn so
+        # the gap is visible; do not raise, since hard-failing here would
+        # break speculative decoding for every new mlx-lm cache type
+        # before its probe lands in this function.
+        logger.warning(
+            "_eval_cache: no mx.array entries found in %d cache objects "
+            "(types: %s); the OOM-avoidance graph break is a no-op for "
+            "this cache type — add an explicit probe here if Metal OOMs "
+            "during prefill on long prompts.",
+            len(cache),
+            sorted({type(c).__name__ for c in cache}),
         )
 
 
@@ -97,7 +103,12 @@ def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
     the ~41 GB Metal buffer limit (e.g. Gemma 4 31B, vocab=262 144, long ctx).
     """
     if prompt.shape[1] <= 1:
-        return _logits(model(prompt, cache=cache))[0, -1, :]
+        result = _logits(model(prompt, cache=cache))[0, -1, :]
+        # Uniform postcondition with the two-pass branch: callers can rely
+        # on the cache being materialised on return regardless of prompt
+        # length. Cheap here because the prompt is a single token.
+        _eval_cache(cache)
+        return result
     prefix, last = prompt[:, :-1], prompt[:, -1:]
     model(prefix, cache=cache)  # output discarded; lm_head never materialised
     _eval_cache(cache)  # materialise KV state before the single-token pass
