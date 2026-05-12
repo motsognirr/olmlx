@@ -245,3 +245,85 @@ class TestPrefillLastLogit:
         mx.eval(cache[0].keys, cache[0].values)
 
         assert cache[0].offset == prompt.shape[1]
+
+
+class _CausalAttention:
+    """Minimal scaled-dot-product attention over a real KV cache.
+
+    The pass-2 output for the last position depends on K/V from positions
+    0..N-2 via the attention mechanism, so a broken cache split (e.g. pass 1
+    not materialised before pass 2) produces numerically different logits
+    than a single-pass forward.
+    """
+
+    def __init__(self, hidden_size: int):
+        rng = mx.random.key(0)
+        self.wqkv = mx.random.normal((hidden_size, hidden_size * 3), key=rng) * 0.1
+        self.n_heads = 1
+
+    def __call__(self, x, cache=None):
+        B, T, D = x.shape
+        qkv = x @ self.wqkv
+        q, k, v = mx.split(qkv, 3, axis=-1)
+        # (B, n_heads=1, T, D)
+        q = q.reshape(B, 1, T, D)
+        k = k.reshape(B, 1, T, D)
+        v = v.reshape(B, 1, T, D)
+        if cache is not None:
+            k, v = cache.update_and_fetch(k, v)
+        scale = 1.0 / (D**0.5)
+        scores = (q @ mx.swapaxes(k, -1, -2)) * scale
+        # Causal mask over the appended-to history.
+        S = k.shape[2]
+        offset = S - T
+        i = mx.arange(T).reshape(T, 1) + offset
+        j = mx.arange(S).reshape(1, S)
+        mask = mx.where(j <= i, 0.0, -1e9)
+        scores = scores + mask
+        attn = mx.softmax(scores, axis=-1)
+        out = (attn @ v).reshape(B, T, D)
+        return out
+
+
+class _CausalMockModel:
+    """Model with real causal attention so KV cache state matters for output."""
+
+    def __init__(self, vocab_size: int, hidden_size: int):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        rng = mx.random.key(1)
+        self.embed_w = mx.random.normal((vocab_size, hidden_size), key=rng) * 0.1
+        self.attn = _CausalAttention(hidden_size)
+        self.lm_head_w = mx.random.normal((hidden_size, vocab_size), key=rng) * 0.1
+        # KV cache protocol expects model.layers iterable for make_prompt_cache
+        self.layers = [self.attn]
+
+    def __call__(self, input_ids, cache=None):
+        h = self.embed_w[input_ids]
+        layer_cache = cache[0] if cache is not None else None
+        h = self.attn(h, cache=layer_cache)
+        return h @ self.lm_head_w
+
+
+class TestPrefillLastLogitCausal:
+    """Validates that _prefill_last_logit's two-pass split produces the same
+    last-position logit as a single-pass forward on a model where attention
+    actually consults the KV cache."""
+
+    def test_two_pass_matches_naive_with_causal_attention(self):
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine.speculative import _prefill_last_logit
+
+        model = _CausalMockModel(vocab_size=32, hidden_size=16)
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7]])
+
+        naive_cache = [KVCache()]
+        naive = model(prompt, cache=naive_cache)[0, -1, :]
+        mx.eval(naive)
+
+        two_pass_cache = [KVCache()]
+        result = _prefill_last_logit(model, prompt, two_pass_cache)
+        mx.eval(result)
+
+        assert mx.allclose(result, naive, atol=1e-4)

@@ -63,6 +63,18 @@ def _eval_cache(cache: list) -> None:
                 arrs.extend(a for a in state if isinstance(a, mx.array))
     if arrs:
         mx.eval(*arrs)
+    elif cache:
+        # Defensive: a non-empty cache produced no arrays to evaluate. The
+        # caller relies on pass 1's KV state being materialised before pass
+        # 2; a silent no-op here would let pass 2 see lazily-unevaluated
+        # state and produce wrong logits. Warn so unrecognised cache types
+        # surface instead of failing silently.
+        logger.warning(
+            "_eval_cache: no mx.array entries found in %d cache objects "
+            "(types: %s); pass-2 correctness may be compromised",
+            len(cache),
+            sorted({type(c).__name__ for c in cache}),
+        )
 
 
 def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
