@@ -209,28 +209,24 @@ class TestPrefillLastLogit:
 
         assert mx.allclose(result, naive, atol=1e-5)
 
-    def test_matches_naive_multi_token(self, model):
-        """Smoke test: two-pass result shape matches naive forward on MockModel.
+    def test_multi_token_smoke(self, model):
+        """Smoke test: ``_prefill_last_logit`` runs end-to-end on a multi-token
+        prompt and returns a vocab-shaped logit.
 
-        Note: MockModel is cache-agnostic, so this does not verify numerical
-        correctness of the KV-cache split for real causal transformers. It
-        validates that ``_prefill_last_logit`` runs end-to-end and returns
-        the expected shape, not that pass 2 sees the correct cached state.
+        MockModel is cache-agnostic (``MockAttention`` discards the
+        ``update_and_fetch`` return), so this only exercises the code path.
+        Numerical correctness of the two-pass split is covered by
+        ``TestPrefillLastLogitCausal``.
         """
         from mlx_lm.models.cache import make_prompt_cache
 
-        from olmlx.engine.speculative import _logits, _prefill_last_logit
-
-        prompt = mx.array([[1, 2, 3, 4, 5]])
-        cache_naive = make_prompt_cache(model)
-        naive = _logits(model(prompt, cache=cache_naive))[0, -1, :]
-        mx.eval(naive)
+        from olmlx.engine.speculative import _prefill_last_logit
 
         cache_2p = make_prompt_cache(model)
-        result = _prefill_last_logit(model, prompt, cache_2p)
+        result = _prefill_last_logit(model, mx.array([[1, 2, 3, 4, 5]]), cache_2p)
         mx.eval(result)
 
-        assert mx.allclose(result, naive, atol=1e-5)
+        assert result.shape == (32,)
 
     def test_cache_offset_equals_prompt_length(self, model):
         """After _prefill_last_logit, KV cache offset must equal prompt length."""
