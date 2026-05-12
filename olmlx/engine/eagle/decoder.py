@@ -40,12 +40,14 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from olmlx.engine.dflash.decoder import (
-    _find_gdn_class,
-    _GDNStateCapture,
-    _get_layers,
-    _HAS_GDN,
     _patch_model,
     _unpatch_model,
+)
+from olmlx.engine.gdn_rollback import (
+    _HAS_GDN,
+    find_gdn_class as _find_gdn_class,
+    GDNStateCapture as _GDNStateCapture,
+    get_model_layers as _get_layers,
 )
 from olmlx.engine.eagle.draft_model import EagleDraftModel
 from olmlx.engine.speculative import verify_draft_greedy
