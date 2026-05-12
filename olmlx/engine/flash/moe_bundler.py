@@ -105,6 +105,7 @@ class MoeExpertLayout:
     bits: int
     group_size: int
     quant_mode: str = "affine"
+    manifest: list[dict] | None = None
 
 
 # Cache for loaded shard files to avoid re-reading the same shard.
@@ -382,6 +383,31 @@ def _collect_all_projections(
     return all_components, manifest
 
 
+def _quant_params_from_manifest(
+    manifest: list[dict], hidden_size: int
+) -> tuple[bool, int, int]:
+    """Detect (is_quantized, bits, group_size) from a per-layer expert manifest.
+
+    Uses the first gate/fc1 projection weight shape to infer bit-width, and the
+    corresponding scales shape to infer group_size. Works for any projection that
+    maps hidden_size → intermediate_size (gate_proj, up_proj, fc1).
+    """
+    weight_entry = next(
+        (e for e in manifest if e["name"] in ("gate_proj.weight", "fc1.weight")),
+        None,
+    )
+    if weight_entry is None or weight_entry["dtype"] != "uint32":
+        return False, 0, 0
+    packed_in = weight_entry["shape"][1]
+    bits = round(32 * packed_in / hidden_size)
+    scales_key = weight_entry["name"].replace(".weight", ".scales")
+    scales_entry = next((e for e in manifest if e["name"] == scales_key), None)
+    group_size = 64
+    if scales_entry is not None:
+        group_size = round(hidden_size / scales_entry["shape"][1])
+    return True, bits, group_size
+
+
 def bundle_moe_experts(
     model_dir: Path,
     output_dir: Path,
@@ -453,40 +479,31 @@ def bundle_moe_experts(
         fmt = _detect_expert_format(model_dir, moe_layers[0], index)
         expert_prefix = fmt.expert_prefix
 
-        # Process first MoE layer to determine component manifest
+        # Process first MoE layer to get the expert prefix format and quant_mode.
         first_prefix = fmt.full_prefix(moe_layers[0])
-        _, manifest = _collect_all_projections(
+        _, first_manifest = _collect_all_projections(
             model_dir, first_prefix, index, fmt.projections
         )
-        expert_byte_size = sum(entry["nbytes"] for entry in manifest)
+        quant_mode = quant_config.get("mode", "affine") if quant_config else "affine"
 
-        bits = 0
-        group_size = 0
-        quant_mode = "affine"
-        is_quantized = any(
-            e["dtype"] == "uint32" for e in manifest if "weight" in e["name"]
-        )
-        if is_quantized and quant_config:
-            bits = quant_config.get("bits", 4)
-            group_size = quant_config.get("group_size", 32)
-            quant_mode = quant_config.get("mode", "affine")
         for layer_idx in moe_layers:
             prefix = fmt.full_prefix(layer_idx)
 
             all_components, layer_manifest = _collect_all_projections(
                 model_dir, prefix, index, fmt.projections
             )
-            if layer_manifest != manifest:
-                raise ValueError(
-                    f"MoE layer {layer_idx} has different component layout than "
-                    f"layer {moe_layers[0]}. Heterogeneous MoE layers are not supported."
-                )
+
+            # Compute per-layer layout params from actual tensor shapes/dtypes.
+            layer_expert_byte_size = sum(entry["nbytes"] for entry in layer_manifest)
+            layer_is_quantized, layer_bits, layer_group_size = (
+                _quant_params_from_manifest(layer_manifest, hidden_size)
+            )
 
             # Build offset table
             offset_table_size = num_experts * 8
             data_start = MOE_HEADER_SIZE + offset_table_size
             offsets = np.array(
-                [data_start + i * expert_byte_size for i in range(num_experts)],
+                [data_start + i * layer_expert_byte_size for i in range(num_experts)],
                 dtype=np.uint64,
             )
 
@@ -497,10 +514,10 @@ def bundle_moe_experts(
                         num_experts,
                         hidden_size,
                         intermediate_size,
-                        is_quantized,
-                        bits,
-                        group_size,
-                        expert_byte_size,
+                        layer_is_quantized,
+                        layer_bits,
+                        layer_group_size,
+                        layer_expert_byte_size,
                     )
                 )
                 f.write(offsets.tobytes())
@@ -519,12 +536,13 @@ def bundle_moe_experts(
                 num_experts=num_experts,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                expert_byte_size=expert_byte_size,
+                expert_byte_size=layer_expert_byte_size,
                 file_path=file_path,
                 offsets=offsets,
-                is_quantized=is_quantized,
-                bits=bits,
-                group_size=group_size,
+                is_quantized=layer_is_quantized,
+                bits=layer_bits,
+                group_size=layer_group_size,
+                manifest=layer_manifest,
             )
 
             logger.info("Bundled MoE layer %d: %d experts", layer_idx, num_experts)
@@ -535,16 +553,19 @@ def bundle_moe_experts(
     finally:
         _clear_shard_cache()
 
-    # Write layout JSON with component manifest
+    # Write layout JSON. Per-layer manifests are stored under each layer entry so
+    # the weight store can parse heterogeneous (mixed-precision) experts correctly.
+    # The top-level component_manifest is kept for backward compat with existing bundles.
+    first_layout = layouts[moe_layers[0]]
     layout_config = {
         "num_moe_layers": len(layouts),
         "num_experts": num_experts,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
-        "is_quantized": is_quantized,
+        "is_quantized": first_layout.is_quantized,
         "quant_mode": quant_mode,
         "expert_prefix": expert_prefix,
-        "component_manifest": manifest,
+        "component_manifest": first_manifest,
         "layers": {
             str(idx): {
                 "file": layout.file_path.name,
@@ -553,6 +574,7 @@ def bundle_moe_experts(
                 "is_quantized": layout.is_quantized,
                 "bits": layout.bits,
                 "group_size": layout.group_size,
+                "component_manifest": layout.manifest,
             }
             for idx, layout in layouts.items()
         },

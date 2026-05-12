@@ -127,6 +127,7 @@ class FlashMoeWeightStore:
                 bits=header["bits"],
                 group_size=header["group_size"],
                 quant_mode=self._quant_mode,
+                manifest=layer_info.get("component_manifest"),
             )
 
         return layouts
@@ -138,8 +139,9 @@ class FlashMoeWeightStore:
         offset = int(layout.offsets[expert_idx])
         raw = full_pread(fd, layout.expert_byte_size, offset)
 
-        if self._manifest:
-            return self._parse_expert_with_manifest(raw, self._manifest)
+        manifest = layout.manifest if layout.manifest is not None else self._manifest
+        if manifest:
+            return self._parse_expert_with_manifest(raw, manifest)
         elif layout.is_quantized:
             return self._parse_quantized_expert(raw, layout)
         else:
