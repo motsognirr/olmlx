@@ -40,17 +40,22 @@ def _logits(out: Any) -> mx.array:
 def _eval_cache(cache: list) -> None:
     """Materialise KV cache state without evaluating logits.
 
-    Handles KVCache (.keys/.values) and ArraysCache-style caches (.state
+    Handles KVCache (.keys/.values as mx.array), quantised caches that wrap
+    packed data in a list/tuple, and ArraysCache-style caches (.state
     returning a list of tensors).
     """
     arrs = []
     for c in cache:
         k = getattr(c, "keys", None)
+        v = getattr(c, "values", None)
         if isinstance(k, mx.array):
             arrs.append(k)
-        v = getattr(c, "values", None)
+        elif isinstance(k, (list, tuple)):
+            arrs.extend(a for a in k if isinstance(a, mx.array))
         if isinstance(v, mx.array):
             arrs.append(v)
+        elif isinstance(v, (list, tuple)):
+            arrs.extend(a for a in v if isinstance(a, mx.array))
         if k is None and v is None:
             # ArraysCache and similar: state is a list/tuple of arrays
             state = getattr(c, "state", None)

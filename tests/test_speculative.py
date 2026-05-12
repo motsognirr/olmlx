@@ -210,7 +210,13 @@ class TestPrefillLastLogit:
         assert mx.allclose(result, naive, atol=1e-5)
 
     def test_matches_naive_multi_token(self, model):
-        """Two-pass result for a multi-token prompt must match naive full-sequence forward."""
+        """Smoke test: two-pass result shape matches naive forward on MockModel.
+
+        Note: MockModel is cache-agnostic, so this does not verify numerical
+        correctness of the KV-cache split for real causal transformers. It
+        validates that ``_prefill_last_logit`` runs end-to-end and returns
+        the expected shape, not that pass 2 sees the correct cached state.
+        """
         from mlx_lm.models.cache import make_prompt_cache
 
         from olmlx.engine.speculative import _logits, _prefill_last_logit

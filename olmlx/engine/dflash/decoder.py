@@ -368,6 +368,10 @@ class DFlashDecoder:
             captured_prefix = list(self._hidden_capture)
             if any(h is None for h in captured_prefix):
                 raise RuntimeError(_err_msg)
+            # Force pass-1 hiddens before dropping slot references, so
+            # correctness does not depend on _eval_cache transitively
+            # materialising the same graph.
+            mx.eval(*captured_prefix)
             # Reset capture slots so the pass-2 None-check is independent.
             self._hidden_capture[:] = [None] * len(self._hidden_capture)
             _eval_cache(self._target_cache)

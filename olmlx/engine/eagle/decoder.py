@@ -328,6 +328,9 @@ class EagleDecoder:
             # produces a [1, 1, vocab] logit and refreshes the capture slot.
             if prompt.shape[1] > 1:
                 self._target(prompt[:, :-1], cache=self._target_cache)
+                # Discard pass-1 capture so the pass-2 None-check below is
+                # an active guard rather than dead code.
+                self._hidden_storage[0] = None
                 _eval_cache(self._target_cache)
                 target_out = self._target(prompt[:, -1:], cache=self._target_cache)
             else:
