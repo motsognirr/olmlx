@@ -72,16 +72,15 @@ def _eval_cache(cache: list) -> None:
     if arrs:
         mx.eval(*arrs)
     elif cache:
-        # Defensive: a non-empty cache produced no arrays to evaluate. The
-        # caller relies on pass 1's KV state being materialised before pass
-        # 2; a silent no-op here would let pass 2 see lazily-unevaluated
-        # state and produce wrong logits. Warn so unrecognised cache types
-        # surface instead of failing silently.
-        logger.warning(
-            "_eval_cache: no mx.array entries found in %d cache objects "
-            "(types: %s); pass-2 correctness may be compromised",
-            len(cache),
-            sorted({type(c).__name__ for c in cache}),
+        # A non-empty cache produced no arrays to evaluate. The caller's
+        # contract is that pass-2 logits are only meaningful if pass-1's
+        # KV state has been materialised. Continuing would produce silently
+        # wrong tokens for any unrecognised cache type, so fail loudly.
+        raise RuntimeError(
+            f"_eval_cache: no mx.array entries found in {len(cache)} cache "
+            f"objects (types: {sorted({type(c).__name__ for c in cache})}). "
+            "Pass-2 KV state cannot be guaranteed. Add explicit handling "
+            "for this cache type in _eval_cache."
         )
 
 

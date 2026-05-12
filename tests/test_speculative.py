@@ -165,6 +165,17 @@ class TestSpeculativeDecoder:
         assert shared_decoder._cache_seq_len == 20
         assert shared_decoder._target_cache is not None
 
+    def test_generate_step_long_prompt_two_pass(self, shared_decoder):
+        """generate_step() with a long prompt exercises the two-pass split
+        (temporary KV cache + _prefill_last_logit) added to avoid the
+        [batch, seq_len+lambda, vocab] materialisation OOM."""
+        prompt = mx.array([list(range(20))])
+        accepted, num_draft = shared_decoder.generate_step(prompt)
+
+        assert len(accepted) >= 1
+        assert num_draft == 3
+        assert all(0 <= t < 32 for t in accepted)
+
 
 class TestPrefillLastLogit:
     """Tests for _prefill_last_logit: two-pass prefill to avoid materialising
