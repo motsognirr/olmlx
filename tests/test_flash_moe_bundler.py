@@ -1321,6 +1321,111 @@ class TestBundleHeterogeneousMoeExperts:
         ][expert_idx]
         np.testing.assert_array_equal(gate_read, gate_orig)
 
+    def test_invalid_bits_raises(self, tmp_path):
+        """_quant_params_from_manifest should raise on an unsupported bit-width."""
+        from safetensors.numpy import save_file
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        # Craft a weight where packed_in doesn't correspond to any valid bit-width.
+        # hidden=64, packed_in=7 → bits = round(32*7/64) = round(3.5) = 4 — that's valid,
+        # so use hidden=64, packed_in=3 → bits = round(32*3/64) = round(1.5) = 2 — valid.
+        # Use packed_in=5 → bits = round(32*5/64) = round(2.5) = 2 — rounds to valid.
+        # Use hidden=60 (not divisible cleanly), packed_in=7 → round(32*7/60)=round(3.73)=4 valid.
+        # Actually craft hidden=64, packed_in=9 → round(32*9/64) = round(4.5) = 4 — valid.
+        # Use hidden=64, packed_in=11 → round(32*11/64) = round(5.5) = 6 — valid.
+        # Use hidden=100, packed_in=9 → round(32*9/100) = round(2.88) = 3 — valid.
+        # Safest: hidden=64, packed_in=13 → round(32*13/64) = round(6.5) = 6 — valid.
+        # We need something that rounds outside {2,3,4,5,6,8}.
+        # hidden=64, packed_in=20 → round(32*20/64) = round(10) = 10 — INVALID ✓
+        rng = np.random.RandomState(0)
+        hidden, inter, experts = 64, 32, 4
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        tensors = {
+            "language_model.model.layers.0.router.proj.weight": rng.randn(
+                experts, hidden
+            ).astype(np.float16),
+            # packed_in=20 → inferred bits = round(32*20/64) = 10, not in valid set
+            "language_model.model.layers.0.experts.switch_glu.gate_proj.weight": rng.randint(
+                0, 2**31, (experts, inter, 20)
+            ).astype(np.uint32),
+            "language_model.model.layers.0.experts.switch_glu.up_proj.weight": rng.randint(
+                0, 2**31, (experts, inter, 20)
+            ).astype(np.uint32),
+            "language_model.model.layers.0.experts.switch_glu.down_proj.weight": rng.randint(
+                0, 2**31, (experts, hidden, 10)
+            ).astype(np.uint32),
+            "language_model.model.embed_tokens.weight": rng.randn(100, hidden).astype(
+                np.float16
+            ),
+        }
+        save_file(tensors, str(model_dir / "model.safetensors"))
+        config = {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": hidden,
+                "intermediate_size": inter,
+                "moe_intermediate_size": inter,
+                "num_hidden_layers": 1,
+                "num_experts": experts,
+                "top_k_experts": 2,
+                "enable_moe_block": True,
+            },
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+
+        with pytest.raises(ValueError, match="not a supported MLX quantization"):
+            bundle_moe_experts(model_dir, tmp_path / "flash_moe")
+
+    def test_missing_scales_raises(self, tmp_path):
+        """_quant_params_from_manifest should raise when scales are absent for quantized weights."""
+        from safetensors.numpy import save_file
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        rng = np.random.RandomState(0)
+        hidden, inter, experts = 64, 32, 4
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        # 4-bit weights (packed_in=8) but NO scales tensors
+        tensors = {
+            "language_model.model.layers.0.router.proj.weight": rng.randn(
+                experts, hidden
+            ).astype(np.float16),
+            "language_model.model.layers.0.experts.switch_glu.gate_proj.weight": rng.randint(
+                0, 2**31, (experts, inter, 8)
+            ).astype(np.uint32),
+            "language_model.model.layers.0.experts.switch_glu.up_proj.weight": rng.randint(
+                0, 2**31, (experts, inter, 8)
+            ).astype(np.uint32),
+            "language_model.model.layers.0.experts.switch_glu.down_proj.weight": rng.randint(
+                0, 2**31, (experts, hidden, 4)
+            ).astype(np.uint32),
+            "language_model.model.embed_tokens.weight": rng.randn(100, hidden).astype(
+                np.float16
+            ),
+        }
+        save_file(tensors, str(model_dir / "model.safetensors"))
+        config = {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": hidden,
+                "intermediate_size": inter,
+                "moe_intermediate_size": inter,
+                "num_hidden_layers": 1,
+                "num_experts": experts,
+                "top_k_experts": 2,
+                "enable_moe_block": True,
+            },
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+
+        with pytest.raises(ValueError, match="no corresponding scales"):
+            bundle_moe_experts(model_dir, tmp_path / "flash_moe")
+
 
 class TestShardCacheCleanup:
     """Tests for _shard_cache lifecycle — issue #171."""

@@ -383,6 +383,10 @@ def _collect_all_projections(
     return all_components, manifest
 
 
+# MLX affine quantization supports these bit widths (see mx.quantize docs).
+_VALID_QUANT_BITS = {2, 3, 4, 5, 6, 8}
+
+
 def _quant_params_from_manifest(
     manifest: list[dict], hidden_size: int
 ) -> tuple[bool, int, int]:
@@ -400,11 +404,21 @@ def _quant_params_from_manifest(
         return False, 0, 0
     packed_in = weight_entry["shape"][1]
     bits = round(32 * packed_in / hidden_size)
+    if bits not in _VALID_QUANT_BITS:
+        raise ValueError(
+            f"Inferred bit-width {bits} is not a supported MLX quantization value "
+            f"{_VALID_QUANT_BITS}. packed_in={packed_in}, hidden_size={hidden_size}. "
+            "The checkpoint may be corrupt or use an unsupported quantization format."
+        )
     scales_key = weight_entry["name"].replace(".weight", ".scales")
     scales_entry = next((e for e in manifest if e["name"] == scales_key), None)
-    group_size = 64
-    if scales_entry is not None:
-        group_size = round(hidden_size / scales_entry["shape"][1])
+    if scales_entry is None:
+        raise ValueError(
+            f"Expert manifest has quantized weights (dtype=uint32) for "
+            f"'{weight_entry['name']}' but no corresponding scales entry "
+            f"'{scales_key}'. The checkpoint may be corrupt."
+        )
+    group_size = round(hidden_size / scales_entry["shape"][1])
     return True, bits, group_size
 
 
@@ -484,6 +498,9 @@ def bundle_moe_experts(
         _, first_manifest = _collect_all_projections(
             model_dir, first_prefix, index, fmt.projections
         )
+        # quant_mode is treated as layer-invariant: OptiQ varies bits per layer but
+        # always uses "affine" mode. A checkpoint mixing affine and non-affine modes
+        # per layer would need a per-layer quant_mode field added here.
         quant_mode = quant_config.get("mode", "affine") if quant_config else "affine"
 
         for layer_idx in moe_layers:
@@ -555,7 +572,11 @@ def bundle_moe_experts(
 
     # Write layout JSON. Per-layer manifests are stored under each layer entry so
     # the weight store can parse heterogeneous (mixed-precision) experts correctly.
-    # The top-level component_manifest is kept for backward compat with existing bundles.
+    # The top-level component_manifest is layer 0's manifest, kept so that an updated
+    # reader loading an old (homogeneous) bundle still finds the global manifest.
+    # NOTE: an old reader loading a new heterogeneous bundle will use layer 0's manifest
+    # for every layer and silently misparse layers with different bit-widths. There is
+    # no version gate — rolling back the reader on a heterogeneous bundle is unsupported.
     first_layout = layouts[moe_layers[0]]
     layout_config = {
         "num_moe_layers": len(layouts),
