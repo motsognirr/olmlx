@@ -537,15 +537,23 @@ class SpeculativeDecoder:
     # ------------------------------------------------------------------
 
     def _draft_generate(self, prompt: mx.array, n: int) -> list[int]:
-        """Generate n candidate tokens with fresh KV cache (stateless).
-
-        Only invoked from ``generate_step``, which guards on
-        ``make_prompt_cache is None`` before calling, so ``cache`` here is
-        always usable.
-        """
-        assert make_prompt_cache is not None
+        """Generate n candidate tokens with fresh KV cache (stateless)."""
+        if make_prompt_cache is None:
+            # Caller (generate_step) already raises with the same wording;
+            # this guard exists because asserts are stripped under -O.
+            raise RuntimeError(
+                "mlx_lm.models.cache.make_prompt_cache is not available; "
+                "upgrade mlx-lm to a version that exports it."
+            )
+        try:
+            cache = make_prompt_cache(self._draft)
+        except (TypeError, AttributeError) as exc:
+            raise RuntimeError(
+                f"make_prompt_cache failed for draft model "
+                f"{type(self._draft).__name__!r}: {exc}. The draft model may "
+                "not be compatible with mlx-lm's KV-cache API."
+            ) from exc
         tokens: list[int] = []
-        cache = make_prompt_cache(self._draft)
 
         logits = _logits(self._draft(prompt, cache=cache))
         next_logits = logits[:, -1, :]

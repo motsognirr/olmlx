@@ -374,6 +374,36 @@ class TestEvalCacheCacheTypes:
         assert mx.allclose(kd, mx.full((2, 4, 4), 0.5))
         assert mx.allclose(vd, mx.full((2, 4, 4), 0.25))
 
+    def test_real_turboquant_cache_does_not_log_error(self, caplog):
+        """Regression: a real ``TurboQuantKVCache`` must hit a known probe
+        branch in ``_eval_cache``. If anyone renames ``_key_dequant`` /
+        ``_value_dequant`` on the cache class, the helper would silently
+        fall through to the unrecognised-cache error path and the OOM
+        protection would degrade to a no-op without test failure. This
+        test pins the contract by instantiating the real cache."""
+        import logging
+
+        from olmlx.engine.speculative import _eval_cache
+        from olmlx.engine.turboquant import TurboQuantRotation
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        rk = TurboQuantRotation(head_dim=64, seed=0)
+        rv = TurboQuantRotation(head_dim=64, seed=1)
+        cache = TurboQuantKVCache(bits=4, rotation_key=rk, rotation_value=rv)
+        k = mx.random.normal((1, 8, 4, 64))
+        v = mx.random.normal((1, 8, 4, 64))
+        cache.update_and_fetch(k, v)
+
+        with caplog.at_level(logging.ERROR, logger="olmlx.engine.speculative"):
+            _eval_cache([cache])
+        assert not any(
+            "no mx.array entries found" in r.message for r in caplog.records
+        ), (
+            "_eval_cache hit the unrecognised-cache branch for a real "
+            "TurboQuantKVCache. Check that _key_dequant / _value_dequant "
+            "(or any replacement attributes) are probed in _eval_cache."
+        )
+
     def test_unrecognised_cache_logs_error(self, caplog):
         """A cache with no probed arrays must log at ERROR level so the
         OOM-avoidance no-op surfaces on first encounter."""
