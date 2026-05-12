@@ -37,6 +37,49 @@ def _logits(out: Any) -> mx.array:
     return cast(mx.array, getattr(out, "logits", out))
 
 
+def _eval_cache(cache: list) -> None:
+    """Materialise KV cache state without evaluating logits.
+
+    Handles KVCache (.keys/.values) and ArraysCache-style caches (.state
+    returning a list of tensors).
+    """
+    arrs = []
+    for c in cache:
+        k = getattr(c, "keys", None)
+        if isinstance(k, mx.array):
+            arrs.append(k)
+        v = getattr(c, "values", None)
+        if isinstance(v, mx.array):
+            arrs.append(v)
+        if k is None and v is None:
+            # ArraysCache and similar: state is a list/tuple of arrays
+            state = getattr(c, "state", None)
+            if isinstance(state, (list, tuple)):
+                arrs.extend(a for a in state if isinstance(a, mx.array))
+    if arrs:
+        mx.eval(*arrs)
+
+
+def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
+    """Return the logit for the last prompt position without materialising
+    the full [batch, seq_len, vocab] tensor.
+
+    For prompts longer than 1 token, runs two passes:
+    - Pass 1: prefix[:-1] fills the KV cache; the model output is discarded
+      so MLX's lazy evaluation never computes lm_head on seq_len-1 positions.
+    - Pass 2: last token produces a [1, 1, vocab] logit; safe to evaluate.
+
+    This avoids the Metal OOM that occurs when seq_len × vocab_size exceeds
+    the ~41 GB Metal buffer limit (e.g. Gemma 4 31B, vocab=262 144, long ctx).
+    """
+    if prompt.shape[1] <= 1:
+        return _logits(model(prompt, cache=cache))[0, -1, :]
+    prefix, last = prompt[:, :-1], prompt[:, -1:]
+    model(prefix, cache=cache)  # output discarded; lm_head never materialised
+    _eval_cache(cache)  # materialise KV state before the single-token pass
+    return _logits(model(last, cache=cache))[0, 0, :]
+
+
 def verify_draft_greedy(
     draft_tokens: list[int],
     target_logits: mx.array,
@@ -283,13 +326,14 @@ class SpeculativeDecoder:
         if self._gdn_capture is not None:
             self._gdn_capture.use_buffer(None)
 
-        target_out = _logits(self._target(prompt, cache=self._target_cache))
-        self._last_target_logit = target_out[0, -1, :]
+        self._last_target_logit = _prefill_last_logit(
+            self._target, prompt, self._target_cache
+        )
         mx.eval(self._last_target_logit)
 
-        # Populate draft cache (logits discarded — only cache state needed).
-        draft_logits = _logits(self._draft(prompt, cache=self._draft_cache))
-        mx.eval(draft_logits)
+        # Populate draft cache; logits not needed.
+        self._draft(prompt, cache=self._draft_cache)
+        _eval_cache(self._draft_cache)
 
         self._cache_seq_len = prompt.shape[1]
 

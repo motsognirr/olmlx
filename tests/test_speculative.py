@@ -155,3 +155,87 @@ class TestSpeculativeDecoder:
         prompt = mx.array([[1, 2, 3]])
         decoder.generate_step(prompt)
         assert 0 <= decoder._alpha <= 1.0
+
+    def test_prefill_long_prompt_gives_valid_token(self, shared_decoder):
+        """prefill() with a long prompt must return a valid token and populate caches."""
+        prompt = mx.array([list(range(20))])
+        first_token = shared_decoder.prefill(prompt)
+
+        assert 0 <= first_token < 32
+        assert shared_decoder._cache_seq_len == 20
+        assert shared_decoder._target_cache is not None
+
+
+class TestPrefillLastLogit:
+    """Tests for _prefill_last_logit: two-pass prefill to avoid materialising
+    the full [batch, seq_len, vocab] logit matrix."""
+
+    @pytest.fixture()
+    def model(self):
+        return MockModel(32, 16)
+
+    def test_single_token_returns_vocab_shaped_logit(self, model):
+        from mlx_lm.models.cache import make_prompt_cache
+
+        from olmlx.engine.speculative import _prefill_last_logit
+
+        cache = make_prompt_cache(model)
+        result = _prefill_last_logit(model, mx.array([[7]]), cache)
+        assert result.shape == (32,)
+
+    def test_multi_token_returns_vocab_shaped_logit(self, model):
+        from mlx_lm.models.cache import make_prompt_cache
+
+        from olmlx.engine.speculative import _prefill_last_logit
+
+        cache = make_prompt_cache(model)
+        result = _prefill_last_logit(model, mx.array([[1, 2, 3, 4, 5]]), cache)
+        assert result.shape == (32,)
+
+    def test_matches_naive_single_token(self, model):
+        """Single-token result must match naive forward."""
+        from mlx_lm.models.cache import make_prompt_cache
+
+        from olmlx.engine.speculative import _logits, _prefill_last_logit
+
+        prompt = mx.array([[7]])
+        cache_naive = make_prompt_cache(model)
+        naive = _logits(model(prompt, cache=cache_naive))[0, -1, :]
+        mx.eval(naive)
+
+        cache_2p = make_prompt_cache(model)
+        result = _prefill_last_logit(model, prompt, cache_2p)
+        mx.eval(result)
+
+        assert mx.allclose(result, naive, atol=1e-5)
+
+    def test_matches_naive_multi_token(self, model):
+        """Two-pass result for a multi-token prompt must match naive full-sequence forward."""
+        from mlx_lm.models.cache import make_prompt_cache
+
+        from olmlx.engine.speculative import _logits, _prefill_last_logit
+
+        prompt = mx.array([[1, 2, 3, 4, 5]])
+        cache_naive = make_prompt_cache(model)
+        naive = _logits(model(prompt, cache=cache_naive))[0, -1, :]
+        mx.eval(naive)
+
+        cache_2p = make_prompt_cache(model)
+        result = _prefill_last_logit(model, prompt, cache_2p)
+        mx.eval(result)
+
+        assert mx.allclose(result, naive, atol=1e-5)
+
+    def test_cache_offset_equals_prompt_length(self, model):
+        """After _prefill_last_logit, KV cache offset must equal prompt length."""
+        from mlx_lm.models.cache import make_prompt_cache
+
+        from olmlx.engine.speculative import _prefill_last_logit
+
+        prompt = mx.array([[1, 2, 3, 4, 5]])
+        cache = make_prompt_cache(model)
+        _prefill_last_logit(model, prompt, cache)
+        # Force evaluation so offset is committed.
+        mx.eval(cache[0].keys, cache[0].values)
+
+        assert cache[0].offset == prompt.shape[1]
