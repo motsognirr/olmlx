@@ -599,8 +599,12 @@ class SpeculativeDecoder:
         """
         if make_prompt_cache is None:
             raise RuntimeError(
-                "mlx_lm.models.cache not available; cannot use stateless "
-                "speculative decoding"
+                "mlx_lm.models.cache.make_prompt_cache is not available "
+                "(import failed at module load). Upgrade mlx-lm to a "
+                "version that exports it (or use the cached prefill+step "
+                "API instead, which has the same requirement). The "
+                "previous cache-less path was removed because it OOMed "
+                "on Metal for large-vocab models on long prompts."
             )
 
         draft_tokens = self._draft_generate(prompt, self._lambda)

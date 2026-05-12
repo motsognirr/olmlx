@@ -298,10 +298,13 @@ class _CausalMockModel:
     def __init__(self, vocab_size: int, hidden_size: int):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
-        rng = mx.random.key(1)
-        self.embed_w = mx.random.normal((vocab_size, hidden_size), key=rng) * 0.1
+        # Separate PRNG keys so embed_w and lm_head_w are independent.
+        # Reusing one key would tie them (MLX PRNGs are deterministic per key).
+        rng_embed = mx.random.key(1)
+        rng_head = mx.random.key(2)
+        self.embed_w = mx.random.normal((vocab_size, hidden_size), key=rng_embed) * 0.1
         self.attn = _CausalAttention(hidden_size)
-        self.lm_head_w = mx.random.normal((hidden_size, vocab_size), key=rng) * 0.1
+        self.lm_head_w = mx.random.normal((hidden_size, vocab_size), key=rng_head) * 0.1
         # KV cache protocol expects model.layers iterable for make_prompt_cache
         self.layers = [self.attn]
 
@@ -310,6 +313,54 @@ class _CausalMockModel:
         layer_cache = cache[0] if cache is not None else None
         h = self.attn(h, cache=layer_cache)
         return h @ self.lm_head_w
+
+
+class TestEvalCacheCacheTypes:
+    """Coverage for the cache-type dispatch in _eval_cache. The function must
+    surface arrays from each supported cache shape (KVCache via .keys/.values,
+    ArraysCache-style via .state, TurboQuantKVCache via _key_dequant /
+    _value_dequant) so pass-1 state is forced before pass-2 runs."""
+
+    def test_arrays_cache_state_branch(self):
+        """ArraysCache-style cache (no .keys/.values; .state returns a list of
+        arrays) must reach the .state branch and be eval'd."""
+
+        from olmlx.engine.speculative import _eval_cache
+
+        class _ArraysCacheStub:
+            """Minimal stand-in for mlx-lm's ArraysCache: no .keys/.values,
+            exposes .state as a list of mx.arrays. Mirrors what hybrid
+            linear-attention layers (e.g. Qwen3.5 GatedDeltaNet) use."""
+
+            def __init__(self, arrs):
+                self._arrs = arrs
+
+            @property
+            def state(self):
+                return self._arrs
+
+        a = mx.zeros((4, 4)) + 1.0
+        b = mx.zeros((4, 4)) + 2.0
+        cache = [_ArraysCacheStub([a, b])]
+        # Should not raise and should not log an error (arrays were found).
+        _eval_cache(cache)
+        # Sanity: arrays are still valid and have their expected values.
+        assert mx.allclose(a, mx.ones((4, 4)))
+        assert mx.allclose(b, mx.full((4, 4), 2.0))
+
+    def test_unrecognised_cache_logs_error(self, caplog):
+        """A cache with no probed arrays must log at ERROR level so the
+        OOM-avoidance no-op surfaces on first encounter."""
+        import logging
+
+        from olmlx.engine.speculative import _eval_cache
+
+        class _OpaqueCache:
+            pass
+
+        with caplog.at_level(logging.ERROR, logger="olmlx.engine.speculative"):
+            _eval_cache([_OpaqueCache()])
+        assert any("no mx.array entries found" in r.message for r in caplog.records)
 
 
 class TestPrefillLastLogitCausal:
