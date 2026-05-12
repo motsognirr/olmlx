@@ -379,13 +379,6 @@ class DFlashDecoder:
             captured_last = list(self._hidden_capture)
             if any(h is None for h in captured_last):
                 raise RuntimeError(_err_msg)
-            if len(captured_prefix) != len(captured_last):
-                raise RuntimeError(
-                    f"DFlash prefill: pass 1 captured {len(captured_prefix)} "
-                    f"hidden states but pass 2 captured {len(captured_last)} "
-                    f"(expected {len(target_layer_ids)} each). The two passes "
-                    "must hit the same set of target_layer_ids."
-                )
             captured = [
                 mx.concatenate([p, q], axis=1)
                 for p, q in zip(captured_prefix, captured_last)

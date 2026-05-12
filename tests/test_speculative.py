@@ -240,7 +240,12 @@ class TestPrefillLastLogit:
         assert result.shape == (32,)
 
     def test_cache_offset_equals_prompt_length(self, model):
-        """After _prefill_last_logit, KV cache offset must equal prompt length."""
+        """After _prefill_last_logit, KV cache offset must equal prompt length.
+
+        ``offset`` is a Python int incremented by ``update_and_fetch``
+        regardless of lazy evaluation, so reading it directly is enough —
+        no explicit ``mx.eval`` to mask whether the two passes ran.
+        """
         from mlx_lm.models.cache import make_prompt_cache
 
         from olmlx.engine.speculative import _prefill_last_logit
@@ -248,8 +253,6 @@ class TestPrefillLastLogit:
         prompt = mx.array([[1, 2, 3, 4, 5]])
         cache = make_prompt_cache(model)
         _prefill_last_logit(model, prompt, cache)
-        # Force evaluation so offset is committed.
-        mx.eval(cache[0].keys, cache[0].values)
 
         assert cache[0].offset == prompt.shape[1]
 
@@ -347,6 +350,29 @@ class TestEvalCacheCacheTypes:
         # Sanity: arrays are still valid and have their expected values.
         assert mx.allclose(a, mx.ones((4, 4)))
         assert mx.allclose(b, mx.full((4, 4), 2.0))
+
+    def test_turboquant_dequant_buffer_probe(self):
+        """TurboQuantKVCache exposes _key_dequant / _value_dequant rather
+        than .keys/.values. _eval_cache must probe those attributes so the
+        dequant chain is forced as a separate graph (otherwise pass-2 would
+        fuse pass-1's dequant into one Metal command buffer)."""
+
+        from olmlx.engine.speculative import _eval_cache
+
+        class _TurboQuantStub:
+            """No .keys/.values/.state, but exposes dequant side buffers."""
+
+            def __init__(self, kd, vd):
+                self._key_dequant = kd
+                self._value_dequant = vd
+
+        kd = mx.zeros((2, 4, 4)) + 0.5
+        vd = mx.zeros((2, 4, 4)) + 0.25
+        # Should reach the dequant-probe branch and NOT log an error.
+        _eval_cache([_TurboQuantStub(kd, vd)])
+        # Sanity: values are still those we set.
+        assert mx.allclose(kd, mx.full((2, 4, 4), 0.5))
+        assert mx.allclose(vd, mx.full((2, 4, 4), 0.25))
 
     def test_unrecognised_cache_logs_error(self, caplog):
         """A cache with no probed arrays must log at ERROR level so the

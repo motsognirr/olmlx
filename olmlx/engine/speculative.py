@@ -101,21 +101,17 @@ def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
 
     This avoids the Metal OOM that occurs when seq_len × vocab_size exceeds
     the ~41 GB Metal buffer limit (e.g. Gemma 4 31B, vocab=262 144, long ctx).
+
+    The returned logit is lazy. Cache state is materialised between passes
+    (graph-break for OOM avoidance) but the caller is expected to evaluate
+    the returned logit, which transitively forces pass-2's cache state.
     """
     if prompt.shape[1] <= 1:
-        result = _logits(model(prompt, cache=cache))[0, -1, :]
-        # Uniform postcondition with the two-pass branch: callers can rely
-        # on the cache being materialised on return regardless of prompt
-        # length. Cheap here because the prompt is a single token.
-        _eval_cache(cache)
-        return result
+        return _logits(model(prompt, cache=cache))[0, -1, :]
     prefix, last = prompt[:, :-1], prompt[:, -1:]
     model(prefix, cache=cache)  # output discarded; lm_head never materialised
     _eval_cache(cache)  # materialise KV state before the single-token pass
-    result = _logits(model(last, cache=cache))[0, 0, :]
-    # Uniform postcondition: cache materialised on return for either branch.
-    _eval_cache(cache)
-    return result
+    return _logits(model(last, cache=cache))[0, 0, :]
 
 
 def verify_draft_greedy(
@@ -541,41 +537,29 @@ class SpeculativeDecoder:
     # ------------------------------------------------------------------
 
     def _draft_generate(self, prompt: mx.array, n: int) -> list[int]:
-        """Generate n candidate tokens with fresh KV cache (stateless)."""
+        """Generate n candidate tokens with fresh KV cache (stateless).
+
+        Only invoked from ``generate_step``, which guards on
+        ``make_prompt_cache is None`` before calling, so ``cache`` here is
+        always usable.
+        """
+        assert make_prompt_cache is not None
         tokens: list[int] = []
+        cache = make_prompt_cache(self._draft)
 
-        cache = None
-        if make_prompt_cache is not None:
-            try:
-                cache = make_prompt_cache(self._draft)
-            except (TypeError, AttributeError):
-                pass
+        logits = _logits(self._draft(prompt, cache=cache))
+        next_logits = logits[:, -1, :]
+        mx.eval(next_logits)
+        next_token = int(mx.argmax(next_logits, axis=-1).item())
+        tokens.append(next_token)
 
-        if cache is not None:
-            logits = _logits(self._draft(prompt, cache=cache))
+        for _ in range(n - 1):
+            inp = mx.array([[next_token]])
+            logits = _logits(self._draft(inp, cache=cache))
             next_logits = logits[:, -1, :]
             mx.eval(next_logits)
             next_token = int(mx.argmax(next_logits, axis=-1).item())
             tokens.append(next_token)
-
-            for _ in range(n - 1):
-                inp = mx.array([[next_token]])
-                logits = _logits(self._draft(inp, cache=cache))
-                next_logits = logits[:, -1, :]
-                mx.eval(next_logits)
-                next_token = int(mx.argmax(next_logits, axis=-1).item())
-                tokens.append(next_token)
-        else:
-            for _ in range(n):
-                if tokens:
-                    current = mx.concatenate([prompt, mx.array([tokens])], axis=1)
-                else:
-                    current = prompt
-                logits = _logits(self._draft(current))
-                next_logits = logits[:, -1, :]
-                mx.eval(next_logits)
-                next_token = int(mx.argmax(next_logits, axis=-1).item())
-                tokens.append(next_token)
 
         return tokens
 
