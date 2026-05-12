@@ -328,6 +328,14 @@ class EagleDecoder:
             # produces a [1, 1, vocab] logit and refreshes the capture slot.
             if prompt.shape[1] > 1:
                 self._target(prompt[:, :-1], cache=self._target_cache)
+                # Force the pass-1 hidden (if captured) before dropping the
+                # slot reference, mirroring DFlash. Correctness does not
+                # require it today — _eval_cache transitively materialises
+                # the same graph — but the explicit eval makes the ordering
+                # robust to future narrowing of _eval_cache's scope.
+                _hidden_p1 = self._hidden_storage[0]
+                if _hidden_p1 is not None:
+                    mx.eval(_hidden_p1)
                 # Discard pass-1 capture so the pass-2 None-check below is
                 # an active guard rather than dead code.
                 self._hidden_storage[0] = None

@@ -61,6 +61,14 @@ def _eval_cache(cache: list) -> None:
             state = getattr(c, "state", None)
             if isinstance(state, (list, tuple)):
                 arrs.extend(a for a in state if isinstance(a, mx.array))
+        # TurboQuantKVCache / SpectralQuantKVCache return values from
+        # update_and_fetch are views over a separately maintained dequant
+        # side buffer that is not surfaced via .state. Probe explicitly so
+        # the dequant graph is forced here instead of fusing into pass 2.
+        for attr in ("_key_dequant", "_value_dequant"):
+            buf = getattr(c, attr, None)
+            if isinstance(buf, mx.array):
+                arrs.append(buf)
     if arrs:
         mx.eval(*arrs)
     elif cache:
@@ -570,20 +578,35 @@ class SpeculativeDecoder:
         self,
         prompt: mx.array,
     ) -> tuple[list[int], int]:
-        """One speculative decoding step (stateless, no cross-step caching)."""
+        """One speculative decoding step (stateless, no cross-step caching).
+
+        Uses a temporary KV cache internally so the target forward over the
+        long prompt does not materialise the full [batch, seq_len, vocab]
+        logit matrix (same Metal OOM that ``_prefill_last_logit`` avoids).
+        """
+        if make_prompt_cache is None:
+            raise RuntimeError(
+                "mlx_lm.models.cache not available; cannot use stateless "
+                "speculative decoding"
+            )
+
         draft_tokens = self._draft_generate(prompt, self._lambda)
 
-        draft_ids = mx.array([draft_tokens])
-        combined = mx.concatenate([prompt, draft_ids], axis=1)
         # See prefill() for why this reset is needed (mlx-vlm 0.4.4 VLMs).
         for attr in ("_position_ids", "_rope_deltas"):
             if hasattr(self._target, attr):
                 setattr(self._target, attr, None)
-        target_out = _logits(self._target(combined))
-        mx.eval(target_out)
 
-        seq_len = prompt.shape[1]
-        target_logits = target_out[0, seq_len - 1 : seq_len + self._lambda, :]
+        # Two-pass split: prefill the prompt into a temporary cache (yields
+        # the first verification logit), then feed [pending, D1..D_lambda]
+        # for the remaining lambda logits. Total materialised logit shape is
+        # [1, lambda+1, vocab] instead of [1, seq_len+lambda, vocab].
+        target_cache = make_prompt_cache(self._target)
+        first_logit = _prefill_last_logit(self._target, prompt, target_cache)
+        draft_ids = mx.array([draft_tokens])
+        draft_out = _logits(self._target(draft_ids, cache=target_cache))
+        target_logits = mx.concatenate([first_logit[None, :], draft_out[0]], axis=0)
+        mx.eval(target_logits)
 
         accepted = self._verify(draft_tokens, target_logits)
 
