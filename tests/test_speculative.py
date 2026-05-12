@@ -176,6 +176,11 @@ class TestSpeculativeDecoder:
         assert num_draft == 3
         assert all(0 <= t < 32 for t in accepted)
 
+    def test_draft_generate_n_zero_returns_empty(self, decoder):
+        """_draft_generate(prompt, n=0) must return [] (no tokens)."""
+        prompt = mx.array([[1, 2, 3]])
+        assert decoder._draft_generate(prompt, n=0) == []
+
 
 class TestPrefillLastLogit:
     """Tests for _prefill_last_logit: two-pass prefill to avoid materialising
@@ -373,6 +378,62 @@ class TestEvalCacheCacheTypes:
         # Sanity: values are still those we set.
         assert mx.allclose(kd, mx.full((2, 4, 4), 0.5))
         assert mx.allclose(vd, mx.full((2, 4, 4), 0.25))
+
+    def test_real_spectralquant_cache_does_not_log_error(self, caplog):
+        """Regression: a real ``SpectralQuantKVCache`` must hit the ``.state``
+        probe branch. If ``.state`` is removed or restructured on the cache
+        class, the helper would silently fall through to the unrecognised
+        cache error path and the OOM protection would degrade to a no-op."""
+        import logging
+
+        import numpy as np
+
+        from olmlx.engine.spectralquant import (
+            SpectralRotation,
+            fit_codebook,
+        )
+        from olmlx.engine.spectralquant_cache import SpectralQuantKVCache
+        from olmlx.engine.speculative import _eval_cache
+
+        head_dim = 8
+        d_eff = 4
+        bits_high = 4
+        bits_low = 2
+        rng = np.random.RandomState(42)
+        q, _ = np.linalg.qr(rng.randn(head_dim, head_dim).astype(np.float32))
+        rot_k = SpectralRotation(mx.array(q))
+        q2, _ = np.linalg.qr(rng.randn(head_dim, head_dim).astype(np.float32))
+        rot_v = SpectralRotation(mx.array(q2))
+        data = mx.random.normal((500, head_dim))
+        norms = mx.linalg.norm(data, axis=-1, keepdims=True)
+        data_n = data / mx.maximum(norms, mx.array(1e-8))
+        rotated = rot_k.rotate(data_n)
+        cb_sem = fit_codebook(rotated[..., :d_eff].reshape(-1), bits=bits_high)
+        cb_tail = fit_codebook(rotated[..., d_eff:].reshape(-1), bits=bits_low)
+        cache = SpectralQuantKVCache(
+            rotation_key=rot_k,
+            rotation_value=rot_v,
+            codebook_sem_key=cb_sem,
+            codebook_tail_key=cb_tail,
+            codebook_sem_value=cb_sem,
+            codebook_tail_value=cb_tail,
+            d_eff=d_eff,
+            bits_high=bits_high,
+            bits_low=bits_low,
+        )
+        k = mx.random.normal((1, 2, 4, head_dim))
+        v = mx.random.normal((1, 2, 4, head_dim))
+        cache.update_and_fetch(k, v)
+
+        with caplog.at_level(logging.ERROR, logger="olmlx.engine.speculative"):
+            _eval_cache([cache])
+        assert not any(
+            "no mx.array entries found" in r.message for r in caplog.records
+        ), (
+            "_eval_cache hit the unrecognised-cache branch for a real "
+            "SpectralQuantKVCache. Check that .state still returns the "
+            "packed-storage arrays."
+        )
 
     def test_real_turboquant_cache_does_not_log_error(self, caplog):
         """Regression: a real ``TurboQuantKVCache`` must hit a known probe

@@ -61,10 +61,12 @@ def _eval_cache(cache: list) -> None:
             state = getattr(c, "state", None)
             if isinstance(state, (list, tuple)):
                 arrs.extend(a for a in state if isinstance(a, mx.array))
-        # TurboQuantKVCache / SpectralQuantKVCache return values from
-        # update_and_fetch are views over a separately maintained dequant
-        # side buffer that is not surfaced via .state. Probe explicitly so
-        # the dequant graph is forced here instead of fusing into pass 2.
+        # TurboQuantKVCache maintains a dequantized side buffer in
+        # _key_dequant / _value_dequant that update_and_fetch returns
+        # views over. The buffer is not part of .state, so probe it
+        # explicitly to force the dequant graph here instead of letting
+        # it fuse into pass 2. (SpectralQuantKVCache dequantizes fresh on
+        # each call and is already covered by the .state branch above.)
         for attr in ("_key_dequant", "_value_dequant"):
             buf = getattr(c, attr, None)
             if isinstance(buf, mx.array):
@@ -545,6 +547,8 @@ class SpeculativeDecoder:
                 "mlx_lm.models.cache.make_prompt_cache is not available; "
                 "upgrade mlx-lm to a version that exports it."
             )
+        if n <= 0:
+            return []
         try:
             cache = make_prompt_cache(self._draft)
         except (TypeError, AttributeError) as exc:
@@ -555,10 +559,14 @@ class SpeculativeDecoder:
             ) from exc
         tokens: list[int] = []
 
-        logits = _logits(self._draft(prompt, cache=cache))
-        next_logits = logits[:, -1, :]
-        mx.eval(next_logits)
-        next_token = int(mx.argmax(next_logits, axis=-1).item())
+        # Same OOM path as the target: a large-vocab draft (e.g. same model
+        # family as target, 262k vocab) on a long prompt would materialise
+        # [1, seq_len, vocab] inside lm_head before the [:, -1, :] slice.
+        # Route through _prefill_last_logit to keep the prefix lm_head out
+        # of the eval graph.
+        first_logit = _prefill_last_logit(self._draft, prompt, cache)
+        mx.eval(first_logit)
+        next_token = int(mx.argmax(first_logit).item())
         tokens.append(next_token)
 
         for _ in range(n - 1):
