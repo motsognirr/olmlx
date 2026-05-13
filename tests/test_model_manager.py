@@ -1934,6 +1934,91 @@ class TestExpiryChecker:
         assert "busy:latest" in manager._loaded
 
     @pytest.mark.asyncio
+    async def test_expire_stale_isolates_per_model_failures(
+        self, registry, mock_store, caplog
+    ):
+        """A failing close() on model A must not skip models B and C.
+
+        Without per-model isolation, a single broken prefetcher would block
+        every other expired model in the same cycle from being cleaned up.
+        """
+        manager = ModelManager(registry, mock_store)
+
+        def _flash_lm(name: str, *, raises: bool = False):
+            prefetcher = MagicMock()
+            if raises:
+                prefetcher.close.side_effect = RuntimeError(f"{name} boom")
+            weight_store = MagicMock()
+            model = MagicMock()
+            model.prefetcher = prefetcher
+            lm = LoadedModel(
+                name=name,
+                hf_path=f"x/{name}",
+                model=model,
+                tokenizer=MagicMock(),
+                weight_store=weight_store,
+                is_flash=True,
+                expires_at=time.time() - 10,
+            )
+            return lm, prefetcher, weight_store
+
+        a, _, ws_a = _flash_lm("a", raises=True)
+        b, _, ws_b = _flash_lm("b")
+        c, _, ws_c = _flash_lm("c")
+        manager._loaded["a"] = a
+        manager._loaded["b"] = b
+        manager._loaded["c"] = c
+
+        with caplog.at_level(logging.ERROR, logger="olmlx.engine.model_manager"):
+            await manager._expire_stale()  # must not raise
+
+        assert "a" not in manager._loaded
+        assert "b" not in manager._loaded
+        assert "c" not in manager._loaded
+        # Sibling weight stores must have been closed despite A's failure.
+        ws_a.close.assert_called_once()
+        ws_b.close.assert_called_once()
+        ws_c.close.assert_called_once()
+        assert any(
+            "Error closing resources for model a" in r.message for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_check_expiry_loop_survives_unhandled_error(
+        self, registry, mock_store, caplog, monkeypatch
+    ):
+        """The background expiry task must survive a raising _expire_stale.
+
+        If _expire_stale ever propagates, the unguarded `while True` in
+        _check_expiry_loop exits permanently — no log, no restart, models
+        accumulate forever. Defense in depth on top of per-model isolation.
+        """
+        manager = ModelManager(registry, mock_store)
+        sleep_calls = {"n": 0}
+
+        async def _fake_sleep(_seconds):
+            sleep_calls["n"] += 1
+            if sleep_calls["n"] >= 2:
+                raise asyncio.CancelledError()
+
+        monkeypatch.setattr("olmlx.engine.model_manager.asyncio.sleep", _fake_sleep)
+        call_count = {"n": 0}
+
+        async def _raising_expire():
+            call_count["n"] += 1
+            raise RuntimeError("simulated failure")
+
+        manager._expire_stale = _raising_expire  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.ERROR, logger="olmlx.engine.model_manager"):
+            with pytest.raises(asyncio.CancelledError):
+                await manager._check_expiry_loop()
+
+        # First iteration raised → loop continued → second iteration cancelled.
+        assert call_count["n"] == 1
+        assert any("Expiry check failed" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
     async def test_expire_stale_closes_flash_resources(self, registry, mock_store):
         """_expire_stale must close prefetcher + weight_store on a Flash model.
 

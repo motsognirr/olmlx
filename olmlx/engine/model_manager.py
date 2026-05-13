@@ -2765,12 +2765,38 @@ class ModelManager:
                 and lm.expires_at <= now
                 and lm.active_refs == 0
             ]
+            had_expired = False
             for name in expired:
                 logger.info("Unloading expired model %s", name)
                 lm = self._loaded.pop(name)
-                self._close_loaded_model(lm)
+                # Per-model isolation: one failing close() must not skip the
+                # remaining expired models. ``_close_loaded_model`` already
+                # try/finally-chains its own three resources; this guard
+                # protects sibling models in the same expiry cycle.
+                try:
+                    self._close_loaded_model(lm)
+                except Exception:
+                    logger.exception("Error closing resources for model %s", name)
+                had_expired = True
+            # Flush Metal allocator cache so freed buffers don't inflate the
+            # next ensure_loaded() memory check. Mirrors _evict_lru_if_needed.
+            # Skip when any deferred cleanup is pending — a background thread
+            # for a different model may still be allocating Metal memory.
+            if had_expired and not self._pending_cleanups:
+                gc.collect()
+                mx.clear_cache()
 
     async def _check_expiry_loop(self):
         while True:
             await asyncio.sleep(30)
-            await self._expire_stale()
+            # Guard the while True: any unhandled exception here would
+            # permanently kill the background expiry task and leak models
+            # indefinitely. Per-model errors are already absorbed inside
+            # ``_expire_stale``; this catch is a belt-and-braces for the
+            # surrounding async machinery (CancelledError still propagates).
+            try:
+                await self._expire_stale()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Expiry check failed")
