@@ -1328,6 +1328,48 @@ class TestPingBeforeCacheInfo:
         else:
             pytest.fail("message_start event not found in SSE output")
 
+    @pytest.mark.asyncio
+    async def test_cache_info_with_none_token_counts(self, app_client):
+        """If a cache_info event arrives with explicit None values, the
+        streaming path must coerce them to 0 — emitting JSON null would
+        violate the Anthropic SSE protocol."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {
+                    "cache_info": True,
+                    "cache_read_tokens": None,
+                    "cache_creation_tokens": None,
+                }
+                yield {"text": "Hello", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats(eval_count=1)}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        text = resp.text
+
+        for line in text.split("\n"):
+            if line.startswith("data:") and "message_start" in line:
+                data = json.loads(line[5:])
+                usage = data["message"]["usage"]
+                assert usage["cache_read_input_tokens"] == 0
+                assert usage["cache_creation_input_tokens"] == 0
+                break
+        else:
+            pytest.fail("message_start event not found in SSE output")
+
 
 class TestResolveAnthropicModel:
     def test_no_mapping_returns_unchanged(self):

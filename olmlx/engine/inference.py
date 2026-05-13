@@ -2999,15 +2999,15 @@ async def generate_chat(
     # Disabled in distributed mode because rank 0 processes only suffix tokens
     # on cache hits while workers process the full prompt, causing all_sum
     # call count mismatch and deadlock.
-    # When enabling for non-streaming, also surface cache_creation_tokens /
-    # cache_read_tokens in _full_completion's result dict so routers can
-    # forward them (Anthropic /v1/messages already reads these keys).
     use_prompt_cache = (
         settings.prompt_cache
         and stream
         and make_prompt_cache is not None
         and not lm.is_distributed
     )
+    # TODO: when enabling prompt cache for non-streaming, also surface
+    # cache_creation_tokens / cache_read_tokens in _full_completion's result
+    # dict — the Anthropic router already reads these keys.
     prompt_tokens = None
     if use_prompt_cache:
         prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
