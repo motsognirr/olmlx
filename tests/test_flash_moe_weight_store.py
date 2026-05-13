@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from tests.test_flash_moe_bundler import (
+    _make_synthetic_heterogeneous_moe_weights,
     _make_synthetic_moe_weights,
     _make_synthetic_nemotron_moe_weights,
 )
@@ -306,3 +307,78 @@ class TestFlashMoeWeightStoreNemotron:
 
         np.testing.assert_array_equal(np.array(loaded.up_weight[0]), fc1_w[3])
         np.testing.assert_array_equal(np.array(loaded.down_weight[0]), fc2_w[3])
+
+
+class TestFlashMoeWeightStoreHeterogeneous:
+    """Weight store with heterogeneous per-layer quantization (OptiQ-style)."""
+
+    @pytest.fixture()
+    def hetero_store(self, tmp_path):
+        hidden, inter, experts = 64, 32, 4
+        model_dir = _make_synthetic_heterogeneous_moe_weights(
+            hidden, inter, experts, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        bundle_moe_experts(model_dir, output_dir)
+
+        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+        store = FlashMoeWeightStore(
+            output_dir, num_io_threads=2, cache_budget_experts=8
+        )
+        return store, model_dir, hidden, inter, experts
+
+    def test_load_quantized_layer(self, hetero_store):
+        """4-bit layer: metadata correct and packed weights match original."""
+        from safetensors.numpy import load_file
+
+        store, model_dir, hidden, inter, experts = hetero_store
+        original = load_file(str(model_dir / "model.safetensors"))
+
+        loaded = store.load_experts(0, [2])
+        assert loaded.is_quantized is True
+        assert loaded.bits == 4
+
+        gate_orig = original[
+            "language_model.model.layers.0.experts.switch_glu.gate_proj.weight"
+        ][2]
+        np.testing.assert_array_equal(np.array(loaded.gate_weight[0]), gate_orig)
+
+    def test_load_higher_bit_layer(self, hetero_store):
+        """8-bit layer: metadata correct and packed weights match original."""
+        from safetensors.numpy import load_file
+
+        store, model_dir, hidden, inter, experts = hetero_store
+        original = load_file(str(model_dir / "model.safetensors"))
+
+        loaded = store.load_experts(1, [3])
+        assert loaded.is_quantized is True
+        assert loaded.bits == 8
+
+        gate_orig = original[
+            "language_model.model.layers.1.experts.switch_glu.gate_proj.weight"
+        ][3]
+        np.testing.assert_array_equal(np.array(loaded.gate_weight[0]), gate_orig)
+
+    def test_load_unquantized_layer(self, hetero_store):
+        """bf16 layer should load with is_quantized=False."""
+        store, _, hidden, inter, experts = hetero_store
+        loaded = store.load_experts(2, [0])
+        assert loaded.is_quantized is False
+
+    def test_bf16_data_matches_original(self, hetero_store):
+        """bf16 layer (layer 2) expert data must match original safetensors."""
+        from safetensors.numpy import load_file
+
+        store, model_dir, hidden, inter, experts = hetero_store
+        original = load_file(str(model_dir / "model.safetensors"))
+
+        loaded = store.load_experts(2, [1])
+
+        gate_orig = original[
+            "language_model.model.layers.2.experts.switch_glu.gate_proj.weight"
+        ][1]
+        np.testing.assert_array_equal(np.array(loaded.gate_weight[0]), gate_orig)
