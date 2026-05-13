@@ -2807,17 +2807,25 @@ class ModelManager:
         # Close outside the lock. Per-model isolation: one failing close()
         # must not skip the remaining expired models. _close_loaded_model
         # already logs per-resource on failure, so callers absorb silently.
-        for lm in expired_lms:
+        # Pop from the list so no live reference (including the loop
+        # variable) survives into the gc.collect() below — otherwise the
+        # Metal buffers attached to the LoadedModel can't be reclaimed
+        # and mx.clear_cache() runs against nothing. Same reason
+        # _evict_lru_if_needed calls ``del evicted``.
+        flush = bool(expired_lms) and not self._pending_cleanups
+        while expired_lms:
+            lm = expired_lms.pop()
             try:
                 self._close_loaded_model(lm)
             except Exception:
                 pass  # already logged inside _close_loaded_model
+            del lm
 
         # Flush Metal allocator cache so freed buffers don't inflate the
         # next ensure_loaded() memory check. Mirrors _evict_lru_if_needed.
         # Skip when any deferred cleanup is pending — a background thread
         # for a different model may still be allocating Metal memory.
-        if expired_lms and not self._pending_cleanups:
+        if flush:
             gc.collect()
             mx.clear_cache()
 

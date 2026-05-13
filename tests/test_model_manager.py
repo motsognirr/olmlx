@@ -1986,6 +1986,50 @@ class TestExpiryChecker:
         )
 
     @pytest.mark.asyncio
+    async def test_expire_stale_drops_refs_before_gc(
+        self, registry, mock_store, monkeypatch
+    ):
+        """The expired-models list must be dropped before gc.collect().
+
+        Otherwise gc.collect() can't reclaim the Metal buffers referenced
+        by the LoadedModel objects, and the mx.clear_cache() that was
+        specifically added to flush expired-model memory is effectively
+        a no-op. Mirrors the ``del evicted`` pattern in
+        _evict_lru_if_needed.
+
+        Uses a weakref to assert the LoadedModel is unreachable at the
+        moment gc.collect() runs — proving expired_lms was dropped.
+        """
+        import weakref
+
+        manager = ModelManager(registry, mock_store)
+        weakref_alive_at_gc: list[bool] = []
+        ref_holder: dict[str, Any] = {}
+
+        def _fake_gc():
+            weakref_alive_at_gc.append(ref_holder["wr"]() is not None)
+
+        monkeypatch.setattr("olmlx.engine.model_manager.gc.collect", _fake_gc)
+        monkeypatch.setattr("olmlx.engine.model_manager.mx.clear_cache", lambda: None)
+
+        lm = LoadedModel(
+            name="expired:latest",
+            hf_path="test/model",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            expires_at=time.time() - 10,
+        )
+        manager._loaded["expired:latest"] = lm
+        ref_holder["wr"] = weakref.ref(lm)
+        del lm  # only manager._loaded holds it now
+
+        await manager._expire_stale()
+
+        # If expired_lms was still alive at gc time, the weakref would
+        # resolve to a live object. The fix asserts it's dead.
+        assert weakref_alive_at_gc == [False]
+
+    @pytest.mark.asyncio
     async def test_expire_stale_releases_lock_before_closing(
         self, registry, mock_store
     ):
