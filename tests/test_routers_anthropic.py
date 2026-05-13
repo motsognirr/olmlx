@@ -512,6 +512,97 @@ class TestAnthropicEndpoint:
         assert data["content"][0]["type"] == "text"
 
     @pytest.mark.asyncio
+    async def test_non_streaming_forwards_cache_stats(self, app_client):
+        """Issue #244: non-streaming response must forward cache_creation_tokens
+        / cache_read_tokens from the engine result dict into AnthropicUsage,
+        symmetric with the streaming path's cache_info events."""
+        stats = TimingStats(prompt_eval_count=10, eval_count=20)
+        mock_result = {
+            "text": "Hello",
+            "done": True,
+            "stats": stats,
+            "cache_read_tokens": 42,
+            "cache_creation_tokens": 8,
+        }
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+            )
+
+        assert resp.status_code == 200
+        usage = resp.json()["usage"]
+        assert usage["input_tokens"] == 10
+        assert usage["output_tokens"] == 20
+        assert usage["cache_read_input_tokens"] == 42
+        assert usage["cache_creation_input_tokens"] == 8
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_cache_stats_default_zero(self, app_client):
+        """When the engine omits cache stats (no prompt cache for this path),
+        the response still reports them as 0 rather than raising."""
+        stats = TimingStats(prompt_eval_count=5, eval_count=3)
+        mock_result = {"text": "ok", "done": True, "stats": stats}
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+            )
+
+        assert resp.status_code == 200
+        usage = resp.json()["usage"]
+        assert usage["cache_read_input_tokens"] == 0
+        assert usage["cache_creation_input_tokens"] == 0
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_cache_stats_none_coerced_to_zero(self, app_client):
+        """If the engine sets cache keys to None, the router must coerce to 0
+        rather than letting None reach AnthropicUsage's int field (Pydantic
+        would raise ValidationError)."""
+        stats = TimingStats(prompt_eval_count=5, eval_count=3)
+        mock_result = {
+            "text": "ok",
+            "done": True,
+            "stats": stats,
+            "cache_read_tokens": None,
+            "cache_creation_tokens": None,
+        }
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+            )
+
+        assert resp.status_code == 200
+        usage = resp.json()["usage"]
+        assert usage["cache_read_input_tokens"] == 0
+        assert usage["cache_creation_input_tokens"] == 0
+
+    @pytest.mark.asyncio
     async def test_streaming(self, app_client):
         async def mock_stream(*args, **kwargs):
             async def gen():
@@ -1233,6 +1324,48 @@ class TestPingBeforeCacheInfo:
                 assert usage["cache_creation_input_tokens"] == 8, (
                     f"Expected cache_creation=8, got {usage}"
                 )
+                break
+        else:
+            pytest.fail("message_start event not found in SSE output")
+
+    @pytest.mark.asyncio
+    async def test_cache_info_with_none_token_counts(self, app_client):
+        """If a cache_info event arrives with explicit None values, the
+        streaming path must coerce them to 0 — emitting JSON null would
+        violate the Anthropic SSE protocol."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {
+                    "cache_info": True,
+                    "cache_read_tokens": None,
+                    "cache_creation_tokens": None,
+                }
+                yield {"text": "Hello", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats(eval_count=1)}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        text = resp.text
+
+        for line in text.split("\n"):
+            if line.startswith("data:") and "message_start" in line:
+                data = json.loads(line[5:])
+                usage = data["message"]["usage"]
+                assert usage["cache_read_input_tokens"] == 0
+                assert usage["cache_creation_input_tokens"] == 0
                 break
         else:
             pytest.fail("message_start event not found in SSE output")

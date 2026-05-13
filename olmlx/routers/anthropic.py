@@ -796,8 +796,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                 meta = {}
                 async for event in path:
                     if isinstance(event, dict) and event.get("cache_info"):
-                        cache_read = event.get("cache_read_tokens", 0)
-                        cache_creation = event.get("cache_creation_tokens", 0)
+                        cache_read = event.get("cache_read_tokens") or 0
+                        cache_creation = event.get("cache_creation_tokens") or 0
                         logger.debug(
                             "Cache stats for message_start: read=%d creation=%d",
                             cache_read,
@@ -942,6 +942,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         usage = AnthropicUsage(
             input_tokens=stats.prompt_eval_count if stats else 0,
             output_tokens=stats.eval_count if stats else 0,
+            cache_creation_input_tokens=result.get("cache_creation_tokens") or 0,
+            cache_read_input_tokens=result.get("cache_read_tokens") or 0,
         )
         return AnthropicMessagesResponse(
             id=msg_id,
