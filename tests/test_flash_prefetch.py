@@ -480,6 +480,32 @@ class TestAsyncPrediction:
             prefetcher.wait(i)
         prefetcher.close()
 
+    def test_submit_bulk_no_false_positive_after_failed_predict(self, prefetch_setup):
+        """submit_bulk() must not raise after a failed prediction drains.
+
+        Regression: on the prediction-failure path, ``state.done.set()`` and
+        the ``_predict_in_flight`` decrement must run in an order such that a
+        thread that wakes on ``wait()`` cannot then observe a stale counter
+        and trip the guard.
+        """
+        from unittest.mock import patch
+
+        prefetcher, _, _, hidden, _, num_layers = prefetch_setup
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+
+        def failing_predict(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        with patch.object(prefetcher, "_predict", side_effect=failing_predict):
+            prefetcher.submit(0, x)
+            prefetcher.wait(1)
+
+        # Counter must be back to 0 — submit_bulk must NOT raise here.
+        prefetcher.submit_bulk({i: x for i in range(num_layers)})
+        for i in range(num_layers):
+            prefetcher.wait(i)
+        prefetcher.close()
+
     def test_cancel_then_submit_bulk_does_not_falsely_trigger_guard(
         self, prefetch_setup
     ):

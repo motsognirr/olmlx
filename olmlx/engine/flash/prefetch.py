@@ -220,10 +220,10 @@ class Prefetcher:
         indices: list[int] | None = None
         # _predict() is the only mx.eval-bearing region; the counter tracks
         # mx.eval residency so submit_bulk()'s guard can decide whether a
-        # concurrent mx.eval is possible.  Decrement before _enqueue_io so
-        # that the I/O thread's state.done.set() (which can fire synchronously
-        # for empty indices, or on a fast cache hit) cannot unblock wait()
-        # before the counter drops back to 0.
+        # concurrent mx.eval is possible.  Decrement before *any*
+        # state.done.set() — both the _enqueue_io path and the failed-predict
+        # path — so a wait() that wakes on state.done.set() never observes a
+        # stale _predict_in_flight > 0.
         try:
             if self._lookahead_bank is not None:
                 indices = self._predict_lookahead(layer_idx, hidden_state)
@@ -233,12 +233,13 @@ class Prefetcher:
             logger.warning("Prediction failed for layer %d", next_layer, exc_info=True)
             with self._lock:
                 self.stats.failures += 1
-            state.done.set()
         finally:
             with self._lock:
                 self._predict_in_flight -= 1
 
-        if indices is not None:
+        if indices is None:
+            state.done.set()
+        else:
             self._enqueue_io(next_layer, indices, state)
 
     def _predict(self, layer_idx: int, hidden_state: mx.array) -> list[int]:
