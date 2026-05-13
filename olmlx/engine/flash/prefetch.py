@@ -177,6 +177,12 @@ class Prefetcher:
            between forward-pass steps when no prediction is in-flight.
            Enforced at runtime: raises :class:`RuntimeError` if violated.
         """
+        # The check + per-layer _predict() loop is not mutually exclusive with
+        # submit(): a submit() call landing between the check and the first
+        # _predict() would bypass this guard.  Sound today because both paths
+        # are driven by the single forward-pass thread; the runtime check just
+        # turns the documented invariant into a fail-fast error rather than a
+        # full mutex.
         with self._lock:
             if self._predict_in_flight > 0:
                 raise RuntimeError(

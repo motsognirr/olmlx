@@ -468,9 +468,38 @@ class TestAsyncPrediction:
                 prefetcher.submit_bulk(layer_states)
 
             release.set()
-            prefetcher.wait(1)  # drain the in-flight predict
+            # wait(1) unblocks on state.done.set() inside _enqueue_io's I/O
+            # task.  _do_predict_and_io's finally decrements _predict_in_flight
+            # *before* invoking _enqueue_io, so by the time wait() returns the
+            # counter is guaranteed to be back at 0.
+            prefetcher.wait(1)
 
         # After the in-flight predict drains, submit_bulk works again.
+        prefetcher.submit_bulk({i: x for i in range(num_layers)})
+        for i in range(num_layers):
+            prefetcher.wait(i)
+        prefetcher.close()
+
+    def test_cancel_then_submit_bulk_does_not_falsely_trigger_guard(
+        self, prefetch_setup
+    ):
+        """cancel() followed by submit_bulk() must not raise.
+
+        This is the SpeculativeFlashDecoder steady-state pattern:
+        ``_after_verify`` calls ``cancel()`` after the target forward pass has
+        fully exited (all submit() predicts already waited on at their paired
+        layer), then the next iteration's ``_after_draft`` calls
+        ``submit_bulk()``.  Pin the invariant that the guard does not fire on
+        this path.
+        """
+        prefetcher, _, _, hidden, _, num_layers = prefetch_setup
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+
+        prefetcher.submit(0, x)
+        prefetcher.wait(1)  # mirrors the forward-pass wait that drains predicts
+        prefetcher.cancel()
+
+        # Must not raise — no predict is in flight after the wait above.
         prefetcher.submit_bulk({i: x for i in range(num_layers)})
         for i in range(num_layers):
             prefetcher.wait(i)
