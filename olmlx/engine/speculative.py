@@ -557,6 +557,14 @@ class SpeculativeDecoder:
                 f"{type(self._draft).__name__!r}: {exc}. The draft model may "
                 "not be compatible with mlx-lm's KV-cache API."
             ) from exc
+        # Same reset prefill()/generate_step apply to the target: VLM drafts
+        # (mlx-vlm 0.4.4 Qwen3_5 etc.) cache _position_ids/_rope_deltas on
+        # the module instance across calls, and pass 1 of _prefill_last_logit
+        # below has cache_offset==0, which would consume a stale slice of
+        # _position_ids from a previous request.
+        for attr in ("_position_ids", "_rope_deltas"):
+            if hasattr(self._draft, attr):
+                setattr(self._draft, attr, None)
         tokens: list[int] = []
 
         # Same OOM path as the target: a large-vocab draft (e.g. same model
