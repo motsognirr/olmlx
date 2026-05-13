@@ -420,6 +420,21 @@ class TestEagleDecoderLifecycle:
         assert not decoder._patched
         assert not decoder._bound
 
+    def test_close_is_alias_for_reset(self):
+        """ModelManager._close_loaded_model calls .close() on whichever decoder
+        type the strategy resolved to. Eagle must expose the same lifecycle
+        name as SpeculativeDecoder and DFlashDecoder, otherwise eviction and
+        keep-alive expiry raise AttributeError for eagle users.
+        """
+        decoder, _, _ = _make_decoder()
+        prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+        decoder.prefill(prompt)
+        decoder.close()
+        assert decoder._target_cache is None
+        assert decoder._draft_cache is None
+        assert not decoder._patched
+        assert not decoder._bound
+
 
 class TestEagleDecoderPrefillStep:
     """End-to-end protocol: prefill, then step produces accepted tokens."""

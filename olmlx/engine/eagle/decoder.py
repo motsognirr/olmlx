@@ -172,6 +172,15 @@ class EagleDecoder:
 
     # ----- lifecycle -------------------------------------------------------
 
+    def close(self) -> None:
+        """Alias for :meth:`reset` so callers can use the same
+        ``close()`` lifecycle name as :class:`SpeculativeDecoder` and
+        :class:`DFlashDecoder` — ``ModelManager`` holds whichever
+        decoder type the strategy resolved to and treats them uniformly
+        on unload, eviction, and keep-alive expiry.
+        """
+        self.reset()
+
     def reset(self) -> None:
         # Close the GDN capture *first* — it holds ``_GDN_PATCH_LOCK``,
         # and if any of the steps below raises we still want the lock

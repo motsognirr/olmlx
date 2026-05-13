@@ -1895,15 +1895,7 @@ class TestExpiryChecker:
         )
         manager._loaded["expired:latest"] = lm
 
-        # Run one cycle of expiry check manually
-        now = time.time()
-        expired = [
-            name
-            for name, m in manager._loaded.items()
-            if m.expires_at is not None and m.expires_at <= now
-        ]
-        for name in expired:
-            del manager._loaded[name]
+        await manager._expire_stale()
 
         assert "expired:latest" not in manager._loaded
 
@@ -1919,14 +1911,7 @@ class TestExpiryChecker:
         )
         manager._loaded["active:latest"] = lm
 
-        now = time.time()
-        expired = [
-            name
-            for name, m in manager._loaded.items()
-            if m.expires_at is not None and m.expires_at <= now
-        ]
-        for name in expired:
-            del manager._loaded[name]
+        await manager._expire_stale()
 
         assert "active:latest" in manager._loaded
 
@@ -1944,15 +1929,7 @@ class TestExpiryChecker:
         )
         manager._loaded["busy:latest"] = lm
 
-        # Simulate one cycle of _check_expiry_loop logic
-        now = time.time()
-        expired = [
-            name
-            for name, m in manager._loaded.items()
-            if m.expires_at is not None and m.expires_at <= now and m.active_refs == 0
-        ]
-        for name in expired:
-            del manager._loaded[name]
+        await manager._expire_stale()
 
         assert "busy:latest" in manager._loaded
 
@@ -2669,6 +2646,38 @@ class TestEvictLruIfNeeded:
         manager._loaded["old"] = old
         manager._evict_lru_if_needed()
         assert "old" not in manager._loaded
+
+    def test_close_loaded_model_continues_on_failure(self, registry, mock_store):
+        """A raising prefetcher.close() must not skip weight_store/decoder cleanup.
+
+        Without try/finally chaining, a single resource failure during eviction
+        or expiry would leak the weight store's file descriptors and leave the
+        speculative decoder's GDN monkey-patch installed indefinitely.
+        """
+        manager = ModelManager(registry, mock_store)
+        prefetcher = MagicMock()
+        prefetcher.close.side_effect = RuntimeError("boom")
+        weight_store = MagicMock()
+        decoder = MagicMock()
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        lm = LoadedModel(
+            name="x",
+            hf_path="x/x",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            weight_store=weight_store,
+            speculative_decoder=decoder,
+            is_flash=True,
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            manager._close_loaded_model(lm)
+
+        # Both subsequent resources must still be released.
+        weight_store.close.assert_called_once()
+        decoder.close.assert_called_once()
+        assert lm.speculative_decoder is None
 
     def test_closes_flash_resources_on_evict(self, registry, mock_store, monkeypatch):
         """LRU eviction of a Flash model must close prefetcher + weight_store.

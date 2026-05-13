@@ -859,14 +859,25 @@ class ModelManager:
         target/draft: the class-level monkey-patch holds a strong reference to
         the capture instance via its closure, so ``__del__`` never fires and
         the patch lock stays held until ``close()`` is called explicitly.
+
+        Each close() is wrapped in its own try/finally so a failure in one
+        resource doesn't skip the others — without this, a single raising
+        prefetcher.close() would leak the weight store's file descriptors and
+        leave the GDN monkey-patch installed indefinitely.
         """
-        if getattr(lm.model, "prefetcher", None) is not None:
-            lm.model.prefetcher.close()
-        if lm.weight_store is not None:
-            lm.weight_store.close()
-        if lm.speculative_decoder is not None:
-            lm.speculative_decoder.close()
-        lm.speculative_decoder = None
+        try:
+            if getattr(lm.model, "prefetcher", None) is not None:
+                lm.model.prefetcher.close()
+        finally:
+            try:
+                if lm.weight_store is not None:
+                    lm.weight_store.close()
+            finally:
+                try:
+                    if lm.speculative_decoder is not None:
+                        lm.speculative_decoder.close()
+                finally:
+                    lm.speculative_decoder = None
 
     def _evict_lru_if_needed(self) -> None:
         """Evict least-recently-used models until below max_loaded_models.
