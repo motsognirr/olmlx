@@ -312,7 +312,32 @@ async def _stream_buffered_with_tools(
     result: AsyncIterator[dict[str, Any]],
     declared_tools: list[dict[str, Any]] | None = None,
 ) -> AsyncIterator[str | dict[str, Any]]:
-    """Buffer full output, parse tools, yield SSE strings. Yields a final dict with metadata."""
+    """Buffer full output, parse tools, yield SSE strings. Yields a final dict with metadata.
+
+    Buffering is load-bearing for correctness when tools are present and cannot
+    be replaced with incremental parsing — see ``parse_model_output`` in
+    ``engine/tool_parser.py``:
+
+    1. The parser tries 9 formats in priority order (Qwen, Mistral, Llama,
+       DeepSeek, MiniMax, gemma4, standalone <function=...>, bare JSON,
+       gpt-oss channels). The first parser to match wins, so an incremental
+       parser would commit to a guess before higher-priority formats had a
+       chance to appear.
+    2. ``_try_bare_json`` requires brace-balanced JSON across the whole output.
+       A ``{`` token could be visible text or the start of a tool call; once
+       streamed as text it can't be retracted.
+    3. ``_try_xml_func`` matches ``<function=...>`` anywhere in the output,
+       including inside prose — indefinite lookahead would be required on
+       every ``<`` token.
+    4. ``_parse_gpt_oss_channels`` classifies blocks only at their terminating
+       marker (``<|end|>``/``<|call|>``/``<|return|>``).
+    5. Anthropic SSE requires ``content_block_start`` to carry the tool's
+       ``id`` and ``name`` upfront, so the JSON body must be parsed before
+       any tool events can be emitted.
+
+    Keepalive ping events (see ``_with_keepalive_pings``) prevent connection
+    timeouts during the buffering window.
+    """
     text_chunks: list[str] = []
     raw_text = ""
     output_tokens = 0
