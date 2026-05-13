@@ -161,10 +161,15 @@ async def abort_generation(req: AbortRequest, request: Request):
 @router.post("/api/unload")
 async def unload_model(req: UnloadRequest, request: Request):
     """Manually unload a model from VRAM."""
+    from olmlx.engine.model_manager import ActiveRequestsError
+
     manager = request.app.state.model_manager
     try:
         unloaded = manager.unload(req.model)
-    except RuntimeError as e:
+    except ActiveRequestsError as e:
+        # 409 is narrow on purpose: only "model has active requests".
+        # Resource-close failures from _close_loaded_model surface as
+        # ExceptionGroup and fall through to FastAPI's 500 handler.
         return JSONResponse({"error": str(e)}, status_code=409)
     if not unloaded:
         return JSONResponse(

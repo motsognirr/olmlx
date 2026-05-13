@@ -289,6 +289,16 @@ class SpectralCalibrationMissingError(FileNotFoundError):
     """Raised when SpectralQuant is configured but calibration data is absent."""
 
 
+class ActiveRequestsError(RuntimeError):
+    """Raised by ``ModelManager.unload`` when a model has in-flight requests.
+
+    Subclasses ``RuntimeError`` so legacy ``except RuntimeError:`` keeps
+    working, but the dedicated type lets HTTP routers narrow the 409 path
+    to exactly this condition. Without it, an unrelated ``RuntimeError``
+    from ``_close_loaded_model`` would be misreported as 409.
+    """
+
+
 @dataclass
 class CachedPromptState:
     """KV cache state from a previous generation, for prompt cache reuse."""
@@ -890,6 +900,12 @@ class ModelManager:
             except Exception as exc:
                 logger.exception("Error closing speculative decoder for %s", lm.name)
                 errors.append(exc)
+        # Null every direct field on the LoadedModel that we just closed, so
+        # later code can't accidentally observe (or double-close) a closed
+        # resource. ``lm.model.prefetcher`` is not nulled because that lives
+        # on the model wrapper itself, not on the LM — the model is dropped
+        # along with the LM and shouldn't be mutated here.
+        lm.weight_store = None
         lm.speculative_decoder = None
         if errors:
             raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
@@ -1278,7 +1294,7 @@ class ModelManager:
         if lm is None:
             return False
         if lm.active_refs > 0:
-            raise RuntimeError(
+            raise ActiveRequestsError(
                 f"Model '{normalized}' has {lm.active_refs} active request(s)"
             )
         lm = self._loaded.pop(normalized)

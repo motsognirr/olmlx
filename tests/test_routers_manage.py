@@ -217,6 +217,33 @@ class TestManageRouter:
             lm.active_refs = 0
 
     @pytest.mark.asyncio
+    async def test_unload_close_failure_is_not_409(self, app_client):
+        """A close() failure must NOT be reported as 409.
+
+        Pre-PR the router caught bare RuntimeError, so a raising
+        prefetcher.close() would be confusingly returned as
+        "model has active requests". Post-PR the router narrows the
+        409 path to ActiveRequestsError, and close failures surface
+        as ExceptionGroup (a 500 by FastAPI default).
+        """
+        from unittest.mock import MagicMock
+
+        manager = app_client._transport.app.state.model_manager
+        lm = manager._loaded["qwen3:latest"]
+        original_close = manager._close_loaded_model
+        manager._close_loaded_model = MagicMock(
+            side_effect=RuntimeError("simulated close failure")
+        )
+        try:
+            resp = await app_client.post("/api/unload", json={"model": "qwen3"})
+            # Whatever the exact status, it must not be the active-refs 409.
+            assert resp.status_code != 409
+        finally:
+            manager._close_loaded_model = original_close
+            # Restore the LoadedModel since the failing close() popped it.
+            manager._loaded["qwen3:latest"] = lm
+
+    @pytest.mark.asyncio
     async def test_abort_returns_noop(self, app_client):
         resp = await app_client.post("/api/abort", json={"model": "qwen3"})
         assert resp.status_code == 200

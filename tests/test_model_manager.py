@@ -100,10 +100,16 @@ class TestModelManager:
         assert mock_manager.unload("nonexistent") is False
 
     def test_unload_active_refs_raises(self, mock_manager):
+        from olmlx.engine.model_manager import ActiveRequestsError
+
         lm = mock_manager._loaded["qwen3:latest"]
         lm.active_refs = 1
-        with pytest.raises(RuntimeError, match="active"):
+        # ActiveRequestsError is the narrow type the unload HTTP handler
+        # catches for 409. It also subclasses RuntimeError so legacy
+        # callers using ``except RuntimeError:`` continue to work.
+        with pytest.raises(ActiveRequestsError, match="active"):
             mock_manager.unload("qwen3")
+        assert issubclass(ActiveRequestsError, RuntimeError)
         assert len(mock_manager.get_loaded()) == 1  # still loaded
         lm.active_refs = 0
 
@@ -2104,6 +2110,12 @@ class TestExpiryChecker:
         per-layer file descriptors for every expired Flash model (issue #178).
         """
         manager = ModelManager(registry, mock_store)
+        # Wire both prefetcher and weight_store through the same ``parent``
+        # MagicMock so their .close() calls are recorded in a single ordered
+        # mock_calls list. _close_loaded_model accesses prefetcher via
+        # ``lm.model.prefetcher`` and weight_store via ``lm.weight_store``;
+        # both end up resolving to attributes on ``parent`` here, which is
+        # what makes the cross-resource ordering assertion work.
         parent = MagicMock()
         prefetcher = parent.prefetcher
         weight_store = parent.weight_store
@@ -2848,6 +2860,10 @@ class TestEvictLruIfNeeded:
         # Both subsequent resources must still be released.
         weight_store.close.assert_called_once()
         decoder.close.assert_called_once()
+        # LoadedModel-owned references are nulled so later code can't
+        # accidentally observe a closed resource. ``lm.model.prefetcher``
+        # is intentionally left alone — see helper docstring.
+        assert lm.weight_store is None
         assert lm.speculative_decoder is None
 
     def test_close_loaded_model_surfaces_multiple_failures(self, registry, mock_store):
@@ -2883,6 +2899,7 @@ class TestEvictLruIfNeeded:
         assert any("weight-store-boom" in m for m in messages)
         # Decoder still closed despite both prior failures.
         decoder.close.assert_called_once()
+        assert lm.weight_store is None
         assert lm.speculative_decoder is None
 
     def test_evict_absorbs_close_failure(
@@ -2926,6 +2943,9 @@ class TestEvictLruIfNeeded:
         """
         monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
         manager = ModelManager(registry, mock_store)
+        # Wire both resources through the same ``parent`` MagicMock so the
+        # cross-resource ordering assertion below has a single ordered call
+        # log to inspect. See the matching test in TestExpiryChecker.
         parent = MagicMock()
         prefetcher = parent.prefetcher
         weight_store = parent.weight_store
