@@ -861,9 +861,14 @@ class ModelManager:
         the patch lock stays held until ``close()`` is called explicitly.
 
         Each close() is attempted independently and logged at point of
-        failure. If exactly one raises, that exception is re-raised; if
-        multiple do, an ``ExceptionGroup`` surfaces all of them — Python's
-        nested-try/finally semantics would otherwise silently discard
+        failure. On any error, always raises an ``ExceptionGroup`` carrying
+        every failure — even when only one resource failed — so callers see
+        a stable exception type. Without this, code writing
+        ``except RuntimeError:`` around the single-failure case would
+        silently miss a two-failure case. Use ``except*`` (PEP 654) to
+        handle individual member types.
+
+        Python's nested-try/finally would otherwise silently discard
         earlier exceptions when a later finally also raised.
         """
         errors: list[BaseException] = []
@@ -886,8 +891,6 @@ class ModelManager:
                 logger.exception("Error closing speculative decoder for %s", lm.name)
                 errors.append(exc)
         lm.speculative_decoder = None
-        if len(errors) == 1:
-            raise errors[0]
         if errors:
             raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
 

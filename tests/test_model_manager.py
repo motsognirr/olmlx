@@ -2772,6 +2772,9 @@ class TestEvictLruIfNeeded:
         Without try/finally chaining, a single resource failure during eviction
         or expiry would leak the weight store's file descriptors and leave the
         speculative decoder's GDN monkey-patch installed indefinitely.
+
+        _close_loaded_model always raises ExceptionGroup on any error
+        (single or multiple) so callers see a stable exception type.
         """
         manager = ModelManager(registry, mock_store)
         prefetcher = MagicMock()
@@ -2790,9 +2793,14 @@ class TestEvictLruIfNeeded:
             is_flash=True,
         )
 
-        with pytest.raises(RuntimeError, match="boom"):
+        with pytest.raises(ExceptionGroup) as exc_info:
             manager._close_loaded_model(lm)
 
+        # Single-failure case is still wrapped in ExceptionGroup for a
+        # stable contract — see docstring on _close_loaded_model.
+        assert len(exc_info.value.exceptions) == 1
+        assert isinstance(exc_info.value.exceptions[0], RuntimeError)
+        assert "boom" in str(exc_info.value.exceptions[0])
         # Both subsequent resources must still be released.
         weight_store.close.assert_called_once()
         decoder.close.assert_called_once()
