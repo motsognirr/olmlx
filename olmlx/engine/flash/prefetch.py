@@ -84,6 +84,7 @@ class Prefetcher:
 
         self._lock = threading.Lock()
         self._pending: dict[int, _LayerPrefetchState] = {}
+        self._predict_in_flight = 0
         self.stats = PrefetchStats()
 
     @property
@@ -131,6 +132,7 @@ class Prefetcher:
         state = _LayerPrefetchState()
         with self._lock:
             self._pending[next_layer] = state
+            self._predict_in_flight += 1
 
         try:
             self._predict_executor.submit(
@@ -139,6 +141,7 @@ class Prefetcher:
         except RuntimeError:
             with self._lock:
                 self._pending.pop(next_layer, None)
+                self._predict_in_flight -= 1
             state.done.set()  # unblock any concurrent wait()
 
     def wait(self, layer_idx: int) -> None:
@@ -172,7 +175,14 @@ class Prefetcher:
            would deadlock with the concurrent ``mx.eval`` on the prediction
            thread.  Current callers (``_submit_draft_prefetch``) invoke this
            between forward-pass steps when no prediction is in-flight.
+           Enforced at runtime: raises :class:`RuntimeError` if violated.
         """
+        with self._lock:
+            if self._predict_in_flight > 0:
+                raise RuntimeError(
+                    "submit_bulk() called while a submit() prediction is in flight; "
+                    "concurrent mx.eval would deadlock Metal (see issue #242)"
+                )
         for layer_idx, hidden in layer_hidden_states.items():
             if layer_idx >= self._num_layers:
                 continue
@@ -212,6 +222,9 @@ class Prefetcher:
             with self._lock:
                 self.stats.failures += 1
             state.done.set()
+        finally:
+            with self._lock:
+                self._predict_in_flight -= 1
 
     def _predict(self, layer_idx: int, hidden_state: mx.array) -> list[int]:
         flat = hidden_state.reshape(-1, hidden_state.shape[-1])
