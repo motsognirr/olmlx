@@ -1957,6 +1957,66 @@ class TestExpiryChecker:
         assert "busy:latest" in manager._loaded
 
     @pytest.mark.asyncio
+    async def test_expire_stale_closes_flash_resources(self, registry, mock_store):
+        """_expire_stale must close prefetcher + weight_store on a Flash model.
+
+        Otherwise the keep-alive timer leaks ThreadPoolExecutor workers and
+        per-layer file descriptors for every expired Flash model (issue #178).
+        """
+        manager = ModelManager(registry, mock_store)
+        parent = MagicMock()
+        prefetcher = parent.prefetcher
+        weight_store = parent.weight_store
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        lm = LoadedModel(
+            name="expired:latest",
+            hf_path="test/model",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            weight_store=weight_store,
+            is_flash=True,
+            expires_at=time.time() - 10,
+        )
+        manager._loaded["expired:latest"] = lm
+
+        await manager._expire_stale()
+
+        assert "expired:latest" not in manager._loaded
+        prefetcher.close.assert_called_once()
+        weight_store.close.assert_called_once()
+        call_names = [c[0] for c in parent.mock_calls]
+        assert call_names.index("prefetcher.close") < call_names.index(
+            "weight_store.close"
+        )
+
+    @pytest.mark.asyncio
+    async def test_expire_stale_skips_active(self, registry, mock_store):
+        """Models with active_refs > 0 must not be expired or closed."""
+        manager = ModelManager(registry, mock_store)
+        prefetcher = MagicMock()
+        weight_store = MagicMock()
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        lm = LoadedModel(
+            name="busy:latest",
+            hf_path="test/model",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            weight_store=weight_store,
+            is_flash=True,
+            expires_at=time.time() - 10,
+            active_refs=1,
+        )
+        manager._loaded["busy:latest"] = lm
+
+        await manager._expire_stale()
+
+        assert "busy:latest" in manager._loaded
+        prefetcher.close.assert_not_called()
+        weight_store.close.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_expired_model_object_still_usable(self, registry, mock_store):
         """Even if a model is removed from _loaded, the object remains usable."""
         manager = ModelManager(registry, mock_store)
@@ -2609,6 +2669,39 @@ class TestEvictLruIfNeeded:
         manager._loaded["old"] = old
         manager._evict_lru_if_needed()
         assert "old" not in manager._loaded
+
+    def test_closes_flash_resources_on_evict(self, registry, mock_store, monkeypatch):
+        """LRU eviction of a Flash model must close prefetcher + weight_store.
+
+        Otherwise ThreadPoolExecutor workers and per-layer file descriptors
+        leak for every evicted Flash model (issue #178).
+        """
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+        manager = ModelManager(registry, mock_store)
+        parent = MagicMock()
+        prefetcher = parent.prefetcher
+        weight_store = parent.weight_store
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            weight_store=weight_store,
+            is_flash=True,
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["old"] = old
+        manager._evict_lru_if_needed()
+        prefetcher.close.assert_called_once()
+        weight_store.close.assert_called_once()
+        # Order matters: prefetcher tasks submit into the weight store's pool,
+        # so the prefetcher must shut down before the weight store.
+        call_names = [c[0] for c in parent.mock_calls]
+        assert call_names.index("prefetcher.close") < call_names.index(
+            "weight_store.close"
+        )
 
 
 class TestSpeculativeLoading:

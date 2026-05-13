@@ -844,6 +844,30 @@ class ModelManager:
             keep_alive if keep_alive is not None else settings.default_keep_alive
         )
 
+    @staticmethod
+    def _close_loaded_model(lm: "LoadedModel") -> None:
+        """Release resources held by a LoadedModel.
+
+        Used by every lifecycle exit (explicit unload, LRU eviction, keep-alive
+        expiry). Without this, Flash models leak ThreadPoolExecutor workers and
+        per-layer file descriptors on eviction/expiry — issue #178.
+
+        Order matters: prefetcher tasks submit into the weight store's pool, so
+        the prefetcher must shut down before the weight store. Closing the
+        speculative decoder (not just dropping the reference) is required when
+        it owns a ``GDNStateCapture`` for a hybrid linear-attention
+        target/draft: the class-level monkey-patch holds a strong reference to
+        the capture instance via its closure, so ``__del__`` never fires and
+        the patch lock stays held until ``close()`` is called explicitly.
+        """
+        if getattr(lm.model, "prefetcher", None) is not None:
+            lm.model.prefetcher.close()
+        if lm.weight_store is not None:
+            lm.weight_store.close()
+        if lm.speculative_decoder is not None:
+            lm.speculative_decoder.close()
+        lm.speculative_decoder = None
+
     def _evict_lru_if_needed(self) -> None:
         """Evict least-recently-used models until below max_loaded_models.
 
@@ -859,16 +883,7 @@ class ModelManager:
             oldest_name = min(evictable, key=lambda k: evictable[k].loaded_at)
             logger.info("Evicting model %s", oldest_name)
             evicted = self._loaded.pop(oldest_name)
-            # Release draft model Metal memory promptly. Closing the
-            # decoder (not just dropping the reference) is required when
-            # the decoder owns a ``GDNStateCapture`` for a hybrid
-            # linear-attention target/draft: the class-level monkey-patch
-            # holds a strong reference to the capture instance via its
-            # closure, so ``__del__`` never fires and the patch lock
-            # stays held until ``close()`` is called explicitly.
-            if evicted.speculative_decoder is not None:
-                evicted.speculative_decoder.close()
-            evicted.speculative_decoder = None
+            self._close_loaded_model(evicted)
             del evicted
 
         # Flush Metal allocator cache so that buffers from evicted models
@@ -1224,19 +1239,7 @@ class ModelManager:
                 f"Model '{normalized}' has {lm.active_refs} active request(s)"
             )
         lm = self._loaded.pop(normalized)
-        # Close prefetcher *before* weight store: prefetcher tasks submit into
-        # the weight store's pool, so weight store must outlive the prefetcher.
-        if hasattr(lm.model, "prefetcher") and lm.model.prefetcher is not None:
-            lm.model.prefetcher.close()
-        if lm.weight_store is not None:
-            lm.weight_store.close()
-        # Release draft model Metal memory promptly and unhook the
-        # class-level GatedDeltaNet patch if one is installed (hybrid
-        # target/draft). See the eviction site above for why ``close()``
-        # is required — ``__del__`` cannot break the closure cycle.
-        if lm.speculative_decoder is not None:
-            lm.speculative_decoder.close()
-        lm.speculative_decoder = None
+        self._close_loaded_model(lm)
         return True
 
     # Config keys that indicate a vision-language model
@@ -2753,7 +2756,8 @@ class ModelManager:
             ]
             for name in expired:
                 logger.info("Unloading expired model %s", name)
-                del self._loaded[name]
+                lm = self._loaded.pop(name)
+                self._close_loaded_model(lm)
 
     async def _check_expiry_loop(self):
         while True:
