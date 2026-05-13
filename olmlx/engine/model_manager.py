@@ -910,13 +910,12 @@ class ModelManager:
             # model can't permanently block subsequent model loads. The model
             # is already removed from ``_loaded``; the new load will proceed
             # with leaked threads/fds rather than failing.
-            # Mirrors the per-model guard in ``_expire_stale``.
+            # _close_loaded_model logs per-resource on failure, so no extra
+            # logging here — mirrors the absorb pattern in _expire_stale.
             try:
                 self._close_loaded_model(evicted)
             except Exception:
-                logger.exception(
-                    "Error closing resources for evicted model %s", oldest_name
-                )
+                pass  # already logged inside _close_loaded_model
             del evicted
 
         # Flush Metal allocator cache so that buffers from evicted models
@@ -1263,6 +1262,13 @@ class ModelManager:
         """Unload a model. Returns True if unloaded, False if not loaded.
 
         Raises RuntimeError if model has active requests.
+
+        Note: if ``_close_loaded_model`` raises, the model has already been
+        removed from ``_loaded`` (so a subsequent ``unload`` would return
+        ``False``) but the caller still sees the exception. Each resource
+        is attempted independently and logged before the raise — strictly
+        better than the pre-refactor inline code, which would abort on
+        the first failure and leak the remaining resources silently.
         """
         normalized = self.registry.normalize_name(name)
         lm = self._loaded.get(normalized)
@@ -2775,39 +2781,42 @@ class ModelManager:
     async def _expire_stale(self):
         """Unload models whose keep-alive has expired (active_refs == 0)."""
         now = time.time()
+        # Pop expired entries under the lock, then close them after releasing
+        # it. _close_loaded_model calls executor.shutdown(wait=True) which
+        # blocks the event loop until the pool drains; holding self._lock
+        # during that would stall every concurrent ensure_loaded() caller.
+        # Models with active_refs > 0 are skipped — they are currently
+        # serving requests. Even if a model slips through with
+        # active_refs == 0 between ensure_loaded() and _inference_ref(),
+        # the caller still holds a Python reference, so the model/
+        # tokenizer stay alive; only the _loaded dict entry is removed.
         async with self._lock:
-            # Models with active_refs > 0 are skipped — they are currently
-            # serving requests.  Even if a model slips through with
-            # active_refs == 0 between ensure_loaded() and _inference_ref(),
-            # the caller still holds a Python reference, so the model/
-            # tokenizer stay alive; only the _loaded dict entry is removed.
-            expired = [
-                name
-                for name, lm in self._loaded.items()
-                if lm.expires_at is not None
-                and lm.expires_at <= now
-                and lm.active_refs == 0
-            ]
-            had_expired = False
-            for name in expired:
-                logger.info("Unloading expired model %s", name)
-                lm = self._loaded.pop(name)
-                # Per-model isolation: one failing close() must not skip the
-                # remaining expired models. ``_close_loaded_model`` already
-                # try/finally-chains its own three resources; this guard
-                # protects sibling models in the same expiry cycle.
-                try:
-                    self._close_loaded_model(lm)
-                except Exception:
-                    logger.exception("Error closing resources for model %s", name)
-                had_expired = True
-            # Flush Metal allocator cache so freed buffers don't inflate the
-            # next ensure_loaded() memory check. Mirrors _evict_lru_if_needed.
-            # Skip when any deferred cleanup is pending — a background thread
-            # for a different model may still be allocating Metal memory.
-            if had_expired and not self._pending_cleanups:
-                gc.collect()
-                mx.clear_cache()
+            expired_lms: list[LoadedModel] = []
+            for name, lm in list(self._loaded.items()):
+                if (
+                    lm.expires_at is not None
+                    and lm.expires_at <= now
+                    and lm.active_refs == 0
+                ):
+                    logger.info("Unloading expired model %s", name)
+                    expired_lms.append(self._loaded.pop(name))
+
+        # Close outside the lock. Per-model isolation: one failing close()
+        # must not skip the remaining expired models. _close_loaded_model
+        # already logs per-resource on failure, so callers absorb silently.
+        for lm in expired_lms:
+            try:
+                self._close_loaded_model(lm)
+            except Exception:
+                pass  # already logged inside _close_loaded_model
+
+        # Flush Metal allocator cache so freed buffers don't inflate the
+        # next ensure_loaded() memory check. Mirrors _evict_lru_if_needed.
+        # Skip when any deferred cleanup is pending — a background thread
+        # for a different model may still be allocating Metal memory.
+        if expired_lms and not self._pending_cleanups:
+            gc.collect()
+            mx.clear_cache()
 
     async def _check_expiry_loop(self):
         while True:

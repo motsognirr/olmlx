@@ -1979,9 +1979,43 @@ class TestExpiryChecker:
         ws_a.close.assert_called_once()
         ws_b.close.assert_called_once()
         ws_c.close.assert_called_once()
+        # _close_loaded_model logs per-resource; A's prefetcher failure
+        # surfaces as "Error closing prefetcher for a".
         assert any(
-            "Error closing resources for model a" in r.message for r in caplog.records
+            "Error closing prefetcher for a" in r.message for r in caplog.records
         )
+
+    @pytest.mark.asyncio
+    async def test_expire_stale_releases_lock_before_closing(
+        self, registry, mock_store
+    ):
+        """_close_loaded_model must run outside self._lock.
+
+        ``executor.shutdown(wait=True)`` is synchronous and can take long
+        enough to be noticeable. Holding ``self._lock`` during that would
+        stall every concurrent ``ensure_loaded()`` caller until the pool
+        drained — a latency spike on a server doing real inference when
+        a keep-alive happens to expire.
+        """
+        manager = ModelManager(registry, mock_store)
+        lock_held_during_close: list[bool] = []
+
+        def _record_lock_state(_lm):
+            lock_held_during_close.append(manager._lock.locked())
+
+        manager._close_loaded_model = _record_lock_state  # type: ignore[assignment]
+        lm = LoadedModel(
+            name="expired:latest",
+            hf_path="test/model",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            expires_at=time.time() - 10,
+        )
+        manager._loaded["expired:latest"] = lm
+
+        await manager._expire_stale()
+
+        assert lock_held_during_close == [False]
 
     @pytest.mark.asyncio
     async def test_check_expiry_loop_survives_unhandled_error(
@@ -2827,9 +2861,9 @@ class TestEvictLruIfNeeded:
             manager._evict_lru_if_needed()  # must not raise
 
         assert "old" not in manager._loaded
+        # _close_loaded_model logs per-resource; eviction site absorbs silently.
         assert any(
-            "Error closing resources for evicted model old" in r.message
-            for r in caplog.records
+            "Error closing prefetcher for old" in r.message for r in caplog.records
         )
 
     def test_closes_flash_resources_on_evict(self, registry, mock_store, monkeypatch):
