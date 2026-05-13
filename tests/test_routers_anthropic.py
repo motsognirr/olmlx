@@ -853,6 +853,77 @@ class TestAnthropicEndpoint:
         assert "tool_use" in text
 
     @pytest.mark.asyncio
+    async def test_streaming_orphaned_close_think_classified_as_thinking(
+        self, app_client
+    ):
+        """Issue #307: Qwen3.5/3.6 emit thinking without ``<think>`` opener.
+
+        Streaming-without-tools previously fell through the state machine's
+        ``init`` branch (which only entered the thinking state when the
+        buffer started with ``<think>``) and emitted the entire reasoning
+        preamble as ``text_delta``. With the orphan-handling fix the prefix
+        before ``</think>`` must be emitted as ``thinking_delta``.
+        """
+        # Multi-line preamble exceeds any plausible "give-up" buffer.
+        preamble = (
+            "Thinking Process:\n\n"
+            "1. Analyze the Request: The user wants 17 * 23.\n"
+            "2. Recall multiplication: 17 * 23 = 17 * (20 + 3) = 340 + 51 = 391.\n"
+            "3. Sanity check: 17 * 25 = 425, minus 2*17 = 34, gives 391. OK.\n"
+            "4. Format the answer: just the number, no prose.\n"
+            "5. Construct Final Response: 391"
+        )
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                # Many small chunks, like real generation
+                for i in range(0, len(preamble), 16):
+                    yield {"text": preamble[i : i + 16], "done": False}
+                yield {"text": "\n</think>\n\n", "done": False}
+                yield {"text": "391", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "17*23"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        # Reassemble the per-block content.
+        thinking_text = ""
+        visible_text = ""
+        for line in resp.text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") != "content_block_delta":
+                continue
+            delta = payload.get("delta", {})
+            if delta.get("type") == "thinking_delta":
+                thinking_text += delta.get("thinking", "")
+            elif delta.get("type") == "text_delta":
+                visible_text += delta.get("text", "")
+
+        assert "Thinking Process" in thinking_text
+        assert "Sanity check" in thinking_text
+        assert "Thinking Process" not in visible_text
+        assert "</think>" not in visible_text
+        assert "</think>" not in thinking_text
+        assert visible_text.strip() == "391"
+
+    @pytest.mark.asyncio
     async def test_streaming_partial_think_tag(self, app_client):
         """Test state machine when <think> tag arrives across multiple tokens."""
 

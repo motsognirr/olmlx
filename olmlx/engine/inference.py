@@ -3027,22 +3027,57 @@ async def generate_chat(
             make_prompt_cache is not None,
         )
 
+    # Compute the *effective* thinking decision so streaming routers can tell
+    # whether to wait for a (possibly orphaned, see #307) `</think>` token.
+    # Mirrors the resolution in `_apply_chat_template`.
+    effective_thinking_kwarg: bool | None
+    if caps.supports_enable_thinking:
+        if enable_thinking is not None:
+            effective_thinking_kwarg = enable_thinking
+        elif tools:
+            effective_thinking_kwarg = False
+        else:
+            effective_thinking_kwarg = True
+    else:
+        effective_thinking_kwarg = None
+    thinking_expected = bool(effective_thinking_kwarg)
+
     if stream:
-        return _stream_completion(
-            lm,
-            prompt,
-            mt,
-            gen_kwargs,
-            stats,
-            images,
-            use_prompt_cache=use_prompt_cache,
-            prompt_tokens=prompt_tokens,
-            cache_id=cache_id,
+        return _prepend_meta(
+            _stream_completion(
+                lm,
+                prompt,
+                mt,
+                gen_kwargs,
+                stats,
+                images,
+                use_prompt_cache=use_prompt_cache,
+                prompt_tokens=prompt_tokens,
+                cache_id=cache_id,
+            ),
+            {"thinking_expected": thinking_expected},
         )
     else:
         return await _full_completion(
             lm, prompt, mt, gen_kwargs, stats, images, has_tools=bool(tools)
         )
+
+
+async def _prepend_meta(
+    stream: AsyncGenerator[dict, None],
+    meta: dict,
+) -> AsyncGenerator[dict, None]:
+    """Yield ``meta`` as the first chunk, then forward ``stream``.
+
+    Used so routers learn streaming-level metadata (e.g. whether thinking is
+    expected — issue #307) before any text chunks arrive.
+    """
+    try:
+        yield meta
+        async for chunk in stream:
+            yield chunk
+    finally:
+        await stream.aclose()
 
 
 async def generate_embeddings(

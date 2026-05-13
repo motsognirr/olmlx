@@ -80,6 +80,99 @@ class TestChatRouter:
         assert call_args[1]["max_tokens"] == 100
 
     @pytest.mark.asyncio
+    async def test_chat_non_streaming_separates_thinking_from_content(self, app_client):
+        """Issue #307: ``<think>...</think>`` and Qwen3.5-style orphan
+        ``</think>`` thinking must be separated from ``message.content`` and
+        surfaced under ``message.thinking`` to match Ollama's API."""
+        # Qwen3.5 case: no opening <think>, closing tag present.
+        raw = (
+            "Thinking Process:\n\n"
+            "1. Analyze the Request: The user wants 17 * 23.\n"
+            "2. Compute: 17 * 23 = 391.\n"
+            "3. Construct Final Response: 391\n"
+            "</think>\n\n"
+            "391"
+        )
+        mock_result = {"text": raw, "done": True, "stats": TimingStats(eval_count=10)}
+
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "17*23"}],
+                    "stream": False,
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        msg = data["message"]
+        assert msg["content"].strip() == "391"
+        assert "</think>" not in msg["content"]
+        assert "Thinking Process" not in msg["content"]
+        assert "Thinking Process" in msg.get("thinking", "")
+        assert "</think>" not in msg.get("thinking", "")
+
+    @pytest.mark.asyncio
+    async def test_chat_streaming_separates_thinking_from_content(self, app_client):
+        """Issue #307: streaming path must put thinking into ``message.thinking``
+        and not leak it into ``message.content`` — even when the orphan
+        preamble is longer than the conservative non-thinking buffer."""
+        preamble = (
+            "Thinking Process:\n\n"
+            "1. Analyze the Request: The user wants the product of 17 and 23.\n"
+            "2. Compute: 17 * 23 = (17 * 20) + (17 * 3) = 340 + 51 = 391.\n"
+            "3. Sanity check: 17 * 25 - 2 * 17 = 425 - 34 = 391.\n"
+            "4. Format: just the number, no prose.\n"
+            "5. Construct Final Response: 391"
+        )
+        # Must exceed the conservative 200-char limit used when thinking is
+        # not expected so the test actually exercises the plumbed path.
+        assert len(preamble) > 200
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                for i in range(0, len(preamble), 16):
+                    yield {"text": preamble[i : i + 16], "done": False}
+                yield {"text": "\n</think>\n\n", "done": False}
+                yield {"text": "391", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "17*23"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        content = ""
+        thinking = ""
+        for line in resp.text.strip().split("\n"):
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            msg = payload.get("message", {})
+            content += msg.get("content", "")
+            thinking += msg.get("thinking", "") or ""
+
+        assert "Thinking Process" in thinking
+        assert "Thinking Process" not in content
+        assert "</think>" not in content
+        assert "</think>" not in thinking
+        assert content.strip() == "391"
+
+    @pytest.mark.asyncio
     async def test_chat_streaming_error_mid_stream(self, app_client):
         """Error during streaming emits an NDJSON error line instead of crashing."""
 

@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from olmlx.engine.inference import generate_chat
+from olmlx.engine.tool_parser import parse_model_output
 from olmlx.routers.common import format_error
 from olmlx.schemas.chat import ChatRequest, Message
 from olmlx.utils.streaming import safe_ndjson_stream
@@ -13,6 +14,114 @@ from olmlx.utils.streaming import safe_ndjson_stream
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# Generous upper bound on how long a Qwen3.5/3.6-style orphan thinking
+# preamble may run before `</think>` arrives.  Matches the OpenAI router's
+# limit (issue #307).  Only consulted when the engine signals
+# `thinking_expected=True` via the stream meta chunk.
+_INIT_ORPHAN_DETECT_LIMIT = 65536
+
+
+def _split_thinking_streaming(text: str, state: dict) -> tuple[str, str]:
+    """Split a streaming token into ``(thinking_chunk, content_chunk)``.
+
+    Mirrors ``_strip_thinking_streaming`` in the OpenAI router but routes the
+    thinking text into a separate output channel instead of discarding it,
+    so the Ollama API can populate ``message.thinking`` (issue #307).
+
+    State keys:
+    - ``phase``: ``"detect"``, ``"in_think"``, ``"passthrough"``
+    - ``buffer``: accumulated text waiting to be resolved
+    - ``thinking_expected``: when True, the detect phase tolerates a
+      longer orphan-thinking preamble before giving up.
+    """
+    buf = state.get("buffer", "") + text
+    thinking_parts: list[str] = []
+    content_parts: list[str] = []
+    phase = state.get("phase", "detect")
+    detect_limit = _INIT_ORPHAN_DETECT_LIMIT if state.get("thinking_expected") else 200
+
+    while buf:
+        if phase == "detect":
+            open_idx = buf.find("<think>")
+            close_idx = buf.find("</think>")
+
+            if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
+                # Orphan `</think>`: prefix is thinking content.
+                thinking_parts.append(buf[:close_idx])
+                buf = buf[close_idx + len("</think>") :].lstrip("\n")
+                phase = "passthrough"
+            elif open_idx != -1:
+                # Pre-think text is content; tag itself is consumed.
+                content_parts.append(buf[:open_idx])
+                buf = buf[open_idx + len("<think>") :]
+                phase = "in_think"
+            else:
+                # No tag yet.  Buffer until we can decide, then flush as
+                # content if no tag ever appears.
+                if len(buf) > detect_limit:
+                    content_parts.append(buf)
+                    buf = ""
+                    phase = "passthrough"
+                break
+
+        elif phase == "in_think":
+            end = buf.find("</think>")
+            if end == -1:
+                # Hold back up to 7 trailing chars in case `</think>` is
+                # split across two chunks; emit the rest as thinking.
+                if len(buf) > 8:
+                    thinking_parts.append(buf[:-8])
+                    buf = buf[-8:]
+                break
+            thinking_parts.append(buf[:end])
+            buf = buf[end + len("</think>") :].lstrip("\n")
+            phase = "passthrough"
+
+        else:  # passthrough
+            open_idx = buf.find("<think>")
+            if open_idx == -1:
+                # Hold back any trailing prefix of `<think>` so a follow-up
+                # chunk can complete the tag (avoids loop-spin on bare "<").
+                longest_partial = 0
+                for i in range(1, min(len("<think>"), len(buf) + 1)):
+                    if "<think>".startswith(buf[-i:]):
+                        longest_partial = i
+                        break
+                if longest_partial:
+                    content_parts.append(buf[:-longest_partial])
+                    buf = buf[-longest_partial:]
+                else:
+                    content_parts.append(buf)
+                    buf = ""
+                break
+            content_parts.append(buf[:open_idx])
+            buf = buf[open_idx + len("<think>") :]
+            phase = "in_think"
+
+    state["buffer"] = buf
+    state["phase"] = phase
+    return "".join(thinking_parts), "".join(content_parts)
+
+
+def _flush_split_thinking(state: dict) -> tuple[str, str]:
+    """Flush remaining buffer at stream end.
+
+    If the buffer is still in ``detect`` (no tag ever seen), treat it as
+    content.  In ``in_think`` (open tag without close), treat as thinking so
+    the response isn't truncated.
+    """
+    buf = state.get("buffer", "")
+    phase = state.get("phase", "detect")
+    state["buffer"] = ""
+    if not buf:
+        return "", ""
+    if phase == "detect":
+        return "", buf
+    if phase == "in_think":
+        return buf, ""
+    return "", buf
 
 
 @router.post("/api/chat")
@@ -37,29 +146,47 @@ async def chat(req: ChatRequest, request: Request):
             cache_id=cache_id,
         )
 
+        think_state: dict = {}
+
         def format_chunk(chunk):
             if chunk.get("cache_info"):
                 return None
+            if "thinking_expected" in chunk:
+                think_state["thinking_expected"] = bool(chunk["thinking_expected"])
+                return None
             now = datetime.now(timezone.utc).isoformat()
             if chunk.get("done"):
+                thinking_tail, content_tail = _flush_split_thinking(think_state)
                 stats = chunk.get("stats")
                 final = {
                     "model": req.model,
                     "created_at": now,
-                    "message": Message(role="assistant", content="").model_dump(),
+                    "message": Message(
+                        role="assistant",
+                        content=content_tail,
+                        thinking=thinking_tail or None,
+                    ).model_dump(exclude_none=True),
                     "done": True,
                     "done_reason": chunk.get("done_reason", "stop"),
                 }
                 if stats:
                     final.update(stats.to_dict())
                 return json.dumps(final) + "\n"
-            text = chunk.get("text", "")
+            thinking_chunk, content_chunk = _split_thinking_streaming(
+                chunk.get("text", ""), think_state
+            )
+            if not thinking_chunk and not content_chunk:
+                return None
             return (
                 json.dumps(
                     {
                         "model": req.model,
                         "created_at": now,
-                        "message": Message(role="assistant", content=text).model_dump(),
+                        "message": Message(
+                            role="assistant",
+                            content=content_chunk,
+                            thinking=thinking_chunk or None,
+                        ).model_dump(exclude_none=True),
                         "done": False,
                     }
                 )
@@ -90,12 +217,17 @@ async def chat(req: ChatRequest, request: Request):
         )
         now = datetime.now(timezone.utc).isoformat()
         stats = result.get("stats")
+        # Use raw_text when present (gpt-oss channel format), else text.
+        raw = result.get("raw_text") or result.get("text", "")
+        thinking, visible, _tool_uses = parse_model_output(raw, has_tools=bool(tools))
         response = {
             "model": req.model,
             "created_at": now,
             "message": Message(
-                role="assistant", content=result.get("text", "")
-            ).model_dump(),
+                role="assistant",
+                content=visible,
+                thinking=thinking or None,
+            ).model_dump(exclude_none=True),
             "done": True,
             "done_reason": result.get("done_reason", "stop"),
         }

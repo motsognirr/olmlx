@@ -160,11 +160,12 @@ def _strip_thinking_streaming(text: str, state: dict) -> str:
                 # buffer grows large enough that an orphaned tag is very
                 # unlikely, emit the safe prefix and transition to
                 # passthrough so non-thinking models stream progressively.
-                # The threshold is generous to catch real orphaned tags
-                # (thinking content before </think>) while avoiding
-                # unbounded buffering for non-thinking models.
-                _DETECT_LIMIT = 200
-                if len(buf) > _DETECT_LIMIT:
+                # When the caller knows thinking is expected (issue #307),
+                # the limit is raised so Qwen3.5/3.6's long orphan-prefix
+                # thinking is detected even though `</think>` arrives only
+                # after several thousand characters.
+                detect_limit = state.get("detect_limit", 200)
+                if len(buf) > detect_limit:
                     out_parts.append(buf)
                     buf = ""
                     phase = "passthrough"
@@ -236,6 +237,12 @@ async def _stream_openai_sse(
     try:
         async for chunk in result:
             if chunk.get("cache_info"):
+                continue
+            if "thinking_expected" in chunk:
+                # Engine-emitted meta: tells the thinking stripper how long
+                # to wait for an orphan </think> (issue #307).
+                if chunk["thinking_expected"]:
+                    think_state["detect_limit"] = 65536
                 continue
             if chunk.get("done"):
                 # Flush any buffered content from thinking detection.
@@ -318,7 +325,7 @@ async def _stream_openai_sse_with_tools(
     done_reason = None
     try:
         async for chunk in result:
-            if chunk.get("cache_info"):
+            if chunk.get("cache_info") or "thinking_expected" in chunk:
                 continue
             if chunk.get("done"):
                 # Read raw_text from done chunk for gpt-oss tool call parsing

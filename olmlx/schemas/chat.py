@@ -17,6 +17,7 @@ class ToolCall(BaseModel):
 class Message(BaseModel):
     role: str
     content: str = Field("", max_length=1_000_000)
+    thinking: str | None = Field(None, max_length=1_000_000)
     images: list[str] | None = None
     tool_calls: list[ToolCall] | None = None
 

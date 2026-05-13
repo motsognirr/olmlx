@@ -349,6 +349,8 @@ async def _stream_buffered_with_tools(
         if isinstance(chunk, dict) and chunk.get("cache_info"):
             yield chunk  # Forward to stream_sse for message_start
             continue
+        if isinstance(chunk, dict) and "thinking_expected" in chunk:
+            continue
         if chunk.get("done"):
             stats = chunk.get("stats")
             if stats:
@@ -547,6 +549,9 @@ def _flush_thinking_buffer(
     return events, block_idx
 
 
+_INIT_ORPHAN_DETECT_LIMIT = 65536
+
+
 async def _stream_thinking_state_machine(result):
     """Stream incrementally with thinking state machine. Yields a final dict with metadata."""
     block_idx = 0
@@ -555,6 +560,10 @@ async def _stream_thinking_state_machine(result):
     state = "init"  # "init", "thinking", "text"
     text_block_started = False
     done_reason = None
+    # Engine forwards this via a meta chunk; when set, we wait for an orphan
+    # `</think>` to classify the leading buffer as thinking instead of text
+    # (issue #307 — Qwen3.5/3.6 emit thinking without the `<think>` opener).
+    thinking_expected = False
 
     async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
         if chunk is _PING_SENTINEL:
@@ -562,6 +571,9 @@ async def _stream_thinking_state_machine(result):
             continue
         if isinstance(chunk, dict) and chunk.get("cache_info"):
             yield chunk  # Forward to stream_sse for message_start
+            continue
+        if isinstance(chunk, dict) and "thinking_expected" in chunk:
+            thinking_expected = bool(chunk["thinking_expected"])
             continue
         if chunk.get("done"):
             stats = chunk.get("stats")
@@ -575,6 +587,7 @@ async def _stream_thinking_state_machine(result):
 
         while buffer:
             if state == "init":
+                close_idx = buffer.find("</think>")
                 if buffer.startswith("<think>"):
                     state = "thinking"
                     buffer = buffer[7:]
@@ -586,7 +599,42 @@ async def _stream_thinking_state_machine(result):
                             "content_block": {"type": "thinking", "thinking": ""},
                         },
                     )
+                elif close_idx >= 0:
+                    # Orphaned `</think>` — Qwen3.5/3.6 chat templates miss
+                    # the `<think>` opener but still emit the closer (#307).
+                    # Everything buffered before it is the thinking block.
+                    orphan_thinking = buffer[:close_idx]
+                    yield _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_idx,
+                            "content_block": {"type": "thinking", "thinking": ""},
+                        },
+                    )
+                    if orphan_thinking:
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_idx,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": orphan_thinking,
+                                },
+                            },
+                        )
+                    yield _sse(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": block_idx},
+                    )
+                    block_idx += 1
+                    buffer = buffer[close_idx + 8 :].lstrip("\n")
+                    state = "text"
                 elif len(buffer) < 7 and "<think>".startswith(buffer):
+                    break
+                elif thinking_expected and len(buffer) < _INIT_ORPHAN_DETECT_LIMIT:
+                    # Keep waiting for a (possibly orphaned) `</think>`.
                     break
                 else:
                     state = "text"
