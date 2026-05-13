@@ -540,6 +540,8 @@ class SpeculativeDecoder:
 
     def _draft_generate(self, prompt: mx.array, n: int) -> list[int]:
         """Generate n candidate tokens with fresh KV cache (stateless)."""
+        if n <= 0:
+            return []
         if make_prompt_cache is None:
             # Caller (generate_step) already raises with the same wording;
             # this guard exists because asserts are stripped under -O.
@@ -547,8 +549,6 @@ class SpeculativeDecoder:
                 "mlx_lm.models.cache.make_prompt_cache is not available; "
                 "upgrade mlx-lm to a version that exports it."
             )
-        if n <= 0:
-            return []
         try:
             cache = make_prompt_cache(self._draft)
         except (TypeError, AttributeError) as exc:
