@@ -860,24 +860,36 @@ class ModelManager:
         the capture instance via its closure, so ``__del__`` never fires and
         the patch lock stays held until ``close()`` is called explicitly.
 
-        Each close() is wrapped in its own try/finally so a failure in one
-        resource doesn't skip the others — without this, a single raising
-        prefetcher.close() would leak the weight store's file descriptors and
-        leave the GDN monkey-patch installed indefinitely.
+        Each close() is attempted independently and logged at point of
+        failure. If exactly one raises, that exception is re-raised; if
+        multiple do, an ``ExceptionGroup`` surfaces all of them — Python's
+        nested-try/finally semantics would otherwise silently discard
+        earlier exceptions when a later finally also raised.
         """
-        try:
-            if getattr(lm.model, "prefetcher", None) is not None:
-                lm.model.prefetcher.close()
-        finally:
+        errors: list[BaseException] = []
+        if getattr(lm.model, "prefetcher", None) is not None:
             try:
-                if lm.weight_store is not None:
-                    lm.weight_store.close()
-            finally:
-                try:
-                    if lm.speculative_decoder is not None:
-                        lm.speculative_decoder.close()
-                finally:
-                    lm.speculative_decoder = None
+                lm.model.prefetcher.close()
+            except Exception as exc:
+                logger.exception("Error closing prefetcher for %s", lm.name)
+                errors.append(exc)
+        if lm.weight_store is not None:
+            try:
+                lm.weight_store.close()
+            except Exception as exc:
+                logger.exception("Error closing weight store for %s", lm.name)
+                errors.append(exc)
+        if lm.speculative_decoder is not None:
+            try:
+                lm.speculative_decoder.close()
+            except Exception as exc:
+                logger.exception("Error closing speculative decoder for %s", lm.name)
+                errors.append(exc)
+        lm.speculative_decoder = None
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
 
     def _evict_lru_if_needed(self) -> None:
         """Evict least-recently-used models until below max_loaded_models.
@@ -894,7 +906,17 @@ class ModelManager:
             oldest_name = min(evictable, key=lambda k: evictable[k].loaded_at)
             logger.info("Evicting model %s", oldest_name)
             evicted = self._loaded.pop(oldest_name)
-            self._close_loaded_model(evicted)
+            # Absorb cleanup failures so a stuck prefetcher on the evicted
+            # model can't permanently block subsequent model loads. The model
+            # is already removed from ``_loaded``; the new load will proceed
+            # with leaked threads/fds rather than failing.
+            # Mirrors the per-model guard in ``_expire_stale``.
+            try:
+                self._close_loaded_model(evicted)
+            except Exception:
+                logger.exception(
+                    "Error closing resources for evicted model %s", oldest_name
+                )
             del evicted
 
         # Flush Metal allocator cache so that buffers from evicted models
@@ -1100,7 +1122,6 @@ class ModelManager:
                     # Detect if flash mode was used
                     is_flash = False
                     is_flash_moe = False
-                    _weight_store = None
                     try:
                         from olmlx.engine.flash.flash_model import (
                             FlashModelWrapper,
@@ -1114,11 +1135,13 @@ class ModelManager:
                             FlashMoeModelWrapper,
                         )
 
-                        if isinstance(model, FlashMoeModelWrapper):
-                            is_flash_moe = True
-                            _weight_store = getattr(model, "_weight_store", None)
+                        is_flash_moe = isinstance(model, FlashMoeModelWrapper)
                     except ImportError:
                         pass
+                    # Both Flash wrappers store the underlying weight store as
+                    # ``_weight_store`` so eviction / keep-alive expiry can
+                    # close it. Non-Flash models leave this at None.
+                    _weight_store = getattr(model, "_weight_store", None)
 
                     lm = LoadedModel(
                         name=normalized,

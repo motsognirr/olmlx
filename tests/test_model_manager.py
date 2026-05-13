@@ -2764,6 +2764,74 @@ class TestEvictLruIfNeeded:
         decoder.close.assert_called_once()
         assert lm.speculative_decoder is None
 
+    def test_close_loaded_model_surfaces_multiple_failures(self, registry, mock_store):
+        """When two close() calls raise, both errors must surface.
+
+        Python's nested-try/finally silently replaces an earlier exception
+        with a later one. The per-resource try/except pattern collects all
+        failures and raises an ExceptionGroup so neither failure is hidden.
+        """
+        manager = ModelManager(registry, mock_store)
+        prefetcher = MagicMock()
+        prefetcher.close.side_effect = RuntimeError("prefetcher-boom")
+        weight_store = MagicMock()
+        weight_store.close.side_effect = RuntimeError("weight-store-boom")
+        decoder = MagicMock()
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        lm = LoadedModel(
+            name="x",
+            hf_path="x/x",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            weight_store=weight_store,
+            speculative_decoder=decoder,
+            is_flash=True,
+        )
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            manager._close_loaded_model(lm)
+
+        messages = [str(e) for e in exc_info.value.exceptions]
+        assert any("prefetcher-boom" in m for m in messages)
+        assert any("weight-store-boom" in m for m in messages)
+        # Decoder still closed despite both prior failures.
+        decoder.close.assert_called_once()
+        assert lm.speculative_decoder is None
+
+    def test_evict_absorbs_close_failure(
+        self, registry, mock_store, monkeypatch, caplog
+    ):
+        """LRU eviction must not propagate close() failures.
+
+        A stuck prefetcher would otherwise permanently block all future
+        model loads. The eviction site logs the error and continues.
+        """
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+        manager = ModelManager(registry, mock_store)
+        prefetcher = MagicMock()
+        prefetcher.close.side_effect = RuntimeError("stuck-prefetcher")
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            is_flash=True,
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["old"] = old
+
+        with caplog.at_level(logging.ERROR, logger="olmlx.engine.model_manager"):
+            manager._evict_lru_if_needed()  # must not raise
+
+        assert "old" not in manager._loaded
+        assert any(
+            "Error closing resources for evicted model old" in r.message
+            for r in caplog.records
+        )
+
     def test_closes_flash_resources_on_evict(self, registry, mock_store, monkeypatch):
         """LRU eviction of a Flash model must close prefetcher + weight_store.
 
