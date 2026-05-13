@@ -571,6 +571,38 @@ class TestAnthropicEndpoint:
         assert usage["cache_creation_input_tokens"] == 0
 
     @pytest.mark.asyncio
+    async def test_non_streaming_cache_stats_none_coerced_to_zero(self, app_client):
+        """If the engine sets cache keys to None, the router must coerce to 0
+        rather than letting None reach AnthropicUsage's int field (Pydantic
+        would raise ValidationError)."""
+        stats = TimingStats(prompt_eval_count=5, eval_count=3)
+        mock_result = {
+            "text": "ok",
+            "done": True,
+            "stats": stats,
+            "cache_read_tokens": None,
+            "cache_creation_tokens": None,
+        }
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+            )
+
+        assert resp.status_code == 200
+        usage = resp.json()["usage"]
+        assert usage["cache_read_input_tokens"] == 0
+        assert usage["cache_creation_input_tokens"] == 0
+
+    @pytest.mark.asyncio
     async def test_streaming(self, app_client):
         async def mock_stream(*args, **kwargs):
             async def gen():
