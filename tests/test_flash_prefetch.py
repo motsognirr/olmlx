@@ -437,6 +437,100 @@ class TestAsyncPrediction:
         # Should not raise
         prefetcher.submit(0, x)
 
+    def test_submit_bulk_rejects_concurrent_predict(self, prefetch_setup):
+        """submit_bulk() must raise if a submit() prediction is in flight.
+
+        Both paths call ``mx.eval`` inside ``_predict()``; running them
+        concurrently would deadlock Metal. The runtime guard turns this
+        documented invariant into an enforced one (issue #242).
+        """
+        import threading
+        from unittest.mock import patch
+
+        prefetcher, _, _, hidden, _, num_layers = prefetch_setup
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+
+        in_predict = threading.Event()
+        release = threading.Event()
+        original_predict = prefetcher._predict
+
+        def blocking_predict(*args, **kwargs):
+            in_predict.set()
+            release.wait(timeout=5.0)
+            return original_predict(*args, **kwargs)
+
+        with patch.object(prefetcher, "_predict", side_effect=blocking_predict):
+            prefetcher.submit(0, x)
+            assert in_predict.wait(timeout=2.0), "background predict never started"
+
+            layer_states = {i: x for i in range(num_layers)}
+            with pytest.raises(RuntimeError, match="in flight"):
+                prefetcher.submit_bulk(layer_states)
+
+            release.set()
+            # wait(1) unblocks on state.done.set() inside _enqueue_io's I/O
+            # task.  _do_predict_and_io's finally decrements _predict_in_flight
+            # *before* invoking _enqueue_io, so by the time wait() returns the
+            # counter is guaranteed to be back at 0.
+            prefetcher.wait(1)
+
+        # After the in-flight predict drains, submit_bulk works again.
+        prefetcher.submit_bulk({i: x for i in range(num_layers)})
+        for i in range(num_layers):
+            prefetcher.wait(i)
+        prefetcher.close()
+
+    def test_submit_bulk_no_false_positive_after_failed_predict(self, prefetch_setup):
+        """submit_bulk() must not raise after a failed prediction drains.
+
+        Regression: on the prediction-failure path, ``state.done.set()`` and
+        the ``_predict_in_flight`` decrement must run in an order such that a
+        thread that wakes on ``wait()`` cannot then observe a stale counter
+        and trip the guard.
+        """
+        from unittest.mock import patch
+
+        prefetcher, _, _, hidden, _, num_layers = prefetch_setup
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+
+        def failing_predict(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        with patch.object(prefetcher, "_predict", side_effect=failing_predict):
+            prefetcher.submit(0, x)
+            prefetcher.wait(1)
+
+        # Counter must be back to 0 — submit_bulk must NOT raise here.
+        prefetcher.submit_bulk({i: x for i in range(num_layers)})
+        for i in range(num_layers):
+            prefetcher.wait(i)
+        prefetcher.close()
+
+    def test_cancel_then_submit_bulk_does_not_falsely_trigger_guard(
+        self, prefetch_setup
+    ):
+        """cancel() followed by submit_bulk() must not raise.
+
+        This is the SpeculativeFlashDecoder steady-state pattern:
+        ``_after_verify`` calls ``cancel()`` after the target forward pass has
+        fully exited (all submit() predicts already waited on at their paired
+        layer), then the next iteration's ``_after_draft`` calls
+        ``submit_bulk()``.  Pin the invariant that the guard does not fire on
+        this path.
+        """
+        prefetcher, _, _, hidden, _, num_layers = prefetch_setup
+        x = mx.random.normal((1, hidden)).astype(mx.float16)
+
+        prefetcher.submit(0, x)
+        prefetcher.wait(1)  # mirrors the forward-pass wait that drains predicts
+        prefetcher.cancel()
+
+        # Must not raise — no predict is in flight after the wait above.
+        prefetcher.submit_bulk({i: x for i in range(num_layers)})
+        for i in range(num_layers):
+            prefetcher.wait(i)
+        prefetcher.close()
+
 
 # ---------------------------------------------------------------------------
 # FlashMLP + Prefetcher integration tests

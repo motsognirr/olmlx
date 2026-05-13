@@ -84,6 +84,7 @@ class Prefetcher:
 
         self._lock = threading.Lock()
         self._pending: dict[int, _LayerPrefetchState] = {}
+        self._predict_in_flight = 0
         self.stats = PrefetchStats()
 
     @property
@@ -131,6 +132,7 @@ class Prefetcher:
         state = _LayerPrefetchState()
         with self._lock:
             self._pending[next_layer] = state
+            self._predict_in_flight += 1
 
         try:
             self._predict_executor.submit(
@@ -139,6 +141,7 @@ class Prefetcher:
         except RuntimeError:
             with self._lock:
                 self._pending.pop(next_layer, None)
+                self._predict_in_flight -= 1
             state.done.set()  # unblock any concurrent wait()
 
     def wait(self, layer_idx: int) -> None:
@@ -172,7 +175,20 @@ class Prefetcher:
            would deadlock with the concurrent ``mx.eval`` on the prediction
            thread.  Current callers (``_submit_draft_prefetch``) invoke this
            between forward-pass steps when no prediction is in-flight.
+           Enforced at runtime: raises :class:`RuntimeError` if violated.
         """
+        # The check + per-layer _predict() loop is not mutually exclusive with
+        # submit(): a submit() call landing between the check and the first
+        # _predict() would bypass this guard.  Sound today because both paths
+        # are driven by the single forward-pass thread; the runtime check just
+        # turns the documented invariant into a fail-fast error rather than a
+        # full mutex.
+        with self._lock:
+            if self._predict_in_flight > 0:
+                raise RuntimeError(
+                    "submit_bulk() called while a submit() prediction is in flight; "
+                    "concurrent mx.eval would deadlock Metal (see issue #242)"
+                )
         for layer_idx, hidden in layer_hidden_states.items():
             if layer_idx >= self._num_layers:
                 continue
@@ -201,17 +217,30 @@ class Prefetcher:
     ) -> None:
         """Run on the prediction thread: predict next layer then submit I/O."""
         next_layer = layer_idx + 1
+        indices: list[int] | None = None
+        # _predict() is the only mx.eval-bearing region; the counter tracks
+        # mx.eval residency so submit_bulk()'s guard can decide whether a
+        # concurrent mx.eval is possible.  Decrement before *any*
+        # state.done.set() — both the _enqueue_io path and the failed-predict
+        # path — so a wait() that wakes on state.done.set() never observes a
+        # stale _predict_in_flight > 0.
         try:
             if self._lookahead_bank is not None:
                 indices = self._predict_lookahead(layer_idx, hidden_state)
             else:
                 indices = self._predict(next_layer, hidden_state)
-            self._enqueue_io(next_layer, indices, state)
         except Exception:
             logger.warning("Prediction failed for layer %d", next_layer, exc_info=True)
             with self._lock:
                 self.stats.failures += 1
+        finally:
+            with self._lock:
+                self._predict_in_flight -= 1
+
+        if indices is None:
             state.done.set()
+        else:
+            self._enqueue_io(next_layer, indices, state)
 
     def _predict(self, layer_idx: int, hidden_state: mx.array) -> list[int]:
         flat = hidden_state.reshape(-1, hidden_state.shape[-1])
