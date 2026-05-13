@@ -217,12 +217,18 @@ class Prefetcher:
     ) -> None:
         """Run on the prediction thread: predict next layer then submit I/O."""
         next_layer = layer_idx + 1
+        indices: list[int] | None = None
+        # _predict() is the only mx.eval-bearing region; the counter tracks
+        # mx.eval residency so submit_bulk()'s guard can decide whether a
+        # concurrent mx.eval is possible.  Decrement before _enqueue_io so
+        # that the I/O thread's state.done.set() (which can fire synchronously
+        # for empty indices, or on a fast cache hit) cannot unblock wait()
+        # before the counter drops back to 0.
         try:
             if self._lookahead_bank is not None:
                 indices = self._predict_lookahead(layer_idx, hidden_state)
             else:
                 indices = self._predict(next_layer, hidden_state)
-            self._enqueue_io(next_layer, indices, state)
         except Exception:
             logger.warning("Prediction failed for layer %d", next_layer, exc_info=True)
             with self._lock:
@@ -231,6 +237,9 @@ class Prefetcher:
         finally:
             with self._lock:
                 self._predict_in_flight -= 1
+
+        if indices is not None:
+            self._enqueue_io(next_layer, indices, state)
 
     def _predict(self, layer_idx: int, hidden_state: mx.array) -> list[int]:
         flat = hidden_state.reshape(-1, hidden_state.shape[-1])
