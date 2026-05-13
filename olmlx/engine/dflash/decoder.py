@@ -37,7 +37,7 @@ from olmlx.engine.gdn_rollback import (
     GDNStateCapture,
     get_model_layers as _get_layers,
 )
-from olmlx.engine.speculative import verify_draft_greedy
+from olmlx.engine.speculative import _eval_cache, verify_draft_greedy
 
 
 # ``_trim_recent_cache`` reaches into ``RotatingKVCache._temporal_order`` and
@@ -346,15 +346,49 @@ class DFlashDecoder:
             )
             self._capture.use_buffer(self._capture_buffer)
 
-        target_out = self._target(prompt, cache=self._target_cache)
+        # Two-pass prefill avoids materialising the full [batch, N, vocab] logit
+        # (the OOM path for large-vocab models on long contexts).
+        #
+        # Pass 1 — prefix (positions 0..N-2): fills the KV cache and captures
+        # hidden states for ALL prefix positions. The model output is discarded,
+        # so lm_head on N-1 positions is never evaluated by MLX's lazy scheduler.
+        # Pass 2 — last token: produces a [1, 1, vocab] logit + captures the
+        # last position's hidden state.
+        #
+        # DFlash's draft conditions on self._hidden[1, N, …] (all prompt hiddens),
+        # so we concatenate captured_prefix + captured_last along the time axis.
+        _err_msg = (
+            "Target forward did not populate all configured "
+            "target_layer_ids — check that the layer indices exist on "
+            f"this model (got {target_layer_ids})."
+        )
+        if prompt.shape[1] > 1:
+            prefix, last = prompt[:, :-1], prompt[:, -1:]
+            self._target(prefix, cache=self._target_cache)  # output discarded
+            captured_prefix = list(self._hidden_capture)
+            if any(h is None for h in captured_prefix):
+                raise RuntimeError(_err_msg)
+            # Force pass-1 hiddens before dropping slot references, so
+            # correctness does not depend on _eval_cache transitively
+            # materialising the same graph.
+            mx.eval(*captured_prefix)
+            # Reset capture slots so the pass-2 None-check is independent.
+            self._hidden_capture[:] = [None] * len(self._hidden_capture)
+            _eval_cache(self._target_cache)
+            target_out = self._target(last, cache=self._target_cache)
+            captured_last = list(self._hidden_capture)
+            if any(h is None for h in captured_last):
+                raise RuntimeError(_err_msg)
+            captured = [
+                mx.concatenate([p, q], axis=1)
+                for p, q in zip(captured_prefix, captured_last)
+            ]
+        else:
+            target_out = self._target(prompt, cache=self._target_cache)
+            captured = list(self._hidden_capture)
+            if any(h is None for h in captured):
+                raise RuntimeError(_err_msg)
         logits = _logits(target_out)
-        captured = list(self._hidden_capture)
-        if any(h is None for h in captured):
-            raise RuntimeError(
-                "Target forward did not populate all configured "
-                "target_layer_ids — check that the layer indices exist on "
-                f"this model (got {target_layer_ids})."
-            )
         self._hidden = mx.concatenate(captured, axis=-1)
         last_logit = logits[:, -1, :]
         mx.eval(last_logit, self._hidden)

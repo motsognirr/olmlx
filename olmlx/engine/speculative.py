@@ -37,6 +37,85 @@ def _logits(out: Any) -> mx.array:
     return cast(mx.array, getattr(out, "logits", out))
 
 
+def _eval_cache(cache: list) -> None:
+    """Materialise KV cache state without evaluating logits.
+
+    Handles KVCache (.keys/.values as mx.array), quantised caches that wrap
+    packed data in a list/tuple, and ArraysCache-style caches (.state
+    returning a list of tensors).
+    """
+    arrs = []
+    for c in cache:
+        k = getattr(c, "keys", None)
+        v = getattr(c, "values", None)
+        if isinstance(k, mx.array):
+            arrs.append(k)
+        elif isinstance(k, (list, tuple)):
+            arrs.extend(a for a in k if isinstance(a, mx.array))
+        if isinstance(v, mx.array):
+            arrs.append(v)
+        elif isinstance(v, (list, tuple)):
+            arrs.extend(a for a in v if isinstance(a, mx.array))
+        if k is None and v is None:
+            # ArraysCache and similar: state is a list/tuple of arrays
+            state = getattr(c, "state", None)
+            if isinstance(state, (list, tuple)):
+                arrs.extend(a for a in state if isinstance(a, mx.array))
+        # TurboQuantKVCache maintains a dequantized side buffer in
+        # _key_dequant / _value_dequant that update_and_fetch returns
+        # views over. The buffer is not part of .state, so probe it
+        # explicitly to force the dequant graph here instead of letting
+        # it fuse into pass 2. (SpectralQuantKVCache dequantizes fresh on
+        # each call and is already covered by the .state branch above.)
+        for attr in ("_key_dequant", "_value_dequant"):
+            buf = getattr(c, attr, None)
+            if isinstance(buf, mx.array):
+                arrs.append(buf)
+    if arrs:
+        mx.eval(*arrs)
+    elif cache:
+        # A non-empty cache produced no arrays to evaluate (unrecognised
+        # cache type). MLX's lazy graph chains pass-1's cache mutations
+        # into pass-2's forward regardless, so tokens stay correct — but
+        # the OOM this helper was designed to prevent will resurface
+        # (pass-2's eval pulls pass-1's lm_head graph through). Warn so
+        # the gap is visible; do not raise, since hard-failing here would
+        # break speculative decoding for every new mlx-lm cache type
+        # before its probe lands in this function.
+        logger.error(
+            "_eval_cache: no mx.array entries found in %d cache objects "
+            "(types: %s); the OOM-avoidance graph break is a no-op for "
+            "this cache type — add an explicit probe here if Metal OOMs "
+            "during prefill on long prompts.",
+            len(cache),
+            sorted({type(c).__name__ for c in cache}),
+        )
+
+
+def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
+    """Return the logit for the last prompt position without materialising
+    the full [batch, seq_len, vocab] tensor.
+
+    For prompts longer than 1 token, runs two passes:
+    - Pass 1: prefix[:-1] fills the KV cache; the model output is discarded
+      so MLX's lazy evaluation never computes lm_head on seq_len-1 positions.
+    - Pass 2: last token produces a [1, 1, vocab] logit; safe to evaluate.
+
+    This avoids the Metal OOM that occurs when seq_len × vocab_size exceeds
+    the ~41 GB Metal buffer limit (e.g. Gemma 4 31B, vocab=262 144, long ctx).
+
+    The returned logit is lazy. Cache state is materialised between passes
+    (graph-break for OOM avoidance) but the caller is expected to evaluate
+    the returned logit, which transitively forces pass-2's cache state.
+    """
+    if prompt.shape[1] <= 1:
+        return _logits(model(prompt, cache=cache))[0, -1, :]
+    prefix, last = prompt[:, :-1], prompt[:, -1:]
+    model(prefix, cache=cache)  # output discarded; lm_head never materialised
+    _eval_cache(cache)  # materialise KV state before the single-token pass
+    return _logits(model(last, cache=cache))[0, 0, :]
+
+
 def verify_draft_greedy(
     draft_tokens: list[int],
     target_logits: mx.array,
@@ -283,13 +362,14 @@ class SpeculativeDecoder:
         if self._gdn_capture is not None:
             self._gdn_capture.use_buffer(None)
 
-        target_out = _logits(self._target(prompt, cache=self._target_cache))
-        self._last_target_logit = target_out[0, -1, :]
+        self._last_target_logit = _prefill_last_logit(
+            self._target, prompt, self._target_cache
+        )
         mx.eval(self._last_target_logit)
 
-        # Populate draft cache (logits discarded — only cache state needed).
-        draft_logits = _logits(self._draft(prompt, cache=self._draft_cache))
-        mx.eval(draft_logits)
+        # Populate draft cache; logits not needed.
+        self._draft(prompt, cache=self._draft_cache)
+        _eval_cache(self._draft_cache)
 
         self._cache_seq_len = prompt.shape[1]
 
@@ -460,40 +540,50 @@ class SpeculativeDecoder:
 
     def _draft_generate(self, prompt: mx.array, n: int) -> list[int]:
         """Generate n candidate tokens with fresh KV cache (stateless)."""
+        if n <= 0:
+            return []
+        if make_prompt_cache is None:
+            # Caller (generate_step) already raises with the same wording;
+            # this guard exists because asserts are stripped under -O.
+            raise RuntimeError(
+                "mlx_lm.models.cache.make_prompt_cache is not available; "
+                "upgrade mlx-lm to a version that exports it."
+            )
+        try:
+            cache = make_prompt_cache(self._draft)
+        except (TypeError, AttributeError) as exc:
+            raise RuntimeError(
+                f"make_prompt_cache failed for draft model "
+                f"{type(self._draft).__name__!r}: {exc}. The draft model may "
+                "not be compatible with mlx-lm's KV-cache API."
+            ) from exc
+        # Same reset prefill()/generate_step apply to the target: VLM drafts
+        # (mlx-vlm 0.4.4 Qwen3_5 etc.) cache _position_ids/_rope_deltas on
+        # the module instance across calls, and pass 1 of _prefill_last_logit
+        # below has cache_offset==0, which would consume a stale slice of
+        # _position_ids from a previous request.
+        for attr in ("_position_ids", "_rope_deltas"):
+            if hasattr(self._draft, attr):
+                setattr(self._draft, attr, None)
         tokens: list[int] = []
 
-        cache = None
-        if make_prompt_cache is not None:
-            try:
-                cache = make_prompt_cache(self._draft)
-            except (TypeError, AttributeError):
-                pass
+        # Same OOM path as the target: a large-vocab draft (e.g. same model
+        # family as target, 262k vocab) on a long prompt would materialise
+        # [1, seq_len, vocab] inside lm_head before the [:, -1, :] slice.
+        # Route through _prefill_last_logit to keep the prefix lm_head out
+        # of the eval graph.
+        first_logit = _prefill_last_logit(self._draft, prompt, cache)
+        mx.eval(first_logit)
+        next_token = int(mx.argmax(first_logit).item())
+        tokens.append(next_token)
 
-        if cache is not None:
-            logits = _logits(self._draft(prompt, cache=cache))
+        for _ in range(n - 1):
+            inp = mx.array([[next_token]])
+            logits = _logits(self._draft(inp, cache=cache))
             next_logits = logits[:, -1, :]
             mx.eval(next_logits)
             next_token = int(mx.argmax(next_logits, axis=-1).item())
             tokens.append(next_token)
-
-            for _ in range(n - 1):
-                inp = mx.array([[next_token]])
-                logits = _logits(self._draft(inp, cache=cache))
-                next_logits = logits[:, -1, :]
-                mx.eval(next_logits)
-                next_token = int(mx.argmax(next_logits, axis=-1).item())
-                tokens.append(next_token)
-        else:
-            for _ in range(n):
-                if tokens:
-                    current = mx.concatenate([prompt, mx.array([tokens])], axis=1)
-                else:
-                    current = prompt
-                logits = _logits(self._draft(current))
-                next_logits = logits[:, -1, :]
-                mx.eval(next_logits)
-                next_token = int(mx.argmax(next_logits, axis=-1).item())
-                tokens.append(next_token)
 
         return tokens
 
@@ -509,20 +599,39 @@ class SpeculativeDecoder:
         self,
         prompt: mx.array,
     ) -> tuple[list[int], int]:
-        """One speculative decoding step (stateless, no cross-step caching)."""
+        """One speculative decoding step (stateless, no cross-step caching).
+
+        Uses a temporary KV cache internally so the target forward over the
+        long prompt does not materialise the full [batch, seq_len, vocab]
+        logit matrix (same Metal OOM that ``_prefill_last_logit`` avoids).
+        """
+        if make_prompt_cache is None:
+            raise RuntimeError(
+                "mlx_lm.models.cache.make_prompt_cache is not available "
+                "(import failed at module load). Upgrade mlx-lm to a "
+                "version that exports it (or use the cached prefill+step "
+                "API instead, which has the same requirement). The "
+                "previous cache-less path was removed because it OOMed "
+                "on Metal for large-vocab models on long prompts."
+            )
+
         draft_tokens = self._draft_generate(prompt, self._lambda)
 
-        draft_ids = mx.array([draft_tokens])
-        combined = mx.concatenate([prompt, draft_ids], axis=1)
         # See prefill() for why this reset is needed (mlx-vlm 0.4.4 VLMs).
         for attr in ("_position_ids", "_rope_deltas"):
             if hasattr(self._target, attr):
                 setattr(self._target, attr, None)
-        target_out = _logits(self._target(combined))
-        mx.eval(target_out)
 
-        seq_len = prompt.shape[1]
-        target_logits = target_out[0, seq_len - 1 : seq_len + self._lambda, :]
+        # Two-pass split: prefill the prompt into a temporary cache (yields
+        # the first verification logit), then feed [pending, D1..D_lambda]
+        # for the remaining lambda logits. Total materialised logit shape is
+        # [1, lambda+1, vocab] instead of [1, seq_len+lambda, vocab].
+        target_cache = make_prompt_cache(self._target)
+        first_logit = _prefill_last_logit(self._target, prompt, target_cache)
+        draft_ids = mx.array([draft_tokens])
+        draft_out = _logits(self._target(draft_ids, cache=target_cache))
+        target_logits = mx.concatenate([first_logit[None, :], draft_out[0]], axis=0)
+        mx.eval(target_logits)
 
         accepted = self._verify(draft_tokens, target_logits)
 

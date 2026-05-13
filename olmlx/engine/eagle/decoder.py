@@ -50,7 +50,7 @@ from olmlx.engine.gdn_rollback import (
     get_model_layers as _get_layers,
 )
 from olmlx.engine.eagle.draft_model import EagleDraftModel
-from olmlx.engine.speculative import verify_draft_greedy
+from olmlx.engine.speculative import _eval_cache, verify_draft_greedy
 
 try:
     from mlx_lm.models.cache import (
@@ -323,7 +323,26 @@ class EagleDecoder:
                 self._capture = _GDNStateCapture(self._target)
 
             # Run the target on the prompt and capture its last-layer hidden.
-            target_out = self._target(prompt, cache=self._target_cache)
+            # Two-pass: prefix fills the KV cache without materialising the
+            # full [batch, seq_len, vocab] logit; final single-token pass
+            # produces a [1, 1, vocab] logit and refreshes the capture slot.
+            if prompt.shape[1] > 1:
+                self._target(prompt[:, :-1], cache=self._target_cache)
+                # Force the pass-1 hidden (if captured) before dropping the
+                # slot reference, mirroring DFlash. Correctness does not
+                # require it today — _eval_cache transitively materialises
+                # the same graph — but the explicit eval makes the ordering
+                # robust to future narrowing of _eval_cache's scope.
+                _hidden_p1 = self._hidden_storage[0]
+                if _hidden_p1 is not None:
+                    mx.eval(_hidden_p1)
+                # Discard pass-1 capture so the pass-2 None-check below is
+                # an active guard rather than dead code.
+                self._hidden_storage[0] = None
+                _eval_cache(self._target_cache)
+                target_out = self._target(prompt[:, -1:], cache=self._target_cache)
+            else:
+                target_out = self._target(prompt, cache=self._target_cache)
             target_logits = _logits(target_out)
             captured = self._hidden_storage[0]
             if captured is None:
