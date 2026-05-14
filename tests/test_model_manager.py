@@ -100,12 +100,38 @@ class TestModelManager:
         assert mock_manager.unload("nonexistent") is False
 
     def test_unload_active_refs_raises(self, mock_manager):
+        from olmlx.engine.model_manager import ActiveRequestsError
+
         lm = mock_manager._loaded["qwen3:latest"]
         lm.active_refs = 1
-        with pytest.raises(RuntimeError, match="active"):
+        # ActiveRequestsError is the narrow type the unload HTTP handler
+        # catches for 409. It also subclasses RuntimeError so legacy
+        # callers using ``except RuntimeError:`` continue to work.
+        with pytest.raises(ActiveRequestsError, match="active"):
             mock_manager.unload("qwen3")
+        assert issubclass(ActiveRequestsError, RuntimeError)
         assert len(mock_manager.get_loaded()) == 1  # still loaded
         lm.active_refs = 0
+
+    def test_unload_absorbs_close_failure(self, mock_manager):
+        """unload() returns True even when _close_loaded_model raises.
+
+        The model is already popped from ``_loaded`` before close is
+        attempted, so the user-visible semantics are satisfied: the
+        model is gone. Surfacing the ExceptionGroup as a 500 would
+        leave the HTTP client unable to distinguish "close failed,
+        model is gone" from an unrelated 500.
+        """
+        from unittest.mock import MagicMock
+
+        # Replace _close_loaded_model with one that raises like the
+        # real helper does when a resource close fails.
+        mock_manager._close_loaded_model = MagicMock(
+            side_effect=ExceptionGroup("simulated", [RuntimeError("prefetcher boom")])
+        )
+        result = mock_manager.unload("qwen3")
+        assert result is True
+        assert "qwen3:latest" not in mock_manager._loaded
 
     @pytest.mark.asyncio
     async def test_ensure_loaded_cached(self, mock_manager):
@@ -1895,15 +1921,7 @@ class TestExpiryChecker:
         )
         manager._loaded["expired:latest"] = lm
 
-        # Run one cycle of expiry check manually
-        now = time.time()
-        expired = [
-            name
-            for name, m in manager._loaded.items()
-            if m.expires_at is not None and m.expires_at <= now
-        ]
-        for name in expired:
-            del manager._loaded[name]
+        await manager._expire_stale()
 
         assert "expired:latest" not in manager._loaded
 
@@ -1919,14 +1937,7 @@ class TestExpiryChecker:
         )
         manager._loaded["active:latest"] = lm
 
-        now = time.time()
-        expired = [
-            name
-            for name, m in manager._loaded.items()
-            if m.expires_at is not None and m.expires_at <= now
-        ]
-        for name in expired:
-            del manager._loaded[name]
+        await manager._expire_stale()
 
         assert "active:latest" in manager._loaded
 
@@ -1944,17 +1955,285 @@ class TestExpiryChecker:
         )
         manager._loaded["busy:latest"] = lm
 
-        # Simulate one cycle of _check_expiry_loop logic
-        now = time.time()
-        expired = [
-            name
-            for name, m in manager._loaded.items()
-            if m.expires_at is not None and m.expires_at <= now and m.active_refs == 0
-        ]
-        for name in expired:
-            del manager._loaded[name]
+        await manager._expire_stale()
 
         assert "busy:latest" in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_expire_stale_isolates_per_model_failures(
+        self, registry, mock_store, caplog
+    ):
+        """A failing close() on model A must not skip models B and C.
+
+        Without per-model isolation, a single broken prefetcher would block
+        every other expired model in the same cycle from being cleaned up.
+        """
+        manager = ModelManager(registry, mock_store)
+
+        def _flash_lm(name: str, *, raises: bool = False):
+            prefetcher = MagicMock()
+            if raises:
+                prefetcher.close.side_effect = RuntimeError(f"{name} boom")
+            weight_store = MagicMock()
+            model = MagicMock()
+            model.prefetcher = prefetcher
+            lm = LoadedModel(
+                name=name,
+                hf_path=f"x/{name}",
+                model=model,
+                tokenizer=MagicMock(),
+                weight_store=weight_store,
+                is_flash=True,
+                expires_at=time.time() - 10,
+            )
+            return lm, prefetcher, weight_store
+
+        a, _, ws_a = _flash_lm("a", raises=True)
+        b, _, ws_b = _flash_lm("b")
+        c, _, ws_c = _flash_lm("c")
+        manager._loaded["a"] = a
+        manager._loaded["b"] = b
+        manager._loaded["c"] = c
+
+        with caplog.at_level(logging.ERROR, logger="olmlx.engine.model_manager"):
+            await manager._expire_stale()  # must not raise
+
+        assert "a" not in manager._loaded
+        assert "b" not in manager._loaded
+        assert "c" not in manager._loaded
+        # Sibling weight stores must have been closed despite A's failure.
+        ws_a.close.assert_called_once()
+        ws_b.close.assert_called_once()
+        ws_c.close.assert_called_once()
+        # _close_loaded_model logs per-resource; A's prefetcher failure
+        # surfaces as "Error closing prefetcher for a".
+        assert any(
+            "Error closing prefetcher for a" in r.message for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_expire_stale_drops_refs_before_gc(
+        self, registry, mock_store, monkeypatch
+    ):
+        """The expired-models list must be dropped before gc.collect().
+
+        Otherwise gc.collect() can't reclaim the Metal buffers referenced
+        by the LoadedModel objects, and the mx.clear_cache() that was
+        specifically added to flush expired-model memory is effectively
+        a no-op. Mirrors the ``del evicted`` pattern in
+        _evict_lru_if_needed.
+
+        Uses a weakref to assert the LoadedModel is unreachable at the
+        moment gc.collect() runs — proving expired_lms was dropped.
+
+        Assumes CPython refcount semantics: an object with refcount 0 is
+        deallocated immediately, so the weakref resolves to None as soon
+        as the last strong reference goes away. On a non-refcounting
+        runtime (PyPy, Jython) a back-reference cycle introduced by
+        MagicMock could keep the LM alive — but we also monkeypatch
+        gc.collect here, so the cycle collector would not run to clean
+        it up. The codebase is CPython-only (uv-managed cpython-3.11),
+        so this is fine.
+        """
+        import weakref
+
+        manager = ModelManager(registry, mock_store)
+        weakref_alive_at_gc: list[bool] = []
+        ref_holder: dict[str, Any] = {}
+
+        def _fake_gc():
+            weakref_alive_at_gc.append(ref_holder["wr"]() is not None)
+
+        monkeypatch.setattr("olmlx.engine.model_manager.gc.collect", _fake_gc)
+        monkeypatch.setattr("olmlx.engine.model_manager.mx.clear_cache", lambda: None)
+
+        lm = LoadedModel(
+            name="expired:latest",
+            hf_path="test/model",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            expires_at=time.time() - 10,
+        )
+        manager._loaded["expired:latest"] = lm
+        ref_holder["wr"] = weakref.ref(lm)
+        del lm  # only manager._loaded holds it now
+
+        await manager._expire_stale()
+
+        # If expired_lms was still alive at gc time, the weakref would
+        # resolve to a live object. The fix asserts it's dead.
+        assert weakref_alive_at_gc == [False]
+
+    @pytest.mark.asyncio
+    async def test_expire_stale_offloads_close_to_thread(
+        self, registry, mock_store, monkeypatch
+    ):
+        """Close runs off the event loop.
+
+        ``executor.shutdown(wait=True)`` is synchronous. Running it on
+        the event loop thread would stall every concurrent coroutine
+        until the pools drained, even with the lock released. The fix
+        is ``await asyncio.to_thread(self._close_loaded_model, lm)``.
+        This test asserts the call went through ``asyncio.to_thread``.
+        """
+        manager = ModelManager(registry, mock_store)
+        original_to_thread = asyncio.to_thread
+        to_thread_calls: list[Any] = []
+
+        async def _tracking_to_thread(fn, *args, **kwargs):
+            to_thread_calls.append(fn)
+            return await original_to_thread(fn, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.asyncio.to_thread", _tracking_to_thread
+        )
+
+        lm = LoadedModel(
+            name="expired:latest",
+            hf_path="test/model",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            expires_at=time.time() - 10,
+        )
+        manager._loaded["expired:latest"] = lm
+
+        await manager._expire_stale()
+
+        # The close was routed through to_thread (off-event-loop).
+        assert manager._close_loaded_model in to_thread_calls
+
+    @pytest.mark.asyncio
+    async def test_expire_stale_releases_lock_before_closing(
+        self, registry, mock_store
+    ):
+        """_close_loaded_model must run outside self._lock.
+
+        ``executor.shutdown(wait=True)`` is synchronous and can take long
+        enough to be noticeable. Holding ``self._lock`` during that would
+        stall every concurrent ``ensure_loaded()`` caller until the pool
+        drained — a latency spike on a server doing real inference when
+        a keep-alive happens to expire.
+        """
+        manager = ModelManager(registry, mock_store)
+        lock_held_during_close: list[bool] = []
+
+        def _record_lock_state(_lm):
+            lock_held_during_close.append(manager._lock.locked())
+
+        manager._close_loaded_model = _record_lock_state  # type: ignore[assignment]
+        lm = LoadedModel(
+            name="expired:latest",
+            hf_path="test/model",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            expires_at=time.time() - 10,
+        )
+        manager._loaded["expired:latest"] = lm
+
+        await manager._expire_stale()
+
+        assert lock_held_during_close == [False]
+
+    @pytest.mark.asyncio
+    async def test_check_expiry_loop_survives_unhandled_error(
+        self, registry, mock_store, caplog, monkeypatch
+    ):
+        """The background expiry task must survive a raising _expire_stale.
+
+        If _expire_stale ever propagates, the unguarded `while True` in
+        _check_expiry_loop exits permanently — no log, no restart, models
+        accumulate forever. Defense in depth on top of per-model isolation.
+        """
+        manager = ModelManager(registry, mock_store)
+        sleep_calls = {"n": 0}
+
+        async def _fake_sleep(_seconds):
+            sleep_calls["n"] += 1
+            if sleep_calls["n"] >= 2:
+                raise asyncio.CancelledError()
+
+        monkeypatch.setattr("olmlx.engine.model_manager.asyncio.sleep", _fake_sleep)
+        call_count = {"n": 0}
+
+        async def _raising_expire():
+            call_count["n"] += 1
+            raise RuntimeError("simulated failure")
+
+        manager._expire_stale = _raising_expire  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.ERROR, logger="olmlx.engine.model_manager"):
+            with pytest.raises(asyncio.CancelledError):
+                await manager._check_expiry_loop()
+
+        # First iteration raised → loop continued → second iteration cancelled.
+        assert call_count["n"] == 1
+        assert any("Expiry check failed" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_expire_stale_closes_flash_resources(self, registry, mock_store):
+        """_expire_stale must close prefetcher + weight_store on a Flash model.
+
+        Otherwise the keep-alive timer leaks ThreadPoolExecutor workers and
+        per-layer file descriptors for every expired Flash model (issue #178).
+        """
+        manager = ModelManager(registry, mock_store)
+        # Wire both prefetcher and weight_store through the same ``parent``
+        # MagicMock so their .close() calls are recorded in a single ordered
+        # mock_calls list. _close_loaded_model accesses prefetcher via
+        # ``lm.model.prefetcher`` and weight_store via ``lm.weight_store``;
+        # both end up resolving to attributes on ``parent`` here, which is
+        # what makes the cross-resource ordering assertion work.
+        parent = MagicMock()
+        prefetcher = parent.prefetcher
+        weight_store = parent.weight_store
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        lm = LoadedModel(
+            name="expired:latest",
+            hf_path="test/model",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            weight_store=weight_store,
+            is_flash=True,
+            expires_at=time.time() - 10,
+        )
+        manager._loaded["expired:latest"] = lm
+
+        await manager._expire_stale()
+
+        assert "expired:latest" not in manager._loaded
+        prefetcher.close.assert_called_once()
+        weight_store.close.assert_called_once()
+        call_names = [c[0] for c in parent.mock_calls]
+        assert call_names.index("prefetcher.close") < call_names.index(
+            "weight_store.close"
+        )
+
+    @pytest.mark.asyncio
+    async def test_expire_stale_skips_active(self, registry, mock_store):
+        """Models with active_refs > 0 must not be expired or closed."""
+        manager = ModelManager(registry, mock_store)
+        prefetcher = MagicMock()
+        weight_store = MagicMock()
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        lm = LoadedModel(
+            name="busy:latest",
+            hf_path="test/model",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            weight_store=weight_store,
+            is_flash=True,
+            expires_at=time.time() - 10,
+            active_refs=1,
+        )
+        manager._loaded["busy:latest"] = lm
+
+        await manager._expire_stale()
+
+        assert "busy:latest" in manager._loaded
+        prefetcher.close.assert_not_called()
+        weight_store.close.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_expired_model_object_still_usable(self, registry, mock_store):
@@ -2609,6 +2888,158 @@ class TestEvictLruIfNeeded:
         manager._loaded["old"] = old
         manager._evict_lru_if_needed()
         assert "old" not in manager._loaded
+
+    def test_close_loaded_model_continues_on_failure(self, registry, mock_store):
+        """A raising prefetcher.close() must not skip weight_store/decoder cleanup.
+
+        Without try/finally chaining, a single resource failure during eviction
+        or expiry would leak the weight store's file descriptors and leave the
+        speculative decoder's GDN monkey-patch installed indefinitely.
+
+        _close_loaded_model always raises ExceptionGroup on any error
+        (single or multiple) so callers see a stable exception type.
+        """
+        manager = ModelManager(registry, mock_store)
+        prefetcher = MagicMock()
+        prefetcher.close.side_effect = RuntimeError("boom")
+        weight_store = MagicMock()
+        decoder = MagicMock()
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        lm = LoadedModel(
+            name="x",
+            hf_path="x/x",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            weight_store=weight_store,
+            speculative_decoder=decoder,
+            is_flash=True,
+        )
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            manager._close_loaded_model(lm)
+
+        # Single-failure case is still wrapped in ExceptionGroup for a
+        # stable contract — see docstring on _close_loaded_model.
+        assert len(exc_info.value.exceptions) == 1
+        assert isinstance(exc_info.value.exceptions[0], RuntimeError)
+        assert "boom" in str(exc_info.value.exceptions[0])
+        # Both subsequent resources must still be released.
+        weight_store.close.assert_called_once()
+        decoder.close.assert_called_once()
+        # LoadedModel-owned references are nulled so later code can't
+        # accidentally observe a closed resource. ``lm.model.prefetcher``
+        # is intentionally left alone — see helper docstring.
+        assert lm.weight_store is None
+        assert lm.speculative_decoder is None
+
+    def test_close_loaded_model_surfaces_multiple_failures(self, registry, mock_store):
+        """When two close() calls raise, both errors must surface.
+
+        Python's nested-try/finally silently replaces an earlier exception
+        with a later one. The per-resource try/except pattern collects all
+        failures and raises an ExceptionGroup so neither failure is hidden.
+        """
+        manager = ModelManager(registry, mock_store)
+        prefetcher = MagicMock()
+        prefetcher.close.side_effect = RuntimeError("prefetcher-boom")
+        weight_store = MagicMock()
+        weight_store.close.side_effect = RuntimeError("weight-store-boom")
+        decoder = MagicMock()
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        lm = LoadedModel(
+            name="x",
+            hf_path="x/x",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            weight_store=weight_store,
+            speculative_decoder=decoder,
+            is_flash=True,
+        )
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            manager._close_loaded_model(lm)
+
+        messages = [str(e) for e in exc_info.value.exceptions]
+        assert any("prefetcher-boom" in m for m in messages)
+        assert any("weight-store-boom" in m for m in messages)
+        # Decoder still closed despite both prior failures.
+        decoder.close.assert_called_once()
+        # Failed close() leaves the reference alive — preserves the
+        # partially-closed object for inspection / retry. Successful
+        # decoder close still nulls its field.
+        assert lm.weight_store is weight_store
+        assert lm.speculative_decoder is None
+
+    def test_evict_absorbs_close_failure(
+        self, registry, mock_store, monkeypatch, caplog
+    ):
+        """LRU eviction must not propagate close() failures.
+
+        A stuck prefetcher would otherwise permanently block all future
+        model loads. The eviction site logs the error and continues.
+        """
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+        manager = ModelManager(registry, mock_store)
+        prefetcher = MagicMock()
+        prefetcher.close.side_effect = RuntimeError("stuck-prefetcher")
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            is_flash=True,
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["old"] = old
+
+        with caplog.at_level(logging.ERROR, logger="olmlx.engine.model_manager"):
+            manager._evict_lru_if_needed()  # must not raise
+
+        assert "old" not in manager._loaded
+        # _close_loaded_model logs per-resource; eviction site absorbs silently.
+        assert any(
+            "Error closing prefetcher for old" in r.message for r in caplog.records
+        )
+
+    def test_closes_flash_resources_on_evict(self, registry, mock_store, monkeypatch):
+        """LRU eviction of a Flash model must close prefetcher + weight_store.
+
+        Otherwise ThreadPoolExecutor workers and per-layer file descriptors
+        leak for every evicted Flash model (issue #178).
+        """
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+        manager = ModelManager(registry, mock_store)
+        # Wire both resources through the same ``parent`` MagicMock so the
+        # cross-resource ordering assertion below has a single ordered call
+        # log to inspect. See the matching test in TestExpiryChecker.
+        parent = MagicMock()
+        prefetcher = parent.prefetcher
+        weight_store = parent.weight_store
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            weight_store=weight_store,
+            is_flash=True,
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["old"] = old
+        manager._evict_lru_if_needed()
+        prefetcher.close.assert_called_once()
+        weight_store.close.assert_called_once()
+        # Order matters: prefetcher tasks submit into the weight store's pool,
+        # so the prefetcher must shut down before the weight store.
+        call_names = [c[0] for c in parent.mock_calls]
+        assert call_names.index("prefetcher.close") < call_names.index(
+            "weight_store.close"
+        )
 
 
 class TestSpeculativeLoading:

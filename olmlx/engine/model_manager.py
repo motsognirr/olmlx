@@ -289,6 +289,16 @@ class SpectralCalibrationMissingError(FileNotFoundError):
     """Raised when SpectralQuant is configured but calibration data is absent."""
 
 
+class ActiveRequestsError(RuntimeError):
+    """Raised by ``ModelManager.unload`` when a model has in-flight requests.
+
+    Subclasses ``RuntimeError`` so legacy ``except RuntimeError:`` keeps
+    working, but the dedicated type lets HTTP routers narrow the 409 path
+    to exactly this condition. Without it, an unrelated ``RuntimeError``
+    from ``_close_loaded_model`` would be misreported as 409.
+    """
+
+
 @dataclass
 class CachedPromptState:
     """KV cache state from a previous generation, for prompt cache reuse."""
@@ -844,6 +854,65 @@ class ModelManager:
             keep_alive if keep_alive is not None else settings.default_keep_alive
         )
 
+    @staticmethod
+    def _close_loaded_model(lm: "LoadedModel") -> None:
+        """Release resources held by a LoadedModel.
+
+        Used by every lifecycle exit (explicit unload, LRU eviction, keep-alive
+        expiry). Without this, Flash models leak ThreadPoolExecutor workers and
+        per-layer file descriptors on eviction/expiry — issue #178.
+
+        Order matters: prefetcher tasks submit into the weight store's pool, so
+        the prefetcher must shut down before the weight store. Closing the
+        speculative decoder (not just dropping the reference) is required when
+        it owns a ``GDNStateCapture`` for a hybrid linear-attention
+        target/draft: the class-level monkey-patch holds a strong reference to
+        the capture instance via its closure, so ``__del__`` never fires and
+        the patch lock stays held until ``close()`` is called explicitly.
+
+        Each close() is attempted independently and logged at point of
+        failure. On any error, always raises an ``ExceptionGroup`` carrying
+        every failure — even when only one resource failed — so callers see
+        a stable exception type. Without this, code writing
+        ``except RuntimeError:`` around the single-failure case would
+        silently miss a two-failure case. Use ``except*`` (PEP 654) to
+        handle individual member types.
+
+        Python's nested-try/finally would otherwise silently discard
+        earlier exceptions when a later finally also raised.
+        """
+        errors: list[BaseException] = []
+        if getattr(lm.model, "prefetcher", None) is not None:
+            try:
+                lm.model.prefetcher.close()
+            except Exception as exc:
+                logger.exception("Error closing prefetcher for %s", lm.name)
+                errors.append(exc)
+        if lm.weight_store is not None:
+            try:
+                lm.weight_store.close()
+                # Null only on success — if close() raised, the store may
+                # be partially closed (executor mid-drain). Preserving the
+                # reference lets a future cleanup path (or test) inspect
+                # the failed object instead of orphaning it. Same reasoning
+                # for speculative_decoder below.
+                lm.weight_store = None
+            except Exception as exc:
+                logger.exception("Error closing weight store for %s", lm.name)
+                errors.append(exc)
+        if lm.speculative_decoder is not None:
+            try:
+                lm.speculative_decoder.close()
+                lm.speculative_decoder = None
+            except Exception as exc:
+                logger.exception("Error closing speculative decoder for %s", lm.name)
+                errors.append(exc)
+        # ``lm.model.prefetcher`` is intentionally not nulled — it lives on
+        # the FlashModelWrapper, not on the LM bookkeeping, and the wrapper
+        # goes away with the LM.
+        if errors:
+            raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
+
     def _evict_lru_if_needed(self) -> None:
         """Evict least-recently-used models until below max_loaded_models.
 
@@ -859,16 +928,18 @@ class ModelManager:
             oldest_name = min(evictable, key=lambda k: evictable[k].loaded_at)
             logger.info("Evicting model %s", oldest_name)
             evicted = self._loaded.pop(oldest_name)
-            # Release draft model Metal memory promptly. Closing the
-            # decoder (not just dropping the reference) is required when
-            # the decoder owns a ``GDNStateCapture`` for a hybrid
-            # linear-attention target/draft: the class-level monkey-patch
-            # holds a strong reference to the capture instance via its
-            # closure, so ``__del__`` never fires and the patch lock
-            # stays held until ``close()`` is called explicitly.
-            if evicted.speculative_decoder is not None:
-                evicted.speculative_decoder.close()
-            evicted.speculative_decoder = None
+            # Absorb cleanup failures so a stuck prefetcher on the evicted
+            # model can't permanently block subsequent model loads. The model
+            # is already removed from ``_loaded``; the new load will proceed
+            # with leaked threads/fds rather than failing.
+            # Narrowed to ExceptionGroup to match _close_loaded_model's
+            # documented contract (always raises ExceptionGroup on any
+            # error) — same shape as the catch in unload(). An unexpected
+            # non-ExceptionGroup exception would propagate as a bug.
+            try:
+                self._close_loaded_model(evicted)
+            except ExceptionGroup:
+                pass  # already logged per-resource inside _close_loaded_model
             del evicted
 
         # Flush Metal allocator cache so that buffers from evicted models
@@ -1074,7 +1145,6 @@ class ModelManager:
                     # Detect if flash mode was used
                     is_flash = False
                     is_flash_moe = False
-                    _weight_store = None
                     try:
                         from olmlx.engine.flash.flash_model import (
                             FlashModelWrapper,
@@ -1088,11 +1158,13 @@ class ModelManager:
                             FlashMoeModelWrapper,
                         )
 
-                        if isinstance(model, FlashMoeModelWrapper):
-                            is_flash_moe = True
-                            _weight_store = getattr(model, "_weight_store", None)
+                        is_flash_moe = isinstance(model, FlashMoeModelWrapper)
                     except ImportError:
                         pass
+                    # Both Flash wrappers store the underlying weight store as
+                    # ``_weight_store`` so eviction / keep-alive expiry can
+                    # close it. Non-Flash models leave this at None.
+                    _weight_store = getattr(model, "_weight_store", None)
 
                     lm = LoadedModel(
                         name=normalized,
@@ -1213,30 +1285,30 @@ class ModelManager:
     def unload(self, name: str) -> bool:
         """Unload a model. Returns True if unloaded, False if not loaded.
 
-        Raises RuntimeError if model has active requests.
+        Raises ActiveRequestsError if model has in-flight requests.
+
+        Close failures from ``_close_loaded_model`` are absorbed: the
+        model is already gone from ``_loaded`` (won't accept new
+        requests), so the user-visible unload semantics are satisfied
+        even if some background threads leaked. The per-resource log
+        lines inside ``_close_loaded_model`` record what failed.
+        Surfacing the ExceptionGroup as a 500 instead would leave the
+        client unable to distinguish "close failed, model is gone" from
+        an unrelated 500 — and either way, the model is gone.
         """
         normalized = self.registry.normalize_name(name)
         lm = self._loaded.get(normalized)
         if lm is None:
             return False
         if lm.active_refs > 0:
-            raise RuntimeError(
+            raise ActiveRequestsError(
                 f"Model '{normalized}' has {lm.active_refs} active request(s)"
             )
         lm = self._loaded.pop(normalized)
-        # Close prefetcher *before* weight store: prefetcher tasks submit into
-        # the weight store's pool, so weight store must outlive the prefetcher.
-        if hasattr(lm.model, "prefetcher") and lm.model.prefetcher is not None:
-            lm.model.prefetcher.close()
-        if lm.weight_store is not None:
-            lm.weight_store.close()
-        # Release draft model Metal memory promptly and unhook the
-        # class-level GatedDeltaNet patch if one is installed (hybrid
-        # target/draft). See the eviction site above for why ``close()``
-        # is required — ``__del__`` cannot break the closure cycle.
-        if lm.speculative_decoder is not None:
-            lm.speculative_decoder.close()
-        lm.speculative_decoder = None
+        try:
+            self._close_loaded_model(lm)
+        except ExceptionGroup:
+            pass  # already logged per-resource inside _close_loaded_model
         return True
 
     # Config keys that indicate a vision-language model
@@ -2738,24 +2810,67 @@ class ModelManager:
     async def _expire_stale(self):
         """Unload models whose keep-alive has expired (active_refs == 0)."""
         now = time.time()
+        # Pop expired entries under the lock, then close them after releasing
+        # it. _close_loaded_model calls executor.shutdown(wait=True) which
+        # blocks the event loop until the pool drains; holding self._lock
+        # during that would stall every concurrent ensure_loaded() caller.
+        # Models with active_refs > 0 are skipped — they are currently
+        # serving requests. Even if a model slips through with
+        # active_refs == 0 between ensure_loaded() and _inference_ref(),
+        # the caller still holds a Python reference, so the model/
+        # tokenizer stay alive; only the _loaded dict entry is removed.
         async with self._lock:
-            # Models with active_refs > 0 are skipped — they are currently
-            # serving requests.  Even if a model slips through with
-            # active_refs == 0 between ensure_loaded() and _inference_ref(),
-            # the caller still holds a Python reference, so the model/
-            # tokenizer stay alive; only the _loaded dict entry is removed.
-            expired = [
-                name
-                for name, lm in self._loaded.items()
-                if lm.expires_at is not None
-                and lm.expires_at <= now
-                and lm.active_refs == 0
-            ]
-            for name in expired:
-                logger.info("Unloading expired model %s", name)
-                del self._loaded[name]
+            expired_lms: list[LoadedModel] = []
+            for name, lm in list(self._loaded.items()):
+                if (
+                    lm.expires_at is not None
+                    and lm.expires_at <= now
+                    and lm.active_refs == 0
+                ):
+                    logger.info("Unloading expired model %s", name)
+                    expired_lms.append(self._loaded.pop(name))
+
+        # Close outside the lock AND off the event loop thread.
+        # ``_close_loaded_model`` calls ``executor.shutdown(wait=True)`` on
+        # the prefetcher (16 threads) and weight store (32 threads); that
+        # join is synchronous, so running it on the event loop would stall
+        # every concurrent coroutine until the pools drained. ``to_thread``
+        # offloads the join. Per-model isolation: one failing close() must
+        # not skip the remaining expired models — _close_loaded_model
+        # already logs per-resource, so callers absorb silently.
+        # Pop from the list so no live reference (including the loop
+        # variable) survives into the gc.collect() below — otherwise the
+        # Metal buffers attached to the LoadedModel can't be reclaimed and
+        # mx.clear_cache() runs against nothing. Same reason
+        # _evict_lru_if_needed calls ``del evicted``.
+        flush = bool(expired_lms) and not self._pending_cleanups
+        while expired_lms:
+            lm = expired_lms.pop()
+            try:
+                await asyncio.to_thread(self._close_loaded_model, lm)
+            except ExceptionGroup:
+                pass  # already logged per-resource inside _close_loaded_model
+            del lm
+
+        # Flush Metal allocator cache so freed buffers don't inflate the
+        # next ensure_loaded() memory check. Mirrors _evict_lru_if_needed.
+        # Skip when any deferred cleanup is pending — a background thread
+        # for a different model may still be allocating Metal memory.
+        if flush:
+            gc.collect()
+            mx.clear_cache()
 
     async def _check_expiry_loop(self):
         while True:
             await asyncio.sleep(30)
-            await self._expire_stale()
+            # Guard the while True: any unhandled exception here would
+            # permanently kill the background expiry task and leak models
+            # indefinitely. Per-model errors are already absorbed inside
+            # ``_expire_stale``; this catch is a belt-and-braces for the
+            # surrounding async machinery (CancelledError still propagates).
+            try:
+                await self._expire_stale()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Expiry check failed")

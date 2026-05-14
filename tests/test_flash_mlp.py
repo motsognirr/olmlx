@@ -351,6 +351,22 @@ class TestFlashModelWrapperShard:
         wrapper = FlashModelWrapper(model, predictor_bank, store, config)
         return wrapper, model, dim, n_heads, n_kv_heads, num_layers
 
+    def test_wrapper_exposes_weight_store_attribute(self, wrapper_setup):
+        """FlashModelWrapper must surface its weight store as ``_weight_store``.
+
+        ``ModelManager._close_loaded_model`` closes ``lm.weight_store`` on
+        eviction and keep-alive expiry; the value comes from
+        ``getattr(model, "_weight_store", None)`` in the LoadedModel
+        construction block. Without this attribute on the dense wrapper,
+        every non-MoE Flash model leaks its FlashWeightStore's
+        ThreadPoolExecutor and per-layer file descriptors on rollover.
+        """
+        wrapper, *_ = wrapper_setup
+        assert wrapper._weight_store is not None
+        from olmlx.engine.flash.weight_store import FlashWeightStore
+
+        assert isinstance(wrapper._weight_store, FlashWeightStore)
+
     def test_shard_divides_attention_heads(self, wrapper_setup):
         """shard() should divide n_heads and n_kv_heads by world size."""
         from olmlx.engine.pre_shard import FakeGroup

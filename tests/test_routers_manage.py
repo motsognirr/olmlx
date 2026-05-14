@@ -217,6 +217,43 @@ class TestManageRouter:
             lm.active_refs = 0
 
     @pytest.mark.asyncio
+    async def test_unload_close_failure_returns_200(self, app_client):
+        """A close() failure absorbs cleanly: 200 with the model gone.
+
+        The model is already removed from ``_loaded`` before the close
+        is attempted, so from the client's perspective the unload
+        succeeded — the per-resource log entries inside
+        ``_close_loaded_model`` capture what leaked. Routing the close
+        failure as 500 would prevent the client from distinguishing
+        "close failed, model is gone" from an unrelated 500, and either
+        way the model is gone.
+
+        This also confirms close failures are NOT misreported as 409,
+        which was the pre-PR bug (router caught bare RuntimeError).
+        """
+        from unittest.mock import MagicMock
+
+        manager = app_client._transport.app.state.model_manager
+        lm = manager._loaded["qwen3:latest"]
+        original_close = manager._close_loaded_model
+        manager._close_loaded_model = MagicMock(
+            side_effect=ExceptionGroup(
+                "simulated close failure",
+                [RuntimeError("simulated prefetcher close failure")],
+            )
+        )
+        try:
+            resp = await app_client.post("/api/unload", json={"model": "qwen3"})
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "unloaded"
+            # Model is in fact gone from _loaded even though close failed.
+            assert "qwen3:latest" not in manager._loaded
+        finally:
+            manager._close_loaded_model = original_close
+            # Restore the LoadedModel for subsequent tests.
+            manager._loaded["qwen3:latest"] = lm
+
+    @pytest.mark.asyncio
     async def test_abort_returns_noop(self, app_client):
         resp = await app_client.post("/api/abort", json={"model": "qwen3"})
         assert resp.status_code == 200

@@ -161,10 +161,18 @@ async def abort_generation(req: AbortRequest, request: Request):
 @router.post("/api/unload")
 async def unload_model(req: UnloadRequest, request: Request):
     """Manually unload a model from VRAM."""
+    from olmlx.engine.model_manager import ActiveRequestsError
+
     manager = request.app.state.model_manager
     try:
         unloaded = manager.unload(req.model)
-    except RuntimeError as e:
+    except ActiveRequestsError as e:
+        # 409 is narrow on purpose: only "model has active requests".
+        # Resource-close failures inside ``_close_loaded_model`` are
+        # absorbed by ``ModelManager.unload`` itself (the model is gone
+        # from ``_loaded`` regardless), so the router never sees them —
+        # they show up only in the per-resource log lines inside the
+        # helper.
         return JSONResponse({"error": str(e)}, status_code=409)
     if not unloaded:
         return JSONResponse(

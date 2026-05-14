@@ -66,6 +66,12 @@ class FlashModelWrapper(nn.Module):
         # for _-prefixed names).
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_sharded", False)
+        # Surface the weight store so ModelManager can close it on
+        # eviction / keep-alive expiry. Without this attribute, the
+        # FlashWeightStore's 32-thread ThreadPoolExecutor and per-layer
+        # file descriptors leak when a dense Flash model rolls out.
+        # Mirrors FlashMoeModelWrapper._weight_store.
+        object.__setattr__(self, "_weight_store", weight_store)
         self.window_manager = WindowManager(
             flash_config.num_layers,
             flash_config.window_size,
