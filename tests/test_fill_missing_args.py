@@ -1,6 +1,6 @@
-"""Tests for _fill_missing_required_args in the OpenAI router."""
+"""Tests for ``fill_missing_required_args``."""
 
-from olmlx.routers.openai import _fill_missing_required_args
+from olmlx.engine.tool_parser import fill_missing_required_args
 
 
 def _make_tool_def(name: str, properties: dict, required: list[str]) -> dict:
@@ -37,7 +37,7 @@ class TestFillMissingRequiredArgs:
         ]
         tool_uses = [_make_tool_use("bash", {"command": "ls -F"})]
 
-        _fill_missing_required_args(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
 
         assert tool_uses[0]["input"]["description"] == ""
         assert tool_uses[0]["input"]["command"] == "ls -F"
@@ -58,7 +58,7 @@ class TestFillMissingRequiredArgs:
             _make_tool_use("bash", {"command": "ls", "description": "List files"})
         ]
 
-        _fill_missing_required_args(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
 
         assert tool_uses[0]["input"]["description"] == "List files"
 
@@ -73,7 +73,7 @@ class TestFillMissingRequiredArgs:
         ]
         tool_uses = [_make_tool_use("bash", {"command": None})]
 
-        _fill_missing_required_args(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
 
         assert tool_uses[0]["input"]["command"] == ""
 
@@ -91,7 +91,7 @@ class TestFillMissingRequiredArgs:
         ]
         tool_uses = [_make_tool_use("search", {"query": "foo"})]
 
-        _fill_missing_required_args(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
 
         assert "limit" not in tool_uses[0]["input"]
 
@@ -109,20 +109,55 @@ class TestFillMissingRequiredArgs:
         ]
         tool_uses = [_make_tool_use("search", {"query": "foo", "limit": None})]
 
-        _fill_missing_required_args(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
 
         assert tool_uses[0]["input"]["limit"] is None
 
     def test_no_op_when_tools_none(self):
         """None declared_tools is a safe no-op."""
         tool_uses = [_make_tool_use("bash", {"command": "ls"})]
-        _fill_missing_required_args(tool_uses, None)
+        fill_missing_required_args(tool_uses, None)
         assert tool_uses[0]["input"] == {"command": "ls"}
+
+    def test_input_none_is_promoted_to_empty_dict(self):
+        """When a tool_use arrives with ``input=None`` and matches a declared
+        tool, ``input`` is replaced with an empty dict — even when no
+        required string injection runs.  Documents the deliberate
+        ``None → {}`` promotion called out in the function's docstring."""
+        tools = [_make_tool_def("noop", {"count": {"type": "integer"}}, ["count"])]
+        tool_uses = [{"type": "tool_use", "id": "x", "name": "noop", "input": None}]
+        fill_missing_required_args(tool_uses, tools)
+        assert tool_uses[0]["input"] == {}
+
+    def test_input_none_normalized_when_tool_has_no_required_params(self):
+        """``None → {}`` is unconditional for any tool present in the
+        declared list, including ones with zero required params.  Pins the
+        contract so callers can always treat ``tu["input"]`` as a dict
+        after the call without an ``or {}`` guard."""
+        tools = [
+            _make_tool_def(
+                "noop",
+                {"count": {"type": "integer"}},
+                [],  # no required params
+            )
+        ]
+        tool_uses = [{"type": "tool_use", "id": "x", "name": "noop", "input": None}]
+        fill_missing_required_args(tool_uses, tools)
+        assert tool_uses[0]["input"] == {}
+
+    def test_input_none_preserved_for_unknown_tool(self):
+        """If the tool is not in the declared list, ``input`` is left
+        untouched (None stays None).  We have no schema to normalize
+        against, so the caller decides what to do with the unknown call."""
+        tools = [_make_tool_def("known", {}, [])]
+        tool_uses = [{"type": "tool_use", "id": "x", "name": "unknown", "input": None}]
+        fill_missing_required_args(tool_uses, tools)
+        assert tool_uses[0]["input"] is None
 
     def test_no_op_when_tools_empty(self):
         """Empty declared_tools is a safe no-op."""
         tool_uses = [_make_tool_use("bash", {"command": "ls"})]
-        _fill_missing_required_args(tool_uses, [])
+        fill_missing_required_args(tool_uses, [])
         assert tool_uses[0]["input"] == {"command": "ls"}
 
     def test_unmatched_tool_name_ignored(self):
@@ -136,7 +171,7 @@ class TestFillMissingRequiredArgs:
         ]
         tool_uses = [_make_tool_use("bash", {"command": "ls"})]
 
-        _fill_missing_required_args(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
 
         assert tool_uses[0]["input"] == {"command": "ls"}
 
@@ -157,7 +192,7 @@ class TestFillMissingRequiredArgs:
             _make_tool_use("bash", {"command": "pwd", "description": "Print dir"}),
         ]
 
-        _fill_missing_required_args(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
 
         assert tool_uses[0]["input"]["description"] == ""
         assert tool_uses[1]["input"]["description"] == "Print dir"
@@ -176,7 +211,7 @@ class TestFillMissingRequiredArgs:
         ]
         tool_uses = [_make_tool_use("bash", {"command": "ls"})]
 
-        _fill_missing_required_args(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
 
         assert tool_uses[0]["input"]["description"] == ""
 
@@ -194,7 +229,7 @@ class TestFillMissingRequiredArgs:
         ]
         tool_uses = [_make_tool_use("BASH", {"command": "ls"})]
 
-        _fill_missing_required_args(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
 
         assert tool_uses[0]["input"]["description"] == ""
 
@@ -212,7 +247,7 @@ class TestFillMissingRequiredArgs:
         ]
         tool_uses = [_make_tool_use("bash", {})]
 
-        _fill_missing_required_args(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
 
         assert tool_uses[0]["input"] == {"command": "", "description": ""}
 
@@ -221,6 +256,6 @@ class TestFillMissingRequiredArgs:
         tools = [{"type": "function", "function": {"name": "noop"}}]
         tool_uses = [_make_tool_use("noop", {})]
 
-        _fill_missing_required_args(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
 
         assert tool_uses[0]["input"] == {}

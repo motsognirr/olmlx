@@ -13,8 +13,13 @@ from olmlx.engine.inference import (
     generate_completion,
     generate_embeddings,
 )
-from olmlx.engine.tool_parser import parse_model_output, resolve_tool_names
+from olmlx.engine.tool_parser import (
+    fill_missing_required_args,
+    parse_model_output,
+    resolve_tool_names,
+)
 from olmlx.routers.common import build_inference_options
+from olmlx.utils.streaming import flush_thinking_buffer, strip_thinking_streaming
 from olmlx.schemas.openai import (
     OpenAIChatMessage,
     OpenAIChatRequest,
@@ -44,59 +49,6 @@ def _make_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
 
-def _fill_missing_required_args(
-    tool_uses: list[dict],
-    declared_tools: list[dict] | None,
-) -> None:
-    """Fill missing required string arguments in tool calls from the client's schema.
-
-    Models sometimes omit fields the client marks as required (e.g. opencode's
-    ``description`` on bash).  Walk the declared tool schemas and inject an
-    empty string for any required string parameter the model left out.
-    Mutates *tool_uses* in place.
-    """
-    if not declared_tools:
-        return
-
-    # Build lookup: lowercase tool name -> {param: type} for required params
-    schema_by_tool: dict[str, dict[str, str]] = {}
-    for tool in declared_tools:
-        func = tool.get("function") or {}
-        name = (func.get("name") or "").lower()
-        params = func.get("parameters") or {}
-        required = set(params.get("required", []))
-        properties = params.get("properties") or {}
-        schema_by_tool[name] = {
-            k: v.get("type", "") for k, v in properties.items() if k in required
-        }
-
-    for tu in tool_uses:
-        required_params = schema_by_tool.get((tu.get("name") or "").lower())
-        if not required_params:
-            continue
-        inp = tu.get("input") or {}
-        changed = False
-        for param, param_type in required_params.items():
-            if param not in inp or inp[param] is None:
-                if param_type == "string":
-                    logger.warning(
-                        "Tool '%s' missing required string param '%s', injecting empty string",
-                        tu.get("name"),
-                        param,
-                    )
-                    inp[param] = ""
-                    changed = True
-                else:
-                    logger.warning(
-                        "Tool '%s' missing required param '%s' (type %r), cannot inject default",
-                        tu.get("name"),
-                        param,
-                        param_type,
-                    )
-        if changed:
-            tu["input"] = inp
-
-
 def _to_openai_tool_calls(tool_uses: list[dict]) -> list[dict]:
     """Convert parsed tool_use blocks to OpenAI tool_calls format."""
     return [
@@ -110,121 +62,6 @@ def _to_openai_tool_calls(tool_uses: list[dict]) -> list[dict]:
         }
         for tu in tool_uses
     ]
-
-
-def _strip_thinking_streaming(text: str, state: dict) -> str:
-    """Strip ``<think>...</think>`` blocks from streaming text chunks.
-
-    Uses *state* dict to track position across calls.  Keys:
-
-    - ``phase``: one of ``"detect"``, ``"in_think"``, ``"passthrough"``
-    - ``buffer``: accumulated text waiting to be resolved
-
-    **Phases:**
-
-    ``detect`` (initial) — The chat template may have opened ``<think>``
-    inside the prompt, so the generated text could start mid-think with
-    only a closing ``</think>``.  We buffer all content until we can
-    determine which case we're in:
-
-    * ``</think>`` seen first → discard buffer (orphaned thinking),
-      switch to ``passthrough``.
-    * ``<think>`` seen first → emit buffer, switch to ``in_think``.
-    * Neither tag after the stream ends → emit buffer (no thinking).
-
-    ``in_think`` — Inside a ``<think>`` block; discard until ``</think>``.
-
-    ``passthrough`` — Emit everything, but still strip any new
-    ``<think>...</think>`` blocks that appear later.
-    """
-    buf = state.get("buffer", "") + text
-    out_parts: list[str] = []
-    phase = state.get("phase", "detect")
-
-    thinking_expected = state.get("thinking_expected", False)
-    while buf:
-        if phase == "detect":
-            open_idx = buf.find("<think>")
-            close_idx = buf.find("</think>")
-
-            if (
-                close_idx != -1
-                and (open_idx == -1 or close_idx < open_idx)
-                and thinking_expected
-            ):
-                # Orphaned </think> — discard everything before it.
-                # Only fires when thinking is actually expected for this
-                # request; otherwise the model is just mentioning the
-                # literal token and we leave the text untouched.
-                buf = buf[close_idx + len("</think>") :]
-                phase = "passthrough"
-            elif open_idx != -1:
-                # Normal <think> — emit text before it, enter in_think.
-                out_parts.append(buf[:open_idx])
-                buf = buf[open_idx + len("<think>") :]
-                phase = "in_think"
-            else:
-                # Neither tag yet.  Keep buffering to detect a potential
-                # orphaned </think> at the start of the stream.  Once the
-                # buffer grows large enough that an orphaned tag is very
-                # unlikely, emit the safe prefix and transition to
-                # passthrough so non-thinking models stream progressively.
-                # When the caller knows thinking is expected (issue #307),
-                # the limit is raised so Qwen3.5/3.6's long orphan-prefix
-                # thinking is detected even though `</think>` arrives only
-                # after several thousand characters.
-                detect_limit = state.get("detect_limit", 200)
-                if len(buf) > detect_limit:
-                    out_parts.append(buf)
-                    buf = ""
-                    phase = "passthrough"
-                break
-
-        elif phase == "in_think":
-            end = buf.find("</think>")
-            if end == -1:
-                buf = ""
-            else:
-                buf = buf[end + len("</think>") :]
-                phase = "passthrough"
-
-        else:  # passthrough
-            open_idx = buf.find("<think>")
-            if open_idx == -1:
-                longest_partial = 0
-                for i in range(1, min(len("<think>"), len(buf) + 1)):
-                    if "<think>".startswith(buf[-i:]):
-                        longest_partial = i
-                        break
-                if longest_partial:
-                    out_parts.append(buf[:-longest_partial])
-                    buf = buf[-longest_partial:]
-                    break
-                else:
-                    out_parts.append(buf)
-                    buf = ""
-            else:
-                out_parts.append(buf[:open_idx])
-                buf = buf[open_idx + len("<think>") :]
-                phase = "in_think"
-
-    state["buffer"] = buf
-    state["phase"] = phase
-    return "".join(out_parts)
-
-
-def _flush_thinking_buffer(state: dict) -> str:
-    """Flush any remaining buffer when the stream ends.
-
-    If we're still in ``detect`` phase (never saw any think tag),
-    the buffered content is real output — emit it.
-    """
-    buf = state.get("buffer", "")
-    phase = state.get("phase", "detect")
-    state["buffer"] = ""
-    if phase == "detect":
-        return buf
-    return ""
 
 
 async def _stream_openai_sse(
@@ -260,7 +97,7 @@ async def _stream_openai_sse(
             if chunk.get("done"):
                 # Flush any buffered content from thinking detection.
                 if strip_thinking:
-                    flushed = _flush_thinking_buffer(think_state)
+                    flushed = flush_thinking_buffer(think_state)
                     if flushed:
                         data = {
                             "id": response_id,
@@ -290,7 +127,7 @@ async def _stream_openai_sse(
             else:
                 text = chunk.get("text", "")
                 if strip_thinking:
-                    text = _strip_thinking_streaming(text, think_state)
+                    text = strip_thinking_streaming(text, think_state)
                 if not text:
                     continue
                 data = {
@@ -361,7 +198,7 @@ async def _stream_openai_sse_with_tools(
             text_for_parsing, True, thinking_expected=thinking_expected
         )
         resolve_tool_names(tool_uses, declared_tools)
-        _fill_missing_required_args(tool_uses, declared_tools)
+        fill_missing_required_args(tool_uses, declared_tools)
         logger.debug(
             "Buffered tool stream (%d chars): thinking=%d visible=%d tool_uses=%d raw=%s",
             len(full_text),
@@ -547,8 +384,11 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             cache_id=cache_id,
         )
         text = result.get("text", "")
-        # Use raw_text for tool parsing (preserves gpt-oss channel tokens)
-        parse_text = result.get("raw_text", text)
+        # Use raw_text for tool parsing (preserves gpt-oss channel tokens);
+        # ``or text`` (not ``.get(key, text)``) so an empty-string ``raw_text``
+        # from generate_chat also falls back to the cleaned text, matching
+        # the streaming path above and the Ollama chat router.
+        parse_text = result.get("raw_text") or text
         logger.debug(
             "Raw model output (%d chars): %s", len(parse_text), parse_text[:1000]
         )
@@ -565,7 +405,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             thinking_expected=bool(result.get("thinking_expected")),
         )
         resolve_tool_names(tool_uses, req.tools)
-        _fill_missing_required_args(tool_uses, req.tools)
+        fill_missing_required_args(tool_uses, req.tools)
 
         tool_calls = _to_openai_tool_calls(tool_uses) if tool_uses else None
         done_reason = result.get("done_reason")
