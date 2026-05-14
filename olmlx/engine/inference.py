@@ -1352,6 +1352,26 @@ def _get_chat_template_text(tokenizer: Any) -> str:
     return tpl if isinstance(tpl, str) else ""
 
 
+def _resolve_thinking_active(
+    caps: TemplateCaps,
+    tools: list[dict] | None,
+    enable_thinking: bool | None,
+) -> bool:
+    """Return whether the chat template will request thinking for this call.
+
+    Centralises the resolution rules used both inside ``_apply_chat_template``
+    (to set the ``enable_thinking`` kwarg) and by ``generate_chat`` (to tell
+    streaming routers whether to wait for an orphan `</think>` — issue #307).
+    """
+    if not caps.supports_enable_thinking:
+        return False
+    if enable_thinking is not None:
+        return enable_thinking
+    # Default: think unless tools were declared (backward compat for
+    # non-Anthropic callers that expect tool calls without thinking).
+    return not bool(tools)
+
+
 def _apply_chat_template(
     tokenizer: Any,
     messages: list[dict],
@@ -1380,14 +1400,9 @@ def _apply_chat_template(
         messages = _inject_tools_into_system(messages, tools)
 
     if caps.supports_enable_thinking:
-        if enable_thinking is not None:
-            kwargs["enable_thinking"] = enable_thinking
-        elif tools:
-            kwargs["enable_thinking"] = (
-                False  # backward compat for non-Anthropic callers
-            )
-        else:
-            kwargs["enable_thinking"] = True
+        kwargs["enable_thinking"] = _resolve_thinking_active(
+            caps, tools, enable_thinking
+        )
 
     try:
         return tokenizer.apply_chat_template(messages, **kwargs)
@@ -3027,20 +3042,9 @@ async def generate_chat(
             make_prompt_cache is not None,
         )
 
-    # Compute the *effective* thinking decision so streaming routers can tell
-    # whether to wait for a (possibly orphaned, see #307) `</think>` token.
-    # Mirrors the resolution in `_apply_chat_template`.
-    effective_thinking_kwarg: bool | None
-    if caps.supports_enable_thinking:
-        if enable_thinking is not None:
-            effective_thinking_kwarg = enable_thinking
-        elif tools:
-            effective_thinking_kwarg = False
-        else:
-            effective_thinking_kwarg = True
-    else:
-        effective_thinking_kwarg = None
-    thinking_expected = bool(effective_thinking_kwarg)
+    # Tell streaming routers whether to wait for a (possibly orphaned, see
+    # #307) `</think>` token — shares the rules with `_apply_chat_template`.
+    thinking_expected = _resolve_thinking_active(caps, tools, enable_thinking)
 
     if stream:
         return _prepend_meta(
@@ -3061,6 +3065,13 @@ async def generate_chat(
         return await _full_completion(
             lm, prompt, mt, gen_kwargs, stats, images, has_tools=bool(tools)
         )
+
+
+# Generous upper bound on how long a Qwen3.5/3.6-style orphan thinking
+# preamble may run before `</think>` arrives.  Streaming routers consult
+# this when the engine signals `thinking_expected=True` (issue #307);
+# centralised here so all three routers stay in sync.
+INIT_ORPHAN_DETECT_LIMIT = 65536
 
 
 async def _prepend_meta(

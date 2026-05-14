@@ -924,6 +924,58 @@ class TestAnthropicEndpoint:
         assert visible_text.strip() == "391"
 
     @pytest.mark.asyncio
+    async def test_streaming_literal_close_think_preserved_when_not_thinking(
+        self, app_client
+    ):
+        """When `thinking_expected=False`, a literal `</think>` in the
+        output (e.g. a non-thinking model explaining the syntax) must be
+        kept as text rather than reclassified as a thinking block."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": False}
+                yield {
+                    "text": "Use </think> to close the thought block.",
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "syntax?"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        thinking_text = ""
+        text_text = ""
+        for line in resp.text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") != "content_block_delta":
+                continue
+            delta = payload.get("delta", {})
+            if delta.get("type") == "thinking_delta":
+                thinking_text += delta.get("thinking", "")
+            elif delta.get("type") == "text_delta":
+                text_text += delta.get("text", "")
+
+        assert thinking_text == ""
+        assert "</think>" in text_text
+        assert text_text == "Use </think> to close the thought block."
+
+    @pytest.mark.asyncio
     async def test_streaming_partial_think_tag(self, app_client):
         """Test state machine when <think> tag arrives across multiple tokens."""
 
@@ -2431,4 +2483,26 @@ class TestFlushThinkingBuffer:
         assert '"content_block_start"' in events[0]
         assert '"type": "text"' in events[0]
         assert '"content_block_stop"' in events[1]
+        assert new_idx == 0
+
+    def test_flush_init_state_with_buffer(self):
+        """Issue #307: when `thinking_expected` holds the init state waiting
+        for an orphan `</think>` that never arrives (short non-thinking
+        response on a thinking-capable model), the buffered content must be
+        emitted as a text block — not silently dropped."""
+        from olmlx.routers.anthropic import _flush_thinking_buffer
+
+        events, new_idx = _flush_thinking_buffer(
+            state="init",
+            buffer="Streamed text",
+            block_idx=0,
+            text_block_started=False,
+        )
+        # Should emit: text start + delta + stop
+        assert len(events) == 3
+        assert '"content_block_start"' in events[0]
+        assert '"type": "text"' in events[0]
+        assert '"text_delta"' in events[1]
+        assert "Streamed text" in events[1]
+        assert '"content_block_stop"' in events[2]
         assert new_idx == 0

@@ -17,11 +17,17 @@ from olmlx.utils.timing import TimingStats
 class TestStripThinkingStreaming:
     """Unit tests for _strip_thinking_streaming."""
 
-    def _stream(self, chunks, detect_limit=None):
-        """Feed chunks through _strip_thinking_streaming, return list of outputs."""
+    def _stream(self, chunks, thinking_expected=False):
+        """Feed chunks through _strip_thinking_streaming, return list of outputs.
+
+        ``thinking_expected`` mirrors the router-side meta chunk: when True,
+        the orphan `</think>` branch is enabled and the detect buffer is
+        raised to the same generous limit used in production.
+        """
         state: dict = {}
-        if detect_limit is not None:
-            state["detect_limit"] = detect_limit
+        if thinking_expected:
+            state["thinking_expected"] = True
+            state["detect_limit"] = 65536
         results = []
         for chunk in chunks:
             out = _strip_thinking_streaming(chunk, state)
@@ -59,10 +65,15 @@ class TestStripThinkingStreaming:
         assert "reasoning" not in full
         assert "The answer." in full
 
-    def test_orphaned_close_think_still_stripped(self):
-        """Orphaned </think> must still be detected and stripped."""
+    def test_orphaned_close_think_stripped_when_thinking_expected(self):
+        """When thinking is expected, an orphan `</think>` strips its prefix.
+
+        The gate matters: a non-thinking model that emits the literal token
+        must keep it (covered by
+        ``test_literal_close_think_preserved_when_thinking_not_expected``).
+        """
         chunks = ["internal ", "thinking", "</think>", "visible"]
-        results = self._stream(chunks)
+        results = self._stream(chunks, thinking_expected=True)
         full = "".join(results)
         assert "internal" not in full
         assert "thinking" not in full
@@ -101,6 +112,22 @@ class TestStripThinkingStreaming:
             "Default detect_limit must keep non-thinking models progressive"
         )
 
+    def test_literal_close_think_preserved_when_thinking_not_expected(self):
+        """A model that doesn't support thinking and happens to emit the
+        literal `</think>` token (e.g. explaining thinking-tag syntax)
+        must not have its content silently reclassified."""
+        chunks = [
+            "When the assistant writes ",
+            "</think>",
+            " the closer ends the thought block.",
+        ]
+        results = self._stream(chunks)  # no detect_limit → not thinking
+        full = "".join(results)
+        # Every character is content; the literal tag survives intact.
+        assert "When the assistant writes" in full
+        assert "</think>" in full
+        assert "the closer ends the thought block." in full
+
     def test_long_orphaned_thinking_preamble_stripped(self):
         """Issue #307: Qwen3.5/3.6 emit thinking without ``<think>`` opener.
 
@@ -126,9 +153,10 @@ class TestStripThinkingStreaming:
             "\n</think>\n\n",
             "391",
         ]
-        # Mirror the router: when thinking is expected, the detect limit is
-        # raised so the orphan handler can wait for the late `</think>`.
-        results = self._stream(chunks, detect_limit=65536)
+        # Mirror the router: when thinking is expected, the orphan branch
+        # is enabled and the detect buffer is raised so the late `</think>`
+        # is caught.
+        results = self._stream(chunks, thinking_expected=True)
         full = "".join(results)
         assert "Thinking Process" not in full
         assert "Sanity check" not in full
@@ -1155,10 +1183,12 @@ class TestToolCallParsing:
     @pytest.mark.asyncio
     async def test_streaming_orphaned_think_close(self, app_client):
         """When the template opens <think> in the prompt, generated text starts
-        mid-think with only </think> — the thinking content must be stripped."""
+        mid-think with only </think> — the thinking content must be stripped.
+        Engine signals `thinking_expected=True` via the meta chunk."""
 
         async def mock_stream(*args, **kwargs):
             async def gen():
+                yield {"thinking_expected": True}
                 yield {"text": "reasoning about", "done": False}
                 yield {"text": " the problem\n", "done": False}
                 yield {"text": "</think>\n", "done": False}

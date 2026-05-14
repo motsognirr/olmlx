@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from olmlx.engine.inference import generate_chat
+from olmlx.engine.inference import INIT_ORPHAN_DETECT_LIMIT, generate_chat
 from olmlx.engine.tool_parser import parse_model_output
 from olmlx.routers.common import format_error
 from olmlx.schemas.chat import ChatRequest, Message
@@ -14,13 +14,6 @@ from olmlx.utils.streaming import safe_ndjson_stream
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-
-# Generous upper bound on how long a Qwen3.5/3.6-style orphan thinking
-# preamble may run before `</think>` arrives.  Matches the OpenAI router's
-# limit (issue #307).  Only consulted when the engine signals
-# `thinking_expected=True` via the stream meta chunk.
-_INIT_ORPHAN_DETECT_LIMIT = 65536
 
 
 def _split_thinking_streaming(text: str, state: dict) -> tuple[str, str]:
@@ -40,15 +33,23 @@ def _split_thinking_streaming(text: str, state: dict) -> tuple[str, str]:
     thinking_parts: list[str] = []
     content_parts: list[str] = []
     phase = state.get("phase", "detect")
-    detect_limit = _INIT_ORPHAN_DETECT_LIMIT if state.get("thinking_expected") else 200
+    thinking_expected = bool(state.get("thinking_expected"))
+    detect_limit = INIT_ORPHAN_DETECT_LIMIT if thinking_expected else 200
 
     while buf:
         if phase == "detect":
             open_idx = buf.find("<think>")
             close_idx = buf.find("</think>")
 
-            if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
+            if (
+                close_idx != -1
+                and (open_idx == -1 or close_idx < open_idx)
+                and thinking_expected
+            ):
                 # Orphan `</think>`: prefix is thinking content.
+                # Gated on `thinking_expected` so a non-thinking model that
+                # legitimately mentions the literal `</think>` token isn't
+                # silently routed into `message.thinking`.
                 thinking_parts.append(buf[:close_idx])
                 buf = buf[close_idx + len("</think>") :].lstrip("\n")
                 phase = "passthrough"
@@ -69,8 +70,9 @@ def _split_thinking_streaming(text: str, state: dict) -> tuple[str, str]:
         elif phase == "in_think":
             end = buf.find("</think>")
             if end == -1:
-                # Hold back up to 7 trailing chars in case `</think>` is
-                # split across two chunks; emit the rest as thinking.
+                # Hold back up to 8 trailing chars (the length of `</think>`)
+                # in case the tag is split across two chunks; emit the rest
+                # as thinking.
                 if len(buf) > 8:
                     thinking_parts.append(buf[:-8])
                     buf = buf[-8:]

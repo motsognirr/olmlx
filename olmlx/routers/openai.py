@@ -8,6 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from olmlx.engine.inference import (
+    INIT_ORPHAN_DETECT_LIMIT,
     generate_chat,
     generate_completion,
     generate_embeddings,
@@ -140,13 +141,21 @@ def _strip_thinking_streaming(text: str, state: dict) -> str:
     out_parts: list[str] = []
     phase = state.get("phase", "detect")
 
+    thinking_expected = state.get("thinking_expected", False)
     while buf:
         if phase == "detect":
             open_idx = buf.find("<think>")
             close_idx = buf.find("</think>")
 
-            if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
+            if (
+                close_idx != -1
+                and (open_idx == -1 or close_idx < open_idx)
+                and thinking_expected
+            ):
                 # Orphaned </think> — discard everything before it.
+                # Only fires when thinking is actually expected for this
+                # request; otherwise the model is just mentioning the
+                # literal token and we leave the text untouched.
                 buf = buf[close_idx + len("</think>") :]
                 phase = "passthrough"
             elif open_idx != -1:
@@ -239,10 +248,14 @@ async def _stream_openai_sse(
             if chunk.get("cache_info"):
                 continue
             if "thinking_expected" in chunk:
-                # Engine-emitted meta: tells the thinking stripper how long
-                # to wait for an orphan </think> (issue #307).
+                # Engine-emitted meta: tells the thinking stripper whether
+                # to wait for an orphan </think> (issue #307).  Without
+                # `thinking_expected`, a model that legitimately mentions
+                # the literal `</think>` token would have its prefix
+                # silently reclassified as thinking.
                 if chunk["thinking_expected"]:
-                    think_state["detect_limit"] = 65536
+                    think_state["thinking_expected"] = True
+                    think_state["detect_limit"] = INIT_ORPHAN_DETECT_LIMIT
                 continue
             if chunk.get("done"):
                 # Flush any buffered content from thinking detection.

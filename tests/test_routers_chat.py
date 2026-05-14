@@ -173,6 +173,50 @@ class TestChatRouter:
         assert content.strip() == "391"
 
     @pytest.mark.asyncio
+    async def test_chat_streaming_literal_close_think_preserved_when_not_thinking(
+        self, app_client
+    ):
+        """When `thinking_expected=False`, a literal `</think>` in the
+        output must stay in `message.content` and not be silently routed
+        to `message.thinking`."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": False}
+                yield {
+                    "text": "Use </think> to close the thought block.",
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "syntax?"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        content = ""
+        thinking = ""
+        for line in resp.text.strip().split("\n"):
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            msg = payload.get("message", {})
+            content += msg.get("content", "")
+            thinking += msg.get("thinking", "") or ""
+
+        assert thinking == ""
+        assert "</think>" in content
+        assert content == "Use </think> to close the thought block."
+
+    @pytest.mark.asyncio
     async def test_chat_streaming_error_mid_stream(self, app_client):
         """Error during streaming emits an NDJSON error line instead of crashing."""
 
