@@ -70,12 +70,12 @@ def _split_thinking_streaming(text: str, state: dict) -> tuple[str, str]:
         elif phase == "in_think":
             end = buf.find("</think>")
             if end == -1:
-                # Hold back up to 8 trailing chars (the length of `</think>`)
-                # in case the tag is split across two chunks; emit the rest
-                # as thinking.
-                if len(buf) > 8:
-                    thinking_parts.append(buf[:-8])
-                    buf = buf[-8:]
+                # Hold back up to `len("</think>")` trailing chars in case
+                # the tag is split across two chunks; emit the rest as
+                # thinking.
+                if len(buf) > len("</think>"):
+                    thinking_parts.append(buf[: -len("</think>")])
+                    buf = buf[-len("</think>") :]
                 break
             thinking_parts.append(buf[:end])
             buf = buf[end + len("</think>") :].lstrip("\n")
@@ -200,6 +200,13 @@ async def chat(req: ChatRequest, request: Request):
             # through immediately as content.  The detect buffer in
             # `_split_thinking_streaming` would otherwise hold the first
             # 200 chars of every Ollama response (issue #307 review).
+            #
+            # All emitter branches below use `model_dump(exclude_none=True)`
+            # so null `thinking` / `images` / `tool_calls` fields are
+            # suppressed from the wire payload.  This matches Ollama
+            # upstream behaviour and keeps the `thinking` field invisible
+            # to clients that pre-date its introduction.  Existing clients
+            # that read `content` / `role` are unaffected.
             if not think_state.get("thinking_expected"):
                 if not text:
                     return None

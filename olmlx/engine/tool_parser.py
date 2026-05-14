@@ -494,20 +494,21 @@ def parse_model_output(
     text: str,
     has_tools: bool,
     *,
-    thinking_expected: bool = True,
+    thinking_expected: bool = False,
 ) -> tuple[str, str, list[dict]]:
     """Parse raw model output into (thinking_text, visible_text, tool_use_blocks).
 
     Args:
         text: Raw model output text.
         has_tools: Whether tools were provided in the request.
-        thinking_expected: When False, skip the orphan `</think>` heuristic
-            so a non-thinking model that legitimately mentions the literal
-            token does not have its prefix silently routed into thinking
-            (issue #307 review).  Standard `<think>...</think>` pairs and
-            Gemma4 channel format are always extracted — those tags are
-            unambiguous.  Defaults to True for backward compatibility with
-            callers that have not been updated to plumb the flag.
+        thinking_expected: When True, fire the orphan `</think>` heuristic
+            that strips any leading text preceding a lone `</think>` token
+            into the thinking channel.  Standard `<think>...</think>` pairs
+            and Gemma4 channel format are always extracted — those tags are
+            unambiguous — so this only controls the orphan path.  Defaults
+            to False (conservative): a new caller that forgets to plumb the
+            flag will preserve the literal token in visible content rather
+            than silently misclassifying it (issue #307 review).
     """
     # Try gpt-oss channel format first
     gpt_oss_result = _parse_gpt_oss_channels(text, has_tools)

@@ -3088,6 +3088,19 @@ async def generate_chat(
 #     observed in-issue example is ~280 chars but production traces
 #     can exceed that for non-trivial prompts); revisit if real-world
 #     direct-answer TTFB becomes a complaint.
+#
+# KNOWN LIMITATION: when a thinking preamble exceeds this limit before
+# `</think>` arrives, the streaming routers fall through to text /
+# passthrough state and emit the buffered content as visible text.  The
+# `</think>` that arrives later is then surfaced as a literal token in
+# the visible content (no retroactive reclassification is possible in a
+# streaming path).  Practical impact: a complex multi-step reasoning
+# trace that runs longer than ~1024 characters before closing its
+# thinking block will leak the preamble into the response.  Mitigations
+# the operator can apply: bump this constant (trades TTFB for
+# correctness margin), use the non-streaming endpoint (always re-parses
+# the full text), or use a model that emits the standard `<think>...`
+# opener (which is detected at any position).
 INIT_ORPHAN_DETECT_LIMIT = 1024
 
 

@@ -204,6 +204,62 @@ class TestChatRouter:
         assert content.strip() == "391"
 
     @pytest.mark.asyncio
+    async def test_chat_streaming_orphan_preamble_over_limit_leaks_to_content(
+        self, app_client
+    ):
+        """Documents the known limitation flagged in #307 review round 11:
+        when an orphan thinking preamble exceeds ``INIT_ORPHAN_DETECT_LIMIT``
+        (1024 chars), the streaming router falls through to passthrough
+        before ``</think>`` arrives and the preamble + close tag end up
+        verbatim in ``message.content``.  Mitigations are documented on
+        the constant; this test pins the current behaviour so future
+        tuning of the limit is a deliberate choice."""
+        from olmlx.engine.inference import INIT_ORPHAN_DETECT_LIMIT
+
+        # 1100 chars of orphan thinking — pushes past the 1024 limit before
+        # `</think>` arrives.
+        long_preamble = "thought " * ((INIT_ORPHAN_DETECT_LIMIT // 8) + 10)
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                for i in range(0, len(long_preamble), 64):
+                    yield {"text": long_preamble[i : i + 64], "done": False}
+                yield {"text": "</think>\nanswer", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "?"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        content = ""
+        thinking = ""
+        for line in resp.text.strip().split("\n"):
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            msg = payload.get("message", {})
+            content += msg.get("content", "")
+            thinking += msg.get("thinking", "") or ""
+
+        # Current behaviour (known limitation): once the detect buffer is
+        # exhausted the preamble is emitted as content and the late
+        # `</think>` arrives in passthrough where it is forwarded verbatim.
+        # `answer` still makes it through.
+        assert "answer" in content
+        assert thinking == ""
+        assert "</think>" in content
+
+    @pytest.mark.asyncio
     async def test_chat_streaming_short_direct_answer_in_non_done_chunk(
         self, app_client
     ):
