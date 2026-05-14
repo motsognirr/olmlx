@@ -641,15 +641,20 @@ async def _stream_thinking_state_machine(result):
                     # the standard `<think>` branch instead of swallowing the
                     # `<think>` opener as orphan content.
                     orphan_thinking = buffer[:close_idx]
-                    yield _sse(
-                        "content_block_start",
-                        {
-                            "type": "content_block_start",
-                            "index": block_idx,
-                            "content_block": {"type": "thinking", "thinking": ""},
-                        },
-                    )
+                    # Skip the whole content block when `</think>` is the
+                    # very first token — emitting an empty thinking block
+                    # would diverge from the non-streaming path which
+                    # produces no block in that case (issue #307 review
+                    # round 10).
                     if orphan_thinking:
+                        yield _sse(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": block_idx,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            },
+                        )
                         yield _sse(
                             "content_block_delta",
                             {
@@ -661,11 +666,11 @@ async def _stream_thinking_state_machine(result):
                                 },
                             },
                         )
-                    yield _sse(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": block_idx},
-                    )
-                    block_idx += 1
+                        yield _sse(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": block_idx},
+                        )
+                        block_idx += 1
                     buffer = buffer[close_idx + len("</think>") :].lstrip("\n")
                     state = "text"
                 elif len(buffer) < 7 and "<think>".startswith(buffer):
@@ -673,7 +678,7 @@ async def _stream_thinking_state_machine(result):
                 elif (
                     thinking_expected
                     and close_idx == -1
-                    and len(buffer) < INIT_ORPHAN_DETECT_LIMIT
+                    and len(buffer) <= INIT_ORPHAN_DETECT_LIMIT
                 ):
                     # Keep waiting for a (possibly orphaned) `</think>`.
                     # Gated on `close_idx == -1`: once we've seen `</think>`

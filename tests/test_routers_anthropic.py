@@ -1033,6 +1033,52 @@ class TestAnthropicEndpoint:
         assert "answer" in visible_text
 
     @pytest.mark.asyncio
+    async def test_streaming_orphan_close_at_position_zero_no_empty_thinking_block(
+        self, app_client
+    ):
+        """Issue #307 review round 10: when `</think>` is the very first
+        token in the stream (close_idx == 0), the orphan branch must NOT
+        emit an empty thinking content block — the non-streaming path
+        skips it entirely, and emitting an empty block diverges from that
+        behaviour."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "</think>\n", "done": False}
+                yield {"text": "The answer is 42.", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "?"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        # No content_block of type "thinking" should appear at all (the
+        # non-streaming path produces none for an empty orphan prefix).
+        for line in resp.text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") != "content_block_start":
+                continue
+            assert payload["content_block"]["type"] != "thinking", (
+                "Empty orphan prefix must not emit a thinking content block"
+            )
+
+    @pytest.mark.asyncio
     async def test_streaming_overflow_when_close_think_never_arrives(self, app_client):
         """When `thinking_expected=True` but no `</think>` arrives before the
         buffer crosses `INIT_ORPHAN_DETECT_LIMIT`, the state machine must
