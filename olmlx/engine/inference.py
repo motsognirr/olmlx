@@ -3079,10 +3079,15 @@ async def generate_chat(
 #   * Qwen3.5/3.6's orphan-thinking preamble for reasoning tasks is
 #     typically a few hundred characters before `</think>` arrives.
 #   * For thinking-capable models that produce a direct answer (no
-#     thinking block at all), every byte of this buffer is a TTFB
-#     delay since nothing reaches the client until the limit is hit.
-# 1024 chars covers all observed orphan preambles while keeping
-# direct-answer streaming latency to roughly one chunk's worth.
+#     thinking block at all), every byte of this buffer adds TTFB
+#     latency — at ~1000 chars/s the worst case is roughly one second
+#     before any text reaches the client.  Keep-alive pings cover the
+#     wait but it's still a visible regression vs streaming a
+#     non-thinking model.  1024 was picked over the reviewer-suggested
+#     512 to keep margin for longer Qwen3.5 reasoning traces (the
+#     observed in-issue example is ~280 chars but production traces
+#     can exceed that for non-trivial prompts); revisit if real-world
+#     direct-answer TTFB becomes a complaint.
 INIT_ORPHAN_DETECT_LIMIT = 1024
 
 

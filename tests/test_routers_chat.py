@@ -5,7 +5,31 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from olmlx.routers.chat import _flush_split_thinking, _split_thinking_streaming
 from olmlx.utils.timing import TimingStats
+
+
+class TestSplitThinkingStreaming:
+    """Unit tests for the Ollama-side thinking splitter (issue #307)."""
+
+    def test_flush_in_think_phase_treats_buffer_as_thinking(self):
+        """If the stream ends with an open `<think>` and no closer, the held
+        buffer must be returned as thinking content (not silently lost)."""
+        # Walk through chunks ending mid-think.
+        state: dict = {}
+        thinking, content = _split_thinking_streaming("<think>partial reasoning", state)
+        # `<think>` consumed; "partial reasoning" is 17 chars in `in_think`
+        # phase — the splitter emits all but the last 8 chars and holds the
+        # tail in case `</think>` is straddling a chunk boundary.
+        assert thinking == "partial r"
+        assert content == ""
+        assert state["phase"] == "in_think"
+        assert state["buffer"] == "easoning"
+
+        # Stream ends — flush must surface the buffered remainder as thinking.
+        tail_thinking, tail_content = _flush_split_thinking(state)
+        assert tail_thinking == "easoning"
+        assert tail_content == ""
 
 
 class TestChatRouter:
