@@ -336,17 +336,16 @@ async def _stream_openai_sse_with_tools(
     full_text = ""
     raw_text = ""
     done_reason = None
+    # Engine meta chunk arrives before any text — capture it so the orphan
+    # `</think>` heuristic in `parse_model_output` is gated symmetrically
+    # with the non-tools paths (issue #307 review round 5).
+    thinking_expected = False
     try:
         async for chunk in result:
             if chunk.get("cache_info"):
                 continue
             if "thinking_expected" in chunk:
-                # Tools path buffers the full output and re-parses via
-                # `parse_model_output` once the stream is done; that helper
-                # has its own (currently always-on) orphan-`</think>`
-                # heuristic, so this flag isn't consulted here.  Known
-                # gap for non-thinking models that emit the literal token
-                # while declaring tools (issue #307 review).
+                thinking_expected = bool(chunk["thinking_expected"])
                 continue
             if chunk.get("done"):
                 # Read raw_text from done chunk for gpt-oss tool call parsing
@@ -358,7 +357,9 @@ async def _stream_openai_sse_with_tools(
         # Use raw_text for parsing so channel-format tool calls aren't lost;
         # fall back to full_text for non-gpt-oss models
         text_for_parsing = raw_text if raw_text else full_text
-        _thinking, visible_text, tool_uses = parse_model_output(text_for_parsing, True)
+        _thinking, visible_text, tool_uses = parse_model_output(
+            text_for_parsing, True, thinking_expected=thinking_expected
+        )
         resolve_tool_names(tool_uses, declared_tools)
         _fill_missing_required_args(tool_uses, declared_tools)
         logger.debug(

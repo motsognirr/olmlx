@@ -346,6 +346,10 @@ async def _stream_buffered_with_tools(
     text_chunks: list[str] = []
     raw_text = ""
     output_tokens = 0
+    # Engine meta chunk arrives before any text — capture it so the orphan
+    # `</think>` heuristic in `parse_model_output` is gated symmetrically
+    # with the non-tools paths (issue #307 review round 5).
+    thinking_expected = False
 
     async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
         if chunk is _PING_SENTINEL:
@@ -355,12 +359,7 @@ async def _stream_buffered_with_tools(
             yield chunk  # Forward to stream_sse for message_start
             continue
         if isinstance(chunk, dict) and "thinking_expected" in chunk:
-            # Tools path buffers the full output and re-parses via
-            # `parse_model_output` on the `done` chunk; that helper applies
-            # its own orphan-`</think>` heuristic without consulting this
-            # flag.  Same known false-positive risk as the non-streaming
-            # path for non-thinking models that emit the literal token
-            # while tools are declared (issue #307 review).
+            thinking_expected = bool(chunk["thinking_expected"])
             continue
         if chunk.get("done"):
             stats = chunk.get("stats")
@@ -391,6 +390,7 @@ async def _stream_buffered_with_tools(
     thinking, visible_text, tool_uses = parse_model_output(
         text_for_parsing,
         True,
+        thinking_expected=thinking_expected,
     )
 
     resolve_tool_names(tool_uses, declared_tools)
@@ -611,6 +611,7 @@ async def _stream_thinking_state_machine(result):
 
         while buffer:
             if state == "init":
+                open_idx = buffer.find("<think>")
                 close_idx = buffer.find("</think>")
                 if buffer.startswith("<think>"):
                     state = "thinking"
@@ -623,13 +624,22 @@ async def _stream_thinking_state_machine(result):
                             "content_block": {"type": "thinking", "thinking": ""},
                         },
                     )
-                elif close_idx >= 0 and thinking_expected:
+                elif (
+                    close_idx >= 0
+                    and thinking_expected
+                    and (open_idx == -1 or close_idx < open_idx)
+                ):
                     # Orphaned `</think>` — Qwen3.5/3.6 chat templates miss
                     # the `<think>` opener but still emit the closer (#307).
                     # Everything buffered before it is the thinking block.
                     # Gated on `thinking_expected` so a non-thinking model
                     # that legitimately mentions the literal `</think>`
-                    # token isn't silently reclassified as thinking.
+                    # token isn't silently reclassified as thinking, and on
+                    # the open/close order so that a buffer assembled with
+                    # `preamble<think>...</think>answer` (text-before-tag,
+                    # uncommon but real for slow first tokens) routes through
+                    # the standard `<think>` branch instead of swallowing the
+                    # `<think>` opener as orphan content.
                     orphan_thinking = buffer[:close_idx]
                     yield _sse(
                         "content_block_start",
