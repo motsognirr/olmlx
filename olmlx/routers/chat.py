@@ -188,7 +188,7 @@ async def chat(req: ChatRequest, request: Request):
                             "model": req.model,
                             "created_at": now,
                             "message": Message(
-                                role="assistant", content=text
+                                role="assistant", content=text, thinking=None
                             ).model_dump(exclude_none=True),
                             "done": False,
                         }
