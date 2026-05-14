@@ -225,6 +225,10 @@ class TestManageRouter:
         "model has active requests". Post-PR the router narrows the
         409 path to ActiveRequestsError, and close failures surface
         as ExceptionGroup (a 500 by FastAPI default).
+
+        Uses ExceptionGroup as side_effect to match the real type
+        ``_close_loaded_model`` raises — self-documenting and proves
+        the router specifically does not catch ExceptionGroup as 409.
         """
         from unittest.mock import MagicMock
 
@@ -232,7 +236,10 @@ class TestManageRouter:
         lm = manager._loaded["qwen3:latest"]
         original_close = manager._close_loaded_model
         manager._close_loaded_model = MagicMock(
-            side_effect=RuntimeError("simulated close failure")
+            side_effect=ExceptionGroup(
+                "simulated close failure",
+                [RuntimeError("simulated prefetcher close failure")],
+            )
         )
         try:
             resp = await app_client.post("/api/unload", json={"model": "qwen3"})
