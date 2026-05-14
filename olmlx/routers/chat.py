@@ -176,11 +176,15 @@ def _flush_split_thinking(state: dict) -> tuple[str, str]:
     If still in ``detect`` (no tag ever seen), treat as content.  In
     ``in_think`` (open tag without close), treat as thinking so the
     response isn't truncated.
+
+    Resets managed state keys to their initial values so a caller that
+    reuses the dict starts fresh — matches ``flush_thinking_buffer`` in
+    ``utils/streaming.py``.
     """
     buf = state.get("buffer", "")
     phase = state.get("phase", "detect")
     state["buffer"] = ""
-    state["phase"] = "passthrough"
+    state["phase"] = "detect"
     state["expected_close"] = ""
     if not buf:
         return "", ""
@@ -331,7 +335,7 @@ async def _stream_chat_with_tools(
         final = {
             "model": model_name,
             "created_at": now,
-            "message": Message(role="assistant", content="").model_dump(
+            "message": Message(role="assistant", content="", thinking=None).model_dump(
                 exclude_none=True
             ),
             "done": True,
