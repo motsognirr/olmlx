@@ -932,12 +932,14 @@ class ModelManager:
             # model can't permanently block subsequent model loads. The model
             # is already removed from ``_loaded``; the new load will proceed
             # with leaked threads/fds rather than failing.
-            # _close_loaded_model logs per-resource on failure, so no extra
-            # logging here — mirrors the absorb pattern in _expire_stale.
+            # Narrowed to ExceptionGroup to match _close_loaded_model's
+            # documented contract (always raises ExceptionGroup on any
+            # error) — same shape as the catch in unload(). An unexpected
+            # non-ExceptionGroup exception would propagate as a bug.
             try:
                 self._close_loaded_model(evicted)
-            except Exception:
-                pass  # already logged inside _close_loaded_model
+            except ExceptionGroup:
+                pass  # already logged per-resource inside _close_loaded_model
             del evicted
 
         # Flush Metal allocator cache so that buffers from evicted models
@@ -2846,8 +2848,8 @@ class ModelManager:
             lm = expired_lms.pop()
             try:
                 await asyncio.to_thread(self._close_loaded_model, lm)
-            except Exception:
-                pass  # already logged inside _close_loaded_model
+            except ExceptionGroup:
+                pass  # already logged per-resource inside _close_loaded_model
             del lm
 
         # Flush Metal allocator cache so freed buffers don't inflate the

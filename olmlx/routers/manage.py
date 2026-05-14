@@ -168,8 +168,11 @@ async def unload_model(req: UnloadRequest, request: Request):
         unloaded = manager.unload(req.model)
     except ActiveRequestsError as e:
         # 409 is narrow on purpose: only "model has active requests".
-        # Resource-close failures from _close_loaded_model surface as
-        # ExceptionGroup and fall through to FastAPI's 500 handler.
+        # Resource-close failures inside ``_close_loaded_model`` are
+        # absorbed by ``ModelManager.unload`` itself (the model is gone
+        # from ``_loaded`` regardless), so the router never sees them —
+        # they show up only in the per-resource log lines inside the
+        # helper.
         return JSONResponse({"error": str(e)}, status_code=409)
     if not unloaded:
         return JSONResponse(
