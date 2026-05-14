@@ -113,6 +113,26 @@ class TestModelManager:
         assert len(mock_manager.get_loaded()) == 1  # still loaded
         lm.active_refs = 0
 
+    def test_unload_absorbs_close_failure(self, mock_manager):
+        """unload() returns True even when _close_loaded_model raises.
+
+        The model is already popped from ``_loaded`` before close is
+        attempted, so the user-visible semantics are satisfied: the
+        model is gone. Surfacing the ExceptionGroup as a 500 would
+        leave the HTTP client unable to distinguish "close failed,
+        model is gone" from an unrelated 500.
+        """
+        from unittest.mock import MagicMock
+
+        # Replace _close_loaded_model with one that raises like the
+        # real helper does when a resource close fails.
+        mock_manager._close_loaded_model = MagicMock(
+            side_effect=ExceptionGroup("simulated", [RuntimeError("prefetcher boom")])
+        )
+        result = mock_manager.unload("qwen3")
+        assert result is True
+        assert "qwen3:latest" not in mock_manager._loaded
+
     @pytest.mark.asyncio
     async def test_ensure_loaded_cached(self, mock_manager):
         lm = await mock_manager.ensure_loaded("qwen3")
@@ -2045,6 +2065,44 @@ class TestExpiryChecker:
         assert weakref_alive_at_gc == [False]
 
     @pytest.mark.asyncio
+    async def test_expire_stale_offloads_close_to_thread(
+        self, registry, mock_store, monkeypatch
+    ):
+        """Close runs off the event loop.
+
+        ``executor.shutdown(wait=True)`` is synchronous. Running it on
+        the event loop thread would stall every concurrent coroutine
+        until the pools drained, even with the lock released. The fix
+        is ``await asyncio.to_thread(self._close_loaded_model, lm)``.
+        This test asserts the call went through ``asyncio.to_thread``.
+        """
+        manager = ModelManager(registry, mock_store)
+        original_to_thread = asyncio.to_thread
+        to_thread_calls: list[Any] = []
+
+        async def _tracking_to_thread(fn, *args, **kwargs):
+            to_thread_calls.append(fn)
+            return await original_to_thread(fn, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.asyncio.to_thread", _tracking_to_thread
+        )
+
+        lm = LoadedModel(
+            name="expired:latest",
+            hf_path="test/model",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            expires_at=time.time() - 10,
+        )
+        manager._loaded["expired:latest"] = lm
+
+        await manager._expire_stale()
+
+        # The close was routed through to_thread (off-event-loop).
+        assert manager._close_loaded_model in to_thread_calls
+
+    @pytest.mark.asyncio
     async def test_expire_stale_releases_lock_before_closing(
         self, registry, mock_store
     ):
@@ -2908,7 +2966,10 @@ class TestEvictLruIfNeeded:
         assert any("weight-store-boom" in m for m in messages)
         # Decoder still closed despite both prior failures.
         decoder.close.assert_called_once()
-        assert lm.weight_store is None
+        # Failed close() leaves the reference alive — preserves the
+        # partially-closed object for inspection / retry. Successful
+        # decoder close still nulls its field.
+        assert lm.weight_store is weight_store
         assert lm.speculative_decoder is None
 
     def test_evict_absorbs_close_failure(

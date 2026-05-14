@@ -891,22 +891,25 @@ class ModelManager:
         if lm.weight_store is not None:
             try:
                 lm.weight_store.close()
+                # Null only on success — if close() raised, the store may
+                # be partially closed (executor mid-drain). Preserving the
+                # reference lets a future cleanup path (or test) inspect
+                # the failed object instead of orphaning it. Same reasoning
+                # for speculative_decoder below.
+                lm.weight_store = None
             except Exception as exc:
                 logger.exception("Error closing weight store for %s", lm.name)
                 errors.append(exc)
         if lm.speculative_decoder is not None:
             try:
                 lm.speculative_decoder.close()
+                lm.speculative_decoder = None
             except Exception as exc:
                 logger.exception("Error closing speculative decoder for %s", lm.name)
                 errors.append(exc)
-        # Null every direct field on the LoadedModel that we just closed, so
-        # later code can't accidentally observe (or double-close) a closed
-        # resource. ``lm.model.prefetcher`` is not nulled because that lives
-        # on the model wrapper itself, not on the LM — the model is dropped
-        # along with the LM and shouldn't be mutated here.
-        lm.weight_store = None
-        lm.speculative_decoder = None
+        # ``lm.model.prefetcher`` is intentionally not nulled — it lives on
+        # the FlashModelWrapper, not on the LM bookkeeping, and the wrapper
+        # goes away with the LM.
         if errors:
             raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
 
@@ -1280,14 +1283,16 @@ class ModelManager:
     def unload(self, name: str) -> bool:
         """Unload a model. Returns True if unloaded, False if not loaded.
 
-        Raises RuntimeError if model has active requests.
+        Raises ActiveRequestsError if model has in-flight requests.
 
-        Note: if ``_close_loaded_model`` raises, the model has already been
-        removed from ``_loaded`` (so a subsequent ``unload`` would return
-        ``False``) but the caller still sees the exception. Each resource
-        is attempted independently and logged before the raise — strictly
-        better than the pre-refactor inline code, which would abort on
-        the first failure and leak the remaining resources silently.
+        Close failures from ``_close_loaded_model`` are absorbed: the
+        model is already gone from ``_loaded`` (won't accept new
+        requests), so the user-visible unload semantics are satisfied
+        even if some background threads leaked. The per-resource log
+        lines inside ``_close_loaded_model`` record what failed.
+        Surfacing the ExceptionGroup as a 500 instead would leave the
+        client unable to distinguish "close failed, model is gone" from
+        an unrelated 500 — and either way, the model is gone.
         """
         normalized = self.registry.normalize_name(name)
         lm = self._loaded.get(normalized)
@@ -1298,7 +1303,10 @@ class ModelManager:
                 f"Model '{normalized}' has {lm.active_refs} active request(s)"
             )
         lm = self._loaded.pop(normalized)
-        self._close_loaded_model(lm)
+        try:
+            self._close_loaded_model(lm)
+        except ExceptionGroup:
+            pass  # already logged per-resource inside _close_loaded_model
         return True
 
     # Config keys that indicate a vision-language model
@@ -2820,19 +2828,24 @@ class ModelManager:
                     logger.info("Unloading expired model %s", name)
                     expired_lms.append(self._loaded.pop(name))
 
-        # Close outside the lock. Per-model isolation: one failing close()
-        # must not skip the remaining expired models. _close_loaded_model
-        # already logs per-resource on failure, so callers absorb silently.
+        # Close outside the lock AND off the event loop thread.
+        # ``_close_loaded_model`` calls ``executor.shutdown(wait=True)`` on
+        # the prefetcher (16 threads) and weight store (32 threads); that
+        # join is synchronous, so running it on the event loop would stall
+        # every concurrent coroutine until the pools drained. ``to_thread``
+        # offloads the join. Per-model isolation: one failing close() must
+        # not skip the remaining expired models — _close_loaded_model
+        # already logs per-resource, so callers absorb silently.
         # Pop from the list so no live reference (including the loop
         # variable) survives into the gc.collect() below — otherwise the
-        # Metal buffers attached to the LoadedModel can't be reclaimed
-        # and mx.clear_cache() runs against nothing. Same reason
+        # Metal buffers attached to the LoadedModel can't be reclaimed and
+        # mx.clear_cache() runs against nothing. Same reason
         # _evict_lru_if_needed calls ``del evicted``.
         flush = bool(expired_lms) and not self._pending_cleanups
         while expired_lms:
             lm = expired_lms.pop()
             try:
-                self._close_loaded_model(lm)
+                await asyncio.to_thread(self._close_loaded_model, lm)
             except Exception:
                 pass  # already logged inside _close_loaded_model
             del lm
