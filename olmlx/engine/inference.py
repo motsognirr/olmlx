@@ -3062,9 +3062,13 @@ async def generate_chat(
             {"thinking_expected": thinking_expected},
         )
     else:
-        return await _full_completion(
+        result = await _full_completion(
             lm, prompt, mt, gen_kwargs, stats, images, has_tools=bool(tools)
         )
+        # Mirror the streaming meta chunk so non-streaming routers can gate
+        # orphan `</think>` handling on the same signal (issue #307).
+        result["thinking_expected"] = thinking_expected
+        return result
 
 
 # Streaming routers consult this when the engine signals

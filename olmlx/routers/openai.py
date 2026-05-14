@@ -338,7 +338,15 @@ async def _stream_openai_sse_with_tools(
     done_reason = None
     try:
         async for chunk in result:
-            if chunk.get("cache_info") or "thinking_expected" in chunk:
+            if chunk.get("cache_info"):
+                continue
+            if "thinking_expected" in chunk:
+                # Tools path buffers the full output and re-parses via
+                # `parse_model_output` once the stream is done; that helper
+                # has its own (currently always-on) orphan-`</think>`
+                # heuristic, so this flag isn't consulted here.  Known
+                # gap for non-thinking models that emit the literal token
+                # while declaring tools (issue #307 review).
                 continue
             if chunk.get("done"):
                 # Read raw_text from done chunk for gpt-oss tool call parsing

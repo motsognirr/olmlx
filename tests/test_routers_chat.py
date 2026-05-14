@@ -93,7 +93,14 @@ class TestChatRouter:
             "</think>\n\n"
             "391"
         )
-        mock_result = {"text": raw, "done": True, "stats": TimingStats(eval_count=10)}
+        # Engine signals thinking_expected via the non-streaming result dict,
+        # mirroring the streaming meta chunk (issue #307 review).
+        mock_result = {
+            "text": raw,
+            "done": True,
+            "stats": TimingStats(eval_count=10),
+            "thinking_expected": True,
+        }
 
         with patch(
             "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
@@ -171,6 +178,41 @@ class TestChatRouter:
         assert "</think>" not in content
         assert "</think>" not in thinking
         assert content.strip() == "391"
+
+    @pytest.mark.asyncio
+    async def test_chat_non_streaming_literal_close_think_preserved_when_not_thinking(
+        self, app_client
+    ):
+        """Issue #307 review: the non-streaming path must agree with the
+        streaming path — a literal `</think>` token from a non-thinking
+        model must stay in `message.content`, not be silently routed to
+        `message.thinking`."""
+        raw = "Use </think> to close the thought block."
+        mock_result = {
+            "text": raw,
+            "done": True,
+            "stats": TimingStats(eval_count=10),
+            "thinking_expected": False,
+        }
+
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "syntax?"}],
+                    "stream": False,
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        msg = data["message"]
+        assert msg["content"] == raw
+        assert "thinking" not in msg or msg["thinking"] is None
 
     @pytest.mark.asyncio
     async def test_chat_streaming_literal_close_think_preserved_when_not_thinking(

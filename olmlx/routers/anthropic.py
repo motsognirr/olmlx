@@ -355,6 +355,12 @@ async def _stream_buffered_with_tools(
             yield chunk  # Forward to stream_sse for message_start
             continue
         if isinstance(chunk, dict) and "thinking_expected" in chunk:
+            # Tools path buffers the full output and re-parses via
+            # `parse_model_output` on the `done` chunk; that helper applies
+            # its own orphan-`</think>` heuristic without consulting this
+            # flag.  Same known false-positive risk as the non-streaming
+            # path for non-thinking models that emit the literal token
+            # while tools are declared (issue #307 review).
             continue
         if chunk.get("done"):
             stats = chunk.get("stats")
@@ -656,11 +662,12 @@ async def _stream_thinking_state_machine(result):
                     break
                 elif thinking_expected and len(buffer) < INIT_ORPHAN_DETECT_LIMIT:
                     # Keep waiting for a (possibly orphaned) `</think>`.
-                    # NOTE: this can delay the first `text_delta` event by up
-                    # to ~64 KB for a thinking-capable model that produces a
+                    # NOTE: this can delay the first `text_delta` event by
+                    # up to `INIT_ORPHAN_DETECT_LIMIT` characters (currently
+                    # 1024) for a thinking-capable model that produces a
                     # short direct answer with no `</think>`; the keep-alive
-                    # ping loop covers the wait, and the buffered content is
-                    # emitted at stream end via `_flush_thinking_buffer`.
+                    # ping loop covers the wait, and the buffered content
+                    # is emitted at stream end via `_flush_thinking_buffer`.
                     break
                 else:
                     state = "text"
