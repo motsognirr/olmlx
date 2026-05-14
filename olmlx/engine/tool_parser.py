@@ -579,6 +579,105 @@ def parse_model_output(
     return thinking, visible_text, tool_uses
 
 
+def fill_missing_required_args(
+    tool_uses: list[dict],
+    declared_tools: list[dict] | None,
+) -> None:
+    """Fill missing required string arguments in tool calls from the client's schema.
+
+    Models sometimes omit fields the client marks as required (e.g. opencode's
+    ``description`` on bash). Walk the declared tool schemas and inject an
+    empty string for any required string parameter the model left out, so
+    downstream Pydantic constructors (``ToolCallFunction.arguments``) don't
+    blow up on the omission. Mutates *tool_uses* in place.
+
+    Trade-off: injecting ``""`` prevents a Pydantic crash but produces a
+    semantically degraded tool call.  A ``bash`` tool receiving
+    ``command: ""`` runs nothing useful; a ``write_file`` tool receiving
+    ``path: ""`` may behave dangerously.  We log a warning per injection,
+    but callers should treat empty injected strings as "model failed to
+    populate this field" rather than a meaningful value.
+
+    Post-condition for any tool present in *declared_tools*: ``tu["input"]``
+    is a freshly-constructed ``dict`` (never ``None``), even when no
+    injection runs.  Tools NOT in *declared_tools* are left untouched, so
+    ``_build_tool_calls`` in ``routers/chat.py`` still needs an ``or {}``
+    guard — narrowed to the unknown-tool case, which this function cannot
+    normalize because it has no schema to reason about.
+    """
+    # ``not declared_tools`` covers both ``None`` (no tools field on the
+    # request) and ``[]`` (caller passed an explicit empty list).  Both
+    # mean "no schemas available to normalize against", so we leave
+    # ``tu["input"]`` untouched in either case.  The ``is None`` change
+    # at the per-tool loop below only affects how each individual tool's
+    # ``required_params`` is interpreted; this top-level guard is
+    # deliberately broader.
+    if not declared_tools:
+        return
+
+    # Build lookup: lowercase tool name -> {param: type} for required params
+    schema_by_tool: dict[str, dict[str, str]] = {}
+    for tool in declared_tools:
+        func = tool.get("function") or {}
+        name = (func.get("name") or "").lower()
+        params = func.get("parameters") or {}
+        required = set(params.get("required", []))
+        properties = params.get("properties") or {}
+        schema_by_tool[name] = {
+            k: v.get("type", "") for k, v in properties.items() if k in required
+        }
+
+    for tu in tool_uses:
+        required_params = schema_by_tool.get((tu.get("name") or "").lower())
+        # Intentionally ``is None`` rather than the old ``not required_params``
+        # check: the old guard skipped declared tools with zero required
+        # params too, leaving their ``input`` as-is (e.g. ``None`` from a
+        # gpt-oss ``null`` payload).  The new contract is unconditional
+        # normalization for *any* declared tool — only unknown tools (truly
+        # absent from the declared list) are skipped here.
+        if required_params is None:
+            continue
+        # Always materialize our own dict and write it back, even when
+        # ``required_params`` is empty (the tool exists in the declared
+        # list but declares no required params).  Two observable changes
+        # relative to the old version, both benign for current callers
+        # (which all build a ``ToolCall`` from the dict immediately):
+        #
+        # - ``tu["input"]`` is replaced with a fresh dict, so callers must
+        #   not rely on dict identity.
+        # - ``input is None`` is normalized to ``input == {}`` regardless
+        #   of whether any required-string injection runs.  An earlier
+        #   draft made this promotion conditional on the tool having ≥1
+        #   required param, which produced a footgun-y contract where
+        #   ``input is None`` meant something different depending on the
+        #   declared schema.
+        inp = dict(tu.get("input") or {})
+        tu["input"] = inp
+        for param, param_type in required_params.items():
+            if param not in inp or inp[param] is None:
+                if param_type == "string":
+                    logger.warning(
+                        "Tool '%s' missing required string param '%s', injecting empty string",
+                        tu.get("name"),
+                        param,
+                    )
+                    inp[param] = ""
+                else:
+                    # No safe default to inject for a non-string param;
+                    # the call WILL fail downstream (any executor that
+                    # validates required fields will reject the missing
+                    # key).  ``error`` rather than ``warning`` so the
+                    # severity matches the certainty of failure.
+                    logger.error(
+                        "Tool '%s' missing required param '%s' (type %r); "
+                        "forwarding call with the field absent — will fail "
+                        "in any executor that validates required fields",
+                        tu.get("name"),
+                        param,
+                        param_type,
+                    )
+
+
 def resolve_tool_names(
     tool_uses: list[dict], declared_tools: list[dict] | None
 ) -> None:

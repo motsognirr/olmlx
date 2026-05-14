@@ -34,6 +34,531 @@ class TestSplitThinkingStreaming:
 
 class TestChatRouter:
     @pytest.mark.asyncio
+    async def test_chat_non_streaming_strips_gemma4_channel(self, app_client):
+        """Gemma 4 channel-thinking tokens must not leak into message.content (#306)."""
+        stats = TimingStats(eval_count=10)
+        mock_result = {
+            "text": "<|channel>thought\nLet me think about this.\n<channel|>391",
+            "done": True,
+            "stats": stats,
+        }
+
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "gemma4",
+                    "messages": [{"role": "user", "content": "What is 17 * 23?"}],
+                    "stream": False,
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        content = data["message"]["content"]
+        assert "<|channel>" not in content
+        assert "<channel|>" not in content
+        assert "thought" not in content
+        assert "391" in content
+
+    @pytest.mark.asyncio
+    async def test_chat_streaming_strips_gemma4_channel(self, app_client):
+        """Gemma 4 channel tokens must not leak through the streaming path."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "<|channel>thought\n", "done": False}
+                yield {"text": "Let me think.", "done": False}
+                yield {"text": "<channel|>", "done": False}
+                yield {"text": "391", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "gemma4",
+                    "messages": [{"role": "user", "content": "What is 17 * 23?"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        lines = [line for line in resp.text.strip().split("\n") if line.strip()]
+        joined = "".join(json.loads(line)["message"]["content"] for line in lines)
+        assert "<|channel>" not in joined
+        assert "<channel|>" not in joined
+        assert "Let me think." not in joined
+        assert "391" in joined
+
+    @pytest.mark.asyncio
+    async def test_chat_streaming_short_response_emits_content_chunk(self, app_client):
+        """A short, no-thinking response must be emitted as a non-done chunk.
+
+        Regression: putting the detect-phase buffer in the final done chunk
+        is invisible to Ollama clients that ignore done-chunk content.
+        """
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "hello", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        lines = [
+            json.loads(line) for line in resp.text.strip().split("\n") if line.strip()
+        ]
+        non_done = [line for line in lines if not line.get("done")]
+        joined_non_done = "".join(c["message"]["content"] for c in non_done)
+        assert "hello" in joined_non_done
+
+    @pytest.mark.asyncio
+    async def test_chat_non_streaming_returns_tool_calls(self, app_client):
+        """Parsed tool calls must be returned in message.tool_calls, not stripped."""
+        stats = TimingStats(eval_count=10)
+        mock_result = {
+            "text": '<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>',
+            "done": True,
+            "stats": stats,
+        }
+
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "weather in Paris"}],
+                    "stream": False,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "description": "Get the weather",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"city": {"type": "string"}},
+                                    "required": ["city"],
+                                },
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        tool_calls = data["message"].get("tool_calls")
+        assert tool_calls, f"Expected tool_calls in response, got {data['message']}"
+        assert tool_calls[0]["function"]["name"] == "get_weather"
+        assert tool_calls[0]["function"]["arguments"] == {"city": "Paris"}
+
+    @pytest.mark.asyncio
+    async def test_chat_non_streaming_tool_call_with_null_arguments(self, app_client):
+        """A tool call whose arguments parse to JSON ``null`` must not crash
+        the ``ToolCallFunction`` Pydantic construction.  Regression: the
+        Ollama path passed ``tu["input"]`` to ``arguments: dict[str, Any]``
+        unguarded, and gpt-oss-style channel parsing can emit ``input=None``
+        when the tool-call ``<|message|>`` payload is the literal string
+        ``null``."""
+        stats = TimingStats(eval_count=10)
+        # Emit a gpt-oss harmony block whose message payload is JSON null.
+        raw = (
+            "<|start|>assistant<|channel|>commentary to=functions.ping"
+            "<|message|>null<|call|>"
+        )
+        mock_result = {
+            "text": "",
+            "raw_text": raw,
+            "done": True,
+            "stats": stats,
+        }
+
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "gpt-oss",
+                    "messages": [{"role": "user", "content": "ping?"}],
+                    "stream": False,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "ping",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        tool_calls = data["message"].get("tool_calls")
+        assert tool_calls
+        # Null payload should coerce to an empty dict, not propagate as None.
+        assert tool_calls[0]["function"]["arguments"] == {}
+
+    @pytest.mark.asyncio
+    async def test_chat_streaming_with_tools_text_only_omits_tool_calls_key(
+        self, app_client
+    ):
+        """When tools are declared but the model returns only text, the
+        emitted ``message`` must omit the ``tool_calls`` key entirely
+        rather than serialising it as ``null``.  Ollama clients that use
+        ``"tool_calls" in chunk["message"]`` to detect tool responses
+        would otherwise see a false positive on every text-only chunk on
+        this path."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "just answering normally", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "x",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        lines = [
+            json.loads(line) for line in resp.text.strip().split("\n") if line.strip()
+        ]
+        for line in lines:
+            msg = line.get("message") or {}
+            assert "tool_calls" not in msg, (
+                f"text-only response leaked tool_calls key: {line}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_chat_streaming_with_tools_thinking_only_no_empty_content_chunk(
+        self, app_client
+    ):
+        """If the model's entire output is a thinking block, the
+        streaming-with-tools path must surface that thinking via
+        ``message.thinking`` rather than dropping it.  The pre-done chunk
+        must NOT carry an empty ``content`` field (regression from PR
+        #313: without the visible/thinking/tool_calls guard, an
+        all-thinking response produced a spurious
+        ``{"content": ""}`` line before the done chunk)."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {
+                    "text": "<think>just thinking out loud</think>",
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "x",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        lines = [
+            json.loads(line) for line in resp.text.strip().split("\n") if line.strip()
+        ]
+        non_done = [line for line in lines if not line.get("done")]
+        # Exactly one non-done chunk, carrying the thinking content.
+        # ``content`` may be present as an empty string (Ollama protocol
+        # keeps the field on every message), but the thinking text is
+        # what makes the chunk non-spurious.
+        assert len(non_done) == 1, (
+            f"expected one non-done chunk for thinking content, got {non_done}"
+        )
+        msg = non_done[0]["message"]
+        assert "just thinking out loud" in msg.get("thinking", ""), (
+            f"thinking content missing: {msg}"
+        )
+        # The done chunk must still close the stream cleanly.
+        assert lines and lines[-1].get("done") is True
+
+    @pytest.mark.asyncio
+    async def test_chat_streaming_with_tools_uses_raw_text_for_parsing(
+        self, app_client
+    ):
+        """When ``generate_chat`` sets ``raw_text`` on the done chunk (gpt-oss
+        models route their channel-formatted output that way), the
+        streaming-with-tools path must parse against ``raw_text`` rather than
+        the accumulated visible-only ``full_text``.  Without this the
+        tool-call markup encoded in the channel block is invisible to
+        ``parse_model_output`` and ``tool_calls`` comes back empty."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                # Visible chunks carry no tool-call text; the channel-
+                # formatted call lives only in ``raw_text`` on the done
+                # chunk, mimicking the gpt-oss code path.
+                yield {"text": "Looking up the time...", "done": False}
+                yield {
+                    "text": "",
+                    "raw_text": (
+                        "<|start|>assistant<|channel|>commentary "
+                        "to=functions.get_time"
+                        '<|message|>{"tz": "UTC"}<|call|>'
+                    ),
+                    "done": True,
+                    "stats": TimingStats(),
+                }
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "gpt-oss",
+                    "messages": [{"role": "user", "content": "what time is it?"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_time",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"tz": {"type": "string"}},
+                                },
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        lines = [
+            json.loads(line) for line in resp.text.strip().split("\n") if line.strip()
+        ]
+        tool_calls = []
+        for line in lines:
+            tc = (line.get("message") or {}).get("tool_calls")
+            if tc:
+                tool_calls.extend(tc)
+        assert tool_calls, f"expected raw_text-sourced tool_calls, got {lines}"
+        assert tool_calls[0]["function"]["name"] == "get_time"
+        assert tool_calls[0]["function"]["arguments"] == {"tz": "UTC"}
+
+    @pytest.mark.asyncio
+    async def test_chat_streaming_with_tools_post_parse_error_yields_error_chunk(
+        self, app_client
+    ):
+        """An exception raised after the stream is drained (e.g. in
+        ``_build_tool_calls``) must surface as an NDJSON error line, not a
+        silent truncation."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "anything", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with (
+            patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream),
+            patch(
+                "olmlx.routers.chat._build_tool_calls",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "x",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        lines = [
+            json.loads(line) for line in resp.text.strip().split("\n") if line.strip()
+        ]
+        assert lines, "expected at least one NDJSON line on error"
+        last = lines[-1]
+        assert "error" in last, f"expected error chunk, got {last}"
+        assert last.get("done") is True
+
+    @pytest.mark.asyncio
+    async def test_chat_streaming_with_tools_emits_structured_tool_calls(
+        self, app_client
+    ):
+        """Streaming ``/api/chat`` with tools must surface structured
+        ``message.tool_calls`` instead of leaking the raw markup."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {
+                    "text": '<tool_call>{"name": "get_weather", '
+                    '"arguments": {"city": "Paris"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "weather in Paris"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "description": "Get the weather",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"city": {"type": "string"}},
+                                    "required": ["city"],
+                                },
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        lines = [
+            json.loads(line) for line in resp.text.strip().split("\n") if line.strip()
+        ]
+        # Collect tool_calls from any chunk.
+        tool_calls = []
+        for line in lines:
+            tc = (line.get("message") or {}).get("tool_calls")
+            if tc:
+                tool_calls.extend(tc)
+            # Markup must not leak in content.
+            content = (line.get("message") or {}).get("content") or ""
+            assert "<tool_call>" not in content, (
+                f"raw markup leaked in streaming response: {line}"
+            )
+        assert tool_calls, f"Expected structured tool_calls in stream, got {lines}"
+        assert tool_calls[0]["function"]["name"] == "get_weather"
+        assert tool_calls[0]["function"]["arguments"] == {"city": "Paris"}
+
+    @pytest.mark.asyncio
+    async def test_chat_non_streaming_fills_missing_required_args(self, app_client):
+        """If the model omits a required string arg, the router must inject
+        an empty string so ``ToolCallFunction`` construction succeeds
+        (mirrors the OpenAI router's behavior).
+        """
+        stats = TimingStats(eval_count=10)
+        mock_result = {
+            "text": '<tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>',
+            "done": True,
+            "stats": stats,
+        }
+
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "list files"}],
+                    "stream": False,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "description": "Run a shell command",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {"type": "string"},
+                                        "description": {"type": "string"},
+                                    },
+                                    "required": ["command", "description"],
+                                },
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        tool_calls = data["message"].get("tool_calls")
+        assert tool_calls
+        args = tool_calls[0]["function"]["arguments"]
+        assert args.get("command") == "ls"
+        assert args.get("description") == "", (
+            f"Missing required string arg should be filled, got {args}"
+        )
+
+    @pytest.mark.asyncio
     async def test_chat_non_streaming(self, app_client):
         stats = TimingStats(eval_count=10)
         mock_result = {"text": "Hello!", "done": True, "stats": stats}

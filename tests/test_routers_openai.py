@@ -7,22 +7,19 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from olmlx.engine.inference import INIT_ORPHAN_DETECT_LIMIT
-from olmlx.routers.openai import (
-    JSON_MODE_SYSTEM_MSG,
-    _flush_thinking_buffer,
-    _strip_thinking_streaming,
-)
+from olmlx.routers.openai import JSON_MODE_SYSTEM_MSG
+from olmlx.utils.streaming import flush_thinking_buffer, strip_thinking_streaming
 from olmlx.utils.timing import TimingStats
 
 
 class TestStripThinkingStreaming:
-    """Unit tests for _strip_thinking_streaming."""
+    """Unit tests for strip_thinking_streaming."""
 
     def _stream(self, chunks, thinking_expected=False):
-        """Feed chunks through _strip_thinking_streaming, return list of outputs.
+        """Feed chunks through strip_thinking_streaming, return list of outputs.
 
         ``thinking_expected`` mirrors the router-side meta chunk: when True,
-        the orphan `</think>` branch is enabled and the detect buffer is
+        the orphan ``</think>`` branch is enabled and the detect buffer is
         raised to the same generous limit used in production.
         """
         state: dict = {}
@@ -31,9 +28,9 @@ class TestStripThinkingStreaming:
             state["detect_limit"] = INIT_ORPHAN_DETECT_LIMIT
         results = []
         for chunk in chunks:
-            out = _strip_thinking_streaming(chunk, state)
+            out = strip_thinking_streaming(chunk, state)
             results.append(out)
-        flushed = _flush_thinking_buffer(state)
+        flushed = flush_thinking_buffer(state)
         if flushed:
             results.append(flushed)
         return results
@@ -80,6 +77,139 @@ class TestStripThinkingStreaming:
         assert "thinking" not in full
         assert "visible" in full
 
+    def test_gemma4_channel_block_stripped(self):
+        """Gemma 4 ``<|channel>thought\\n...<channel|>`` blocks must be stripped."""
+        chunks = [
+            "<|channel>thought\n",
+            "Let me think.",
+            "<channel|>",
+            "The answer is 391.",
+        ]
+        results = self._stream(chunks)
+        full = "".join(results)
+        assert "Let me think." not in full
+        assert "<|channel>" not in full
+        assert "<channel|>" not in full
+        assert "The answer is 391." in full
+
+    def test_close_tag_split_across_chunks_in_think_phase(self):
+        """A close tag straddling a chunk boundary must still be detected.
+
+        Regression: in ``in_think`` phase, clearing ``buf`` discards any
+        partial close-tag suffix, which would leave the stream stuck in
+        ``in_think`` and silently drop all subsequent output.
+        """
+        chunks = ["<think>", "reasoning</thi", "nk>", "visible"]
+        results = self._stream(chunks)
+        full = "".join(results)
+        assert "reasoning" not in full
+        assert "</think>" not in full
+        assert "visible" in full
+
+    def test_orphaned_gemma4_close_channel_stripped(self):
+        """Orphaned ``<channel|>`` (template pre-opened thought) must be
+        stripped when the engine signalled ``thinking_expected``: the
+        prefix is thinking content from a template-pre-opened block."""
+        chunks = ["internal thoughts ", "more thinking", "<channel|>", "visible"]
+        results = self._stream(chunks, thinking_expected=True)
+        full = "".join(results)
+        assert "internal" not in full
+        assert "more thinking" not in full
+        assert "<channel|>" not in full
+        assert "visible" in full
+
+    def test_orphaned_channel_close_in_prose_preserved_when_not_thinking(self):
+        """A literal ``<channel|>`` in non-thinking prose must survive.
+
+        With the ``thinking_expected`` gate added in PR #314, the
+        orphan-close branch only fires when the engine reports that
+        thinking is incoming.  For a code-gen reply that explains
+        Gemma 4's delimiter syntax (``thinking_expected=False``), the
+        prefix is no longer silently truncated.  This pins the fix so
+        the Limitation 2 regression cannot return for non-thinking
+        responses.
+        """
+        chunks = [
+            "Gemma 4 uses ",
+            "<channel|>",
+            " to close a channel block.",
+        ]
+        results = self._stream(chunks, thinking_expected=False)
+        full = "".join(results)
+        assert "Gemma 4 uses" in full, (
+            f"prose prefix dropped despite thinking_expected=False: {full!r}"
+        )
+        assert " to close a channel block." in full
+        # The literal token survives in the output too — we no longer
+        # consume it as an "orphan close".
+        assert "<channel|>" in full
+
+    def test_detect_limit_holds_partial_open_tag_at_tail(self):
+        """When the detect-limit fires, a partial open-tag at the tail must
+        be held back so the next chunk can complete the tag.
+
+        Without this, a non-thinking prefix ending with ``"<|channel>though"``
+        would emit those bytes verbatim and then enter ``passthrough``
+        unaware it was mid-tag.
+        """
+        # Build a single chunk: prefix that's > 200 chars + partial open tag at end
+        prefix = "x" * 210
+        chunks = [prefix + "<|channel>though", "t\nthinking", "<channel|>", "visible"]
+        results = self._stream(chunks)
+        full = "".join(results)
+        assert "<|channel>" not in full
+        assert "thinking" not in full
+        assert prefix in full
+        assert "visible" in full
+
+    def test_passthrough_flush_returns_held_partial_open_tag(self):
+        """A stream ending in passthrough with a held partial open-tag suffix
+        must surface those bytes — they are real visible content.
+        """
+        # 250-char prefix → exits detect into passthrough; then end with a
+        # partial open-tag suffix the stream never completes.
+        chunks = ["x" * 250, "<thi"]
+        results = self._stream(chunks)
+        full = "".join(results)
+        assert full.endswith("<thi"), f"Held partial dropped: {full[-10:]!r}"
+
+    def test_think_block_with_literal_channel_close_in_content(self):
+        """A ``<think>`` block whose thinking content mentions the literal
+        string ``<channel|>`` must NOT exit early on that string.
+
+        Regression: if ``in_think`` matched any close tag (``</think>`` OR
+        ``<channel|>``), thinking content discussing Gemma 4's delimiters
+        would leak into the visible output.
+        """
+        chunks = [
+            "<think>",
+            "Gemma 4 uses <channel|> as its close marker.",
+            "</think>",
+            "visible answer",
+        ]
+        results = self._stream(chunks)
+        full = "".join(results)
+        assert "Gemma" not in full
+        assert "<channel|>" not in full
+        assert "</think>" not in full
+        assert "visible answer" in full
+
+    def test_gemma4_block_with_literal_think_close_in_content(self):
+        """A Gemma 4 channel block containing the literal ``</think>`` must
+        only close on its paired ``<channel|>``."""
+        chunks = [
+            "<|channel>thought\n",
+            "Qwen uses </think> as its close marker.",
+            "<channel|>",
+            "visible answer",
+        ]
+        results = self._stream(chunks)
+        full = "".join(results)
+        assert "Qwen" not in full
+        assert "</think>" not in full
+        assert "<channel|>" not in full
+        assert "visible answer" in full
+
     def test_passthrough_partial_think_prefix_does_not_hang(self):
         """Regression: a buffer equal to a prefix of ``<think>`` must not loop.
 
@@ -91,14 +221,14 @@ class TestStripThinkingStreaming:
         # First chunk long enough to exit detect phase into passthrough.
         long_chunk = "x" * 250
         state: dict = {}
-        _strip_thinking_streaming(long_chunk, state)
+        strip_thinking_streaming(long_chunk, state)
         # Now feed a bare "<" — a legitimate prefix of "<think>".
-        out = _strip_thinking_streaming("<", state)
+        out = strip_thinking_streaming("<", state)
         # Must return without hanging; the "<" is held for the next chunk.
         assert out == ""
         assert state["buffer"] == "<"
         # Follow-up chunk that is NOT a think tag must flush cleanly.
-        out2 = _strip_thinking_streaming(" hello", state)
+        out2 = strip_thinking_streaming(" hello", state)
         assert out2 == "< hello"
         assert state["buffer"] == ""
 
@@ -391,6 +521,53 @@ class TestOpenAIRouter:
         options = mock_gen.call_args[0][3]
         assert "frequency_penalty" not in options
         assert "presence_penalty" not in options
+
+    @pytest.mark.asyncio
+    async def test_chat_streaming_flushes_held_partial_open_tag_suffix(
+        self, app_client
+    ):
+        """An OpenAI streaming response that ends with a held partial open-tag
+        suffix (e.g. ``"<thi"``) must surface those bytes — they are real
+        visible content, not the start of a thinking block that never
+        materialized.  Regression for the shared
+        ``flush_thinking_buffer`` fix (issue #306 review).
+        """
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                # 250-char prefix → exits detect into passthrough.
+                yield {"text": "x" * 250, "done": False}
+                # Trailing partial open-tag suffix that never completes.
+                yield {"text": "<thi", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        full = ""
+        for line in resp.text.strip().split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                continue
+            chunk = json.loads(payload)
+            delta = chunk["choices"][0].get("delta") or {}
+            full += delta.get("content") or ""
+        assert full.endswith("<thi"), (
+            f"held partial open-tag suffix dropped at end-of-stream: {full[-10:]!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_chat_streaming_error_mid_stream(self, app_client):
