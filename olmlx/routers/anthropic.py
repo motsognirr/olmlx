@@ -666,12 +666,21 @@ async def _stream_thinking_state_machine(result):
                         {"type": "content_block_stop", "index": block_idx},
                     )
                     block_idx += 1
-                    buffer = buffer[close_idx + 8 :].lstrip("\n")
+                    buffer = buffer[close_idx + len("</think>") :].lstrip("\n")
                     state = "text"
                 elif len(buffer) < 7 and "<think>".startswith(buffer):
                     break
-                elif thinking_expected and len(buffer) < INIT_ORPHAN_DETECT_LIMIT:
+                elif (
+                    thinking_expected
+                    and close_idx == -1
+                    and len(buffer) < INIT_ORPHAN_DETECT_LIMIT
+                ):
                     # Keep waiting for a (possibly orphaned) `</think>`.
+                    # Gated on `close_idx == -1`: once we've seen `</think>`
+                    # we have enough information to make a decision (either
+                    # the orphan branch above already fired, or the text
+                    # state will emit the buffered content) — no point
+                    # waiting longer.
                     # NOTE: this can delay the first `text_delta` event by
                     # up to `INIT_ORPHAN_DETECT_LIMIT` characters (currently
                     # 1024) for a thinking-capable model that produces a
@@ -703,11 +712,11 @@ async def _stream_thinking_state_machine(result):
                         {"type": "content_block_stop", "index": block_idx},
                     )
                     block_idx += 1
-                    buffer = buffer[end_idx + 8 :]
+                    buffer = buffer[end_idx + len("</think>") :]
                     state = "text"
-                elif len(buffer) > 8:
-                    safe = buffer[:-8]
-                    buffer = buffer[-8:]
+                elif len(buffer) > len("</think>"):
+                    safe = buffer[: -len("</think>")]
+                    buffer = buffer[-len("</think>") :]
                     yield _sse(
                         "content_block_delta",
                         {

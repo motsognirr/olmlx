@@ -969,7 +969,16 @@ class TestAnthropicEndpoint:
         but real for slow first tokens), the state machine must NOT fire
         the orphan branch on the late `</think>` and swallow the `<think>`
         opener as part of a thinking content block. The opener-before-closer
-        order signals a standard `<think>...</think>` pair."""
+        order signals a standard `<think>...</think>` pair.
+
+        Pre-existing limitation: the Anthropic ``text`` state does not
+        re-detect a mid-text ``<think>`` block (interleaving thinking into
+        an in-flight text block is awkward in the SSE content-block model),
+        so the literal tags currently survive into the text delta for this
+        assembly pattern. The OpenAI passthrough state does re-detect. Out
+        of scope for #307; this test only asserts the orphan-branch
+        correctness — that ``<think>``/``thoughts``/``preamble`` are NOT
+        misclassified as thinking content."""
 
         async def mock_stream(*args, **kwargs):
             async def gen():
@@ -1012,9 +1021,13 @@ class TestAnthropicEndpoint:
             elif delta.get("type") == "text_delta":
                 visible_text += delta.get("text", "")
 
-        # Neither the `<think>` opener nor "preamble" should appear in
-        # thinking — `preamble` must stay in text content.
+        # Critical: the orphan branch must NOT fire when `<think>` comes
+        # first.  Neither the literal opener nor "preamble" nor the
+        # thinking content should appear in a thinking_delta — they must
+        # stay in text (where the literal tag survives, per the docstring
+        # note above).
         assert "<think>" not in thinking_text
+        assert "thoughts" not in thinking_text
         assert "preamble" not in thinking_text
         assert "preamble" in visible_text
         assert "answer" in visible_text
