@@ -2005,6 +2005,15 @@ class TestExpiryChecker:
 
         Uses a weakref to assert the LoadedModel is unreachable at the
         moment gc.collect() runs — proving expired_lms was dropped.
+
+        Assumes CPython refcount semantics: an object with refcount 0 is
+        deallocated immediately, so the weakref resolves to None as soon
+        as the last strong reference goes away. On a non-refcounting
+        runtime (PyPy, Jython) a back-reference cycle introduced by
+        MagicMock could keep the LM alive — but we also monkeypatch
+        gc.collect here, so the cycle collector would not run to clean
+        it up. The codebase is CPython-only (uv-managed cpython-3.11),
+        so this is fine.
         """
         import weakref
 
