@@ -1064,6 +1064,38 @@ class TestToolCallParsing:
         assert len(tool_chunks) == 0
 
     @pytest.mark.asyncio
+    async def test_non_streaming_literal_close_think_preserved_when_not_thinking(
+        self, app_client
+    ):
+        """Issue #307 review: a non-thinking model that mentions the literal
+        `</think>` token in a non-streaming response must keep it in
+        `message.content` rather than have its prefix silently dropped by
+        the orphan-`</think>` heuristic."""
+        raw = "Use </think> to close the thought block."
+        mock_result = {
+            "text": raw,
+            "done": True,
+            "stats": TimingStats(prompt_eval_count=10, eval_count=5),
+            "thinking_expected": False,
+        }
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "syntax?"}],
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["choices"][0]["message"]["content"] == raw
+
+    @pytest.mark.asyncio
     async def test_non_streaming_thinking_stripped_without_tools(self, app_client):
         """Thinking blocks are stripped even when no tools are in the request."""
         mock_result = {

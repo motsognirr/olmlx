@@ -493,12 +493,21 @@ def _parse_gpt_oss_channels(
 def parse_model_output(
     text: str,
     has_tools: bool,
+    *,
+    thinking_expected: bool = True,
 ) -> tuple[str, str, list[dict]]:
     """Parse raw model output into (thinking_text, visible_text, tool_use_blocks).
 
     Args:
         text: Raw model output text.
         has_tools: Whether tools were provided in the request.
+        thinking_expected: When False, skip the orphan `</think>` heuristic
+            so a non-thinking model that legitimately mentions the literal
+            token does not have its prefix silently routed into thinking
+            (issue #307 review).  Standard `<think>...</think>` pairs and
+            Gemma4 channel format are always extracted — those tags are
+            unambiguous.  Defaults to True for backward compatibility with
+            callers that have not been updated to plumb the flag.
     """
     # Try gpt-oss channel format first
     gpt_oss_result = _parse_gpt_oss_channels(text, has_tools)
@@ -521,16 +530,19 @@ def parse_model_output(
 
     # Handle orphaned </think> — the chat template may open <think> in the
     # prompt so the generated text starts mid-think with only a closing tag.
-    orphan_idx = text.find("</think>")
-    if orphan_idx != -1:
-        orphan_thinking = text[:orphan_idx].strip()
-        if orphan_thinking:
-            thinking = (
-                f"{thinking}\n{orphan_thinking}".strip()
-                if thinking
-                else orphan_thinking
-            )
-        text = text[orphan_idx + len("</think>") :].lstrip("\n")
+    # Gated on `thinking_expected` so a non-thinking model that mentions the
+    # literal token is not misclassified (issue #307).
+    if thinking_expected:
+        orphan_idx = text.find("</think>")
+        if orphan_idx != -1:
+            orphan_thinking = text[:orphan_idx].strip()
+            if orphan_thinking:
+                thinking = (
+                    f"{thinking}\n{orphan_thinking}".strip()
+                    if thinking
+                    else orphan_thinking
+                )
+            text = text[orphan_idx + len("</think>") :].lstrip("\n")
 
     tool_uses: list[dict] = []
     if has_tools:

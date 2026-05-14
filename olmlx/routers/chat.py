@@ -244,17 +244,16 @@ async def chat(req: ChatRequest, request: Request):
         # calls / thinking).  For every other model the `or` falls back
         # to `text`, which is already the unstripped output.
         raw = result.get("raw_text") or result.get("text", "")
-        # Gate thinking-extraction on the engine-resolved `thinking_expected`
-        # so the streaming and non-streaming paths agree (issue #307 review):
-        # a non-thinking model that legitimately mentions the literal
-        # `</think>` token would otherwise have its prefix silently routed
-        # into `message.thinking` here while streaming preserves it.
-        if result.get("thinking_expected"):
-            thinking, visible, _tool_uses = parse_model_output(
-                raw, has_tools=bool(tools)
-            )
-        else:
-            thinking, visible = "", raw
+        # Pass `thinking_expected` so the orphan-`</think>` heuristic only
+        # fires when the engine actually requested thinking (issue #307
+        # review): keeps streaming and non-streaming behaviour symmetric
+        # and prevents a non-thinking model that mentions the literal
+        # token from having its prefix silently routed to thinking.
+        thinking, visible, _tool_uses = parse_model_output(
+            raw,
+            has_tools=bool(tools),
+            thinking_expected=bool(result.get("thinking_expected")),
+        )
         response = {
             "model": req.model,
             "created_at": now,

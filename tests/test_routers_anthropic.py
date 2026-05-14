@@ -421,12 +421,49 @@ class TestAnthropicEndpoint:
         assert data["usage"]["output_tokens"] == 20
 
     @pytest.mark.asyncio
+    async def test_non_streaming_literal_close_think_preserved_when_not_thinking(
+        self, app_client
+    ):
+        """Issue #307 review: a non-thinking model that legitimately mentions
+        the literal `</think>` token (e.g. explaining the syntax) must keep
+        it in the text block on the non-streaming path, not have its prefix
+        silently routed into a thinking block."""
+        raw = "Use </think> to close the thought block."
+        stats = TimingStats()
+        mock_result = {
+            "text": raw,
+            "done": True,
+            "stats": stats,
+            "thinking_expected": False,
+        }
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "syntax?"}],
+                    "max_tokens": 100,
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        content_types = [b["type"] for b in data["content"]]
+        assert "thinking" not in content_types
+        assert any(b.get("text") == raw for b in data["content"])
+
+    @pytest.mark.asyncio
     async def test_non_streaming_with_thinking(self, app_client):
         stats = TimingStats()
         mock_result = {
             "text": "<think>reasoning</think>The answer is 42.",
             "done": True,
             "stats": stats,
+            "thinking_expected": True,
         }
 
         with patch(

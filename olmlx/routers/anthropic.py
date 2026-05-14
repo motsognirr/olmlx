@@ -984,10 +984,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             visible_text = text
             resolve_tool_names(tool_uses, tools)
         else:
-            # Parse normally for other model formats
+            # Pass `thinking_expected` so the orphan-`</think>` heuristic
+            # only fires when the engine actually requested thinking
+            # (issue #307 review — symmetric with the Ollama fix).
             thinking_parsed, visible_text, tool_uses = parse_model_output(
                 text,
                 has_tools,
+                thinking_expected=bool(result.get("thinking_expected")),
             )
             thinking = thinking or thinking_parsed
             resolve_tool_names(tool_uses, tools)

@@ -554,7 +554,15 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         usage = OpenAIUsage.from_stats(result.get("stats"))
 
         has_tools = bool(req.tools)
-        _thinking, visible_text, tool_uses = parse_model_output(parse_text, has_tools)
+        # Pass `thinking_expected` so the orphan-`</think>` heuristic only
+        # fires when the engine actually requested thinking (issue #307
+        # review): a non-thinking model that mentions the literal token
+        # would otherwise have its prefix silently dropped from content.
+        _thinking, visible_text, tool_uses = parse_model_output(
+            parse_text,
+            has_tools,
+            thinking_expected=bool(result.get("thinking_expected")),
+        )
         resolve_tool_names(tool_uses, req.tools)
         _fill_missing_required_args(tool_uses, req.tools)
 
