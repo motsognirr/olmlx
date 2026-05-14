@@ -10,7 +10,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from olmlx.config import settings
-from olmlx.engine.inference import _inference_ref, count_chat_tokens, generate_chat
+from olmlx.engine.inference import (
+    INIT_ORPHAN_DETECT_LIMIT,
+    _inference_ref,
+    count_chat_tokens,
+    generate_chat,
+)
 from olmlx.routers.common import build_inference_options
 from olmlx.engine.tool_parser import (
     _make_tool_use_id,
@@ -341,6 +346,10 @@ async def _stream_buffered_with_tools(
     text_chunks: list[str] = []
     raw_text = ""
     output_tokens = 0
+    # Engine meta chunk arrives before any text — capture it so the orphan
+    # `</think>` heuristic in `parse_model_output` is gated symmetrically
+    # with the non-tools paths (issue #307 review round 5).
+    thinking_expected = False
 
     async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
         if chunk is _PING_SENTINEL:
@@ -348,6 +357,9 @@ async def _stream_buffered_with_tools(
             continue
         if isinstance(chunk, dict) and chunk.get("cache_info"):
             yield chunk  # Forward to stream_sse for message_start
+            continue
+        if isinstance(chunk, dict) and "thinking_expected" in chunk:
+            thinking_expected = bool(chunk["thinking_expected"])
             continue
         if chunk.get("done"):
             stats = chunk.get("stats")
@@ -378,6 +390,7 @@ async def _stream_buffered_with_tools(
     thinking, visible_text, tool_uses = parse_model_output(
         text_for_parsing,
         True,
+        thinking_expected=thinking_expected,
     )
 
     resolve_tool_names(tool_uses, declared_tools)
@@ -527,7 +540,12 @@ def _flush_thinking_buffer(
             )
         )
     else:
-        # state == "init" — no output at all, emit empty text block
+        # state == "init" — the stream ended before we could classify the
+        # leading buffer.  This happens when `thinking_expected` held the
+        # init state waiting for an orphan `</think>` that never arrived
+        # (issue #307 — short non-thinking output on a thinking-capable
+        # model).  Emit any held content as a text block so the response
+        # isn't dropped.
         events.append(
             _sse(
                 "content_block_start",
@@ -538,6 +556,17 @@ def _flush_thinking_buffer(
                 },
             )
         )
+        if buffer:
+            events.append(
+                _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_idx,
+                        "delta": {"type": "text_delta", "text": buffer},
+                    },
+                )
+            )
         events.append(
             _sse(
                 "content_block_stop",
@@ -555,6 +584,10 @@ async def _stream_thinking_state_machine(result):
     state = "init"  # "init", "thinking", "text"
     text_block_started = False
     done_reason = None
+    # Engine forwards this via a meta chunk; when set, we wait for an orphan
+    # `</think>` to classify the leading buffer as thinking instead of text
+    # (issue #307 — Qwen3.5/3.6 emit thinking without the `<think>` opener).
+    thinking_expected = False
 
     async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
         if chunk is _PING_SENTINEL:
@@ -562,6 +595,9 @@ async def _stream_thinking_state_machine(result):
             continue
         if isinstance(chunk, dict) and chunk.get("cache_info"):
             yield chunk  # Forward to stream_sse for message_start
+            continue
+        if isinstance(chunk, dict) and "thinking_expected" in chunk:
+            thinking_expected = bool(chunk["thinking_expected"])
             continue
         if chunk.get("done"):
             stats = chunk.get("stats")
@@ -575,6 +611,8 @@ async def _stream_thinking_state_machine(result):
 
         while buffer:
             if state == "init":
+                open_idx = buffer.find("<think>")
+                close_idx = buffer.find("</think>")
                 if buffer.startswith("<think>"):
                     state = "thinking"
                     buffer = buffer[7:]
@@ -586,7 +624,74 @@ async def _stream_thinking_state_machine(result):
                             "content_block": {"type": "thinking", "thinking": ""},
                         },
                     )
+                elif (
+                    close_idx >= 0
+                    and thinking_expected
+                    and (open_idx == -1 or close_idx < open_idx)
+                ):
+                    # Orphaned `</think>` — Qwen3.5/3.6 chat templates miss
+                    # the `<think>` opener but still emit the closer (#307).
+                    # Everything buffered before it is the thinking block.
+                    # Gated on `thinking_expected` so a non-thinking model
+                    # that legitimately mentions the literal `</think>`
+                    # token isn't silently reclassified as thinking, and on
+                    # the open/close order so that a buffer assembled with
+                    # `preamble<think>...</think>answer` (text-before-tag,
+                    # uncommon but real for slow first tokens) routes through
+                    # the standard `<think>` branch instead of swallowing the
+                    # `<think>` opener as orphan content.
+                    orphan_thinking = buffer[:close_idx]
+                    # Skip the whole content block when `</think>` is the
+                    # very first token — emitting an empty thinking block
+                    # would diverge from the non-streaming path which
+                    # produces no block in that case (issue #307 review
+                    # round 10).
+                    if orphan_thinking:
+                        yield _sse(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": block_idx,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            },
+                        )
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_idx,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": orphan_thinking,
+                                },
+                            },
+                        )
+                        yield _sse(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": block_idx},
+                        )
+                        block_idx += 1
+                    buffer = buffer[close_idx + len("</think>") :].lstrip("\n")
+                    state = "text"
                 elif len(buffer) < 7 and "<think>".startswith(buffer):
+                    break
+                elif (
+                    thinking_expected
+                    and close_idx == -1
+                    and len(buffer) <= INIT_ORPHAN_DETECT_LIMIT
+                ):
+                    # Keep waiting for a (possibly orphaned) `</think>`.
+                    # Gated on `close_idx == -1`: once we've seen `</think>`
+                    # we have enough information to make a decision (either
+                    # the orphan branch above already fired, or the text
+                    # state will emit the buffered content) — no point
+                    # waiting longer.
+                    # NOTE: this can delay the first `text_delta` event by
+                    # up to `INIT_ORPHAN_DETECT_LIMIT` characters (currently
+                    # 1024) for a thinking-capable model that produces a
+                    # short direct answer with no `</think>`; the keep-alive
+                    # ping loop covers the wait, and the buffered content
+                    # is emitted at stream end via `_flush_thinking_buffer`.
                     break
                 else:
                     state = "text"
@@ -612,11 +717,11 @@ async def _stream_thinking_state_machine(result):
                         {"type": "content_block_stop", "index": block_idx},
                     )
                     block_idx += 1
-                    buffer = buffer[end_idx + 8 :]
+                    buffer = buffer[end_idx + len("</think>") :]
                     state = "text"
-                elif len(buffer) > 8:
-                    safe = buffer[:-8]
-                    buffer = buffer[-8:]
+                elif len(buffer) > len("</think>"):
+                    safe = buffer[: -len("</think>")]
+                    buffer = buffer[-len("</think>") :]
                     yield _sse(
                         "content_block_delta",
                         {
@@ -903,10 +1008,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             visible_text = text
             resolve_tool_names(tool_uses, tools)
         else:
-            # Parse normally for other model formats
+            # Pass `thinking_expected` so the orphan-`</think>` heuristic
+            # only fires when the engine actually requested thinking
+            # (issue #307 review — symmetric with the Ollama fix).
             thinking_parsed, visible_text, tool_uses = parse_model_output(
                 text,
                 has_tools,
+                thinking_expected=bool(result.get("thinking_expected")),
             )
             thinking = thinking or thinking_parsed
             resolve_tool_names(tool_uses, tools)

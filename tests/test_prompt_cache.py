@@ -1163,9 +1163,16 @@ class TestCacheStatsInCacheInfoChunk:
             async for chunk in gen:
                 chunks.append(chunk)
 
-        # First chunk should be cache_info
-        cache_info = chunks[0]
-        assert cache_info.get("cache_info") is True
+        # cache_info must arrive before any text/done chunk; a leading
+        # ``thinking_expected`` meta chunk (issue #307) may precede it.
+        cache_info_idx = next(
+            i for i, c in enumerate(chunks) if c.get("cache_info") is True
+        )
+        first_text_or_done_idx = next(
+            i for i, c in enumerate(chunks) if "text" in c or c.get("done") is True
+        )
+        assert cache_info_idx < first_text_or_done_idx
+        cache_info = chunks[cache_info_idx]
         assert cache_info["cache_read_tokens"] == 5
         assert cache_info["cache_creation_tokens"] == 3
 
@@ -1266,8 +1273,7 @@ class TestCacheExactMatchTrimAlignment:
         # tokens whose KV entries are actually reused from cache.  The token at
         # suffix_start is re-processed by stream_generate, so its KV is not
         # served from cache.
-        cache_info = chunks[0]
-        assert cache_info.get("cache_info") is True
+        cache_info = next(c for c in chunks if c.get("cache_info") is True)
         assert cache_info["cache_read_tokens"] == 2
         assert cache_info["cache_creation_tokens"] == 1
 
@@ -1313,9 +1319,13 @@ class TestLockReleasedOnCacheInfoDisconnect:
                 [{"role": "user", "content": "hi"}],
                 stream=True,
             )
-            # Read only the cache_info chunk, then close (simulates client disconnect)
-            first = await gen.__anext__()
-            assert first.get("cache_info") is True
+            # Read up to and including the cache_info chunk, then close
+            # (simulates client disconnect).  The engine may prepend a
+            # ``thinking_expected`` meta chunk (issue #307) before cache_info.
+            while True:
+                chunk = await gen.__anext__()
+                if chunk.get("cache_info") is True:
+                    break
             await gen.aclose()
 
         # Lock must be released — if not, this acquire would deadlock

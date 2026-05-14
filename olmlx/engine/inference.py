@@ -1352,6 +1352,26 @@ def _get_chat_template_text(tokenizer: Any) -> str:
     return tpl if isinstance(tpl, str) else ""
 
 
+def _resolve_thinking_active(
+    caps: TemplateCaps,
+    tools: list[dict] | None,
+    enable_thinking: bool | None,
+) -> bool:
+    """Return whether the chat template will request thinking for this call.
+
+    Centralises the resolution rules used both inside ``_apply_chat_template``
+    (to set the ``enable_thinking`` kwarg) and by ``generate_chat`` (to tell
+    streaming routers whether to wait for an orphan `</think>` — issue #307).
+    """
+    if not caps.supports_enable_thinking:
+        return False
+    if enable_thinking is not None:
+        return enable_thinking
+    # Default: think unless tools were declared (backward compat for
+    # non-Anthropic callers that expect tool calls without thinking).
+    return not bool(tools)
+
+
 def _apply_chat_template(
     tokenizer: Any,
     messages: list[dict],
@@ -1380,14 +1400,9 @@ def _apply_chat_template(
         messages = _inject_tools_into_system(messages, tools)
 
     if caps.supports_enable_thinking:
-        if enable_thinking is not None:
-            kwargs["enable_thinking"] = enable_thinking
-        elif tools:
-            kwargs["enable_thinking"] = (
-                False  # backward compat for non-Anthropic callers
-            )
-        else:
-            kwargs["enable_thinking"] = True
+        kwargs["enable_thinking"] = _resolve_thinking_active(
+            caps, tools, enable_thinking
+        )
 
     try:
         return tokenizer.apply_chat_template(messages, **kwargs)
@@ -3027,22 +3042,83 @@ async def generate_chat(
             make_prompt_cache is not None,
         )
 
+    # Tell streaming routers whether to wait for a (possibly orphaned, see
+    # #307) `</think>` token — shares the rules with `_apply_chat_template`.
+    thinking_expected = _resolve_thinking_active(caps, tools, enable_thinking)
+
     if stream:
-        return _stream_completion(
-            lm,
-            prompt,
-            mt,
-            gen_kwargs,
-            stats,
-            images,
-            use_prompt_cache=use_prompt_cache,
-            prompt_tokens=prompt_tokens,
-            cache_id=cache_id,
+        return _prepend_meta(
+            _stream_completion(
+                lm,
+                prompt,
+                mt,
+                gen_kwargs,
+                stats,
+                images,
+                use_prompt_cache=use_prompt_cache,
+                prompt_tokens=prompt_tokens,
+                cache_id=cache_id,
+            ),
+            {"thinking_expected": thinking_expected},
         )
     else:
-        return await _full_completion(
+        result = await _full_completion(
             lm, prompt, mt, gen_kwargs, stats, images, has_tools=bool(tools)
         )
+        # Mirror the streaming meta chunk so non-streaming routers can gate
+        # orphan `</think>` handling on the same signal (issue #307).
+        result["thinking_expected"] = thinking_expected
+        return result
+
+
+# Streaming routers consult this when the engine signals
+# `thinking_expected=True` (issue #307): how many characters of leading
+# output to buffer while waiting for an orphan `</think>` before giving
+# up and emitting the held text as content.  Tuned for the tension
+# between two concerns:
+#   * Qwen3.5/3.6's orphan-thinking preamble for reasoning tasks is
+#     typically a few hundred characters before `</think>` arrives.
+#   * For thinking-capable models that produce a direct answer (no
+#     thinking block at all), every byte of this buffer adds TTFB
+#     latency — at ~1000 chars/s the worst case is roughly one second
+#     before any text reaches the client.  Keep-alive pings cover the
+#     wait but it's still a visible regression vs streaming a
+#     non-thinking model.  1024 was picked over the reviewer-suggested
+#     512 to keep margin for longer Qwen3.5 reasoning traces (the
+#     observed in-issue example is ~280 chars but production traces
+#     can exceed that for non-trivial prompts); revisit if real-world
+#     direct-answer TTFB becomes a complaint.
+#
+# KNOWN LIMITATION: when a thinking preamble exceeds this limit before
+# `</think>` arrives, the streaming routers fall through to text /
+# passthrough state and emit the buffered content as visible text.  The
+# `</think>` that arrives later is then surfaced as a literal token in
+# the visible content (no retroactive reclassification is possible in a
+# streaming path).  Practical impact: a complex multi-step reasoning
+# trace that runs longer than ~1024 characters before closing its
+# thinking block will leak the preamble into the response.  Mitigations
+# the operator can apply: bump this constant (trades TTFB for
+# correctness margin), use the non-streaming endpoint (always re-parses
+# the full text), or use a model that emits the standard `<think>...`
+# opener (which is detected at any position).
+INIT_ORPHAN_DETECT_LIMIT = 1024
+
+
+async def _prepend_meta(
+    stream: AsyncGenerator[dict, None],
+    meta: dict,
+) -> AsyncGenerator[dict, None]:
+    """Yield ``meta`` as the first chunk, then forward ``stream``.
+
+    Used so routers learn streaming-level metadata (e.g. whether thinking is
+    expected — issue #307) before any text chunks arrive.
+    """
+    try:
+        yield meta
+        async for chunk in stream:
+            yield chunk
+    finally:
+        await stream.aclose()
 
 
 async def generate_embeddings(

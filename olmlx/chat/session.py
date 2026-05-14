@@ -985,6 +985,11 @@ class ChatSession:
                 template_has_thinking=template_has_thinking,
             )
 
+            # Captured from the engine's `thinking_expected` meta chunk so
+            # `parse_model_output` only fires the orphan-`</think>`
+            # heuristic when thinking was actually requested (issue #307).
+            thinking_expected = False
+
             async for chunk in await generate_chat(
                 self.manager,
                 self.config.model_name,
@@ -998,6 +1003,9 @@ class ChatSession:
                 enable_thinking=self.config.thinking,
             ):
                 if chunk.get("cache_info"):
+                    continue
+                if "thinking_expected" in chunk:
+                    thinking_expected = bool(chunk["thinking_expected"])
                     continue
                 if chunk.get("done"):
                     break
@@ -1046,7 +1054,9 @@ class ChatSession:
 
             try:
                 _, visible_text, tool_uses = parse_model_output(
-                    full_text, has_tools=(mcp_tools is not None)
+                    full_text,
+                    has_tools=(mcp_tools is not None),
+                    thinking_expected=thinking_expected,
                 )
             except Exception as exc:
                 logger.error(

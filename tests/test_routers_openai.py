@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from olmlx.engine.inference import INIT_ORPHAN_DETECT_LIMIT
 from olmlx.routers.openai import (
     JSON_MODE_SYSTEM_MSG,
     _flush_thinking_buffer,
@@ -17,9 +18,17 @@ from olmlx.utils.timing import TimingStats
 class TestStripThinkingStreaming:
     """Unit tests for _strip_thinking_streaming."""
 
-    def _stream(self, chunks):
-        """Feed chunks through _strip_thinking_streaming, return list of outputs."""
-        state = {}
+    def _stream(self, chunks, thinking_expected=False):
+        """Feed chunks through _strip_thinking_streaming, return list of outputs.
+
+        ``thinking_expected`` mirrors the router-side meta chunk: when True,
+        the orphan `</think>` branch is enabled and the detect buffer is
+        raised to the same generous limit used in production.
+        """
+        state: dict = {}
+        if thinking_expected:
+            state["thinking_expected"] = True
+            state["detect_limit"] = INIT_ORPHAN_DETECT_LIMIT
         results = []
         for chunk in chunks:
             out = _strip_thinking_streaming(chunk, state)
@@ -57,10 +66,15 @@ class TestStripThinkingStreaming:
         assert "reasoning" not in full
         assert "The answer." in full
 
-    def test_orphaned_close_think_still_stripped(self):
-        """Orphaned </think> must still be detected and stripped."""
+    def test_orphaned_close_think_stripped_when_thinking_expected(self):
+        """When thinking is expected, an orphan `</think>` strips its prefix.
+
+        The gate matters: a non-thinking model that emits the literal token
+        must keep it (covered by
+        ``test_literal_close_think_preserved_when_thinking_not_expected``).
+        """
         chunks = ["internal ", "thinking", "</think>", "visible"]
-        results = self._stream(chunks)
+        results = self._stream(chunks, thinking_expected=True)
         full = "".join(results)
         assert "internal" not in full
         assert "thinking" not in full
@@ -87,6 +101,68 @@ class TestStripThinkingStreaming:
         out2 = _strip_thinking_streaming(" hello", state)
         assert out2 == "< hello"
         assert state["buffer"] == ""
+
+    def test_default_detect_limit_unchanged_for_non_thinking(self):
+        """Without a router-supplied detect_limit, the legacy 200-char
+        threshold applies so non-thinking models stream progressively."""
+        # 280 chars of plain text — must exit detect phase under the default
+        chunks = [f"token_{i} " for i in range(40)]
+        results = self._stream(chunks)
+        non_empty = [r for r in results if r]
+        assert len(non_empty) > 1, (
+            "Default detect_limit must keep non-thinking models progressive"
+        )
+
+    def test_literal_close_think_preserved_when_thinking_not_expected(self):
+        """A model that doesn't support thinking and happens to emit the
+        literal `</think>` token (e.g. explaining thinking-tag syntax)
+        must not have its content silently reclassified."""
+        chunks = [
+            "When the assistant writes ",
+            "</think>",
+            " the closer ends the thought block.",
+        ]
+        results = self._stream(chunks)  # no detect_limit → not thinking
+        full = "".join(results)
+        # Every character is content; the literal tag survives intact.
+        assert "When the assistant writes" in full
+        assert "</think>" in full
+        assert "the closer ends the thought block." in full
+
+    def test_long_orphaned_thinking_preamble_stripped(self):
+        """Issue #307: Qwen3.5/3.6 emit thinking without ``<think>`` opener.
+
+        The orphan ``</think>`` arrives only after several hundred characters
+        of structured thinking text. The detect-mode buffer must not give up
+        before the orphan tag arrives — otherwise the thinking leaks into
+        ``message.content``.
+        """
+        # Simulate a Qwen3.5-style thinking preamble exceeding the legacy
+        # 200-char detect threshold (here ~600 chars), followed by </think>
+        # and the visible answer.
+        preamble = (
+            "Thinking Process:\n\n"
+            "1. Analyze the Request: The user wants 17 * 23.\n"
+            "2. Recall multiplication: 17 * 23 = 17 * (20 + 3) = 340 + 51 = 391.\n"
+            "3. Sanity check: 17 * 25 = 425, minus 2*17 = 34, gives 391. OK.\n"
+            "4. Format the answer: just the number, no prose.\n"
+            "5. Final answer: 391.\n"
+            "6. Construct Final Response: 391"
+        )
+        assert len(preamble) > 200, "preamble must exceed legacy detect limit"
+        chunks = [preamble[i : i + 16] for i in range(0, len(preamble), 16)] + [
+            "\n</think>\n\n",
+            "391",
+        ]
+        # Mirror the router: when thinking is expected, the orphan branch
+        # is enabled and the detect buffer is raised so the late `</think>`
+        # is caught.
+        results = self._stream(chunks, thinking_expected=True)
+        full = "".join(results)
+        assert "Thinking Process" not in full
+        assert "Sanity check" not in full
+        assert "</think>" not in full
+        assert full.strip() == "391"
 
 
 class TestOpenAIRouter:
@@ -988,6 +1064,38 @@ class TestToolCallParsing:
         assert len(tool_chunks) == 0
 
     @pytest.mark.asyncio
+    async def test_non_streaming_literal_close_think_preserved_when_not_thinking(
+        self, app_client
+    ):
+        """Issue #307 review: a non-thinking model that mentions the literal
+        `</think>` token in a non-streaming response must keep it in
+        `message.content` rather than have its prefix silently dropped by
+        the orphan-`</think>` heuristic."""
+        raw = "Use </think> to close the thought block."
+        mock_result = {
+            "text": raw,
+            "done": True,
+            "stats": TimingStats(prompt_eval_count=10, eval_count=5),
+            "thinking_expected": False,
+        }
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "syntax?"}],
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["choices"][0]["message"]["content"] == raw
+
+    @pytest.mark.asyncio
     async def test_non_streaming_thinking_stripped_without_tools(self, app_client):
         """Thinking blocks are stripped even when no tools are in the request."""
         mock_result = {
@@ -1057,12 +1165,63 @@ class TestToolCallParsing:
         assert "The answer is 42." in full_content
 
     @pytest.mark.asyncio
-    async def test_streaming_orphaned_think_close(self, app_client):
-        """When the template opens <think> in the prompt, generated text starts
-        mid-think with only </think> — the thinking content must be stripped."""
+    async def test_streaming_qwen35_long_orphaned_thinking(self, app_client):
+        """Issue #307: Qwen3.5/3.6 stream their thinking without ``<think>``
+        opener; the orphan ``</think>`` arrives only after several hundred
+        characters. The router must wait for it before flushing, otherwise
+        the entire reasoning preamble leaks into ``message.content``."""
+        preamble = (
+            "Thinking Process:\n\n"
+            "1. Analyze the Request: The user wants 17 * 23.\n"
+            "2. Compute: 17 * 23 = (17 * 20) + (17 * 3) = 340 + 51 = 391.\n"
+            "3. Sanity check: 17 * 25 - 2*17 = 425 - 34 = 391.\n"
+            "4. Format: just the number, no prose.\n"
+            "5. Construct Final Response: 391"
+        )
+        assert len(preamble) > 200
 
         async def mock_stream(*args, **kwargs):
             async def gen():
+                yield {"thinking_expected": True}
+                for i in range(0, len(preamble), 16):
+                    yield {"text": preamble[i : i + 16], "done": False}
+                yield {"text": "\n</think>\n\n", "done": False}
+                yield {"text": "391", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "17*23"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        full_content = ""
+        for line in resp.text.strip().split("\n"):
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                payload = json.loads(line[6:])
+                delta = payload.get("choices", [{}])[0].get("delta", {})
+                full_content += delta.get("content", "") or ""
+        assert "Thinking Process" not in full_content
+        assert "Sanity check" not in full_content
+        assert "</think>" not in full_content
+        assert full_content.strip() == "391"
+
+    @pytest.mark.asyncio
+    async def test_streaming_orphaned_think_close(self, app_client):
+        """When the template opens <think> in the prompt, generated text starts
+        mid-think with only </think> — the thinking content must be stripped.
+        Engine signals `thinking_expected=True` via the meta chunk."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
                 yield {"text": "reasoning about", "done": False}
                 yield {"text": " the problem\n", "done": False}
                 yield {"text": "</think>\n", "done": False}

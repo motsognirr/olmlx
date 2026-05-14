@@ -8,6 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from olmlx.engine.inference import (
+    INIT_ORPHAN_DETECT_LIMIT,
     generate_chat,
     generate_completion,
     generate_embeddings,
@@ -140,13 +141,21 @@ def _strip_thinking_streaming(text: str, state: dict) -> str:
     out_parts: list[str] = []
     phase = state.get("phase", "detect")
 
+    thinking_expected = state.get("thinking_expected", False)
     while buf:
         if phase == "detect":
             open_idx = buf.find("<think>")
             close_idx = buf.find("</think>")
 
-            if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
+            if (
+                close_idx != -1
+                and (open_idx == -1 or close_idx < open_idx)
+                and thinking_expected
+            ):
                 # Orphaned </think> — discard everything before it.
+                # Only fires when thinking is actually expected for this
+                # request; otherwise the model is just mentioning the
+                # literal token and we leave the text untouched.
                 buf = buf[close_idx + len("</think>") :]
                 phase = "passthrough"
             elif open_idx != -1:
@@ -160,11 +169,12 @@ def _strip_thinking_streaming(text: str, state: dict) -> str:
                 # buffer grows large enough that an orphaned tag is very
                 # unlikely, emit the safe prefix and transition to
                 # passthrough so non-thinking models stream progressively.
-                # The threshold is generous to catch real orphaned tags
-                # (thinking content before </think>) while avoiding
-                # unbounded buffering for non-thinking models.
-                _DETECT_LIMIT = 200
-                if len(buf) > _DETECT_LIMIT:
+                # When the caller knows thinking is expected (issue #307),
+                # the limit is raised so Qwen3.5/3.6's long orphan-prefix
+                # thinking is detected even though `</think>` arrives only
+                # after several thousand characters.
+                detect_limit = state.get("detect_limit", 200)
+                if len(buf) > detect_limit:
                     out_parts.append(buf)
                     buf = ""
                     phase = "passthrough"
@@ -236,6 +246,16 @@ async def _stream_openai_sse(
     try:
         async for chunk in result:
             if chunk.get("cache_info"):
+                continue
+            if "thinking_expected" in chunk:
+                # Engine-emitted meta: tells the thinking stripper whether
+                # to wait for an orphan </think> (issue #307).  Without
+                # `thinking_expected`, a model that legitimately mentions
+                # the literal `</think>` token would have its prefix
+                # silently reclassified as thinking.
+                if chunk["thinking_expected"]:
+                    think_state["thinking_expected"] = True
+                    think_state["detect_limit"] = INIT_ORPHAN_DETECT_LIMIT
                 continue
             if chunk.get("done"):
                 # Flush any buffered content from thinking detection.
@@ -316,9 +336,16 @@ async def _stream_openai_sse_with_tools(
     full_text = ""
     raw_text = ""
     done_reason = None
+    # Engine meta chunk arrives before any text — capture it so the orphan
+    # `</think>` heuristic in `parse_model_output` is gated symmetrically
+    # with the non-tools paths (issue #307 review round 5).
+    thinking_expected = False
     try:
         async for chunk in result:
             if chunk.get("cache_info"):
+                continue
+            if "thinking_expected" in chunk:
+                thinking_expected = bool(chunk["thinking_expected"])
                 continue
             if chunk.get("done"):
                 # Read raw_text from done chunk for gpt-oss tool call parsing
@@ -330,7 +357,9 @@ async def _stream_openai_sse_with_tools(
         # Use raw_text for parsing so channel-format tool calls aren't lost;
         # fall back to full_text for non-gpt-oss models
         text_for_parsing = raw_text if raw_text else full_text
-        _thinking, visible_text, tool_uses = parse_model_output(text_for_parsing, True)
+        _thinking, visible_text, tool_uses = parse_model_output(
+            text_for_parsing, True, thinking_expected=thinking_expected
+        )
         resolve_tool_names(tool_uses, declared_tools)
         _fill_missing_required_args(tool_uses, declared_tools)
         logger.debug(
@@ -526,7 +555,15 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         usage = OpenAIUsage.from_stats(result.get("stats"))
 
         has_tools = bool(req.tools)
-        _thinking, visible_text, tool_uses = parse_model_output(parse_text, has_tools)
+        # Pass `thinking_expected` so the orphan-`</think>` heuristic only
+        # fires when the engine actually requested thinking (issue #307
+        # review): a non-thinking model that mentions the literal token
+        # would otherwise have its prefix silently dropped from content.
+        _thinking, visible_text, tool_uses = parse_model_output(
+            parse_text,
+            has_tools,
+            thinking_expected=bool(result.get("thinking_expected")),
+        )
         resolve_tool_names(tool_uses, req.tools)
         _fill_missing_required_args(tool_uses, req.tools)
 
