@@ -160,20 +160,41 @@ async def chat(req: ChatRequest, request: Request):
             if chunk.get("done"):
                 thinking_tail, content_tail = _flush_split_thinking(think_state)
                 stats = chunk.get("stats")
+                # Emit any held content as a regular non-done chunk *before*
+                # the done marker.  Ollama clients accumulate
+                # `message.content` from non-done chunks and the standard
+                # done frame has `content=""`; putting accumulated text in
+                # the done frame would silently drop it on those clients
+                # (issue #307 review round 9).
+                pre_done = ""
+                if thinking_tail or content_tail:
+                    pre_done = (
+                        json.dumps(
+                            {
+                                "model": req.model,
+                                "created_at": now,
+                                "message": Message(
+                                    role="assistant",
+                                    content=content_tail,
+                                    thinking=thinking_tail or None,
+                                ).model_dump(exclude_none=True),
+                                "done": False,
+                            }
+                        )
+                        + "\n"
+                    )
                 final = {
                     "model": req.model,
                     "created_at": now,
                     "message": Message(
-                        role="assistant",
-                        content=content_tail,
-                        thinking=thinking_tail or None,
+                        role="assistant", content="", thinking=None
                     ).model_dump(exclude_none=True),
                     "done": True,
                     "done_reason": chunk.get("done_reason", "stop"),
                 }
                 if stats:
                     final.update(stats.to_dict())
-                return json.dumps(final) + "\n"
+                return pre_done + json.dumps(final) + "\n"
             text = chunk.get("text", "")
             # Fast path: when thinking is not expected, pass every token
             # through immediately as content.  The detect buffer in

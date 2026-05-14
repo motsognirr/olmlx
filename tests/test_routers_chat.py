@@ -204,6 +204,53 @@ class TestChatRouter:
         assert content.strip() == "391"
 
     @pytest.mark.asyncio
+    async def test_chat_streaming_short_direct_answer_in_non_done_chunk(
+        self, app_client
+    ):
+        """Issue #307 review round 9: when `thinking_expected=True` and the
+        model gives a short direct answer (fits in the orphan-detect buffer
+        without any `</think>`), the buffered content must be flushed to a
+        non-done chunk before the done marker.  Standard Ollama clients
+        only accumulate `message.content` from non-done chunks; putting
+        accumulated content in the done frame's `message.content` would
+        be silently dropped."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "The answer is 42.", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "?"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        lines = [line for line in resp.text.strip().split("\n") if line.strip()]
+        # Walk all lines; non-done chunks should carry the content.
+        non_done_content = ""
+        done_content = ""
+        for line in lines:
+            payload = json.loads(line)
+            msg = payload.get("message", {})
+            if payload.get("done"):
+                done_content += msg.get("content", "")
+            else:
+                non_done_content += msg.get("content", "")
+        # All content must be in non-done chunks; the done marker carries
+        # an empty content field per the Ollama convention.
+        assert non_done_content == "The answer is 42."
+        assert done_content == ""
+
+    @pytest.mark.asyncio
     async def test_chat_non_streaming_literal_close_think_preserved_when_not_thinking(
         self, app_client
     ):
