@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from olmlx.engine.inference import INIT_ORPHAN_DETECT_LIMIT
 from olmlx.routers.openai import (
     JSON_MODE_SYSTEM_MSG,
     _flush_thinking_buffer,
@@ -27,7 +28,7 @@ class TestStripThinkingStreaming:
         state: dict = {}
         if thinking_expected:
             state["thinking_expected"] = True
-            state["detect_limit"] = 65536
+            state["detect_limit"] = INIT_ORPHAN_DETECT_LIMIT
         results = []
         for chunk in chunks:
             out = _strip_thinking_streaming(chunk, state)

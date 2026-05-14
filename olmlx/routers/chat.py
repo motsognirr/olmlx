@@ -174,9 +174,28 @@ async def chat(req: ChatRequest, request: Request):
                 if stats:
                     final.update(stats.to_dict())
                 return json.dumps(final) + "\n"
-            thinking_chunk, content_chunk = _split_thinking_streaming(
-                chunk.get("text", ""), think_state
-            )
+            text = chunk.get("text", "")
+            # Fast path: when thinking is not expected, pass every token
+            # through immediately as content.  The detect buffer in
+            # `_split_thinking_streaming` would otherwise hold the first
+            # 200 chars of every Ollama response (issue #307 review).
+            if not think_state.get("thinking_expected"):
+                if not text:
+                    return None
+                return (
+                    json.dumps(
+                        {
+                            "model": req.model,
+                            "created_at": now,
+                            "message": Message(
+                                role="assistant", content=text
+                            ).model_dump(exclude_none=True),
+                            "done": False,
+                        }
+                    )
+                    + "\n"
+                )
+            thinking_chunk, content_chunk = _split_thinking_streaming(text, think_state)
             if not thinking_chunk and not content_chunk:
                 return None
             return (
@@ -219,7 +238,11 @@ async def chat(req: ChatRequest, request: Request):
         )
         now = datetime.now(timezone.utc).isoformat()
         stats = result.get("stats")
-        # Use raw_text when present (gpt-oss channel format), else text.
+        # `_full_completion` only populates `raw_text` for gpt-oss channel
+        # format (where `text` has the channel tokens stripped and
+        # `parse_model_output` needs the un-stripped form to find tool
+        # calls / thinking).  For every other model the `or` falls back
+        # to `text`, which is already the unstripped output.
         raw = result.get("raw_text") or result.get("text", "")
         thinking, visible, _tool_uses = parse_model_output(raw, has_tools=bool(tools))
         response = {

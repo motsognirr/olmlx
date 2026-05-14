@@ -3067,11 +3067,19 @@ async def generate_chat(
         )
 
 
-# Generous upper bound on how long a Qwen3.5/3.6-style orphan thinking
-# preamble may run before `</think>` arrives.  Streaming routers consult
-# this when the engine signals `thinking_expected=True` (issue #307);
-# centralised here so all three routers stay in sync.
-INIT_ORPHAN_DETECT_LIMIT = 65536
+# Streaming routers consult this when the engine signals
+# `thinking_expected=True` (issue #307): how many characters of leading
+# output to buffer while waiting for an orphan `</think>` before giving
+# up and emitting the held text as content.  Tuned for the tension
+# between two concerns:
+#   * Qwen3.5/3.6's orphan-thinking preamble for reasoning tasks is
+#     typically a few hundred characters before `</think>` arrives.
+#   * For thinking-capable models that produce a direct answer (no
+#     thinking block at all), every byte of this buffer is a TTFB
+#     delay since nothing reaches the client until the limit is hit.
+# 1024 chars covers all observed orphan preambles while keeping
+# direct-answer streaming latency to roughly one chunk's worth.
+INIT_ORPHAN_DETECT_LIMIT = 1024
 
 
 async def _prepend_meta(

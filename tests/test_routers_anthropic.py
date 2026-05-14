@@ -924,6 +924,60 @@ class TestAnthropicEndpoint:
         assert visible_text.strip() == "391"
 
     @pytest.mark.asyncio
+    async def test_streaming_thinking_expected_but_direct_answer(self, app_client):
+        """Issue #307 review: when `thinking_expected=True` and the model
+        produces a direct answer (no `<think>` / `</think>` tags at all),
+        the state machine must still emit the buffered content as a
+        `text_delta` rather than silently swallow it.
+
+        Exercises the full SSE path through `_stream_thinking_state_machine`
+        → init-state wait for orphan close → stream end → flush via
+        `_flush_thinking_buffer`.
+        """
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                # Direct, short answer — no <think> or </think> anywhere.
+                yield {"text": "The answer is ", "done": False}
+                yield {"text": "42.", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "what is 6*7?"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        thinking_text = ""
+        text_text = ""
+        for line in resp.text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") != "content_block_delta":
+                continue
+            delta = payload.get("delta", {})
+            if delta.get("type") == "thinking_delta":
+                thinking_text += delta.get("thinking", "")
+            elif delta.get("type") == "text_delta":
+                text_text += delta.get("text", "")
+
+        assert thinking_text == ""
+        assert text_text == "The answer is 42."
+
+    @pytest.mark.asyncio
     async def test_streaming_literal_close_think_preserved_when_not_thinking(
         self, app_client
     ):
