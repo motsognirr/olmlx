@@ -1958,6 +1958,13 @@ class TestEnsureTokenizerEosInStops:
         _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids == {151643, 151645}
 
+    def test_noop_when_stops_not_a_set(self):
+        # A wrapper with add_eos_token but eos_token_ids=None must not crash;
+        # the guard returns early so the stop set is left unchanged.
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops=None)
+        _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids is None
+
     def test_warns_on_unexpected_type(self, caplog):
         # Defends against a refactor that accidentally skips the warning
         # branch or promotes/demotes its log level.
@@ -1991,6 +1998,29 @@ class TestLoadWithModelTypeFallbackEosFix:
         assert returned is tok
         assert 151645 in tok.eos_token_ids
         assert 151643 in tok.eos_token_ids
+
+    def test_flash_strict_fallback_path_augments_stops(self, tmp_path):
+        # When mlx_lm.load raises "parameters not in model", flash/prepare's
+        # strict-fallback branch reloads via load_model + load_tokenizer; the
+        # EOS augmentation must still run after that branch.
+        from olmlx.engine.flash.prepare import (
+            _STRICT_LOAD_ERROR,
+            load_model_with_strict_fallback,
+        )
+
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError(_STRICT_LOAD_ERROR)
+        mock_mlx_lm.utils.load_model.return_value = (
+            MagicMock(),
+            {"eos_token_id": 151643},
+        )
+        mock_mlx_lm.utils.load_tokenizer.return_value = tok
+
+        with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+            _, returned = load_model_with_strict_fallback(str(tmp_path), lazy=False)
+        assert returned is tok
+        assert 151645 in tok.eos_token_ids
 
     def test_flash_load_path_augments_stops(self, tmp_path):
         # Flash mode bypasses _load_with_model_type_fallback and calls

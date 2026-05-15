@@ -177,8 +177,6 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     kwargs.setdefault("tokenizer_config", {"trust_remote_code": True})
     try:
         model, tokenizer = mlx_lm.load(str(load_path), **kwargs)
-        _ensure_tokenizer_eos_in_stops(tokenizer)
-        return model, tokenizer
     except (AttributeError, ValueError, KeyError) as exc:
         config_file = Path(load_path) / "config.json"
         if not config_file.exists():
@@ -215,8 +213,10 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
             )
         finally:
             config_file.write_text(original_text)
-        _ensure_tokenizer_eos_in_stops(tokenizer)
-        return model, tokenizer
+    # Outside try/except: an AttributeError from the EOS helper must not
+    # trigger the model-type remapping fallback with a misleading error.
+    _ensure_tokenizer_eos_in_stops(tokenizer)
+    return model, tokenizer
 
 
 def _is_serializable_cache(cache: list) -> bool:
