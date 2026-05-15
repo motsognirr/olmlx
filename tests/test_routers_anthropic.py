@@ -484,6 +484,51 @@ class TestAnthropicEndpoint:
         content_types = [b["type"] for b in data["content"]]
         assert "thinking" in content_types
         assert "text" in content_types
+        # Issue #309: thinking content must be in `thinking` field, not `text`.
+        thinking_block = next(b for b in data["content"] if b["type"] == "thinking")
+        assert thinking_block["thinking"] == "reasoning"
+        # `text` is omitted entirely on thinking blocks (response_model_exclude_none).
+        assert "text" not in thinking_block
+        # SDK expects `signature` as a string; emit empty for non-Claude models.
+        assert thinking_block["signature"] == ""
+        # `signature` must be omitted on non-thinking blocks per Anthropic spec.
+        text_block = next(b for b in data["content"] if b["type"] == "text")
+        assert "signature" not in text_block
+        assert "thinking" not in text_block
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_pre_extracted_thinking(self, app_client):
+        """Issue #309: thinking can arrive pre-extracted from the engine via
+        `result['thinking']` (no `<think>` tags in `text`). The router must
+        still route it into the `thinking` field, not `text`."""
+        stats = TimingStats()
+        mock_result = {
+            "text": "The answer is 42.",
+            "thinking": "pre-extracted reasoning",
+            "done": True,
+            "stats": stats,
+            "thinking_expected": True,
+        }
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "think"}],
+                    "max_tokens": 100,
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        thinking_block = next(b for b in data["content"] if b["type"] == "thinking")
+        assert thinking_block["thinking"] == "pre-extracted reasoning"
+        assert "text" not in thinking_block
+        assert thinking_block["signature"] == ""
 
     @pytest.mark.asyncio
     async def test_non_streaming_with_tool_use(self, app_client):
@@ -699,6 +744,8 @@ class TestAnthropicEndpoint:
         text = resp.text
         assert "thinking_delta" in text
         assert "text_delta" in text
+        # Issue #309: SDK populates ThinkingBlock.signature from this delta.
+        assert "signature_delta" in text
 
     @pytest.mark.asyncio
     async def test_streaming_with_tools_buffered(self, app_client):
@@ -790,6 +837,8 @@ class TestAnthropicEndpoint:
         text = resp.text
         assert "thinking_delta" in text
         assert "message_stop" in text
+        # Mid-stream end goes through `_flush_thinking_buffer` — also emits signature_delta.
+        assert "signature_delta" in text
 
     @pytest.mark.asyncio
     async def test_streaming_no_output_at_all(self, app_client):
@@ -888,6 +937,8 @@ class TestAnthropicEndpoint:
         text = resp.text
         assert "thinking" in text
         assert "tool_use" in text
+        # Buffered-tools path emits signature_delta via _emit_content_block.
+        assert "signature_delta" in text
 
     @pytest.mark.asyncio
     async def test_streaming_orphaned_close_think_classified_as_thinking(
@@ -959,6 +1010,8 @@ class TestAnthropicEndpoint:
         assert "</think>" not in visible_text
         assert "</think>" not in thinking_text
         assert visible_text.strip() == "391"
+        # Orphan-close branch must also emit signature_delta before stop.
+        assert "signature_delta" in resp.text
 
     @pytest.mark.asyncio
     async def test_streaming_text_before_standard_think_pair_not_eaten_as_orphan(
@@ -2686,14 +2739,17 @@ class TestFlushThinkingBuffer:
             block_idx=0,
             text_block_started=False,
         )
-        # Should emit: thinking delta, thinking stop, empty text start+stop
-        assert len(events) == 4
+        # Should emit: thinking delta, signature_delta, thinking stop,
+        # empty text start+stop
+        assert len(events) == 5
         assert '"thinking_delta"' in events[0]
         assert "remaining thought" in events[0]
-        assert '"content_block_stop"' in events[1]
-        assert '"content_block_start"' in events[2]
-        assert '"type": "text"' in events[2]
-        assert '"content_block_stop"' in events[3]
+        assert '"signature_delta"' in events[1]
+        assert '"signature": ""' in events[1]
+        assert '"content_block_stop"' in events[2]
+        assert '"content_block_start"' in events[3]
+        assert '"type": "text"' in events[3]
+        assert '"content_block_stop"' in events[4]
         assert new_idx == 1  # thinking block 0, text block 1
 
     def test_flush_from_thinking_state_empty_buffer(self):
@@ -2702,11 +2758,12 @@ class TestFlushThinkingBuffer:
         events, new_idx = _flush_thinking_buffer(
             state="thinking", buffer="", block_idx=0, text_block_started=False
         )
-        # Should emit: thinking stop (no delta), empty text start+stop
-        assert len(events) == 3
-        assert '"content_block_stop"' in events[0]
-        assert '"content_block_start"' in events[1]
-        assert '"content_block_stop"' in events[2]
+        # Should emit: signature_delta, thinking stop, empty text start+stop
+        assert len(events) == 4
+        assert '"signature_delta"' in events[0]
+        assert '"content_block_stop"' in events[1]
+        assert '"content_block_start"' in events[2]
+        assert '"content_block_stop"' in events[3]
         assert new_idx == 1
 
     def test_flush_text_block_started(self):

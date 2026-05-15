@@ -239,6 +239,23 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+def _signature_delta_sse(block_idx: int, signature: str = "") -> str:
+    """Emit a `signature_delta` event for a thinking block.
+
+    The Anthropic SDK populates `ThinkingBlock.signature` from this delta; we
+    have nothing to sign for non-Claude models, so emit an empty string before
+    `content_block_stop`.
+    """
+    return _sse(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": block_idx,
+            "delta": {"type": "signature_delta", "signature": signature},
+        },
+    )
+
+
 _PING_SENTINEL = object()
 
 
@@ -279,8 +296,14 @@ def _emit_content_block(
     content_key: str,
     content: str,
     chunk_size: int,
+    signature: str | None = None,
 ) -> list[str]:
-    """Emit SSE strings for a complete content block (start + deltas + stop)."""
+    """Emit SSE strings for a complete content block (start + deltas + stop).
+
+    When `signature` is provided (thinking blocks), a `signature_delta` is
+    emitted before `content_block_stop` so the Anthropic SDK can populate
+    `ThinkingBlock.signature`.
+    """
     events = []
     events.append(
         _sse(
@@ -307,6 +330,8 @@ def _emit_content_block(
                     },
                 )
             )
+    if signature is not None:
+        events.append(_signature_delta_sse(block_idx, signature))
     events.append(
         _sse("content_block_stop", {"type": "content_block_stop", "index": block_idx})
     )
@@ -412,6 +437,7 @@ async def _stream_buffered_with_tools(
             "thinking",
             thinking,
             THINKING_CHUNK_SIZE,
+            signature="",
         ):
             yield event
         block_idx += 1
@@ -481,6 +507,7 @@ def _flush_thinking_buffer(
                     },
                 )
             )
+        events.append(_signature_delta_sse(block_idx))
         events.append(
             _sse(
                 "content_block_stop",
@@ -666,6 +693,7 @@ async def _stream_thinking_state_machine(result):
                                 },
                             },
                         )
+                        yield _signature_delta_sse(block_idx)
                         yield _sse(
                             "content_block_stop",
                             {"type": "content_block_stop", "index": block_idx},
@@ -712,6 +740,7 @@ async def _stream_thinking_state_machine(result):
                                 },
                             },
                         )
+                    yield _signature_delta_sse(block_idx)
                     yield _sse(
                         "content_block_stop",
                         {"type": "content_block_stop", "index": block_idx},
@@ -770,7 +799,11 @@ async def _stream_thinking_state_machine(result):
     }
 
 
-@router.post("/v1/messages/count_tokens")
+@router.post(
+    "/v1/messages/count_tokens",
+    response_model=AnthropicTokenCountResponse,
+    response_model_exclude_none=True,
+)
 async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request):
     logger.info(
         "Anthropic count_tokens: model=%s messages=%d tools=%d",
@@ -805,7 +838,11 @@ async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request
     return AnthropicTokenCountResponse(input_tokens=token_count)
 
 
-@router.post("/v1/messages")
+@router.post(
+    "/v1/messages",
+    response_model=AnthropicMessagesResponse,
+    response_model_exclude_none=True,
+)
 async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     logger.info(
         "Anthropic request: model=%s stream=%s tools=%d messages=%d max_tokens=%d",
@@ -1022,7 +1059,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         content_blocks = []
 
         if thinking:
-            content_blocks.append(AnthropicContentBlock(type="thinking", text=thinking))
+            content_blocks.append(
+                AnthropicContentBlock(type="thinking", thinking=thinking, signature="")
+            )
 
         if visible_text:
             content_blocks.append(AnthropicContentBlock(type="text", text=visible_text))
