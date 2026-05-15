@@ -1992,6 +1992,23 @@ class TestLoadWithModelTypeFallbackEosFix:
         assert 151645 in tok.eos_token_ids
         assert 151643 in tok.eos_token_ids
 
+    def test_flash_load_path_augments_stops(self, tmp_path):
+        # Flash mode bypasses _load_with_model_type_fallback and calls
+        # mlx_lm.load() directly via load_model_with_strict_fallback. That
+        # path must also apply the EOS workaround — otherwise Flash-mode
+        # Qwen2.5-Coder-1.5B-Instruct would still leak <|im_end|>.
+        from olmlx.engine.flash.prepare import load_model_with_strict_fallback
+
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.return_value = (MagicMock(), tok)
+
+        with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+            _, returned = load_model_with_strict_fallback(str(tmp_path), lazy=False)
+        assert returned is tok
+        assert 151645 in tok.eos_token_ids
+        assert 151643 in tok.eos_token_ids
+
     def test_fallback_path_augments_stops(self, tmp_path):
         # Exercises the model_type-remapping branch: mlx_lm.load raises, then
         # load_model + load_tokenizer are called with the stripped model_type.
