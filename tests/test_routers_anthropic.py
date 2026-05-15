@@ -487,9 +487,14 @@ class TestAnthropicEndpoint:
         # Issue #309: thinking content must be in `thinking` field, not `text`.
         thinking_block = next(b for b in data["content"] if b["type"] == "thinking")
         assert thinking_block["thinking"] == "reasoning"
-        assert thinking_block.get("text") is None
+        # `text` is omitted entirely on thinking blocks (response_model_exclude_none).
+        assert "text" not in thinking_block
         # SDK expects `signature` as a string; emit empty for non-Claude models.
         assert thinking_block["signature"] == ""
+        # `signature` must be omitted on non-thinking blocks per Anthropic spec.
+        text_block = next(b for b in data["content"] if b["type"] == "text")
+        assert "signature" not in text_block
+        assert "thinking" not in text_block
 
     @pytest.mark.asyncio
     async def test_non_streaming_pre_extracted_thinking(self, app_client):
@@ -522,7 +527,7 @@ class TestAnthropicEndpoint:
         data = resp.json()
         thinking_block = next(b for b in data["content"] if b["type"] == "thinking")
         assert thinking_block["thinking"] == "pre-extracted reasoning"
-        assert thinking_block.get("text") is None
+        assert "text" not in thinking_block
         assert thinking_block["signature"] == ""
 
     @pytest.mark.asyncio
@@ -739,6 +744,8 @@ class TestAnthropicEndpoint:
         text = resp.text
         assert "thinking_delta" in text
         assert "text_delta" in text
+        # Issue #309: SDK populates ThinkingBlock.signature from this delta.
+        assert "signature_delta" in text
 
     @pytest.mark.asyncio
     async def test_streaming_with_tools_buffered(self, app_client):
@@ -830,6 +837,8 @@ class TestAnthropicEndpoint:
         text = resp.text
         assert "thinking_delta" in text
         assert "message_stop" in text
+        # Mid-stream end goes through `_flush_thinking_buffer` — also emits signature_delta.
+        assert "signature_delta" in text
 
     @pytest.mark.asyncio
     async def test_streaming_no_output_at_all(self, app_client):
@@ -928,6 +937,8 @@ class TestAnthropicEndpoint:
         text = resp.text
         assert "thinking" in text
         assert "tool_use" in text
+        # Buffered-tools path emits signature_delta via _emit_content_block.
+        assert "signature_delta" in text
 
     @pytest.mark.asyncio
     async def test_streaming_orphaned_close_think_classified_as_thinking(
@@ -999,6 +1010,8 @@ class TestAnthropicEndpoint:
         assert "</think>" not in visible_text
         assert "</think>" not in thinking_text
         assert visible_text.strip() == "391"
+        # Orphan-close branch must also emit signature_delta before stop.
+        assert "signature_delta" in resp.text
 
     @pytest.mark.asyncio
     async def test_streaming_text_before_standard_think_pair_not_eaten_as_orphan(

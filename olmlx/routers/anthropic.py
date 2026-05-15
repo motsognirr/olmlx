@@ -799,7 +799,11 @@ async def _stream_thinking_state_machine(result):
     }
 
 
-@router.post("/v1/messages/count_tokens")
+@router.post(
+    "/v1/messages/count_tokens",
+    response_model=AnthropicTokenCountResponse,
+    response_model_exclude_none=True,
+)
 async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request):
     logger.info(
         "Anthropic count_tokens: model=%s messages=%d tools=%d",
@@ -834,7 +838,11 @@ async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request
     return AnthropicTokenCountResponse(input_tokens=token_count)
 
 
-@router.post("/v1/messages")
+@router.post(
+    "/v1/messages",
+    response_model=AnthropicMessagesResponse,
+    response_model_exclude_none=True,
+)
 async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     logger.info(
         "Anthropic request: model=%s stream=%s tools=%d messages=%d max_tokens=%d",
