@@ -61,3 +61,33 @@ class TestEmbedRouter:
         assert resp.status_code == 200
         data = resp.json()
         assert data["embedding"] == [0.5, 0.6]
+
+    @pytest.mark.asyncio
+    async def test_embed_rejects_empty_string_input(self, app_client):
+        resp = await app_client.post(
+            "/api/embed",
+            json={"model": "qwen3", "input": ""},
+        )
+        assert resp.status_code == 422
+        assert "input" in resp.text.lower()
+        assert "empty" in resp.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_embed_rejects_empty_list_input(self, app_client):
+        resp = await app_client.post(
+            "/api/embed",
+            json={"model": "qwen3", "input": []},
+        )
+        assert resp.status_code == 422
+        assert "input" in resp.text.lower()
+        assert "empty" in resp.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_embeddings_legacy_rejects_empty_prompt(self, app_client):
+        resp = await app_client.post(
+            "/api/embeddings",
+            json={"model": "qwen3", "prompt": ""},
+        )
+        assert resp.status_code == 422
+        assert "prompt" in resp.text.lower()
+        assert "empty" in resp.text.lower()

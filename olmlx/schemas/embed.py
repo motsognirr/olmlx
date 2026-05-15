@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from olmlx.schemas.common import ModelName
 
@@ -9,6 +9,19 @@ class EmbedRequest(BaseModel):
     truncate: bool = True
     options: dict | None = None
     keep_alive: str | None = None
+
+    @field_validator("input")
+    @classmethod
+    def validate_input_non_empty(cls, v: str | list[str]) -> str | list[str]:
+        if isinstance(v, str):
+            if not v:
+                raise ValueError("input cannot be empty")
+        else:
+            if not v:
+                raise ValueError("input cannot be an empty list")
+            if any(not s for s in v):
+                raise ValueError("input cannot contain empty strings")
+        return v
 
 
 class EmbedResponse(BaseModel):
@@ -24,6 +37,13 @@ class EmbeddingsRequest(BaseModel):
     prompt: str
     options: dict | None = None
     keep_alive: str | None = None
+
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt_non_empty(cls, v: str) -> str:
+        if not v:
+            raise ValueError("prompt cannot be empty")
+        return v
 
 
 class EmbeddingsResponse(BaseModel):

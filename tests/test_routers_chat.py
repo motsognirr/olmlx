@@ -942,6 +942,19 @@ class TestChatRouter:
         assert "created_at" in last_line
 
 
+class TestEmptyMessagesRejected:
+    @pytest.mark.asyncio
+    async def test_api_chat_rejects_empty_messages(self, app_client):
+        resp = await app_client.post(
+            "/api/chat",
+            json={"model": "qwen3", "messages": []},
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "messages" in body
+        assert "empty" in body
+
+
 class TestXCacheIDHeader:
     @pytest.mark.asyncio
     async def test_header_passed_to_generate_chat(self, app_client):

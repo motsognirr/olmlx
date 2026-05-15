@@ -76,6 +76,15 @@ class AnthropicMessagesRequest(BaseModel):
 
         return validate_token_limit(v, "max_tokens")
 
+    @field_validator("messages")
+    @classmethod
+    def validate_messages_non_empty(
+        cls, v: list[AnthropicMessage]
+    ) -> list[AnthropicMessage]:
+        if not v:
+            raise ValueError("messages cannot be empty")
+        return v
+
     temperature: float | None = Field(None, ge=0, le=1)
     top_p: float | None = Field(None, ge=0, le=1)
     top_k: int | None = Field(None, ge=1)  # Anthropic spec: top_k >= 1

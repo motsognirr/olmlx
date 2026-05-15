@@ -64,6 +64,15 @@ class OpenAIChatRequest(BaseModel):
 
         return validate_token_limit(v, "max_tokens")
 
+    @field_validator("messages")
+    @classmethod
+    def validate_messages_non_empty(
+        cls, v: list[OpenAIChatMessage]
+    ) -> list[OpenAIChatMessage]:
+        if not v:
+            raise ValueError("messages cannot be empty")
+        return v
+
 
 class OpenAIUsage(BaseModel):
     prompt_tokens: int = 0
@@ -163,6 +172,19 @@ class OpenAIEmbeddingRequest(BaseModel):
     model: ModelName
     input: str | list[str]
     encoding_format: str = "float"
+
+    @field_validator("input")
+    @classmethod
+    def validate_input_non_empty(cls, v: str | list[str]) -> str | list[str]:
+        if isinstance(v, str):
+            if not v:
+                raise ValueError("input cannot be empty")
+        else:
+            if not v:
+                raise ValueError("input cannot be an empty list")
+            if any(not s for s in v):
+                raise ValueError("input cannot contain empty strings")
+        return v
 
 
 class OpenAIEmbeddingData(BaseModel):

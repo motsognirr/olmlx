@@ -1435,6 +1435,19 @@ class TestAnthropicEndpoint:
         assert "internal server error" in error_data["error"]["message"]
 
 
+class TestEmptyMessagesRejected:
+    @pytest.mark.asyncio
+    async def test_messages_rejects_empty_messages_array(self, app_client):
+        resp = await app_client.post(
+            "/v1/messages",
+            json={"model": "qwen3", "messages": [], "max_tokens": 100},
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "messages" in body
+        assert "empty" in body
+
+
 class TestCountTokens:
     @pytest.mark.asyncio
     async def test_simple_message(self, app_client, mock_loaded_model):
