@@ -128,11 +128,14 @@ def _ensure_tokenizer_eos_in_stops(tokenizer: Any) -> None:
         return
     if not isinstance(inner_eos, int):
         # mlx-lm renamed ``_tokenizer`` or the inner HF tokenizer surfaces an
-        # unexpected type. Log at debug so upstream API churn is visible
-        # rather than silently reintroducing the original bug.
-        logger.debug(
+        # unexpected type. ``warning``, not ``debug``: this branch indicates
+        # the #308 workaround has silently regressed because mlx-lm changed
+        # its internals, and we recover by no-op'ing — operators need to see
+        # the signal in default logging configs, not only under DEBUG.
+        logger.warning(
             "Inner eos_token_id has unexpected type %s on %s; skipping "
-            "eos stop-set augmentation.",
+            "eos stop-set augmentation (issue #308 workaround may have "
+            "regressed against mlx-lm internals).",
             type(inner_eos).__name__,
             type(tokenizer).__name__,
         )

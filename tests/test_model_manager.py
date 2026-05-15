@@ -1983,9 +1983,15 @@ class TestLoadWithModelTypeFallbackEosFix:
         # Exercises the model_type-remapping branch: mlx_lm.load raises, then
         # load_model + load_tokenizer are called with the stripped model_type.
         # Same EOS mismatch scenario as the main path must still be repaired.
+        # We patch transformers' CONFIG_MAPPING so the test owns its
+        # precondition — without the patch a future transformers release
+        # dropping the chosen model_type would silently re-raise instead of
+        # exercising the fallback.
+        import transformers.models.auto.configuration_auto as auto_cfg
+
         from olmlx.engine.model_manager import _load_with_model_type_fallback
 
-        original_cfg = {"model_type": "deepseek_v32", "eos_token_id": 151643}
+        original_cfg = {"model_type": "fakemodel2", "eos_token_id": 151643}
         (tmp_path / "config.json").write_text(json.dumps(original_cfg))
 
         tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
@@ -1997,7 +2003,8 @@ class TestLoadWithModelTypeFallbackEosFix:
         )
         mock_mlx_lm.utils.load_tokenizer.return_value = tok
 
-        _, returned = _load_with_model_type_fallback(mock_mlx_lm, str(tmp_path))
+        with patch.object(auto_cfg, "CONFIG_MAPPING", {"fakemodel": object()}):
+            _, returned = _load_with_model_type_fallback(mock_mlx_lm, str(tmp_path))
         assert returned is tok
         assert 151645 in tok.eos_token_ids
         assert 151643 in tok.eos_token_ids
