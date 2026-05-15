@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from olmlx.schemas.common import ModelName, ModelOptions
 
@@ -35,6 +35,13 @@ class ChatRequest(BaseModel):
     stream: bool = True
     options: ModelOptions | None = None
     keep_alive: str | None = None
+
+    @field_validator("messages")
+    @classmethod
+    def validate_messages_non_empty(cls, v: list[Message]) -> list[Message]:
+        if not v:
+            raise ValueError("messages cannot be empty")
+        return v
 
 
 class ChatResponse(BaseModel):

@@ -128,10 +128,17 @@ class TestCommonSchemas:
 
 class TestGenerateSchemas:
     def test_generate_request_defaults(self):
-        req = GenerateRequest(model="test")
-        assert req.prompt == ""
+        req = GenerateRequest(model="test", prompt="hi")
         assert req.stream is True
         assert req.raw is False
+
+    def test_generate_request_requires_prompt(self):
+        with pytest.raises(ValidationError, match="prompt"):
+            GenerateRequest(model="test")
+
+    def test_generate_request_rejects_empty_prompt(self):
+        with pytest.raises(ValidationError, match="prompt"):
+            GenerateRequest(model="test", prompt="")
 
     def test_generate_response(self):
         resp = GenerateResponse(
@@ -170,6 +177,10 @@ class TestChatSchemas:
             done=True,
         )
         assert resp.done is True
+
+    def test_chat_request_rejects_empty_messages(self):
+        with pytest.raises(ValidationError, match="messages"):
+            ChatRequest(model="test", messages=[])
 
 
 class TestModelSchemas:
@@ -215,6 +226,22 @@ class TestEmbedSchemas:
     def test_embeddings_request(self):
         req = EmbeddingsRequest(model="test", prompt="hello")
         assert req.prompt == "hello"
+
+    def test_embed_request_rejects_empty_string(self):
+        with pytest.raises(ValidationError, match="input"):
+            EmbedRequest(model="test", input="")
+
+    def test_embed_request_rejects_empty_list(self):
+        with pytest.raises(ValidationError, match="input"):
+            EmbedRequest(model="test", input=[])
+
+    def test_embed_request_rejects_list_with_empty_string(self):
+        with pytest.raises(ValidationError, match="input"):
+            EmbedRequest(model="test", input=["hello", ""])
+
+    def test_embeddings_request_rejects_empty_prompt(self):
+        with pytest.raises(ValidationError, match="prompt"):
+            EmbeddingsRequest(model="test", prompt="")
 
 
 class TestManageSchemas:
@@ -304,6 +331,18 @@ class TestOpenAISchemas:
         req = OpenAICompletionRequest(model="test", prompt="hello")
         assert req.stream is False
 
+    def test_completion_request_rejects_empty_prompt_string(self):
+        with pytest.raises(ValidationError, match="prompt"):
+            OpenAICompletionRequest(model="test", prompt="")
+
+    def test_completion_request_rejects_empty_prompt_list(self):
+        with pytest.raises(ValidationError, match="prompt"):
+            OpenAICompletionRequest(model="test", prompt=[])
+
+    def test_completion_request_rejects_list_with_empty_string(self):
+        with pytest.raises(ValidationError, match="prompt"):
+            OpenAICompletionRequest(model="test", prompt=["hello", ""])
+
     def test_completion_response(self):
         resp = OpenAICompletionResponse(
             id="test",
@@ -325,6 +364,22 @@ class TestOpenAISchemas:
     def test_embedding_request_string(self):
         req = OpenAIEmbeddingRequest(model="test", input="hello")
         assert req.encoding_format == "float"
+
+    def test_embedding_request_rejects_empty_string(self):
+        with pytest.raises(ValidationError, match="input"):
+            OpenAIEmbeddingRequest(model="test", input="")
+
+    def test_embedding_request_rejects_empty_list(self):
+        with pytest.raises(ValidationError, match="input"):
+            OpenAIEmbeddingRequest(model="test", input=[])
+
+    def test_embedding_request_rejects_list_with_empty_string(self):
+        with pytest.raises(ValidationError, match="input"):
+            OpenAIEmbeddingRequest(model="test", input=["hello", ""])
+
+    def test_chat_request_rejects_empty_messages(self):
+        with pytest.raises(ValidationError, match="messages"):
+            OpenAIChatRequest(model="test", messages=[])
 
     def test_embedding_response(self):
         resp = OpenAIEmbeddingResponse(
@@ -579,6 +634,10 @@ class TestAnthropicSchemas:
                 messages=[AnthropicMessage(role="user", content="hi")],
                 max_tokens=0,
             )
+
+    def test_messages_request_rejects_empty_messages(self):
+        with pytest.raises(ValidationError, match="messages"):
+            AnthropicMessagesRequest(model="test", messages=[])
 
     def test_usage(self):
         u = AnthropicUsage()

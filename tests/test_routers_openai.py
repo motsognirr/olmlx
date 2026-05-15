@@ -603,6 +603,63 @@ class TestOpenAIRouter:
         assert any("[DONE]" in line for line in lines)
 
 
+class TestEmptyInputRejected:
+    @pytest.mark.asyncio
+    async def test_chat_completions_rejects_empty_messages(self, app_client):
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen3", "messages": []},
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "messages" in body
+        assert "empty" in body
+
+    @pytest.mark.asyncio
+    async def test_embeddings_rejects_empty_string_input(self, app_client):
+        resp = await app_client.post(
+            "/v1/embeddings",
+            json={"model": "qwen3", "input": ""},
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "input" in body
+        assert "empty" in body
+
+    @pytest.mark.asyncio
+    async def test_embeddings_rejects_empty_list_input(self, app_client):
+        resp = await app_client.post(
+            "/v1/embeddings",
+            json={"model": "qwen3", "input": []},
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "input" in body
+        assert "empty" in body
+
+    @pytest.mark.asyncio
+    async def test_completions_rejects_empty_prompt(self, app_client):
+        resp = await app_client.post(
+            "/v1/completions",
+            json={"model": "qwen3", "prompt": ""},
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "prompt" in body
+        assert "empty" in body
+
+    @pytest.mark.asyncio
+    async def test_completions_rejects_empty_list_prompt(self, app_client):
+        resp = await app_client.post(
+            "/v1/completions",
+            json={"model": "qwen3", "prompt": []},
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "prompt" in body
+        assert "empty" in body
+
+
 class TestXCacheIDHeader:
     @pytest.mark.asyncio
     async def test_header_passed_to_generate_chat(self, app_client):

@@ -1,6 +1,6 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
-from olmlx.schemas.common import ModelName
+from olmlx.schemas.common import ModelName, validate_non_empty_text_input
 
 
 class EmbedRequest(BaseModel):
@@ -9,6 +9,11 @@ class EmbedRequest(BaseModel):
     truncate: bool = True
     options: dict | None = None
     keep_alive: str | None = None
+
+    @field_validator("input")
+    @classmethod
+    def validate_input_non_empty(cls, v: str | list[str]) -> str | list[str]:
+        return validate_non_empty_text_input(v, "input")
 
 
 class EmbedResponse(BaseModel):
@@ -24,6 +29,11 @@ class EmbeddingsRequest(BaseModel):
     prompt: str
     options: dict | None = None
     keep_alive: str | None = None
+
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt_non_empty(cls, v: str) -> str:
+        return validate_non_empty_text_input(v, "prompt")
 
 
 class EmbeddingsResponse(BaseModel):

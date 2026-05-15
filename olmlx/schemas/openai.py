@@ -64,6 +64,15 @@ class OpenAIChatRequest(BaseModel):
 
         return validate_token_limit(v, "max_tokens")
 
+    @field_validator("messages")
+    @classmethod
+    def validate_messages_non_empty(
+        cls, v: list[OpenAIChatMessage]
+    ) -> list[OpenAIChatMessage]:
+        if not v:
+            raise ValueError("messages cannot be empty")
+        return v
+
 
 class OpenAIUsage(BaseModel):
     prompt_tokens: int = 0
@@ -125,6 +134,13 @@ class OpenAICompletionRequest(BaseModel):
 
         return validate_token_limit(v, "max_tokens")
 
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt_non_empty(cls, v: str | list[str]) -> str | list[str]:
+        from olmlx.schemas.common import validate_non_empty_text_input
+
+        return validate_non_empty_text_input(v, "prompt")
+
 
 class OpenAICompletionChoice(BaseModel):
     index: int = 0
@@ -163,6 +179,13 @@ class OpenAIEmbeddingRequest(BaseModel):
     model: ModelName
     input: str | list[str]
     encoding_format: str = "float"
+
+    @field_validator("input")
+    @classmethod
+    def validate_input_non_empty(cls, v: str | list[str]) -> str | list[str]:
+        from olmlx.schemas.common import validate_non_empty_text_input
+
+        return validate_non_empty_text_input(v, "input")
 
 
 class OpenAIEmbeddingData(BaseModel):

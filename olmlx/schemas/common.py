@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, overload
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -13,6 +13,25 @@ def validate_token_limit(v: int, field_name: str) -> int:
             f"{field_name} {v} exceeds configured limit {settings.max_tokens_limit} "
             f"(set OLMLX_MAX_TOKENS_LIMIT to increase)"
         )
+    return v
+
+
+@overload
+def validate_non_empty_text_input(v: str, field_name: str) -> str: ...
+@overload
+def validate_non_empty_text_input(v: list[str], field_name: str) -> list[str]: ...
+def validate_non_empty_text_input(
+    v: str | list[str], field_name: str
+) -> str | list[str]:
+    """Reject empty string, empty list, or list containing an empty string."""
+    if isinstance(v, str):
+        if not v:
+            raise ValueError(f"{field_name} cannot be empty")
+    else:
+        if not v:
+            raise ValueError(f"{field_name} cannot be an empty list")
+        if any(not s for s in v):
+            raise ValueError(f"{field_name} cannot contain empty strings")
     return v
 
 

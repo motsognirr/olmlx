@@ -1,11 +1,15 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from olmlx.schemas.common import ModelName, ModelOptions
+from olmlx.schemas.common import (
+    ModelName,
+    ModelOptions,
+    validate_non_empty_text_input,
+)
 
 
 class GenerateRequest(BaseModel):
     model: ModelName
-    prompt: str = Field("", max_length=1_000_000)
+    prompt: str = Field(..., max_length=1_000_000)
     suffix: str | None = None
     images: list[str] | None = None
     system: str | None = None
@@ -16,6 +20,11 @@ class GenerateRequest(BaseModel):
     format: str | None = None
     options: ModelOptions | None = None
     keep_alive: str | None = None
+
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt_non_empty(cls, v: str) -> str:
+        return validate_non_empty_text_input(v, "prompt")
 
 
 class GenerateResponse(BaseModel):
