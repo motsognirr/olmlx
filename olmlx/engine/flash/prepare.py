@@ -62,8 +62,15 @@ def load_model_with_strict_fallback(model_path: str, *, lazy: bool) -> tuple:
     """
     import mlx_lm
 
+    # Function-local import: model_manager doesn't import flash.prepare at
+    # module level, but a top-level import here would still cross a module
+    # boundary for an internal helper. Keep the dependency lazy.
+    from olmlx.engine.model_manager import _ensure_tokenizer_eos_in_stops
+
     try:
-        return mlx_lm.load(model_path, lazy=lazy)
+        # mlx_lm.load returns 2- or 3-tuple depending on return_config; default
+        # is 2-tuple. Pyright can't narrow on the parameter default.
+        model, tokenizer = mlx_lm.load(model_path, lazy=lazy)  # pyright: ignore[reportAssignmentType]
     except ValueError as exc:
         if _STRICT_LOAD_ERROR not in str(exc):
             raise
@@ -82,7 +89,8 @@ def load_model_with_strict_fallback(model_path: str, *, lazy: bool) -> tuple:
         tokenizer = mlx_lm.utils.load_tokenizer(
             model_dir, eos_token_ids=[eos] if isinstance(eos, int) else eos
         )
-        return model, tokenizer
+    _ensure_tokenizer_eos_in_stops(tokenizer)
+    return model, tokenizer
 
 
 def _encode_tokens(tokenizer, text: str) -> list[int]:

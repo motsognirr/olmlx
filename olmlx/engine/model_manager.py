@@ -98,6 +98,78 @@ def _sanitize_model_config_in_place(load_path) -> None:
             )
 
 
+def _ensure_tokenizer_eos_in_stops(tokenizer: Any) -> None:
+    """Add the tokenizer's own ``eos_token_id`` to its stop-token set.
+
+    Workaround for repos (e.g. ``mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit``,
+    issue #308) whose ``config.json`` declares ``eos_token_id`` as a token
+    different from the chat template's real end-of-turn token (the
+    ``eos_token`` field in ``tokenizer_config.json``). mlx-lm's ``load()``
+    feeds only the config.json value into ``TokenizerWrapper.eos_token_ids``,
+    so generation does not stop at the template's actual EOT and the EOT
+    string leaks into the decoded response.
+    """
+    # ``add_eos_token`` is the TokenizerWrapper marker — keep the gate on it
+    # so plain HF tokenizers and mlx-vlm processors are skipped — but mutate
+    # the ``eos_token_ids`` set directly to bypass the wrapper's stringly-typed
+    # API (``add_eos_token(str)`` does ``int(token)`` first then a vocab
+    # lookup; we already have the integer so set-mutation is unambiguous).
+    if not callable(getattr(tokenizer, "add_eos_token", None)):
+        return
+    stops = getattr(tokenizer, "eos_token_ids", None)
+    if not isinstance(stops, set):
+        # Symmetric with the missing-_tokenizer DEBUG log below: an mlx-lm
+        # change from set to list/frozenset/dict for eos_token_ids would
+        # otherwise silently disable the workaround.
+        logger.debug(
+            "TokenizerWrapper.eos_token_ids is %s (not set) on %s; eos "
+            "stop-set augmentation skipped (issue #308).",
+            type(stops).__name__,
+            type(tokenizer).__name__,
+        )
+        return
+    inner_tok = getattr(tokenizer, "_tokenizer", None)
+    if inner_tok is None:
+        # Past the ``add_eos_token`` gate but no ``_tokenizer`` attribute —
+        # mlx-lm likely renamed the field. Log at debug so the regression is
+        # discoverable in DEBUG-enabled environments without spamming the
+        # warning channel for a possibly-deliberate variant.
+        logger.debug(
+            "TokenizerWrapper._tokenizer not accessible on %s; eos stop-set "
+            "augmentation skipped (issue #308).",
+            type(tokenizer).__name__,
+        )
+        return
+    inner_eos = getattr(inner_tok, "eos_token_id", None)
+    if isinstance(inner_eos, list):
+        # Stock HF tokenizers always surface a single int here; defensive
+        # against custom trust_remote_code=True tokenizers that override
+        # ``eos_token_id`` to return list[int].
+        stops.update(t for t in inner_eos if isinstance(t, int))
+        return
+    if inner_eos is None:
+        # Tokenizer has no EOS configured — legitimate for some HF tokenizers
+        # (e.g. base/non-instruction-tuned variants). Silent no-op.
+        return
+    if not isinstance(inner_eos, int):
+        # mlx-lm renamed ``_tokenizer`` or the inner HF tokenizer surfaces an
+        # unexpected type. ``warning``, not ``debug``: this branch indicates
+        # the #308 workaround has silently regressed because mlx-lm changed
+        # its internals, and we recover by no-op'ing — operators need to see
+        # the signal in default logging configs, not only under DEBUG.
+        logger.warning(
+            "Inner eos_token_id has unexpected type %s on %s; skipping "
+            "eos stop-set augmentation (issue #308 workaround may have "
+            "regressed against mlx-lm internals).",
+            type(inner_eos).__name__,
+            type(tokenizer).__name__,
+        )
+        return
+    if inner_eos in stops:
+        return
+    stops.add(inner_eos)
+
+
 def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     """Load model + tokenizer, remapping unrecognised model_type if needed.
 
@@ -113,7 +185,7 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     _sanitize_model_config_in_place(load_path)
     kwargs.setdefault("tokenizer_config", {"trust_remote_code": True})
     try:
-        return mlx_lm.load(str(load_path), **kwargs)
+        model, tokenizer = mlx_lm.load(str(load_path), **kwargs)
     except (AttributeError, ValueError, KeyError) as exc:
         config_file = Path(load_path) / "config.json"
         if not config_file.exists():
@@ -150,7 +222,10 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
             )
         finally:
             config_file.write_text(original_text)
-        return model, tokenizer
+    # Outside try/except: an AttributeError from the EOS helper must not
+    # trigger the model-type remapping fallback with a misleading error.
+    _ensure_tokenizer_eos_in_stops(tokenizer)
+    return model, tokenizer
 
 
 def _is_serializable_cache(cache: list) -> bool:

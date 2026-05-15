@@ -14,6 +14,7 @@ from olmlx.engine.model_manager import (
     LoadedModel,
     ModelLoadTimeoutError,
     ModelManager,
+    _ensure_tokenizer_eos_in_stops,
     parse_keep_alive,
 )
 from olmlx.engine.registry import SpeculativeConfig
@@ -1906,6 +1907,190 @@ class TestTryLmThenVlmFallback:
         with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
             with pytest.raises(MemoryError):
                 manager._try_lm_then_vlm("test/path", "test")
+
+
+class _FakeTokenizerWrapper:
+    """Minimal stand-in for mlx-lm's TokenizerWrapper for stop-token tests."""
+
+    def __init__(
+        self,
+        inner_eos: int | list[int] | None,
+        stops: set[int] | None,
+    ):
+        inner = MagicMock()
+        inner.eos_token_id = inner_eos
+        self._tokenizer = inner
+        self.eos_token_ids: set[int] | None = stops
+
+    def add_eos_token(self, token: str) -> None:
+        assert self.eos_token_ids is not None
+        self.eos_token_ids.add(int(token))
+
+
+class TestEnsureTokenizerEosInStops:
+    """Issue #308: <|im_end|> leaks when config.json eos_token_id != template EOT."""
+
+    def test_adds_inner_eos_when_missing(self):
+        # Repro: Qwen2.5-Coder-1.5B has config.eos_token_id=151643 (<|endoftext|>)
+        # but tokenizer_config eos_token=<|im_end|> (151645). The chat template
+        # ends turns with 151645, so it must be in the stop set.
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151643, 151645}
+
+    def test_noop_when_already_present(self):
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151645})
+        _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151645}
+
+    def test_noop_when_inner_eos_missing(self, caplog):
+        # None is legitimate (HF tokenizers without an EOS); must not warn.
+        # Scope caplog to our logger to avoid spurious failures from unrelated
+        # WARNING-level emissions (e.g. deprecation notices from pytest plugins).
+        tok = _FakeTokenizerWrapper(inner_eos=None, stops={151643})
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151643}
+        assert not caplog.records, f"unexpected warnings: {caplog.records}"
+
+    def test_adds_list_inner_eos(self):
+        # Defensive: HF stock tokenizers expose eos_token_id as a single int,
+        # but custom trust_remote_code=True tokenizers may surface list[int].
+        tok = _FakeTokenizerWrapper(inner_eos=[151645, 151643], stops={151643})
+        _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151643, 151645}
+
+    def test_noop_when_stops_not_a_set(self, caplog):
+        # A wrapper with add_eos_token but eos_token_ids=None must not crash;
+        # the guard returns early so the stop set is left unchanged. Should
+        # also DEBUG-log so a future mlx-lm change of the stop-set type is
+        # discoverable rather than silently disabling the workaround.
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops=None)
+        with caplog.at_level(logging.DEBUG, logger="olmlx.engine.model_manager"):
+            _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids is None
+        assert any("not set" in r.message for r in caplog.records)
+
+    def test_debug_logs_when_tokenizer_attr_missing(self, caplog):
+        # Past the add_eos_token gate but no _tokenizer attribute — mlx-lm
+        # likely renamed the field. Must log at DEBUG so the regression is
+        # discoverable without spamming WARNING for deliberate variants.
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        del tok._tokenizer
+        with caplog.at_level(logging.DEBUG, logger="olmlx.engine.model_manager"):
+            _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151643}
+        assert any("not accessible" in r.message for r in caplog.records)
+
+    def test_warns_on_unexpected_type(self, caplog):
+        # Defends against a refactor that accidentally skips the warning
+        # branch or promotes/demotes its log level.
+        tok = _FakeTokenizerWrapper(inner_eos=None, stops={151643})
+        tok._tokenizer.eos_token_id = 3.14  # float: not int, list, or None
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151643}  # unchanged
+        assert any("unexpected type" in r.message for r in caplog.records)
+
+    def test_noop_on_non_wrapper(self):
+        # mlx-vlm processors / plain HF tokenizers don't expose add_eos_token.
+        processor = MagicMock(spec=["tokenizer", "eos_token_id"])
+        # Calling on a non-wrapper must not raise.
+        _ensure_tokenizer_eos_in_stops(processor)
+
+
+class TestLoadWithModelTypeFallbackEosFix:
+    """Issue #308: _load_with_model_type_fallback must augment stop tokens."""
+
+    def test_main_path_augments_stops(self, tmp_path):
+        from olmlx.engine.model_manager import _load_with_model_type_fallback
+
+        (tmp_path / "config.json").write_text("{}")
+
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.return_value = (MagicMock(), tok)
+
+        _, returned = _load_with_model_type_fallback(mock_mlx_lm, str(tmp_path))
+        assert returned is tok
+        assert 151645 in tok.eos_token_ids
+        assert 151643 in tok.eos_token_ids
+
+    def test_flash_strict_fallback_path_augments_stops(self, tmp_path):
+        # When mlx_lm.load raises "parameters not in model", flash/prepare's
+        # strict-fallback branch reloads via load_model + load_tokenizer; the
+        # EOS augmentation must still run after that branch.
+        from olmlx.engine.flash.prepare import (
+            _STRICT_LOAD_ERROR,
+            load_model_with_strict_fallback,
+        )
+
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError(_STRICT_LOAD_ERROR)
+        mock_mlx_lm.utils.load_model.return_value = (
+            MagicMock(),
+            {"eos_token_id": 151643},
+        )
+        mock_mlx_lm.utils.load_tokenizer.return_value = tok
+
+        with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+            _, returned = load_model_with_strict_fallback(str(tmp_path), lazy=False)
+        assert returned is tok
+        assert 151645 in tok.eos_token_ids
+
+    def test_flash_load_path_augments_stops(self, tmp_path):
+        # Flash mode bypasses _load_with_model_type_fallback and calls
+        # mlx_lm.load() directly via load_model_with_strict_fallback. That
+        # path must also apply the EOS workaround — otherwise Flash-mode
+        # Qwen2.5-Coder-1.5B-Instruct would still leak <|im_end|>.
+        from olmlx.engine.flash.prepare import load_model_with_strict_fallback
+
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.return_value = (MagicMock(), tok)
+
+        with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+            _, returned = load_model_with_strict_fallback(str(tmp_path), lazy=False)
+        assert returned is tok
+        assert 151645 in tok.eos_token_ids
+        assert 151643 in tok.eos_token_ids
+
+    def test_fallback_path_augments_stops(self, tmp_path):
+        # Exercises the model_type-remapping branch: mlx_lm.load raises, then
+        # load_model + load_tokenizer are called with the stripped model_type.
+        # Same EOS mismatch scenario as the main path must still be repaired.
+        # We patch transformers' CONFIG_MAPPING so the test owns its
+        # precondition — without the patch a future transformers release
+        # dropping the chosen model_type would silently re-raise instead of
+        # exercising the fallback.
+        import transformers.models.auto.configuration_auto as auto_cfg
+
+        from olmlx.engine.model_manager import _load_with_model_type_fallback
+
+        original_cfg = {"model_type": "fakemodel2", "eos_token_id": 151643}
+        (tmp_path / "config.json").write_text(json.dumps(original_cfg))
+
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError("unsupported model_type")
+        mock_mlx_lm.utils.load_model.return_value = (
+            MagicMock(),
+            {"eos_token_id": 151643},
+        )
+        mock_mlx_lm.utils.load_tokenizer.return_value = tok
+
+        # "fakemodel2" → strips last digit → "fakemodel" via the regex
+        # ``re.sub(r"\d+$", lambda m: m.group()[:-1], ...)`` in
+        # _load_with_model_type_fallback. CONFIG_MAPPING must contain
+        # "fakemodel" for the fallback branch to proceed.
+        with patch.object(auto_cfg, "CONFIG_MAPPING", {"fakemodel": object()}):
+            _, returned = _load_with_model_type_fallback(mock_mlx_lm, str(tmp_path))
+        assert returned is tok
+        assert 151645 in tok.eos_token_ids
+        assert 151643 in tok.eos_token_ids
+        # config.json must be restored after the temporary remap.
+        assert json.loads((tmp_path / "config.json").read_text()) == original_cfg
 
 
 class TestExpiryChecker:
