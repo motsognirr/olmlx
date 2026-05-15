@@ -79,6 +79,10 @@ async def _stream_openai_sse(
     format_content(text) -> choices[0] dict for content chunks
     format_done() -> choices[0] dict for the final chunk
     """
+
+    def _compact_choice(choice: dict) -> dict:
+        return {k: v for k, v in choice.items() if v is not None}
+
     think_state: dict = {}
     try:
         async for chunk in result:
@@ -104,7 +108,7 @@ async def _stream_openai_sse(
                             "object": object_type,
                             "created": created,
                             "model": model,
-                            "choices": [format_content(flushed)],
+                            "choices": [_compact_choice(format_content(flushed))],
                         }
                         yield f"data: {json.dumps(data)}\n\n"
                 done_reason = chunk.get("done_reason")
@@ -120,7 +124,7 @@ async def _stream_openai_sse(
                     "object": object_type,
                     "created": created,
                     "model": model,
-                    "choices": [done_choice],
+                    "choices": [_compact_choice(done_choice)],
                 }
                 yield f"data: {json.dumps(data)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -135,7 +139,7 @@ async def _stream_openai_sse(
                     "object": object_type,
                     "created": created,
                     "model": model,
-                    "choices": [format_content(text)],
+                    "choices": [_compact_choice(format_content(text))],
                 }
                 yield f"data: {json.dumps(data)}\n\n"
     except Exception as exc:
@@ -209,13 +213,14 @@ async def _stream_openai_sse_with_tools(
         )
 
         def _chunk(choices_0):
+            choices_0_clean = {k: v for k, v in choices_0.items() if v is not None}
             return json.dumps(
                 {
                     "id": response_id,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model,
-                    "choices": [{"index": 0, **choices_0}],
+                    "choices": [{"index": 0, **choices_0_clean}],
                 }
             )
 
@@ -286,7 +291,11 @@ def _build_options(req) -> dict:
     )
 
 
-@router.post("/v1/chat/completions")
+@router.post(
+    "/v1/chat/completions",
+    response_model=OpenAIChatResponse,
+    response_model_exclude_none=True,
+)
 async def openai_chat(req: OpenAIChatRequest, request: Request):
     logger.info(
         "OpenAI chat request: model=%s stream=%s tools=%d messages=%d max_tokens=%s max_completion_tokens=%s",
@@ -438,7 +447,11 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         )
 
 
-@router.post("/v1/completions")
+@router.post(
+    "/v1/completions",
+    response_model=OpenAICompletionResponse,
+    response_model_exclude_none=True,
+)
 async def openai_completions(req: OpenAICompletionRequest, request: Request):
     manager = request.app.state.model_manager
     options = _build_options(req)
@@ -496,7 +509,11 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
         )
 
 
-@router.get("/v1/models")
+@router.get(
+    "/v1/models",
+    response_model=OpenAIModelList,
+    response_model_exclude_none=True,
+)
 async def openai_list_models(request: Request):
     registry = request.app.state.registry
     models = registry.list_models()
@@ -504,7 +521,11 @@ async def openai_list_models(request: Request):
     return OpenAIModelList(data=data)
 
 
-@router.post("/v1/embeddings")
+@router.post(
+    "/v1/embeddings",
+    response_model=OpenAIEmbeddingResponse,
+    response_model_exclude_none=True,
+)
 async def openai_embeddings(req: OpenAIEmbeddingRequest, request: Request):
     manager = request.app.state.model_manager
     texts = req.input if isinstance(req.input, list) else [req.input]
