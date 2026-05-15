@@ -61,8 +61,13 @@ logger = logging.getLogger(__name__)
 # Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_NUM_HIDDEN_LAYERS = 4
-DEFAULT_BLOCK_SIZE = 4  # number of draft tokens per step (== MASK count)
+# Paper-reported configuration (arxiv:2602.06036): 5 draft layers, 5
+# target hidden states, block_size=16. The pre-#317 defaults of 4/4/4
+# were ad-hoc and have not been bench-validated since the paper was
+# published. See gh#317 (Gap 3).
+DEFAULT_NUM_HIDDEN_LAYERS = 5
+DEFAULT_NUM_TARGET_LAYERS = 5
+DEFAULT_BLOCK_SIZE = 16  # number of draft tokens per step (== MASK count)
 DEFAULT_STEPS = 2000
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_SEQ_LEN = 2048
@@ -104,26 +109,48 @@ def _text_config(target_cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def _evenly_spaced(num_layers: int, k: int) -> list[int]:
-    """Pick ``k`` layer indices from ``[0, num_layers)`` evenly spaced.
+    """Pick ``k`` target-layer indices following the upstream DFlash recipe.
 
-    For the default ``num_target_layers=4`` and a 32-layer target this
-    gives ``[6, 12, 19, 25]`` (``step = 31/5 = 6.2``, positions rounded)
-    — the upstream papers show middle/late layers carry the most useful
-    signal. Edge layers are intentionally avoided (the draft already
-    sees the input via embed_tokens, and the final-layer hidden is
-    roughly equivalent to the LM head's pre-projection signal).
+    Returns ``k`` indices evenly distributed across ``[1, num_layers - 3]``
+    (inclusive), early-biased to match upstream
+    ``build_target_layer_ids`` in z-lab/dflash. For ``num_layers=32,
+    k=5`` this gives ``[1, 8, 15, 22, 29]``. The range avoids layer 0
+    (the draft already sees that signal through ``embed_tokens``) and
+    the final two layers (the bound ``lm_head`` already carries that
+    information). See gh#317 (Gap 4).
+
+    Falls back to a centred 0..num_layers-1 spread when the upstream
+    range is degenerate (``num_layers - 3 < 1``); returns
+    ``list(range(num_layers))`` when ``k >= num_layers`` and ``[]``
+    when ``k <= 0``.
     """
     if k <= 0:
         return []
     if k >= num_layers:
         return list(range(num_layers))
-    step = (num_layers - 1) / (k + 1)
+
+    end = num_layers - 3
+    if end < k:
+        # Degenerate: the upstream [1, N-3] range is too small to fit
+        # ``k`` unique indices (e.g. ``num_layers=4, k=2`` has range
+        # size 1, ``num_layers=5, k=3`` has range size 2). Fall back
+        # to a centred spread across the full layer range so small
+        # synthetic targets used in unit tests still produce sensible
+        # (and unique) indices.
+        if k == 1:
+            return [num_layers // 2]
+        fallback_step = (num_layers - 1) / (k - 1)
+        return sorted({int(round(i * fallback_step)) for i in range(k)})
+
+    if k == 1:
+        return [1]
+    step = (end - 1) / (k - 1)
     # Dedupe + sort: rounding can collide for small ``num_layers``
-    # close to ``k`` (e.g. ``num_layers=5, k=4`` → step 0.8 →
-    # ``[1, 2, 2, 3]``). Duplicates would double-wrap the repeated
-    # layer in ``_LayerHook`` and ``_unpatch_model`` only strips one
-    # level — the dangling hook would corrupt subsequent captures.
-    result = sorted({int(round((i + 1) * step)) for i in range(k)})
+    # close to ``k`` (e.g. ``num_layers=5, k=4`` would otherwise hit
+    # duplicates). Duplicates would double-wrap the repeated layer in
+    # ``_LayerHook`` and ``_unpatch_model`` only strips one level —
+    # the dangling hook would corrupt subsequent captures.
+    result = sorted({int(round(1 + i * step)) for i in range(k)})
     if len(result) < k:
         # Operator surprise: ``--num-target-layers`` won't match the
         # final ``num_target_layers`` baked into the saved
@@ -167,7 +194,7 @@ def _resolve_target_layer_ids(
                 f"target_layer_ids contains duplicate indices: {requested}"
             )
         return sorted(requested)
-    k = num_target_layers or DEFAULT_NUM_HIDDEN_LAYERS
+    k = num_target_layers or DEFAULT_NUM_TARGET_LAYERS
     return _evenly_spaced(target_num_layers, k)
 
 
@@ -349,6 +376,7 @@ def _draft_loss(
     distill_alpha: float = 0.0,
     distill_temp: float = 1.0,
     pad_token_id: int | None = None,
+    position_decay_gamma: float | None = None,
 ) -> mx.array:
     """Loss on the masked positions: cross-entropy + optional KL distillation.
 
@@ -374,25 +402,54 @@ def _draft_loss(
     which equals the target after MASK==PAD aliasing) — contaminating
     the running average without contributing any gradient. The mask
     makes such batches deliver an honest no-op step instead.
+
+    When ``position_decay_gamma`` is provided (positive float), apply
+    the paper's per-position weighting ``w_k = exp(-(k-1)/gamma)`` for
+    ``k = 1..block_size`` (so position 0 has weight 1.0, decaying to
+    ``exp(-(N-1)/gamma)`` at position N-1). This emphasises early
+    positions because acceptance length compounds — a wrong token at
+    position 1 wastes the remaining positions 2..N regardless of how
+    correct they would have been. With ``None`` (or ``<= 0``) the
+    reduction stays a uniform mean (legacy behaviour). See gh#317
+    (Gap 2).
     """
     draft_logits = draft(block_input, target_hidden, cache, logits_start=1)
     log_probs = nn.log_softmax(draft_logits, axis=-1)
     nll = -mx.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
 
+    # ``pos_weights`` has shape ``(block_size,)`` and broadcasts against
+    # the ``(B, block_size)`` per-position NLL / KL arrays. When
+    # ``position_decay_gamma`` is unset, fall back to ones so the
+    # weighted-mean reduction collapses to the legacy uniform mean.
+    if position_decay_gamma is not None and position_decay_gamma > 0:
+        block_size = nll.shape[-1]
+        pos = mx.arange(block_size, dtype=nll.dtype)
+        pos_weights = mx.exp(-pos / float(position_decay_gamma))
+    else:
+        pos_weights = None
+
     # Initialise upfront so the type checker can see ``denom`` is in
-    # scope when the KL branch reaches for it (it's only meaningful when
-    # ``valid is not None``, which is equivalent to ``pad_token_id is not
-    # None``, but the type narrowing isn't trivially derivable).
+    # scope when the KL branch reaches for it.
     valid: mx.array | None = None
     denom: mx.array | None = None
     if pad_token_id is not None:
         valid = (targets != pad_token_id).astype(nll.dtype)
+        # Combine pad mask with per-position weights when both are
+        # active. The pad path's invariant — sum(weights) >= 0 across
+        # all-pad batches collapses to exactly 0.0 — is preserved
+        # because positive ``pos_weights`` only scale a zero mask.
+        combined = valid if pos_weights is None else valid * pos_weights
         # ``valid.sum().clip(1.0, ...)`` keeps the divisor from hitting
         # zero when the entire window is pad. Combined with the
         # zero-weighted nll the result is an exact 0.0 — the optimizer
         # update then has zero gradient (flowing back through 0/1).
-        denom = mx.maximum(valid.sum(), mx.array(1.0, dtype=nll.dtype))
-        ce = (nll * valid).sum() / denom
+        denom = mx.maximum(combined.sum(), mx.array(1.0, dtype=nll.dtype))
+        ce = (nll * combined).sum() / denom
+    elif pos_weights is not None:
+        # Pure position-weighted mean: sum(w * nll) / sum(w). ``denom``
+        # stays ``None`` here — the KL branch below recomputes its own
+        # denominator using the same weights.
+        ce = (nll * pos_weights).sum() / (pos_weights.sum() * nll.shape[0])
     else:
         ce = mx.mean(nll)
 
@@ -410,16 +467,13 @@ def _draft_loss(
     if valid is not None:
         # ``valid`` and ``denom`` are co-assigned in the
         # ``pad_token_id is not None`` branch above, so checking
-        # ``valid`` alone implies ``denom`` is non-None. ``denom`` is
-        # reused here instead of re-running ``valid.sum()`` and the
-        # maximum-with-1.0 floor a second time — the two
-        # ``valid.sum()`` calls would produce the same value differing
-        # only in dtype, so an ``astype`` cast is sufficient.
-        # Use ``typing.cast`` rather than an ``assert`` for type
-        # narrowing because Python ``-O`` strips assertions, and a
-        # training pipeline can plausibly run optimised.
+        # ``valid`` alone implies ``denom`` is non-None. Reuse the
+        # combined-weights ``denom`` via dtype cast.
         denom_kl = cast(mx.array, denom)
-        kl_loss = (kl * valid).sum() / denom_kl.astype(kl.dtype) * (t * t)
+        combined_kl = valid if pos_weights is None else valid * pos_weights
+        kl_loss = (kl * combined_kl).sum() / denom_kl.astype(kl.dtype) * (t * t)
+    elif pos_weights is not None:
+        kl_loss = (kl * pos_weights).sum() / (pos_weights.sum() * kl.shape[0]) * (t * t)
     else:
         kl_loss = mx.mean(kl) * (t * t)
 
@@ -538,6 +592,7 @@ def prepare_dflash_draft(
     distill: bool = False,
     distill_alpha: float = 0.5,
     distill_temp: float = 2.0,
+    position_decay_gamma: float | None = None,
     use_precomputed: str | Path | None = None,
     _target_loader: Callable[[str], tuple[Any, Any]] | None = None,
     _batch_iterator: Any = None,
@@ -549,6 +604,13 @@ def prepare_dflash_draft(
     ``(1 - alpha) * CE + alpha * T^2 * KL``. Requires running the
     target online — incompatible with ``use_precomputed`` (precomputed
     shards store hiddens but not vocab-size logits).
+
+    ``position_decay_gamma``: per-position loss weighting decay
+    constant ``γ`` in ``w_k = exp(-(k-1)/γ)`` (k=1..block_size). When
+    ``None``, defaults to ``block_size / 2`` (the issue's suggested
+    starting point — the paper does not publicly pin a single value).
+    Pass ``0`` or a negative value to disable the weighting and recover
+    the uniform-mean reduction. See gh#317 (Gap 2).
 
     ``use_precomputed``: read precomputed (input_ids, hidden) shards
     from this directory instead of running the target each step. Skips
@@ -569,6 +631,16 @@ def prepare_dflash_draft(
         raise ValueError(f"distill_alpha must be in [0, 1], got {distill_alpha}")
     if distill_temp <= 0:
         raise ValueError(f"distill_temp must be > 0, got {distill_temp}")
+    # ``position_decay_gamma`` defaults to ``None`` (disabled) — the
+    # uniform-mean reduction matches legacy behaviour bit-for-bit. The
+    # issue (gh#317 Gap 2) flags this as a hyperparameter to sweep,
+    # not a definitively-correct default; operators opt in via the
+    # ``--position-decay-gamma`` CLI flag (suggested starting point:
+    # ``block_size / 2``). ``0`` or a negative value explicitly
+    # disables and is normalised to ``None`` so the loss branches stay
+    # simple.
+    if position_decay_gamma is not None and position_decay_gamma <= 0:
+        position_decay_gamma = None
     if block_size < 1:
         # ``block_size == 0`` builds zero-length mask/target tensors,
         # ``_draft_loss`` then returns 0 with no gradient, and the
@@ -738,6 +810,7 @@ def prepare_dflash_draft(
             distill_alpha=distill_alpha if distill else 0.0,
             distill_temp=distill_temp,
             pad_token_id=pad_for_loss,
+            position_decay_gamma=position_decay_gamma,
         )
 
     loss_and_grad = nn.value_and_grad(draft, loss_fn)
@@ -1000,7 +1073,18 @@ def prepare_dflash_draft(
             )
             block_input = mx.concatenate([pending, mask_block], axis=1)
             targets = input_ids[:, p + 1 : p + 1 + block_size]
-            target_hidden = target_hidden_full[:, : p + 1, :]
+            # Slice ctx to positions 0..p-1 so the draft sees the same
+            # hidden-state distribution at training and inference time.
+            # At inference, ctx covers 0..L-1 and pending sits at RoPE
+            # position L (the position pending's content actually
+            # corresponds to). A prior version sliced ``[:, :p+1, :]``,
+            # which (a) gave the draft the target's own hidden for the
+            # pending position — a copy-shortcut that doesn't exist at
+            # inference — and (b) pushed proposal RoPE positions to
+            # p+1..p+block_size+1 instead of p..p+block_size. The pivot
+            # range guarantees ``p >= block_size >= 1`` so the slice is
+            # non-empty. See gh#317 (Gap 1).
+            target_hidden = target_hidden_full[:, :p, :]
 
             target_logits_window: mx.array | None = None
             if distill and target_logits_full is not None:

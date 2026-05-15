@@ -2255,6 +2255,7 @@ def cmd_dflash_prepare(args):
         distill=args.distill,
         distill_alpha=args.distill_alpha,
         distill_temp=args.distill_temp,
+        position_decay_gamma=args.position_decay_gamma,
         use_precomputed=args.use_precomputed,
         progress_callback=_flash_progress,
     )
@@ -2657,22 +2658,22 @@ def build_parser() -> argparse.ArgumentParser:
     dflash_prepare_p.add_argument(
         "--block-size",
         type=int,
-        default=4,
-        help="Number of draft tokens per step (default: 4)",
+        default=16,
+        help="Number of draft tokens per step (default: 16, per paper)",
     )
     dflash_prepare_p.add_argument(
         "--num-hidden-layers",
         type=int,
-        default=4,
-        help="Draft model hidden layer count (default: 4)",
+        default=5,
+        help="Draft model hidden layer count (default: 5, per paper)",
     )
     dflash_prepare_p.add_argument(
         "--num-target-layers",
         type=int,
-        default=4,
+        default=5,
         help=(
-            "Number of target hidden states to extract (default: 4). "
-            "Ignored when --target-layer-ids is set."
+            "Number of target hidden states to extract (default: 5, "
+            "per paper). Ignored when --target-layer-ids is set."
         ),
     )
     dflash_prepare_p.add_argument(
@@ -2735,6 +2736,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Distillation temperature T (default: 2.0)",
     )
     dflash_prepare_p.add_argument(
+        "--position-decay-gamma",
+        type=float,
+        default=None,
+        help=(
+            "Per-position loss weight decay: w_k = exp(-(k-1)/gamma) for "
+            "k=1..block_size. Emphasises early positions because "
+            "acceptance length compounds. Default: block_size/2. Pass "
+            "0 (or negative) to disable and use the uniform-mean "
+            "reduction."
+        ),
+    )
+    dflash_prepare_p.add_argument(
         "--use-precomputed",
         type=str,
         default=None,
@@ -2771,8 +2784,8 @@ def build_parser() -> argparse.ArgumentParser:
     dflash_precompute_p.add_argument(
         "--num-target-layers",
         type=int,
-        default=4,
-        help="Number of target hidden states to extract (default: 4)",
+        default=5,
+        help="Number of target hidden states to extract (default: 5, per paper)",
     )
     dflash_precompute_p.add_argument(
         "--target-layer-ids",

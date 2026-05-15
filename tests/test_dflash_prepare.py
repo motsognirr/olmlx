@@ -111,17 +111,32 @@ def _mock_target_loader(vocab_size: int, hidden_size: int, num_layers: int):
 def _synthetic_batches(vocab: int, batch_size: int, seq_len: int, n: int):
     """Deterministic batch iterator so tests don't hit the network.
 
-    Emits tokens in ``[1, vocab)`` rather than ``[0, vocab)`` because
-    ``_MockTokenizer.pad_token_id == 0`` and the trainer's pad-aware
-    pivot helper would otherwise treat any random 0 as padding and
-    shrink the valid pivot range. Tests that need to exercise the
-    pad-aware path build batches explicitly with pad tokens (see
-    ``TestPivotSelection``).
+    Emits sequences whose next-token IS the previous-token + 1 (mod
+    ``vocab - 1``, then shifted into ``[1, vocab)``) so there's *actual*
+    learnable structure for the loss-decrease sanity check. Previous
+    versions yielded pure ``mx.random.randint`` noise, which worked
+    only because the pre-#317 training pipeline let the draft cheat
+    via a target-hidden copy shortcut at the pending position (the
+    very bug gh#317 Gap 1 fixes). With the shortcut removed the draft
+    can't reduce CE on noise — so the synthetic data must carry a
+    pattern.
+
+    Tokens stay in ``[1, vocab)`` because ``_MockTokenizer.pad_token_id
+    == 0`` and the trainer's pad-aware pivot helper would otherwise
+    treat any 0 as padding and shrink the valid pivot range. Tests
+    that need to exercise the pad-aware path build batches explicitly
+    with pad tokens (see ``TestPivotSelection``).
     """
-    rng = mx.random.key(0)
-    for _ in range(n):
-        rng, sub = mx.random.split(rng)
-        yield mx.random.randint(1, vocab, (batch_size, seq_len), key=sub)
+    # Build a deterministic per-batch starting offset, then walk
+    # ``seq_len`` consecutive tokens in 1..vocab-1.
+    period = vocab - 1
+    for i in range(n):
+        offsets = mx.arange(seq_len, dtype=mx.int32) + i
+        # Each row starts at a slightly different offset so batches
+        # don't all carry the same window.
+        per_row = mx.arange(batch_size, dtype=mx.int32)[:, None] * 7
+        tokens = (offsets[None, :] + per_row) % period + 1
+        yield tokens
 
 
 def _write_target_config(tmp_path: Path, vocab_size: int, hidden_size: int) -> Path:
@@ -165,6 +180,32 @@ class TestEvenlySpaced:
         ids = _evenly_spaced(2, 4)
         # When k >= num_layers, returns the full layer range.
         assert ids == [0, 1]
+
+    def test_matches_upstream_recipe_for_n32_k5(self):
+        """Upstream ``build_target_layer_ids(32, 5) == [1, 8, 15, 22,
+        29]``: indices evenly spread over ``[1, N-3]`` (early-biased,
+        skipping the embedding-adjacent layer 0 and the lm_head-adjacent
+        last two layers). See gh#317 (Gap 4).
+        """
+        from olmlx.engine.dflash.prepare import _evenly_spaced
+
+        assert _evenly_spaced(32, 5) == [1, 8, 15, 22, 29]
+
+    def test_skips_layer_zero_and_last_two_layers(self):
+        """The upstream recipe explicitly avoids layer 0 (its signal
+        duplicates ``embed_tokens``) and the last 2 layers (their
+        signal duplicates the bound ``lm_head``). Regression guard:
+        any non-degenerate selection must respect the boundary.
+        """
+        from olmlx.engine.dflash.prepare import _evenly_spaced
+
+        for n in (12, 24, 32, 48, 80):
+            for k in range(2, min(n - 3, 8) + 1):
+                ids = _evenly_spaced(n, k)
+                assert min(ids) >= 1, f"_evenly_spaced({n},{k}) included layer 0"
+                assert max(ids) <= n - 3, (
+                    f"_evenly_spaced({n},{k}) reached layer {max(ids)} > {n - 3}"
+                )
 
 
 class TestResolveTargetLayerIds:
@@ -695,6 +736,198 @@ class TestDraftLossPadMasking:
         # both CE and KL → 0. Without masking, CE would be ~13.3
         # (one near-zero + two ~20s averaged).
         assert float(loss) < 1e-3
+
+
+class TestPerPositionLossWeighting:
+    """Gap 2 (gh#317): the paper trains with ``w_k = exp(-(k-1)/gamma)``
+    to emphasise early positions because acceptance length compounds —
+    a wrong token at position 1 wastes positions 2..N regardless of
+    how correct those would have been. Without the weighting the
+    optimizer spends equal gradient budget on positions whose impact
+    is only conditional on every earlier position being accepted.
+    """
+
+    def test_legacy_uniform_mean_when_gamma_none(self):
+        """When ``position_decay_gamma`` is omitted (or ``None``), the
+        reduction collapses to the legacy uniform mean — required so
+        the existing tests pass unchanged and existing checkpoints
+        remain reproducible.
+        """
+        from olmlx.engine.dflash.prepare import _draft_loss
+
+        vocab = 8
+        # Construct a CE that depends on position so weighted and
+        # uniform mean give visibly different numbers.
+        # Logits peak sharply at id=1 for position 0 only; positions 1..2
+        # peak at id=2. With targets [1, 1, 1] only position 0 is near-zero
+        # NLL; positions 1-2 have very high NLL (~20 each).
+        per_pos_peaks = [1, 2, 2]
+        target_id = 1
+        peak = 20.0
+        # Build logits manually so each position uses a different peak id.
+        arr = mx.zeros((1, 3, vocab))
+        for k, pid in enumerate(per_pos_peaks):
+            arr = arr.at[:, k, pid].add(peak)
+        targets = mx.array([[target_id, target_id, target_id]])
+        loss = _draft_loss(
+            _FakeDraft(arr),
+            block_input=mx.zeros((1, 4), dtype=mx.int32),
+            target_hidden=mx.zeros((1, 1, 1)),
+            targets=targets,
+            cache=[],
+        )
+        # Legacy uniform mean over 3 positions: (~0 + ~20 + ~20) / 3 ≈ 13.3.
+        assert 12.0 < float(loss) < 15.0
+
+    def test_weighted_mean_emphasises_early_positions(self):
+        """With ``position_decay_gamma`` set, the weighted mean must
+        upweight the first (easy) position and downweight the later
+        (hard) ones, producing a lower aggregate loss than the
+        uniform-mean baseline on the same logits.
+        """
+        from olmlx.engine.dflash.prepare import _draft_loss
+
+        vocab = 8
+        per_pos_peaks = [1, 2, 2]
+        target_id = 1
+        peak = 20.0
+        arr = mx.zeros((1, 3, vocab))
+        for k, pid in enumerate(per_pos_peaks):
+            arr = arr.at[:, k, pid].add(peak)
+        targets = mx.array([[target_id, target_id, target_id]])
+        # gamma=1 strongly downweights positions 1..2 (weights ~ [1.0,
+        # 0.37, 0.14]). Weighted mean: (0*1 + 20*0.37 + 20*0.14) /
+        # (1 + 0.37 + 0.14) ≈ 6.7 — well below the uniform-mean ~13.3.
+        loss = _draft_loss(
+            _FakeDraft(arr),
+            block_input=mx.zeros((1, 4), dtype=mx.int32),
+            target_hidden=mx.zeros((1, 1, 1)),
+            targets=targets,
+            cache=[],
+            position_decay_gamma=1.0,
+        )
+        assert 5.0 < float(loss) < 9.0
+
+    def test_disabled_when_gamma_non_positive(self):
+        """``position_decay_gamma`` of 0 (or negative) disables the
+        weighting and recovers the uniform-mean reduction. Important
+        for the CLI's escape hatch (operators sweeping the
+        hyperparameter who want a no-weighting baseline).
+        """
+        from olmlx.engine.dflash.prepare import _draft_loss
+
+        vocab = 8
+        per_pos_peaks = [1, 2, 2]
+        arr = mx.zeros((1, 3, vocab))
+        for k, pid in enumerate(per_pos_peaks):
+            arr = arr.at[:, k, pid].add(20.0)
+        targets = mx.array([[1, 1, 1]])
+        loss_uniform = _draft_loss(
+            _FakeDraft(arr),
+            block_input=mx.zeros((1, 4), dtype=mx.int32),
+            target_hidden=mx.zeros((1, 1, 1)),
+            targets=targets,
+            cache=[],
+        )
+        loss_disabled = _draft_loss(
+            _FakeDraft(arr),
+            block_input=mx.zeros((1, 4), dtype=mx.int32),
+            target_hidden=mx.zeros((1, 1, 1)),
+            targets=targets,
+            cache=[],
+            position_decay_gamma=0.0,
+        )
+        assert float(loss_disabled) == pytest.approx(float(loss_uniform), abs=1e-6)
+
+    def test_weighting_combines_with_pad_mask(self):
+        """The pad mask and per-position weighting must compose: pad
+        positions stay zero-weighted, and the remaining real positions
+        are reduced via the weighted mean. The all-pad case must still
+        deliver exact 0.0 so the optimizer takes an honest no-op step.
+        """
+        from olmlx.engine.dflash.prepare import _draft_loss
+
+        vocab = 8
+        # All targets are pad → loss must be exactly 0 regardless of
+        # the weighting.
+        bad_logits = _logits_with_target_at_index(1, 3, vocab, target_id=1, peak=20.0)
+        targets = mx.array([[5, 5, 5]])
+        loss = _draft_loss(
+            _FakeDraft(bad_logits),
+            block_input=mx.zeros((1, 4), dtype=mx.int32),
+            target_hidden=mx.zeros((1, 1, 1)),
+            targets=targets,
+            cache=[],
+            pad_token_id=5,
+            position_decay_gamma=1.0,
+        )
+        assert float(loss) == 0.0
+
+
+class TestSliceMatchesInferenceConvention:
+    """Gap 1 (gh#317): training must slice ``target_hidden_full[:, :p,
+    :]`` — ctx covers positions 0..p-1 and pending sits at position p.
+    The pre-fix slice ``[:, :p+1, :]`` included the target's hidden
+    for the pending position itself, giving the draft a copy-shortcut
+    that didn't exist at inference and silently mis-aligning the
+    proposal RoPE positions by 1.
+    """
+
+    def test_target_hidden_slice_excludes_pending_position(self, tmp_path, monkeypatch):
+        """Inspect the ``target_hidden`` shape fed into ``_draft_loss``:
+        its sequence dim must equal the pivot ``p``, not ``p + 1``.
+        """
+        from olmlx.engine.dflash import prepare as prepare_mod
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        vocab, hidden, num_layers = 64, 16, 4
+        _write_target_config(tmp_path, vocab, hidden)
+
+        # ``_select_pivot`` returns a host int, so we can record the
+        # pivot directly. Capture (pivot, target_hidden.shape[1]) pairs
+        # to verify equality.
+        observed_pivots: list[int] = []
+        original_select = prepare_mod._select_pivot
+
+        def recording_select(input_ids, pad_token_id, block_size):
+            p = original_select(input_ids, pad_token_id, block_size)
+            if p is not None:
+                observed_pivots.append(p)
+            return p
+
+        original_loss = prepare_mod._draft_loss
+        observed_shapes: list[int] = []
+
+        def recording_loss(draft, block_input, target_hidden, *args, **kwargs):
+            observed_shapes.append(target_hidden.shape[1])
+            return original_loss(draft, block_input, target_hidden, *args, **kwargs)
+
+        monkeypatch.setattr(prepare_mod, "_select_pivot", recording_select)
+        monkeypatch.setattr(prepare_mod, "_draft_loss", recording_loss)
+
+        prepare_dflash_draft(
+            tmp_path,
+            steps=3,
+            batch_size=2,
+            seq_len=32,
+            block_size=2,
+            num_hidden_layers=1,
+            num_target_layers=2,
+            lr=1e-2,
+            output_dir=tmp_path / "dflash_out",
+            _target_loader=_mock_target_loader(vocab, hidden, num_layers),
+            _batch_iterator=_synthetic_batches(vocab, batch_size=2, seq_len=32, n=3),
+        )
+
+        assert observed_pivots, "expected at least one pivot to be recorded"
+        assert len(observed_shapes) == len(observed_pivots)
+        for p, ctx_len in zip(observed_pivots, observed_shapes):
+            assert ctx_len == p, (
+                f"target_hidden ctx len = {ctx_len}, expected {p} so that "
+                "the draft conditions on positions 0..p-1 and pending sits "
+                "at RoPE position p (matching inference's convention "
+                "where ctx covers 0..L-1 and pending is at L)"
+            )
 
 
 class TestPivotSelection:
