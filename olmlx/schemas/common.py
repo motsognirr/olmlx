@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, overload
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -16,15 +16,14 @@ def validate_token_limit(v: int, field_name: str) -> int:
     return v
 
 
+@overload
+def validate_non_empty_text_input(v: str, field_name: str) -> str: ...
+@overload
+def validate_non_empty_text_input(v: list[str], field_name: str) -> list[str]: ...
 def validate_non_empty_text_input(
     v: str | list[str], field_name: str
 ) -> str | list[str]:
-    """Reject empty strings, empty lists, and lists containing empty strings.
-
-    Shared by request schemas where a ``str | list[str]`` field is fed to
-    inference — empty values would otherwise leak raw MLX errors (#311) or
-    IndexErrors (e.g. ``req.prompt[0]`` on an empty list).
-    """
+    """Reject empty string, empty list, or list containing an empty string."""
     if isinstance(v, str):
         if not v:
             raise ValueError(f"{field_name} cannot be empty")

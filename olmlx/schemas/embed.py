@@ -33,8 +33,7 @@ class EmbeddingsRequest(BaseModel):
     @field_validator("prompt")
     @classmethod
     def validate_prompt_non_empty(cls, v: str) -> str:
-        validate_non_empty_text_input(v, "prompt")
-        return v
+        return validate_non_empty_text_input(v, "prompt")
 
 
 class EmbeddingsResponse(BaseModel):
