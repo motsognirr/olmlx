@@ -209,7 +209,7 @@ class DFlashDecoder:
         target_model: nn.Module,
         draft_model: DFlashDraftModel,
         draft_config: DraftConfig,
-        block_size: int = 4,
+        block_size: int = 16,
     ):
         self._target = target_model
         self._draft = draft_model
