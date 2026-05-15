@@ -68,7 +68,9 @@ def load_model_with_strict_fallback(model_path: str, *, lazy: bool) -> tuple:
     from olmlx.engine.model_manager import _ensure_tokenizer_eos_in_stops
 
     try:
-        model, tokenizer = mlx_lm.load(model_path, lazy=lazy)
+        # mlx_lm.load returns 2- or 3-tuple depending on return_config; default
+        # is 2-tuple. Pyright can't narrow on the parameter default.
+        model, tokenizer = mlx_lm.load(model_path, lazy=lazy)  # pyright: ignore[reportAssignmentType]
     except ValueError as exc:
         if _STRICT_LOAD_ERROR not in str(exc):
             raise
