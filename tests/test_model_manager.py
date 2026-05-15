@@ -1945,8 +1945,10 @@ class TestEnsureTokenizerEosInStops:
 
     def test_noop_when_inner_eos_missing(self, caplog):
         # None is legitimate (HF tokenizers without an EOS); must not warn.
+        # Scope caplog to our logger to avoid spurious failures from unrelated
+        # WARNING-level emissions (e.g. deprecation notices from pytest plugins).
         tok = _FakeTokenizerWrapper(inner_eos=None, stops={151643})
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
             _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids == {151643}
         assert not caplog.records, f"unexpected warnings: {caplog.records}"
