@@ -126,6 +126,10 @@ def _ensure_tokenizer_eos_in_stops(tokenizer: Any) -> None:
         # ``eos_token_id`` to return list[int].
         stops.update(t for t in inner_eos if isinstance(t, int))
         return
+    if inner_eos is None:
+        # Tokenizer has no EOS configured — legitimate for some HF tokenizers
+        # (e.g. base/non-instruction-tuned variants). Silent no-op.
+        return
     if not isinstance(inner_eos, int):
         # mlx-lm renamed ``_tokenizer`` or the inner HF tokenizer surfaces an
         # unexpected type. ``warning``, not ``debug``: this branch indicates

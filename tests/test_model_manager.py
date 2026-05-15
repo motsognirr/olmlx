@@ -1943,10 +1943,13 @@ class TestEnsureTokenizerEosInStops:
         _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids == {151645}
 
-    def test_noop_when_inner_eos_missing(self):
+    def test_noop_when_inner_eos_missing(self, caplog):
+        # None is legitimate (HF tokenizers without an EOS); must not warn.
         tok = _FakeTokenizerWrapper(inner_eos=None, stops={151643})
-        _ensure_tokenizer_eos_in_stops(tok)
+        with caplog.at_level(logging.WARNING):
+            _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids == {151643}
+        assert not caplog.records, f"unexpected warnings: {caplog.records}"
 
     def test_adds_list_inner_eos(self):
         # Defensive: HF stock tokenizers expose eos_token_id as a single int,
