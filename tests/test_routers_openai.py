@@ -637,6 +637,28 @@ class TestEmptyInputRejected:
         assert "input" in body
         assert "empty" in body
 
+    @pytest.mark.asyncio
+    async def test_completions_rejects_empty_prompt(self, app_client):
+        resp = await app_client.post(
+            "/v1/completions",
+            json={"model": "qwen3", "prompt": ""},
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "prompt" in body
+        assert "empty" in body
+
+    @pytest.mark.asyncio
+    async def test_completions_rejects_empty_list_prompt(self, app_client):
+        resp = await app_client.post(
+            "/v1/completions",
+            json={"model": "qwen3", "prompt": []},
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "prompt" in body
+        assert "empty" in body
+
 
 class TestXCacheIDHeader:
     @pytest.mark.asyncio

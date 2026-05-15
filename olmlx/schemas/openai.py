@@ -134,6 +134,13 @@ class OpenAICompletionRequest(BaseModel):
 
         return validate_token_limit(v, "max_tokens")
 
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt_non_empty(cls, v: str | list[str]) -> str | list[str]:
+        from olmlx.schemas.common import validate_non_empty_text_input
+
+        return validate_non_empty_text_input(v, "prompt")
+
 
 class OpenAICompletionChoice(BaseModel):
     index: int = 0
@@ -176,15 +183,9 @@ class OpenAIEmbeddingRequest(BaseModel):
     @field_validator("input")
     @classmethod
     def validate_input_non_empty(cls, v: str | list[str]) -> str | list[str]:
-        if isinstance(v, str):
-            if not v:
-                raise ValueError("input cannot be empty")
-        else:
-            if not v:
-                raise ValueError("input cannot be an empty list")
-            if any(not s for s in v):
-                raise ValueError("input cannot contain empty strings")
-        return v
+        from olmlx.schemas.common import validate_non_empty_text_input
+
+        return validate_non_empty_text_input(v, "input")
 
 
 class OpenAIEmbeddingData(BaseModel):

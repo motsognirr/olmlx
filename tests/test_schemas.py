@@ -324,6 +324,18 @@ class TestOpenAISchemas:
         req = OpenAICompletionRequest(model="test", prompt="hello")
         assert req.stream is False
 
+    def test_completion_request_rejects_empty_prompt_string(self):
+        with pytest.raises(ValidationError, match="prompt"):
+            OpenAICompletionRequest(model="test", prompt="")
+
+    def test_completion_request_rejects_empty_prompt_list(self):
+        with pytest.raises(ValidationError, match="prompt"):
+            OpenAICompletionRequest(model="test", prompt=[])
+
+    def test_completion_request_rejects_list_with_empty_string(self):
+        with pytest.raises(ValidationError, match="prompt"):
+            OpenAICompletionRequest(model="test", prompt=["hello", ""])
+
     def test_completion_response(self):
         resp = OpenAICompletionResponse(
             id="test",

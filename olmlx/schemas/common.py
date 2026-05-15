@@ -16,6 +16,26 @@ def validate_token_limit(v: int, field_name: str) -> int:
     return v
 
 
+def validate_non_empty_text_input(
+    v: str | list[str], field_name: str
+) -> str | list[str]:
+    """Reject empty strings, empty lists, and lists containing empty strings.
+
+    Shared by request schemas where a ``str | list[str]`` field is fed to
+    inference — empty values would otherwise leak raw MLX errors (#311) or
+    IndexErrors (e.g. ``req.prompt[0]`` on an empty list).
+    """
+    if isinstance(v, str):
+        if not v:
+            raise ValueError(f"{field_name} cannot be empty")
+    else:
+        if not v:
+            raise ValueError(f"{field_name} cannot be an empty list")
+        if any(not s for s in v):
+            raise ValueError(f"{field_name} cannot contain empty strings")
+    return v
+
+
 class ModelOptions(BaseModel):
     """Ollama model options / parameters."""
 

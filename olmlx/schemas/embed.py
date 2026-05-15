@@ -1,6 +1,6 @@
 from pydantic import BaseModel, field_validator
 
-from olmlx.schemas.common import ModelName
+from olmlx.schemas.common import ModelName, validate_non_empty_text_input
 
 
 class EmbedRequest(BaseModel):
@@ -13,15 +13,7 @@ class EmbedRequest(BaseModel):
     @field_validator("input")
     @classmethod
     def validate_input_non_empty(cls, v: str | list[str]) -> str | list[str]:
-        if isinstance(v, str):
-            if not v:
-                raise ValueError("input cannot be empty")
-        else:
-            if not v:
-                raise ValueError("input cannot be an empty list")
-            if any(not s for s in v):
-                raise ValueError("input cannot contain empty strings")
-        return v
+        return validate_non_empty_text_input(v, "input")
 
 
 class EmbedResponse(BaseModel):
@@ -41,8 +33,7 @@ class EmbeddingsRequest(BaseModel):
     @field_validator("prompt")
     @classmethod
     def validate_prompt_non_empty(cls, v: str) -> str:
-        if not v:
-            raise ValueError("prompt cannot be empty")
+        validate_non_empty_text_input(v, "prompt")
         return v
 
 
