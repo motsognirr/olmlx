@@ -118,6 +118,15 @@ def _ensure_tokenizer_eos_in_stops(tokenizer: Any) -> None:
         return
     stops = getattr(tokenizer, "eos_token_ids", None)
     if not isinstance(stops, set):
+        # Symmetric with the missing-_tokenizer DEBUG log below: an mlx-lm
+        # change from set to list/frozenset/dict for eos_token_ids would
+        # otherwise silently disable the workaround.
+        logger.debug(
+            "TokenizerWrapper.eos_token_ids is %s (not set) on %s; eos "
+            "stop-set augmentation skipped (issue #308).",
+            type(stops).__name__,
+            type(tokenizer).__name__,
+        )
         return
     inner_tok = getattr(tokenizer, "_tokenizer", None)
     if inner_tok is None:

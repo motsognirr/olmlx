@@ -1960,12 +1960,16 @@ class TestEnsureTokenizerEosInStops:
         _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids == {151643, 151645}
 
-    def test_noop_when_stops_not_a_set(self):
+    def test_noop_when_stops_not_a_set(self, caplog):
         # A wrapper with add_eos_token but eos_token_ids=None must not crash;
-        # the guard returns early so the stop set is left unchanged.
+        # the guard returns early so the stop set is left unchanged. Should
+        # also DEBUG-log so a future mlx-lm change of the stop-set type is
+        # discoverable rather than silently disabling the workaround.
         tok = _FakeTokenizerWrapper(inner_eos=151645, stops=None)
-        _ensure_tokenizer_eos_in_stops(tok)
+        with caplog.at_level(logging.DEBUG, logger="olmlx.engine.model_manager"):
+            _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids is None
+        assert any("not set" in r.message for r in caplog.records)
 
     def test_debug_logs_when_tokenizer_attr_missing(self, caplog):
         # Past the add_eos_token gate but no _tokenizer attribute — mlx-lm
@@ -2076,6 +2080,10 @@ class TestLoadWithModelTypeFallbackEosFix:
         )
         mock_mlx_lm.utils.load_tokenizer.return_value = tok
 
+        # "fakemodel2" → strips last digit → "fakemodel" via the regex
+        # ``re.sub(r"\d+$", lambda m: m.group()[:-1], ...)`` in
+        # _load_with_model_type_fallback. CONFIG_MAPPING must contain
+        # "fakemodel" for the fallback branch to proceed.
         with patch.object(auto_cfg, "CONFIG_MAPPING", {"fakemodel": object()}):
             _, returned = _load_with_model_type_fallback(mock_mlx_lm, str(tmp_path))
         assert returned is tok
