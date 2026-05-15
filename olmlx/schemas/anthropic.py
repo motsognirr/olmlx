@@ -24,7 +24,10 @@ class AnthropicContentBlock(BaseModel):
     text: str | None = None
     # thinking fields
     thinking: str | None = None
-    signature: str | None = None
+    # `signature` defaults to "" rather than None because the Anthropic SDK
+    # `ThinkingBlock` spec requires a string — emitting `null` would break
+    # parsing on the client side.
+    signature: str = ""
     # tool_use fields
     id: str | None = None
     name: str | None = None
