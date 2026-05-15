@@ -988,20 +988,22 @@ class ModelManager:
         if errors:
             raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
 
-    async def _evict_lru_if_needed(self) -> None:
-        """Evict least-recently-used models until below max_loaded_models.
+    def _pop_lru_evictees(self) -> list[LoadedModel]:
+        """Pop LRU evictees from ``_loaded`` until below max_loaded_models.
 
-        Must be called while holding self._lock.
-        Raises RuntimeError if all loaded models are in active use.
+        Must be called while holding ``self._lock``. Returns the popped
+        models for the caller to close via :meth:`_close_evictees` after
+        the lock is released. Raises ``RuntimeError`` if all loaded
+        models are in active use.
 
-        Async because ``_close_loaded_model`` calls
-        ``executor.shutdown(wait=True)`` on the prefetcher (16 threads) and
-        weight store (32 threads); that join is synchronous and would stall
-        the event loop for every concurrent coroutine — not just other
-        ``ensure_loaded`` callers waiting on ``self._lock`` — until the
-        pools drained. ``asyncio.to_thread`` offloads the join so the loop
-        keeps servicing other endpoints during eviction. Issue #315.
+        The pop / close split exists because ``_close_loaded_model`` calls
+        ``executor.shutdown(wait=True)`` on the prefetcher (16 threads)
+        and weight store (32 threads). Doing that join while holding
+        ``self._lock`` stalls every other ``ensure_loaded`` caller —
+        including one that just wants to return an already-loaded model
+        — for the full duration of the join. Issue #315.
         """
+        evictees: list[LoadedModel] = []
         while len(self._loaded) >= settings.max_loaded_models:
             evictable = {k: v for k, v in self._loaded.items() if v.active_refs == 0}
             if not evictable:
@@ -1010,28 +1012,39 @@ class ModelManager:
                 )
             oldest_name = min(evictable, key=lambda k: evictable[k].loaded_at)
             logger.info("Evicting model %s", oldest_name)
-            evicted = self._loaded.pop(oldest_name)
-            # Absorb cleanup failures so a stuck prefetcher on the evicted
-            # model can't permanently block subsequent model loads. The model
-            # is already removed from ``_loaded``; the new load will proceed
-            # with leaked threads/fds rather than failing.
-            # Narrowed to ExceptionGroup to match _close_loaded_model's
-            # documented contract (always raises ExceptionGroup on any
-            # error) — same shape as the catch in unload(). An unexpected
-            # non-ExceptionGroup exception would propagate as a bug.
+            evictees.append(self._loaded.pop(oldest_name))
+        return evictees
+
+    async def _close_evictees(self, evictees: list[LoadedModel]) -> None:
+        """Close popped evictees off the event loop. MUST NOT hold ``self._lock``.
+
+        Mirrors :meth:`_expire_stale`'s close loop: each close runs on a
+        worker thread via ``asyncio.to_thread`` so the event loop keeps
+        servicing other coroutines (including other ``ensure_loaded``
+        callers) while the prefetcher / weight store pools drain.
+
+        Pops from the list as we go so no live reference (including the
+        loop variable) survives into the caller's ``gc.collect()`` —
+        otherwise the Metal buffers attached to the LoadedModel can't be
+        reclaimed. Same reason :meth:`_expire_stale` uses ``del lm`` in
+        its pop loop.
+
+        Absorb cleanup failures so a stuck prefetcher on an evicted
+        model can't permanently block subsequent model loads. The
+        models are already removed from ``_loaded``; the new load will
+        proceed with leaked threads/fds rather than failing.
+        Narrowed to ExceptionGroup to match ``_close_loaded_model``'s
+        documented contract (always raises ExceptionGroup on any error)
+        — same shape as the catch in :meth:`unload`. An unexpected
+        non-ExceptionGroup exception would propagate as a bug.
+        """
+        while evictees:
+            evicted = evictees.pop()
             try:
                 await asyncio.to_thread(self._close_loaded_model, evicted)
             except ExceptionGroup:
                 pass  # already logged per-resource inside _close_loaded_model
             del evicted
-
-        # Flush Metal allocator cache so that buffers from evicted models
-        # don't inflate the mem_before measurement below.  Skip when
-        # any deferred cleanup is pending — a different model's
-        # background thread may still be allocating Metal memory.
-        if not self._pending_cleanups:
-            gc.collect()
-            mx.clear_cache()
 
     async def ensure_loaded(
         self, name: str, keep_alive: str | None = None
@@ -1061,6 +1074,7 @@ class ModelManager:
                         exc_info=True,
                     )
 
+            evictees: list[LoadedModel] = []
             async with self._lock:
                 # A cleanup may have been scheduled while we were waiting
                 # for the lock (another caller timed out).  Release the lock
@@ -1112,7 +1126,43 @@ class ModelManager:
                 spec_config = model_config.resolved_speculative()
                 kv_cache_quant = model_config.resolved_kv_cache_quant()
 
-                await self._evict_lru_if_needed()
+                # Pop LRU evictees under the lock; close them outside the lock
+                # below so other ``ensure_loaded`` callers — especially ones
+                # asking for an already-loaded model — aren't stalled for the
+                # 48-thread executor.shutdown join. Issue #315.
+                evictees = self._pop_lru_evictees()
+
+            # Close popped evictees off the event loop with the lock released.
+            if evictees:
+                await self._close_evictees(evictees)
+
+            # Pre-load Metal allocator flush. Runs even with no evictees so
+            # the ``mem_before`` measurement in the second lock section sees
+            # a clean baseline. Skip when a deferred cleanup is pending — a
+            # background thread for a different model may still be allocating
+            # Metal memory, and ``mx.clear_cache()`` is not safe to call
+            # concurrently with active allocations.
+            if not self._pending_cleanups:
+                gc.collect()
+                mx.clear_cache()
+
+            async with self._lock:
+                # State may have changed while the lock was released for the
+                # close. Re-validate before proceeding with the load.
+                if normalized in self._pending_cleanups:
+                    continue
+
+                if normalized in self._loaded:
+                    # Another caller loaded the same model during our close.
+                    lm = self._loaded[normalized]
+                    ka = self._resolve_keep_alive(keep_alive)
+                    lm.expires_at = (time.time() + ka) if ka is not None else None
+                    return lm
+
+                if len(self._loaded) >= settings.max_loaded_models:
+                    # Another caller filled the slot we just emptied. Loop
+                    # back to the top and re-evict before retrying.
+                    continue
 
                 logger.info("Loading model %s from %s", normalized, hf_path)
                 mem_before = memory_utils.get_metal_memory()
@@ -1365,10 +1415,18 @@ class ModelManager:
         if lm is not None:
             lm.prompt_cache_store.remove(cache_id)
 
-    def unload(self, name: str) -> bool:
+    async def unload(self, name: str) -> bool:
         """Unload a model. Returns True if unloaded, False if not loaded.
 
         Raises ActiveRequestsError if model has in-flight requests.
+
+        Async because ``_close_loaded_model`` calls
+        ``executor.shutdown(wait=True)`` on the prefetcher (16 threads)
+        and weight store (32 threads); doing that join on the event loop
+        thread stalls every concurrent coroutine for the duration of the
+        join. ``asyncio.to_thread`` offloads it so other endpoints keep
+        responding while a Flash model unloads. Same fix shape as the
+        eviction / expiry paths. Issue #315.
 
         Close failures from ``_close_loaded_model`` are absorbed: the
         model is already gone from ``_loaded`` (won't accept new
@@ -1389,7 +1447,7 @@ class ModelManager:
             )
         lm = self._loaded.pop(normalized)
         try:
-            self._close_loaded_model(lm)
+            await asyncio.to_thread(self._close_loaded_model, lm)
         except ExceptionGroup:
             pass  # already logged per-resource inside _close_loaded_model
         return True

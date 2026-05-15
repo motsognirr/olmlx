@@ -861,7 +861,8 @@ class TestCacheInvalidatedOnCancel:
 
 
 class TestCacheClearedOnModelUnload:
-    def test_unloaded_model_has_no_cache(self, mock_manager):
+    @pytest.mark.asyncio
+    async def test_unloaded_model_has_no_cache(self, mock_manager):
         """When a model is unloaded, its cache state is released."""
         from olmlx.engine.model_manager import CachedPromptState
 
@@ -874,7 +875,7 @@ class TestCacheClearedOnModelUnload:
             ),
         )
 
-        mock_manager.unload("qwen3")
+        await mock_manager.unload("qwen3")
         # LoadedModel is removed from _loaded, so its cache is freed with it
         assert "qwen3:latest" not in mock_manager._loaded
 

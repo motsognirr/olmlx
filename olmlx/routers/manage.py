@@ -165,7 +165,7 @@ async def unload_model(req: UnloadRequest, request: Request):
 
     manager = request.app.state.model_manager
     try:
-        unloaded = manager.unload(req.model)
+        unloaded = await manager.unload(req.model)
     except ActiveRequestsError as e:
         # 409 is narrow on purpose: only "model has active requests".
         # Resource-close failures inside ``_close_loaded_model`` are
