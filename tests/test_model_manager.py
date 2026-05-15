@@ -1968,6 +1968,31 @@ class TestLoadWithModelTypeFallbackEosFix:
         assert 151645 in tok.eos_token_ids
         assert 151643 in tok.eos_token_ids
 
+    def test_fallback_path_augments_stops(self, tmp_path):
+        # Exercises the model_type-remapping branch: mlx_lm.load raises, then
+        # load_model + load_tokenizer are called with the stripped model_type.
+        # Same EOS mismatch scenario as the main path must still be repaired.
+        from olmlx.engine.model_manager import _load_with_model_type_fallback
+
+        original_cfg = {"model_type": "deepseek_v32", "eos_token_id": 151643}
+        (tmp_path / "config.json").write_text(json.dumps(original_cfg))
+
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError("unsupported model_type")
+        mock_mlx_lm.utils.load_model.return_value = (
+            MagicMock(),
+            {"eos_token_id": 151643},
+        )
+        mock_mlx_lm.utils.load_tokenizer.return_value = tok
+
+        _, returned = _load_with_model_type_fallback(mock_mlx_lm, str(tmp_path))
+        assert returned is tok
+        assert 151645 in tok.eos_token_ids
+        assert 151643 in tok.eos_token_ids
+        # config.json must be restored after the temporary remap.
+        assert json.loads((tmp_path / "config.json").read_text()) == original_cfg
+
 
 class TestExpiryChecker:
     @pytest.mark.asyncio

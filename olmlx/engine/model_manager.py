@@ -109,19 +109,30 @@ def _ensure_tokenizer_eos_in_stops(tokenizer: Any) -> None:
     so generation does not stop at the template's actual EOT and the EOT
     string leaks into the decoded response.
     """
-    add_eos = getattr(tokenizer, "add_eos_token", None)
-    if not callable(add_eos):
+    # ``add_eos_token`` is the TokenizerWrapper marker — keep the gate on it
+    # so plain HF tokenizers and mlx-vlm processors are skipped — but mutate
+    # the ``eos_token_ids`` set directly to bypass the wrapper's stringly-typed
+    # API (``add_eos_token(str)`` does ``int(token)`` first then a vocab
+    # lookup; we already have the integer so set-mutation is unambiguous).
+    if not callable(getattr(tokenizer, "add_eos_token", None)):
+        return
+    stops = getattr(tokenizer, "eos_token_ids", None)
+    if not isinstance(stops, set):
         return
     inner_eos = getattr(getattr(tokenizer, "_tokenizer", None), "eos_token_id", None)
     if not isinstance(inner_eos, int):
+        # mlx-lm renamed ``_tokenizer`` or the inner HF tokenizer lost its
+        # ``eos_token_id`` attribute. Log at debug so upstream API churn is
+        # visible rather than silently reintroducing the original bug.
+        logger.debug(
+            "Tokenizer wrapper present but inner eos_token_id missing "
+            "(type=%s); skipping eos stop-set augmentation.",
+            type(tokenizer).__name__,
+        )
         return
-    stops = getattr(tokenizer, "eos_token_ids", None)
-    if stops is not None and inner_eos in stops:
+    if inner_eos in stops:
         return
-    try:
-        add_eos(str(inner_eos))
-    except Exception:  # pragma: no cover — defensive against tokenizer variants
-        logger.debug("Could not add tokenizer eos_token_id to stops", exc_info=True)
+    stops.add(inner_eos)
 
 
 def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
