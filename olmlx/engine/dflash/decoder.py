@@ -233,6 +233,12 @@ class DFlashDecoder:
         # used to compute draft-cache trim amounts.
         self._n_generated: int = 0
 
+        # Idempotency guards for reset() — a double-call (e.g. eviction
+        # path followed by __del__) must not double-unpatch the GDN
+        # class-level monkey-patch.
+        self._patched: bool = False
+        self._bound: bool = False
+
         # Diagnostic counters (reset on prefill, mirrors SpeculativeDecoder)
         self._stats_steps: int = 0
         self._stats_proposed: int = 0
@@ -252,11 +258,21 @@ class DFlashDecoder:
 
     def reset(self) -> None:
         if self._capture is not None:
-            self._capture.close()
-            self._capture = None
-            self._capture_buffer = None
-        _unpatch_model(self._target)
-        self._draft.unbind()
+            try:
+                self._capture.close()
+            finally:
+                self._capture = None
+                self._capture_buffer = None
+        if self._patched:
+            try:
+                _unpatch_model(self._target)
+            finally:
+                self._patched = False
+        if self._bound:
+            try:
+                self._draft.unbind()
+            finally:
+                self._bound = False
         self._target_cache = None
         self._draft_cache = None
         self._target_can_trim = True
@@ -326,7 +342,9 @@ class DFlashDecoder:
         self._target_cache = make_prompt_cache(self._target)
         self._hidden_capture = [None] * len(target_layer_ids)
         _patch_model(self._target, target_layer_ids, self._hidden_capture)
+        self._patched = True
         self._draft.bind(self._target)
+        self._bound = True
 
         # Call the draft's own ``make_cache`` directly. ``make_prompt_cache``
         # would defer to it via ``hasattr(model, "make_cache")`` today, but
