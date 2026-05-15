@@ -98,6 +98,32 @@ def _sanitize_model_config_in_place(load_path) -> None:
             )
 
 
+def _ensure_tokenizer_eos_in_stops(tokenizer: Any) -> None:
+    """Add the tokenizer's own ``eos_token_id`` to its stop-token set.
+
+    Workaround for repos (e.g. ``mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit``,
+    issue #308) whose ``config.json`` declares ``eos_token_id`` as a token
+    different from the chat template's real end-of-turn token (the
+    ``eos_token`` field in ``tokenizer_config.json``). mlx-lm's ``load()``
+    feeds only the config.json value into ``TokenizerWrapper.eos_token_ids``,
+    so generation does not stop at the template's actual EOT and the EOT
+    string leaks into the decoded response.
+    """
+    add_eos = getattr(tokenizer, "add_eos_token", None)
+    if not callable(add_eos):
+        return
+    inner_eos = getattr(getattr(tokenizer, "_tokenizer", None), "eos_token_id", None)
+    if not isinstance(inner_eos, int):
+        return
+    stops = getattr(tokenizer, "eos_token_ids", None)
+    if stops is not None and inner_eos in stops:
+        return
+    try:
+        add_eos(str(inner_eos))
+    except Exception:  # pragma: no cover — defensive against tokenizer variants
+        logger.debug("Could not add tokenizer eos_token_id to stops", exc_info=True)
+
+
 def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     """Load model + tokenizer, remapping unrecognised model_type if needed.
 
@@ -113,7 +139,9 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     _sanitize_model_config_in_place(load_path)
     kwargs.setdefault("tokenizer_config", {"trust_remote_code": True})
     try:
-        return mlx_lm.load(str(load_path), **kwargs)
+        model, tokenizer = mlx_lm.load(str(load_path), **kwargs)
+        _ensure_tokenizer_eos_in_stops(tokenizer)
+        return model, tokenizer
     except (AttributeError, ValueError, KeyError) as exc:
         config_file = Path(load_path) / "config.json"
         if not config_file.exists():
@@ -150,6 +178,7 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
             )
         finally:
             config_file.write_text(original_text)
+        _ensure_tokenizer_eos_in_stops(tokenizer)
         return model, tokenizer
 
 

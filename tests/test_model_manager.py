@@ -14,6 +14,7 @@ from olmlx.engine.model_manager import (
     LoadedModel,
     ModelLoadTimeoutError,
     ModelManager,
+    _ensure_tokenizer_eos_in_stops,
     parse_keep_alive,
 )
 from olmlx.engine.registry import SpeculativeConfig
@@ -1906,6 +1907,66 @@ class TestTryLmThenVlmFallback:
         with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
             with pytest.raises(MemoryError):
                 manager._try_lm_then_vlm("test/path", "test")
+
+
+class _FakeTokenizerWrapper:
+    """Minimal stand-in for mlx-lm's TokenizerWrapper for stop-token tests."""
+
+    def __init__(self, inner_eos: int | None, stops: set[int] | None):
+        inner = MagicMock()
+        inner.eos_token_id = inner_eos
+        self._tokenizer = inner
+        self.eos_token_ids: set[int] | None = stops
+
+    def add_eos_token(self, token: str) -> None:
+        assert self.eos_token_ids is not None
+        self.eos_token_ids.add(int(token))
+
+
+class TestEnsureTokenizerEosInStops:
+    """Issue #308: <|im_end|> leaks when config.json eos_token_id != template EOT."""
+
+    def test_adds_inner_eos_when_missing(self):
+        # Repro: Qwen2.5-Coder-1.5B has config.eos_token_id=151643 (<|endoftext|>)
+        # but tokenizer_config eos_token=<|im_end|> (151645). The chat template
+        # ends turns with 151645, so it must be in the stop set.
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151643, 151645}
+
+    def test_noop_when_already_present(self):
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151645})
+        _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151645}
+
+    def test_noop_when_inner_eos_missing(self):
+        tok = _FakeTokenizerWrapper(inner_eos=None, stops={151643})
+        _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151643}
+
+    def test_noop_on_non_wrapper(self):
+        # mlx-vlm processors / plain HF tokenizers don't expose add_eos_token.
+        processor = MagicMock(spec=["tokenizer", "eos_token_id"])
+        # Calling on a non-wrapper must not raise.
+        _ensure_tokenizer_eos_in_stops(processor)
+
+
+class TestLoadWithModelTypeFallbackEosFix:
+    """Issue #308: _load_with_model_type_fallback must augment stop tokens."""
+
+    def test_main_path_augments_stops(self, tmp_path):
+        from olmlx.engine.model_manager import _load_with_model_type_fallback
+
+        (tmp_path / "config.json").write_text("{}")
+
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.return_value = (MagicMock(), tok)
+
+        _, returned = _load_with_model_type_fallback(mock_mlx_lm, str(tmp_path))
+        assert returned is tok
+        assert 151645 in tok.eos_token_ids
+        assert 151643 in tok.eos_token_ids
 
 
 class TestExpiryChecker:
