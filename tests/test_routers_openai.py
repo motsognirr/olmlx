@@ -1137,7 +1137,7 @@ class TestToolCallParsing:
         data = resp.json()
         choice = data["choices"][0]
         assert choice["finish_reason"] == "stop"
-        assert choice["message"]["tool_calls"] is None
+        assert "tool_calls" not in choice["message"]
         assert choice["message"]["content"] == self.QWEN_TOOL_CALL
 
     @pytest.mark.asyncio

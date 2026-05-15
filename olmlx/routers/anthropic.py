@@ -913,26 +913,22 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                 def _emit_message_start():
                     nonlocal message_started
                     message_started = True
+                    msg_data: dict[str, Any] = {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": req.model,
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_creation_input_tokens": cache_creation,
+                            "cache_read_input_tokens": cache_read,
+                        },
+                    }
                     return _sse(
                         "message_start",
-                        {
-                            "type": "message_start",
-                            "message": {
-                                "id": msg_id,
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [],
-                                "model": req.model,
-                                "stop_reason": None,
-                                "stop_sequence": None,
-                                "usage": {
-                                    "input_tokens": 0,
-                                    "output_tokens": 0,
-                                    "cache_creation_input_tokens": cache_creation,
-                                    "cache_read_input_tokens": cache_read,
-                                },
-                            },
-                        },
+                        {"type": "message_start", "message": msg_data},
                     )
 
                 meta = {}
@@ -990,7 +986,6 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                         "type": "message_delta",
                         "delta": {
                             "stop_reason": meta.get("stop_reason", "end_turn"),
-                            "stop_sequence": None,
                         },
                         "usage": {
                             "output_tokens": meta.get("output_tokens", 0),
