@@ -1958,6 +1958,16 @@ class TestEnsureTokenizerEosInStops:
         _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids == {151643, 151645}
 
+    def test_warns_on_unexpected_type(self, caplog):
+        # Defends against a refactor that accidentally skips the warning
+        # branch or promotes/demotes its log level.
+        tok = _FakeTokenizerWrapper(inner_eos=None, stops={151643})
+        tok._tokenizer.eos_token_id = 3.14  # float: not int, list, or None
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151643}  # unchanged
+        assert any("unexpected type" in r.message for r in caplog.records)
+
     def test_noop_on_non_wrapper(self):
         # mlx-vlm processors / plain HF tokenizers don't expose add_eos_token.
         processor = MagicMock(spec=["tokenizer", "eos_token_id"])

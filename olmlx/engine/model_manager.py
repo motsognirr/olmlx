@@ -119,7 +119,19 @@ def _ensure_tokenizer_eos_in_stops(tokenizer: Any) -> None:
     stops = getattr(tokenizer, "eos_token_ids", None)
     if not isinstance(stops, set):
         return
-    inner_eos = getattr(getattr(tokenizer, "_tokenizer", None), "eos_token_id", None)
+    inner_tok = getattr(tokenizer, "_tokenizer", None)
+    if inner_tok is None:
+        # Past the ``add_eos_token`` gate but no ``_tokenizer`` attribute —
+        # mlx-lm likely renamed the field. Log at debug so the regression is
+        # discoverable in DEBUG-enabled environments without spamming the
+        # warning channel for a possibly-deliberate variant.
+        logger.debug(
+            "TokenizerWrapper._tokenizer not accessible on %s; eos stop-set "
+            "augmentation skipped (issue #308).",
+            type(tokenizer).__name__,
+        )
+        return
+    inner_eos = getattr(inner_tok, "eos_token_id", None)
     if isinstance(inner_eos, list):
         # Stock HF tokenizers always surface a single int here; defensive
         # against custom trust_remote_code=True tokenizers that override
