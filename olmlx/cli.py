@@ -2742,9 +2742,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Per-position loss weight decay: w_k = exp(-(k-1)/gamma) for "
             "k=1..block_size. Emphasises early positions because "
-            "acceptance length compounds. Default: block_size/2. Pass "
-            "0 (or negative) to disable and use the uniform-mean "
-            "reduction."
+            "acceptance length compounds. Pass 0 (or negative) to "
+            "disable and use the uniform-mean reduction (the default "
+            "when this flag is omitted). Suggested starting value: "
+            "block_size/2."
         ),
     )
     dflash_prepare_p.add_argument(

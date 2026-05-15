@@ -191,11 +191,14 @@ class TestEvenlySpaced:
 
         assert _evenly_spaced(32, 5) == [1, 8, 15, 22, 29]
 
-    def test_skips_layer_zero_and_last_two_layers(self):
+    def test_non_degenerate_skips_layer_zero_and_last_two_layers(self):
         """The upstream recipe explicitly avoids layer 0 (its signal
         duplicates ``embed_tokens``) and the last 2 layers (their
-        signal duplicates the bound ``lm_head``). Regression guard:
-        any non-degenerate selection must respect the boundary.
+        signal duplicates the bound ``lm_head``). Regression guard
+        for the *non-degenerate* path only: any selection where the
+        ``[1, N-3]`` range can fit ``k`` unique indices must respect
+        the boundary. The degenerate fallback (``N-3 < k``) is
+        covered by ``test_degenerate_fallback_returns_k_unique_indices``.
         """
         from olmlx.engine.dflash.prepare import _evenly_spaced
 
@@ -206,6 +209,41 @@ class TestEvenlySpaced:
                 assert max(ids) <= n - 3, (
                     f"_evenly_spaced({n},{k}) reached layer {max(ids)} > {n - 3}"
                 )
+
+    def test_degenerate_fallback_returns_k_unique_indices(self):
+        """When the upstream ``[1, N-3]`` range is too small to fit
+        ``k`` unique indices (``N - 3 < k`` but ``k < N``), the
+        fallback spreads across the full ``0..N-1`` range. The
+        contract here is **k unique indices, no rounding collisions**
+        — and in this regime layer 0 *can* appear, in contradiction
+        with the non-degenerate path's invariant. The trade is
+        intentional so small synthetic targets in unit tests still
+        produce ``k`` distinct hidden-state hooks; documenting it as
+        an explicit test prevents a future refactor from silently
+        re-introducing the rounding-collision bug.
+        """
+        from olmlx.engine.dflash.prepare import _evenly_spaced
+
+        # ``(num_layers, k)`` pairs that exercise the fallback:
+        # ``num_layers - 3 < k`` but ``k < num_layers``.
+        cases = [
+            (6, 4),  # end=3 < 4
+            (5, 3),  # end=2 < 3
+            (7, 5),  # end=4 < 5
+            (4, 2),  # end=1 < 2 — the test fixture in TestPrepareDflashDraft
+        ]
+        for n, k in cases:
+            ids = _evenly_spaced(n, k)
+            assert len(ids) == k, (
+                f"_evenly_spaced({n},{k}) returned {ids} ({len(ids)} indices, "
+                f"expected {k}); rounding collision in the fallback"
+            )
+            assert len(set(ids)) == k, (
+                f"_evenly_spaced({n},{k}) returned duplicates: {ids}"
+            )
+            assert all(0 <= i < n for i in ids), (
+                f"_evenly_spaced({n},{k}) returned out-of-range index: {ids}"
+            )
 
 
 class TestResolveTargetLayerIds:

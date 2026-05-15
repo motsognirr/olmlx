@@ -120,9 +120,13 @@ def _evenly_spaced(num_layers: int, k: int) -> list[int]:
     information). See gh#317 (Gap 4).
 
     Falls back to a centred 0..num_layers-1 spread when the upstream
-    range is degenerate (``num_layers - 3 < 1``); returns
-    ``list(range(num_layers))`` when ``k >= num_layers`` and ``[]``
-    when ``k <= 0``.
+    range ``[1, num_layers - 3]`` is too small to fit ``k`` unique
+    indices (i.e. ``num_layers - 3 < k``); note this fallback **can
+    return layer 0**, in contradiction with the no-layer-0 invariant
+    of the non-degenerate path — the trade is intentional so small
+    synthetic targets in unit tests still produce ``k`` distinct
+    indices. Returns ``list(range(num_layers))`` when ``k >=
+    num_layers`` and ``[]`` when ``k <= 0``.
     """
     if k <= 0:
         return []
@@ -607,10 +611,12 @@ def prepare_dflash_draft(
 
     ``position_decay_gamma``: per-position loss weighting decay
     constant ``γ`` in ``w_k = exp(-(k-1)/γ)`` (k=1..block_size). When
-    ``None``, defaults to ``block_size / 2`` (the issue's suggested
-    starting point — the paper does not publicly pin a single value).
-    Pass ``0`` or a negative value to disable the weighting and recover
-    the uniform-mean reduction. See gh#317 (Gap 2).
+    ``None`` (the default), the weighting is disabled and the
+    reduction is a uniform mean over positions — matching legacy
+    behaviour bit-for-bit. The issue's suggested starting value to
+    sweep is ``block_size / 2``; the paper does not publicly pin a
+    single value. ``0`` or a negative value also disables the
+    weighting. See gh#317 (Gap 2).
 
     ``use_precomputed``: read precomputed (input_ids, hidden) shards
     from this directory instead of running the target each step. Skips
