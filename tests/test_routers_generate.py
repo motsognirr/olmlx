@@ -177,3 +177,26 @@ class TestGenerateRouter:
         assert last_line["done_reason"] == "error"
         assert last_line["model"] == "qwen3"
         assert "created_at" in last_line
+
+
+class TestEmptyPromptRejected:
+    @pytest.mark.asyncio
+    async def test_api_generate_rejects_empty_prompt(self, app_client):
+        resp = await app_client.post(
+            "/api/generate",
+            json={"model": "qwen3", "prompt": ""},
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "prompt" in body
+        assert "empty" in body
+
+    @pytest.mark.asyncio
+    async def test_api_generate_rejects_missing_prompt(self, app_client):
+        resp = await app_client.post(
+            "/api/generate",
+            json={"model": "qwen3"},
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "prompt" in body

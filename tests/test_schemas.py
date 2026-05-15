@@ -128,10 +128,17 @@ class TestCommonSchemas:
 
 class TestGenerateSchemas:
     def test_generate_request_defaults(self):
-        req = GenerateRequest(model="test")
-        assert req.prompt == ""
+        req = GenerateRequest(model="test", prompt="hi")
         assert req.stream is True
         assert req.raw is False
+
+    def test_generate_request_requires_prompt(self):
+        with pytest.raises(ValidationError, match="prompt"):
+            GenerateRequest(model="test")
+
+    def test_generate_request_rejects_empty_prompt(self):
+        with pytest.raises(ValidationError, match="prompt"):
+            GenerateRequest(model="test", prompt="")
 
     def test_generate_response(self):
         resp = GenerateResponse(
