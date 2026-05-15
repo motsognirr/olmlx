@@ -1022,7 +1022,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         content_blocks = []
 
         if thinking:
-            content_blocks.append(AnthropicContentBlock(type="thinking", text=thinking))
+            content_blocks.append(
+                AnthropicContentBlock(type="thinking", thinking=thinking, signature="")
+            )
 
         if visible_text:
             content_blocks.append(AnthropicContentBlock(type="text", text=visible_text))

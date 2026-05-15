@@ -22,6 +22,9 @@ class AnthropicTool(BaseModel):
 class AnthropicContentBlock(BaseModel):
     type: str = "text"
     text: str | None = None
+    # thinking fields
+    thinking: str | None = None
+    signature: str | None = None
     # tool_use fields
     id: str | None = None
     name: str | None = None

@@ -484,6 +484,12 @@ class TestAnthropicEndpoint:
         content_types = [b["type"] for b in data["content"]]
         assert "thinking" in content_types
         assert "text" in content_types
+        # Issue #309: thinking content must be in `thinking` field, not `text`.
+        thinking_block = next(b for b in data["content"] if b["type"] == "thinking")
+        assert thinking_block["thinking"] == "reasoning"
+        assert thinking_block.get("text") in (None, "")
+        # SDK expects `signature` as a string; emit empty for non-Claude models.
+        assert thinking_block["signature"] == ""
 
     @pytest.mark.asyncio
     async def test_non_streaming_with_tool_use(self, app_client):
