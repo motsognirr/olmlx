@@ -988,11 +988,19 @@ class ModelManager:
         if errors:
             raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
 
-    def _evict_lru_if_needed(self) -> None:
+    async def _evict_lru_if_needed(self) -> None:
         """Evict least-recently-used models until below max_loaded_models.
 
         Must be called while holding self._lock.
         Raises RuntimeError if all loaded models are in active use.
+
+        Async because ``_close_loaded_model`` calls
+        ``executor.shutdown(wait=True)`` on the prefetcher (16 threads) and
+        weight store (32 threads); that join is synchronous and would stall
+        the event loop for every concurrent coroutine — not just other
+        ``ensure_loaded`` callers waiting on ``self._lock`` — until the
+        pools drained. ``asyncio.to_thread`` offloads the join so the loop
+        keeps servicing other endpoints during eviction. Issue #315.
         """
         while len(self._loaded) >= settings.max_loaded_models:
             evictable = {k: v for k, v in self._loaded.items() if v.active_refs == 0}
@@ -1012,7 +1020,7 @@ class ModelManager:
             # error) — same shape as the catch in unload(). An unexpected
             # non-ExceptionGroup exception would propagate as a bug.
             try:
-                self._close_loaded_model(evicted)
+                await asyncio.to_thread(self._close_loaded_model, evicted)
             except ExceptionGroup:
                 pass  # already logged per-resource inside _close_loaded_model
             del evicted
@@ -1104,7 +1112,7 @@ class ModelManager:
                 spec_config = model_config.resolved_speculative()
                 kv_cache_quant = model_config.resolved_kv_cache_quant()
 
-                self._evict_lru_if_needed()
+                await self._evict_lru_if_needed()
 
                 logger.info("Loading model %s from %s", normalized, hf_path)
                 mem_before = memory_utils.get_metal_memory()
