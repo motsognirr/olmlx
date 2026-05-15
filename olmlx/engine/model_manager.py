@@ -120,13 +120,20 @@ def _ensure_tokenizer_eos_in_stops(tokenizer: Any) -> None:
     if not isinstance(stops, set):
         return
     inner_eos = getattr(getattr(tokenizer, "_tokenizer", None), "eos_token_id", None)
+    if isinstance(inner_eos, list):
+        # Stock HF tokenizers always surface a single int here; defensive
+        # against custom trust_remote_code=True tokenizers that override
+        # ``eos_token_id`` to return list[int].
+        stops.update(t for t in inner_eos if isinstance(t, int))
+        return
     if not isinstance(inner_eos, int):
-        # mlx-lm renamed ``_tokenizer`` or the inner HF tokenizer lost its
-        # ``eos_token_id`` attribute. Log at debug so upstream API churn is
-        # visible rather than silently reintroducing the original bug.
+        # mlx-lm renamed ``_tokenizer`` or the inner HF tokenizer surfaces an
+        # unexpected type. Log at debug so upstream API churn is visible
+        # rather than silently reintroducing the original bug.
         logger.debug(
-            "Tokenizer wrapper present but inner eos_token_id missing "
-            "(type=%s); skipping eos stop-set augmentation.",
+            "Inner eos_token_id has unexpected type %s on %s; skipping "
+            "eos stop-set augmentation.",
+            type(inner_eos).__name__,
             type(tokenizer).__name__,
         )
         return

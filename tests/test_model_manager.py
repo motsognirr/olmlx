@@ -1912,7 +1912,11 @@ class TestTryLmThenVlmFallback:
 class _FakeTokenizerWrapper:
     """Minimal stand-in for mlx-lm's TokenizerWrapper for stop-token tests."""
 
-    def __init__(self, inner_eos: int | None, stops: set[int] | None):
+    def __init__(
+        self,
+        inner_eos: int | list[int] | None,
+        stops: set[int] | None,
+    ):
         inner = MagicMock()
         inner.eos_token_id = inner_eos
         self._tokenizer = inner
@@ -1943,6 +1947,13 @@ class TestEnsureTokenizerEosInStops:
         tok = _FakeTokenizerWrapper(inner_eos=None, stops={151643})
         _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids == {151643}
+
+    def test_adds_list_inner_eos(self):
+        # Defensive: HF stock tokenizers expose eos_token_id as a single int,
+        # but custom trust_remote_code=True tokenizers may surface list[int].
+        tok = _FakeTokenizerWrapper(inner_eos=[151645, 151643], stops={151643})
+        _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151643, 151645}
 
     def test_noop_on_non_wrapper(self):
         # mlx-vlm processors / plain HF tokenizers don't expose add_eos_token.
