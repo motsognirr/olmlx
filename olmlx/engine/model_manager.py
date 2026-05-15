@@ -1029,22 +1029,54 @@ class ModelManager:
         reclaimed. Same reason :meth:`_expire_stale` uses ``del lm`` in
         its pop loop.
 
-        Absorb cleanup failures so a stuck prefetcher on an evicted
-        model can't permanently block subsequent model loads. The
-        models are already removed from ``_loaded``; the new load will
-        proceed with leaked threads/fds rather than failing.
-        Narrowed to ExceptionGroup to match ``_close_loaded_model``'s
-        documented contract (always raises ExceptionGroup on any error)
-        — same shape as the catch in :meth:`unload`. An unexpected
-        non-ExceptionGroup exception would propagate as a bug.
+        On any abnormal exit (``CancelledError`` from client disconnect,
+        unexpected close failure, ``KeyboardInterrupt`` etc.) drain the
+        rest of the list synchronously. The popped models are already
+        gone from ``_loaded`` — nothing else will close their
+        prefetcher / weight store pools (48 threads + per-layer fds
+        each) if we drop them on the floor here. Sync close is fine on
+        the abnormal path: we'd rather briefly stall the loop than
+        permanently leak. The recursive ``_close_loaded_model`` close
+        still absorbs ``ExceptionGroup`` per-model.
+
+        Normal-path ``ExceptionGroup`` absorption matches
+        ``_close_loaded_model``'s documented contract (always raises
+        ExceptionGroup on any error) — same shape as the catch in
+        :meth:`unload`. An unexpected non-ExceptionGroup exception goes
+        through the abnormal-path drain and re-raises.
         """
-        while evictees:
-            evicted = evictees.pop()
-            try:
-                await asyncio.to_thread(self._close_loaded_model, evicted)
-            except ExceptionGroup:
-                pass  # already logged per-resource inside _close_loaded_model
-            del evicted
+        try:
+            while evictees:
+                evicted = evictees.pop()
+                try:
+                    await asyncio.to_thread(self._close_loaded_model, evicted)
+                except ExceptionGroup:
+                    pass  # already logged per-resource inside _close_loaded_model
+                except BaseException:
+                    # Abnormal exit. Put the just-popped evictee back so the
+                    # finally drain catches it. ``_close_loaded_model`` is
+                    # idempotent (nulls weight_store / speculative_decoder
+                    # sentinels and ThreadPoolExecutor.shutdown(wait=True)
+                    # accepts repeated calls), so a re-close from drain
+                    # racing with the background thread is safe — just
+                    # noisy in logs if both run to completion.
+                    evictees.append(evicted)
+                    raise
+                del evicted
+        finally:
+            # On normal exit ``evictees`` is empty and this is a no-op. On
+            # any abnormal exit (CancelledError from client disconnect,
+            # unexpected close failure, KeyboardInterrupt) drain the rest
+            # synchronously so the 48-thread + per-layer-fd resources
+            # don't leak — the popped models are already gone from
+            # ``_loaded`` and nothing else will close them.
+            while evictees:
+                lm = evictees.pop()
+                try:
+                    self._close_loaded_model(lm)
+                except ExceptionGroup:
+                    pass  # already logged per-resource inside _close_loaded_model
+                del lm
 
     async def ensure_loaded(
         self, name: str, keep_alive: str | None = None
@@ -1142,6 +1174,12 @@ class ModelManager:
             # background thread for a different model may still be allocating
             # Metal memory, and ``mx.clear_cache()`` is not safe to call
             # concurrently with active allocations.
+            #
+            # The ``_pending_cleanups`` read is lock-free. Safe because asyncio
+            # is cooperative: there is no ``await`` between the dict check and
+            # the ``mx.clear_cache()`` call, so no other coroutine (including
+            # the one that would schedule a deferred cleanup via
+            # ``_schedule_deferred_cleanup``) can interleave between the two.
             if not self._pending_cleanups:
                 gc.collect()
                 mx.clear_cache()
@@ -1450,6 +1488,12 @@ class ModelManager:
             await asyncio.to_thread(self._close_loaded_model, lm)
         except ExceptionGroup:
             pass  # already logged per-resource inside _close_loaded_model
+        # Drop the local reference so the Metal buffers can be reclaimed
+        # before the function returns. Matches the pattern in
+        # ``_close_evictees`` and ``_expire_stale``; without it a caller
+        # that polls ``get_metal_memory()`` immediately after unload may
+        # see the model's allocations still resident in the pool.
+        del lm
         return True
 
     # Config keys that indicate a vision-language model

@@ -3332,6 +3332,60 @@ class TestEvictLruIfNeeded:
         assert close_completed.is_set()
 
     @pytest.mark.asyncio
+    async def test_close_evictees_cancellation_drains_remaining(
+        self, registry, mock_store
+    ):
+        """A CancelledError mid-loop must NOT leak remaining evictees.
+
+        ``asyncio.to_thread`` propagates ``asyncio.CancelledError`` when
+        the awaiting task is cancelled (e.g. client disconnect during
+        eviction). The popped evictees that haven't been closed yet
+        would otherwise be dropped on the floor — they're already
+        gone from ``_loaded``, so nothing else will close their
+        prefetcher / weight store pools (48 threads each). The fix
+        drains the remainder synchronously in a finally before
+        re-raising so the cleanup contract holds even on the abnormal
+        path.
+        """
+        manager = ModelManager(registry, mock_store)
+        closed_names: list[str] = []
+
+        def _close(lm):
+            closed_names.append(lm.name)
+
+        manager._close_loaded_model = _close  # type: ignore[method-assign]
+
+        # Patch ``asyncio.to_thread`` to record the close call and raise
+        # ``CancelledError`` on the second invocation — simulating a
+        # client disconnect while ``_close_evictees`` is mid-loop.
+        original_to_thread = asyncio.to_thread
+
+        async def _cancelling_to_thread(fn, *args, **kwargs):
+            if len(closed_names) == 1:
+                raise asyncio.CancelledError()
+            return await original_to_thread(fn, *args, **kwargs)
+
+        evictees = [
+            LoadedModel(
+                name=f"e{i}",
+                hf_path=f"e{i}/r",
+                model=MagicMock(),
+                tokenizer=MagicMock(),
+            )
+            for i in range(3)
+        ]
+        with patch(
+            "olmlx.engine.model_manager.asyncio.to_thread", _cancelling_to_thread
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await manager._close_evictees(evictees)
+
+        # All three evictees must be closed despite cancellation —
+        # the first via the normal async path, the remaining two via
+        # the sync drain in the cancellation handler.
+        assert sorted(closed_names) == ["e0", "e1", "e2"]
+
+    @pytest.mark.asyncio
     async def test_close_evictees_unblocks_event_loop(self, registry, mock_store):
         """A slow close must not block the event loop.
 
