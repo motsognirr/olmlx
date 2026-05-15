@@ -1965,6 +1965,17 @@ class TestEnsureTokenizerEosInStops:
         _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids is None
 
+    def test_debug_logs_when_tokenizer_attr_missing(self, caplog):
+        # Past the add_eos_token gate but no _tokenizer attribute — mlx-lm
+        # likely renamed the field. Must log at DEBUG so the regression is
+        # discoverable without spamming WARNING for deliberate variants.
+        tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
+        del tok._tokenizer
+        with caplog.at_level(logging.DEBUG, logger="olmlx.engine.model_manager"):
+            _ensure_tokenizer_eos_in_stops(tok)
+        assert tok.eos_token_ids == {151643}
+        assert any("not accessible" in r.message for r in caplog.records)
+
     def test_warns_on_unexpected_type(self, caplog):
         # Defends against a refactor that accidentally skips the warning
         # branch or promotes/demotes its log level.
