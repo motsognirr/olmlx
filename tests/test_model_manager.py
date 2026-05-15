@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ from olmlx.engine.model_manager import (
     _ensure_tokenizer_eos_in_stops,
     parse_keep_alive,
 )
-from olmlx.engine.registry import SpeculativeConfig
+from olmlx.engine.registry import ModelConfig, SpeculativeConfig
 from olmlx.engine.template_caps import TemplateCaps
 
 
@@ -93,14 +94,17 @@ class TestModelManager:
         assert len(loaded) == 1
         assert loaded[0].name == "qwen3:latest"
 
-    def test_unload(self, mock_manager):
-        mock_manager.unload("qwen3")
+    @pytest.mark.asyncio
+    async def test_unload(self, mock_manager):
+        await mock_manager.unload("qwen3")
         assert mock_manager.get_loaded() == []
 
-    def test_unload_not_loaded(self, mock_manager):
-        assert mock_manager.unload("nonexistent") is False
+    @pytest.mark.asyncio
+    async def test_unload_not_loaded(self, mock_manager):
+        assert await mock_manager.unload("nonexistent") is False
 
-    def test_unload_active_refs_raises(self, mock_manager):
+    @pytest.mark.asyncio
+    async def test_unload_active_refs_raises(self, mock_manager):
         from olmlx.engine.model_manager import ActiveRequestsError
 
         lm = mock_manager._loaded["qwen3:latest"]
@@ -109,12 +113,13 @@ class TestModelManager:
         # catches for 409. It also subclasses RuntimeError so legacy
         # callers using ``except RuntimeError:`` continue to work.
         with pytest.raises(ActiveRequestsError, match="active"):
-            mock_manager.unload("qwen3")
+            await mock_manager.unload("qwen3")
         assert issubclass(ActiveRequestsError, RuntimeError)
         assert len(mock_manager.get_loaded()) == 1  # still loaded
         lm.active_refs = 0
 
-    def test_unload_absorbs_close_failure(self, mock_manager):
+    @pytest.mark.asyncio
+    async def test_unload_absorbs_close_failure(self, mock_manager):
         """unload() returns True even when _close_loaded_model raises.
 
         The model is already popped from ``_loaded`` before close is
@@ -130,9 +135,35 @@ class TestModelManager:
         mock_manager._close_loaded_model = MagicMock(
             side_effect=ExceptionGroup("simulated", [RuntimeError("prefetcher boom")])
         )
-        result = mock_manager.unload("qwen3")
+        result = await mock_manager.unload("qwen3")
         assert result is True
         assert "qwen3:latest" not in mock_manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_unload_offloads_close_to_thread(self, mock_manager, monkeypatch):
+        """unload() must run _close_loaded_model off the event loop.
+
+        Same problem as #315 on a different code path: the sync HTTP
+        ``/api/unload`` handler in routers/manage.py calls ``unload``,
+        which calls ``_close_loaded_model``, which joins 48 threads
+        synchronously. Doing that on the event loop stalls every
+        concurrent coroutine until the pools drain.
+        """
+        original_to_thread = asyncio.to_thread
+        to_thread_calls: list[Any] = []
+
+        async def _tracking_to_thread(fn, *args, **kwargs):
+            to_thread_calls.append(fn)
+            return await original_to_thread(fn, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.asyncio.to_thread", _tracking_to_thread
+        )
+
+        result = await mock_manager.unload("qwen3")
+
+        assert result is True
+        assert mock_manager._close_loaded_model in to_thread_calls
 
     @pytest.mark.asyncio
     async def test_ensure_loaded_cached(self, mock_manager):
@@ -2999,7 +3030,14 @@ class TestPerModelConfig:
 
 
 class TestEvictLruIfNeeded:
-    """Tests for ModelManager._evict_lru_if_needed."""
+    """Tests for ModelManager._pop_lru_evictees + _close_evictees.
+
+    Eviction is split: ``_pop_lru_evictees`` pops under the lock, then
+    ``_close_evictees`` runs the close off the event loop with the
+    lock released so concurrent ``ensure_loaded`` callers — including
+    ones requesting an already-loaded model — aren't stalled by the
+    48-thread executor.shutdown join. Issue #315.
+    """
 
     def test_no_eviction_below_capacity(self, registry, mock_store, monkeypatch):
         monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 3)
@@ -3008,7 +3046,7 @@ class TestEvictLruIfNeeded:
             name="a", hf_path="a/a", model=MagicMock(), tokenizer=MagicMock()
         )
         manager._loaded["a"] = lm
-        manager._evict_lru_if_needed()
+        assert manager._pop_lru_evictees() == []
         assert "a" in manager._loaded
 
     def test_evicts_oldest_inactive(self, registry, mock_store, monkeypatch):
@@ -3022,7 +3060,8 @@ class TestEvictLruIfNeeded:
             loaded_at=time.time() - 100,
         )
         manager._loaded["old"] = old
-        manager._evict_lru_if_needed()
+        evictees = manager._pop_lru_evictees()
+        assert [e.name for e in evictees] == ["old"]
         assert "old" not in manager._loaded
 
     def test_raises_when_all_active(self, registry, mock_store, monkeypatch):
@@ -3037,29 +3076,38 @@ class TestEvictLruIfNeeded:
         active.active_refs = 1
         manager._loaded["active"] = active
         with pytest.raises(RuntimeError, match="All loaded models are in use"):
-            manager._evict_lru_if_needed()
+            manager._pop_lru_evictees()
 
-    def test_skips_gc_when_pending_cleanup(self, registry, mock_store, monkeypatch):
-        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+    @pytest.mark.asyncio
+    async def test_close_evictees_does_not_touch_gc_or_metal(
+        self, registry, mock_store
+    ):
+        """``_close_evictees`` MUST NOT flush gc / Metal itself.
+
+        ``ensure_loaded`` (and the matching exception handlers) own that
+        flush so it can run unconditionally before the post-eviction
+        memory baseline and be suppressed when a deferred cleanup is in
+        flight. Doing it inside ``_close_evictees`` would either double-
+        flush during a real load or skip when a non-eviction caller
+        depends on it.
+        """
         manager = ModelManager(registry, mock_store)
         old = LoadedModel(
             name="old",
             hf_path="o/o",
             model=MagicMock(),
             tokenizer=MagicMock(),
-            loaded_at=time.time() - 100,
         )
-        manager._loaded["old"] = old
-        # Simulate pending cleanup — use a truthy sentinel (dict only checks key presence)
-        manager._pending_cleanups["other"] = True
-        with patch("olmlx.engine.model_manager.gc.collect") as mock_gc:
-            manager._evict_lru_if_needed()
+        with (
+            patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
+            patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+        ):
+            await manager._close_evictees([old])
             mock_gc.assert_not_called()
-        assert "old" not in manager._loaded
-        del manager._pending_cleanups["other"]
+            mock_clear.assert_not_called()
 
-    def test_nulls_speculative_decoder(self, registry, mock_store, monkeypatch):
-        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+    @pytest.mark.asyncio
+    async def test_close_evictees_nulls_speculative_decoder(self, registry, mock_store):
         manager = ModelManager(registry, mock_store)
         decoder = MagicMock()
         old = LoadedModel(
@@ -3068,11 +3116,9 @@ class TestEvictLruIfNeeded:
             model=MagicMock(),
             tokenizer=MagicMock(),
             speculative_decoder=decoder,
-            loaded_at=time.time() - 100,
         )
-        manager._loaded["old"] = old
-        manager._evict_lru_if_needed()
-        assert "old" not in manager._loaded
+        await manager._close_evictees([old])
+        decoder.close.assert_called_once()
 
     def test_close_loaded_model_continues_on_failure(self, registry, mock_store):
         """A raising prefetcher.close() must not skip weight_store/decoder cleanup.
@@ -3157,15 +3203,15 @@ class TestEvictLruIfNeeded:
         assert lm.weight_store is weight_store
         assert lm.speculative_decoder is None
 
-    def test_evict_absorbs_close_failure(
-        self, registry, mock_store, monkeypatch, caplog
+    @pytest.mark.asyncio
+    async def test_close_evictees_absorbs_close_failure(
+        self, registry, mock_store, caplog
     ):
-        """LRU eviction must not propagate close() failures.
+        """Close failures must not propagate.
 
         A stuck prefetcher would otherwise permanently block all future
-        model loads. The eviction site logs the error and continues.
+        model loads. The close site logs the error and continues.
         """
-        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
         manager = ModelManager(registry, mock_store)
         prefetcher = MagicMock()
         prefetcher.close.side_effect = RuntimeError("stuck-prefetcher")
@@ -3177,26 +3223,23 @@ class TestEvictLruIfNeeded:
             model=flash_model,
             tokenizer=MagicMock(),
             is_flash=True,
-            loaded_at=time.time() - 100,
         )
-        manager._loaded["old"] = old
 
         with caplog.at_level(logging.ERROR, logger="olmlx.engine.model_manager"):
-            manager._evict_lru_if_needed()  # must not raise
+            await manager._close_evictees([old])  # must not raise
 
-        assert "old" not in manager._loaded
-        # _close_loaded_model logs per-resource; eviction site absorbs silently.
+        # _close_loaded_model logs per-resource; close site absorbs silently.
         assert any(
             "Error closing prefetcher for old" in r.message for r in caplog.records
         )
 
-    def test_closes_flash_resources_on_evict(self, registry, mock_store, monkeypatch):
-        """LRU eviction of a Flash model must close prefetcher + weight_store.
+    @pytest.mark.asyncio
+    async def test_close_evictees_closes_flash_resources(self, registry, mock_store):
+        """Closing a Flash evictee must close prefetcher + weight_store.
 
         Otherwise ThreadPoolExecutor workers and per-layer file descriptors
         leak for every evicted Flash model (issue #178).
         """
-        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
         manager = ModelManager(registry, mock_store)
         # Wire both resources through the same ``parent`` MagicMock so the
         # cross-resource ordering assertion below has a single ordered call
@@ -3213,10 +3256,8 @@ class TestEvictLruIfNeeded:
             tokenizer=MagicMock(),
             weight_store=weight_store,
             is_flash=True,
-            loaded_at=time.time() - 100,
         )
-        manager._loaded["old"] = old
-        manager._evict_lru_if_needed()
+        await manager._close_evictees([old])
         prefetcher.close.assert_called_once()
         weight_store.close.assert_called_once()
         # Order matters: prefetcher tasks submit into the weight store's pool,
@@ -3225,6 +3266,208 @@ class TestEvictLruIfNeeded:
         assert call_names.index("prefetcher.close") < call_names.index(
             "weight_store.close"
         )
+
+    @pytest.mark.asyncio
+    async def test_close_evictees_offloads_close_to_thread(
+        self, registry, mock_store, monkeypatch
+    ):
+        """The close must run off the event loop.
+
+        ``executor.shutdown(wait=True)`` is synchronous and joins 48 threads
+        (16 prefetch + 32 weight store). Running it on the event loop thread
+        stalls every concurrent coroutine — even ones that don't touch the
+        model manager — until the pools drain. Issue #315.
+        """
+        manager = ModelManager(registry, mock_store)
+        original_to_thread = asyncio.to_thread
+        to_thread_calls: list[Any] = []
+
+        async def _tracking_to_thread(fn, *args, **kwargs):
+            to_thread_calls.append(fn)
+            return await original_to_thread(fn, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.asyncio.to_thread", _tracking_to_thread
+        )
+
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+
+        await manager._close_evictees([old])
+
+        assert manager._close_loaded_model in to_thread_calls
+
+    @pytest.mark.asyncio
+    async def test_close_evictees_runs_without_lock(self, registry, mock_store):
+        """``_close_evictees`` must NOT require ``self._lock``.
+
+        The whole point of splitting pop and close is so the close runs
+        with the lock released — that's what lets concurrent
+        ``ensure_loaded`` callers (e.g. for an already-loaded model)
+        return immediately while a Flash close drains its 48-thread
+        pools. We verify by acquiring the lock around the call and
+        watching the close still complete.
+        """
+        manager = ModelManager(registry, mock_store)
+        close_completed = threading.Event()
+
+        def _close(_lm):
+            close_completed.set()
+
+        manager._close_loaded_model = _close  # type: ignore[method-assign]
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+
+        # If _close_evictees tried to take the lock, this would deadlock.
+        async with manager._lock:
+            await manager._close_evictees([old])
+        assert close_completed.is_set()
+
+    @pytest.mark.asyncio
+    async def test_close_evictees_cancellation_drains_remaining(
+        self, registry, mock_store
+    ):
+        """A CancelledError mid-loop must NOT leak remaining evictees.
+
+        ``asyncio.to_thread`` propagates ``asyncio.CancelledError`` when
+        the awaiting task is cancelled (e.g. client disconnect during
+        eviction). The popped evictees that haven't been closed yet
+        would otherwise be dropped on the floor — they're already
+        gone from ``_loaded``, so nothing else will close their
+        prefetcher / weight store pools (48 threads each). The fix
+        drains the remainder synchronously in a finally before
+        re-raising so the cleanup contract holds even on the abnormal
+        path.
+        """
+        manager = ModelManager(registry, mock_store)
+        closed_names: list[str] = []
+
+        def _close(lm):
+            closed_names.append(lm.name)
+
+        manager._close_loaded_model = _close  # type: ignore[method-assign]
+
+        # Patch ``asyncio.to_thread`` to record the close call and raise
+        # ``CancelledError`` on the second invocation — simulating a
+        # client disconnect while ``_close_evictees`` is mid-loop.
+        original_to_thread = asyncio.to_thread
+
+        async def _cancelling_to_thread(fn, *args, **kwargs):
+            if len(closed_names) == 1:
+                raise asyncio.CancelledError()
+            return await original_to_thread(fn, *args, **kwargs)
+
+        evictees = [
+            LoadedModel(
+                name=f"e{i}",
+                hf_path=f"e{i}/r",
+                model=MagicMock(),
+                tokenizer=MagicMock(),
+            )
+            for i in range(3)
+        ]
+        with patch(
+            "olmlx.engine.model_manager.asyncio.to_thread", _cancelling_to_thread
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await manager._close_evictees(evictees)
+
+        # All three evictees must be closed despite cancellation —
+        # the first via the normal async path, the remaining two via
+        # the sync drain in the cancellation handler.
+        assert sorted(closed_names) == ["e0", "e1", "e2"]
+
+    @pytest.mark.asyncio
+    async def test_close_evictees_unblocks_event_loop(self, registry, mock_store):
+        """A slow close must not block the event loop.
+
+        Use a threading.Event rendezvous so the assertion does not
+        depend on wall-clock timing. The slow-close worker thread
+        blocks on the event; while it blocks, the event loop services
+        the sibling coroutine, which signals the event so the close
+        can finish.
+        """
+        manager = ModelManager(registry, mock_store)
+        block_close = threading.Event()
+        sibling_ran = False
+
+        def _slow_close(_lm):
+            # Block until the sibling coroutine signals — proves the
+            # event loop kept turning while this worker thread waited.
+            assert block_close.wait(timeout=5.0)
+
+        manager._close_loaded_model = _slow_close  # type: ignore[method-assign]
+
+        async def _sibling():
+            nonlocal sibling_ran
+            sibling_ran = True
+            block_close.set()
+
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        sibling_task = asyncio.create_task(_sibling())
+        await manager._close_evictees([old])
+        await sibling_task
+        assert sibling_ran
+
+    @pytest.mark.asyncio
+    async def test_ensure_loaded_releases_lock_during_close(
+        self, registry, mock_store, monkeypatch
+    ):
+        """``ensure_loaded`` must release the lock while closing evictees.
+
+        Otherwise an ``ensure_loaded`` call for an already-loaded
+        model is stalled for the duration of an unrelated Flash close
+        — the regression Claude raised on the first round of #315.
+        """
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+        manager = ModelManager(registry, mock_store)
+        lock_held_during_close: list[bool] = []
+
+        async def _spy_close(_evictees):
+            lock_held_during_close.append(manager._lock.locked())
+
+        manager._close_evictees = _spy_close  # type: ignore[method-assign]
+
+        # Pre-load a model so eviction triggers when we ask for another.
+        existing = LoadedModel(
+            name="existing:latest",
+            hf_path="existing/repo",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["existing:latest"] = existing
+
+        # Stub the registry + load path so ensure_loaded reaches the close.
+        manager.registry.resolve = MagicMock(  # type: ignore[method-assign]
+            return_value=ModelConfig(hf_path="new/repo")
+        )
+        manager.registry.normalize_name = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda n: f"{n}:latest"
+        )
+
+        async def _abort_load(*_a, **_kw):
+            raise RuntimeError("stop before load")
+
+        monkeypatch.setattr("olmlx.engine.model_manager.asyncio.to_thread", _abort_load)
+
+        with pytest.raises(RuntimeError, match="stop before load"):
+            await manager.ensure_loaded("new")
+
+        assert lock_held_during_close == [False]
 
 
 class TestSpeculativeLoading:
