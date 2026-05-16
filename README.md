@@ -360,14 +360,14 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 
 | Variable | Default | Description |
 |---|---|---|
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED` | `false` | Enable distributed inference |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE` | `~/.olmlx/hostfile.json` | Path to hostfile with hosts and model |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND` | `ring` | MLX distributed backend |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT` | `32323` | Base port for ring backend (increments per rank) |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT` | `32400` | TCP port for coordinator↔worker sideband |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET` | *(empty)* | Shared secret for worker authentication |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR` | *(empty)* | Working directory on remote workers |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON` | `python` | Python command on remote workers |
+| `OLMLX_DISTRIBUTED` | `false` | Enable distributed inference |
+| `OLMLX_DISTRIBUTED_HOSTFILE` | `~/.olmlx/hostfile.json` | Path to hostfile with hosts and model |
+| `OLMLX_DISTRIBUTED_BACKEND` | `ring` | MLX distributed backend |
+| `OLMLX_DISTRIBUTED_PORT` | `32323` | Base port for ring backend (increments per rank) |
+| `OLMLX_DISTRIBUTED_SIDEBAND_PORT` | `32400` | TCP port for coordinator↔worker sideband |
+| `OLMLX_DISTRIBUTED_SECRET` | *(empty)* | Shared secret for worker authentication |
+| `OLMLX_DISTRIBUTED_REMOTE_WORKING_DIR` | *(empty)* | Working directory on remote workers |
+| `OLMLX_DISTRIBUTED_REMOTE_PYTHON` | `python` | Python command on remote workers |
 
 ## Speculative Decoding
 
@@ -522,13 +522,13 @@ Run models across multiple Apple Silicon machines connected via network (Thunder
 
 4. **Configure** the coordinator with a `.env` file or environment variables:
    ```bash
-   OLMLX_EXPERIMENTAL_DISTRIBUTED=true
-   OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE=~/.olmlx/hostfile.json
-   OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND=ring
-   OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT=32323
-   OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT=32400
-   OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR=~/Documents/olmlx_distributed
-   OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON=.venv/bin/python
+   OLMLX_DISTRIBUTED=true
+   OLMLX_DISTRIBUTED_HOSTFILE=~/.olmlx/hostfile.json
+   OLMLX_DISTRIBUTED_BACKEND=ring
+   OLMLX_DISTRIBUTED_PORT=32323
+   OLMLX_DISTRIBUTED_SIDEBAND_PORT=32400
+   OLMLX_DISTRIBUTED_REMOTE_WORKING_DIR=~/Documents/olmlx_distributed
+   OLMLX_DISTRIBUTED_REMOTE_PYTHON=.venv/bin/python
    OLMLX_HOST=0.0.0.0
    ```
 

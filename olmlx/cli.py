@@ -50,9 +50,10 @@ def cmd_serve(args):
     _configure_logging()
     _apply_serve_overrides(args)
 
-    from olmlx.config import experimental
+    from olmlx.config import settings
 
-    if experimental.distributed:
+    _surface_legacy_distributed_env()  # must run before the guard — legacy env var
+    if settings.distributed:
         _hosts, strategy, hostfile_layers = _launch_distributed_workers()
         # The ring backend's init() blocks until all ranks connect. Both the
         # coordinator and workers must call init() within each other's retry
@@ -63,7 +64,7 @@ def cmd_serve(args):
         import mlx.core as mx
 
         try:
-            group = mx.distributed.init(backend=experimental.distributed_backend)
+            group = mx.distributed.init(backend=settings.distributed_backend)
         except Exception:
             _cleanup_workers()
             raise
@@ -76,8 +77,8 @@ def cmd_serve(args):
 
         coordinator = DistributedCoordinator(
             world_size=group.size(),
-            port=experimental.distributed_sideband_port,
-            secret=experimental.distributed_secret or None,
+            port=settings.distributed_sideband_port,
+            secret=settings.distributed_secret or None,
         )
         # Store for the app lifespan to retrieve
         global _cli_distributed_group, _cli_distributed_coordinator
@@ -472,6 +473,88 @@ def _warn_kv_cache_quant_incompatibilities() -> None:
     # for any non-serializable cache regardless of the source, so there
     # is no silent data loss.
 
+#: Distributed fields with their ``OLMLX_EXPERIMENTAL_DISTRIBUTED_*`` legacy
+#: name and the corresponding ``OLMLX_DISTRIBUTED_*`` new name (without
+#: prefix), keyed by the Python attribute name on ``Settings``.
+_DISTRIBUTED_LEGACY_ENV_MAP: dict[str, tuple[str, str]] = {
+    "distributed": ("OLMLX_EXPERIMENTAL_DISTRIBUTED", "OLMLX_DISTRIBUTED"),
+    "distributed_strategy": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_STRATEGY", "OLMLX_DISTRIBUTED_STRATEGY"),
+    "distributed_hostfile": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE", "OLMLX_DISTRIBUTED_HOSTFILE"),
+    "distributed_backend": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND", "OLMLX_DISTRIBUTED_BACKEND"),
+    "distributed_port": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT", "OLMLX_DISTRIBUTED_PORT"),
+    "distributed_sideband_port": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT", "OLMLX_DISTRIBUTED_SIDEBAND_PORT"),
+    "distributed_secret": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET", "OLMLX_DISTRIBUTED_SECRET"),
+    "distributed_remote_working_dir": (
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR",
+        "OLMLX_DISTRIBUTED_REMOTE_WORKING_DIR",
+    ),
+    "distributed_remote_python": (
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON",
+        "OLMLX_DISTRIBUTED_REMOTE_PYTHON",
+    ),
+    "distributed_pre_shard": (
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_PRE_SHARD",
+        "OLMLX_DISTRIBUTED_PRE_SHARD",
+    ),
+    "distributed_shard_dir": (
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_SHARD_DIR",
+        "OLMLX_DISTRIBUTED_SHARD_DIR",
+    ),
+    "distributed_worker_shard_dir": (
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_WORKER_SHARD_DIR",
+        "OLMLX_DISTRIBUTED_WORKER_SHARD_DIR",
+    ),
+}
+
+
+def _surface_legacy_distributed_env() -> None:
+    """Forward legacy ``OLMLX_EXPERIMENTAL_DISTRIBUTED_*`` env vars to the new
+    ``OLMLX_DISTRIBUTED_*`` names when the new env var is unset.
+
+    Mirrors the kv_cache_quant / speculative legacy forwarding pattern.
+    Called from ``cmd_serve`` and worker applications that read
+    ``settings.distributed_*`` so the deprecation window is honoured uniformly.
+    """
+    from olmlx.config import settings as _settings
+
+    for attr_name, (legacy_name, new_name) in _DISTRIBUTED_LEGACY_ENV_MAP.items():
+        # New env var takes precedence over legacy.
+        if os.environ.get(new_name) is not None:
+            continue
+        legacy_val = os.environ.get(legacy_name)
+        if legacy_val is None:
+            continue
+        current = getattr(_settings, attr_name)
+        if isinstance(current, bool):
+            legacy_val = legacy_val.lower() in ("true", "1", "yes")
+        elif isinstance(current, int):
+            try:
+                legacy_val = int(legacy_val)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Could not forward legacy %s=%r: not a valid int",
+                    legacy_name,
+                    legacy_val,
+                )
+                continue
+        try:
+            setattr(_settings, attr_name, legacy_val)
+            logger.warning(
+                "Forwarding legacy %s=%r → settings.%s. "
+                "Rename to %s.",
+                legacy_name,
+                legacy_val,
+                attr_name,
+                new_name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not forward legacy %s=%r: %s",
+                legacy_name,
+                legacy_val,
+                exc,
+            )
+
 
 def _apply_serve_overrides(args) -> None:
     """Apply CLI flags to the global Settings before the server starts.
@@ -811,7 +894,7 @@ def _cleanup_workers():
 
 
 def _pre_shard_and_distribute(
-    hosts, model, world_size, experimental, strategy="tensor", layer_counts=None
+    hosts, model, world_size, settings, strategy="tensor", layer_counts=None
 ) -> bool:
     """Pre-shard model weights and distribute to workers via SCP.
 
@@ -834,7 +917,7 @@ def _pre_shard_and_distribute(
         return False
 
     safe_name = _safe_dir_name(model)
-    shard_base = Path(experimental.distributed_shard_dir).expanduser() / safe_name
+    shard_base = Path(settings.distributed_shard_dir).expanduser() / safe_name
 
     # Resolve default layer_counts for pipeline so marker comparison works
     # when the hostfile omits an explicit "layers" key.
@@ -892,7 +975,7 @@ def _pre_shard_and_distribute(
 
     # SCP shards to each worker
     # Resolve ~ to absolute path so we can safely shlex.quote for SSH commands.
-    worker_shard_dir = str(Path(experimental.distributed_worker_shard_dir).expanduser())
+    worker_shard_dir = str(Path(settings.distributed_worker_shard_dir).expanduser())
     for rank, host in enumerate(hosts[1:], start=1):
         shard_dir = shard_base / f"rank{rank}"
         remote_dir = f"{worker_shard_dir}/{safe_name}/rank{rank}"
@@ -955,9 +1038,9 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
     import atexit
     import shlex
 
-    from olmlx.config import experimental
+    from olmlx.config import experimental, settings
 
-    hostfile_path = Path(experimental.distributed_hostfile).expanduser()
+    hostfile_path = Path(settings.distributed_hostfile).expanduser()
     if not hostfile_path.exists():
         print(
             f"Error: distributed hostfile not found at {hostfile_path}",
@@ -1028,12 +1111,12 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
 
     # Generate ring hostfile for MLX distributed backend
     ring_hostfile_data = [
-        [f"{h}:{experimental.distributed_port + i}"] for i, h in enumerate(hosts)
+        [f"{h}:{settings.distributed_port + i}"] for i, h in enumerate(hosts)
     ]
-    max_port = experimental.distributed_port + len(hosts) - 1
+    max_port = settings.distributed_port + len(hosts) - 1
     if max_port > 65535:
         print(
-            f"Error: distributed_port {experimental.distributed_port} + "
+            f"Error: distributed_port {settings.distributed_port} + "
             f"{len(hosts)} hosts exceeds port limit 65535",
             file=sys.stderr,
         )
@@ -1054,14 +1137,14 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
         atexit.register(_cleanup_workers)
         _atexit_registered = True
 
-    remote_python = experimental.distributed_remote_python
+    remote_python = settings.distributed_remote_python
     validate_remote_python(remote_python)
-    remote_working_dir = experimental.distributed_remote_working_dir
+    remote_working_dir = settings.distributed_remote_working_dir
 
     if experimental.flash_moe:
         print(
             "Error: Flash-MoE + distributed is not supported. "
-            "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or OLMLX_EXPERIMENTAL_DISTRIBUTED.",
+            "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or OLMLX_DISTRIBUTED.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1076,7 +1159,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
 
     # Pre-shard and distribute weights to workers if enabled
     pre_sharded = False
-    if experimental.distributed_pre_shard:
+    if settings.distributed_pre_shard:
         if experimental.flash:
             logger.info(
                 "Skipping pre-sharding: Flash mode shards only attention "
@@ -1088,7 +1171,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
                 hosts,
                 model,
                 world_size,
-                experimental,
+                settings,
                 strategy=strategy,
                 layer_counts=hostfile_layers,
             )
@@ -1099,22 +1182,22 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
 
     safe_name = _safe_dir_name(model) if pre_sharded else ""
     # Keep ~ as-is: the worker calls expanduser() on the received path
-    worker_shard_dir = experimental.distributed_worker_shard_dir if pre_sharded else ""
+    worker_shard_dir = settings.distributed_worker_shard_dir if pre_sharded else ""
 
     # Launch workers on remote hosts (rank 1..N)
     for rank, host in enumerate(hosts[1:], start=1):
         env = {
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_MODEL": model,
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND": experimental.distributed_backend,
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST": coordinator_host,
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT": str(
-                experimental.distributed_sideband_port
+            "OLMLX_DISTRIBUTED_MODEL": model,
+            "OLMLX_DISTRIBUTED_BACKEND": settings.distributed_backend,
+            "OLMLX_DISTRIBUTED_COORDINATOR_HOST": coordinator_host,
+            "OLMLX_DISTRIBUTED_SIDEBAND_PORT": str(
+                settings.distributed_sideband_port
             ),
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_STRATEGY": strategy,
+            "OLMLX_DISTRIBUTED_STRATEGY": strategy,
             "MLX_RANK": str(rank),
         }
         if hostfile_layers is not None:
-            env["OLMLX_EXPERIMENTAL_DISTRIBUTED_LAYER_COUNTS"] = ",".join(
+            env["OLMLX_DISTRIBUTED_LAYER_COUNTS"] = ",".join(
                 str(x) for x in hostfile_layers
             )
         if pre_sharded:
@@ -1160,13 +1243,13 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
         if remote_working_dir:
             script_parts.append(f"cd {shlex.quote(remote_working_dir)}")
 
-        if experimental.distributed_secret:
+        if settings.distributed_secret:
             script_parts.extend(
                 [
                     "SECRET_FILE=$(mktemp)",
-                    f"printf '%s' {shlex.quote(experimental.distributed_secret)} > $SECRET_FILE",
+                    f"printf '%s' {shlex.quote(settings.distributed_secret)} > $SECRET_FILE",
                     "chmod 600 $SECRET_FILE",
-                    "export OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET_FILE=$SECRET_FILE",
+                    "export OLMLX_DISTRIBUTED_SECRET_FILE=$SECRET_FILE",
                 ]
             )
 
@@ -1835,7 +1918,7 @@ def cmd_chat(args):
 def cmd_config_show(_args):
     """Show current configuration."""
     _surface_legacy_kv_cache_quant_env()
-    from olmlx.config import experimental
+    _surface_legacy_distributed_env()
 
     print(f"Host:                   {settings.host}")
     print(f"Port:                   {settings.port}")
@@ -1850,13 +1933,13 @@ def cmd_config_show(_args):
     print(f"CORS origins:           {settings.cors_origins}")
     if settings.kv_cache_quant:
         print(f"KV cache quant:         {settings.kv_cache_quant}")
-    if experimental.distributed:
+    if settings.distributed:
         print()
-        print("Experimental distributed inference:")
-        print(f"  Hostfile:             {experimental.distributed_hostfile}")
-        print(f"  Backend:              {experimental.distributed_backend}")
-        print(f"  Port:                 {experimental.distributed_port}")
-        print(f"  Sideband port:        {experimental.distributed_sideband_port}")
+        print("Distributed inference:")
+        print(f"  Hostfile:             {settings.distributed_hostfile}")
+        print(f"  Backend:              {settings.distributed_backend}")
+        print(f"  Port:                 {settings.distributed_port}")
+        print(f"  Sideband port:        {settings.distributed_sideband_port}")
 
 
 def cmd_bench_run(args):

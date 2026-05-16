@@ -1,6 +1,6 @@
 """Distributed inference sideband coordination.
 
-Only imported when OLMLX_EXPERIMENTAL_DISTRIBUTED=true. Uses simple TCP sockets
+Only imported when OLMLX_DISTRIBUTED=true. Uses simple TCP sockets
 with length-prefixed JSON messages for coordinator↔worker communication.
 """
 

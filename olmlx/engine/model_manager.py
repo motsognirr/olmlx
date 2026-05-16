@@ -2014,9 +2014,53 @@ class ModelManager:
         spectral_path = self.store.local_path(hf_path) / "spectral"
         if spectral_path.exists() and (spectral_path / "spectral_config.json").exists():
             return spectral_path
+        # Auto-calibrate if enabled
+        if settings.kv_cache_auto_calibrate:
+            return self._auto_calibrate_spectral(hf_path, kv_cache_quant)
         raise SpectralCalibrationMissingError(
             f"SpectralQuant configured ({kv_cache_quant}) but no calibration data "
-            f"found at {spectral_path}. Run 'olmlx spectral prepare <model>' first."
+            f"found at {spectral_path}. "
+            f"Run 'olmlx spectral prepare <model>' first, or set "
+            f"OLMLX_KV_CACHE_AUTO_CALIBRATE=true to auto-calibrate on first load."
+        )
+
+    def _auto_calibrate_spectral(
+        self, hf_path: str, kv_cache_quant: str
+    ) -> Path:
+        """Run spectral calibration automatically with default settings."""
+        import logging
+
+        from olmlx.engine.spectralquant_calibrate import calibrate_model
+
+        _, bits_str = kv_cache_quant.split(":")
+        avg_bits = int(bits_str)
+        local_dir = self.store.local_path(hf_path)
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "Auto-calibrating spectral quant (%s-bit) for %s "
+            "(this may take several minutes)...",
+            avg_bits, hf_path,
+        )
+        try:
+            output_dir = calibrate_model(
+                model_path=str(local_dir),
+                num_samples=64,
+                calibration_dataset="c4",
+                avg_bits=avg_bits,
+                max_tokens_per_head=2048,
+            )
+        except Exception as exc:
+            raise SpectralCalibrationMissingError(
+                f"Auto-calibration failed for {hf_path}: {exc}. "
+                f"Run 'olmlx spectral prepare {hf_path}' manually."
+            ) from exc
+        spectral_path = Path(output_dir)
+        if spectral_path.exists() and (spectral_path / "spectral_config.json").exists():
+            logger.info("Auto-calibration complete for %s", hf_path)
+            return spectral_path
+        raise SpectralCalibrationMissingError(
+            f"Auto-calibration completed but spectral data not found at "
+            f"{spectral_path}. Run 'olmlx spectral prepare {hf_path}' manually."
         )
 
     def _resolve_draft_path(self, hf_path: str) -> str:

@@ -44,14 +44,14 @@ async def lifespan(app: FastAPI):
     registry.load()
     store = ModelStore(registry)
 
-    # -- Experimental: Distributed inference --
-    from olmlx.config import experimental
+    # -- Distributed inference --
+    from olmlx.config import settings
 
     distributed_group = None
     coordinator = None
     distributed_strategy = "tensor"
     distributed_layer_counts = None
-    if experimental.distributed:
+    if settings.distributed:
         from olmlx.engine.inference import set_distributed_coordinator
 
         # The CLI starts the ring backend and sideband server before uvicorn
@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
             "Distributed mode: rank %d, world_size %d, backend %s",
             distributed_group.rank(),
             world_size,
-            experimental.distributed_backend,
+            settings.distributed_backend,
         )
         import asyncio
 

@@ -248,7 +248,7 @@ class TestWorkerPreShardedLoading:
         """Verify the env var constant is defined and consistent."""
         from olmlx.config import PRE_SHARDED_DIR_ENV
 
-        assert PRE_SHARDED_DIR_ENV == "OLMLX_EXPERIMENTAL_DISTRIBUTED_PRE_SHARDED_DIR"
+        assert PRE_SHARDED_DIR_ENV == "OLMLX_DISTRIBUTED_PRE_SHARDED_DIR"
 
     def test_marker_mismatch_returns_none(self, tmp_path):
         """When marker doesn't match expected model, should signal fallback."""
@@ -590,30 +590,30 @@ class TestPreShardPipelineAllWorkers:
 
 
 class TestConfigFields:
-    """Tests for the new ExperimentalSettings fields."""
+    """Tests for the distributed Settings fields."""
 
     def test_pre_shard_defaults(self, monkeypatch):
         for key in os.environ:
-            if key.startswith("OLMLX_EXPERIMENTAL_"):
+            if key.startswith("OLMLX_DISTRIBUTED_"):
                 monkeypatch.delenv(key, raising=False)
 
-        from olmlx.config import ExperimentalSettings
+        from olmlx.config import Settings
 
-        s = ExperimentalSettings()
+        s = Settings()
         assert s.distributed_pre_shard is True
         assert s.distributed_shard_dir == Path("~/.olmlx/shards")
         assert s.distributed_worker_shard_dir == "~/.olmlx/shards"
 
     def test_pre_shard_env_override(self, monkeypatch):
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_PRE_SHARD", "false")
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_SHARD_DIR", "/tmp/shards")
+        monkeypatch.setenv("OLMLX_DISTRIBUTED_PRE_SHARD", "false")
+        monkeypatch.setenv("OLMLX_DISTRIBUTED_SHARD_DIR", "/tmp/shards")
         monkeypatch.setenv(
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_WORKER_SHARD_DIR", "/remote/shards"
+            "OLMLX_DISTRIBUTED_WORKER_SHARD_DIR", "/remote/shards"
         )
 
-        from olmlx.config import ExperimentalSettings
+        from olmlx.config import Settings
 
-        s = ExperimentalSettings()
+        s = Settings()
         assert s.distributed_pre_shard is False
         assert s.distributed_shard_dir == Path("/tmp/shards")
         assert s.distributed_worker_shard_dir == "/remote/shards"

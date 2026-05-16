@@ -171,7 +171,7 @@ async def _gpt_oss_filter(token_stream):
 
 
 # -- Experimental: Distributed inference coordinator --
-# Only set when OLMLX_EXPERIMENTAL_DISTRIBUTED=true; see set_distributed_coordinator().
+# Only set when OLMLX_DISTRIBUTED=true; see set_distributed_coordinator().
 _distributed_coordinator = None
 _distributed_coordinator_lock = threading.Lock()
 

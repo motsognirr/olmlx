@@ -107,13 +107,13 @@ The first host is the coordinator. Use Thunderbolt IPs for best performance.
 Create `~/Documents/olmlx_distributed/.env`:
 
 ```bash
-OLMLX_EXPERIMENTAL_DISTRIBUTED=true
-OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE=~/.olmlx/hostfile.json
-OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND=ring
-OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT=32323
-OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT=32400
-OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR=~/Documents/olmlx_distributed
-OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON=.venv/bin/python
+OLMLX_DISTRIBUTED=true
+OLMLX_DISTRIBUTED_HOSTFILE=~/.olmlx/hostfile.json
+OLMLX_DISTRIBUTED_BACKEND=ring
+OLMLX_DISTRIBUTED_PORT=32323
+OLMLX_DISTRIBUTED_SIDEBAND_PORT=32400
+OLMLX_DISTRIBUTED_REMOTE_WORKING_DIR=~/Documents/olmlx_distributed
+OLMLX_DISTRIBUTED_REMOTE_PYTHON=.venv/bin/python
 OLMLX_HOST=0.0.0.0
 ```
 
@@ -183,7 +183,7 @@ Flash and distributed can be used together for dense (non-MoE) models. This comb
 
 ### How it works
 
-When both `OLMLX_EXPERIMENTAL_FLASH=true` and `OLMLX_EXPERIMENTAL_DISTRIBUTED=true` are set:
+When both `OLMLX_EXPERIMENTAL_FLASH=true` and `OLMLX_DISTRIBUTED=true` are set:
 
 1. `FlashModelWrapper.shard()` shards only attention projections (`q/k/v/o_proj`), leaving FlashMLP layers unsharded
 2. `o_proj` uses `ShardedToAllLinear` which calls `all_sum` — its output is replicated on all ranks
@@ -202,7 +202,7 @@ olmlx flash prepare mlx-community/Qwen2.5-32B-Instruct-4bit
 Then configure the coordinator:
 
 ```bash
-OLMLX_EXPERIMENTAL_DISTRIBUTED=true
+OLMLX_DISTRIBUTED=true
 OLMLX_EXPERIMENTAL_FLASH=true
 # Flash tuning params are forwarded to workers automatically
 OLMLX_EXPERIMENTAL_FLASH_IO_THREADS=32

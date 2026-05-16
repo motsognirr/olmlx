@@ -1,4 +1,4 @@
-"""Tests for experimental distributed inference."""
+"""Tests for distributed inference."""
 
 import os
 import socket
@@ -9,23 +9,23 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from olmlx.config import ExperimentalSettings
+from olmlx.config import Settings
 
 
-class TestExperimentalSettings:
-    """Tests for ExperimentalSettings configuration."""
+class TestDistributedSettings:
+    """Tests for distributed Settings configuration."""
 
     def test_defaults(self, monkeypatch):
         for key in (
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED",
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE",
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND",
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT",
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT",
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET",
+            "OLMLX_DISTRIBUTED",
+            "OLMLX_DISTRIBUTED_HOSTFILE",
+            "OLMLX_DISTRIBUTED_BACKEND",
+            "OLMLX_DISTRIBUTED_PORT",
+            "OLMLX_DISTRIBUTED_SIDEBAND_PORT",
+            "OLMLX_DISTRIBUTED_SECRET",
         ):
             monkeypatch.delenv(key, raising=False)
-        s = ExperimentalSettings()
+        s = Settings()
         assert s.distributed is False
         assert s.distributed_hostfile == Path("~/.olmlx/hostfile.json")
         assert s.distributed_backend == "ring"
@@ -33,12 +33,12 @@ class TestExperimentalSettings:
         assert s.distributed_sideband_port == 32400
 
     def test_env_override(self, monkeypatch):
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", "true")
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE", "/tmp/hosts.json")
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND", "mpi")
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT", "40000")
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT", "40100")
-        s = ExperimentalSettings()
+        monkeypatch.setenv("OLMLX_DISTRIBUTED", "true")
+        monkeypatch.setenv("OLMLX_DISTRIBUTED_HOSTFILE", "/tmp/hosts.json")
+        monkeypatch.setenv("OLMLX_DISTRIBUTED_BACKEND", "mpi")
+        monkeypatch.setenv("OLMLX_DISTRIBUTED_PORT", "40000")
+        monkeypatch.setenv("OLMLX_DISTRIBUTED_SIDEBAND_PORT", "40100")
+        s = Settings()
         assert s.distributed is True
         assert s.distributed_hostfile == Path("/tmp/hosts.json")
         assert s.distributed_backend == "mpi"
@@ -46,15 +46,15 @@ class TestExperimentalSettings:
         assert s.distributed_sideband_port == 40100
 
     def test_distributed_false_by_default(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", raising=False)
-        s = ExperimentalSettings()
+        monkeypatch.delenv("OLMLX_DISTRIBUTED", raising=False)
+        s = Settings()
         assert s.distributed is False
 
-    def test_separate_from_main_settings(self, monkeypatch):
-        """ExperimentalSettings uses OLMLX_EXPERIMENTAL_ prefix, consistent with main."""
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", "true")
-        s = ExperimentalSettings()
-        assert s.distributed is True  # Should read OLMLX_EXPERIMENTAL_ prefix
+    def test_olmlx_prefix(self, monkeypatch):
+        """Settings uses OLMLX_ prefix for distributed fields."""
+        monkeypatch.setenv("OLMLX_DISTRIBUTED", "true")
+        s = Settings()
+        assert s.distributed is True  # Should read OLMLX_DISTRIBUTED
 
 
 class TestInferenceRequest:
@@ -609,19 +609,18 @@ class TestInferenceBroadcast:
         _maybe_broadcast_distributed(lm, [1, 2, 3], "test", 100, {})
 
 
-class TestExperimentalModuleGlobal:
-    """Tests that the experimental singleton is available."""
+class TestSettingsSingleton:
+    """Tests that the settings singleton is available."""
 
-    def test_experimental_singleton_exists(self):
-        from olmlx.config import experimental
+    def test_settings_singleton_exists(self):
+        from olmlx.config import settings
 
-        assert experimental is not None
-        assert isinstance(experimental, ExperimentalSettings)
+        assert settings is not None
+        assert isinstance(settings, Settings)
 
-    def test_experimental_singleton_disabled_by_default(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", raising=False)
-        # Re-instantiate to test defaults
-        s = ExperimentalSettings()
+    def test_settings_distributed_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_DISTRIBUTED", raising=False)
+        s = Settings()
         assert s.distributed is False
 
 
@@ -858,17 +857,24 @@ class TestFileHandleLeak:
         hostfile.write_text('{"hosts": ["host0", "host1"], "model": "test/model"}')
 
         monkeypatch.setattr(
-            "olmlx.config.experimental",
+            "olmlx.config.settings",
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
-                flash=False,
-                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
+                distributed_pre_shard=False,
+                distributed_worker_shard_dir="",
+            ),
+        )
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                flash=False,
+                flash_moe=False,
             ),
         )
 
@@ -884,22 +890,22 @@ class TestFileHandleLeak:
         assert len(cli_module._worker_procs) == 0
 
 
-class TestEnvPrefix:
-    """Issue 11: OLMLX_EXPERIMENTAL_ env prefix."""
+class TestDistributedPrefix:
+    """Issue 11: OLMLX_ env prefix for distributed settings."""
 
-    def test_olmlx_experimental_prefix(self, monkeypatch):
-        """ExperimentalSettings should use OLMLX_EXPERIMENTAL_ prefix."""
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", "true")
-        monkeypatch.setenv("OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND", "mpi")
-        s = ExperimentalSettings()
+    def test_olmlx_distributed_prefix(self, monkeypatch):
+        """Settings should use OLMLX_ prefix for distributed fields."""
+        monkeypatch.setenv("OLMLX_DISTRIBUTED", "true")
+        monkeypatch.setenv("OLMLX_DISTRIBUTED_BACKEND", "mpi")
+        s = Settings()
         assert s.distributed is True
         assert s.distributed_backend == "mpi"
 
     def test_old_prefix_no_longer_works(self, monkeypatch):
         """Old EXPERIMENTAL_ prefix should NOT be recognized."""
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_DISTRIBUTED", raising=False)
+        monkeypatch.delenv("OLMLX_DISTRIBUTED", raising=False)
         monkeypatch.setenv("EXPERIMENTAL_DISTRIBUTED", "true")
-        s = ExperimentalSettings()
+        s = Settings()
         assert s.distributed is False
 
 
@@ -1033,17 +1039,24 @@ class TestSSHFailureDetection:
         hostfile.write_text('{"hosts": ["host0", "host1"], "model": "test/model"}')
 
         monkeypatch.setattr(
-            "olmlx.config.experimental",
+            "olmlx.config.settings",
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
-                flash=False,
-                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="test-secret",
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
+                distributed_pre_shard=False,
+                distributed_worker_shard_dir="",
+            ),
+        )
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                flash=False,
+                flash_moe=False,
             ),
         )
 
@@ -1124,17 +1137,24 @@ class TestLogFileHandleLifetime:
         hostfile.write_text('{"hosts": ["host0", "host1"], "model": "test/model"}')
 
         monkeypatch.setattr(
-            "olmlx.config.experimental",
+            "olmlx.config.settings",
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
-                flash=False,
-                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
+                distributed_pre_shard=False,
+                distributed_worker_shard_dir="",
+            ),
+        )
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                flash=False,
+                flash_moe=False,
             ),
         )
 
@@ -1169,6 +1189,8 @@ class TestExperimentalEnvFile:
 
     def test_env_file_configured(self):
         """ExperimentalSettings should have env_file='.env' in model_config."""
+        from olmlx.config import ExperimentalSettings
+
         assert ExperimentalSettings.model_config.get("env_file") == ".env"
 
 
@@ -1177,23 +1199,23 @@ class TestRemoteExecutionConfig:
 
     def test_defaults(self, monkeypatch):
         for key in (
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR",
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON",
+            "OLMLX_DISTRIBUTED_REMOTE_WORKING_DIR",
+            "OLMLX_DISTRIBUTED_REMOTE_PYTHON",
         ):
             monkeypatch.delenv(key, raising=False)
-        s = ExperimentalSettings()
+        s = Settings()
         assert s.distributed_remote_working_dir == ""
         assert s.distributed_remote_python == "python"
 
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv(
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR",
+            "OLMLX_DISTRIBUTED_REMOTE_WORKING_DIR",
             "~/Documents/olmlx_distributed",
         )
         monkeypatch.setenv(
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON", "uv run python"
+            "OLMLX_DISTRIBUTED_REMOTE_PYTHON", "uv run python"
         )
-        s = ExperimentalSettings()
+        s = Settings()
         assert s.distributed_remote_working_dir == "~/Documents/olmlx_distributed"
         assert s.distributed_remote_python == "uv run python"
 
@@ -1215,17 +1237,24 @@ class TestRingHostfileGeneration:
         )
 
         monkeypatch.setattr(
-            "olmlx.config.experimental",
+            "olmlx.config.settings",
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
-                flash=False,
-                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
+                distributed_pre_shard=False,
+                distributed_worker_shard_dir="",
+            ),
+        )
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                flash=False,
+                flash_moe=False,
             ),
         )
 
@@ -1268,17 +1297,24 @@ class TestRingHostfileGeneration:
         )
 
         monkeypatch.setattr(
-            "olmlx.config.experimental",
+            "olmlx.config.settings",
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
-                flash=False,
-                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=50000,
                 distributed_secret="",
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
+                distributed_pre_shard=False,
+                distributed_worker_shard_dir="",
+            ),
+        )
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                flash=False,
+                flash_moe=False,
             ),
         )
 
@@ -1446,17 +1482,24 @@ class TestSSHCommandConstruction:
         )
 
         monkeypatch.setattr(
-            "olmlx.config.experimental",
+            "olmlx.config.settings",
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
-                flash=False,
-                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",
                 distributed_remote_working_dir="~/Documents/olmlx_distributed",
                 distributed_remote_python="uv run python",
+                distributed_pre_shard=False,
+                distributed_worker_shard_dir="",
+            ),
+        )
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                flash=False,
+                flash_moe=False,
             ),
         )
 
@@ -1493,17 +1536,24 @@ class TestSSHCommandConstruction:
         )
 
         monkeypatch.setattr(
-            "olmlx.config.experimental",
+            "olmlx.config.settings",
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
-                flash=False,
-                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
+                distributed_pre_shard=False,
+                distributed_worker_shard_dir="",
+            ),
+        )
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                flash=False,
+                flash_moe=False,
             ),
         )
 
@@ -1539,17 +1589,24 @@ class TestSSHCommandConstruction:
         )
 
         monkeypatch.setattr(
-            "olmlx.config.experimental",
+            "olmlx.config.settings",
             MagicMock(
                 distributed_hostfile=str(hostfile),
                 distributed_backend="ring",
-                flash=False,
-                flash_moe=False,
                 distributed_sideband_port=32400,
                 distributed_port=32323,
                 distributed_secret="",
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
+                distributed_pre_shard=False,
+                distributed_worker_shard_dir="",
+            ),
+        )
+        monkeypatch.setattr(
+            "olmlx.config.experimental",
+            MagicMock(
+                flash=False,
+                flash_moe=False,
             ),
         )
 
