@@ -607,9 +607,7 @@ class TestConfigFields:
     def test_pre_shard_env_override(self, monkeypatch):
         monkeypatch.setenv("OLMLX_DISTRIBUTED_PRE_SHARD", "false")
         monkeypatch.setenv("OLMLX_DISTRIBUTED_SHARD_DIR", "/tmp/shards")
-        monkeypatch.setenv(
-            "OLMLX_DISTRIBUTED_WORKER_SHARD_DIR", "/remote/shards"
-        )
+        monkeypatch.setenv("OLMLX_DISTRIBUTED_WORKER_SHARD_DIR", "/remote/shards")
 
         from olmlx.config import Settings
 

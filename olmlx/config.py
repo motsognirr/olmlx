@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 #: Metal sync behavior at inference-lock boundaries. Single source of truth
@@ -123,6 +123,18 @@ class Settings(BaseSettings):
     speculative_strategy: Literal["classic", "dflash", "eagle"] = "classic"
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] | None = None
+
+    @model_validator(mode="after")
+    def validate_auto_calibrate(self) -> "Settings":
+        if self.kv_cache_auto_calibrate and (
+            self.kv_cache_quant is None
+            or not self.kv_cache_quant.startswith("spectral:")
+        ):
+            raise ValueError(
+                "OLMLX_KV_CACHE_AUTO_CALIBRATE=true requires "
+                "OLMLX_KV_CACHE_QUANT=spectral:<bits>"
+            )
+        return self
 
     @field_validator("kv_cache_quant")
     @classmethod

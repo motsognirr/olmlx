@@ -473,17 +473,36 @@ def _warn_kv_cache_quant_incompatibilities() -> None:
     # for any non-serializable cache regardless of the source, so there
     # is no silent data loss.
 
+
 #: Distributed fields with their ``OLMLX_EXPERIMENTAL_DISTRIBUTED_*`` legacy
 #: name and the corresponding ``OLMLX_DISTRIBUTED_*`` new name (without
 #: prefix), keyed by the Python attribute name on ``Settings``.
 _DISTRIBUTED_LEGACY_ENV_MAP: dict[str, tuple[str, str]] = {
     "distributed": ("OLMLX_EXPERIMENTAL_DISTRIBUTED", "OLMLX_DISTRIBUTED"),
-    "distributed_strategy": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_STRATEGY", "OLMLX_DISTRIBUTED_STRATEGY"),
-    "distributed_hostfile": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE", "OLMLX_DISTRIBUTED_HOSTFILE"),
-    "distributed_backend": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND", "OLMLX_DISTRIBUTED_BACKEND"),
-    "distributed_port": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT", "OLMLX_DISTRIBUTED_PORT"),
-    "distributed_sideband_port": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT", "OLMLX_DISTRIBUTED_SIDEBAND_PORT"),
-    "distributed_secret": ("OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET", "OLMLX_DISTRIBUTED_SECRET"),
+    "distributed_strategy": (
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_STRATEGY",
+        "OLMLX_DISTRIBUTED_STRATEGY",
+    ),
+    "distributed_hostfile": (
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE",
+        "OLMLX_DISTRIBUTED_HOSTFILE",
+    ),
+    "distributed_backend": (
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND",
+        "OLMLX_DISTRIBUTED_BACKEND",
+    ),
+    "distributed_port": (
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT",
+        "OLMLX_DISTRIBUTED_PORT",
+    ),
+    "distributed_sideband_port": (
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT",
+        "OLMLX_DISTRIBUTED_SIDEBAND_PORT",
+    ),
+    "distributed_secret": (
+        "OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET",
+        "OLMLX_DISTRIBUTED_SECRET",
+    ),
     "distributed_remote_working_dir": (
         "OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR",
         "OLMLX_DISTRIBUTED_REMOTE_WORKING_DIR",
@@ -537,11 +556,12 @@ def _surface_legacy_distributed_env() -> None:
                     legacy_val,
                 )
                 continue
+        elif isinstance(current, Path):
+            legacy_val = Path(legacy_val).expanduser()
         try:
             setattr(_settings, attr_name, legacy_val)
             logger.warning(
-                "Forwarding legacy %s=%r → settings.%s. "
-                "Rename to %s.",
+                "Forwarding legacy %s=%r → settings.%s. Rename to %s.",
                 legacy_name,
                 legacy_val,
                 attr_name,
@@ -1190,9 +1210,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
             "OLMLX_DISTRIBUTED_MODEL": model,
             "OLMLX_DISTRIBUTED_BACKEND": settings.distributed_backend,
             "OLMLX_DISTRIBUTED_COORDINATOR_HOST": coordinator_host,
-            "OLMLX_DISTRIBUTED_SIDEBAND_PORT": str(
-                settings.distributed_sideband_port
-            ),
+            "OLMLX_DISTRIBUTED_SIDEBAND_PORT": str(settings.distributed_sideband_port),
             "OLMLX_DISTRIBUTED_STRATEGY": strategy,
             "MLX_RANK": str(rank),
         }

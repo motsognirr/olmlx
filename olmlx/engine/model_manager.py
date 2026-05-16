@@ -1337,6 +1337,11 @@ class ModelManager:
                     # close it. Non-Flash models leave this at None.
                     _weight_store = getattr(model, "_weight_store", None)
 
+                    # _find_spectral_dir may trigger multi-minute calibration.
+                    # Run it in a thread so it does not block the event loop.
+                    _spectral_dir = await asyncio.to_thread(
+                        self._find_spectral_dir, hf_path, kv_cache_quant
+                    )
                     lm = LoadedModel(
                         name=normalized,
                         hf_path=hf_path,
@@ -1351,9 +1356,7 @@ class ModelManager:
                         template_caps=caps,
                         expires_at=expires,
                         kv_cache_quant=kv_cache_quant,
-                        spectral_calibration_dir=self._find_spectral_dir(
-                            hf_path, kv_cache_quant
-                        ),
+                        spectral_calibration_dir=_spectral_dir,
                         default_options=dict(model_config.options),
                         inference_queue_timeout=model_config.inference_queue_timeout,
                         inference_timeout=model_config.inference_timeout,
@@ -2024,22 +2027,25 @@ class ModelManager:
             f"OLMLX_KV_CACHE_AUTO_CALIBRATE=true to auto-calibrate on first load."
         )
 
-    def _auto_calibrate_spectral(
-        self, hf_path: str, kv_cache_quant: str
-    ) -> Path:
+    def _auto_calibrate_spectral(self, hf_path: str, kv_cache_quant: str) -> Path:
         """Run spectral calibration automatically with default settings."""
         import logging
 
         from olmlx.engine.spectralquant_calibrate import calibrate_model
 
-        _, bits_str = kv_cache_quant.split(":")
+        method, bits_str = kv_cache_quant.split(":")
+        assert method == "spectral", (
+            f"_auto_calibrate_spectral called with non-spectral quant: "
+            f"{kv_cache_quant!r}"
+        )
         avg_bits = int(bits_str)
         local_dir = self.store.local_path(hf_path)
         logger = logging.getLogger(__name__)
         logger.info(
             "Auto-calibrating spectral quant (%s-bit) for %s "
             "(this may take several minutes)...",
-            avg_bits, hf_path,
+            avg_bits,
+            hf_path,
         )
         try:
             output_dir = calibrate_model(

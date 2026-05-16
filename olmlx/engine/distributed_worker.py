@@ -45,9 +45,7 @@ def _get_env(name: str, default: str | None = None) -> str | None:
     if legacy_name is not None:
         val = os.environ.get(legacy_name)
         if val is not None:
-            logger.warning(
-                "Using legacy env var %s — rename to %s", legacy_name, name
-            )
+            logger.warning("Using legacy env var %s — rename to %s", legacy_name, name)
             return val
     return default
 
@@ -217,12 +215,8 @@ def worker_main() -> None:
             )
             sys.exit(1)
 
-    coordinator_host = _get_env(
-        "OLMLX_DISTRIBUTED_COORDINATOR_HOST", "127.0.0.1"
-    )
-    sideband_port = int(
-        _get_env("OLMLX_DISTRIBUTED_SIDEBAND_PORT", "32400")
-    )
+    coordinator_host = _get_env("OLMLX_DISTRIBUTED_COORDINATOR_HOST", "127.0.0.1")
+    sideband_port = int(_get_env("OLMLX_DISTRIBUTED_SIDEBAND_PORT", "32400"))
 
     secret_file = _get_env("OLMLX_DISTRIBUTED_SECRET_FILE")
     if secret_file:
@@ -262,9 +256,7 @@ def worker_main() -> None:
 
     if strategy == "pipeline":
         # Pipeline mode: load model, apply pipeline partitioning
-        layer_counts_str = _get_env(
-            "OLMLX_DISTRIBUTED_LAYER_COUNTS", ""
-        )
+        layer_counts_str = _get_env("OLMLX_DISTRIBUTED_LAYER_COUNTS", "")
         try:
             layer_counts = (
                 [int(x) for x in layer_counts_str.split(",") if x]

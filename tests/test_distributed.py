@@ -1212,9 +1212,7 @@ class TestRemoteExecutionConfig:
             "OLMLX_DISTRIBUTED_REMOTE_WORKING_DIR",
             "~/Documents/olmlx_distributed",
         )
-        monkeypatch.setenv(
-            "OLMLX_DISTRIBUTED_REMOTE_PYTHON", "uv run python"
-        )
+        monkeypatch.setenv("OLMLX_DISTRIBUTED_REMOTE_PYTHON", "uv run python")
         s = Settings()
         assert s.distributed_remote_working_dir == "~/Documents/olmlx_distributed"
         assert s.distributed_remote_python == "uv run python"
