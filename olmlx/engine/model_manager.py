@@ -990,13 +990,16 @@ class ModelManager:
                 errors.append(exc)
         # Free GPU memory held by prompt caches BEFORE nulling model references.
         # CachedPromptState entries hold per-layer KV cache buffers (deepest GPU
-        # consumer besides weights). Without this, the caller's gc.collect() may
-        # not reclaim the Metal buffers because the PromptCacheStore still holds
-        # live references — the root cause of issue #223 where loading a large
-        # model after eviction pushes Metal into swap.
+        # consumer besides weights).  Uses clear() which also deletes on-disk
+        # entries for this model — correct for a full eviction since any
+        # previously-offloaded caches are permanently stale.
         if lm.prompt_cache_store is not None:
             try:
                 lm.prompt_cache_store.clear()
+                # Null on success (consistent with weight_store /
+                # speculative_decoder) so re-entry from the
+                # _close_evictees drain skips a redundant clear().
+                lm.prompt_cache_store = None
             except Exception as exc:
                 logger.exception("Error clearing prompt cache for %s", lm.name)
                 errors.append(exc)
@@ -1006,11 +1009,14 @@ class ModelManager:
         # arrays alive through the GC pass — the exact leak pattern behind
         # issue #223.
         #
-        # Null only on success so the re-entry drain in _close_evictees
-        # can safely call _close_loaded_model a second time: if weight_store
-        # or speculative_decoder raised, the drain retries and must find
-        # ``lm.model`` still set so ``getattr(lm.model, "prefetcher", None)``
-        # doesn't crash (issue #315 re-entry contract).
+        # Null only on success: if a prior step (prefetcher / weight_store /
+        # speculative_decoder) raised, the re-entry drain in _close_evictees
+        # may call _close_loaded_model a second time.  Nulling lm.model early
+        # would cause the prefetcher-close guard at line 966
+        # (``getattr(lm.model, "prefetcher", None)``) to silently skip the
+        # close on re-entry — the field must stay set so re-entry reaches
+        # every resource.  Same pattern as weight_store / speculative_decoder
+        # where the reference is preserved on failure (issue #315).
         if not errors:
             lm.model = None
             lm.tokenizer = None
@@ -1232,7 +1238,11 @@ class ModelManager:
                     "flushing prompt caches to free GPU memory",
                     normalized,
                 )
-                for other_lm in self._loaded.values():
+                # Snapshot to a list before the await loop — iterating
+                # a live dict view across await yields would risk
+                # RuntimeError if another coroutine modifies _loaded
+                # during the I/O (issue #315 lock-split contract).
+                for other_lm in list(self._loaded.values()):
                     if other_lm.prompt_cache_store is not None:
                         await other_lm.prompt_cache_store.async_evict_all_to_disk()
                 gc.collect()

@@ -3481,12 +3481,14 @@ class TestEvictLruIfNeeded:
         assert lm.speculative_decoder is None
 
     def test_close_loaded_model_clears_prompt_cache(self, registry, mock_store):
-        """_close_loaded_model must clear prompt caches on eviction.
+        """_close_loaded_model must clear prompt caches and null the store on eviction.
 
         CachedPromptState objects hold per-layer GPU KV cache buffers. If
         we don't clear them during eviction, the GPU memory remains
         allocated even after ``gc.collect()`` — the Metal buffers survive
-        because the PromptCacheStore references keep them alive.
+        because the PromptCacheStore references keep them alive. On success,
+        the store reference is also nulled (consistent with weight_store /
+        speculative_decoder) so re-entry skips a redundant clear().
         """
         manager = ModelManager(registry, mock_store)
         cache_store = MagicMock()
@@ -3499,6 +3501,7 @@ class TestEvictLruIfNeeded:
         )
         manager._close_loaded_model(lm)
         cache_store.clear.assert_called_once()
+        assert lm.prompt_cache_store is None
 
     def test_close_loaded_model_nulls_model_and_tokenizer(self, registry, mock_store):
         """_close_loaded_model must null model/tokenizer for prompt GC.
