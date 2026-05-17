@@ -326,7 +326,7 @@ def calibrate_model(
     num_samples: int = _SPECTRAL_DEFAULT_NUM_SAMPLES,
     calibration_dataset: str | None = None,
     avg_bits: int = 4,
-    max_tokens_per_head: int = 8192,
+    max_tokens_per_head: int = _SPECTRAL_DEFAULT_MAX_TOKENS_PER_HEAD,
     progress_callback: Any | None = None,
 ) -> Path:
     """Run spectral calibration on a model.

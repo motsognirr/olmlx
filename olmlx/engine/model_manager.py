@@ -2050,8 +2050,7 @@ class ModelManager:
                 raise SpectralCalibrationMissingError(
                     f"SpectralQuant configured ({kv_cache_quant}) but calibration "
                     f"file at {spectral_path}/spectral_config.json is unreadable "
-                    f"({exc}). Delete {spectral_path} and re-run "
-                    f"'{recalibrate_cmd}'."
+                    f"({exc}). Re-run '{recalibrate_cmd}'."
                 )
             cal_bits = config.get("meta", {}).get("avg_bits")
             if cal_bits is not None and cal_bits != configured_bits:
