@@ -148,6 +148,23 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_flash_neuron_range(self) -> "Settings":
+        # Cross-field check: an inverted min/max would produce a silently
+        # broken ``FlashConfig`` at runtime (FlashMLP clamps each token's
+        # active neurons into ``[min, max]``, and a min > max collapses
+        # the interval). Fail at config load instead.
+        if (
+            self.flash_max_active_neurons is not None
+            and self.flash_min_active_neurons > self.flash_max_active_neurons
+        ):
+            raise ValueError(
+                f"flash_min_active_neurons ({self.flash_min_active_neurons}) "
+                f"must be <= flash_max_active_neurons "
+                f"({self.flash_max_active_neurons})"
+            )
+        return self
+
     @field_validator("kv_cache_quant")
     @classmethod
     def validate_kv_cache_quant(cls, v: str | None) -> str | None:

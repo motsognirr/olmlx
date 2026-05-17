@@ -502,6 +502,15 @@ def _surface_legacy_flash_env() -> None:
     ``..._PREDICTOR_*``, ``..._PREFETCH*``, ``..._SPECULATIVE*``,
     ``..._MOE*``) remain under the experimental prefix and pass through
     unchanged.
+
+    Note: this updates ``settings.<field>`` in-process but does not write
+    back to ``os.environ``. All callers in this codebase consume the
+    promoted knobs via ``settings.*`` (including the distributed-worker
+    env-forwarding loop in ``_launch_distributed_workers`` which mirrors
+    ``settings.flash`` into the worker's ``OLMLX_FLASH=true``), so the
+    legacy → new bridge is observable. Anything that reads
+    ``os.environ.get("OLMLX_FLASH*")`` directly will miss the legacy
+    value — mirror through ``settings`` instead.
     """
     from olmlx.config import Settings, settings as _settings
 

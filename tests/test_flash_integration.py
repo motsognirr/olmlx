@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from olmlx.config import ExperimentalSettings, Settings
 
@@ -38,6 +39,27 @@ class TestFlashSettings:
             assert s.flash_min_active_neurons == 64
             e = ExperimentalSettings()
             assert e.flash_window_size == 10
+
+    def test_min_greater_than_max_rejected(self):
+        """Inverted neuron range at the Settings level is caught at parse time."""
+        env = {
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS": "1000",
+            "OLMLX_FLASH_MAX_ACTIVE_NEURONS": "100",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with pytest.raises(ValidationError, match="must be <="):
+                Settings()
+
+    def test_min_equals_max_accepted(self):
+        """Boundary: min == max is valid (a fixed-neuron-count regime)."""
+        env = {
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS": "256",
+            "OLMLX_FLASH_MAX_ACTIVE_NEURONS": "256",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            s = Settings()
+            assert s.flash_min_active_neurons == 256
+            assert s.flash_max_active_neurons == 256
 
 
 class TestModelManagerFlashDetection:

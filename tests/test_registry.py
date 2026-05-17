@@ -527,6 +527,84 @@ class TestModelConfig:
                 }
             )
 
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("flash", True),
+            ("flash_sparsity_threshold", 0.3),
+            ("flash_min_active_neurons", 64),
+            ("flash_max_active_neurons", 512),
+            ("flash_memory_budget_fraction", 0.5),
+        ],
+    )
+    def test_flash_primary_keys_in_experimental_rejected(self, key, value):
+        """Each Flash primary knob in the experimental block raises the
+        migration error from PROMOTED_EXPERIMENTAL_KEYS."""
+        with pytest.raises(ValueError, match="promoted out of 'experimental'"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "experimental": {key: value},
+                }
+            )
+
+    def test_flash_min_greater_than_max_rejected_per_model(self):
+        """Inverted min/max active neurons in a single ModelConfig is rejected."""
+        with pytest.raises(ValueError, match="must be <="):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "flash_min_active_neurons": 1000,
+                    "flash_max_active_neurons": 100,
+                }
+            )
+
+    def test_resolved_flash_rejects_inverted_global_per_model_combo(self, monkeypatch):
+        """resolved_flash() catches the cross-layer case: per-model min
+        combined with global max produces an inverted range."""
+        from olmlx.config import settings as _settings
+        from olmlx.engine.registry import ModelConfig
+
+        # Set the global min below the global max first so the Settings
+        # cross-field validator stays happy — the test exercises the
+        # ``resolved_flash()`` check that fires when a *per-model*
+        # override crosses over the *global* bound.
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", 32)
+        monkeypatch.setattr(_settings, "flash_max_active_neurons", 100)
+        mc = ModelConfig(hf_path="org/model", flash_min_active_neurons=1000)
+        with pytest.raises(ValueError, match="inverted range"):
+            mc.resolved_flash()
+
+    def test_resolved_flash_falls_back_to_global(self, monkeypatch):
+        """When per-model Flash fields are None, the global Settings are used."""
+        from olmlx.config import settings as _settings
+        from olmlx.engine.registry import ModelConfig
+
+        monkeypatch.setattr(_settings, "flash", True)
+        monkeypatch.setattr(_settings, "flash_sparsity_threshold", 0.4)
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", 256)
+        mc = ModelConfig(hf_path="org/model")
+        resolved = mc.resolved_flash()
+        assert resolved.enabled is True
+        assert resolved.sparsity_threshold == 0.4
+        assert resolved.min_active_neurons == 256
+
+    def test_resolved_flash_per_model_overrides_global(self, monkeypatch):
+        """Per-model Flash fields take precedence over the global Settings."""
+        from olmlx.config import settings as _settings
+        from olmlx.engine.registry import ModelConfig
+
+        monkeypatch.setattr(_settings, "flash", False)
+        monkeypatch.setattr(_settings, "flash_sparsity_threshold", 0.5)
+        mc = ModelConfig(
+            hf_path="org/model",
+            flash=True,
+            flash_sparsity_threshold=0.2,
+        )
+        resolved = mc.resolved_flash()
+        assert resolved.enabled is True
+        assert resolved.sparsity_threshold == 0.2
+
     def test_resolved_kv_cache_quant_falls_back_to_global(self, monkeypatch):
         """When per-model kv_cache_quant is None, the global setting is used."""
         from olmlx.config import settings as _settings

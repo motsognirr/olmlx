@@ -360,6 +360,22 @@ class ModelConfig:
                 f"'flash_memory_budget_fraction' must be a number in (0, 1] "
                 f"or None, got {self.flash_memory_budget_fraction!r}"
             )
+        # Cross-field range check. Catches the case where the per-model
+        # entry sets both ``flash_min_active_neurons`` and
+        # ``flash_max_active_neurons`` to an inverted pair. The
+        # global-vs-per-model interaction (per-model min > global max, or
+        # vice versa) is caught in ``resolved_flash()`` below — at this
+        # point we only know the per-model values.
+        if (
+            self.flash_min_active_neurons is not None
+            and self.flash_max_active_neurons is not None
+            and self.flash_min_active_neurons > self.flash_max_active_neurons
+        ):
+            raise ValueError(
+                f"'flash_min_active_neurons' ({self.flash_min_active_neurons}) "
+                f"must be <= 'flash_max_active_neurons' "
+                f"({self.flash_max_active_neurons})"
+            )
 
     def resolved_speculative(self) -> SpeculativeConfig:
         """Resolve speculative config: per-model overrides global settings.
@@ -411,6 +427,28 @@ class ModelConfig:
         """
         from olmlx.config import settings
 
+        min_active = (
+            self.flash_min_active_neurons
+            if self.flash_min_active_neurons is not None
+            else settings.flash_min_active_neurons
+        )
+        max_active = (
+            self.flash_max_active_neurons
+            if self.flash_max_active_neurons is not None
+            else settings.flash_max_active_neurons
+        )
+        # Cross-field range check. Both ``Settings`` and
+        # ``ModelConfig.__post_init__`` already catch inverted pairs
+        # within a single config layer; this final check catches the
+        # case where a per-model override on one bound combined with the
+        # global value for the other bound produces an inverted pair.
+        if max_active is not None and min_active > max_active:
+            raise ValueError(
+                f"Resolved flash_min_active_neurons ({min_active}) must be "
+                f"<= flash_max_active_neurons ({max_active}) for {self.hf_path!r} "
+                f"(per-model overrides combined with global Settings produced "
+                f"an inverted range)."
+            )
         return FlashConfig(
             enabled=self.flash if self.flash is not None else settings.flash,
             sparsity_threshold=(
@@ -418,16 +456,8 @@ class ModelConfig:
                 if self.flash_sparsity_threshold is not None
                 else settings.flash_sparsity_threshold
             ),
-            min_active_neurons=(
-                self.flash_min_active_neurons
-                if self.flash_min_active_neurons is not None
-                else settings.flash_min_active_neurons
-            ),
-            max_active_neurons=(
-                self.flash_max_active_neurons
-                if self.flash_max_active_neurons is not None
-                else settings.flash_max_active_neurons
-            ),
+            min_active_neurons=min_active,
+            max_active_neurons=max_active,
             memory_budget_fraction=(
                 self.flash_memory_budget_fraction
                 if self.flash_memory_budget_fraction is not None
