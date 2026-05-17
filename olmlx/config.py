@@ -311,14 +311,13 @@ def surface_legacy_flash_env() -> None:
     distributed-worker entry point can reuse the same logic without
     pulling in argparse/uvicorn.
     """
-    # Collect per-field actions: only count a legacy var as actionable
+    # Collect per-field actions: only consider a legacy var "pending"
     # if its *parsed* value would actually change the live Settings.
     # ``OLMLX_EXPERIMENTAL_FLASH=false`` (a user explicitly disabling
     # flash via the old name) parses to the schema default ``False``
     # and has nothing to migrate — skipping it here suppresses a
     # noisy warning that would otherwise nag every invocation for a
     # variable whose only effect is "leave the default".
-    actionable: list[str] = []
     pending: list[tuple[str, str, str, Any]] = []
     for legacy, new, attr, parse in LEGACY_FLASH_FORWARD:
         legacy_val = os.environ.get(legacy)
@@ -345,25 +344,20 @@ def surface_legacy_flash_env() -> None:
             continue
         if value == field_default:
             # Parsed value already matches the schema default — no
-            # behavioural change, nothing to migrate. Suppress the
-            # banner for this var.
+            # behavioural change, nothing to migrate.
             continue
-        actionable.append(legacy)
         pending.append((legacy, new, attr, value))
 
-    if not actionable:
+    if not pending:
         return
-    logger.warning(
-        "Deprecated env vars detected: %s. The Flash primary knobs have "
-        "been promoted out of the experimental prefix — rename to "
-        "OLMLX_FLASH, OLMLX_FLASH_SPARSITY_THRESHOLD, "
-        "OLMLX_FLASH_MIN_ACTIVE_NEURONS, OLMLX_FLASH_MAX_ACTIVE_NEURONS, "
-        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION. The legacy names will be "
-        "removed in a future release. Advanced flash tuning fields "
-        "(window_size, io_threads, cache_budget_neurons, predictor_*, "
-        "prefetch_*, etc.) remain under OLMLX_EXPERIMENTAL_FLASH_*.",
-        ", ".join(actionable),
-    )
+
+    # Apply first; banner names only the vars that actually landed in
+    # Settings. A legacy value rejected by a cross-field Pydantic
+    # validator (e.g. an inverted min/max neuron range built from a
+    # legacy pair) should not be listed as "rename this" — the legacy
+    # value was never honoured, so renaming it would just hit the same
+    # validator again.
+    applied: list[str] = []
     for legacy, new, attr, value in pending:
         try:
             setattr(settings, attr, value)
@@ -374,6 +368,21 @@ def surface_legacy_flash_env() -> None:
                 new,
                 exc,
             )
+            continue
+        applied.append(legacy)
+    if not applied:
+        return
+    logger.warning(
+        "Deprecated env vars detected: %s. The Flash primary knobs have "
+        "been promoted out of the experimental prefix — rename to "
+        "OLMLX_FLASH, OLMLX_FLASH_SPARSITY_THRESHOLD, "
+        "OLMLX_FLASH_MIN_ACTIVE_NEURONS, OLMLX_FLASH_MAX_ACTIVE_NEURONS, "
+        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION. The legacy names will be "
+        "removed in a future release. Advanced flash tuning fields "
+        "(window_size, io_threads, cache_budget_neurons, predictor_*, "
+        "prefetch_*, etc.) remain under OLMLX_EXPERIMENTAL_FLASH_*.",
+        ", ".join(applied),
+    )
 
 
 def resolve_experimental(

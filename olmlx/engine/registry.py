@@ -328,6 +328,8 @@ class ModelConfig:
         # Flash primary-knob bounds match the Settings field constraints.
         # Kept here so direct ModelConfig() construction (tests,
         # programmatic callers) hits the same validation as from_entry().
+        if self.flash is not None and not isinstance(self.flash, bool):
+            raise ValueError(f"'flash' must be a bool or None, got {self.flash!r}")
         if self.flash_sparsity_threshold is not None and not (
             isinstance(self.flash_sparsity_threshold, (int, float))
             and not isinstance(self.flash_sparsity_threshold, bool)

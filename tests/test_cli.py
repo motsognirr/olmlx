@@ -1224,7 +1224,7 @@ class TestBuildParser:
         monkeypatch.delenv("OLMLX_FLASH", raising=False)
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "true")
 
-        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
             _surface_legacy_flash_env()
 
         assert _settings.flash is True
@@ -1274,7 +1274,7 @@ class TestBuildParser:
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS", "256")
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION", "0.4")
 
-        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
             _surface_legacy_flash_env()
 
         assert _settings.flash_sparsity_threshold == 0.3
@@ -1304,7 +1304,7 @@ class TestBuildParser:
         ):
             monkeypatch.delenv(legacy, raising=False)
 
-        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
             _surface_legacy_flash_env()
 
         # New env var explicitly set → live Settings retains its
@@ -1330,6 +1330,56 @@ class TestBuildParser:
         _surface_legacy_flash_env()
         assert _settings.flash == before
 
+    def test_legacy_flash_rejected_value_not_in_banner(self, monkeypatch, caplog):
+        """An inverted min/max legacy pair triggers the cross-field Pydantic
+        validator on the second setattr. The deprecation banner must name
+        only the vars that actually landed in Settings — listing a
+        rejected var as "rename this" would be misleading because the
+        rename would hit the same validator."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import Settings, settings as _settings
+
+        defaults = Settings.model_fields
+        # Reset live Settings so the shim sees the field defaults.
+        monkeypatch.setattr(_settings, "flash", defaults["flash"].default)
+        monkeypatch.setattr(
+            _settings,
+            "flash_min_active_neurons",
+            defaults["flash_min_active_neurons"].default,
+        )
+        monkeypatch.setattr(
+            _settings,
+            "flash_max_active_neurons",
+            defaults["flash_max_active_neurons"].default,
+        )
+        for new_name in (
+            "OLMLX_FLASH",
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
+        ):
+            monkeypatch.delenv(new_name, raising=False)
+        # Inverted pair: min=200 > max=100. The first setattr lands
+        # (min=200, max still None), the second is rejected by the
+        # cross-field validator.
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS", "200")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS", "100")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        # The rejected var is logged via the per-field "Could not
+        # forward" warning, but it must NOT appear in the bulk banner.
+        assert "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS" in caplog.text
+        if "Deprecated env vars detected" in caplog.text:
+            banner_line = next(
+                line
+                for line in caplog.text.splitlines()
+                if "Deprecated env vars detected" in line
+            )
+            assert "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS" not in banner_line
+
     def test_legacy_flash_false_value_does_not_warn(self, monkeypatch, caplog):
         """``OLMLX_EXPERIMENTAL_FLASH=false`` parses to the schema default
         (``flash=False``) so the deprecation banner should NOT fire — there
@@ -1350,7 +1400,7 @@ class TestBuildParser:
             monkeypatch.delenv(legacy, raising=False)
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "false")
 
-        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
             _surface_legacy_flash_env()
 
         # Nothing migrated, no warning.
