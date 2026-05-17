@@ -1440,6 +1440,10 @@ class TestModelLoadTimeout:
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -1473,6 +1477,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
@@ -1509,6 +1517,10 @@ class TestModelLoadTimeout:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -1533,6 +1545,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
@@ -1565,6 +1581,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
@@ -1615,6 +1635,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
@@ -1677,6 +1701,10 @@ class TestModelLoadTimeout:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -1737,6 +1765,10 @@ class TestModelLoadTimeout:
                 return_value=1 * self.GB,
             ),
             patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
+            patch(
                 "olmlx.engine.model_manager.gc.collect",
                 side_effect=gc_collect_that_fails_second_time,
             ),
@@ -1775,6 +1807,10 @@ class TestModelLoadTimeout:
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -1808,6 +1844,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
@@ -1851,6 +1891,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
@@ -2519,6 +2563,10 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -2556,6 +2604,10 @@ class TestMemoryCheck:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
@@ -2598,6 +2650,10 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -2631,6 +2687,10 @@ class TestMemoryCheck:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
@@ -2668,6 +2728,10 @@ class TestMemoryCheck:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
@@ -2735,6 +2799,10 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect", side_effect=track_gc),
             patch("olmlx.engine.model_manager.mx.clear_cache", side_effect=track_clear),
         ):
@@ -2776,6 +2844,10 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -2810,6 +2882,10 @@ class TestMemoryCheck:
             patch(
                 "olmlx.utils.memory.get_metal_memory",
                 side_effect=[1 * self.GB, OSError("Metal query failed")],
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
@@ -2846,6 +2922,10 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=0,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
         ):
             await manager.ensure_loaded("qwen3")
 
@@ -2865,6 +2945,10 @@ class TestMemoryCheck:
             patch(
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,

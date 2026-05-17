@@ -988,6 +988,25 @@ class ModelManager:
             except Exception as exc:
                 logger.exception("Error closing speculative decoder for %s", lm.name)
                 errors.append(exc)
+        # Free GPU memory held by prompt caches BEFORE nulling model references.
+        # CachedPromptState entries hold per-layer KV cache buffers (deepest GPU
+        # consumer besides weights). Without this, the caller's gc.collect() may
+        # not reclaim the Metal buffers because the PromptCacheStore still holds
+        # live references — the root cause of issue #223 where loading a large
+        # model after eviction pushes Metal into swap.
+        if lm.prompt_cache_store is not None:
+            try:
+                lm.prompt_cache_store.clear()
+            except Exception as exc:
+                logger.exception("Error clearing prompt cache for %s", lm.name)
+                errors.append(exc)
+        # Explicitly null model and tokenizer so the caller's subsequent
+        # gc.collect() (run with the lock released) can reclaim Metal buffers
+        # immediately.  Without this, the LoadedModel field keeps the MLX
+        # arrays alive through the GC pass — the exact leak pattern behind
+        # issue #223.
+        lm.model = None
+        lm.tokenizer = None
         # ``lm.model.prefetcher`` is intentionally not nulled — it lives on
         # the FlashModelWrapper, not on the LM bookkeeping, and the wrapper
         # goes away with the LM.
@@ -1210,6 +1229,26 @@ class ModelManager:
 
                 logger.info("Loading model %s from %s", normalized, hf_path)
                 mem_before = memory_utils.get_metal_memory()
+
+                # Pre-load memory hygiene: if Metal memory is still under
+                # pressure after eviction + close + gc, evict prompt caches
+                # from all remaining loaded models and do another cleanup pass.
+                # Without this, loading a model on top of residual GPU
+                # allocations from a prior model pushes Metal into swap,
+                # causing the sub-token-per-second thrashing documented in
+                # issue #223.
+                if memory_utils.is_memory_pressure_high(
+                    settings.memory_limit_fraction
+                ):
+                    logger.warning(
+                        "Metal memory under pressure before loading %s; "
+                        "flushing prompt caches to free GPU memory",
+                        normalized,
+                    )
+                    for other_lm in self._loaded.values():
+                        other_lm.prompt_cache_store.evict_all_to_disk()
+                    gc.collect()
+                    mx.clear_cache()
 
                 # Initialize before try so the except handler can always
                 # clean up, whether _load_model or the post-load check fails.
