@@ -3874,6 +3874,63 @@ class TestEvictLruIfNeeded:
         # prompt caches (async path — offloaded to thread).
         cache_store.async_evict_all_to_disk.assert_called()
 
+    @pytest.mark.asyncio
+    async def test_ensure_loaded_preload_memory_hygiene_happy_path(
+        self, registry, mock_store, monkeypatch
+    ):
+        """The hygiene flush succeeds and the subsequent load completes normally.
+
+        Verifies the full happy path: memory pressure triggers the flush,
+        the flush completes, and then the normal loading flow proceeds
+        without errors.  Without this, a hygiene-pass bug that derails the
+        load path (e.g. accidentally clearing load state) would go undetected
+        until a real bench sweep.
+        """
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 2)
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", None
+        )
+        # First call (pre-load hygiene check): pressure high → flush.
+        # Second call (post-hygiene check): pressure resolved → proceed.
+        pressure_values = [True, False]
+        monkeypatch.setattr(
+            "olmlx.utils.memory.is_memory_pressure_high",
+            lambda _fraction, threshold=0.9: pressure_values.pop(0),
+        )
+        manager = ModelManager(registry, mock_store)
+
+        cache_store = MagicMock()
+        cache_store.async_evict_all_to_disk = AsyncMock()
+        existing = LoadedModel(
+            name="existing:latest",
+            hf_path="existing/repo",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            prompt_cache_store=cache_store,
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["existing:latest"] = existing
+
+        manager.registry.resolve = MagicMock(  # type: ignore[method-assign]
+            return_value=ModelConfig(hf_path="new/repo")
+        )
+        manager.registry.normalize_name = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda n: f"{n}:latest"
+        )
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        def _shard(*args, **kwargs):
+            return (mock_model, mock_tokenizer, False, TemplateCaps(), False, None)
+
+        monkeypatch.setattr(manager, "_load_model_and_shard", _shard)
+
+        lm = await manager.ensure_loaded("new")
+        assert lm.name == "new:latest"
+        cache_store.async_evict_all_to_disk.assert_called()
+
 
 class TestSpeculativeLoading:
     """Tests for standalone speculative decoder loading in _load_model."""

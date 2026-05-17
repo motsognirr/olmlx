@@ -963,12 +963,21 @@ class ModelManager:
         earlier exceptions when a later finally also raised.
         """
         errors: list[BaseException] = []
+        # Track resource failures (prefetcher / weight_store / decoder)
+        # separately from prompt-cache failures.  Only resource failures
+        # gate the model/tokenizer null below — a failed prompt-cache
+        # clear() is a disk/path operation with no bearing on whether the
+        # prefetcher needs retrying.  If a clear() error blocked nulling,
+        # the exact GPU leak this PR fixes would persist on an otherwise
+        # clean eviction.
+        resource_errors: list[BaseException] = []
         if getattr(lm.model, "prefetcher", None) is not None:
             try:
                 lm.model.prefetcher.close()
             except Exception as exc:
                 logger.exception("Error closing prefetcher for %s", lm.name)
                 errors.append(exc)
+                resource_errors.append(exc)
         if lm.weight_store is not None:
             try:
                 lm.weight_store.close()
@@ -981,6 +990,7 @@ class ModelManager:
             except Exception as exc:
                 logger.exception("Error closing weight store for %s", lm.name)
                 errors.append(exc)
+                resource_errors.append(exc)
         if lm.speculative_decoder is not None:
             try:
                 lm.speculative_decoder.close()
@@ -988,6 +998,7 @@ class ModelManager:
             except Exception as exc:
                 logger.exception("Error closing speculative decoder for %s", lm.name)
                 errors.append(exc)
+                resource_errors.append(exc)
         # Free GPU memory held by prompt caches BEFORE nulling model references.
         # CachedPromptState entries hold per-layer KV cache buffers (deepest GPU
         # consumer besides weights).  Uses clear() which also deletes on-disk
@@ -1003,21 +1014,25 @@ class ModelManager:
             except Exception as exc:
                 logger.exception("Error clearing prompt cache for %s", lm.name)
                 errors.append(exc)
+                # Deliberately NOT appended to resource_errors — a
+                # failed prompt cache clear() must not prevent model
+                # nulling.  If it did, an otherwise clean eviction would
+                # leak GPU memory (exactly what issue #223 fixes).
         # Explicitly null model and tokenizer so the caller's subsequent
         # gc.collect() (run with the lock released) can reclaim Metal buffers
         # immediately.  Without this, the LoadedModel field keeps the MLX
         # arrays alive through the GC pass — the exact leak pattern behind
         # issue #223.
         #
-        # Null only on success: if a prior step (prefetcher / weight_store /
-        # speculative_decoder) raised, the re-entry drain in _close_evictees
-        # may call _close_loaded_model a second time.  Nulling lm.model early
-        # would cause the prefetcher-close guard at line 966
+        # Null only on success of resource-close steps (prefetcher / weight_store
+        # / speculative_decoder): if a resource raised, the re-entry drain in
+        # _close_evictees may call _close_loaded_model a second time.  Nulling
+        # lm.model early would cause the prefetcher-close guard at line 966
         # (``getattr(lm.model, "prefetcher", None)``) to silently skip the
         # close on re-entry — the field must stay set so re-entry reaches
         # every resource.  Same pattern as weight_store / speculative_decoder
         # where the reference is preserved on failure (issue #315).
-        if not errors:
+        if not resource_errors:
             lm.model = None
             lm.tokenizer = None
         # ``lm.model.prefetcher`` is intentionally not nulled — it lives on
@@ -1242,11 +1257,26 @@ class ModelManager:
                 # a live dict view across await yields would risk
                 # RuntimeError if another coroutine modifies _loaded
                 # during the I/O (issue #315 lock-split contract).
+                #
+                # Narrow race: _expire_stale (background loop, every 30s)
+                # may concurrently pop and close a model that is in our
+                # snapshot.  In CPython the GIL prevents a segfault, and
+                # the concurrent close makes our async_evict_all_to_disk()
+                # a harmless no-op (the store is already cleared).  Worst
+                # case a few cache entries are not flushed to disk, but
+                # GPU memory is freed either way.
                 for other_lm in list(self._loaded.values()):
                     if other_lm.prompt_cache_store is not None:
                         await other_lm.prompt_cache_store.async_evict_all_to_disk()
                 gc.collect()
                 mx.clear_cache()
+                if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+                    logger.warning(
+                        "Metal pressure persists after hygiene flush; "
+                        "proceeding to load %s anyway — generation may "
+                        "be slow if Metal swaps",
+                        normalized,
+                    )
 
             async with self._lock:
                 # State may have changed while the lock was released for the
