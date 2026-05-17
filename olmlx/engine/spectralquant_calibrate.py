@@ -21,6 +21,12 @@ from olmlx.engine.spectralquant import allocate_bits, fit_codebook
 
 logger = logging.getLogger(__name__)
 
+#: Default max tokens collected per head during calibration.  Also duplicated
+#: in ``model_manager.py`` (which avoids importing this module eagerly) —
+#: both copies must be kept in sync.
+_SPECTRAL_DEFAULT_MAX_TOKENS_PER_HEAD = 8192
+_SPECTRAL_DEFAULT_NUM_SAMPLES = 256
+
 
 def _resolve_config_holder(inner: Any, model: Any) -> Any:
     # Some architectures (e.g. Qwen3Next) expose the config namespace only on
@@ -317,10 +323,10 @@ def load_calibration(calibration_dir: Path) -> CalibrationData:
 def calibrate_model(
     model_path: str,
     output_dir: Path | None = None,
-    num_samples: int = 256,
+    num_samples: int = _SPECTRAL_DEFAULT_NUM_SAMPLES,
     calibration_dataset: str | None = None,
     avg_bits: int = 4,
-    max_tokens_per_head: int = 8192,
+    max_tokens_per_head: int = _SPECTRAL_DEFAULT_MAX_TOKENS_PER_HEAD,
     progress_callback: Any | None = None,
 ) -> Path:
     """Run spectral calibration on a model.

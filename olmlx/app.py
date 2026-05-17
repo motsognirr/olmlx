@@ -11,7 +11,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from olmlx.config import settings
 from olmlx.context import request_id_var
 from olmlx.engine.inference import ServerBusyError
-from olmlx.engine.model_manager import ModelLoadTimeoutError, ModelManager
+from olmlx.engine.model_manager import (
+    ModelLoadTimeoutError,
+    ModelManager,
+    SpectralCalibrationMissingError,
+)
 from olmlx.engine.registry import ModelRegistry
 from olmlx.models.store import ModelStore
 from olmlx.routers import (
@@ -248,6 +252,23 @@ def create_app() -> FastAPI:
         )
         response.headers["Retry-After"] = "5"
         return response
+
+    @app.exception_handler(SpectralCalibrationMissingError)
+    async def spectral_calibration_missing_handler(
+        request: Request, exc: SpectralCalibrationMissingError
+    ):
+        msg = str(exc)
+        logger.warning(
+            "SpectralCalibrationMissingError on %s: %s", request.url.path, msg
+        )
+        return _make_error_response(
+            request.url.path,
+            400,
+            msg,
+            "invalid_request_error",
+            "invalid_request_error",
+            "calibration_missing",
+        )
 
     @app.exception_handler(RuntimeError)
     async def runtime_error_handler(request: Request, exc: RuntimeError):

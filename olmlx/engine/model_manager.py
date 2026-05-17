@@ -29,6 +29,12 @@ from olmlx.models.store import _strip_ollama_tag
 
 logger = logging.getLogger(__name__)
 
+#: Default max tokens collected per head during SpectralQuant calibration.
+#: Duplicated from spectralquant_calibrate (which imports numpy/mlx_lm
+#: eagerly) to avoid pulling those imports into lightweight CLI paths.
+_SPECTRAL_DEFAULT_MAX_TOKENS_PER_HEAD = 8192
+_SPECTRAL_DEFAULT_NUM_SAMPLES = 256
+
 
 try:
     from mlx_lm.models.cache import (
@@ -360,7 +366,7 @@ class ModelLoadTimeoutError(TimeoutError):
     """Raised when model loading exceeds OLMLX_MODEL_LOAD_TIMEOUT."""
 
 
-class SpectralCalibrationMissingError(FileNotFoundError):
+class SpectralCalibrationMissingError(Exception):
     """Raised when SpectralQuant is configured but calibration data is absent."""
 
 
@@ -2014,17 +2020,74 @@ class ModelManager:
             return None
         if self.store is None:
             return None
+
+        # Parse and validate bit width before checking for calibration data.
+        # Defence-in-depth: config.py's validator already gates all real
+        # entrypoints; this protects direct callers (e.g. tests) that bypass
+        # config loading and would otherwise hit a cryptic downstream error.
+        try:
+            configured_bits = int(kv_cache_quant.split(":", 1)[1])
+        except (ValueError, IndexError):
+            raise ValueError(
+                f"Invalid SpectralQuant config {kv_cache_quant!r}; "
+                f"expected spectral:2 or spectral:4"
+            )
+        if configured_bits not in (2, 4):
+            raise ValueError(
+                f"Invalid SpectralQuant bit width {kv_cache_quant!r}; expected 2 or 4"
+            )
+
         spectral_path = self.store.local_path(hf_path) / "spectral"
         if spectral_path.exists() and (spectral_path / "spectral_config.json").exists():
+            try:
+                config = json.loads(
+                    (spectral_path / "spectral_config.json").read_text()
+                )
+            except (json.JSONDecodeError, OSError) as exc:
+                recalibrate_cmd = f"olmlx spectral prepare {hf_path}"
+                if configured_bits != 4:
+                    recalibrate_cmd += f" --avg-bits {configured_bits}"
+                raise SpectralCalibrationMissingError(
+                    f"SpectralQuant configured ({kv_cache_quant}) but calibration "
+                    f"file at {spectral_path}/spectral_config.json is unreadable "
+                    f"({exc}). Re-run '{recalibrate_cmd}'."
+                )
+            cal_bits = config.get("meta", {}).get("avg_bits")
+            if cal_bits is not None and cal_bits != configured_bits:
+                calibrate_cmd = (
+                    f"olmlx spectral prepare {hf_path} --avg-bits {configured_bits}"
+                )
+                raise SpectralCalibrationMissingError(
+                    f"SpectralQuant configured ({kv_cache_quant}) but calibration "
+                    f"data at {spectral_path} was generated with "
+                    f"--avg-bits {cal_bits}. Run '{calibrate_cmd}' "
+                    f"to re-calibrate at {configured_bits}-bit, "
+                    f"or set OLMLX_KV_CACHE_QUANT=spectral:{cal_bits} "
+                    f"to use the existing calibration."
+                )
             return spectral_path
+
         # Auto-calibrate if enabled
         if settings.kv_cache_auto_calibrate:
             return self._auto_calibrate_spectral(hf_path, kv_cache_quant)
+
+        other_bits = 4 if configured_bits == 2 else 2
+
+        calibrate_cmd = f"olmlx spectral prepare {hf_path}"
+        if configured_bits != 4:  # 4 is calibrate_model's default avg_bits
+            calibrate_cmd += f" --avg-bits {configured_bits}"
         raise SpectralCalibrationMissingError(
             f"SpectralQuant configured ({kv_cache_quant}) but no calibration data "
-            f"found at {spectral_path}. "
-            f"Run 'olmlx spectral prepare <model>' first, or set "
-            f"OLMLX_KV_CACHE_AUTO_CALIBRATE=true to auto-calibrate on first load."
+            f"found at {spectral_path}. Run '{calibrate_cmd}' "
+            f"to calibrate. Calibration collects KV vectors from "
+            f"~{_SPECTRAL_DEFAULT_NUM_SAMPLES} text samples (C4 by default) "
+            f"and computes per-layer eigendecompositions for non-uniform "
+            f"bit allocation ({_SPECTRAL_DEFAULT_MAX_TOKENS_PER_HEAD} "
+            f"tokens/head). "
+            f"Use --avg-bits {other_bits} for {other_bits}-bit mode, "
+            f"--samples N to change sample count, "
+            f"--calibration-dataset synthetic to override dataset. "
+            f"Or set OLMLX_KV_CACHE_AUTO_CALIBRATE=true to auto-calibrate."
         )
 
     def _auto_calibrate_spectral(self, hf_path: str, kv_cache_quant: str) -> Path:

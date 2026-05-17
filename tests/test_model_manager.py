@@ -3029,6 +3029,198 @@ class TestPerModelConfig:
         assert lm.expires_at is not None
         assert lm.expires_at < time.time() + 70  # ~1 minute
 
+    def test_find_spectral_dir_returns_path_when_calibration_exists(self, tmp_path):
+        from olmlx.engine.model_manager import ModelManager
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        spectral_path = tmp_path / "spectral"
+        spectral_path.mkdir()
+        (spectral_path / "spectral_config.json").write_text("{}")
+        mock_store = MagicMock()
+        mock_store.local_path.return_value = tmp_path
+        manager.store = mock_store
+
+        result = manager._find_spectral_dir("test/model", "spectral:4")
+        assert result == spectral_path
+
+    def test_find_spectral_dir_returns_path_when_avg_bits_match(self, tmp_path):
+        """Returns path when calibration exists with matching avg_bits."""
+        import json as _json
+
+        from olmlx.engine.model_manager import ModelManager
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        spectral_path = tmp_path / "spectral"
+        spectral_path.mkdir()
+        (spectral_path / "spectral_config.json").write_text(
+            _json.dumps({"meta": {"avg_bits": 4}})
+        )
+        mock_store = MagicMock()
+        mock_store.local_path.return_value = tmp_path
+        manager.store = mock_store
+
+        result = manager._find_spectral_dir("test/model", "spectral:4")
+        assert result == spectral_path
+
+    def test_find_spectral_dir_returns_none_for_turboquant(self):
+        from olmlx.engine.model_manager import ModelManager
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        manager.store = MagicMock()
+
+        result = manager._find_spectral_dir("test/model", "turboquant:4")
+        assert result is None
+
+    def test_find_spectral_dir_returns_none_when_none(self):
+        from olmlx.engine.model_manager import ModelManager
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        manager.store = MagicMock()
+
+        result = manager._find_spectral_dir("test/model", None)
+        assert result is None
+
+    def test_find_spectral_dir_raises_when_calibration_missing(
+        self, tmp_path, monkeypatch
+    ):
+        from olmlx.engine.model_manager import (
+            ModelManager,
+            SpectralCalibrationMissingError,
+        )
+
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.kv_cache_auto_calibrate", False
+        )
+        manager = ModelManager(MagicMock(), MagicMock())
+        spectral_path = tmp_path / "spectral"
+        spectral_path.mkdir()
+        mock_store = MagicMock()
+        mock_store.local_path.return_value = tmp_path
+        manager.store = mock_store
+
+        with pytest.raises(SpectralCalibrationMissingError) as exc_info:
+            manager._find_spectral_dir("test/model", "spectral:4")
+        msg = str(exc_info.value)
+        assert "olmlx spectral prepare" in msg
+        assert "test/model" in msg
+        assert "C4" in msg
+        assert "256" in msg
+        assert "8192" in msg
+        assert "--avg-bits 2" in msg
+        assert "olmlx spectral prepare test/model" in msg
+        assert str(spectral_path) in msg
+
+    def test_find_spectral_dir_raises_when_dir_missing(self, tmp_path, monkeypatch):
+        from olmlx.engine.model_manager import (
+            ModelManager,
+            SpectralCalibrationMissingError,
+        )
+
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.kv_cache_auto_calibrate", False
+        )
+        manager = ModelManager(MagicMock(), MagicMock())
+        mock_store = MagicMock()
+        mock_store.local_path.return_value = tmp_path
+        manager.store = mock_store
+
+        with pytest.raises(SpectralCalibrationMissingError) as exc_info:
+            manager._find_spectral_dir("test/model", "spectral:2")
+        msg = str(exc_info.value)
+        assert "olmlx spectral prepare" in msg
+        assert "test/model" in msg
+        assert "--avg-bits 2" in msg
+        assert "--avg-bits 4" in msg
+
+    def test_find_spectral_dir_raises_valueerror_for_malformed_config(self):
+        from olmlx.engine.model_manager import ModelManager
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        manager.store = MagicMock()
+
+        with pytest.raises(ValueError, match="spectral:abc"):
+            manager._find_spectral_dir("test/model", "spectral:abc")
+
+    def test_find_spectral_dir_raises_valueerror_for_missing_colon(self):
+        from olmlx.engine.model_manager import ModelManager
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        manager.store = MagicMock()
+
+        with pytest.raises(ValueError, match="spectral:"):
+            manager._find_spectral_dir("test/model", "spectral:")
+
+    def test_find_spectral_dir_raises_valueerror_for_bad_bit_width(self):
+        from olmlx.engine.model_manager import ModelManager
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        manager.store = MagicMock()
+
+        with pytest.raises(ValueError, match="spectral:3"):
+            manager._find_spectral_dir("test/model", "spectral:3")
+
+    def test_find_spectral_dir_validates_bits_before_early_return(self, tmp_path):
+        """Bit-width validation fires even when calibration data exists."""
+        from olmlx.engine.model_manager import ModelManager
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        spectral_path = tmp_path / "spectral"
+        spectral_path.mkdir()
+        (spectral_path / "spectral_config.json").write_text("{}")
+        mock_store = MagicMock()
+        mock_store.local_path.return_value = tmp_path
+        manager.store = mock_store
+
+        with pytest.raises(ValueError, match="spectral:3"):
+            manager._find_spectral_dir("test/model", "spectral:3")
+
+    def test_find_spectral_dir_raises_on_bit_width_mismatch(self, tmp_path):
+        """Raises when calibration exists but at a different bit width."""
+        import json as _json
+
+        from olmlx.engine.model_manager import (
+            ModelManager,
+            SpectralCalibrationMissingError,
+        )
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        spectral_path = tmp_path / "spectral"
+        spectral_path.mkdir()
+        (spectral_path / "spectral_config.json").write_text(
+            _json.dumps({"meta": {"avg_bits": 4}})
+        )
+        mock_store = MagicMock()
+        mock_store.local_path.return_value = tmp_path
+        manager.store = mock_store
+
+        with pytest.raises(SpectralCalibrationMissingError) as exc_info:
+            manager._find_spectral_dir("test/model", "spectral:2")
+        msg = str(exc_info.value)
+        assert "--avg-bits 2" in msg
+        assert "generated with --avg-bits 4" in msg
+        assert "OLMLX_KV_CACHE_QUANT=spectral:4" in msg
+
+    def test_find_spectral_dir_raises_for_corrupt_config(self, tmp_path):
+        """Raises SpectralCalibrationMissingError when config file is not valid JSON."""
+        from olmlx.engine.model_manager import (
+            ModelManager,
+            SpectralCalibrationMissingError,
+        )
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        spectral_path = tmp_path / "spectral"
+        spectral_path.mkdir()
+        (spectral_path / "spectral_config.json").write_text("not valid json {{")
+        mock_store = MagicMock()
+        mock_store.local_path.return_value = tmp_path
+        manager.store = mock_store
+
+        with pytest.raises(SpectralCalibrationMissingError) as exc_info:
+            manager._find_spectral_dir("test/model", "spectral:4")
+        msg = str(exc_info.value)
+        assert "unreadable" in msg
+        assert "olmlx spectral prepare test/model" in msg
+
 
 class TestEvictLruIfNeeded:
     """Tests for ModelManager._pop_lru_evictees + _close_evictees.
