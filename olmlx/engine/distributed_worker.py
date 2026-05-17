@@ -184,25 +184,17 @@ def worker_main() -> None:
     from olmlx.config import experimental as _exp_early
     from olmlx.config import settings as _settings_early
 
-    # Honour the one-release deprecation window for ``OLMLX_EXPERIMENTAL_FLASH``
-    # on the direct-worker path. The coordinator runs the full shim in
-    # ``_surface_legacy_flash_env`` and forwards the resolved
-    # ``OLMLX_FLASH=true`` to workers it launches via SSH; this fallback
-    # covers users who start ``python -m olmlx.engine.distributed_worker``
-    # directly with only the legacy name set. ``olmlx.cli`` is not
-    # imported here on purpose — the worker entry point should not pull
-    # in argparse, uvicorn, etc.
-    if (
-        os.environ.get("OLMLX_EXPERIMENTAL_FLASH", "").strip().lower()
-        in ("1", "true", "yes", "on")
-        and os.environ.get("OLMLX_FLASH") is None
-        and not _settings_early.flash
-    ):
-        logger.warning(
-            "OLMLX_EXPERIMENTAL_FLASH is deprecated; rename to OLMLX_FLASH. "
-            "Honoring the legacy name for this run."
-        )
-        _settings_early.flash = True
+    # Honour the one-release deprecation window for the full
+    # ``OLMLX_EXPERIMENTAL_FLASH*`` set on the direct-worker path. The
+    # coordinator runs the same shim in its own startup and forwards
+    # resolved ``OLMLX_FLASH*`` values to workers it launches via SSH,
+    # so this matters only when ``python -m olmlx.engine.distributed_worker``
+    # is invoked directly with legacy env vars set. The helper lives in
+    # ``olmlx.config`` so the worker does not need to import ``olmlx.cli``
+    # (and its argparse/uvicorn baggage).
+    from olmlx.config import surface_legacy_flash_env as _surface_legacy_flash_env
+
+    _surface_legacy_flash_env()
 
     if _exp_early.flash_moe:
         logger.error(

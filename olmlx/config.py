@@ -1,8 +1,12 @@
+import logging
+import os
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Callable, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+logger = logging.getLogger(__name__)
 
 #: Metal sync behavior at inference-lock boundaries. Single source of truth
 #: shared by ``Settings.sync_mode``, ``ModelConfig.sync_mode``, and
@@ -242,6 +246,134 @@ class ExperimentalSettings(BaseSettings):
 experimental = ExperimentalSettings()
 
 PRE_SHARDED_DIR_ENV = "OLMLX_DISTRIBUTED_PRE_SHARDED_DIR"
+
+
+#: Legacy ``OLMLX_EXPERIMENTAL_FLASH*`` env vars and their parsers.
+#: Lives here rather than in ``olmlx.cli`` so the distributed-worker
+#: entry point (which must not import argparse/uvicorn) can apply the
+#: same one-release deprecation shim that ``cmd_serve`` / ``cmd_chat`` /
+#: ``cmd_config_show`` / ``cmd_flash_info`` apply on the CLI side.
+LEGACY_FLASH_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], ...] = (
+    (
+        "OLMLX_EXPERIMENTAL_FLASH",
+        "OLMLX_FLASH",
+        "flash",
+        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD",
+        "OLMLX_FLASH_SPARSITY_THRESHOLD",
+        "flash_sparsity_threshold",
+        float,
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
+        "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
+        "flash_min_active_neurons",
+        int,
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
+        "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
+        "flash_max_active_neurons",
+        int,
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
+        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION",
+        "flash_memory_budget_fraction",
+        float,
+    ),
+)
+
+
+def surface_legacy_flash_env() -> None:
+    """Detect and forward legacy ``OLMLX_EXPERIMENTAL_FLASH*`` (primary
+    knobs only) to the new ``OLMLX_FLASH*`` names.
+
+    Only the five promoted primary knobs are forwarded. Advanced tuning
+    fields (``OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE``,
+    ``..._IO_THREADS``, ``..._CACHE_BUDGET_NEURONS``,
+    ``..._BYPASS_OS_CACHE``, ``..._PREALLOCATED_BUFFER``,
+    ``..._PREDICTOR_*``, ``..._PREFETCH*``, ``..._SPECULATIVE*``,
+    ``..._MOE*``) remain under the experimental prefix and pass through
+    unchanged.
+
+    Updates ``settings.<field>`` in-process but does not write back to
+    ``os.environ``. All callers in this codebase consume the promoted
+    knobs via ``settings.*`` (the distributed-worker env-forwarding loop
+    in ``_launch_distributed_workers`` mirrors ``settings.*`` into the
+    worker's ``OLMLX_FLASH*`` env vars). Anything that reads
+    ``os.environ.get("OLMLX_FLASH*")`` directly will miss the legacy
+    value — mirror through ``settings`` instead.
+
+    Defined in ``olmlx.config`` rather than ``olmlx.cli`` so the
+    distributed-worker entry point can reuse the same logic without
+    pulling in argparse/uvicorn.
+    """
+    # Collect per-field actions: only count a legacy var as actionable
+    # if its *parsed* value would actually change the live Settings.
+    # ``OLMLX_EXPERIMENTAL_FLASH=false`` (a user explicitly disabling
+    # flash via the old name) parses to the schema default ``False``
+    # and has nothing to migrate — skipping it here suppresses a
+    # noisy warning that would otherwise nag every invocation for a
+    # variable whose only effect is "leave the default".
+    actionable: list[str] = []
+    pending: list[tuple[str, str, str, Any]] = []
+    for legacy, new, attr, parse in LEGACY_FLASH_FORWARD:
+        legacy_val = os.environ.get(legacy)
+        if legacy_val is None:
+            continue
+        if os.environ.get(new) is not None:
+            continue
+        field_default = Settings.model_fields[attr].default
+        if getattr(settings, attr) != field_default:
+            # ``.env`` (or programmatic write at import time) already
+            # supplied a non-default value; don't let the legacy var
+            # clobber it.
+            continue
+        try:
+            value = parse(legacy_val)
+        except Exception as exc:
+            logger.warning(
+                "Could not forward legacy env var %s=%r to %s: %s",
+                legacy,
+                legacy_val,
+                new,
+                exc,
+            )
+            continue
+        if value == field_default:
+            # Parsed value already matches the schema default — no
+            # behavioural change, nothing to migrate. Suppress the
+            # banner for this var.
+            continue
+        actionable.append(legacy)
+        pending.append((legacy, new, attr, value))
+
+    if not actionable:
+        return
+    logger.warning(
+        "Deprecated env vars detected: %s. The Flash primary knobs have "
+        "been promoted out of the experimental prefix — rename to "
+        "OLMLX_FLASH, OLMLX_FLASH_SPARSITY_THRESHOLD, "
+        "OLMLX_FLASH_MIN_ACTIVE_NEURONS, OLMLX_FLASH_MAX_ACTIVE_NEURONS, "
+        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION. The legacy names will be "
+        "removed in a future release. Advanced flash tuning fields "
+        "(window_size, io_threads, cache_budget_neurons, predictor_*, "
+        "prefetch_*, etc.) remain under OLMLX_EXPERIMENTAL_FLASH_*.",
+        ", ".join(actionable),
+    )
+    for legacy, new, attr, value in pending:
+        try:
+            setattr(settings, attr, value)
+        except Exception as exc:
+            logger.warning(
+                "Could not forward legacy env var %s to %s: %s",
+                legacy,
+                new,
+                exc,
+            )
 
 
 def resolve_experimental(

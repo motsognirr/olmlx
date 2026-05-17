@@ -454,128 +454,11 @@ def _surface_legacy_kv_cache_quant_env() -> None:
         )
 
 
-# Legacy Flash env var → new env var, attribute, parser.
-# Promoted in PR #274 (Flash promotion); honour for one release with a
-# warning, then drop the entries here and the corresponding logic.
-_LEGACY_FLASH_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], ...] = (
-    (
-        "OLMLX_EXPERIMENTAL_FLASH",
-        "OLMLX_FLASH",
-        "flash",
-        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
-    ),
-    (
-        "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD",
-        "OLMLX_FLASH_SPARSITY_THRESHOLD",
-        "flash_sparsity_threshold",
-        float,
-    ),
-    (
-        "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
-        "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
-        "flash_min_active_neurons",
-        int,
-    ),
-    (
-        "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
-        "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
-        "flash_max_active_neurons",
-        int,
-    ),
-    (
-        "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
-        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION",
-        "flash_memory_budget_fraction",
-        float,
-    ),
-)
-
-
-def _surface_legacy_flash_env() -> None:
-    """Detect and forward legacy ``OLMLX_EXPERIMENTAL_FLASH*`` (primary
-    knobs only) to the new ``OLMLX_FLASH*`` names.
-
-    Only the five promoted primary knobs are forwarded. Advanced tuning
-    fields (``OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE``,
-    ``..._IO_THREADS``, ``..._CACHE_BUDGET_NEURONS``,
-    ``..._BYPASS_OS_CACHE``, ``..._PREALLOCATED_BUFFER``,
-    ``..._PREDICTOR_*``, ``..._PREFETCH*``, ``..._SPECULATIVE*``,
-    ``..._MOE*``) remain under the experimental prefix and pass through
-    unchanged.
-
-    Note: this updates ``settings.<field>`` in-process but does not write
-    back to ``os.environ``. All callers in this codebase consume the
-    promoted knobs via ``settings.*`` (including the distributed-worker
-    env-forwarding loop in ``_launch_distributed_workers`` which mirrors
-    ``settings.flash`` into the worker's ``OLMLX_FLASH=true``), so the
-    legacy → new bridge is observable. Anything that reads
-    ``os.environ.get("OLMLX_FLASH*")`` directly will miss the legacy
-    value — mirror through ``settings`` instead.
-    """
-    from olmlx.config import Settings, settings as _settings
-
-    # Collect per-field actions: only count a legacy var as actionable
-    # if its *parsed* value would actually change the live Settings.
-    # ``OLMLX_EXPERIMENTAL_FLASH=false`` (a user explicitly disabling
-    # flash via the old name) parses to the schema default ``False``
-    # and has nothing to migrate — skipping it here suppresses a
-    # noisy warning that would otherwise nag every invocation.
-    actionable: list[str] = []
-    pending: list[tuple[str, str, str, Any]] = []
-    for legacy, new, attr, parse in _LEGACY_FLASH_FORWARD:
-        legacy_val = os.environ.get(legacy)
-        if legacy_val is None:
-            continue
-        if os.environ.get(new) is not None:
-            continue
-        field_default = Settings.model_fields[attr].default
-        if getattr(_settings, attr) != field_default:
-            # ``.env`` (or programmatic write at import time) already
-            # supplied a non-default value; don't let the legacy var
-            # clobber it.
-            continue
-        try:
-            value = parse(legacy_val)
-        except Exception as exc:
-            logger.warning(
-                "Could not forward legacy env var %s=%r to %s: %s",
-                legacy,
-                legacy_val,
-                new,
-                exc,
-            )
-            continue
-        if value == field_default:
-            # Parsed value already matches the schema default — no
-            # behavioural change, nothing to migrate. Suppress the
-            # banner for this var.
-            continue
-        actionable.append(legacy)
-        pending.append((legacy, new, attr, value))
-
-    if not actionable:
-        return
-    logger.warning(
-        "Deprecated env vars detected: %s. The Flash primary knobs have "
-        "been promoted out of the experimental prefix — rename to "
-        "OLMLX_FLASH, OLMLX_FLASH_SPARSITY_THRESHOLD, "
-        "OLMLX_FLASH_MIN_ACTIVE_NEURONS, OLMLX_FLASH_MAX_ACTIVE_NEURONS, "
-        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION. The legacy names will be "
-        "removed in a future release. Advanced flash tuning fields "
-        "(window_size, io_threads, cache_budget_neurons, predictor_*, "
-        "prefetch_*, etc.) remain under OLMLX_EXPERIMENTAL_FLASH_*.",
-        ", ".join(actionable),
-    )
-    for legacy, new, attr, value in pending:
-        try:
-            setattr(_settings, attr, value)
-        except Exception as exc:
-            logger.warning(
-                "Could not forward legacy env var %s to %s: %s",
-                legacy,
-                new,
-                exc,
-            )
+# The legacy Flash env-var shim now lives in ``olmlx.config`` so the
+# distributed-worker entry point can reuse it without pulling in
+# argparse/uvicorn. Re-exported here so existing call sites and tests
+# continue to work.
+from olmlx.config import surface_legacy_flash_env as _surface_legacy_flash_env  # noqa: E402, F401
 
 
 def _warn_kv_cache_quant_incompatibilities() -> None:
@@ -2626,6 +2509,11 @@ def cmd_eagle_prepare(args):
 
 def cmd_flash_info(args):
     """Show flash preparation info for a model."""
+    # Honour the legacy ``OLMLX_EXPERIMENTAL_FLASH*`` shim so that
+    # ``olmlx flash info`` reflects the same effective Flash settings
+    # an operator would see from ``olmlx config show`` / ``olmlx serve``
+    # when they've only renamed the new env vars in some shells.
+    _surface_legacy_flash_env()
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
     hf_path = _resolved.hf_path if _resolved is not None else args.model

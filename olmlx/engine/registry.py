@@ -561,62 +561,15 @@ class ModelConfig:
                     )
             speculative_tokens = speculative_tokens_raw
 
-            flash_raw = entry.get("flash")
-            if flash_raw is not None and not isinstance(flash_raw, bool):
-                raise ValueError(f"'flash' must be a bool, got {flash_raw!r}")
-            flash = flash_raw
-
-            flash_sparsity_threshold_raw = entry.get("flash_sparsity_threshold")
-            if flash_sparsity_threshold_raw is not None:
-                if (
-                    isinstance(flash_sparsity_threshold_raw, bool)
-                    or not isinstance(flash_sparsity_threshold_raw, (int, float))
-                    or not (0 < flash_sparsity_threshold_raw <= 1.0)
-                ):
-                    raise ValueError(
-                        f"'flash_sparsity_threshold' must be a number in (0, 1], "
-                        f"got {flash_sparsity_threshold_raw!r}"
-                    )
-            flash_sparsity_threshold = flash_sparsity_threshold_raw
-
-            flash_min_active_neurons_raw = entry.get("flash_min_active_neurons")
-            if flash_min_active_neurons_raw is not None:
-                if (
-                    isinstance(flash_min_active_neurons_raw, bool)
-                    or not isinstance(flash_min_active_neurons_raw, int)
-                    or flash_min_active_neurons_raw < 1
-                ):
-                    raise ValueError(
-                        f"'flash_min_active_neurons' must be a positive "
-                        f"integer, got {flash_min_active_neurons_raw!r}"
-                    )
-            flash_min_active_neurons = flash_min_active_neurons_raw
-
-            flash_max_active_neurons_raw = entry.get("flash_max_active_neurons")
-            if flash_max_active_neurons_raw is not None:
-                if (
-                    isinstance(flash_max_active_neurons_raw, bool)
-                    or not isinstance(flash_max_active_neurons_raw, int)
-                    or flash_max_active_neurons_raw < 1
-                ):
-                    raise ValueError(
-                        f"'flash_max_active_neurons' must be a positive "
-                        f"integer, got {flash_max_active_neurons_raw!r}"
-                    )
-            flash_max_active_neurons = flash_max_active_neurons_raw
-
-            flash_memory_budget_fraction_raw = entry.get("flash_memory_budget_fraction")
-            if flash_memory_budget_fraction_raw is not None:
-                if (
-                    isinstance(flash_memory_budget_fraction_raw, bool)
-                    or not isinstance(flash_memory_budget_fraction_raw, (int, float))
-                    or not (0 < flash_memory_budget_fraction_raw <= 1.0)
-                ):
-                    raise ValueError(
-                        f"'flash_memory_budget_fraction' must be a number in "
-                        f"(0, 1], got {flash_memory_budget_fraction_raw!r}"
-                    )
-            flash_memory_budget_fraction = flash_memory_budget_fraction_raw
+            # Flash primary-knob fields: type/bounds checks live in
+            # ``ModelConfig.__post_init__`` (which fires from the
+            # ``cls(...)`` call below). Pull raw values verbatim and let
+            # the dataclass validator produce the error message.
+            flash = entry.get("flash")
+            flash_sparsity_threshold = entry.get("flash_sparsity_threshold")
+            flash_min_active_neurons = entry.get("flash_min_active_neurons")
+            flash_max_active_neurons = entry.get("flash_max_active_neurons")
+            flash_memory_budget_fraction = entry.get("flash_memory_budget_fraction")
 
             kv_cache_quant_raw = entry.get("kv_cache_quant")
             if kv_cache_quant_raw is not None:
