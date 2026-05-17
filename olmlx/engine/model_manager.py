@@ -1268,8 +1268,13 @@ class ModelManager:
                 for other_lm in list(self._loaded.values()):
                     if other_lm.prompt_cache_store is not None:
                         await other_lm.prompt_cache_store.async_evict_all_to_disk()
-                gc.collect()
-                mx.clear_cache()
+                # Skip gc/clear when a deferred cleanup is pending:
+                # mx.clear_cache() is not safe to call concurrently with
+                # active Metal allocations from a background thread (see
+                # the matching guard at the _ensure_loaded pre-load path).
+                if not self._pending_cleanups:
+                    gc.collect()
+                    mx.clear_cache()
                 if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
                     logger.warning(
                         "Metal pressure persists after hygiene flush; "

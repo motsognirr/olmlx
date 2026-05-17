@@ -3533,7 +3533,9 @@ class TestEvictLruIfNeeded:
         If the first call nulled ``lm.model`` unconditionally, the
         re-entry's ``getattr(lm.model, "prefetcher", None)`` would crash
         with ``AttributeError``. The nulls must be guarded by
-        ``if not errors:`` so re-entry finds the fields intact.
+        ``if not resource_errors:`` (not plain ``errors`` — a prompt-cache
+        failure must not block model nulling) so re-entry finds
+        the fields intact.
         """
         manager = ModelManager(registry, mock_store)
         weight_store = MagicMock()
@@ -3892,10 +3894,14 @@ class TestEvictLruIfNeeded:
         )
         # First call (pre-load hygiene check): pressure high → flush.
         # Second call (post-hygiene check): pressure resolved → proceed.
-        pressure_values = [True, False]
+        # Use an iterator so any additional calls (e.g. from future code)
+        # return False instead of raising IndexError on an exhausted list.
+        import itertools
+
+        pressure_vals = itertools.chain([True, False], itertools.repeat(False))
         monkeypatch.setattr(
             "olmlx.utils.memory.is_memory_pressure_high",
-            lambda _fraction, threshold=0.9: pressure_values.pop(0),
+            lambda _fraction, threshold=0.9: next(pressure_vals),
         )
         manager = ModelManager(registry, mock_store)
 
