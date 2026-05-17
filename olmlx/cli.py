@@ -514,22 +514,14 @@ def _surface_legacy_flash_env() -> None:
     """
     from olmlx.config import Settings, settings as _settings
 
-    stale = [
-        legacy for legacy, _, _, _ in _LEGACY_FLASH_FORWARD if os.environ.get(legacy)
-    ]
-    if not stale:
-        return
-    logger.warning(
-        "Deprecated env vars detected: %s. The Flash primary knobs have "
-        "been promoted out of the experimental prefix — rename to "
-        "OLMLX_FLASH, OLMLX_FLASH_SPARSITY_THRESHOLD, "
-        "OLMLX_FLASH_MIN_ACTIVE_NEURONS, OLMLX_FLASH_MAX_ACTIVE_NEURONS, "
-        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION. The legacy names will be "
-        "removed in a future release. Advanced flash tuning fields "
-        "(window_size, io_threads, cache_budget_neurons, predictor_*, "
-        "prefetch_*, etc.) remain under OLMLX_EXPERIMENTAL_FLASH_*.",
-        ", ".join(stale),
-    )
+    # Collect per-field actions: only count a legacy var as actionable
+    # if its *parsed* value would actually change the live Settings.
+    # ``OLMLX_EXPERIMENTAL_FLASH=false`` (a user explicitly disabling
+    # flash via the old name) parses to the schema default ``False``
+    # and has nothing to migrate — skipping it here suppresses a
+    # noisy warning that would otherwise nag every invocation.
+    actionable: list[str] = []
+    pending: list[tuple[str, str, str, Any]] = []
     for legacy, new, attr, parse in _LEGACY_FLASH_FORWARD:
         legacy_val = os.environ.get(legacy)
         if legacy_val is None:
@@ -544,12 +536,43 @@ def _surface_legacy_flash_env() -> None:
             continue
         try:
             value = parse(legacy_val)
-            setattr(_settings, attr, value)
         except Exception as exc:
             logger.warning(
                 "Could not forward legacy env var %s=%r to %s: %s",
                 legacy,
                 legacy_val,
+                new,
+                exc,
+            )
+            continue
+        if value == field_default:
+            # Parsed value already matches the schema default — no
+            # behavioural change, nothing to migrate. Suppress the
+            # banner for this var.
+            continue
+        actionable.append(legacy)
+        pending.append((legacy, new, attr, value))
+
+    if not actionable:
+        return
+    logger.warning(
+        "Deprecated env vars detected: %s. The Flash primary knobs have "
+        "been promoted out of the experimental prefix — rename to "
+        "OLMLX_FLASH, OLMLX_FLASH_SPARSITY_THRESHOLD, "
+        "OLMLX_FLASH_MIN_ACTIVE_NEURONS, OLMLX_FLASH_MAX_ACTIVE_NEURONS, "
+        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION. The legacy names will be "
+        "removed in a future release. Advanced flash tuning fields "
+        "(window_size, io_threads, cache_budget_neurons, predictor_*, "
+        "prefetch_*, etc.) remain under OLMLX_EXPERIMENTAL_FLASH_*.",
+        ", ".join(actionable),
+    )
+    for legacy, new, attr, value in pending:
+        try:
+            setattr(_settings, attr, value)
+        except Exception as exc:
+            logger.warning(
+                "Could not forward legacy env var %s to %s: %s",
+                legacy,
                 new,
                 exc,
             )

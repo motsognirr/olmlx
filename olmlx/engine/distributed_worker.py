@@ -184,6 +184,26 @@ def worker_main() -> None:
     from olmlx.config import experimental as _exp_early
     from olmlx.config import settings as _settings_early
 
+    # Honour the one-release deprecation window for ``OLMLX_EXPERIMENTAL_FLASH``
+    # on the direct-worker path. The coordinator runs the full shim in
+    # ``_surface_legacy_flash_env`` and forwards the resolved
+    # ``OLMLX_FLASH=true`` to workers it launches via SSH; this fallback
+    # covers users who start ``python -m olmlx.engine.distributed_worker``
+    # directly with only the legacy name set. ``olmlx.cli`` is not
+    # imported here on purpose — the worker entry point should not pull
+    # in argparse, uvicorn, etc.
+    if (
+        os.environ.get("OLMLX_EXPERIMENTAL_FLASH", "").strip().lower()
+        in ("1", "true", "yes", "on")
+        and os.environ.get("OLMLX_FLASH") is None
+        and not _settings_early.flash
+    ):
+        logger.warning(
+            "OLMLX_EXPERIMENTAL_FLASH is deprecated; rename to OLMLX_FLASH. "
+            "Honoring the legacy name for this run."
+        )
+        _settings_early.flash = True
+
     if _exp_early.flash_moe:
         logger.error(
             "Flash-MoE + distributed is not supported. "

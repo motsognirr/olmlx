@@ -1171,6 +1171,48 @@ class TestBuildParser:
         args = parser.parse_args(["serve", "--kv-cache-quant", "turboquant:4"])
         assert args.kv_cache_quant == "turboquant:4"
 
+    def test_serve_flash_flag_default_none(self):
+        """Bare ``olmlx serve`` leaves ``args.flash`` as None so the env-var
+        value wins (no implicit CLI override)."""
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        assert args.flash is None
+
+    def test_serve_flash_flag_enable(self):
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--flash"])
+        assert args.flash is True
+
+    def test_serve_no_flash_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--no-flash"])
+        assert args.flash is False
+
+    def test_apply_serve_overrides_no_flash_overrides_env(self, monkeypatch):
+        """``--no-flash`` on the CLI overrides ``OLMLX_FLASH=true``."""
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        parser = build_parser()
+        monkeypatch.setattr(_settings, "flash", True)
+        args = parser.parse_args(["serve", "--no-flash"])
+        # ``_apply_serve_overrides`` is heavy (touches registry walk,
+        # legacy shims) — exercise just the flash branch via the same
+        # public entry the live code uses.
+        _apply_serve_overrides(args)
+        assert _settings.flash is False
+
+    def test_apply_serve_overrides_flash_overrides_env(self, monkeypatch):
+        """``--flash`` on the CLI overrides ``OLMLX_FLASH=false`` (the default)."""
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        parser = build_parser()
+        monkeypatch.setattr(_settings, "flash", False)
+        args = parser.parse_args(["serve", "--flash"])
+        _apply_serve_overrides(args)
+        assert _settings.flash is True
+
     def test_legacy_flash_enable_forwarded(self, monkeypatch, caplog):
         """OLMLX_EXPERIMENTAL_FLASH=true → settings.flash=True with a warning."""
         import logging
@@ -1241,7 +1283,9 @@ class TestBuildParser:
         assert _settings.flash_memory_budget_fraction == 0.4
 
     def test_legacy_flash_new_env_var_wins(self, monkeypatch, caplog):
-        """When the new OLMLX_FLASH* env var is set, the legacy value is ignored."""
+        """When the new OLMLX_FLASH* env var is set, the legacy value is
+        fully shadowed: Settings keeps its current value and the banner
+        is suppressed (nothing to migrate)."""
         import logging
 
         from olmlx.cli import _surface_legacy_flash_env
@@ -1252,6 +1296,13 @@ class TestBuildParser:
         # Legacy says false; new says true — without precedence, the
         # legacy value would clobber back to False.
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "false")
+        for legacy in (
+            "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD",
+            "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(legacy, raising=False)
 
         with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
             _surface_legacy_flash_env()
@@ -1259,9 +1310,8 @@ class TestBuildParser:
         # New env var explicitly set → live Settings retains its
         # current value, not the legacy "false".
         assert _settings.flash is True
-        # The bulk deprecation banner still fires (legacy var detected),
-        # which is the only log line this shim emits.
-        assert "Deprecated env vars detected" in caplog.text
+        # The new env var fully shadows the legacy one; no banner.
+        assert "Deprecated env vars detected" not in caplog.text
 
     def test_legacy_flash_no_op_when_unset(self, monkeypatch):
         """No legacy env vars set → no Settings mutation, no warning."""
@@ -1279,6 +1329,33 @@ class TestBuildParser:
         before = _settings.flash
         _surface_legacy_flash_env()
         assert _settings.flash == before
+
+    def test_legacy_flash_false_value_does_not_warn(self, monkeypatch, caplog):
+        """``OLMLX_EXPERIMENTAL_FLASH=false`` parses to the schema default
+        (``flash=False``) so the deprecation banner should NOT fire — there
+        is nothing for the user to migrate."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "flash", False)
+        monkeypatch.delenv("OLMLX_FLASH", raising=False)
+        for legacy in (
+            "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD",
+            "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(legacy, raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "false")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _surface_legacy_flash_env()
+
+        # Nothing migrated, no warning.
+        assert _settings.flash is False
+        assert "Deprecated env vars detected" not in caplog.text
 
     def test_kv_cache_quant_disk_incompat_warning(self, monkeypatch, caplog):
         """prompt_cache_disk + kv_cache_quant together produce a warning."""
