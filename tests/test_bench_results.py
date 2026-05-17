@@ -105,7 +105,7 @@ class TestScenarioResult:
         sr = ScenarioResult(
             scenario_name="flash",
             scenario_description="Flash inference",
-            env_overrides={"OLMLX_EXPERIMENTAL_FLASH": "true"},
+            env_overrides={"OLMLX_FLASH": "true"},
             prompt_results=[],
             skipped=True,
             skip_reason="No flash layout",

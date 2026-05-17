@@ -124,6 +124,18 @@ class Settings(BaseSettings):
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] | None = None
 
+    # Flash inference (LLM in a Flash). Primary, user-facing knobs.
+    # Advanced tuning (window size, IO threads, cache budget, predictor
+    # rank, buffer modes) lives on ``ExperimentalSettings`` and the
+    # ``olmlx flash prepare`` CLI — these five fields are the ones a
+    # typical user needs to touch. Per-model overrides live on
+    # ``ModelConfig`` in ``olmlx.engine.registry``.
+    flash: bool = False
+    flash_sparsity_threshold: Annotated[float, Field(gt=0, le=1.0)] = 0.5
+    flash_min_active_neurons: Annotated[int, Field(gt=0)] = 128
+    flash_max_active_neurons: Annotated[int, Field(gt=0)] | None = None
+    flash_memory_budget_fraction: Annotated[float, Field(gt=0, le=1.0)] | None = None
+
     @model_validator(mode="after")
     def validate_auto_calibrate(self) -> "Settings":
         if self.kv_cache_auto_calibrate and (
@@ -179,11 +191,14 @@ class ExperimentalSettings(BaseSettings):
         "extra": "ignore",
     }
 
-    # Flash inference (LLM in a Flash)
-    flash: bool = False
-    flash_sparsity_threshold: Annotated[float, Field(gt=0, le=1.0)] = 0.5
-    flash_min_active_neurons: Annotated[int, Field(gt=0)] = 128
-    flash_max_active_neurons: Annotated[int, Field(gt=0)] | None = None
+    # Flash inference — advanced/tuning knobs. The primary user-facing
+    # fields (``flash``, ``flash_sparsity_threshold``,
+    # ``flash_min_active_neurons``, ``flash_max_active_neurons``,
+    # ``flash_memory_budget_fraction``) were promoted to ``Settings``;
+    # what remains here is rarely-touched tuning that most users should
+    # not need to set. Per-model overrides for advanced knobs still go
+    # under the ``experimental`` block in models.json. (``distributed_*``
+    # was promoted to ``Settings`` in #326 and removed from here too.)
     flash_window_size: Annotated[int, Field(gt=0)] = 5
     flash_io_threads: Annotated[int, Field(gt=0)] = 32
     flash_cache_budget_neurons: Annotated[int, Field(ge=0)] = 1024
@@ -192,7 +207,6 @@ class ExperimentalSettings(BaseSettings):
     flash_predictor_sensitive_rank_multiplier: Annotated[int, Field(gt=0)] = 4
     flash_bypass_os_cache: bool = False
     flash_preallocated_buffer: bool = False
-    flash_memory_budget_fraction: Annotated[float, Field(gt=0, le=1.0)] | None = None
     flash_prefetch: bool = False
     flash_prefetch_confidence_threshold: Annotated[float, Field(gt=0, le=1.0)] = 0.3
     flash_prefetch_min_neurons: Annotated[int, Field(gt=0)] = 64

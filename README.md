@@ -334,15 +334,27 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_SPECULATIVE_TOKENS` | `4` | Candidate tokens generated per verification step (also `--speculative-tokens`) |
 | `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), or `spectral:2` (also `--kv-cache-quant`) |
 
-### Flash inference settings (experimental)
+### Flash inference settings
+
+Primary user-facing knobs (most users only need `OLMLX_FLASH`):
 
 | Variable | Default | Description |
 |---|---|---|
-| `OLMLX_EXPERIMENTAL_FLASH` | `false` | Enable LLM in a Flash inference |
-| `OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD` | `0.5` | Activation sparsity threshold (0-1] |
-| `OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS` | `128` | Minimum active neurons per layer |
+| `OLMLX_FLASH` | `false` | Enable LLM in a Flash inference (also `--flash` on `olmlx serve`) |
+| `OLMLX_FLASH_SPARSITY_THRESHOLD` | `0.5` | Activation sparsity threshold (0-1] |
+| `OLMLX_FLASH_MIN_ACTIVE_NEURONS` | `128` | Minimum active neurons per layer |
+| `OLMLX_FLASH_MAX_ACTIVE_NEURONS` | *(unset)* | Cap on active neurons per layer |
+| `OLMLX_FLASH_MEMORY_BUDGET_FRACTION` | *(unset)* | Fraction of system RAM Flash may use for its neuron cache |
+
+Advanced tuning (rarely needed; left under the experimental prefix):
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE` | `5` | Rolling-window steps used by the active-neuron policy |
 | `OLMLX_EXPERIMENTAL_FLASH_IO_THREADS` | `32` | I/O threads for SSD weight loading |
 | `OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS` | `1024` | Budget for cached neurons in memory |
+| `OLMLX_EXPERIMENTAL_FLASH_BYPASS_OS_CACHE` | `false` | `O_DIRECT`/`F_NOCACHE` reads (skip page cache) |
+| `OLMLX_EXPERIMENTAL_FLASH_PREALLOCATED_BUFFER` | `false` | Use a single preallocated read buffer per worker |
 | `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE` | `false` | Enable speculative decoding with draft model |
 | `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL` | `None` | Draft model name or HuggingFace path |
 | `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS` | `4` | Candidate tokens per speculative step |
@@ -431,35 +443,63 @@ The settings have been promoted out of `experimental`. The new env vars are `OLM
 
 **Behaviour change — Settings now validate on assignment.** As part of this change, `Settings` runs Pydantic validators on every programmatic field assignment (not just the speculative ones). Code that previously did `settings.port = 0` to test error handling will now raise `ValidationError` instead of silently accepting the bad value. This is intentional — invalid settings should never be reachable — but it is a behaviour change for anyone who was monkey-patching settings in tests or tools.
 
-## LLM in a Flash (Experimental)
+## LLM in a Flash
 
-Run models larger than available GPU memory by keeping only active neurons in RAM and loading the rest from SSD on demand.
+Run models larger than available GPU memory by keeping only active neurons in RAM and loading the rest from SSD on demand. The primary user-facing knobs (`OLMLX_FLASH*`) are stable; only advanced tuning (speculative-prefetch, window size, I/O thread count, etc.) remains under the `OLMLX_EXPERIMENTAL_*` prefix.
 
 ### Setup
 
 ```bash
-# 1. Prepare the model (one-time)
+# 1. Prepare the model (one-time). Takes 15-30 min on an M-series Mac;
+#    produces a `flash/` directory next to the model with bundled
+#    weights and trained sparsity predictors. Disk usage is roughly the
+#    same as the model itself (you keep both the original safetensors
+#    and the bundled .flashweights — the original still hosts attention
+#    weights at load time).
 olmlx flash prepare mlx-community/Qwen2.5-32B-Instruct-4bit
 
 # 2. Check preparation status
 olmlx flash info mlx-community/Qwen2.5-32B-Instruct-4bit
 
 # 3. Start with flash enabled
-OLMLX_EXPERIMENTAL_FLASH=true olmlx serve
+olmlx serve --flash
+# (or: OLMLX_FLASH=true olmlx serve)
 ```
+
+### Supported architectures
+
+Flash dense (sparse FFN with SSD-backed neurons) is validated on Qwen3-family text models today (`Qwen3`, `Qwen3-Coder`, and the hybrid linear-attention variants `Qwen3.5` / `Qwen3-Coder-Next` text towers). Architectures with non-standard FFN shapes (gated MoE, vision encoders, hybrid Mamba blocks) may need adapter work. For Mixture-of-Experts targets use Flash-MoE instead — it routes through a separate code path (`OLMLX_EXPERIMENTAL_FLASH_MOE=true`).
+
+### Tuning the sparsity threshold
+
+`OLMLX_FLASH_SPARSITY_THRESHOLD` (default `0.5`) controls how aggressively neurons are pruned per step. Lower values keep more neurons resident (faster, more RAM), higher values load fewer (slower, less RAM). The trained sparsity predictor outputs a per-neuron activation score; only the top-K above this threshold are loaded for the current token. `OLMLX_FLASH_MIN_ACTIVE_NEURONS` and `OLMLX_FLASH_MAX_ACTIVE_NEURONS` clamp the floor and ceiling so that even a very confident predictor cannot starve a layer or thrash the SSD.
 
 ### Speculative decoding
 
 Combine flash with a small draft model for faster token generation:
 
 ```bash
-OLMLX_EXPERIMENTAL_FLASH=true \
+OLMLX_FLASH=true \
 OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE=true \
 OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit \
 olmlx serve
 ```
 
 The draft model generates candidate tokens in-memory, then the flash model verifies them in one pass — producing multiple tokens per SSD read.
+
+### Migration from `OLMLX_EXPERIMENTAL_FLASH_*`
+
+Flash inference's primary knobs have been promoted out of `experimental`. Rename:
+
+| Old | New |
+|---|---|
+| `OLMLX_EXPERIMENTAL_FLASH` | `OLMLX_FLASH` |
+| `OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD` | `OLMLX_FLASH_SPARSITY_THRESHOLD` |
+| `OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS` | `OLMLX_FLASH_MIN_ACTIVE_NEURONS` |
+| `OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS` | `OLMLX_FLASH_MAX_ACTIVE_NEURONS` |
+| `OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION` | `OLMLX_FLASH_MEMORY_BUDGET_FRACTION` |
+
+The legacy `OLMLX_EXPERIMENTAL_FLASH*` names for these five fields are still honoured for one release with a deprecation warning. Per-model `models.json` entries that previously placed these keys under `"experimental": {...}` now go at the top level — loading an old config raises a clear migration error pointing at the new location. Advanced tuning fields (`OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE`, `..._IO_THREADS`, `..._CACHE_BUDGET_NEURONS`, `..._BYPASS_OS_CACHE`, `..._PREALLOCATED_BUFFER`, `..._PREFETCH*`, `..._SPECULATIVE*`) and the Flash-MoE knobs (`OLMLX_EXPERIMENTAL_FLASH_MOE*`) remain under the experimental prefix.
 
 ### Flash-MoE
 
@@ -556,7 +596,7 @@ Run models across multiple Apple Silicon machines connected via network (Thunder
 
 ### Combining with Flash inference
 
-Flash and distributed can be used together for dense (non-MoE) models. Attention is distributed across ranks while each rank loads active MLP neurons from its local SSD. Each machine must independently run `olmlx flash prepare <model>`. Enable with `OLMLX_EXPERIMENTAL_FLASH=true` alongside distributed settings. See [DISTRIBUTED.md](DISTRIBUTED.md) for details.
+Flash and distributed can be used together for dense (non-MoE) models. Attention is distributed across ranks while each rank loads active MLP neurons from its local SSD. Each machine must independently run `olmlx flash prepare <model>`. Enable with `OLMLX_FLASH=true` alongside distributed settings. See [DISTRIBUTED.md](DISTRIBUTED.md) for details.
 
 ### Limitations
 

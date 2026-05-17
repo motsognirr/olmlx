@@ -896,7 +896,6 @@ class TestBuildParser:
         flash override) must be caught as a flash-conflict — the previous
         per-model-only check missed this case."""
         from olmlx.cli import _audit_speculative_config
-        from olmlx.config import experimental as _exp
         from olmlx.config import settings as _settings
 
         models_json = tmp_path / "models.json"
@@ -914,7 +913,9 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "models_config", models_json)
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
-        monkeypatch.setattr(_exp, "flash", True)
+        # Flash primary knob was promoted out of ``experimental`` —
+        # set it on ``settings`` so ``mc.resolved_flash().enabled`` is True.
+        monkeypatch.setattr(_settings, "flash", True)
 
         bad, dormant, flash_conflicts, dflash_moe_conflicts, _global_used = (
             _audit_speculative_config()
@@ -951,7 +952,7 @@ class TestBuildParser:
                         "hf_path": "conflict/flash-and-spec",
                         "speculative": True,
                         "speculative_draft_model": "conflict/draft",
-                        "experimental": {"flash": True},
+                        "flash": True,
                     },
                 }
             )

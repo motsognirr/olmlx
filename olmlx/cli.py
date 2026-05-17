@@ -454,6 +454,98 @@ def _surface_legacy_kv_cache_quant_env() -> None:
         )
 
 
+# Legacy Flash env var → new env var, attribute, parser.
+# Promoted in PR #274 (Flash promotion); honour for one release with a
+# warning, then drop the entries here and the corresponding logic.
+_LEGACY_FLASH_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], ...] = (
+    (
+        "OLMLX_EXPERIMENTAL_FLASH",
+        "OLMLX_FLASH",
+        "flash",
+        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD",
+        "OLMLX_FLASH_SPARSITY_THRESHOLD",
+        "flash_sparsity_threshold",
+        float,
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
+        "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
+        "flash_min_active_neurons",
+        int,
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
+        "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
+        "flash_max_active_neurons",
+        int,
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
+        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION",
+        "flash_memory_budget_fraction",
+        float,
+    ),
+)
+
+
+def _surface_legacy_flash_env() -> None:
+    """Detect and forward legacy ``OLMLX_EXPERIMENTAL_FLASH*`` (primary
+    knobs only) to the new ``OLMLX_FLASH*`` names.
+
+    Only the five promoted primary knobs are forwarded. Advanced tuning
+    fields (``OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE``,
+    ``..._IO_THREADS``, ``..._CACHE_BUDGET_NEURONS``,
+    ``..._BYPASS_OS_CACHE``, ``..._PREALLOCATED_BUFFER``,
+    ``..._PREDICTOR_*``, ``..._PREFETCH*``, ``..._SPECULATIVE*``,
+    ``..._MOE*``) remain under the experimental prefix and pass through
+    unchanged.
+    """
+    from olmlx.config import Settings, settings as _settings
+
+    stale = [
+        legacy for legacy, _, _, _ in _LEGACY_FLASH_FORWARD if os.environ.get(legacy)
+    ]
+    if not stale:
+        return
+    logger.warning(
+        "Deprecated env vars detected: %s. The Flash primary knobs have "
+        "been promoted out of the experimental prefix — rename to "
+        "OLMLX_FLASH, OLMLX_FLASH_SPARSITY_THRESHOLD, "
+        "OLMLX_FLASH_MIN_ACTIVE_NEURONS, OLMLX_FLASH_MAX_ACTIVE_NEURONS, "
+        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION. The legacy names will be "
+        "removed in a future release. Advanced flash tuning fields "
+        "(window_size, io_threads, cache_budget_neurons, predictor_*, "
+        "prefetch_*, etc.) remain under OLMLX_EXPERIMENTAL_FLASH_*.",
+        ", ".join(stale),
+    )
+    for legacy, new, attr, parse in _LEGACY_FLASH_FORWARD:
+        legacy_val = os.environ.get(legacy)
+        if legacy_val is None:
+            continue
+        if os.environ.get(new) is not None:
+            continue
+        field_default = Settings.model_fields[attr].default
+        if getattr(_settings, attr) != field_default:
+            # ``.env`` (or programmatic write at import time) already
+            # supplied a non-default value; don't let the legacy var
+            # clobber it.
+            continue
+        try:
+            value = parse(legacy_val)
+            setattr(_settings, attr, value)
+        except Exception as exc:
+            logger.warning(
+                "Could not forward legacy env var %s=%r to %s: %s",
+                legacy,
+                legacy_val,
+                new,
+                exc,
+            )
+
+
 def _warn_kv_cache_quant_incompatibilities() -> None:
     """Warn about tracked incompatibilities at startup."""
     from olmlx.config import settings as _settings
@@ -587,6 +679,7 @@ def _apply_serve_overrides(args) -> None:
 
     _surface_legacy_speculative_env()
     _surface_legacy_dflash_env()
+    _surface_legacy_flash_env()
 
     # ``getattr`` defends programmatic callers that hand a bare
     # ``argparse.Namespace`` (e.g. tests) without populating these
@@ -608,6 +701,10 @@ def _apply_serve_overrides(args) -> None:
     kvq = getattr(args, "kv_cache_quant", None)
     if kvq is not None:
         _settings.kv_cache_quant = kvq
+
+    flash_flag = getattr(args, "flash", None)
+    if flash_flag is not None:
+        _settings.flash = flash_flag
 
     _surface_legacy_kv_cache_quant_env()
 
@@ -856,8 +953,10 @@ def _audit_speculative_config() -> tuple[
             global_draft_used = True
         if enabled:
             # Resolve the full experimental config (global defaults
-            # merged with per-model overrides) so a globally enabled
-            # OLMLX_EXPERIMENTAL_FLASH still trips the conflict check.
+            # merged with per-model overrides) for the advanced/MoE
+            # knobs that still live under ``experimental``. Flash
+            # primary knobs are now promoted to top-level and resolved
+            # via ``mc.resolved_flash()``.
             try:
                 resolved_exp = resolve_experimental(global_exp, mc.experimental)
             except Exception as exc:
@@ -869,7 +968,18 @@ def _audit_speculative_config() -> tuple[
                     exc_info=True,
                 )
                 continue
-            if resolved_exp.flash:
+            try:
+                resolved_flash = mc.resolved_flash()
+            except Exception as exc:
+                logger.warning(
+                    "Skipping flash-conflict check for %s: could not "
+                    "resolve flash overrides: %s",
+                    name,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            if resolved_flash.enabled:
                 flash_conflicts.append(name)
             if resolved_exp.flash_moe and strategy == "dflash":
                 dflash_moe_conflicts.append(name)
@@ -1169,7 +1279,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
         )
         sys.exit(1)
 
-    if experimental.flash and strategy == "pipeline":
+    if settings.flash and strategy == "pipeline":
         print(
             "Error: Flash + pipeline distributed strategy is not supported. "
             "Use tensor strategy or disable Flash.",
@@ -1180,7 +1290,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
     # Pre-shard and distribute weights to workers if enabled
     pre_sharded = False
     if settings.distributed_pre_shard:
-        if experimental.flash:
+        if settings.flash:
             logger.info(
                 "Skipping pre-sharding: Flash mode shards only attention "
                 "layers at runtime, MLP weights are loaded from SSD on "
@@ -1242,13 +1352,20 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
                 )
         if _resolved_kvq:
             env["OLMLX_KV_CACHE_QUANT"] = _resolved_kvq
-        if experimental.flash:
-            env["OLMLX_EXPERIMENTAL_FLASH"] = "true"
+        if settings.flash:
+            env["OLMLX_FLASH"] = "true"
             # Forward all flash tuning params so worker FlashConfig matches.
-            # OLMLX_EXPERIMENTAL_FLASH_MOE also matches this prefix but is
-            # safe: the flash_moe guard above already exited if it was true.
+            # Promoted primary knobs live under ``OLMLX_FLASH_*``; advanced
+            # tuning still lives under ``OLMLX_EXPERIMENTAL_FLASH_*``.
+            # OLMLX_EXPERIMENTAL_FLASH_MOE also matches the experimental
+            # prefix but is safe: the flash_moe guard above already exited
+            # if it was true.
             for key, val in os.environ.items():
-                if key.startswith("OLMLX_EXPERIMENTAL_FLASH_") and key not in env:
+                if key in env:
+                    continue
+                if key.startswith("OLMLX_FLASH_") or key.startswith(
+                    "OLMLX_EXPERIMENTAL_FLASH_"
+                ):
                     env[key] = val
         env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
 
@@ -1586,6 +1703,7 @@ def cmd_chat(args):
     # ``serve`` handles it correctly.
     _surface_legacy_speculative_env()
     _surface_legacy_kv_cache_quant_env()
+    _surface_legacy_flash_env()
     _warn_kv_cache_quant_incompatibilities()
 
     model_name = args.model_name
@@ -1937,6 +2055,7 @@ def cmd_config_show(_args):
     """Show current configuration."""
     _surface_legacy_kv_cache_quant_env()
     _surface_legacy_distributed_env()
+    _surface_legacy_flash_env()
 
     print(f"Host:                   {settings.host}")
     print(f"Port:                   {settings.port}")
@@ -1951,6 +2070,13 @@ def cmd_config_show(_args):
     print(f"CORS origins:           {settings.cors_origins}")
     if settings.kv_cache_quant:
         print(f"KV cache quant:         {settings.kv_cache_quant}")
+    if settings.flash:
+        print("Flash inference:        enabled")
+        print(f"  Sparsity threshold:   {settings.flash_sparsity_threshold}")
+        print(f"  Min active neurons:   {settings.flash_min_active_neurons}")
+        print(f"  Max active neurons:   {settings.flash_max_active_neurons}")
+        if settings.flash_memory_budget_fraction is not None:
+            print(f"  Memory budget frac:   {settings.flash_memory_budget_fraction}")
     if settings.distributed:
         print()
         print("Distributed inference:")
@@ -2187,7 +2313,8 @@ def _cmd_flash_dense_prepare(args, model_path):
     print("\nFlash preparation complete!")
     print(f"  Output: {output_dir}")
     print("\nTo use flash inference:")
-    print("  OLMLX_EXPERIMENTAL_FLASH=true olmlx serve")
+    print("  olmlx serve --flash")
+    print("  # or set OLMLX_FLASH=true")
 
 
 def cmd_dflash_precompute(args):
@@ -2512,7 +2639,8 @@ def _show_flash_dense_info(model_name, flash_dir):
     print(f"  Total size:         {total_bytes / (1024**2):.1f} MB")
 
     print("\nTo use flash inference:")
-    print("  OLMLX_EXPERIMENTAL_FLASH=true olmlx serve")
+    print("  olmlx serve --flash")
+    print("  # or set OLMLX_FLASH=true")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2568,6 +2696,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="KV cache quantization method and bits (e.g. turboquant:4, spectral:2)",
+    )
+    serve_p.add_argument(
+        "--flash",
+        dest="flash",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable Flash inference (LLM in a Flash; sparse FFN with SSD-"
+            "backed neuron loading). Overrides OLMLX_FLASH. Requires the "
+            "model to be prepared first via 'olmlx flash prepare'."
+        ),
     )
 
     svc = sub.add_parser("service", help="Manage the launchd service")

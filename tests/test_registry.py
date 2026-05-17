@@ -317,14 +317,14 @@ class TestModelConfig:
         """Dict entries in models.json become ModelConfig with full config."""
         entry = {
             "hf_path": "Qwen/Qwen3-8B-MLX",
-            "experimental": {"flash": True},
+            "experimental": {"flash_window_size": 10},
             "kv_cache_quant": "turboquant:4",
             "options": {"temperature": 0.7, "num_predict": 2048},
             "keep_alive": "30m",
         }
         mc = ModelConfig.from_entry(entry)
         assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
-        assert mc.experimental == {"flash": True}
+        assert mc.experimental == {"flash_window_size": 10}
         assert mc.kv_cache_quant == "turboquant:4"
         assert mc.options == {"temperature": 0.7, "num_predict": 2048}
         assert mc.keep_alive == "30m"
@@ -338,7 +338,7 @@ class TestModelConfig:
 
     def test_from_dict_missing_hf_path_raises(self):
         with pytest.raises(ValueError, match="hf_path"):
-            ModelConfig.from_entry({"experimental": {"flash": True}})
+            ModelConfig.from_entry({"experimental": {"flash_window_size": 10}})
 
     def test_from_string_timeouts_default_none(self):
         """String entries default timeout fields to None."""
@@ -463,14 +463,14 @@ class TestModelConfig:
         """ModelConfig with overrides serializes to dict."""
         mc = ModelConfig(
             hf_path="org/model",
-            experimental={"flash": True},
+            experimental={"flash_window_size": 10},
             options={"temperature": 0.5},
             keep_alive="10m",
         )
         entry = mc.to_entry()
         assert isinstance(entry, dict)
         assert entry["hf_path"] == "org/model"
-        assert entry["experimental"] == {"flash": True}
+        assert entry["experimental"] == {"flash_window_size": 10}
         assert entry["options"] == {"temperature": 0.5}
         assert entry["keep_alive"] == "10m"
 
@@ -501,7 +501,7 @@ class TestModelConfig:
 
     def test_to_entry_omits_empty_sections(self):
         """Only non-empty sections are included in dict serialization."""
-        mc = ModelConfig(hf_path="org/model", experimental={"flash": True})
+        mc = ModelConfig(hf_path="org/model", experimental={"flash_window_size": 10})
         entry = mc.to_entry()
         assert isinstance(entry, dict)
         assert "options" not in entry
@@ -553,7 +553,7 @@ class TestRegistryModelConfig:
             "llama3:latest": "mlx-community/Llama-3.2-3B-Instruct-4bit",
             "qwen3:latest": {
                 "hf_path": "Qwen/Qwen3-8B-MLX",
-                "experimental": {"flash": True},
+                "experimental": {"flash_window_size": 10},
                 "options": {"temperature": 0.3},
             },
         }
@@ -568,7 +568,7 @@ class TestRegistryModelConfig:
             == "mlx-community/Llama-3.2-3B-Instruct-4bit"
         )
         assert isinstance(reg._mappings["qwen3:latest"], ModelConfig)
-        assert reg._mappings["qwen3:latest"].experimental == {"flash": True}
+        assert reg._mappings["qwen3:latest"].experimental == {"flash_window_size": 10}
 
     def test_resolve_returns_model_config(self, tmp_path, monkeypatch):
         """resolve() returns ModelConfig instead of plain string."""
@@ -644,7 +644,7 @@ class TestRegistryModelConfig:
         config = {
             "qwen3:latest": {
                 "hf_path": "Qwen/Qwen3-8B-MLX",
-                "experimental": {"flash": True},
+                "experimental": {"flash_window_size": 10},
                 "kv_cache_quant": "turboquant:4",
                 "options": {"temperature": 0.7},
             }
@@ -660,7 +660,7 @@ class TestRegistryModelConfig:
         reg2 = ModelRegistry()
         reg2.load()
         qwen = reg2._mappings["qwen3:latest"]
-        assert qwen.experimental == {"flash": True}
+        assert qwen.experimental == {"flash_window_size": 10}
         assert qwen.kv_cache_quant == "turboquant:4"
         assert qwen.options == {"temperature": 0.7}
 
@@ -681,7 +681,7 @@ class TestRegistryModelConfig:
             "llama3:latest": "mlx-community/Llama-3.2-3B-Instruct-4bit",
             "qwen3:latest": {
                 "hf_path": "Qwen/Qwen3-8B-MLX",
-                "experimental": {"flash": True},
+                "experimental": {"flash_window_size": 10},
             },
         }
         config_path = tmp_path / "models.json"
@@ -701,12 +701,12 @@ class TestRegistryModelConfig:
         reg.load()
         mc = ModelConfig(
             hf_path="org/model",
-            experimental={"flash": True},
+            experimental={"flash_window_size": 10},
             options={"temperature": 0.5},
         )
         reg.add_mapping("my-model", "org/model", model_config=mc)
         result = reg.resolve("my-model")
-        assert result.experimental == {"flash": True}
+        assert result.experimental == {"flash_window_size": 10}
         assert result.options == {"temperature": 0.5}
 
     def test_alias_resolves_to_model_config(self, tmp_path, monkeypatch):
@@ -714,7 +714,7 @@ class TestRegistryModelConfig:
         config = {
             "qwen3:latest": {
                 "hf_path": "Qwen/Qwen3-8B-MLX",
-                "experimental": {"flash": True},
+                "experimental": {"flash_window_size": 10},
             }
         }
         config_path = tmp_path / "models.json"
@@ -727,14 +727,14 @@ class TestRegistryModelConfig:
         result = reg.resolve("my-qwen")
         assert isinstance(result, ModelConfig)
         assert result.hf_path == "Qwen/Qwen3-8B-MLX"
-        assert result.experimental == {"flash": True}
+        assert result.experimental == {"flash_window_size": 10}
 
     def test_alias_stores_canonical_name(self, tmp_path, monkeypatch):
         """add_alias stores the canonical model name, not the hf_path."""
         config = {
             "qwen3:latest": {
                 "hf_path": "Qwen/Qwen3-8B-MLX",
-                "experimental": {"flash": True},
+                "experimental": {"flash_window_size": 10},
             }
         }
         config_path = tmp_path / "models.json"
@@ -777,7 +777,7 @@ class TestRegistryModelConfig:
         config = {
             "qwen3:latest": {
                 "hf_path": "Qwen/Qwen3-8B-MLX",
-                "experimental": {"flash": True},
+                "experimental": {"flash_window_size": 10},
             }
         }
         config_path = tmp_path / "models.json"
@@ -788,7 +788,7 @@ class TestRegistryModelConfig:
         reg.load()
         reg.add_alias("my-qwen", "qwen3")
         models = reg.list_models()
-        assert models["my-qwen:latest"].experimental == {"flash": True}
+        assert models["my-qwen:latest"].experimental == {"flash_window_size": 10}
 
     def test_invalid_option_key_rejected(self):
         """Unknown keys in options dict are rejected at parse time."""
@@ -841,7 +841,7 @@ class TestRegistryModelConfig:
             ModelConfig.from_entry(
                 {
                     "hf_path": "org/model",
-                    "experimental": {"flash_sparsity_threshold": -1.0},
+                    "experimental": {"flash_window_size": -1},
                 }
             )
 
@@ -970,7 +970,7 @@ class TestRegistryModelConfig:
         config = {
             "qwen3:latest": {
                 "hf_path": "Qwen/Qwen3-8B-MLX",
-                "experimental": {"flash": True},
+                "experimental": {"flash_window_size": 10},
                 "options": {"temperature": 0.7},
                 "keep_alive": "30m",
             }
@@ -984,7 +984,7 @@ class TestRegistryModelConfig:
         reg.add_mapping("qwen3", "Qwen/Qwen3-8B-MLX")
         # Rich config should be preserved
         mc = reg._mappings["qwen3:latest"]
-        assert mc.experimental == {"flash": True}
+        assert mc.experimental == {"flash_window_size": 10}
         assert mc.options == {"temperature": 0.7}
         assert mc.keep_alive == "30m"
 
