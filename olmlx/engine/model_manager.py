@@ -1005,8 +1005,15 @@ class ModelManager:
         # immediately.  Without this, the LoadedModel field keeps the MLX
         # arrays alive through the GC pass — the exact leak pattern behind
         # issue #223.
-        lm.model = None
-        lm.tokenizer = None
+        #
+        # Null only on success so the re-entry drain in _close_evictees
+        # can safely call _close_loaded_model a second time: if weight_store
+        # or speculative_decoder raised, the drain retries and must find
+        # ``lm.model`` still set so ``getattr(lm.model, "prefetcher", None)``
+        # doesn't crash (issue #315 re-entry contract).
+        if not errors:
+            lm.model = None
+            lm.tokenizer = None
         # ``lm.model.prefetcher`` is intentionally not nulled — it lives on
         # the FlashModelWrapper, not on the LM bookkeeping, and the wrapper
         # goes away with the LM.
@@ -1209,6 +1216,28 @@ class ModelManager:
                 gc.collect()
                 mx.clear_cache()
 
+            # Pre-load memory hygiene: if Metal memory is still under
+            # pressure after eviction + close + gc, evict prompt caches
+            # from all remaining loaded models and do another cleanup pass.
+            # Runs OUTSIDE the lock and offloads disk I/O to worker threads
+            # so concurrent ensure_loaded callers — including ones asking
+            # for already-loaded models — are not stalled (issue #315).
+            # Without this hygiene pass, loading a model on top of residual
+            # GPU allocations from a prior model pushes Metal into swap,
+            # causing the sub-token-per-second thrashing documented in
+            # issue #223.
+            if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+                logger.warning(
+                    "Metal memory under pressure before loading %s; "
+                    "flushing prompt caches to free GPU memory",
+                    normalized,
+                )
+                for other_lm in self._loaded.values():
+                    if other_lm.prompt_cache_store is not None:
+                        await other_lm.prompt_cache_store.async_evict_all_to_disk()
+                gc.collect()
+                mx.clear_cache()
+
             async with self._lock:
                 # State may have changed while the lock was released for the
                 # close. Re-validate before proceeding with the load.
@@ -1229,26 +1258,6 @@ class ModelManager:
 
                 logger.info("Loading model %s from %s", normalized, hf_path)
                 mem_before = memory_utils.get_metal_memory()
-
-                # Pre-load memory hygiene: if Metal memory is still under
-                # pressure after eviction + close + gc, evict prompt caches
-                # from all remaining loaded models and do another cleanup pass.
-                # Without this, loading a model on top of residual GPU
-                # allocations from a prior model pushes Metal into swap,
-                # causing the sub-token-per-second thrashing documented in
-                # issue #223.
-                if memory_utils.is_memory_pressure_high(
-                    settings.memory_limit_fraction
-                ):
-                    logger.warning(
-                        "Metal memory under pressure before loading %s; "
-                        "flushing prompt caches to free GPU memory",
-                        normalized,
-                    )
-                    for other_lm in self._loaded.values():
-                        other_lm.prompt_cache_store.evict_all_to_disk()
-                    gc.collect()
-                    mx.clear_cache()
 
                 # Initialize before try so the except handler can always
                 # clean up, whether _load_model or the post-load check fails.

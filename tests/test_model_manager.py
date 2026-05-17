@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -3480,6 +3480,78 @@ class TestEvictLruIfNeeded:
         assert lm.weight_store is weight_store
         assert lm.speculative_decoder is None
 
+    def test_close_loaded_model_clears_prompt_cache(self, registry, mock_store):
+        """_close_loaded_model must clear prompt caches on eviction.
+
+        CachedPromptState objects hold per-layer GPU KV cache buffers. If
+        we don't clear them during eviction, the GPU memory remains
+        allocated even after ``gc.collect()`` — the Metal buffers survive
+        because the PromptCacheStore references keep them alive.
+        """
+        manager = ModelManager(registry, mock_store)
+        cache_store = MagicMock()
+        lm = LoadedModel(
+            name="x",
+            hf_path="x/x",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            prompt_cache_store=cache_store,
+        )
+        manager._close_loaded_model(lm)
+        cache_store.clear.assert_called_once()
+
+    def test_close_loaded_model_nulls_model_and_tokenizer(self, registry, mock_store):
+        """_close_loaded_model must null model/tokenizer for prompt GC.
+
+        On a clean close path (no prior errors), the LoadedModel's .model
+        and .tokenizer fields must be None so the caller's subsequent
+        ``gc.collect()`` can reclaim the Metal buffers.
+        """
+        manager = ModelManager(registry, mock_store)
+        mock_model = MagicMock()
+        mock_tok = MagicMock()
+        lm = LoadedModel(
+            name="x",
+            hf_path="x/x",
+            model=mock_model,
+            tokenizer=mock_tok,
+        )
+        manager._close_loaded_model(lm)
+        assert lm.model is None
+        assert lm.tokenizer is None
+
+    def test_close_loaded_model_preserves_model_on_prior_failure(
+        self, registry, mock_store
+    ):
+        """Nulls are skipped when a prior close step failed (re-entry contract).
+
+        The ``_close_evictees`` finally-drain path may call
+        ``_close_loaded_model`` a second time after a first call raised.
+        If the first call nulled ``lm.model`` unconditionally, the
+        re-entry's ``getattr(lm.model, "prefetcher", None)`` would crash
+        with ``AttributeError``. The nulls must be guarded by
+        ``if not errors:`` so re-entry finds the fields intact.
+        """
+        manager = ModelManager(registry, mock_store)
+        weight_store = MagicMock()
+        weight_store.close.side_effect = RuntimeError("stuck-weight-store")
+        mock_model = MagicMock()
+        mock_tok = MagicMock()
+        lm = LoadedModel(
+            name="x",
+            hf_path="x/x",
+            model=mock_model,
+            tokenizer=mock_tok,
+            weight_store=weight_store,
+        )
+
+        with pytest.raises(ExceptionGroup):
+            manager._close_loaded_model(lm)
+        # weight_store.close() raised → errors non-empty → model/tokenizer
+        # MUST remain set so a re-entry close can still inspect lm.model.
+        assert lm.model is mock_model
+        assert lm.tokenizer is mock_tok
+
     @pytest.mark.asyncio
     async def test_close_evictees_absorbs_close_failure(
         self, registry, mock_store, caplog
@@ -3745,6 +3817,59 @@ class TestEvictLruIfNeeded:
             await manager.ensure_loaded("new")
 
         assert lock_held_during_close == [False]
+
+    @pytest.mark.asyncio
+    async def test_ensure_loaded_preload_memory_hygiene(
+        self, registry, mock_store, monkeypatch
+    ):
+        """ensure_loaded must flush prompt caches from remaining models before load.
+
+        After closing evictees, Metal memory can still be under pressure
+        if the previous model's prompt caches or residual Metal allocations
+        weren't fully reclaimed. The pre-load memory hygiene path must run
+        OUTSIDE _lock (Bug 1) and use async_evict_all_to_disk() to offload
+        disk I/O to a worker thread.
+        """
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 2)
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", None
+        )
+        monkeypatch.setattr(
+            "olmlx.utils.memory.is_memory_pressure_high",
+            lambda _fraction, threshold=0.9: True,
+        )
+        manager = ModelManager(registry, mock_store)
+
+        cache_store = MagicMock()
+        cache_store.async_evict_all_to_disk = AsyncMock()
+        existing = LoadedModel(
+            name="existing:latest",
+            hf_path="existing/repo",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            prompt_cache_store=cache_store,
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["existing:latest"] = existing
+
+        manager.registry.resolve = MagicMock(  # type: ignore[method-assign]
+            return_value=ModelConfig(hf_path="new/repo")
+        )
+        manager.registry.normalize_name = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda n: f"{n}:latest"
+        )
+
+        def _shard(*args, **kwargs):
+            raise RuntimeError("stop before load")
+
+        monkeypatch.setattr(manager, "_load_model_and_shard", _shard)
+
+        with pytest.raises(RuntimeError, match="stop before load"):
+            await manager.ensure_loaded("new")
+
+        # Pre-load memory hygiene must have flushed the remaining model's
+        # prompt caches (async path — offloaded to thread).
+        cache_store.async_evict_all_to_disk.assert_called()
 
 
 class TestSpeculativeLoading:
