@@ -1003,6 +1003,48 @@ class TestBuildParser:
         assert dflash_moe == ["moe-dflash/m:latest"]
         assert global_used is False
 
+    def test_audit_moe_check_survives_flash_resolution_failure(
+        self, monkeypatch, tmp_path
+    ):
+        """A model with both flash-MoE/dflash *and* an inverted flash range
+        must still be caught by the MoE conflict check, even though
+        ``resolved_flash()`` raises on the inverted range.
+
+        Regression test for the ``continue`` that previously short-
+        circuited both checks together when either resolver failed.
+        """
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "moe-dflash-bad/m:latest": {
+                        "hf_path": "moe-dflash-bad/m",
+                        "speculative": True,
+                        "speculative_strategy": "dflash",
+                        "speculative_draft_model": "moe-dflash-bad/draft",
+                        # Per-model min crosses the (default) global max
+                        # → ``resolved_flash()`` raises "inverted range".
+                        "flash_min_active_neurons": 1_000_000,
+                        "experimental": {"flash_moe": True},
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", 32)
+        monkeypatch.setattr(_settings, "flash_max_active_neurons", 100)
+
+        bad, dormant, flash, dflash_moe, _global_used = _audit_speculative_config()
+        # Flash list is empty (resolution failed) but MoE check still
+        # populated the dflash_moe bucket.
+        assert flash == []
+        assert dflash_moe == ["moe-dflash-bad/m:latest"]
+
     def test_service_install(self):
         parser = build_parser()
         args = parser.parse_args(["service", "install"])
@@ -1207,17 +1249,19 @@ class TestBuildParser:
 
         monkeypatch.setattr(_settings, "flash", True)
         monkeypatch.setenv("OLMLX_FLASH", "true")
+        # Legacy says false; new says true — without precedence, the
+        # legacy value would clobber back to False.
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "false")
 
         with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
             _surface_legacy_flash_env()
 
-        # New env var explicitly set → legacy is reported as stale but
-        # not applied. Live Settings retains its current value.
+        # New env var explicitly set → live Settings retains its
+        # current value, not the legacy "false".
         assert _settings.flash is True
-        # The bulk deprecation banner still fires, but the per-field
-        # ``Forwarding legacy`` line does not.
-        assert "Forwarding legacy" not in caplog.text
+        # The bulk deprecation banner still fires (legacy var detected),
+        # which is the only log line this shim emits.
+        assert "Deprecated env vars detected" in caplog.text
 
     def test_legacy_flash_no_op_when_unset(self, monkeypatch):
         """No legacy env vars set → no Settings mutation, no warning."""

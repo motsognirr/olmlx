@@ -966,31 +966,40 @@ def _audit_speculative_config() -> tuple[
             # knobs that still live under ``experimental``. Flash
             # primary knobs are now promoted to top-level and resolved
             # via ``mc.resolved_flash()``.
+            #
+            # The two ``resolve_*`` calls cover independent conflict
+            # checks (flash vs flash-MoE/dflash), so a failure in one
+            # must not skip the other. Track each result separately and
+            # guard the per-result check on a successful resolution.
+            resolved_exp = None
+            resolved_flash = None
             try:
                 resolved_exp = resolve_experimental(global_exp, mc.experimental)
             except Exception as exc:
                 logger.warning(
-                    "Skipping flash-conflict check for %s: could not "
+                    "Skipping flash-MoE conflict check for %s: could not "
                     "resolve experimental overrides: %s",
                     name,
                     exc,
                     exc_info=True,
                 )
-                continue
             try:
                 resolved_flash = mc.resolved_flash()
             except Exception as exc:
                 logger.warning(
-                    "Skipping flash-conflict check for %s: could not "
+                    "Skipping flash conflict check for %s: could not "
                     "resolve flash overrides: %s",
                     name,
                     exc,
                     exc_info=True,
                 )
-                continue
-            if resolved_flash.enabled:
+            if resolved_flash is not None and resolved_flash.enabled:
                 flash_conflicts.append(name)
-            if resolved_exp.flash_moe and strategy == "dflash":
+            if (
+                resolved_exp is not None
+                and resolved_exp.flash_moe
+                and strategy == "dflash"
+            ):
                 dflash_moe_conflicts.append(name)
     return bad, dormant, flash_conflicts, dflash_moe_conflicts, global_draft_used
 
@@ -2103,7 +2112,8 @@ def cmd_config_show(_args):
         print("Flash inference:        enabled")
         print(f"  Sparsity threshold:   {settings.flash_sparsity_threshold}")
         print(f"  Min active neurons:   {settings.flash_min_active_neurons}")
-        print(f"  Max active neurons:   {settings.flash_max_active_neurons}")
+        if settings.flash_max_active_neurons is not None:
+            print(f"  Max active neurons:   {settings.flash_max_active_neurons}")
         if settings.flash_memory_budget_fraction is not None:
             print(f"  Memory budget frac:   {settings.flash_memory_budget_fraction}")
     if settings.distributed:
