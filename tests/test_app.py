@@ -395,6 +395,80 @@ class TestErrorHandlers:
         assert resp.headers.get("retry-after") == "5"
 
     @pytest.mark.asyncio
+    async def test_spectral_calibration_missing_ollama(self, app_client):
+        from unittest.mock import AsyncMock
+
+        from olmlx.engine.model_manager import SpectralCalibrationMissingError
+
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = SpectralCalibrationMissingError(
+                "SpectralQuant configured (spectral:4) but no calibration data found. "
+                "Run 'olmlx spectral prepare test/model'"
+            )
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "hi",
+                    "stream": False,
+                },
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert "SpectralQuant" in data["error"]
+        assert "spectral prepare" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_spectral_calibration_missing_anthropic(self, app_client):
+        from unittest.mock import AsyncMock
+
+        from olmlx.engine.model_manager import SpectralCalibrationMissingError
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = SpectralCalibrationMissingError(
+                "SpectralQuant configured (spectral:4) but no calibration data found"
+            )
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                },
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "invalid_request_error"
+
+    @pytest.mark.asyncio
+    async def test_spectral_calibration_missing_openai(self, app_client):
+        from unittest.mock import AsyncMock
+
+        from olmlx.engine.model_manager import SpectralCalibrationMissingError
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = SpectralCalibrationMissingError(
+                "SpectralQuant configured (spectral:4) but no calibration data found"
+            )
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"]["code"] == "calibration_missing"
+
+    @pytest.mark.asyncio
     async def test_general_endpoints_exist(self, app_client):
         resp = await app_client.get("/")
         assert resp.status_code == 200
