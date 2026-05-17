@@ -1266,8 +1266,15 @@ class ModelManager:
                 # case a few cache entries are not flushed to disk, but
                 # GPU memory is freed either way.
                 for other_lm in list(self._loaded.values()):
-                    if other_lm.prompt_cache_store is not None:
-                        await other_lm.prompt_cache_store.async_evict_all_to_disk()
+                    # Capture the store reference before the await to
+                    # prevent TOCTOU: _expire_stale (background task,
+                    # every 30s) may concurrently close this model,
+                    # setting ``other_lm.prompt_cache_store = None``
+                    # during the yield.  If that happens, re-evaluating
+                    # the field would raise AttributeError.
+                    store = other_lm.prompt_cache_store
+                    if store is not None:
+                        await store.async_evict_all_to_disk()
                 # Skip gc/clear when a deferred cleanup is pending:
                 # mx.clear_cache() is not safe to call concurrently with
                 # active Metal allocations from a background thread (see
