@@ -5,10 +5,13 @@ loads the model, shards it, then runs stream_generate in lockstep
 with rank 0 for each inference request.
 
 Environment variables:
-    OLMLX_EXPERIMENTAL_DISTRIBUTED_MODEL: HF model path to load
-    OLMLX_EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST: rank 0 hostname
-    OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT: coordinator sideband port
-    OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET: shared secret for authentication
+    OLMLX_DISTRIBUTED_MODEL: HF model path to load
+    OLMLX_DISTRIBUTED_COORDINATOR_HOST: rank 0 hostname
+    OLMLX_DISTRIBUTED_SIDEBAND_PORT: coordinator sideband port
+    OLMLX_DISTRIBUTED_SECRET: shared secret for authentication
+
+Legacy (OLMLX_EXPERIMENTAL_DISTRIBUTED_*) names are also accepted
+for backward compatibility.
 """
 
 from __future__ import annotations
@@ -18,6 +21,33 @@ import os
 import sys
 
 logger = logging.getLogger(__name__)
+
+
+# New env var name → legacy env var name for backward compatibility.
+_DISTRIBUTED_ENV_MAP: dict[str, str] = {
+    "OLMLX_DISTRIBUTED_MODEL": "OLMLX_EXPERIMENTAL_DISTRIBUTED_MODEL",
+    "OLMLX_DISTRIBUTED_COORDINATOR_HOST": "OLMLX_EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST",
+    "OLMLX_DISTRIBUTED_SIDEBAND_PORT": "OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT",
+    "OLMLX_DISTRIBUTED_SECRET": "OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET",
+    "OLMLX_DISTRIBUTED_SECRET_FILE": "OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET_FILE",
+    "OLMLX_DISTRIBUTED_BACKEND": "OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND",
+    "OLMLX_DISTRIBUTED_STRATEGY": "OLMLX_EXPERIMENTAL_DISTRIBUTED_STRATEGY",
+    "OLMLX_DISTRIBUTED_LAYER_COUNTS": "OLMLX_EXPERIMENTAL_DISTRIBUTED_LAYER_COUNTS",
+}
+
+
+def _get_env(name: str, default: str | None = None) -> str | None:
+    """Read *name* from the environment with legacy fallback."""
+    val = os.environ.get(name)
+    if val is not None:
+        return val
+    legacy_name = _DISTRIBUTED_ENV_MAP.get(name)
+    if legacy_name is not None:
+        val = os.environ.get(legacy_name)
+        if val is not None:
+            logger.warning("Using legacy env var %s — rename to %s", legacy_name, name)
+            return val
+    return default
 
 
 def _load_pre_sharded(shard_dir_str, group):
@@ -144,9 +174,9 @@ def worker_main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    model_path = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_MODEL")
+    model_path = _get_env("OLMLX_DISTRIBUTED_MODEL")
     if not model_path:
-        logger.error("OLMLX_EXPERIMENTAL_DISTRIBUTED_MODEL not set")
+        logger.error("OLMLX_DISTRIBUTED_MODEL not set")
         sys.exit(1)
 
     # Check Flash-MoE before ring init — exiting after init hangs the
@@ -157,11 +187,11 @@ def worker_main() -> None:
         logger.error(
             "Flash-MoE + distributed is not supported. "
             "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or "
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED."
+            "OLMLX_DISTRIBUTED."
         )
         sys.exit(1)
 
-    strategy = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_STRATEGY", "tensor")
+    strategy = _get_env("OLMLX_DISTRIBUTED_STRATEGY", "tensor")
     if strategy == "pipeline" and _exp_early.flash:
         logger.error(
             "Flash + pipeline distributed strategy is not supported. "
@@ -185,14 +215,10 @@ def worker_main() -> None:
             )
             sys.exit(1)
 
-    coordinator_host = os.environ.get(
-        "OLMLX_EXPERIMENTAL_DISTRIBUTED_COORDINATOR_HOST", "127.0.0.1"
-    )
-    sideband_port = int(
-        os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT", "32400")
-    )
+    coordinator_host = _get_env("OLMLX_DISTRIBUTED_COORDINATOR_HOST", "127.0.0.1")
+    sideband_port = int(_get_env("OLMLX_DISTRIBUTED_SIDEBAND_PORT", "32400"))
 
-    secret_file = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET_FILE")
+    secret_file = _get_env("OLMLX_DISTRIBUTED_SECRET_FILE")
     if secret_file:
         from pathlib import Path
 
@@ -204,10 +230,10 @@ def worker_main() -> None:
             logger.error("Failed to read secret from %s: %s", secret_file, e)
             sys.exit(1)
     else:
-        secret = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET", "") or None
+        secret = _get_env("OLMLX_DISTRIBUTED_SECRET", "") or None
 
     # Initialize MLX distributed
-    backend = os.environ.get("OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND", "ring")
+    backend = _get_env("OLMLX_DISTRIBUTED_BACKEND", "ring")
     group = mx.distributed.init(backend=backend)
     rank = group.rank()
     world_size = group.size()
@@ -230,9 +256,7 @@ def worker_main() -> None:
 
     if strategy == "pipeline":
         # Pipeline mode: load model, apply pipeline partitioning
-        layer_counts_str = os.environ.get(
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED_LAYER_COUNTS", ""
-        )
+        layer_counts_str = _get_env("OLMLX_DISTRIBUTED_LAYER_COUNTS", "")
         try:
             layer_counts = (
                 [int(x) for x in layer_counts_str.split(",") if x]
@@ -241,7 +265,7 @@ def worker_main() -> None:
             )
         except ValueError:
             logger.error(
-                "Invalid OLMLX_EXPERIMENTAL_DISTRIBUTED_LAYER_COUNTS=%r, "
+                "Invalid OLMLX_DISTRIBUTED_LAYER_COUNTS=%r, "
                 "expected comma-separated integers",
                 layer_counts_str,
             )

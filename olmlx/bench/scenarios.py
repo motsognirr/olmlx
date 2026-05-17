@@ -227,7 +227,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="distributed",
         description="Distributed tensor-parallel inference",
-        env_overrides={"OLMLX_EXPERIMENTAL_DISTRIBUTED": "true"},
+        env_overrides={"OLMLX_DISTRIBUTED": "true"},
         should_skip=_requires_distributed,
         server_mode=True,
     ),
@@ -235,7 +235,7 @@ SCENARIOS: list[Scenario] = [
         name="distributed+tq4",
         description="Distributed tensor-parallel + TurboQuant 4-bit",
         env_overrides={
-            "OLMLX_EXPERIMENTAL_DISTRIBUTED": "true",
+            "OLMLX_DISTRIBUTED": "true",
             "OLMLX_KV_CACHE_QUANT": "turboquant:4",
         },
         should_skip=_requires_distributed,

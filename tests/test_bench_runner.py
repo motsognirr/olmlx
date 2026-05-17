@@ -255,7 +255,7 @@ class TestRunBench:
         server_scenario = Scenario(
             name="distributed",
             description="Distributed",
-            env_overrides={"OLMLX_EXPERIMENTAL_DISTRIBUTED": "true"},
+            env_overrides={"OLMLX_DISTRIBUTED": "true"},
             server_mode=True,
         )
 
@@ -310,7 +310,7 @@ class TestRunServerScenario:
         scenario = Scenario(
             name="distributed",
             description="Distributed",
-            env_overrides={"OLMLX_EXPERIMENTAL_DISTRIBUTED": "true"},
+            env_overrides={"OLMLX_DISTRIBUTED": "true"},
             server_mode=True,
         )
 
@@ -330,7 +330,7 @@ class TestRunServerScenario:
         scenario = Scenario(
             name="distributed",
             description="Distributed",
-            env_overrides={"OLMLX_EXPERIMENTAL_DISTRIBUTED": "true"},
+            env_overrides={"OLMLX_DISTRIBUTED": "true"},
             server_mode=True,
         )
 
@@ -370,7 +370,7 @@ class TestRunServerScenario:
             name="distributed",
             description="Distributed",
             env_overrides={
-                "OLMLX_EXPERIMENTAL_DISTRIBUTED": "true",
+                "OLMLX_DISTRIBUTED": "true",
                 "OLMLX_KV_CACHE_QUANT": "turboquant:4",
             },
             server_mode=True,
@@ -388,7 +388,7 @@ class TestRunServerScenario:
         with patch("olmlx.bench.runner.subprocess.Popen", side_effect=capture_popen):
             _run_server_scenario("model", scenario, [], None)
 
-        assert captured_env.get("OLMLX_EXPERIMENTAL_DISTRIBUTED") == "true"
+        assert captured_env.get("OLMLX_DISTRIBUTED") == "true"
         assert captured_env.get("OLMLX_KV_CACHE_QUANT") == "turboquant:4"
 
 

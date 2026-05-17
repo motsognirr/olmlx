@@ -15,6 +15,7 @@ from olmlx.engine.model_manager import (
     LoadedModel,
     ModelLoadTimeoutError,
     ModelManager,
+    SpectralCalibrationMissingError,
     _ensure_tokenizer_eos_in_stops,
     parse_keep_alive,
 )
@@ -3991,3 +3992,131 @@ class TestEagleLoading:
         assert any("target_layer_id" in r.message for r in caplog.records)
         # Falls back to last layer.
         assert decoder._target_layer_id == 3  # last index of 4 layers
+
+
+class TestSpectralAutoCalibrate:
+    """Tests for ``_find_spectral_dir`` and ``_auto_calibrate_spectral``."""
+
+    def test_find_spectral_dir_returns_none_when_quant_is_none(
+        self, registry, mock_store
+    ):
+        manager = ModelManager(registry, mock_store)
+        result = manager._find_spectral_dir("test/model", None)
+        assert result is None
+
+    def test_find_spectral_dir_returns_none_for_non_spectral(
+        self, registry, mock_store
+    ):
+        manager = ModelManager(registry, mock_store)
+        result = manager._find_spectral_dir("test/model", "turboquant:4")
+        assert result is None
+
+    def test_find_spectral_dir_returns_none_when_store_is_none(self, registry):
+        manager = ModelManager(registry, None)
+        result = manager._find_spectral_dir("test/model", "spectral:4")
+        assert result is None
+
+    def test_find_spectral_dir_returns_path_when_calibration_exists(
+        self, tmp_path, registry, mock_store
+    ):
+        local_dir = mock_store.local_path("test/model")
+        spectral_dir = local_dir / "spectral"
+        spectral_dir.mkdir(parents=True, exist_ok=True)
+        (spectral_dir / "spectral_config.json").write_text("{}")
+        manager = ModelManager(registry, mock_store)
+        result = manager._find_spectral_dir("test/model", "spectral:4")
+        assert result == spectral_dir
+
+    def test_find_spectral_dir_raises_when_no_data_and_auto_calibrate_off(
+        self, registry, mock_store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.kv_cache_auto_calibrate", False
+        )
+        manager = ModelManager(registry, mock_store)
+        with pytest.raises(SpectralCalibrationMissingError, match="Run 'olmlx"):
+            manager._find_spectral_dir("test/model", "spectral:4")
+
+    def test_auto_calibrate_spectral_on_success(
+        self, tmp_path, registry, mock_store, monkeypatch
+    ):
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "kv_cache_quant", "spectral:4")
+        monkeypatch.setattr(_settings, "kv_cache_auto_calibrate", True)
+        # Set up a spectral dir where calibrate_model would write output
+        local_dir = mock_store.local_path("test/model")
+        expected_output = local_dir / "spectral"
+        expected_output.mkdir(parents=True, exist_ok=True)
+        (expected_output / "spectral_config.json").write_text("{}")
+        with patch(
+            "olmlx.engine.spectralquant_calibrate.calibrate_model",
+            return_value=str(expected_output),
+        ):
+            manager = ModelManager(registry, mock_store)
+            result = manager._auto_calibrate_spectral("test/model", "spectral:4")
+            assert result == expected_output
+
+    def test_auto_calibrate_spectral_raises_on_calibration_failure(
+        self, tmp_path, registry, mock_store, monkeypatch
+    ):
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "kv_cache_quant", "spectral:4")
+        monkeypatch.setattr(_settings, "kv_cache_auto_calibrate", True)
+        with patch(
+            "olmlx.engine.spectralquant_calibrate.calibrate_model",
+            side_effect=RuntimeError("GPU out of memory"),
+        ):
+            manager = ModelManager(registry, mock_store)
+            with pytest.raises(
+                SpectralCalibrationMissingError, match="Auto-calibration failed"
+            ):
+                manager._auto_calibrate_spectral("test/model", "spectral:4")
+
+    def test_auto_calibrate_spectral_raises_when_output_missing(
+        self, tmp_path, registry, mock_store, monkeypatch
+    ):
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "kv_cache_quant", "spectral:4")
+        monkeypatch.setattr(_settings, "kv_cache_auto_calibrate", True)
+        # calibrate_model returns a path that doesn't contain spectral_config.json
+        fake_output = tmp_path / "spectral"
+        fake_output.mkdir(exist_ok=True)  # dir exists but no config file
+        with patch(
+            "olmlx.engine.spectralquant_calibrate.calibrate_model",
+            return_value=str(fake_output),
+        ):
+            manager = ModelManager(registry, mock_store)
+            with pytest.raises(
+                SpectralCalibrationMissingError,
+                match="spectral data not found",
+            ):
+                manager._auto_calibrate_spectral("test/model", "spectral:4")
+
+    def test_find_spectral_dir_triggers_auto_calibrate(
+        self, tmp_path, registry, mock_store, monkeypatch
+    ):
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "kv_cache_quant", "spectral:4")
+        monkeypatch.setattr(_settings, "kv_cache_auto_calibrate", True)
+        local_dir = mock_store.local_path("test/model")
+        expected_output = local_dir / "spectral"
+        expected_output.mkdir(parents=True, exist_ok=True)
+        (expected_output / "spectral_config.json").write_text("{}")
+        with patch(
+            "olmlx.engine.spectralquant_calibrate.calibrate_model",
+            return_value=str(expected_output),
+        ):
+            manager = ModelManager(registry, mock_store)
+            result = manager._auto_calibrate_spectral("test/model", "spectral:4")
+            assert result == expected_output
+
+    def test_auto_calibrate_spectral_asserts_method_is_spectral(
+        self, registry, mock_store
+    ):
+        manager = ModelManager(registry, mock_store)
+        with pytest.raises(AssertionError):
+            manager._auto_calibrate_spectral("test/model", "turboquant:4")

@@ -720,6 +720,45 @@ class TestSpectralConfig:
         s = Settings(kv_cache_quant="turboquant:4", _env_file=None)
         assert s.kv_cache_quant == "turboquant:4"
 
+    def test_auto_calibrate_with_spectral_is_accepted(self):
+        from olmlx.config import Settings
+
+        s = Settings(
+            kv_cache_quant="spectral:4",
+            kv_cache_auto_calibrate=True,
+            _env_file=None,
+        )
+        assert s.kv_cache_auto_calibrate is True
+
+    def test_auto_calibrate_without_spectral_is_rejected(self):
+        from olmlx.config import Settings
+
+        with pytest.raises(ValueError, match="AUTO_CALIBRATE"):
+            Settings(
+                kv_cache_quant="turboquant:4",
+                kv_cache_auto_calibrate=True,
+                _env_file=None,
+            )
+
+    def test_auto_calibrate_with_no_quant_is_rejected(self):
+        from olmlx.config import Settings
+
+        with pytest.raises(ValueError, match="AUTO_CALIBRATE"):
+            Settings(
+                kv_cache_auto_calibrate=True,
+                _env_file=None,
+            )
+
+    def test_auto_calibrate_false_without_spectral_is_accepted(self):
+        from olmlx.config import Settings
+
+        s = Settings(
+            kv_cache_quant="turboquant:4",
+            kv_cache_auto_calibrate=False,
+            _env_file=None,
+        )
+        assert s.kv_cache_auto_calibrate is False
+
     def test_resolve_config_holder_prefers_inner_when_it_has_args(self):
         """When backbone (inner) has .args, use it — matches pre-existing behavior."""
         from unittest.mock import MagicMock

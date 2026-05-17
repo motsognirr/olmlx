@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 #: Metal sync behavior at inference-lock boundaries. Single source of truth
@@ -74,6 +74,28 @@ class Settings(BaseSettings):
     # ``olmlx.engine.registry``.
     kv_cache_quant: str | None = None
 
+    # Auto-run spectral calibration when spectral quant is configured but
+    # calibration data is missing. Uses the default calibration dataset
+    # (c4) and 64 samples. Set to ``true`` to avoid manual ``olmlx spectral
+    # prepare <model>`` on first load.
+    kv_cache_auto_calibrate: bool = False
+
+    # Distributed inference — split models across Apple Silicon machines.
+    # Configured via hostfile (``distributed_hostfile``), launched by
+    # ``olmlx serve``.
+    distributed: bool = False
+    distributed_strategy: Literal["tensor", "pipeline"] = "tensor"
+    distributed_hostfile: Path = Path("~/.olmlx/hostfile.json")
+    distributed_backend: str = "ring"
+    distributed_port: int = 32323
+    distributed_sideband_port: int = 32400
+    distributed_secret: str = ""
+    distributed_remote_working_dir: str = ""
+    distributed_remote_python: str = "python"
+    distributed_pre_shard: bool = True
+    distributed_shard_dir: Path = Path("~/.olmlx/shards")
+    distributed_worker_shard_dir: str = "~/.olmlx/shards"
+
     # Speculative decoding (works with any model, not just Flash).
     # Per-model overrides live on ``ModelConfig`` in ``olmlx.engine.registry``.
     # ``min_length=1`` rejects ``OLMLX_SPECULATIVE_DRAFT_MODEL=""`` at parse
@@ -101,6 +123,18 @@ class Settings(BaseSettings):
     speculative_strategy: Literal["classic", "dflash", "eagle"] = "classic"
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] | None = None
+
+    @model_validator(mode="after")
+    def validate_auto_calibrate(self) -> "Settings":
+        if self.kv_cache_auto_calibrate and (
+            self.kv_cache_quant is None
+            or not self.kv_cache_quant.startswith("spectral:")
+        ):
+            raise ValueError(
+                "OLMLX_KV_CACHE_AUTO_CALIBRATE=true requires "
+                "OLMLX_KV_CACHE_QUANT=spectral:<bits>"
+            )
+        return self
 
     @field_validator("kv_cache_quant")
     @classmethod
@@ -145,19 +179,6 @@ class ExperimentalSettings(BaseSettings):
         "extra": "ignore",
     }
 
-    distributed: bool = False
-    distributed_strategy: Literal["tensor", "pipeline"] = "tensor"
-    distributed_hostfile: Path = Path("~/.olmlx/hostfile.json")
-    distributed_backend: str = "ring"
-    distributed_port: int = 32323
-    distributed_sideband_port: int = 32400
-    distributed_secret: str = ""
-    distributed_remote_working_dir: str = ""
-    distributed_remote_python: str = "python"
-    distributed_pre_shard: bool = True
-    distributed_shard_dir: Path = Path("~/.olmlx/shards")
-    distributed_worker_shard_dir: str = "~/.olmlx/shards"
-
     # Flash inference (LLM in a Flash)
     flash: bool = False
     flash_sparsity_threshold: Annotated[float, Field(gt=0, le=1.0)] = 0.5
@@ -189,7 +210,7 @@ class ExperimentalSettings(BaseSettings):
 
 experimental = ExperimentalSettings()
 
-PRE_SHARDED_DIR_ENV = "OLMLX_EXPERIMENTAL_DISTRIBUTED_PRE_SHARDED_DIR"
+PRE_SHARDED_DIR_ENV = "OLMLX_DISTRIBUTED_PRE_SHARDED_DIR"
 
 
 def resolve_experimental(

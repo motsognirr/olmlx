@@ -1182,18 +1182,18 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED` | bool | `false` | Enable distributed inference |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_STRATEGY` | string | `tensor` | Sharding strategy: `tensor` or `pipeline` |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE` | path | `~/.olmlx/hostfile.json` | Path to hostfile |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_BACKEND` | string | `ring` | MLX distributed backend |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_PORT` | int | `32323` | Base port for ring backend |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_SIDEBAND_PORT` | int | `32400` | TCP port for coordinator-worker communication |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_SECRET` | string | *(empty)* | Shared secret for worker authentication |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR` | string | *(empty)* | Working directory on remote workers |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON` | string | `python` | Python command on remote workers (e.g., `.venv/bin/python` or `uv run python`) |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_PRE_SHARD` | bool | `true` | Pre-shard model weights before distribution |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_SHARD_DIR` | path | `~/.olmlx/shards` | Local directory for pre-sharded weights |
-| `OLMLX_EXPERIMENTAL_DISTRIBUTED_WORKER_SHARD_DIR` | string | `~/.olmlx/shards` | Shard directory on remote workers |
+| `OLMLX_DISTRIBUTED` | bool | `false` | Enable distributed inference |
+| `OLMLX_DISTRIBUTED_STRATEGY` | string | `tensor` | Sharding strategy: `tensor` or `pipeline` |
+| `OLMLX_DISTRIBUTED_HOSTFILE` | path | `~/.olmlx/hostfile.json` | Path to hostfile |
+| `OLMLX_DISTRIBUTED_BACKEND` | string | `ring` | MLX distributed backend |
+| `OLMLX_DISTRIBUTED_PORT` | int | `32323` | Base port for ring backend |
+| `OLMLX_DISTRIBUTED_SIDEBAND_PORT` | int | `32400` | TCP port for coordinator-worker communication |
+| `OLMLX_DISTRIBUTED_SECRET` | string | *(empty)* | Shared secret for worker authentication |
+| `OLMLX_DISTRIBUTED_REMOTE_WORKING_DIR` | string | *(empty)* | Working directory on remote workers |
+| `OLMLX_DISTRIBUTED_REMOTE_PYTHON` | string | `python` | Python command on remote workers (e.g., `.venv/bin/python` or `uv run python`) |
+| `OLMLX_DISTRIBUTED_PRE_SHARD` | bool | `true` | Pre-shard model weights before distribution |
+| `OLMLX_DISTRIBUTED_SHARD_DIR` | path | `~/.olmlx/shards` | Local directory for pre-sharded weights |
+| `OLMLX_DISTRIBUTED_WORKER_SHARD_DIR` | string | `~/.olmlx/shards` | Shard directory on remote workers |
 
 ### TurboQuant KV Cache Settings
 
@@ -1533,7 +1533,7 @@ Then enable both features on the coordinator:
 
 ```bash
 OLMLX_EXPERIMENTAL_FLASH=true
-OLMLX_EXPERIMENTAL_DISTRIBUTED=true
+OLMLX_DISTRIBUTED=true
 ```
 
 Flash tuning parameters (sparsity threshold, I/O threads, etc.) are forwarded to workers automatically. Pre-sharding is skipped when Flash is enabled.
@@ -1643,10 +1643,10 @@ The first host is the coordinator (rank 0). Use Thunderbolt IPs for best perform
 **4. Configure coordinator** (`.env` or environment):
 
 ```bash
-OLMLX_EXPERIMENTAL_DISTRIBUTED=true
-OLMLX_EXPERIMENTAL_DISTRIBUTED_HOSTFILE=~/.olmlx/hostfile.json
-OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_WORKING_DIR=~/Documents/olmlx_distributed
-OLMLX_EXPERIMENTAL_DISTRIBUTED_REMOTE_PYTHON=.venv/bin/python
+OLMLX_DISTRIBUTED=true
+OLMLX_DISTRIBUTED_HOSTFILE=~/.olmlx/hostfile.json
+OLMLX_DISTRIBUTED_REMOTE_WORKING_DIR=~/Documents/olmlx_distributed
+OLMLX_DISTRIBUTED_REMOTE_PYTHON=.venv/bin/python
 OLMLX_HOST=0.0.0.0
 ```
 
@@ -1688,7 +1688,7 @@ curl http://coordinator-ip:11434/api/chat -d '{
 
 ### Pre-Sharding
 
-When `OLMLX_EXPERIMENTAL_DISTRIBUTED_PRE_SHARD=true` (default), the coordinator:
+When `OLMLX_DISTRIBUTED_PRE_SHARD=true` (default), the coordinator:
 
 1. Loads the full model
 2. Shards weights to each rank
