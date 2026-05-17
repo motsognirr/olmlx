@@ -1129,6 +1129,113 @@ class TestBuildParser:
         args = parser.parse_args(["serve", "--kv-cache-quant", "turboquant:4"])
         assert args.kv_cache_quant == "turboquant:4"
 
+    def test_legacy_flash_enable_forwarded(self, monkeypatch, caplog):
+        """OLMLX_EXPERIMENTAL_FLASH=true → settings.flash=True with a warning."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "flash", False)
+        monkeypatch.delenv("OLMLX_FLASH", raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "true")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _surface_legacy_flash_env()
+
+        assert _settings.flash is True
+        assert "OLMLX_EXPERIMENTAL_FLASH" in caplog.text
+
+    def test_legacy_flash_numeric_knobs_forwarded(self, monkeypatch, caplog):
+        """Each promoted numeric knob is forwarded from its legacy name."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import Settings, settings as _settings
+
+        # Reset all five primary knobs to schema defaults so the legacy
+        # forwarder considers the live Settings "unset" for each one.
+        defaults = Settings.model_fields
+        monkeypatch.setattr(_settings, "flash", defaults["flash"].default)
+        monkeypatch.setattr(
+            _settings,
+            "flash_sparsity_threshold",
+            defaults["flash_sparsity_threshold"].default,
+        )
+        monkeypatch.setattr(
+            _settings,
+            "flash_min_active_neurons",
+            defaults["flash_min_active_neurons"].default,
+        )
+        monkeypatch.setattr(
+            _settings,
+            "flash_max_active_neurons",
+            defaults["flash_max_active_neurons"].default,
+        )
+        monkeypatch.setattr(
+            _settings,
+            "flash_memory_budget_fraction",
+            defaults["flash_memory_budget_fraction"].default,
+        )
+        for new_name in (
+            "OLMLX_FLASH",
+            "OLMLX_FLASH_SPARSITY_THRESHOLD",
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(new_name, raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD", "0.3")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS", "64")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS", "256")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION", "0.4")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _surface_legacy_flash_env()
+
+        assert _settings.flash_sparsity_threshold == 0.3
+        assert _settings.flash_min_active_neurons == 64
+        assert _settings.flash_max_active_neurons == 256
+        assert _settings.flash_memory_budget_fraction == 0.4
+
+    def test_legacy_flash_new_env_var_wins(self, monkeypatch, caplog):
+        """When the new OLMLX_FLASH* env var is set, the legacy value is ignored."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "flash", True)
+        monkeypatch.setenv("OLMLX_FLASH", "true")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "false")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _surface_legacy_flash_env()
+
+        # New env var explicitly set → legacy is reported as stale but
+        # not applied. Live Settings retains its current value.
+        assert _settings.flash is True
+        # The bulk deprecation banner still fires, but the per-field
+        # ``Forwarding legacy`` line does not.
+        assert "Forwarding legacy" not in caplog.text
+
+    def test_legacy_flash_no_op_when_unset(self, monkeypatch):
+        """No legacy env vars set → no Settings mutation, no warning."""
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import settings as _settings
+
+        for name in (
+            "OLMLX_EXPERIMENTAL_FLASH",
+            "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD",
+            "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        before = _settings.flash
+        _surface_legacy_flash_env()
+        assert _settings.flash == before
+
     def test_kv_cache_quant_disk_incompat_warning(self, monkeypatch, caplog):
         """prompt_cache_disk + kv_cache_quant together produce a warning."""
         import logging

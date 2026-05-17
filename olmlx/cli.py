@@ -1363,18 +1363,38 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
             env["OLMLX_KV_CACHE_QUANT"] = _resolved_kvq
         if settings.flash:
             env["OLMLX_FLASH"] = "true"
-            # Forward all flash tuning params so worker FlashConfig matches.
-            # Promoted primary knobs live under ``OLMLX_FLASH_*``; advanced
-            # tuning still lives under ``OLMLX_EXPERIMENTAL_FLASH_*``.
-            # OLMLX_EXPERIMENTAL_FLASH_MOE also matches the experimental
-            # prefix but is safe: the flash_moe guard above already exited
-            # if it was true.
+            # Forward the *resolved* primary knobs (from ``settings``)
+            # rather than relying on os.environ passthrough. The worker
+            # process does not run ``_surface_legacy_flash_env``, so a
+            # user with only legacy env vars set (e.g.
+            # ``OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD``) would
+            # otherwise see the worker fall back to schema defaults for
+            # the numeric knobs. Sourcing from ``settings`` mirrors
+            # whatever the coordinator's legacy shim already applied.
+            env["OLMLX_FLASH_SPARSITY_THRESHOLD"] = str(
+                settings.flash_sparsity_threshold
+            )
+            env["OLMLX_FLASH_MIN_ACTIVE_NEURONS"] = str(
+                settings.flash_min_active_neurons
+            )
+            if settings.flash_max_active_neurons is not None:
+                env["OLMLX_FLASH_MAX_ACTIVE_NEURONS"] = str(
+                    settings.flash_max_active_neurons
+                )
+            if settings.flash_memory_budget_fraction is not None:
+                env["OLMLX_FLASH_MEMORY_BUDGET_FRACTION"] = str(
+                    settings.flash_memory_budget_fraction
+                )
+            # Forward all advanced flash tuning params verbatim — these
+            # still live under ``OLMLX_EXPERIMENTAL_FLASH_*`` and are
+            # read by the worker's ``ExperimentalSettings()``.
+            # ``OLMLX_EXPERIMENTAL_FLASH_MOE`` also matches this prefix
+            # but is safe: the flash_moe guard above already exited if
+            # it was true.
             for key, val in os.environ.items():
                 if key in env:
                     continue
-                if key.startswith("OLMLX_FLASH_") or key.startswith(
-                    "OLMLX_EXPERIMENTAL_FLASH_"
-                ):
+                if key.startswith("OLMLX_EXPERIMENTAL_FLASH_"):
                     env[key] = val
         env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
 

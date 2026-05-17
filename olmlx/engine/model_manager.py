@@ -18,7 +18,7 @@ import mlx.core as mx
 
 from olmlx.config import SyncMode, experimental as global_experimental
 from olmlx.config import resolve_experimental, settings
-from olmlx.engine.registry import ModelRegistry, SpeculativeConfig
+from olmlx.engine.registry import ModelRegistry, ResolvedFlashConfig, SpeculativeConfig
 from olmlx.utils import memory as memory_utils
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
 
@@ -2673,7 +2673,7 @@ class ModelManager:
             num_speculative_tokens=num_tokens,
         )
 
-    def _is_flash_enabled(self, flash_config: Any) -> bool:
+    def _is_flash_enabled(self, flash_config: ResolvedFlashConfig) -> bool:
         return flash_config.enabled
 
     def _load_flash_model(
@@ -2683,7 +2683,7 @@ class ModelManager:
         flash_dir: Path,
         *,
         model_exp: Any,
-        flash_config: Any,
+        flash_config: ResolvedFlashConfig,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model in flash mode (LLM in a Flash).
 
@@ -2691,10 +2691,7 @@ class ModelManager:
         2. Create FlashWeightStore, PredictorBank, WindowManager
         3. Wrap model with FlashModelWrapper (replaces FFN layers)
         """
-        from olmlx.engine.flash.flash_model import (
-            FlashConfig as _RuntimeFlashConfig,
-            FlashModelWrapper,
-        )
+        from olmlx.engine.flash.flash_model import FlashConfig, FlashModelWrapper
         from olmlx.engine.flash.predictor import LookaheadBank, PredictorBank
         from olmlx.engine.flash.weight_store import FlashWeightStore
 
@@ -2722,7 +2719,7 @@ class ModelManager:
         # Read flash layout for dimensions
         layout_config = json.loads((flash_dir / "flash_layout.json").read_text())
 
-        runtime_flash_config = _RuntimeFlashConfig(
+        runtime_flash_config = FlashConfig(
             hidden_size=layout_config["hidden_size"],
             intermediate_size=layout_config["intermediate_size"],
             num_layers=layout_config["num_layers"],
@@ -2891,7 +2888,7 @@ class ModelManager:
         *,
         model_exp: Any = None,
         spec_config: SpeculativeConfig | None = None,
-        flash_config: Any = None,
+        flash_config: ResolvedFlashConfig | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
 
@@ -3058,7 +3055,7 @@ class ModelManager:
         hf_path: str,
         model_exp: Any = None,
         spec_config: SpeculativeConfig | None = None,
-        flash_config: Any = None,
+        flash_config: ResolvedFlashConfig | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 

@@ -221,12 +221,16 @@ def _validate_keep_alive(value: str) -> None:
 _KNOWN_CONFIG_KEYS: frozenset[str] = frozenset()  # set after ModelConfig is defined
 
 
-class FlashConfig(NamedTuple):
+class ResolvedFlashConfig(NamedTuple):
     """Resolved Flash primary-knob config for a single model.
 
     Only covers the five user-facing knobs that were promoted out of
     ``experimental``. Advanced tuning fields live in
     ``ExperimentalSettings`` and are passed through separately.
+
+    Distinct from ``olmlx.engine.flash.flash_model.FlashConfig`` (the
+    low-level runtime dataclass passed to ``FlashModelWrapper``) — the
+    two are constructed at different layers and carry different fields.
     """
 
     enabled: bool
@@ -417,7 +421,7 @@ class ModelConfig:
             return self.kv_cache_quant
         return settings.kv_cache_quant
 
-    def resolved_flash(self) -> FlashConfig:
+    def resolved_flash(self) -> ResolvedFlashConfig:
         """Resolve Flash primary knobs: per-model overrides global settings.
 
         Only the five user-facing knobs are resolved here. Advanced
@@ -449,7 +453,7 @@ class ModelConfig:
                 f"(per-model overrides combined with global Settings produced "
                 f"an inverted range)."
             )
-        return FlashConfig(
+        return ResolvedFlashConfig(
             enabled=self.flash if self.flash is not None else settings.flash,
             sparsity_threshold=(
                 self.flash_sparsity_threshold
