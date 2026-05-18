@@ -1522,6 +1522,60 @@ class TestBuildParser:
             assert "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS" not in line
             assert "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS" not in line
 
+    def test_legacy_flash_out_of_range_value_logs_failure_only(
+        self, monkeypatch, caplog
+    ):
+        """A legacy value that parses but fails a single-field Pydantic
+        validator (e.g. ``Field(le=1.0)``) is dropped with the per-field
+        ``Could not forward`` log. The migration banner is suppressed
+        because nothing actually landed — listing the var as "rename
+        this" would just point the user at the same validator.
+
+        Documents the current behaviour: the per-field log is the only
+        signal the user sees in this case.
+        """
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import Settings, settings as _settings
+
+        defaults = Settings.model_fields
+        monkeypatch.setattr(_settings, "flash", defaults["flash"].default)
+        monkeypatch.setattr(
+            _settings,
+            "flash_sparsity_threshold",
+            defaults["flash_sparsity_threshold"].default,
+        )
+        for new_name in (
+            "OLMLX_FLASH",
+            "OLMLX_FLASH_SPARSITY_THRESHOLD",
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(new_name, raising=False)
+        for legacy in (
+            "OLMLX_EXPERIMENTAL_FLASH",
+            "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(legacy, raising=False)
+        # 1.5 parses as float but fails ``Field(gt=0, le=1.0)``.
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD", "1.5")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        # Per-field failure logged, Settings stays at default, banner
+        # NOT emitted.
+        assert "Could not forward legacy env var" in caplog.text
+        assert (
+            _settings.flash_sparsity_threshold
+            == defaults["flash_sparsity_threshold"].default
+        )
+        assert "Deprecated env vars detected" not in caplog.text
+
     def test_legacy_flash_false_value_does_not_warn(self, monkeypatch, caplog):
         """``OLMLX_EXPERIMENTAL_FLASH=false`` parses to the schema default
         (``flash=False``) so the deprecation banner should NOT fire — there

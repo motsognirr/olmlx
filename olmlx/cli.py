@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from olmlx.config import settings
+from olmlx.config import settings, surface_legacy_flash_env as _surface_legacy_flash_env
 
 logger = logging.getLogger(__name__)
 
@@ -454,13 +454,6 @@ def _surface_legacy_kv_cache_quant_env() -> None:
         )
 
 
-# The legacy Flash env-var shim now lives in ``olmlx.config`` so the
-# distributed-worker entry point can reuse it without pulling in
-# argparse/uvicorn. Re-exported here so existing call sites and tests
-# continue to work.
-from olmlx.config import surface_legacy_flash_env as _surface_legacy_flash_env  # noqa: E402
-
-
 def _warn_kv_cache_quant_incompatibilities() -> None:
     """Warn about tracked incompatibilities at startup."""
     from olmlx.config import settings as _settings
@@ -772,7 +765,15 @@ def _audit_per_model_flash_in_distributed(registry: "Any | None" = None) -> None
         try:
             resolved = mc.resolved_flash()
         except Exception as exc:
-            logger.debug("Skipping flash distributed audit for %s: %s", name, exc)
+            logger.warning(
+                "Could not audit Flash config for %s in distributed "
+                "mode: %s. This model may fail to load on workers — "
+                "check ``flash_min_active_neurons`` / "
+                "``flash_max_active_neurons`` for cross-field "
+                "violations against the global Settings.",
+                name,
+                exc,
+            )
             continue
         if resolved.enabled != settings.flash:
             mismatched.append(name)
@@ -1404,12 +1405,22 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
                 env["OLMLX_FLASH_MEMORY_BUDGET_FRACTION"] = str(
                     settings.flash_memory_budget_fraction
                 )
-            # Forward all advanced flash tuning params verbatim — these
-            # still live under ``OLMLX_EXPERIMENTAL_FLASH_*`` and are
-            # read by the worker's ``ExperimentalSettings()``.
-            # ``OLMLX_EXPERIMENTAL_FLASH_MOE`` also matches this prefix
-            # but is safe: the flash_moe guard above already exited if
-            # it was true.
+            # Forward all OLMLX_EXPERIMENTAL_FLASH_* vars verbatim.
+            # This intentionally includes:
+            #   - the advanced tuning knobs that still live under the
+            #     experimental prefix (window_size, io_threads,
+            #     cache_budget_neurons, predictor_*, prefetch_*,
+            #     bypass_os_cache, preallocated_buffer);
+            #   - the five *promoted* legacy primary knobs (e.g.
+            #     OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD) when
+            #     the user hasn't renamed them yet. Each worker also
+            #     runs ``surface_legacy_flash_env``, which prefers
+            #     the new-name vars already added above — so the
+            #     legacy copies are harmless redundancy during the
+            #     one-release deprecation window.
+            # ``OLMLX_EXPERIMENTAL_FLASH_MOE`` also matches this
+            # prefix but is safe: the flash_moe guard above already
+            # exited if it was true.
             for key, val in os.environ.items():
                 if key in env:
                     continue
