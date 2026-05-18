@@ -14,8 +14,11 @@ Typical flow:
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 GOLDENS_SUBDIR = "goldens"
 
@@ -50,13 +53,22 @@ def golden_path(bench_dir: Path, model: str, prompt_name: str) -> Path:
 
 
 def load_golden(bench_dir: Path, model: str, prompt_name: str) -> str | None:
-    """Return the stored golden output, or ``None`` if none exists."""
+    """Return the stored golden output, or ``None`` if none exists.
+
+    Returns ``None`` for both "no golden captured" and "golden exists but
+    unreadable" so callers can use a single missing-data check, but logs
+    a warning on the latter — otherwise a permission or I/O error would
+    silently look identical to "needs capturing" and the next capture
+    run would overwrite a golden that is actually intact on disk but
+    just temporarily inaccessible.
+    """
     path = golden_path(bench_dir, model, prompt_name)
     try:
         return path.read_text(encoding="utf-8")
-    except OSError:
-        # FileNotFoundError is a subclass of OSError — one handler covers both
-        # missing files and permission/IO errors.
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.warning("golden exists but unreadable: %s (%s)", path, exc)
         return None
 
 

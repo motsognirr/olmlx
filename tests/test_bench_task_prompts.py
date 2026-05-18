@@ -36,10 +36,14 @@ class TestMMLU:
 
     def test_answer_distribution_not_trivially_skewed(self):
         # If all answers were the same letter, a "always answer C" model
-        # would pass 100% — not a useful benchmark. Sanity-check spread.
+        # would pass 100% — not a useful benchmark. The per-letter cap of
+        # 7/20 (35%) keeps no single-letter constant-strategy above 35%.
+        from collections import Counter
+
         answers = [p.expected["answer"] for p in MMLU_MINI]
-        distinct = set(answers)
-        assert len(distinct) >= 3
+        counts = Counter(answers)
+        assert len(counts) == 4, f"all four letters must appear, got {counts}"
+        assert max(counts.values()) <= 7, f"answer distribution too skewed: {counts}"
 
 
 class TestHumanEval:

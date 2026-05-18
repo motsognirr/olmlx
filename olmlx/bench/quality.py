@@ -92,12 +92,9 @@ def grade_contains(output: str, expected: dict[str, Any]) -> QualityResult:
             score=None,
             detail="no substrings specified",
         )
-    out = output.casefold() if expected.get("ignore_case", True) else output
-    hits = [
-        s
-        for s in substrings
-        if (s.casefold() if expected.get("ignore_case", True) else s) in out
-    ]
+    ignore_case = expected.get("ignore_case", True)
+    out = output.casefold() if ignore_case else output
+    hits = [s for s in substrings if (s.casefold() if ignore_case else s) in out]
     require_all = expected.get("all", True)
     passed = len(hits) == len(substrings) if require_all else len(hits) > 0
     score = len(hits) / len(substrings)
@@ -191,10 +188,9 @@ def _extract_number(text: str) -> float | None:
     matches = _NUMBER_RE.findall(text.replace(",", ""))
     if not matches:
         return None
-    try:
-        return float(matches[-1])
-    except ValueError:
-        return None
+    # `_NUMBER_RE` only matches strings of the form `-?\d+(?:\.\d+)?`,
+    # which `float()` always accepts — no ValueError fallback needed.
+    return float(matches[-1])
 
 
 def grade_numeric(output: str, expected: dict[str, Any]) -> QualityResult:
