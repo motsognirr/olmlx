@@ -1071,6 +1071,9 @@ class TestBuildParser:
 
         assert "per-model Flash numeric overrides" in caplog.text
         assert "qwen/m:latest" in caplog.text
+        # The warning names the specific fields the operator needs to
+        # promote globally, not just the model entries.
+        assert "flash_sparsity_threshold" in caplog.text
 
     def test_per_model_flash_numeric_inert_when_flash_disabled(
         self, monkeypatch, tmp_path, caplog
@@ -1521,6 +1524,75 @@ class TestBuildParser:
         for line in banner_lines:
             assert "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS" not in line
             assert "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS" not in line
+
+    def test_legacy_flash_pending_min_below_live_max_drops_both(
+        self, monkeypatch, caplog
+    ):
+        """Case (b): only legacy *min* is pending; the live ``settings``
+        max (e.g. set in ``.env`` or shell env under the new name) is
+        below the pending min. The pre-check must catch this via the
+        ``effective_min/max`` combination and drop both legacy entries —
+        without it, the legacy min would land first and the live max
+        would silently disappear from the user's mental model."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import Settings, settings as _settings
+
+        defaults = Settings.model_fields
+        default_min = defaults["flash_min_active_neurons"].default
+        monkeypatch.setattr(_settings, "flash", defaults["flash"].default)
+        # Live state: min at schema default (so the legacy min would
+        # otherwise be forwarded), max=150 — a consistent live pair
+        # set via ``.env``/shell under the new name. Pending legacy
+        # min is 200, which conflicts with the live max=150.
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", default_min)
+        monkeypatch.setattr(_settings, "flash_max_active_neurons", 150)
+        # OLMLX_FLASH_MAX_* is "set" from the shim's perspective so the
+        # max forward branch is short-circuited before it gets here.
+        monkeypatch.setenv("OLMLX_FLASH_MAX_ACTIVE_NEURONS", "150")
+        for new_name in ("OLMLX_FLASH", "OLMLX_FLASH_MIN_ACTIVE_NEURONS"):
+            monkeypatch.delenv(new_name, raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS", raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS", "200")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        # Legacy min was rejected; live state is unchanged.
+        assert _settings.flash_min_active_neurons == default_min
+        assert _settings.flash_max_active_neurons == 150
+        assert "min > max" in caplog.text
+
+    def test_legacy_flash_pending_max_below_live_min_drops_both(
+        self, monkeypatch, caplog
+    ):
+        """Case (c): only legacy *max* is pending; the live ``settings``
+        min is above the pending max. Symmetric to case (b)."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import Settings, settings as _settings
+
+        defaults = Settings.model_fields
+        default_max = defaults["flash_max_active_neurons"].default
+        monkeypatch.setattr(_settings, "flash", defaults["flash"].default)
+        # Live min set to 200 (e.g. via OLMLX_FLASH_MIN_ACTIVE_NEURONS
+        # in shell or .env). Pending legacy max is 100.
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", 200)
+        monkeypatch.setattr(_settings, "flash_max_active_neurons", default_max)
+        monkeypatch.setenv("OLMLX_FLASH_MIN_ACTIVE_NEURONS", "200")
+        for new_name in ("OLMLX_FLASH", "OLMLX_FLASH_MAX_ACTIVE_NEURONS"):
+            monkeypatch.delenv(new_name, raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS", raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS", "100")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        assert _settings.flash_min_active_neurons == 200
+        assert _settings.flash_max_active_neurons == default_max
+        assert "min > max" in caplog.text
 
     def test_legacy_flash_out_of_range_value_logs_failure_only(
         self, monkeypatch, caplog

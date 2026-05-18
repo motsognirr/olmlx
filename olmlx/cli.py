@@ -641,9 +641,16 @@ def _apply_serve_overrides(args) -> None:
         sys.exit(1)
 
     # Share one ``ModelRegistry`` instance across the audit helpers so
-    # the disk read happens once. Each helper still degrades gracefully
-    # to "no audit" if the load returned ``None``.
+    # the disk read happens once *and* every audit sees the same
+    # registry state. If the centralised load fails, all audits skip
+    # together — letting each helper retry on its own could leave one
+    # succeeding while another silently skips on the same transient
+    # I/O failure, producing an asymmetric view of the operator's
+    # config and requiring multiple restart cycles to surface every
+    # problem.
     audit_registry = _load_registry_for_audit()
+    if audit_registry is None:
+        return
     bad, dormant_drafts, flash_conflicts, dflash_moe_conflicts, global_draft_used = (
         _audit_speculative_config(audit_registry)
     )
@@ -761,6 +768,7 @@ def _audit_per_model_flash_in_distributed(registry: "Any | None" = None) -> None
     )
     mismatched: list[str] = []
     numeric_only: list[str] = []
+    numeric_fields_by_model: dict[str, list[str]] = {}
     for name, mc in registry.list_models().items():
         try:
             resolved = mc.resolved_flash()
@@ -783,10 +791,15 @@ def _audit_per_model_flash_in_distributed(registry: "Any | None" = None) -> None
         # are inert on both coordinator and worker, so claiming they
         # are "silently dropped on workers" would mislead the user
         # into thinking Flash was running.
-        if resolved.enabled and any(
-            getattr(mc, field, None) is not None for field in numeric_fields
-        ):
-            numeric_only.append(name)
+        if resolved.enabled:
+            set_fields = [
+                field
+                for field in numeric_fields
+                if getattr(mc, field, None) is not None
+            ]
+            if set_fields:
+                numeric_only.append(name)
+                numeric_fields_by_model[name] = set_fields
 
     if mismatched:
         print(
@@ -803,6 +816,10 @@ def _audit_per_model_flash_in_distributed(registry: "Any | None" = None) -> None
         sys.exit(1)
 
     if numeric_only:
+        details = ", ".join(
+            f"{name} [{', '.join(numeric_fields_by_model[name])}]"
+            for name in numeric_only
+        )
         logger.warning(
             "Distributed mode is enabled and the following models.json "
             "entries have per-model Flash numeric overrides "
@@ -811,7 +828,7 @@ def _audit_per_model_flash_in_distributed(registry: "Any | None" = None) -> None
             "coordinator; the distributed worker path uses the global "
             "OLMLX_FLASH_* settings. Set the desired values globally "
             "for them to take effect on every rank.",
-            ", ".join(numeric_only),
+            details,
         )
 
 
@@ -867,10 +884,13 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
 def _load_registry_for_audit() -> "Any":
     """Load the ModelRegistry once for the startup-audit helpers.
 
-    Returns the loaded registry or ``None`` if the load failed (in which
-    case the calling helpers should treat the registry as empty / skip
-    their checks). Centralising this here keeps the three audit helpers
-    in ``_apply_serve_overrides`` from doing redundant disk I/O.
+    Returns the loaded registry or ``None`` if the load failed.
+    ``_apply_serve_overrides`` skips *all* audits together when this
+    returns ``None`` so a transient I/O failure can't let one audit
+    succeed while another silently skips on the same startup
+    (asymmetric output → multiple restart cycles to surface every
+    problem). Standalone callers of the audit helpers (e.g. tests)
+    still get the helper's own retry-and-skip fallback.
     """
     from olmlx.engine.registry import ModelRegistry
 
