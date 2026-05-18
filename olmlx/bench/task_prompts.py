@@ -122,8 +122,13 @@ GSM8K_MINI: list[BenchPrompt] = [
     ),
     _numeric(
         "gsm8k-10-marcy-lipstick",
-        "Marcy spends 12 minutes petting her cat. She spends 1/3 of that time "
-        "combing it. How many minutes does she spend with her cat total?",
+        # Reworded from the original GSM8K-style phrasing — "1/3 of that time
+        # combing it" was genuinely ambiguous between additive (12 + 4 = 16)
+        # and partitive (combing is *part of* the 12). "Then she spends an
+        # additional ..." forces the additive reading.
+        "Marcy spends 12 minutes petting her cat. Then she spends an additional "
+        "1/3 of that time combing it. How many minutes does she spend with her "
+        "cat total?",
         16,
     ),
     _numeric(

@@ -54,3 +54,22 @@ class TestRoundTrip:
         # Prompt names are arbitrary strings; sanitize when used as a filename.
         save_golden(tmp_path, "m", "multi/turn name", "x")
         assert load_golden(tmp_path, "m", "multi/turn name") == "x"
+
+
+class TestTraversalSafety:
+    def test_dotdot_model_does_not_escape_goldens_dir(self, tmp_path):
+        # A model identifier of ".." would otherwise resolve to bench_dir
+        # itself (".." passes through the [a-zA-Z0-9_.-] allowlist), letting
+        # save_golden write outside the goldens tree.
+        d = goldens_dir(tmp_path, "..")
+        assert (tmp_path / "goldens") in d.parents or d.parent == tmp_path / "goldens"
+        assert d.resolve().is_relative_to((tmp_path / "goldens").resolve())
+
+    def test_single_dot_model_does_not_collapse_to_parent(self, tmp_path):
+        d = goldens_dir(tmp_path, ".")
+        assert d.resolve() != (tmp_path / "goldens").resolve()
+        assert d.resolve().is_relative_to((tmp_path / "goldens").resolve())
+
+    def test_dotdot_prompt_name_does_not_escape(self, tmp_path):
+        p = golden_path(tmp_path, "m", "..")
+        assert p.resolve().is_relative_to(goldens_dir(tmp_path, "m").resolve())

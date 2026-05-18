@@ -292,13 +292,16 @@ def grade_code_exec(output: str, expected: dict[str, Any]) -> QualityResult:
     script = f"{prompt}\n{completion}\n{tests}\ncheck({entry_point})\n"
 
     ref = f"entry={entry_point}"
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, encoding="utf-8"
-    ) as f:
-        f.write(script)
-        script_path = f.name
-
+    # Capture the temp path *before* writing so a write failure still
+    # unlinks the empty file in the finally below.
+    script_path: str | None = None
     try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        ) as f:
+            script_path = f.name
+            f.write(script)
+
         try:
             proc = subprocess.run(
                 [sys.executable, "-I", "-S", script_path],
@@ -334,10 +337,11 @@ def grade_code_exec(output: str, expected: dict[str, Any]) -> QualityResult:
             reference=ref,
         )
     finally:
-        try:
-            Path(script_path).unlink()
-        except OSError:
-            pass
+        if script_path is not None:
+            try:
+                Path(script_path).unlink()
+            except OSError:
+                pass
 
 
 def _similarity(a: str, b: str) -> float:
@@ -367,6 +371,13 @@ def grade_regression_snapshot(output: str, expected: dict[str, Any]) -> QualityR
     try:
         reference = Path(ref_path).read_text(encoding="utf-8")
     except OSError as exc:
+        # The golden was specified but is unreadable (deleted, perms,
+        # corrupted). This is *not* a model failure — return passed=None,
+        # the same sentinel as "no golden captured". The `detail`
+        # discriminates the two cases for aggregators; the warning makes
+        # sure the issue surfaces in operator logs instead of going
+        # silently into the ungraded bucket.
+        logger.warning("regression_snapshot golden unreadable: %s (%s)", ref_path, exc)
         return QualityResult(
             grader="regression_snapshot",
             passed=None,

@@ -28,7 +28,15 @@ _SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_.-]")
 
 
 def _sanitize(name: str) -> str:
-    return _SANITIZE_RE.sub("_", name)
+    s = _SANITIZE_RE.sub("_", name)
+    # `.` and `..` are filesystem-special — `bench_dir / "goldens" / ".."`
+    # resolves to `bench_dir`, letting a model identifier of ".." escape
+    # the goldens tree. Map both to a safe placeholder. An empty input
+    # (or one of only-disallowed chars that all became "_") still ends up
+    # as a single "_" via the final guard.
+    if s in (".", ".."):
+        s = s.replace(".", "_")
+    return s or "_"
 
 
 def goldens_dir(bench_dir: Path, model: str) -> Path:
