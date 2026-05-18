@@ -110,19 +110,27 @@ class TestSettings:
 
 class TestResolveExperimental:
     def test_empty_overrides_returns_global(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE", raising=False)
         base = ExperimentalSettings()
         result = resolve_experimental(base, {})
-        assert result.flash == base.flash
+        assert result.flash_window_size == base.flash_window_size
 
     def test_flash_override(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
+        """Advanced flash tuning fields still resolve through experimental.
+
+        ``flash_window_size`` is one of the keys deliberately left under
+        ``ExperimentalSettings`` after the PR #274 promotion — the
+        primary user-facing knobs (``flash``,
+        ``flash_sparsity_threshold``, etc.) moved to ``Settings`` and
+        ``ModelConfig.resolved_flash()``.
+        """
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE", raising=False)
         base = ExperimentalSettings()
-        assert base.flash is False
-        result = resolve_experimental(base, {"flash": True})
-        assert result.flash is True
+        assert base.flash_window_size == 5
+        result = resolve_experimental(base, {"flash_window_size": 10})
+        assert result.flash_window_size == 10
         # Original should be unchanged
-        assert base.flash is False
+        assert base.flash_window_size == 5
 
     def test_kv_cache_quant_top_level(self, monkeypatch):
         """kv_cache_quant is a top-level ModelConfig field, not an experimental override."""
@@ -133,41 +141,42 @@ class TestResolveExperimental:
         assert mc.kv_cache_quant == "turboquant:4"
 
     def test_partial_override_preserves_other_fields(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_IO_THREADS", raising=False)
         base = ExperimentalSettings()
-        result = resolve_experimental(base, {"flash": True})
-        # flash changed, but sparsity_threshold stays at default
-        assert result.flash is True
-        assert result.flash_sparsity_threshold == base.flash_sparsity_threshold
+        result = resolve_experimental(base, {"flash_window_size": 10})
+        # flash_window_size changed, but flash_io_threads stays at default
+        assert result.flash_window_size == 10
+        assert result.flash_io_threads == base.flash_io_threads
 
     def test_multiple_overrides(self, monkeypatch):
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_IO_THREADS", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_MOE", raising=False)
         base = ExperimentalSettings()
         result = resolve_experimental(
             base,
             {
-                "flash": True,
-                "flash_sparsity_threshold": 0.3,
+                "flash_window_size": 10,
+                "flash_io_threads": 64,
                 "flash_moe": True,
             },
         )
-        assert result.flash is True
-        assert result.flash_sparsity_threshold == 0.3
+        assert result.flash_window_size == 10
+        assert result.flash_io_threads == 64
         assert result.flash_moe is True
 
     def test_env_var_does_not_leak_into_overrides(self, monkeypatch):
         """resolve_experimental should not re-read env vars for unrelated fields."""
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH", raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE", raising=False)
         monkeypatch.delenv("OLMLX_KV_CACHE_QUANT", raising=False)
         base = ExperimentalSettings()
         # Set a bad env var *after* base is created — kv_cache_quant is now on
         # Settings (OLMLX_ prefix), not ExperimentalSettings, so it won't leak.
         monkeypatch.setenv("OLMLX_KV_CACHE_QUANT", "bad_value")
-        # Overriding only 'flash' should not trigger any env var parsing
-        result = resolve_experimental(base, {"flash": True})
-        assert result.flash is True
+        # Overriding only 'flash_window_size' should not trigger any env var parsing
+        result = resolve_experimental(base, {"flash_window_size": 10})
+        assert result.flash_window_size == 10
 
 
 class TestSpeculativeConfig:

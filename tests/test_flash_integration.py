@@ -3,36 +3,63 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
-from olmlx.config import ExperimentalSettings
+from olmlx.config import ExperimentalSettings, Settings
 
 
 class TestFlashSettings:
     def test_defaults(self):
         with patch.dict("os.environ", {}, clear=False):
-            s = ExperimentalSettings()
+            # Primary knobs were promoted to Settings.
+            s = Settings()
             assert s.flash is False
             assert s.flash_sparsity_threshold == 0.5
             assert s.flash_min_active_neurons == 128
             assert s.flash_max_active_neurons is None
-            assert s.flash_window_size == 5
-            assert s.flash_io_threads == 32
-            assert s.flash_cache_budget_neurons == 1024
-            assert s.flash_predictor_rank == 128
+            assert s.flash_memory_budget_fraction is None
+            # Advanced tuning remains under ExperimentalSettings.
+            e = ExperimentalSettings()
+            assert e.flash_window_size == 5
+            assert e.flash_io_threads == 32
+            assert e.flash_cache_budget_neurons == 1024
+            assert e.flash_predictor_rank == 128
 
     def test_env_override(self):
         env = {
-            "OLMLX_EXPERIMENTAL_FLASH": "true",
-            "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD": "0.3",
-            "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS": "64",
+            "OLMLX_FLASH": "true",
+            "OLMLX_FLASH_SPARSITY_THRESHOLD": "0.3",
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS": "64",
             "OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE": "10",
         }
         with patch.dict("os.environ", env, clear=False):
-            s = ExperimentalSettings()
+            s = Settings()
             assert s.flash is True
             assert s.flash_sparsity_threshold == 0.3
             assert s.flash_min_active_neurons == 64
-            assert s.flash_window_size == 10
+            e = ExperimentalSettings()
+            assert e.flash_window_size == 10
+
+    def test_min_greater_than_max_rejected(self):
+        """Inverted neuron range at the Settings level is caught at parse time."""
+        env = {
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS": "1000",
+            "OLMLX_FLASH_MAX_ACTIVE_NEURONS": "100",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with pytest.raises(ValidationError, match="must be <="):
+                Settings()
+
+    def test_min_equals_max_accepted(self):
+        """Boundary: min == max is valid (a fixed-neuron-count regime)."""
+        env = {
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS": "256",
+            "OLMLX_FLASH_MAX_ACTIVE_NEURONS": "256",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            s = Settings()
+            assert s.flash_min_active_neurons == 256
+            assert s.flash_max_active_neurons == 256
 
 
 class TestModelManagerFlashDetection:
@@ -76,13 +103,13 @@ class TestModelManagerFlashDetection:
         manager = self.ModelManager(registry, store)
         assert manager._flash_dir("some/model") == flash_path
 
-    def test_is_flash_enabled_reads_experimental(self):
+    def test_is_flash_enabled_reads_resolved_flash_config(self):
         registry = MagicMock()
         manager = self.ModelManager(registry, store=None)
 
-        mock_exp = MagicMock()
-        mock_exp.flash = True
-        assert manager._is_flash_enabled(mock_exp) is True
+        mock_flash = MagicMock()
+        mock_flash.enabled = True
+        assert manager._is_flash_enabled(mock_flash) is True
 
     def test_loaded_model_is_flash_field(self):
         lm = self.LoadedModel(

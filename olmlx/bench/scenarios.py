@@ -185,14 +185,14 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="flash",
         description="Flash inference (CPU/GPU offloading)",
-        env_overrides={"OLMLX_EXPERIMENTAL_FLASH": "true"},
+        env_overrides={"OLMLX_FLASH": "true"},
         should_skip=_requires_flash,
     ),
     Scenario(
         name="flash+tq4",
         description="Flash inference + TurboQuant 4-bit",
         env_overrides={
-            "OLMLX_EXPERIMENTAL_FLASH": "true",
+            "OLMLX_FLASH": "true",
             "OLMLX_KV_CACHE_QUANT": "turboquant:4",
         },
         should_skip=_requires_flash,

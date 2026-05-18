@@ -339,7 +339,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -375,7 +375,7 @@ class TestBuildParser:
         # Stub out registry-walking helpers so the test is hermetic.
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -418,7 +418,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -445,7 +445,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -473,7 +473,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -510,7 +510,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -540,7 +540,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -564,7 +564,8 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], [], False)
+            "olmlx.cli._audit_speculative_config",
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -592,7 +593,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: (["bad/model:latest"], [], [], [], False),
+            lambda registry=None: (["bad/model:latest"], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -648,7 +649,8 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], [], False)
+            "olmlx.cli._audit_speculative_config",
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -693,7 +695,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: (["m:latest"], [], ["m:latest"], [], False),
+            lambda registry=None: (["m:latest"], [], ["m:latest"], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -721,7 +723,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], ["flash/model:latest"], [], False),
+            lambda registry=None: ([], [], ["flash/model:latest"], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -745,7 +747,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], ["dormant/model:latest"], [], [], False),
+            lambda registry=None: ([], ["dormant/model:latest"], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -896,7 +898,6 @@ class TestBuildParser:
         flash override) must be caught as a flash-conflict — the previous
         per-model-only check missed this case."""
         from olmlx.cli import _audit_speculative_config
-        from olmlx.config import experimental as _exp
         from olmlx.config import settings as _settings
 
         models_json = tmp_path / "models.json"
@@ -914,7 +915,9 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "models_config", models_json)
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
-        monkeypatch.setattr(_exp, "flash", True)
+        # Flash primary knob was promoted out of ``experimental`` —
+        # set it on ``settings`` so ``mc.resolved_flash().enabled`` is True.
+        monkeypatch.setattr(_settings, "flash", True)
 
         bad, dormant, flash_conflicts, dflash_moe_conflicts, _global_used = (
             _audit_speculative_config()
@@ -951,7 +954,7 @@ class TestBuildParser:
                         "hf_path": "conflict/flash-and-spec",
                         "speculative": True,
                         "speculative_draft_model": "conflict/draft",
-                        "experimental": {"flash": True},
+                        "flash": True,
                     },
                 }
             )
@@ -1001,6 +1004,222 @@ class TestBuildParser:
         assert flash == []
         assert dflash_moe == ["moe-dflash/m:latest"]
         assert global_used is False
+
+    def test_per_model_flash_mismatch_in_distributed_exits(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """Per-model ``flash: true`` while ``settings.flash=False`` (or
+        vice versa) under distributed mode must hard-exit at startup —
+        the coordinator and workers would load structurally different
+        models and crash the ring all_sum at first inference."""
+        from olmlx.cli import _audit_per_model_flash_in_distributed
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "qwen/m:latest": {
+                        "hf_path": "qwen/m",
+                        "flash": True,
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "distributed", True)
+        monkeypatch.setattr(_settings, "flash", False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _audit_per_model_flash_in_distributed()
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "qwen/m:latest" in err
+        assert "structurally different models" in err
+
+    def test_per_model_flash_numeric_only_in_distributed_warns(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A per-model numeric override (e.g. ``flash_sparsity_threshold``)
+        on a model whose resolved ``flash`` is True logs a warning —
+        the registry isn't consulted on workers, so the override is
+        silently dropped on every rank but the coordinator."""
+        import logging
+
+        from olmlx.cli import _audit_per_model_flash_in_distributed
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "qwen/m:latest": {
+                        "hf_path": "qwen/m",
+                        "flash_sparsity_threshold": 0.3,
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "distributed", True)
+        # Flash globally on so the model resolves to ``enabled=True``;
+        # the per-model numeric override is the silent-drop case.
+        monkeypatch.setattr(_settings, "flash", True)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _audit_per_model_flash_in_distributed()
+
+        assert "per-model Flash numeric overrides" in caplog.text
+        assert "qwen/m:latest" in caplog.text
+        # The warning names the specific fields the operator needs to
+        # promote globally, not just the model entries.
+        assert "flash_sparsity_threshold" in caplog.text
+
+    def test_per_model_flash_numeric_inert_when_flash_disabled(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A per-model numeric override on a model that resolves to
+        ``flash=False`` is inert on both coordinator and worker — no
+        warning, no false positive."""
+        import logging
+
+        from olmlx.cli import _audit_per_model_flash_in_distributed
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "qwen/m:latest": {
+                        "hf_path": "qwen/m",
+                        "flash_sparsity_threshold": 0.3,
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "distributed", True)
+        monkeypatch.setattr(_settings, "flash", False)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _audit_per_model_flash_in_distributed()
+
+        assert "per-model Flash numeric overrides" not in caplog.text
+
+    def test_per_model_flash_silent_without_distributed(
+        self, monkeypatch, tmp_path, caplog, capsys
+    ):
+        """No diagnostics when distributed is off, even with per-model flash set."""
+        import logging
+
+        from olmlx.cli import _audit_per_model_flash_in_distributed
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps({"qwen/m:latest": {"hf_path": "qwen/m", "flash": True}})
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "distributed", False)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _audit_per_model_flash_in_distributed()
+        # No exit, no warning.
+        assert "per-model Flash" not in caplog.text
+        assert "structurally different models" not in capsys.readouterr().err
+
+    def test_audit_moe_check_survives_flash_resolution_failure(
+        self, monkeypatch, tmp_path
+    ):
+        """A model with both flash-MoE/dflash *and* an inverted flash range
+        must still be caught by the MoE conflict check, even though
+        ``resolved_flash()`` raises on the inverted range.
+
+        Regression test for the ``continue`` that previously short-
+        circuited both checks together when either resolver failed.
+        """
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "moe-dflash-bad/m:latest": {
+                        "hf_path": "moe-dflash-bad/m",
+                        "speculative": True,
+                        "speculative_strategy": "dflash",
+                        "speculative_draft_model": "moe-dflash-bad/draft",
+                        # Per-model min crosses the (default) global max
+                        # → ``resolved_flash()`` raises "inverted range".
+                        "flash_min_active_neurons": 1_000_000,
+                        "experimental": {"flash_moe": True},
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", 32)
+        monkeypatch.setattr(_settings, "flash_max_active_neurons", 100)
+
+        bad, dormant, flash, dflash_moe, _global_used = _audit_speculative_config()
+        # Flash list is empty (resolution failed) but MoE check still
+        # populated the dflash_moe bucket.
+        assert flash == []
+        assert dflash_moe == ["moe-dflash-bad/m:latest"]
+
+    def test_audit_flash_conflict_skipped_when_resolved_flash_raises(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A model with ``speculative=true`` plus a flash configuration
+        that makes ``resolved_flash()`` raise (e.g. per-model min above
+        the global max) is intentionally excluded from
+        ``flash_conflicts``. The startup audit logs a "Skipping flash
+        conflict check" warning so the operator sees the resolution
+        failure; the conflict itself surfaces at model load time when
+        ``resolved_flash`` is called again and raises a clear
+        ``ValueError``.
+
+        Regression test pinning the intended behaviour — without it a
+        future reader could "fix" the silent skip by speculatively
+        adding the model to ``flash_conflicts`` even when its flash
+        state is unknown.
+        """
+        import logging
+
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "flash-bad/m:latest": {
+                        "hf_path": "flash-bad/m",
+                        "speculative": True,
+                        "speculative_draft_model": "flash-bad/draft",
+                        # Per-model min crosses the global max →
+                        # ``resolved_flash()`` raises "inverted range".
+                        "flash_min_active_neurons": 1_000_000,
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", 32)
+        monkeypatch.setattr(_settings, "flash_max_active_neurons", 100)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            bad, dormant, flash, dflash_moe, _global_used = _audit_speculative_config()
+
+        # Flash conflict NOT reported (resolution failed, intent is to
+        # skip rather than guess) but the warning is emitted.
+        assert flash == []
+        assert "Skipping flash conflict check" in caplog.text
 
     def test_service_install(self):
         parser = build_parser()
@@ -1127,6 +1346,385 @@ class TestBuildParser:
         parser = build_parser()
         args = parser.parse_args(["serve", "--kv-cache-quant", "turboquant:4"])
         assert args.kv_cache_quant == "turboquant:4"
+
+    def test_serve_flash_flag_default_none(self):
+        """Bare ``olmlx serve`` leaves ``args.flash`` as None so the env-var
+        value wins (no implicit CLI override)."""
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        assert args.flash is None
+
+    def test_serve_flash_flag_enable(self):
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--flash"])
+        assert args.flash is True
+
+    def test_serve_no_flash_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--no-flash"])
+        assert args.flash is False
+
+    def test_apply_serve_overrides_no_flash_overrides_env(self, monkeypatch):
+        """``--no-flash`` on the CLI overrides ``OLMLX_FLASH=true``."""
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        # Stub the audit helpers so the test exercises just the flash
+        # branch in ``_apply_serve_overrides`` without hitting the
+        # registry / file system. Mirrors the pattern used by the other
+        # ``_apply_serve_overrides`` tests in this class.
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda registry=None: ([], [], [], [], False),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._audit_per_model_flash_in_distributed",
+            lambda registry=None: None,
+        )
+
+        parser = build_parser()
+        monkeypatch.setattr(_settings, "flash", True)
+        args = parser.parse_args(["serve", "--no-flash"])
+        _apply_serve_overrides(args)
+        assert _settings.flash is False
+
+    def test_apply_serve_overrides_flash_overrides_env(self, monkeypatch):
+        """``--flash`` on the CLI overrides ``OLMLX_FLASH=false`` (the default)."""
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda registry=None: ([], [], [], [], False),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._audit_per_model_flash_in_distributed",
+            lambda registry=None: None,
+        )
+
+        parser = build_parser()
+        monkeypatch.setattr(_settings, "flash", False)
+        args = parser.parse_args(["serve", "--flash"])
+        _apply_serve_overrides(args)
+        assert _settings.flash is True
+
+    def test_legacy_flash_enable_forwarded(self, monkeypatch, caplog):
+        """OLMLX_EXPERIMENTAL_FLASH=true → settings.flash=True with a warning."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "flash", False)
+        monkeypatch.delenv("OLMLX_FLASH", raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "true")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        assert _settings.flash is True
+        assert "OLMLX_EXPERIMENTAL_FLASH" in caplog.text
+
+    def test_legacy_flash_numeric_knobs_forwarded(self, monkeypatch, caplog):
+        """Each promoted numeric knob is forwarded from its legacy name."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import Settings, settings as _settings
+
+        # Reset all five primary knobs to schema defaults so the legacy
+        # forwarder considers the live Settings "unset" for each one.
+        defaults = Settings.model_fields
+        monkeypatch.setattr(_settings, "flash", defaults["flash"].default)
+        monkeypatch.setattr(
+            _settings,
+            "flash_sparsity_threshold",
+            defaults["flash_sparsity_threshold"].default,
+        )
+        monkeypatch.setattr(
+            _settings,
+            "flash_min_active_neurons",
+            defaults["flash_min_active_neurons"].default,
+        )
+        monkeypatch.setattr(
+            _settings,
+            "flash_max_active_neurons",
+            defaults["flash_max_active_neurons"].default,
+        )
+        monkeypatch.setattr(
+            _settings,
+            "flash_memory_budget_fraction",
+            defaults["flash_memory_budget_fraction"].default,
+        )
+        for new_name in (
+            "OLMLX_FLASH",
+            "OLMLX_FLASH_SPARSITY_THRESHOLD",
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(new_name, raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD", "0.3")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS", "64")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS", "256")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION", "0.4")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        assert _settings.flash_sparsity_threshold == 0.3
+        assert _settings.flash_min_active_neurons == 64
+        assert _settings.flash_max_active_neurons == 256
+        assert _settings.flash_memory_budget_fraction == 0.4
+
+    def test_legacy_flash_new_env_var_wins(self, monkeypatch, caplog):
+        """When the new OLMLX_FLASH* env var is set, the legacy value is
+        fully shadowed: Settings keeps its current value and the banner
+        is suppressed (nothing to migrate)."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "flash", True)
+        monkeypatch.setenv("OLMLX_FLASH", "true")
+        # Legacy says false; new says true — without precedence, the
+        # legacy value would clobber back to False.
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "false")
+        for legacy in (
+            "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD",
+            "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(legacy, raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        # New env var explicitly set → live Settings retains its
+        # current value, not the legacy "false".
+        assert _settings.flash is True
+        # The new env var fully shadows the legacy one; no banner.
+        assert "Deprecated env vars detected" not in caplog.text
+
+    def test_legacy_flash_no_op_when_unset(self, monkeypatch):
+        """No legacy env vars set → no Settings mutation, no warning."""
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import settings as _settings
+
+        for name in (
+            "OLMLX_EXPERIMENTAL_FLASH",
+            "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD",
+            "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        before = _settings.flash
+        _surface_legacy_flash_env()
+        assert _settings.flash == before
+
+    def test_legacy_flash_inverted_neuron_range_drops_both(self, monkeypatch, caplog):
+        """An inverted legacy min/max pair is detected before any setattr,
+        so *both* legacy values are dropped — applying only one would
+        leave the other at its default and silently remove the user's
+        intended ceiling/floor. Verified end-state: Settings retains
+        defaults for both fields."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import Settings, settings as _settings
+
+        defaults = Settings.model_fields
+        monkeypatch.setattr(_settings, "flash", defaults["flash"].default)
+        default_min = defaults["flash_min_active_neurons"].default
+        default_max = defaults["flash_max_active_neurons"].default
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", default_min)
+        monkeypatch.setattr(_settings, "flash_max_active_neurons", default_max)
+        for new_name in (
+            "OLMLX_FLASH",
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
+        ):
+            monkeypatch.delenv(new_name, raising=False)
+        # Inverted pair: min=200 > max=100.
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS", "200")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS", "100")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        # Neither value was applied — Settings retains its defaults.
+        assert _settings.flash_min_active_neurons == default_min
+        assert _settings.flash_max_active_neurons == default_max
+        # A specific warning explains why both were dropped.
+        assert "min > max" in caplog.text
+        # Neither legacy var appears in the bulk migration banner.
+        banner_lines = [
+            line
+            for line in caplog.text.splitlines()
+            if "Deprecated env vars detected" in line
+        ]
+        for line in banner_lines:
+            assert "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS" not in line
+            assert "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS" not in line
+
+    def test_legacy_flash_pending_min_below_live_max_drops_both(
+        self, monkeypatch, caplog
+    ):
+        """Case (b): only legacy *min* is pending; the live ``settings``
+        max (e.g. set in ``.env`` or shell env under the new name) is
+        below the pending min. The pre-check must catch this via the
+        ``effective_min/max`` combination and drop both legacy entries —
+        without it, the legacy min would land first and the live max
+        would silently disappear from the user's mental model."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import Settings, settings as _settings
+
+        defaults = Settings.model_fields
+        default_min = defaults["flash_min_active_neurons"].default
+        monkeypatch.setattr(_settings, "flash", defaults["flash"].default)
+        # Live state: min at schema default (so the legacy min would
+        # otherwise be forwarded), max=150 — a consistent live pair
+        # set via ``.env``/shell under the new name. Pending legacy
+        # min is 200, which conflicts with the live max=150.
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", default_min)
+        monkeypatch.setattr(_settings, "flash_max_active_neurons", 150)
+        # OLMLX_FLASH_MAX_* is "set" from the shim's perspective so the
+        # max forward branch is short-circuited before it gets here.
+        monkeypatch.setenv("OLMLX_FLASH_MAX_ACTIVE_NEURONS", "150")
+        for new_name in ("OLMLX_FLASH", "OLMLX_FLASH_MIN_ACTIVE_NEURONS"):
+            monkeypatch.delenv(new_name, raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS", raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS", "200")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        # Legacy min was rejected; live state is unchanged.
+        assert _settings.flash_min_active_neurons == default_min
+        assert _settings.flash_max_active_neurons == 150
+        assert "min > max" in caplog.text
+
+    def test_legacy_flash_pending_max_below_live_min_drops_both(
+        self, monkeypatch, caplog
+    ):
+        """Case (c): only legacy *max* is pending; the live ``settings``
+        min is above the pending max. Symmetric to case (b)."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import Settings, settings as _settings
+
+        defaults = Settings.model_fields
+        default_max = defaults["flash_max_active_neurons"].default
+        monkeypatch.setattr(_settings, "flash", defaults["flash"].default)
+        # Live min set to 200 (e.g. via OLMLX_FLASH_MIN_ACTIVE_NEURONS
+        # in shell or .env). Pending legacy max is 100.
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", 200)
+        monkeypatch.setattr(_settings, "flash_max_active_neurons", default_max)
+        monkeypatch.setenv("OLMLX_FLASH_MIN_ACTIVE_NEURONS", "200")
+        for new_name in ("OLMLX_FLASH", "OLMLX_FLASH_MAX_ACTIVE_NEURONS"):
+            monkeypatch.delenv(new_name, raising=False)
+        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS", raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS", "100")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        assert _settings.flash_min_active_neurons == 200
+        assert _settings.flash_max_active_neurons == default_max
+        assert "min > max" in caplog.text
+
+    def test_legacy_flash_out_of_range_value_logs_failure_only(
+        self, monkeypatch, caplog
+    ):
+        """A legacy value that parses but fails a single-field Pydantic
+        validator (e.g. ``Field(le=1.0)``) is dropped with the per-field
+        ``Could not forward`` log. The migration banner is suppressed
+        because nothing actually landed — listing the var as "rename
+        this" would just point the user at the same validator.
+
+        Documents the current behaviour: the per-field log is the only
+        signal the user sees in this case.
+        """
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import Settings, settings as _settings
+
+        defaults = Settings.model_fields
+        monkeypatch.setattr(_settings, "flash", defaults["flash"].default)
+        monkeypatch.setattr(
+            _settings,
+            "flash_sparsity_threshold",
+            defaults["flash_sparsity_threshold"].default,
+        )
+        for new_name in (
+            "OLMLX_FLASH",
+            "OLMLX_FLASH_SPARSITY_THRESHOLD",
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(new_name, raising=False)
+        for legacy in (
+            "OLMLX_EXPERIMENTAL_FLASH",
+            "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(legacy, raising=False)
+        # 1.5 parses as float but fails ``Field(gt=0, le=1.0)``.
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD", "1.5")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        # Per-field failure logged, Settings stays at default, banner
+        # NOT emitted.
+        assert "Could not forward legacy env var" in caplog.text
+        assert (
+            _settings.flash_sparsity_threshold
+            == defaults["flash_sparsity_threshold"].default
+        )
+        assert "Deprecated env vars detected" not in caplog.text
+
+    def test_legacy_flash_false_value_does_not_warn(self, monkeypatch, caplog):
+        """``OLMLX_EXPERIMENTAL_FLASH=false`` parses to the schema default
+        (``flash=False``) so the deprecation banner should NOT fire — there
+        is nothing for the user to migrate."""
+        import logging
+
+        from olmlx.cli import _surface_legacy_flash_env
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "flash", False)
+        monkeypatch.delenv("OLMLX_FLASH", raising=False)
+        for legacy in (
+            "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD",
+            "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
+            "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
+        ):
+            monkeypatch.delenv(legacy, raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "false")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            _surface_legacy_flash_env()
+
+        # Nothing migrated, no warning.
+        assert _settings.flash is False
+        assert "Deprecated env vars detected" not in caplog.text
 
     def test_kv_cache_quant_disk_incompat_warning(self, monkeypatch, caplog):
         """prompt_cache_disk + kv_cache_quant together produce a warning."""

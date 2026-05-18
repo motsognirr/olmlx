@@ -4150,7 +4150,7 @@ class TestSpeculativeLoading:
         monkeypatch.setattr(
             manager,
             "_load_flash_model",
-            lambda hf_path, load_path, flash_dir, *, model_exp: sentinel,
+            lambda hf_path, load_path, flash_dir, *, model_exp, flash_config: sentinel,
         )
 
         model_exp = ExperimentalSettings(_env_file=None)

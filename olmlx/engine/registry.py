@@ -25,17 +25,16 @@ logger = logging.getLogger(__name__)
 # Distributed settings are excluded — they affect process startup, not per-model behavior.
 PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
     {
-        # Flash inference
-        "flash",
-        "flash_sparsity_threshold",
-        "flash_min_active_neurons",
-        "flash_max_active_neurons",
+        # Flash inference — advanced/tuning knobs only. The five
+        # primary fields (``flash``, ``flash_sparsity_threshold``,
+        # ``flash_min_active_neurons``, ``flash_max_active_neurons``,
+        # ``flash_memory_budget_fraction``) were promoted to the top
+        # level — see ``PROMOTED_EXPERIMENTAL_KEYS``.
         "flash_window_size",
         "flash_io_threads",
         "flash_cache_budget_neurons",
         "flash_bypass_os_cache",
         "flash_preallocated_buffer",
-        "flash_memory_budget_fraction",
         # Flash prefetch
         "flash_prefetch",
         "flash_prefetch_confidence_threshold",
@@ -63,6 +62,12 @@ PROMOTED_EXPERIMENTAL_KEYS: dict[str, str] = {
     "speculative_draft_model": "speculative_draft_model",
     "speculative_tokens": "speculative_tokens",
     "kv_cache_quant": "kv_cache_quant",
+    # Flash primary knobs promoted to top-level in Settings/ModelConfig.
+    "flash": "flash",
+    "flash_sparsity_threshold": "flash_sparsity_threshold",
+    "flash_min_active_neurons": "flash_min_active_neurons",
+    "flash_max_active_neurons": "flash_max_active_neurons",
+    "flash_memory_budget_fraction": "flash_memory_budget_fraction",
 }
 
 
@@ -216,6 +221,25 @@ def _validate_keep_alive(value: str) -> None:
 _KNOWN_CONFIG_KEYS: frozenset[str] = frozenset()  # set after ModelConfig is defined
 
 
+class ResolvedFlashConfig(NamedTuple):
+    """Resolved Flash primary-knob config for a single model.
+
+    Only covers the five user-facing knobs that were promoted out of
+    ``experimental``. Advanced tuning fields live in
+    ``ExperimentalSettings`` and are passed through separately.
+
+    Distinct from ``olmlx.engine.flash.flash_model.FlashConfig`` (the
+    low-level runtime dataclass passed to ``FlashModelWrapper``) — the
+    two are constructed at different layers and carry different fields.
+    """
+
+    enabled: bool
+    sparsity_threshold: float
+    min_active_neurons: int
+    max_active_neurons: int | None
+    memory_budget_fraction: float | None
+
+
 class SpeculativeConfig(NamedTuple):
     """Resolved speculative decoding config for a single model.
 
@@ -260,6 +284,14 @@ class ModelConfig:
     #: KV cache quantization method and bits (e.g. "turboquant:4").
     #: ``None`` means inherit the global ``Settings.kv_cache_quant`` value.
     kv_cache_quant: str | None = None
+    #: Per-model Flash overrides for the promoted primary knobs.
+    #: ``None`` means inherit from the global ``Settings.flash*`` value.
+    #: Advanced/tuning knobs still go under the ``experimental`` block.
+    flash: bool | None = None
+    flash_sparsity_threshold: float | None = None
+    flash_min_active_neurons: int | None = None
+    flash_max_active_neurons: int | None = None
+    flash_memory_budget_fraction: float | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -292,6 +324,63 @@ class ModelConfig:
                 f"'speculative_strategy' must be one of "
                 f"{sorted(_VALID_SPECULATIVE_STRATEGIES)} or None, "
                 f"got {self.speculative_strategy!r}"
+            )
+        # Flash primary-knob bounds match the Settings field constraints.
+        # Kept here so direct ModelConfig() construction (tests,
+        # programmatic callers) hits the same validation as from_entry().
+        if self.flash is not None and not isinstance(self.flash, bool):
+            raise ValueError(f"'flash' must be a bool or None, got {self.flash!r}")
+        if self.flash_sparsity_threshold is not None and not (
+            isinstance(self.flash_sparsity_threshold, (int, float))
+            and not isinstance(self.flash_sparsity_threshold, bool)
+            and 0 < self.flash_sparsity_threshold <= 1.0
+        ):
+            raise ValueError(
+                f"'flash_sparsity_threshold' must be a number in (0, 1] or "
+                f"None, got {self.flash_sparsity_threshold!r}"
+            )
+        if self.flash_min_active_neurons is not None and (
+            isinstance(self.flash_min_active_neurons, bool)
+            or not isinstance(self.flash_min_active_neurons, int)
+            or self.flash_min_active_neurons < 1
+        ):
+            raise ValueError(
+                f"'flash_min_active_neurons' must be a positive integer or "
+                f"None, got {self.flash_min_active_neurons!r}"
+            )
+        if self.flash_max_active_neurons is not None and (
+            isinstance(self.flash_max_active_neurons, bool)
+            or not isinstance(self.flash_max_active_neurons, int)
+            or self.flash_max_active_neurons < 1
+        ):
+            raise ValueError(
+                f"'flash_max_active_neurons' must be a positive integer or "
+                f"None, got {self.flash_max_active_neurons!r}"
+            )
+        if self.flash_memory_budget_fraction is not None and not (
+            isinstance(self.flash_memory_budget_fraction, (int, float))
+            and not isinstance(self.flash_memory_budget_fraction, bool)
+            and 0 < self.flash_memory_budget_fraction <= 1.0
+        ):
+            raise ValueError(
+                f"'flash_memory_budget_fraction' must be a number in (0, 1] "
+                f"or None, got {self.flash_memory_budget_fraction!r}"
+            )
+        # Cross-field range check. Catches the case where the per-model
+        # entry sets both ``flash_min_active_neurons`` and
+        # ``flash_max_active_neurons`` to an inverted pair. The
+        # global-vs-per-model interaction (per-model min > global max, or
+        # vice versa) is caught in ``resolved_flash()`` below — at this
+        # point we only know the per-model values.
+        if (
+            self.flash_min_active_neurons is not None
+            and self.flash_max_active_neurons is not None
+            and self.flash_min_active_neurons > self.flash_max_active_neurons
+        ):
+            raise ValueError(
+                f"'flash_min_active_neurons' ({self.flash_min_active_neurons}) "
+                f"must be <= 'flash_max_active_neurons' "
+                f"({self.flash_max_active_neurons})"
             )
 
     def resolved_speculative(self) -> SpeculativeConfig:
@@ -333,6 +422,54 @@ class ModelConfig:
         if self.kv_cache_quant is not None:
             return self.kv_cache_quant
         return settings.kv_cache_quant
+
+    def resolved_flash(self) -> ResolvedFlashConfig:
+        """Resolve Flash primary knobs: per-model overrides global settings.
+
+        Only the five user-facing knobs are resolved here. Advanced
+        tuning (window size, IO threads, cache budget, etc.) lives on
+        ``ExperimentalSettings`` and is resolved through
+        ``resolve_experimental`` on ``ModelConfig.experimental``.
+        """
+        from olmlx.config import settings
+
+        min_active = (
+            self.flash_min_active_neurons
+            if self.flash_min_active_neurons is not None
+            else settings.flash_min_active_neurons
+        )
+        max_active = (
+            self.flash_max_active_neurons
+            if self.flash_max_active_neurons is not None
+            else settings.flash_max_active_neurons
+        )
+        # Cross-field range check. Both ``Settings`` and
+        # ``ModelConfig.__post_init__`` already catch inverted pairs
+        # within a single config layer; this final check catches the
+        # case where a per-model override on one bound combined with the
+        # global value for the other bound produces an inverted pair.
+        if max_active is not None and min_active > max_active:
+            raise ValueError(
+                f"Resolved flash_min_active_neurons ({min_active}) must be "
+                f"<= flash_max_active_neurons ({max_active}) for {self.hf_path!r} "
+                f"(per-model overrides combined with global Settings produced "
+                f"an inverted range)."
+            )
+        return ResolvedFlashConfig(
+            enabled=self.flash if self.flash is not None else settings.flash,
+            sparsity_threshold=(
+                self.flash_sparsity_threshold
+                if self.flash_sparsity_threshold is not None
+                else settings.flash_sparsity_threshold
+            ),
+            min_active_neurons=min_active,
+            max_active_neurons=max_active,
+            memory_budget_fraction=(
+                self.flash_memory_budget_fraction
+                if self.flash_memory_budget_fraction is not None
+                else settings.flash_memory_budget_fraction
+            ),
+        )
 
     @classmethod
     def from_entry(cls, entry: str | dict) -> ModelConfig:
@@ -426,6 +563,16 @@ class ModelConfig:
                     )
             speculative_tokens = speculative_tokens_raw
 
+            # Flash primary-knob fields: type/bounds checks live in
+            # ``ModelConfig.__post_init__`` (which fires from the
+            # ``cls(...)`` call below). Pull raw values verbatim and let
+            # the dataclass validator produce the error message.
+            flash = entry.get("flash")
+            flash_sparsity_threshold = entry.get("flash_sparsity_threshold")
+            flash_min_active_neurons = entry.get("flash_min_active_neurons")
+            flash_max_active_neurons = entry.get("flash_max_active_neurons")
+            flash_memory_budget_fraction = entry.get("flash_memory_budget_fraction")
+
             kv_cache_quant_raw = entry.get("kv_cache_quant")
             if kv_cache_quant_raw is not None:
                 if not isinstance(kv_cache_quant_raw, str):
@@ -457,6 +604,11 @@ class ModelConfig:
                 speculative_draft_model=speculative_draft_model,
                 speculative_tokens=speculative_tokens,
                 kv_cache_quant=kv_cache_quant_raw,
+                flash=flash,
+                flash_sparsity_threshold=flash_sparsity_threshold,
+                flash_min_active_neurons=flash_min_active_neurons,
+                flash_max_active_neurons=flash_max_active_neurons,
+                flash_memory_budget_fraction=flash_memory_budget_fraction,
                 _extra=extra,
             )
         raise TypeError(
@@ -477,6 +629,11 @@ class ModelConfig:
             and self.speculative_draft_model is None
             and self.speculative_tokens is None
             and self.kv_cache_quant is None
+            and self.flash is None
+            and self.flash_sparsity_threshold is None
+            and self.flash_min_active_neurons is None
+            and self.flash_max_active_neurons is None
+            and self.flash_memory_budget_fraction is None
             and not self._extra
         ):
             return self.hf_path
@@ -504,6 +661,16 @@ class ModelConfig:
             result["speculative_tokens"] = self.speculative_tokens
         if self.kv_cache_quant is not None:
             result["kv_cache_quant"] = self.kv_cache_quant
+        if self.flash is not None:
+            result["flash"] = self.flash
+        if self.flash_sparsity_threshold is not None:
+            result["flash_sparsity_threshold"] = self.flash_sparsity_threshold
+        if self.flash_min_active_neurons is not None:
+            result["flash_min_active_neurons"] = self.flash_min_active_neurons
+        if self.flash_max_active_neurons is not None:
+            result["flash_max_active_neurons"] = self.flash_max_active_neurons
+        if self.flash_memory_budget_fraction is not None:
+            result["flash_memory_budget_fraction"] = self.flash_memory_budget_fraction
         # Filter known keys defensively — from_entry() already excludes them,
         # but _extra can be set directly via ModelConfig construction.
         result.update(

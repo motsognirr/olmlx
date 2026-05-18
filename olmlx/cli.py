@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from olmlx.config import settings
+from olmlx.config import settings, surface_legacy_flash_env as _surface_legacy_flash_env
 
 logger = logging.getLogger(__name__)
 
@@ -587,6 +587,7 @@ def _apply_serve_overrides(args) -> None:
 
     _surface_legacy_speculative_env()
     _surface_legacy_dflash_env()
+    _surface_legacy_flash_env()
 
     # ``getattr`` defends programmatic callers that hand a bare
     # ``argparse.Namespace`` (e.g. tests) without populating these
@@ -608,6 +609,10 @@ def _apply_serve_overrides(args) -> None:
     kvq = getattr(args, "kv_cache_quant", None)
     if kvq is not None:
         _settings.kv_cache_quant = kvq
+
+    flash_flag = getattr(args, "flash", None)
+    if flash_flag is not None:
+        _settings.flash = flash_flag
 
     _surface_legacy_kv_cache_quant_env()
 
@@ -635,8 +640,23 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(1)
 
+    # Share one ``ModelRegistry`` instance across the two audit helpers
+    # that consume it (``_audit_speculative_config`` and
+    # ``_audit_per_model_flash_in_distributed``) so the disk read
+    # happens once *and* both audits see the same registry state. If
+    # the centralised load fails, both skip together — letting each
+    # helper retry on its own could leave one succeeding while another
+    # silently skips on the same transient I/O failure, producing an
+    # asymmetric view of the operator's config and requiring multiple
+    # restart cycles to surface every problem. Note: the earlier
+    # ``_models_with_promoted_keys_in_experimental`` call uses a raw
+    # ``json.load`` (no registry instance), so it's not part of this
+    # coordination and runs independently.
+    audit_registry = _load_registry_for_audit()
+    if audit_registry is None:
+        return
     bad, dormant_drafts, flash_conflicts, dflash_moe_conflicts, global_draft_used = (
-        _audit_speculative_config()
+        _audit_speculative_config(audit_registry)
     )
     if dormant_drafts:
         logger.warning(
@@ -709,6 +729,112 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(1)
 
+    _audit_per_model_flash_in_distributed(audit_registry)
+
+
+def _audit_per_model_flash_in_distributed(registry: "Any | None" = None) -> None:
+    """Audit per-model Flash settings against distributed-mode invariants.
+
+    Two failure modes to surface at startup:
+
+    * **Hard error — coordinator/worker model-structure mismatch.** If
+      any per-model ``resolved_flash().enabled`` differs from
+      ``settings.flash``, the coordinator and workers would load
+      structurally different models (one with ``FlashModelWrapper``
+      replacing FFN layers, the other dense). The ring ``all_sum``
+      then operates over mismatched layer shapes and crashes
+      inference. Bail at startup with a clear migration nudge instead
+      of letting the cluster spin up only to die during the first
+      request. Mirrors the existing flash + pipeline-strategy guard.
+
+    * **Warning — silently ignored per-model overrides.** When
+      ``resolved_flash().enabled`` matches the global but a model has
+      per-model values for the four numeric Flash knobs
+      (``sparsity_threshold``, ``min/max_active_neurons``,
+      ``memory_budget_fraction``), those overrides are honoured only
+      on the coordinator. The worker path reads globals via
+      ``_load_flash_tensor_worker`` and never consults the registry,
+      so the per-model values are silently dropped. Log a warning so
+      the operator notices before debugging "why is the neuron cap
+      different on rank 1".
+    """
+    if not settings.distributed:
+        return
+    if registry is None:
+        registry = _load_registry_for_audit()
+        if registry is None:
+            return
+    numeric_fields = (
+        "flash_sparsity_threshold",
+        "flash_min_active_neurons",
+        "flash_max_active_neurons",
+        "flash_memory_budget_fraction",
+    )
+    mismatched: list[str] = []
+    numeric_only: list[str] = []
+    numeric_fields_by_model: dict[str, list[str]] = {}
+    for name, mc in registry.list_models().items():
+        try:
+            resolved = mc.resolved_flash()
+        except Exception as exc:
+            logger.warning(
+                "Could not audit Flash config for %s in distributed "
+                "mode: %s. This model may fail to load on workers — "
+                "check ``flash_min_active_neurons`` / "
+                "``flash_max_active_neurons`` for cross-field "
+                "violations against the global Settings.",
+                name,
+                exc,
+            )
+            continue
+        if resolved.enabled != settings.flash:
+            mismatched.append(name)
+            continue
+        # Only warn about numeric overrides when Flash is actually
+        # enabled — overrides on a model that resolves to ``flash=False``
+        # are inert on both coordinator and worker, so claiming they
+        # are "silently dropped on workers" would mislead the user
+        # into thinking Flash was running.
+        if resolved.enabled:
+            set_fields = [
+                field
+                for field in numeric_fields
+                if getattr(mc, field, None) is not None
+            ]
+            if set_fields:
+                numeric_only.append(name)
+                numeric_fields_by_model[name] = set_fields
+
+    if mismatched:
+        print(
+            "Error: distributed mode is enabled and the following "
+            "models.json entries have a per-model Flash on/off that "
+            "disagrees with the global OLMLX_FLASH setting "
+            f"({settings.flash}): {', '.join(mismatched)}. The "
+            "coordinator and workers would load structurally different "
+            "models (one Flash-wrapped, one dense) and crash on the "
+            "ring all_sum. Either remove the per-model 'flash' override "
+            "from these entries, or set OLMLX_FLASH globally to match.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if numeric_only:
+        details = ", ".join(
+            f"{name} [{', '.join(numeric_fields_by_model[name])}]"
+            for name in numeric_only
+        )
+        logger.warning(
+            "Distributed mode is enabled and the following models.json "
+            "entries have per-model Flash numeric overrides "
+            "(sparsity_threshold/min/max/memory_budget_fraction): %s. "
+            "Per-model numeric overrides are honoured only on the "
+            "coordinator; the distributed worker path uses the global "
+            "OLMLX_FLASH_* settings. Set the desired values globally "
+            "for them to take effect on every rank.",
+            details,
+        )
+
 
 def _models_with_promoted_keys_in_experimental() -> list[str]:
     """Return models.json entry names whose ``experimental`` block still
@@ -759,9 +885,45 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
     return bad
 
 
-def _audit_speculative_config() -> tuple[
-    list[str], list[str], list[str], list[str], bool
-]:
+def _load_registry_for_audit() -> "Any":
+    """Load the ModelRegistry once for the startup-audit helpers.
+
+    Returns the loaded registry or ``None`` if the load failed.
+    ``_apply_serve_overrides`` skips *all* audits together when this
+    returns ``None`` so a transient I/O failure can't let one audit
+    succeed while another silently skips on the same startup
+    (asymmetric output → multiple restart cycles to surface every
+    problem). Standalone callers of the audit helpers (e.g. tests)
+    still get the helper's own retry-and-skip fallback.
+    """
+    from olmlx.engine.registry import ModelRegistry
+
+    registry = ModelRegistry()
+    try:
+        registry.load()
+    except ValueError as exc:
+        # Validation errors (a malformed entry that survived the
+        # ``_models_with_promoted_keys_in_experimental`` raw-JSON
+        # check) are operator errors, not transient I/O issues —
+        # flag them distinctly so the log makes the cause clear.
+        # ``ModelRegistry.load`` itself catches per-entry ValueError
+        # today and logs them, so this branch fires only if validation
+        # moves earlier in the load sequence.
+        logger.warning(
+            "Skipping startup registry audit: invalid models.json entry: %s", exc
+        )
+        return None
+    except OSError as exc:
+        logger.warning(
+            "Skipping startup registry audit: could not load registry: %s", exc
+        )
+        return None
+    return registry
+
+
+def _audit_speculative_config(
+    registry: "Any | None" = None,
+) -> tuple[list[str], list[str], list[str], list[str], bool]:
     """Walk the registry and audit each model's resolved speculative
     config.
 
@@ -791,31 +953,10 @@ def _audit_speculative_config() -> tuple[
     """
     from olmlx.config import experimental as global_exp
     from olmlx.config import resolve_experimental
-    from olmlx.engine.registry import ModelRegistry
 
-    registry = ModelRegistry()
-    try:
-        registry.load()
-    except ValueError as exc:
-        # Validation errors (e.g. a malformed entry that survived
-        # ``_models_with_promoted_keys_in_experimental``) are operator
-        # errors, not transient I/O issues — flag them distinctly.
-        # Note: ``ModelRegistry.load`` itself catches per-entry
-        # ValueError today and logs them, so this branch fires only if
-        # validation moves earlier in the load sequence.
-        logger.warning(
-            "Skipping speculative config validation: invalid models.json entry: %s",
-            exc,
-        )
-        return [], [], [], [], False
-    except OSError as exc:
-        # I/O failures: never block startup. The catch is narrow so
-        # programming errors (typos, missing attributes, etc.) inside
-        # the loop below propagate instead of being swallowed.
-        logger.warning(
-            "Skipping speculative config validation: could not load registry: %s",
-            exc,
-        )
+    if registry is None:
+        registry = _load_registry_for_audit()
+    if registry is None:
         return [], [], [], [], False
     bad: list[str] = []
     dormant: list[str] = []
@@ -856,22 +997,44 @@ def _audit_speculative_config() -> tuple[
             global_draft_used = True
         if enabled:
             # Resolve the full experimental config (global defaults
-            # merged with per-model overrides) so a globally enabled
-            # OLMLX_EXPERIMENTAL_FLASH still trips the conflict check.
+            # merged with per-model overrides) for the advanced/MoE
+            # knobs that still live under ``experimental``. Flash
+            # primary knobs are now promoted to top-level and resolved
+            # via ``mc.resolved_flash()``.
+            #
+            # The two ``resolve_*`` calls cover independent conflict
+            # checks (flash vs flash-MoE/dflash), so a failure in one
+            # must not skip the other. Track each result separately and
+            # guard the per-result check on a successful resolution.
+            resolved_exp = None
+            resolved_flash = None
             try:
                 resolved_exp = resolve_experimental(global_exp, mc.experimental)
             except Exception as exc:
                 logger.warning(
-                    "Skipping flash-conflict check for %s: could not "
+                    "Skipping flash-MoE conflict check for %s: could not "
                     "resolve experimental overrides: %s",
                     name,
                     exc,
                     exc_info=True,
                 )
-                continue
-            if resolved_exp.flash:
+            try:
+                resolved_flash = mc.resolved_flash()
+            except Exception as exc:
+                logger.warning(
+                    "Skipping flash conflict check for %s: could not "
+                    "resolve flash overrides: %s",
+                    name,
+                    exc,
+                    exc_info=True,
+                )
+            if resolved_flash is not None and resolved_flash.enabled:
                 flash_conflicts.append(name)
-            if resolved_exp.flash_moe and strategy == "dflash":
+            if (
+                resolved_exp is not None
+                and resolved_exp.flash_moe
+                and strategy == "dflash"
+            ):
                 dflash_moe_conflicts.append(name)
     return bad, dormant, flash_conflicts, dflash_moe_conflicts, global_draft_used
 
@@ -1169,7 +1332,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
         )
         sys.exit(1)
 
-    if experimental.flash and strategy == "pipeline":
+    if settings.flash and strategy == "pipeline":
         print(
             "Error: Flash + pipeline distributed strategy is not supported. "
             "Use tensor strategy or disable Flash.",
@@ -1180,7 +1343,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
     # Pre-shard and distribute weights to workers if enabled
     pre_sharded = False
     if settings.distributed_pre_shard:
-        if experimental.flash:
+        if settings.flash:
             logger.info(
                 "Skipping pre-sharding: Flash mode shards only attention "
                 "layers at runtime, MLP weights are loaded from SSD on "
@@ -1242,13 +1405,50 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
                 )
         if _resolved_kvq:
             env["OLMLX_KV_CACHE_QUANT"] = _resolved_kvq
-        if experimental.flash:
-            env["OLMLX_EXPERIMENTAL_FLASH"] = "true"
-            # Forward all flash tuning params so worker FlashConfig matches.
-            # OLMLX_EXPERIMENTAL_FLASH_MOE also matches this prefix but is
-            # safe: the flash_moe guard above already exited if it was true.
+        if settings.flash:
+            env["OLMLX_FLASH"] = "true"
+            # Forward the *resolved* primary knobs (from ``settings``)
+            # rather than relying on os.environ passthrough. The worker
+            # process does not run ``_surface_legacy_flash_env``, so a
+            # user with only legacy env vars set (e.g.
+            # ``OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD``) would
+            # otherwise see the worker fall back to schema defaults for
+            # the numeric knobs. Sourcing from ``settings`` mirrors
+            # whatever the coordinator's legacy shim already applied.
+            env["OLMLX_FLASH_SPARSITY_THRESHOLD"] = str(
+                settings.flash_sparsity_threshold
+            )
+            env["OLMLX_FLASH_MIN_ACTIVE_NEURONS"] = str(
+                settings.flash_min_active_neurons
+            )
+            if settings.flash_max_active_neurons is not None:
+                env["OLMLX_FLASH_MAX_ACTIVE_NEURONS"] = str(
+                    settings.flash_max_active_neurons
+                )
+            if settings.flash_memory_budget_fraction is not None:
+                env["OLMLX_FLASH_MEMORY_BUDGET_FRACTION"] = str(
+                    settings.flash_memory_budget_fraction
+                )
+            # Forward all OLMLX_EXPERIMENTAL_FLASH_* vars verbatim.
+            # This intentionally includes:
+            #   - the advanced tuning knobs that still live under the
+            #     experimental prefix (window_size, io_threads,
+            #     cache_budget_neurons, predictor_*, prefetch_*,
+            #     bypass_os_cache, preallocated_buffer);
+            #   - the five *promoted* legacy primary knobs (e.g.
+            #     OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD) when
+            #     the user hasn't renamed them yet. Each worker also
+            #     runs ``surface_legacy_flash_env``, which prefers
+            #     the new-name vars already added above — so the
+            #     legacy copies are harmless redundancy during the
+            #     one-release deprecation window.
+            # ``OLMLX_EXPERIMENTAL_FLASH_MOE`` also matches this
+            # prefix but is safe: the flash_moe guard above already
+            # exited if it was true.
             for key, val in os.environ.items():
-                if key.startswith("OLMLX_EXPERIMENTAL_FLASH_") and key not in env:
+                if key in env:
+                    continue
+                if key.startswith("OLMLX_EXPERIMENTAL_FLASH_"):
                     env[key] = val
         env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
 
@@ -1586,6 +1786,7 @@ def cmd_chat(args):
     # ``serve`` handles it correctly.
     _surface_legacy_speculative_env()
     _surface_legacy_kv_cache_quant_env()
+    _surface_legacy_flash_env()
     _warn_kv_cache_quant_incompatibilities()
 
     model_name = args.model_name
@@ -1937,6 +2138,7 @@ def cmd_config_show(_args):
     """Show current configuration."""
     _surface_legacy_kv_cache_quant_env()
     _surface_legacy_distributed_env()
+    _surface_legacy_flash_env()
 
     print(f"Host:                   {settings.host}")
     print(f"Port:                   {settings.port}")
@@ -1951,6 +2153,14 @@ def cmd_config_show(_args):
     print(f"CORS origins:           {settings.cors_origins}")
     if settings.kv_cache_quant:
         print(f"KV cache quant:         {settings.kv_cache_quant}")
+    if settings.flash:
+        print("Flash inference:        enabled")
+        print(f"  Sparsity threshold:   {settings.flash_sparsity_threshold}")
+        print(f"  Min active neurons:   {settings.flash_min_active_neurons}")
+        if settings.flash_max_active_neurons is not None:
+            print(f"  Max active neurons:   {settings.flash_max_active_neurons}")
+        if settings.flash_memory_budget_fraction is not None:
+            print(f"  Memory budget frac:   {settings.flash_memory_budget_fraction}")
     if settings.distributed:
         print()
         print("Distributed inference:")
@@ -2187,7 +2397,8 @@ def _cmd_flash_dense_prepare(args, model_path):
     print("\nFlash preparation complete!")
     print(f"  Output: {output_dir}")
     print("\nTo use flash inference:")
-    print("  OLMLX_EXPERIMENTAL_FLASH=true olmlx serve")
+    print("  olmlx serve --flash")
+    print("  # or set OLMLX_FLASH=true")
 
 
 def cmd_dflash_precompute(args):
@@ -2437,6 +2648,11 @@ def cmd_eagle_prepare(args):
 
 def cmd_flash_info(args):
     """Show flash preparation info for a model."""
+    # Honour the legacy ``OLMLX_EXPERIMENTAL_FLASH*`` shim so that
+    # ``olmlx flash info`` reflects the same effective Flash settings
+    # an operator would see from ``olmlx config show`` / ``olmlx serve``
+    # when they've only renamed the new env vars in some shells.
+    _surface_legacy_flash_env()
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
     hf_path = _resolved.hf_path if _resolved is not None else args.model
@@ -2512,7 +2728,8 @@ def _show_flash_dense_info(model_name, flash_dir):
     print(f"  Total size:         {total_bytes / (1024**2):.1f} MB")
 
     print("\nTo use flash inference:")
-    print("  OLMLX_EXPERIMENTAL_FLASH=true olmlx serve")
+    print("  olmlx serve --flash")
+    print("  # or set OLMLX_FLASH=true")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2568,6 +2785,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="KV cache quantization method and bits (e.g. turboquant:4, spectral:2)",
+    )
+    serve_p.add_argument(
+        "--flash",
+        dest="flash",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable Flash inference (LLM in a Flash; sparse FFN with SSD-"
+            "backed neuron loading). Overrides OLMLX_FLASH. Requires the "
+            "model to be prepared first via 'olmlx flash prepare'."
+        ),
     )
 
     svc = sub.add_parser("service", help="Manage the launchd service")
