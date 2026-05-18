@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 # ~500-char paragraph repeated to build a long-context prompt. Repetition is
 # fine for microbenching attention/KV-cache cost — content variety doesn't
@@ -33,6 +34,12 @@ class BenchPrompt:
     category: str
     messages: list[dict[str, str]]
     max_tokens: int = 256
+    # Optional quality-grading metadata. When ``grader`` is set, the bench
+    # runner will hand ``output_text`` and ``expected`` to ``olmlx.bench.quality.grade``
+    # after the worker returns. Prompts without a grader are pure
+    # throughput probes.
+    grader: str | None = None
+    expected: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -40,6 +47,8 @@ class BenchPrompt:
             "category": self.category,
             "messages": self.messages,
             "max_tokens": self.max_tokens,
+            "grader": self.grader,
+            "expected": self.expected,
         }
 
     @classmethod
@@ -49,6 +58,8 @@ class BenchPrompt:
             category=d["category"],
             messages=d["messages"],
             max_tokens=d.get("max_tokens", 256),
+            grader=d.get("grader"),
+            expected=d.get("expected") or {},
         )
 
 
