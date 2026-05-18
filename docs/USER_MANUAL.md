@@ -17,7 +17,7 @@ A comprehensive guide to olmlx — an Ollama-compatible API server powered by Ap
 - [Distributed Inference (Experimental)](#distributed-inference-experimental)
 - [macOS Service Management](#macos-service-management)
 - [TurboQuant KV Cache Quantization (Experimental)](#turboquant-kv-cache-quantization-experimental)
-- [Flash-MoE Expert Offloading (Experimental)](#flash-moe-expert-offloading-experimental)
+- [Flash-MoE Expert Offloading](#flash-moe-expert-offloading)
 - [Benchmarking](#benchmarking)
 - [Troubleshooting](#troubleshooting)
 - [Model Compatibility](#model-compatibility)
@@ -1201,13 +1201,15 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 |---|---|---|---|
 | `OLMLX_KV_CACHE_QUANT` | string/None | `None` | KV cache quantization method. Format: `<method>:<bits>` where method is `turboquant` or `spectral`, bits is `2` or `4` |
 
-### Flash-MoE Settings (Experimental)
+### Flash-MoE Settings
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `OLMLX_EXPERIMENTAL_FLASH_MOE` | bool | `false` | Enable Flash-MoE expert offloading for MoE models |
-| `OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS` | int | `48` | LRU cache budget per layer (number of experts kept in RAM) |
-| `OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS` | int | `32` | Parallel I/O threads for expert loading from SSD |
+| `OLMLX_FLASH_MOE` | bool | `false` | Enable Flash-MoE expert offloading for MoE models |
+| `OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS` | int | `48` | LRU cache budget per layer (number of experts kept in RAM) |
+| `OLMLX_FLASH_MOE_IO_THREADS` | int | `32` | Parallel I/O threads for expert loading from SSD |
+
+The legacy names `OLMLX_EXPERIMENTAL_FLASH_MOE*` are still honoured for a deprecation window.
 
 ### Configuration Precedence
 
@@ -1798,7 +1800,7 @@ On each attention step, the cache is dequantized: unpack indices, look up centro
 
 ---
 
-## Flash-MoE Expert Offloading (Experimental)
+## Flash-MoE Expert Offloading
 
 Flash-MoE extends LLM in a Flash to Mixture-of-Experts models by keeping only the router and shared experts in RAM while loading routed expert weights from SSD on demand.
 
@@ -1807,9 +1809,9 @@ Flash-MoE extends LLM in a Flash to Mixture-of-Experts models by keeping only th
 Add to your `.env` file or pass as environment variables:
 
 ```bash
-OLMLX_EXPERIMENTAL_FLASH_MOE=true
-OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS=48
-OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS=32
+OLMLX_FLASH_MOE=true
+OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS=48
+OLMLX_FLASH_MOE_IO_THREADS=32
 ```
 
 ### How It Works
@@ -1843,9 +1845,9 @@ Token arrives at MoE layer
 
 | Setting | Default | Description |
 |---|---|---|
-| `OLMLX_EXPERIMENTAL_FLASH_MOE` | `false` | Enable Flash-MoE |
-| `OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS` | `48` | Experts cached per layer (LRU eviction) |
-| `OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS` | `32` | Parallel I/O threads for expert loading |
+| `OLMLX_FLASH_MOE` | `false` | Enable Flash-MoE |
+| `OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS` | `48` | Experts cached per layer (LRU eviction) |
+| `OLMLX_FLASH_MOE_IO_THREADS` | `32` | Parallel I/O threads for expert loading |
 
 ### Constraints
 

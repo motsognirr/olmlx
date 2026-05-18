@@ -360,13 +360,15 @@ Advanced tuning (rarely needed; left under the experimental prefix):
 | `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS` | `4` | Candidate tokens per speculative step |
 | `OLMLX_EXPERIMENTAL_FLASH_PREFETCH` | `false` | Enable speculative neuron prefetching |
 
-### Flash-MoE settings (experimental)
+### Flash-MoE settings
 
 | Variable | Default | Description |
 |---|---|---|
-| `OLMLX_EXPERIMENTAL_FLASH_MOE` | `false` | Enable Flash-MoE expert offloading for MoE models |
-| `OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS` | `48` | Experts cached per layer (LRU eviction) |
-| `OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS` | `32` | I/O threads for expert loading |
+| `OLMLX_FLASH_MOE` | `false` | Enable Flash-MoE expert offloading for MoE models |
+| `OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS` | `48` | Experts cached per layer (LRU eviction) |
+| `OLMLX_FLASH_MOE_IO_THREADS` | `32` | I/O threads for expert loading |
+
+The legacy names `OLMLX_EXPERIMENTAL_FLASH_MOE*` are still honoured for a deprecation window.
 
 ### Distributed inference settings (experimental)
 
@@ -506,7 +508,7 @@ The legacy `OLMLX_EXPERIMENTAL_FLASH*` names for these five fields are still hon
 For Mixture-of-Experts models (DeepSeek-V3, Kimi-K2.5, Qwen3-Next MoE, MiniMax, gpt-oss), Flash-MoE keeps only the router in RAM and loads routed experts from SSD on demand:
 
 ```bash
-OLMLX_EXPERIMENTAL_FLASH_MOE=true olmlx serve
+OLMLX_FLASH_MOE=true olmlx serve
 ```
 
 ### TurboQuant KV cache

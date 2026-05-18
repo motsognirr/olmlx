@@ -9,25 +9,25 @@ from tests.test_flash_moe_bundler import _make_synthetic_moe_weights
 
 class TestFlashMoeConfig:
     def test_flash_moe_defaults(self):
-        from olmlx.config import ExperimentalSettings
+        from olmlx.config import Settings
 
-        s = ExperimentalSettings()
+        s = Settings()
         assert s.flash_moe is False
         assert s.flash_moe_cache_budget_experts == 48
         assert s.flash_moe_io_threads == 32
 
     def test_flash_moe_env_override(self):
-        from olmlx.config import ExperimentalSettings
+        from olmlx.config import Settings
 
         with patch.dict(
             "os.environ",
             {
-                "OLMLX_EXPERIMENTAL_FLASH_MOE": "true",
-                "OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS": "64",
-                "OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS": "16",
+                "OLMLX_FLASH_MOE": "true",
+                "OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS": "64",
+                "OLMLX_FLASH_MOE_IO_THREADS": "16",
             },
         ):
-            s = ExperimentalSettings()
+            s = Settings()
             assert s.flash_moe is True
             assert s.flash_moe_cache_budget_experts == 64
             assert s.flash_moe_io_threads == 16

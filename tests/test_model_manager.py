@@ -19,6 +19,7 @@ from olmlx.engine.model_manager import (
     _ensure_tokenizer_eos_in_stops,
     parse_keep_alive,
 )
+from olmlx.config import FlashMoeConfig
 from olmlx.engine.registry import ModelConfig, SpeculativeConfig
 from olmlx.engine.template_caps import TemplateCaps
 
@@ -1290,11 +1291,12 @@ class TestFlashMoeVlmFallback:
 
     def _mock_model_exp(self):
         exp = MagicMock()
-        exp.flash_moe = True
-        exp.flash_moe_io_threads = 4
-        exp.flash_moe_cache_budget_experts = 16
         exp.kv_cache_quant = None
         return exp
+
+    @staticmethod
+    def _flash_moe_config():
+        return FlashMoeConfig(enabled=True, cache_budget_experts=16, io_threads=4)
 
     def test_flash_moe_falls_back_to_vlm_on_unsupported_model_type(
         self, registry, mock_store
@@ -1303,7 +1305,7 @@ class TestFlashMoeVlmFallback:
         manager = self._make_manager(registry, mock_store)
         self._pre_download(mock_store, "test/moe-vlm")
         flash_moe_dir = self._make_flash_moe_dir(mock_store, "test/moe-vlm")
-        model_exp = self._mock_model_exp()
+        fm_config = self._flash_moe_config()
 
         mock_vlm_model = MagicMock()
         mock_vlm_model.language_model = MagicMock()
@@ -1337,7 +1339,7 @@ class TestFlashMoeVlmFallback:
                             "test/moe-vlm",
                             str(mock_store.local_path("test/moe-vlm")),
                             flash_moe_dir,
-                            model_exp=model_exp,
+                            flash_moe_config=fm_config,
                         )
 
         assert is_vlm is True
@@ -1348,7 +1350,7 @@ class TestFlashMoeVlmFallback:
         manager = self._make_manager(registry, mock_store)
         self._pre_download(mock_store, "test/moe-vlm2")
         flash_moe_dir = self._make_flash_moe_dir(mock_store, "test/moe-vlm2")
-        model_exp = self._mock_model_exp()
+        fm_config = self._flash_moe_config()
 
         mock_language_model = MagicMock()
         mock_vlm_model = MagicMock()
@@ -1382,7 +1384,7 @@ class TestFlashMoeVlmFallback:
                             "test/moe-vlm2",
                             str(mock_store.local_path("test/moe-vlm2")),
                             flash_moe_dir,
-                            model_exp=model_exp,
+                            flash_moe_config=fm_config,
                         )
 
         assert captured_model["model"] is mock_language_model
@@ -1392,7 +1394,7 @@ class TestFlashMoeVlmFallback:
         manager = self._make_manager(registry, mock_store)
         self._pre_download(mock_store, "test/moe-text")
         flash_moe_dir = self._make_flash_moe_dir(mock_store, "test/moe-text")
-        model_exp = self._mock_model_exp()
+        fm_config = self._flash_moe_config()
 
         mock_model = MagicMock()
         mock_tokenizer = MagicMock()
@@ -1411,7 +1413,7 @@ class TestFlashMoeVlmFallback:
                         "test/moe-text",
                         str(mock_store.local_path("test/moe-text")),
                         flash_moe_dir,
-                        model_exp=model_exp,
+                        flash_moe_config=fm_config,
                     )
 
         assert is_vlm is False
@@ -4184,7 +4186,7 @@ class TestSpeculativeLoading:
         monkeypatch.setattr(
             manager,
             "_load_flash_moe_model",
-            lambda hf_path, load_path, flash_moe_dir, *, model_exp: sentinel_load,
+            lambda hf_path, load_path, flash_moe_dir, *, flash_moe_config: sentinel_load,
         )
         sentinel_decoder = object()
         monkeypatch.setattr(
@@ -4195,10 +4197,14 @@ class TestSpeculativeLoading:
 
         model_exp = ExperimentalSettings(_env_file=None)
         spec_config = SpeculativeConfig(True, "test/draft", 4)
+        fm_config = FlashMoeConfig(enabled=True, cache_budget_experts=48, io_threads=32)
 
         with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
             model, tokenizer, is_vlm, caps, decoder = manager._load_model(
-                "test/moe-model", model_exp=model_exp, spec_config=spec_config
+                "test/moe-model",
+                model_exp=model_exp,
+                spec_config=spec_config,
+                flash_moe_config=fm_config,
             )
         # Flash-MoE now supports classic speculative; decoder is loaded.
         assert (model, tokenizer, is_vlm, caps) == sentinel_load
@@ -4221,10 +4227,14 @@ class TestSpeculativeLoading:
 
         model_exp = ExperimentalSettings(_env_file=None)
         spec_config = SpeculativeConfig(True, "test/draft", 4, strategy="dflash")
+        fm_config = FlashMoeConfig(enabled=True, cache_budget_experts=48, io_threads=32)
 
         with pytest.raises(ValueError, match="dflash.*not supported on Flash-MoE"):
             manager._load_model(
-                "test/moe-model", model_exp=model_exp, spec_config=spec_config
+                "test/moe-model",
+                model_exp=model_exp,
+                spec_config=spec_config,
+                flash_moe_config=fm_config,
             )
 
     def test_flash_moe_path_rejects_flash_speculative(self, monkeypatch):
@@ -4243,12 +4253,16 @@ class TestSpeculativeLoading:
 
         model_exp = ExperimentalSettings(_env_file=None, flash_speculative=True)
         spec_config = SpeculativeConfig(False, None, 4)
+        fm_config = FlashMoeConfig(enabled=True, cache_budget_experts=48, io_threads=32)
 
         with pytest.raises(
             ValueError, match="flash_speculative.*not supported on Flash-MoE"
         ):
             manager._load_model(
-                "test/moe-model", model_exp=model_exp, spec_config=spec_config
+                "test/moe-model",
+                model_exp=model_exp,
+                spec_config=spec_config,
+                flash_moe_config=fm_config,
             )
 
 

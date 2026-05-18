@@ -1,12 +1,9 @@
-import logging
-import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
-
-logger = logging.getLogger(__name__)
 
 #: Metal sync behavior at inference-lock boundaries. Single source of truth
 #: shared by ``Settings.sync_mode``, ``ModelConfig.sync_mode``, and
@@ -128,17 +125,10 @@ class Settings(BaseSettings):
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] | None = None
 
-    # Flash inference (LLM in a Flash). Primary, user-facing knobs.
-    # Advanced tuning (window size, IO threads, cache budget, predictor
-    # rank, buffer modes) lives on ``ExperimentalSettings`` and the
-    # ``olmlx flash prepare`` CLI — these five fields are the ones a
-    # typical user needs to touch. Per-model overrides live on
-    # ``ModelConfig`` in ``olmlx.engine.registry``.
-    flash: bool = False
-    flash_sparsity_threshold: Annotated[float, Field(gt=0, le=1.0)] = 0.5
-    flash_min_active_neurons: Annotated[int, Field(gt=0)] = 128
-    flash_max_active_neurons: Annotated[int, Field(gt=0)] | None = None
-    flash_memory_budget_fraction: Annotated[float, Field(gt=0, le=1.0)] | None = None
+    # Flash MoE (SSD-based expert offloading for MoE models)
+    flash_moe: bool = False
+    flash_moe_cache_budget_experts: Annotated[int, Field(ge=0)] = 48
+    flash_moe_io_threads: Annotated[int, Field(gt=0)] = 32
 
     @model_validator(mode="after")
     def validate_auto_calibrate(self) -> "Settings":
@@ -149,23 +139,6 @@ class Settings(BaseSettings):
             raise ValueError(
                 "OLMLX_KV_CACHE_AUTO_CALIBRATE=true requires "
                 "OLMLX_KV_CACHE_QUANT=spectral:<bits>"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def validate_flash_neuron_range(self) -> "Settings":
-        # Cross-field check: an inverted min/max would produce a silently
-        # broken ``FlashConfig`` at runtime (FlashMLP clamps each token's
-        # active neurons into ``[min, max]``, and a min > max collapses
-        # the interval). Fail at config load instead.
-        if (
-            self.flash_max_active_neurons is not None
-            and self.flash_min_active_neurons > self.flash_max_active_neurons
-        ):
-            raise ValueError(
-                f"flash_min_active_neurons ({self.flash_min_active_neurons}) "
-                f"must be <= flash_max_active_neurons "
-                f"({self.flash_max_active_neurons})"
             )
         return self
 
@@ -212,14 +185,11 @@ class ExperimentalSettings(BaseSettings):
         "extra": "ignore",
     }
 
-    # Flash inference — advanced/tuning knobs. The primary user-facing
-    # fields (``flash``, ``flash_sparsity_threshold``,
-    # ``flash_min_active_neurons``, ``flash_max_active_neurons``,
-    # ``flash_memory_budget_fraction``) were promoted to ``Settings``;
-    # what remains here is rarely-touched tuning that most users should
-    # not need to set. Per-model overrides for advanced knobs still go
-    # under the ``experimental`` block in models.json. (``distributed_*``
-    # was promoted to ``Settings`` in #326 and removed from here too.)
+    # Flash inference (LLM in a Flash)
+    flash: bool = False
+    flash_sparsity_threshold: Annotated[float, Field(gt=0, le=1.0)] = 0.5
+    flash_min_active_neurons: Annotated[int, Field(gt=0)] = 128
+    flash_max_active_neurons: Annotated[int, Field(gt=0)] | None = None
     flash_window_size: Annotated[int, Field(gt=0)] = 5
     flash_io_threads: Annotated[int, Field(gt=0)] = 32
     flash_cache_budget_neurons: Annotated[int, Field(ge=0)] = 1024
@@ -228,6 +198,7 @@ class ExperimentalSettings(BaseSettings):
     flash_predictor_sensitive_rank_multiplier: Annotated[int, Field(gt=0)] = 4
     flash_bypass_os_cache: bool = False
     flash_preallocated_buffer: bool = False
+    flash_memory_budget_fraction: Annotated[float, Field(gt=0, le=1.0)] | None = None
     flash_prefetch: bool = False
     flash_prefetch_confidence_threshold: Annotated[float, Field(gt=0, le=1.0)] = 0.3
     flash_prefetch_min_neurons: Annotated[int, Field(gt=0)] = 64
@@ -237,210 +208,11 @@ class ExperimentalSettings(BaseSettings):
     flash_speculative_draft_model: str | None = None
     flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
-    # Flash MoE (SSD-based expert offloading for MoE models)
-    flash_moe: bool = False
-    flash_moe_cache_budget_experts: Annotated[int, Field(ge=0)] = 48  # per layer
-    flash_moe_io_threads: Annotated[int, Field(gt=0)] = 32
 
 
 experimental = ExperimentalSettings()
 
 PRE_SHARDED_DIR_ENV = "OLMLX_DISTRIBUTED_PRE_SHARDED_DIR"
-
-
-#: Legacy ``OLMLX_EXPERIMENTAL_FLASH*`` env vars and their parsers.
-#: Lives here rather than in ``olmlx.cli`` so the distributed-worker
-#: entry point (which must not import argparse/uvicorn) can apply the
-#: same one-release deprecation shim that ``cmd_serve`` / ``cmd_chat`` /
-#: ``cmd_config_show`` / ``cmd_flash_info`` apply on the CLI side.
-LEGACY_FLASH_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], ...] = (
-    (
-        "OLMLX_EXPERIMENTAL_FLASH",
-        "OLMLX_FLASH",
-        "flash",
-        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
-    ),
-    (
-        "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD",
-        "OLMLX_FLASH_SPARSITY_THRESHOLD",
-        "flash_sparsity_threshold",
-        float,
-    ),
-    (
-        "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS",
-        "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
-        "flash_min_active_neurons",
-        int,
-    ),
-    (
-        "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS",
-        "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
-        "flash_max_active_neurons",
-        int,
-    ),
-    (
-        "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION",
-        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION",
-        "flash_memory_budget_fraction",
-        float,
-    ),
-)
-
-
-def surface_legacy_flash_env() -> None:
-    """Detect and forward legacy ``OLMLX_EXPERIMENTAL_FLASH*`` (primary
-    knobs only) to the new ``OLMLX_FLASH*`` names.
-
-    Only the five promoted primary knobs are forwarded. Advanced tuning
-    fields (``OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE``,
-    ``..._IO_THREADS``, ``..._CACHE_BUDGET_NEURONS``,
-    ``..._BYPASS_OS_CACHE``, ``..._PREALLOCATED_BUFFER``,
-    ``..._PREDICTOR_*``, ``..._PREFETCH*``, ``..._SPECULATIVE*``,
-    ``..._MOE*``) remain under the experimental prefix and pass through
-    unchanged.
-
-    Updates ``settings.<field>`` in-process but does not write back to
-    ``os.environ``. All callers in this codebase consume the promoted
-    knobs via ``settings.*`` (the distributed-worker env-forwarding loop
-    in ``_launch_distributed_workers`` mirrors ``settings.*`` into the
-    worker's ``OLMLX_FLASH*`` env vars). Anything that reads
-    ``os.environ.get("OLMLX_FLASH*")`` directly will miss the legacy
-    value — mirror through ``settings`` instead.
-
-    Defined in ``olmlx.config`` rather than ``olmlx.cli`` so the
-    distributed-worker entry point can reuse the same logic without
-    pulling in argparse/uvicorn.
-    """
-    # Collect per-field actions: only consider a legacy var "pending"
-    # if its *parsed* value would actually change the live Settings.
-    # ``OLMLX_EXPERIMENTAL_FLASH=false`` (a user explicitly disabling
-    # flash via the old name) parses to the schema default ``False``
-    # and has nothing to migrate — skipping it here suppresses a
-    # noisy warning that would otherwise nag every invocation for a
-    # variable whose only effect is "leave the default".
-    pending: list[tuple[str, str, str, Any]] = []
-    for legacy, new, attr, parse in LEGACY_FLASH_FORWARD:
-        legacy_val = os.environ.get(legacy)
-        if legacy_val is None:
-            continue
-        # ``os.environ`` only — pydantic-settings reads ``.env`` directly
-        # into the model fields without writing to the shell env, so a
-        # ``.env`` line like ``OLMLX_FLASH=false`` (explicit default)
-        # combined with a legacy shell var would slip past this guard.
-        # The ``getattr != field_default`` check below catches the
-        # non-default case; the only remaining blind spot is a ``.env``
-        # value identical to the schema default. Acceptable during the
-        # one-release deprecation window.
-        if os.environ.get(new) is not None:
-            continue
-        field_default = Settings.model_fields[attr].default
-        if getattr(settings, attr) != field_default:
-            # ``.env`` (or programmatic write at import time) already
-            # supplied a non-default value; don't let the legacy var
-            # clobber it.
-            continue
-        try:
-            value = parse(legacy_val)
-        except Exception as exc:
-            logger.warning(
-                "Could not forward legacy env var %s=%r to %s: %s",
-                legacy,
-                legacy_val,
-                new,
-                exc,
-            )
-            continue
-        if value == field_default:
-            # Parsed value already matches the schema default — no
-            # behavioural change, nothing to migrate.
-            continue
-        pending.append((legacy, new, attr, value))
-
-    if not pending:
-        return
-
-    # Pre-validate cross-field constraints by combining the *pending*
-    # set with the *live* Settings for the non-pending bound. Without
-    # this, three failure modes would slip through to the per-field
-    # setattr — caught only by the generic "Could not forward" log,
-    # with the migration banner suppressed so the user never sees the
-    # rename nudge:
-    #   (a) pending min + pending max, inverted (round-7 case).
-    #   (b) pending min only, but live max (e.g. from ``.env``) is
-    #       below the pending min.
-    #   (c) pending max only, but live min is above the pending max.
-    # All three are handled the same way: drop both flash neuron-range
-    # entries from ``pending`` and emit one explicit warning naming
-    # the effective pair.
-    pending_attrs = {attr: value for _, _, attr, value in pending}
-    pending_min = pending_attrs.get("flash_min_active_neurons")
-    pending_max = pending_attrs.get("flash_max_active_neurons")
-    effective_min = (
-        pending_min if pending_min is not None else settings.flash_min_active_neurons
-    )
-    effective_max = (
-        pending_max if pending_max is not None else settings.flash_max_active_neurons
-    )
-    has_neuron_pending = (
-        "flash_min_active_neurons" in pending_attrs
-        or "flash_max_active_neurons" in pending_attrs
-    )
-    if (
-        has_neuron_pending
-        and effective_max is not None
-        and effective_min > effective_max
-    ):
-        logger.warning(
-            "Refusing to forward legacy flash neuron-range values: the "
-            "resulting pair (min=%r, max=%r) would have min > max. "
-            "Dropping the legacy flash_min/flash_max forwards (any "
-            "partial apply would leave one bound unset and silently "
-            "remove the user's intended ceiling/floor). Rename to "
-            "OLMLX_FLASH_MIN_ACTIVE_NEURONS / "
-            "OLMLX_FLASH_MAX_ACTIVE_NEURONS with a consistent pair.",
-            effective_min,
-            effective_max,
-        )
-        pending = [
-            (legacy, new, attr, value)
-            for legacy, new, attr, value in pending
-            if attr not in ("flash_min_active_neurons", "flash_max_active_neurons")
-        ]
-        if not pending:
-            return
-
-    # Apply each pending value; banner names only the vars that
-    # actually landed in Settings. A legacy value rejected by a
-    # single-field Pydantic validator (e.g. ``Field(gt=0)``) should
-    # not be listed as "rename this" — the legacy value was never
-    # honoured, so renaming it would just hit the same validator
-    # again.
-    applied: list[str] = []
-    for legacy, new, attr, value in pending:
-        try:
-            setattr(settings, attr, value)
-        except Exception as exc:
-            logger.warning(
-                "Could not forward legacy env var %s to %s: %s",
-                legacy,
-                new,
-                exc,
-            )
-            continue
-        applied.append(legacy)
-    if not applied:
-        return
-    logger.warning(
-        "Deprecated env vars detected: %s. The Flash primary knobs have "
-        "been promoted out of the experimental prefix — rename to "
-        "OLMLX_FLASH, OLMLX_FLASH_SPARSITY_THRESHOLD, "
-        "OLMLX_FLASH_MIN_ACTIVE_NEURONS, OLMLX_FLASH_MAX_ACTIVE_NEURONS, "
-        "OLMLX_FLASH_MEMORY_BUDGET_FRACTION. The legacy names will be "
-        "removed in a future release. Advanced flash tuning fields "
-        "(window_size, io_threads, cache_budget_neurons, predictor_*, "
-        "prefetch_*, etc.) remain under OLMLX_EXPERIMENTAL_FLASH_*.",
-        ", ".join(applied),
-    )
 
 
 def resolve_experimental(
@@ -465,3 +237,12 @@ def resolve_experimental(
     # schema validator shared by __init__ and model_validate; calling it
     # directly bypasses _settings_build_values().
     return ExperimentalSettings.__pydantic_validator__.validate_python(merged)
+
+
+@dataclass
+class FlashMoeConfig:
+    """Resolved Flash-MoE configuration: per-model overrides global Settings."""
+
+    enabled: bool
+    cache_budget_experts: int
+    io_threads: int

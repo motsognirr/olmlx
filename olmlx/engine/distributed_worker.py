@@ -139,13 +139,13 @@ def _load_flash_tensor_worker(model_path: str, group) -> tuple:
         hidden_size=layout_config["hidden_size"],
         intermediate_size=layout_config["intermediate_size"],
         num_layers=layout_config["num_layers"],
-        sparsity_threshold=settings.flash_sparsity_threshold,
-        min_active_neurons=settings.flash_min_active_neurons,
-        max_active_neurons=settings.flash_max_active_neurons,
+        sparsity_threshold=experimental.flash_sparsity_threshold,
+        min_active_neurons=experimental.flash_min_active_neurons,
+        max_active_neurons=experimental.flash_max_active_neurons,
         window_size=experimental.flash_window_size,
         io_threads=experimental.flash_io_threads,
         cache_budget_neurons=experimental.flash_cache_budget_neurons,
-        memory_budget_fraction=settings.flash_memory_budget_fraction,
+        memory_budget_fraction=experimental.flash_memory_budget_fraction,
     )
 
     weight_store = FlashWeightStore(
@@ -181,38 +181,25 @@ def worker_main() -> None:
 
     # Check Flash-MoE before ring init — exiting after init hangs the
     # coordinator on ring collectives.
-    from olmlx.config import experimental as _exp_early
-    from olmlx.config import settings as _settings_early
+    from olmlx.config import experimental as _exp_early, settings as _settings_early
 
-    # Honour the one-release deprecation window for the full
-    # ``OLMLX_EXPERIMENTAL_FLASH*`` set on the direct-worker path. The
-    # coordinator runs the same shim in its own startup and forwards
-    # resolved ``OLMLX_FLASH*`` values to workers it launches via SSH,
-    # so this matters only when ``python -m olmlx.engine.distributed_worker``
-    # is invoked directly with legacy env vars set. The helper lives in
-    # ``olmlx.config`` so the worker does not need to import ``olmlx.cli``
-    # (and its argparse/uvicorn baggage).
-    from olmlx.config import surface_legacy_flash_env as _surface_legacy_flash_env
-
-    _surface_legacy_flash_env()
-
-    if _exp_early.flash_moe:
+    if _settings_early.flash_moe:
         logger.error(
             "Flash-MoE + distributed is not supported. "
-            "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or "
+            "Disable OLMLX_FLASH_MOE or "
             "OLMLX_DISTRIBUTED."
         )
         sys.exit(1)
 
     strategy = _get_env("OLMLX_DISTRIBUTED_STRATEGY", "tensor")
-    if strategy == "pipeline" and _settings_early.flash:
+    if strategy == "pipeline" and _exp_early.flash:
         logger.error(
             "Flash + pipeline distributed strategy is not supported. "
             "Use tensor strategy or disable Flash."
         )
         sys.exit(1)
 
-    if _settings_early.flash:
+    if _exp_early.flash:
         from pathlib import Path
 
         from olmlx.config import settings
@@ -265,7 +252,7 @@ def worker_main() -> None:
     # Load and shard the model
     import mlx_lm
 
-    from olmlx.config import PRE_SHARDED_DIR_ENV, settings as _settings_strat
+    from olmlx.config import PRE_SHARDED_DIR_ENV, experimental
 
     if strategy == "pipeline":
         # Pipeline mode: load model, apply pipeline partitioning
@@ -318,7 +305,7 @@ def worker_main() -> None:
             sys.exit(1)
         mx.eval(model.parameters())  # materialize owned weights on GPU
     elif strategy == "tensor":
-        if _settings_strat.flash:
+        if experimental.flash:
             try:
                 model, tokenizer = _load_flash_tensor_worker(model_path, group)
             except Exception:

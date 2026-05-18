@@ -209,14 +209,14 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="flash-moe",
         description="Flash MoE expert offloading",
-        env_overrides={"OLMLX_EXPERIMENTAL_FLASH_MOE": "true"},
+        env_overrides={"OLMLX_FLASH_MOE": "true"},
         should_skip=_requires_flash_moe,
     ),
     Scenario(
         name="flash-moe+tq4",
         description="Flash MoE + TurboQuant 4-bit",
         env_overrides={
-            "OLMLX_EXPERIMENTAL_FLASH_MOE": "true",
+            "OLMLX_FLASH_MOE": "true",
             "OLMLX_KV_CACHE_QUANT": "turboquant:4",
         },
         should_skip=_requires_flash_moe,

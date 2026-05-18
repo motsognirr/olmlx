@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +70,38 @@ class LoadedExperts:
     remap_lut: mx.array | None = None
 
 
+@dataclass
+class ExpertCacheStats:
+    """Counters for monitoring expert cache effectiveness."""
+
+    requests: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    load_failures: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def record(self, hits: int, misses: int, failures: int = 0) -> None:
+        with self._lock:
+            self.requests += 1
+            self.cache_hits += hits
+            self.cache_misses += misses
+            self.load_failures += failures
+
+    def hit_rate(self) -> float:
+        total = self.cache_hits + self.cache_misses
+        return self.cache_hits / total if total > 0 else 0.0
+
+    def snapshot(self) -> dict[str, int]:
+        """Return a snapshot of current counters."""
+        with self._lock:
+            return {
+                "requests": self.requests,
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "load_failures": self.load_failures,
+            }
+
+
 _ExpertCache = LayerLruCache[int, dict[str, Any]]
 
 
@@ -91,6 +124,7 @@ class FlashMoeWeightStore:
         self._quant_mode = self._layout_config.get("quant_mode", "affine")
         self._layouts = self._load_layouts()
         self._fds: dict[int, int] = {}
+        self.stats = ExpertCacheStats()
         try:
             self._fds = open_fds(
                 {idx: layout.file_path for idx, layout in self._layouts.items()},
@@ -290,6 +324,10 @@ class FlashMoeWeightStore:
         cached = self._cache.get_batch(layer_idx, expert_indices)
         missing = [idx for idx in expert_indices if idx not in cached]
 
+        hits = len(expert_indices) - len(missing)
+        misses = len(missing)
+        failures = 0
+
         # Load missing experts via parallel I/O; consume in completion order so
         # slow readers do not block fast ones. On error cancel any queued-but-
         # not-started futures (already-running reads run to completion anyway,
@@ -306,9 +344,12 @@ class FlashMoeWeightStore:
                     cached[idx] = data
                     self._cache.put(layer_idx, idx, data)
             except Exception:
+                failures += 1
                 for f in future_to_idx:
                     f.cancel()
                 raise
+
+        self.stats.record(hits, misses, failures)
 
         # Build index map and stack arrays in input order
         expert_index_map = {eidx: i for i, eidx in enumerate(expert_indices)}

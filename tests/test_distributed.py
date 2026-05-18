@@ -868,6 +868,7 @@ class TestFileHandleLeak:
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
                 distributed_worker_shard_dir="",
+                flash_moe=False,
             ),
         )
         monkeypatch.setattr(
@@ -1050,6 +1051,7 @@ class TestSSHFailureDetection:
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
                 distributed_worker_shard_dir="",
+                flash_moe=False,
             ),
         )
         monkeypatch.setattr(
@@ -1148,6 +1150,7 @@ class TestLogFileHandleLifetime:
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
                 distributed_worker_shard_dir="",
+                flash_moe=False,
             ),
         )
         monkeypatch.setattr(
@@ -1246,6 +1249,7 @@ class TestRingHostfileGeneration:
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
                 distributed_worker_shard_dir="",
+                flash_moe=False,
             ),
         )
         monkeypatch.setattr(
@@ -1306,6 +1310,7 @@ class TestRingHostfileGeneration:
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
                 distributed_worker_shard_dir="",
+                flash_moe=False,
             ),
         )
         monkeypatch.setattr(
@@ -1491,6 +1496,7 @@ class TestSSHCommandConstruction:
                 distributed_remote_python="uv run python",
                 distributed_pre_shard=False,
                 distributed_worker_shard_dir="",
+                flash_moe=False,
             ),
         )
         monkeypatch.setattr(
@@ -1545,6 +1551,7 @@ class TestSSHCommandConstruction:
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
                 distributed_worker_shard_dir="",
+                flash_moe=False,
             ),
         )
         monkeypatch.setattr(
@@ -1598,6 +1605,7 @@ class TestSSHCommandConstruction:
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
                 distributed_worker_shard_dir="",
+                flash_moe=False,
             ),
         )
         monkeypatch.setattr(

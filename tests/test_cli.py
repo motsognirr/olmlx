@@ -989,7 +989,7 @@ class TestBuildParser:
                         "speculative": True,
                         "speculative_strategy": "dflash",
                         "speculative_draft_model": "moe-dflash/draft",
-                        "experimental": {"flash_moe": True},
+                        "flash_moe": True,
                     },
                 }
             )
