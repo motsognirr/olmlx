@@ -160,6 +160,14 @@ class TestGradeNumeric:
         r = grade_numeric("total cost: 1,234", {"answer": 1234})
         assert r.passed is True
 
+    def test_gsm8k_hash_form_with_commas(self):
+        # A model that follows the instructed "#### N" format but writes a
+        # comma-grouped number must still parse correctly. The default
+        # GSM8K prompt asks for "#### <number>" — many models will format
+        # >999 answers with thousands separators.
+        r = grade_numeric("Step 1...\n#### 1,234", {"answer": 1234})
+        assert r.passed is True
+
     def test_no_number_fails(self):
         r = grade_numeric("no digits", {"answer": 5})
         assert r.passed is False

@@ -14,21 +14,31 @@ Typical flow:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
-from olmlx.models.store import _safe_dir_name
-
 GOLDENS_SUBDIR = "goldens"
+
+# Sanitize model names and prompt names for filesystem use. Intentionally
+# duplicates the rule used by ``olmlx.models.store`` (replace anything
+# outside ``[A-Za-z0-9_.-]`` with ``_``) rather than importing a private
+# helper across module boundaries — golden file naming is a local concern
+# that should not break if the model-store sanitizer ever evolves.
+_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_.-]")
+
+
+def _sanitize(name: str) -> str:
+    return _SANITIZE_RE.sub("_", name)
 
 
 def goldens_dir(bench_dir: Path, model: str) -> Path:
     """Directory where goldens for ``model`` live under ``bench_dir``."""
-    return bench_dir / GOLDENS_SUBDIR / _safe_dir_name(model)
+    return bench_dir / GOLDENS_SUBDIR / _sanitize(model)
 
 
 def golden_path(bench_dir: Path, model: str, prompt_name: str) -> Path:
     """Absolute path to a single prompt's golden file."""
-    return goldens_dir(bench_dir, model) / f"{_safe_dir_name(prompt_name)}.txt"
+    return goldens_dir(bench_dir, model) / f"{_sanitize(prompt_name)}.txt"
 
 
 def load_golden(bench_dir: Path, model: str, prompt_name: str) -> str | None:

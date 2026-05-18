@@ -168,14 +168,16 @@ def grade_regex_match(output: str, expected: dict[str, Any]) -> QualityResult:
 
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
-_GSM8K_FINAL_RE = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
+# Allow comma thousands separators so "#### 1,234" parses as 1234. Commas
+# are stripped before float() because Python's float() rejects them.
+_GSM8K_FINAL_RE = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
 
 
 def _extract_number(text: str) -> float | None:
     m = _GSM8K_FINAL_RE.search(text)
     if m:
         try:
-            return float(m.group(1))
+            return float(m.group(1).replace(",", ""))
         except ValueError:
             return None
     # Also tolerate "answer: 42", "= 42", "\\boxed{42}", "42."
@@ -249,15 +251,23 @@ def _code_exec_preexec() -> None:  # pragma: no cover — POSIX child
     import resource
 
     cpu = 5
-    mem = 512 * 1024 * 1024
     try:
         resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
     except (ValueError, OSError):
         pass
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
-    except (ValueError, OSError):
-        pass
+    # RLIMIT_AS limits the *virtual* address space, not resident memory.
+    # On macOS, Python's allocator + linked dylibs can pre-map several GB
+    # of address space at startup, so a tight RLIMIT_AS may kill the
+    # child before its first statement. Apply only on Linux, where
+    # startup VA usage is small enough for the limit to be meaningful;
+    # RLIMIT_CPU + subprocess.run(timeout=10) still bound runaway code
+    # cross-platform.
+    if sys.platform.startswith("linux"):
+        mem = 512 * 1024 * 1024
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+        except (ValueError, OSError):
+            pass
 
 
 def grade_code_exec(output: str, expected: dict[str, Any]) -> QualityResult:
