@@ -717,9 +717,7 @@ class TestRegistryModelConfig:
         """flash_moe in the experimental block should raise a clear migration error."""
         from olmlx.engine import registry
 
-        with pytest.raises(
-            ValueError, match="'flash_moe' to the top level"
-        ):
+        with pytest.raises(ValueError, match="'flash_moe' to the top level"):
             ModelConfig.from_entry(
                 {
                     "hf_path": "mo/non-existent",

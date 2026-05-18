@@ -526,16 +526,20 @@ def _legacy_flash_moe_values_in_dotenv() -> dict[str, str]:
         if key.startswith("export "):
             key = key[len("export ") :].strip()
         value = value.strip()
+        # Strip trailing inline comment before quote detection so
+        # ``"true" # comment`` is recognised as a quoted value.
+        if not (
+            len(value) >= 2 and (value[0] in ('"', "'") and value[-1] in ('"', "'"))
+        ):
+            comment_idx = value.find("#")
+            if comment_idx != -1:
+                value = value[:comment_idx].rstrip()
         is_quoted = len(value) >= 2 and (
             (value.startswith('"') and value.endswith('"'))
             or (value.startswith("'") and value.endswith("'"))
         )
         if is_quoted:
             value = value[1:-1]
-        else:
-            comment_idx = value.find("#")
-            if comment_idx != -1:
-                value = value[:comment_idx].rstrip()
         if key in legacy and key not in found:
             found[key] = value
     return found
@@ -909,9 +913,9 @@ def _audit_speculative_config() -> tuple[
       so users see the redirect. Flash-MoE supports standalone speculative
       (classic strategy only) and is excluded from this check.
     - ``dflash_moe_conflicts`` — models that combine
-      ``speculative_strategy='dflash'`` with Flash-MoE. Triggers a
-      warning since dflash is unsupported on MoE targets (raises
-      ValueError at load time).
+      ``speculative_strategy='dflash'`` or ``'eagle'`` with Flash-MoE.
+      Triggers a warning since both are unsupported on MoE targets
+      (raises ValueError at load time).
     - ``global_draft_used`` — True if at least one model resolves to
       the global ``speculative_draft_model`` (i.e. has ``speculative=True``
       and no per-model draft override). Used to suppress the global
@@ -1002,7 +1006,7 @@ def _audit_speculative_config() -> tuple[
                 continue
             if resolved_exp.flash:
                 flash_conflicts.append(name)
-            if mc.resolved_flash_moe().enabled and strategy == "dflash":
+            if mc.resolved_flash_moe().enabled and strategy in ("dflash", "eagle"):
                 dflash_moe_conflicts.append(name)
     return bad, dormant, flash_conflicts, dflash_moe_conflicts, global_draft_used
 

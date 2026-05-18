@@ -341,19 +341,19 @@ class FlashMoeWeightStore:
                     self._executor.submit(self._read_expert, layer_idx, idx): idx
                     for idx in missing
                 }
-                try:
-                    for future in as_completed(future_to_idx):
+                failed = 0
+                for future in as_completed(future_to_idx):
+                    try:
                         idx = future_to_idx[future]
                         data = future.result()
                         cached[idx] = data
                         self._cache.put(layer_idx, idx, data)
-                except Exception:
-                    # All requested experts are effectively failed since
-                    # we can't serve a partial cache to the caller.
-                    failures = len(missing)
-                    for f in future_to_idx:
-                        f.cancel()
-                    raise
+                    except Exception:
+                        failed += 1
+                        for f in future_to_idx:
+                            f.cancel()
+                        failures = failed
+                        raise
         finally:
             self.stats.record(hits, misses, failures)
 
