@@ -640,14 +640,18 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(1)
 
-    # Share one ``ModelRegistry`` instance across the audit helpers so
-    # the disk read happens once *and* every audit sees the same
-    # registry state. If the centralised load fails, all audits skip
-    # together — letting each helper retry on its own could leave one
-    # succeeding while another silently skips on the same transient
-    # I/O failure, producing an asymmetric view of the operator's
-    # config and requiring multiple restart cycles to surface every
-    # problem.
+    # Share one ``ModelRegistry`` instance across the two audit helpers
+    # that consume it (``_audit_speculative_config`` and
+    # ``_audit_per_model_flash_in_distributed``) so the disk read
+    # happens once *and* both audits see the same registry state. If
+    # the centralised load fails, both skip together — letting each
+    # helper retry on its own could leave one succeeding while another
+    # silently skips on the same transient I/O failure, producing an
+    # asymmetric view of the operator's config and requiring multiple
+    # restart cycles to surface every problem. Note: the earlier
+    # ``_models_with_promoted_keys_in_experimental`` call uses a raw
+    # ``json.load`` (no registry instance), so it's not part of this
+    # coordination and runs independently.
     audit_registry = _load_registry_for_audit()
     if audit_registry is None:
         return

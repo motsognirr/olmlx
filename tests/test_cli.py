@@ -1170,6 +1170,57 @@ class TestBuildParser:
         assert flash == []
         assert dflash_moe == ["moe-dflash-bad/m:latest"]
 
+    def test_audit_flash_conflict_skipped_when_resolved_flash_raises(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A model with ``speculative=true`` plus a flash configuration
+        that makes ``resolved_flash()`` raise (e.g. per-model min above
+        the global max) is intentionally excluded from
+        ``flash_conflicts``. The startup audit logs a "Skipping flash
+        conflict check" warning so the operator sees the resolution
+        failure; the conflict itself surfaces at model load time when
+        ``resolved_flash`` is called again and raises a clear
+        ``ValueError``.
+
+        Regression test pinning the intended behaviour — without it a
+        future reader could "fix" the silent skip by speculatively
+        adding the model to ``flash_conflicts`` even when its flash
+        state is unknown.
+        """
+        import logging
+
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "flash-bad/m:latest": {
+                        "hf_path": "flash-bad/m",
+                        "speculative": True,
+                        "speculative_draft_model": "flash-bad/draft",
+                        # Per-model min crosses the global max →
+                        # ``resolved_flash()`` raises "inverted range".
+                        "flash_min_active_neurons": 1_000_000,
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", 32)
+        monkeypatch.setattr(_settings, "flash_max_active_neurons", 100)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            bad, dormant, flash, dflash_moe, _global_used = _audit_speculative_config()
+
+        # Flash conflict NOT reported (resolution failed, intent is to
+        # skip rather than guess) but the warning is emitted.
+        assert flash == []
+        assert "Skipping flash conflict check" in caplog.text
+
     def test_service_install(self):
         parser = build_parser()
         args = parser.parse_args(["service", "install"])
