@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
-from olmlx.config import SyncMode, experimental as global_experimental
+from olmlx.config import FlashMoeConfig, SyncMode, experimental as global_experimental
 from olmlx.config import resolve_experimental, settings
 from olmlx.engine.registry import ModelRegistry, ResolvedFlashConfig, SpeculativeConfig
 from olmlx.utils import memory as memory_utils
@@ -1201,6 +1201,7 @@ class ModelManager:
                 # ``model_exp``.
                 flash_config = model_config.resolved_flash()
                 kv_cache_quant = model_config.resolved_kv_cache_quant()
+                flash_moe_config = model_config.resolved_flash_moe()
 
                 # Pop LRU evictees under the lock; close them outside the lock
                 # below so other ``ensure_loaded`` callers — especially ones
@@ -1324,6 +1325,7 @@ class ModelManager:
                         model_exp,
                         spec_config,
                         flash_config,
+                        flash_moe_config,
                     )
                     timeout = settings.model_load_timeout
                     is_distributed = False
@@ -2915,8 +2917,8 @@ class ModelManager:
             return flash_moe_path
         return None
 
-    def _is_flash_moe_enabled(self, model_exp: Any) -> bool:
-        return model_exp.flash_moe
+    def _is_flash_moe_enabled(self, flash_moe_config: FlashMoeConfig) -> bool:
+        return flash_moe_config.enabled
 
     def _load_flash_moe_model(
         self,
@@ -2924,7 +2926,7 @@ class ModelManager:
         load_path: str,
         flash_moe_dir: Path,
         *,
-        model_exp: Any,
+        flash_moe_config: FlashMoeConfig,
     ) -> tuple[Any, Any, bool, TemplateCaps]:
         """Load a model in Flash-MoE mode.
 
@@ -2957,8 +2959,8 @@ class ModelManager:
 
         store = FlashMoeWeightStore(
             flash_moe_dir,
-            num_io_threads=model_exp.flash_moe_io_threads,
-            cache_budget_experts=model_exp.flash_moe_cache_budget_experts,
+            num_io_threads=flash_moe_config.io_threads,
+            cache_budget_experts=flash_moe_config.cache_budget_experts,
         )
 
         try:
@@ -2986,6 +2988,7 @@ class ModelManager:
         model_exp: Any = None,
         spec_config: SpeculativeConfig | None = None,
         flash_config: ResolvedFlashConfig | None = None,
+        flash_moe_config: FlashMoeConfig | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
 
@@ -2999,6 +3002,10 @@ class ModelManager:
         *flash_config* is the resolved Flash primary-knob config
         (``ModelConfig.resolved_flash()``). Falls back to a fresh
         resolution from global ``Settings`` values when ``None``.
+
+        *flash_moe_config* is the resolved ``FlashMoeConfig`` (per-model
+        overrides applied). Falls back to a fresh resolution from
+        global ``Settings`` values when ``None``.
 
         Returns (model, tokenizer, is_vlm, caps, speculative_decoder).
         """
@@ -3019,6 +3026,10 @@ class ModelManager:
             from olmlx.engine.registry import ModelConfig
 
             flash_config = ModelConfig(hf_path=hf_path).resolved_flash()
+        if flash_moe_config is None:
+            from olmlx.engine.registry import ModelConfig
+
+            flash_moe_config = ModelConfig(hf_path=hf_path).resolved_flash_moe()
         spec_enabled = spec_config.enabled
 
         # Ensure model is downloaded to the store
@@ -3028,7 +3039,7 @@ class ModelManager:
             load_path = str(local_dir)
 
         # Check for flash-MoE-prepared model
-        if self._is_flash_moe_enabled(model_exp):
+        if self._is_flash_moe_enabled(flash_moe_config):
             flash_moe_dir = self._flash_moe_dir(hf_path)
             if flash_moe_dir is not None:
                 if spec_enabled and spec_config.strategy in ("dflash", "eagle"):
@@ -3055,7 +3066,7 @@ class ModelManager:
                         "use speculative instead."
                     )
                 model, tokenizer, is_vlm, caps = self._load_flash_moe_model(
-                    hf_path, load_path, flash_moe_dir, model_exp=model_exp
+                    hf_path, load_path, flash_moe_dir, flash_moe_config=flash_moe_config
                 )
                 if spec_enabled:
                     decoder = self._load_speculative_decoder(
@@ -3153,6 +3164,7 @@ class ModelManager:
         model_exp: Any = None,
         spec_config: SpeculativeConfig | None = None,
         flash_config: ResolvedFlashConfig | None = None,
+        flash_moe_config: FlashMoeConfig | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 
@@ -3171,6 +3183,7 @@ class ModelManager:
             model_exp=model_exp,
             spec_config=spec_config,
             flash_config=flash_config,
+            flash_moe_config=flash_moe_config,
         )
         is_distributed = False
 

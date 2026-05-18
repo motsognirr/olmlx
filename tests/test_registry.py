@@ -548,6 +548,16 @@ class TestModelConfig:
                 }
             )
 
+    def test_flash_moe_in_experimental_raises_migration_error(self):
+        """flash_moe in the experimental block should raise a clear migration error."""
+        with pytest.raises(ValueError, match="'flash_moe' to the top level"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "mo/non-existent",
+                    "experimental": {"flash_moe": True},
+                }
+            )
+
     def test_flash_min_greater_than_max_rejected_per_model(self):
         """Inverted min/max active neurons in a single ModelConfig is rejected."""
         with pytest.raises(ValueError, match="must be <="):
@@ -698,10 +708,8 @@ class TestRegistryModelConfig:
         config = {
             "mlx-community/DeepSeek-V3.2-4bit:latest": {
                 "hf_path": "mlx-community/DeepSeek-V3.2-4bit",
-                "experimental": {
-                    "flash_moe": True,
-                    "flash_moe_cache_budget_experts": 6,
-                },
+                "flash_moe": True,
+                "flash_moe_cache_budget_experts": 6,
             }
         }
         config_path = tmp_path / "models.json"
@@ -712,10 +720,8 @@ class TestRegistryModelConfig:
         # Request without :latest tag — must still find the rich config
         result = reg.resolve("mlx-community/DeepSeek-V3.2-4bit")
         assert result.hf_path == "mlx-community/DeepSeek-V3.2-4bit"
-        assert result.experimental == {
-            "flash_moe": True,
-            "flash_moe_cache_budget_experts": 6,
-        }
+        assert result.resolved_flash_moe().enabled is True
+        assert result.resolved_flash_moe().cache_budget_experts == 6
 
     def test_save_preserves_rich_config(self, tmp_path, monkeypatch):
         """Round-trip: load → save → load preserves config including promoted fields."""

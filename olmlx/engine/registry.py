@@ -12,7 +12,7 @@ from typing import Any, Literal, NamedTuple, get_args
 
 import logging
 
-from olmlx.config import SyncMode, settings
+from olmlx.config import FlashMoeConfig, SyncMode, settings
 
 SpeculativeStrategy = Literal["classic", "dflash", "eagle"]
 _VALID_SPECULATIVE_STRATEGIES: frozenset[str] = frozenset(
@@ -45,10 +45,6 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
         "flash_speculative",
         "flash_speculative_draft_model",
         "flash_speculative_tokens",
-        # Flash MoE
-        "flash_moe",
-        "flash_moe_cache_budget_experts",
-        "flash_moe_io_threads",
     }
 )
 
@@ -68,6 +64,10 @@ PROMOTED_EXPERIMENTAL_KEYS: dict[str, str] = {
     "flash_min_active_neurons": "flash_min_active_neurons",
     "flash_max_active_neurons": "flash_max_active_neurons",
     "flash_memory_budget_fraction": "flash_memory_budget_fraction",
+    # Flash-MoE promoted to top-level in Settings/ModelConfig.
+    "flash_moe": "flash_moe",
+    "flash_moe_cache_budget_experts": "flash_moe_cache_budget_experts",
+    "flash_moe_io_threads": "flash_moe_io_threads",
 }
 
 
@@ -292,6 +292,11 @@ class ModelConfig:
     flash_min_active_neurons: int | None = None
     flash_max_active_neurons: int | None = None
     flash_memory_budget_fraction: float | None = None
+    #: Flash-MoE expert offloading for MoE models.
+    #: ``None`` means inherit the global ``Settings.flash_moe`` value.
+    flash_moe: bool | None = None
+    flash_moe_cache_budget_experts: int | None = None
+    flash_moe_io_threads: int | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -382,6 +387,10 @@ class ModelConfig:
                 f"must be <= 'flash_max_active_neurons' "
                 f"({self.flash_max_active_neurons})"
             )
+        if self.flash_moe is not None and not isinstance(self.flash_moe, bool):
+            raise ValueError(
+                f"'flash_moe' must be a bool or None, got {self.flash_moe!r}"
+            )
 
     def resolved_speculative(self) -> SpeculativeConfig:
         """Resolve speculative config: per-model overrides global settings.
@@ -468,6 +477,26 @@ class ModelConfig:
                 self.flash_memory_budget_fraction
                 if self.flash_memory_budget_fraction is not None
                 else settings.flash_memory_budget_fraction
+            ),
+        )
+
+    def resolved_flash_moe(self) -> FlashMoeConfig:
+        """Resolve Flash-MoE config: per-model overrides global Settings."""
+        from olmlx.config import settings
+
+        return FlashMoeConfig(
+            enabled=(
+                self.flash_moe if self.flash_moe is not None else settings.flash_moe
+            ),
+            cache_budget_experts=(
+                self.flash_moe_cache_budget_experts
+                if self.flash_moe_cache_budget_experts is not None
+                else settings.flash_moe_cache_budget_experts
+            ),
+            io_threads=(
+                self.flash_moe_io_threads
+                if self.flash_moe_io_threads is not None
+                else settings.flash_moe_io_threads
             ),
         )
 
@@ -572,6 +601,9 @@ class ModelConfig:
             flash_min_active_neurons = entry.get("flash_min_active_neurons")
             flash_max_active_neurons = entry.get("flash_max_active_neurons")
             flash_memory_budget_fraction = entry.get("flash_memory_budget_fraction")
+            flash_moe = entry.get("flash_moe")
+            flash_moe_cache_budget_experts = entry.get("flash_moe_cache_budget_experts")
+            flash_moe_io_threads = entry.get("flash_moe_io_threads")
 
             kv_cache_quant_raw = entry.get("kv_cache_quant")
             if kv_cache_quant_raw is not None:
@@ -609,6 +641,9 @@ class ModelConfig:
                 flash_min_active_neurons=flash_min_active_neurons,
                 flash_max_active_neurons=flash_max_active_neurons,
                 flash_memory_budget_fraction=flash_memory_budget_fraction,
+                flash_moe=flash_moe,
+                flash_moe_cache_budget_experts=flash_moe_cache_budget_experts,
+                flash_moe_io_threads=flash_moe_io_threads,
                 _extra=extra,
             )
         raise TypeError(
@@ -634,6 +669,9 @@ class ModelConfig:
             and self.flash_min_active_neurons is None
             and self.flash_max_active_neurons is None
             and self.flash_memory_budget_fraction is None
+            and self.flash_moe is None
+            and self.flash_moe_cache_budget_experts is None
+            and self.flash_moe_io_threads is None
             and not self._extra
         ):
             return self.hf_path
@@ -671,6 +709,14 @@ class ModelConfig:
             result["flash_max_active_neurons"] = self.flash_max_active_neurons
         if self.flash_memory_budget_fraction is not None:
             result["flash_memory_budget_fraction"] = self.flash_memory_budget_fraction
+        if self.flash_moe is not None:
+            result["flash_moe"] = self.flash_moe
+        if self.flash_moe_cache_budget_experts is not None:
+            result["flash_moe_cache_budget_experts"] = (
+                self.flash_moe_cache_budget_experts
+            )
+        if self.flash_moe_io_threads is not None:
+            result["flash_moe_io_threads"] = self.flash_moe_io_threads
         # Filter known keys defensively — from_entry() already excludes them,
         # but _extra can be set directly via ModelConfig construction.
         result.update(

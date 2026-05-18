@@ -152,19 +152,21 @@ class TestResolveExperimental:
     def test_multiple_overrides(self, monkeypatch):
         monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE", raising=False)
         monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_IO_THREADS", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_MOE", raising=False)
+        monkeypatch.delenv(
+            "OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS", raising=False
+        )
         base = ExperimentalSettings()
         result = resolve_experimental(
             base,
             {
                 "flash_window_size": 10,
                 "flash_io_threads": 64,
-                "flash_moe": True,
+                "flash_cache_budget_neurons": 512,
             },
         )
         assert result.flash_window_size == 10
         assert result.flash_io_threads == 64
-        assert result.flash_moe is True
+        assert result.flash_cache_budget_neurons == 512
 
     def test_env_var_does_not_leak_into_overrides(self, monkeypatch):
         """resolve_experimental should not re-read env vars for unrelated fields."""

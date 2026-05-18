@@ -15,7 +15,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from olmlx.config import settings, surface_legacy_flash_env as _surface_legacy_flash_env
+from olmlx.config import (
+    settings,
+    surface_legacy_flash_env as _surface_legacy_flash_env,
+    surface_legacy_flash_moe_env as _surface_legacy_flash_moe_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -588,6 +592,7 @@ def _apply_serve_overrides(args) -> None:
     _surface_legacy_speculative_env()
     _surface_legacy_dflash_env()
     _surface_legacy_flash_env()
+    _surface_legacy_flash_moe_env()
 
     # ``getattr`` defends programmatic callers that hand a bare
     # ``argparse.Namespace`` (e.g. tests) without populating these
@@ -951,9 +956,6 @@ def _audit_speculative_config(
     The registry is loaded from disk; failures are logged and treated
     as "nothing to validate" so this never blocks startup on its own.
     """
-    from olmlx.config import experimental as global_exp
-    from olmlx.config import resolve_experimental
-
     if registry is None:
         registry = _load_registry_for_audit()
     if registry is None:
@@ -997,27 +999,11 @@ def _audit_speculative_config(
             global_draft_used = True
         if enabled:
             # Resolve the full experimental config (global defaults
-            # merged with per-model overrides) for the advanced/MoE
-            # knobs that still live under ``experimental``. Flash
-            # primary knobs are now promoted to top-level and resolved
-            # via ``mc.resolved_flash()``.
-            #
-            # The two ``resolve_*`` calls cover independent conflict
-            # checks (flash vs flash-MoE/dflash), so a failure in one
-            # must not skip the other. Track each result separately and
-            # guard the per-result check on a successful resolution.
-            resolved_exp = None
+            # merged with per-model overrides) for ``flash`` and via
+            # ``mc.resolved_flash_moe()`` for ``flash_moe``. Both are
+            # promoted to top-level fields; ``experimental`` no longer
+            # carries them.
             resolved_flash = None
-            try:
-                resolved_exp = resolve_experimental(global_exp, mc.experimental)
-            except Exception as exc:
-                logger.warning(
-                    "Skipping flash-MoE conflict check for %s: could not "
-                    "resolve experimental overrides: %s",
-                    name,
-                    exc,
-                    exc_info=True,
-                )
             try:
                 resolved_flash = mc.resolved_flash()
             except Exception as exc:
@@ -1031,9 +1017,9 @@ def _audit_speculative_config(
             if resolved_flash is not None and resolved_flash.enabled:
                 flash_conflicts.append(name)
             if (
-                resolved_exp is not None
-                and resolved_exp.flash_moe
-                and strategy == "dflash"
+                mc is not None
+                and mc.resolved_flash_moe().enabled
+                and strategy in ("dflash", "eagle")
             ):
                 dflash_moe_conflicts.append(name)
     return bad, dormant, flash_conflicts, dflash_moe_conflicts, global_draft_used
@@ -1221,7 +1207,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
     import atexit
     import shlex
 
-    from olmlx.config import experimental, settings
+    from olmlx.config import settings
 
     hostfile_path = Path(settings.distributed_hostfile).expanduser()
     if not hostfile_path.exists():
@@ -1324,10 +1310,10 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
     validate_remote_python(remote_python)
     remote_working_dir = settings.distributed_remote_working_dir
 
-    if experimental.flash_moe:
+    if settings.flash_moe:
         print(
             "Error: Flash-MoE + distributed is not supported. "
-            "Disable OLMLX_EXPERIMENTAL_FLASH_MOE or OLMLX_DISTRIBUTED.",
+            "Disable OLMLX_FLASH_MOE or OLMLX_DISTRIBUTED.",
             file=sys.stderr,
         )
         sys.exit(1)

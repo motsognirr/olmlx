@@ -867,6 +867,7 @@ class TestFileHandleLeak:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
+                flash_moe=False,
                 distributed_worker_shard_dir="",
             ),
         )
@@ -1049,6 +1050,7 @@ class TestSSHFailureDetection:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
+                flash_moe=False,
                 distributed_worker_shard_dir="",
             ),
         )
@@ -1147,6 +1149,7 @@ class TestLogFileHandleLifetime:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
+                flash_moe=False,
                 distributed_worker_shard_dir="",
             ),
         )
@@ -1245,6 +1248,7 @@ class TestRingHostfileGeneration:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
+                flash_moe=False,
                 distributed_worker_shard_dir="",
             ),
         )
@@ -1305,6 +1309,7 @@ class TestRingHostfileGeneration:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
+                flash_moe=False,
                 distributed_worker_shard_dir="",
             ),
         )
@@ -1490,6 +1495,7 @@ class TestSSHCommandConstruction:
                 distributed_remote_working_dir="~/Documents/olmlx_distributed",
                 distributed_remote_python="uv run python",
                 distributed_pre_shard=False,
+                flash_moe=False,
                 distributed_worker_shard_dir="",
             ),
         )
@@ -1544,6 +1550,7 @@ class TestSSHCommandConstruction:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
+                flash_moe=False,
                 distributed_worker_shard_dir="",
             ),
         )
@@ -1597,6 +1604,7 @@ class TestSSHCommandConstruction:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
+                flash_moe=False,
                 distributed_worker_shard_dir="",
             ),
         )

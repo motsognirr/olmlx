@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +70,49 @@ class LoadedExperts:
     remap_lut: mx.array | None = None
 
 
+@dataclass
+class ExpertCacheStats:
+    """Counters for monitoring expert cache effectiveness.
+
+    ``load_calls`` counts ``load_experts()`` invocations (one per
+    MoE-layer forward pass). ``cache_hits``, ``cache_misses``, and
+    ``load_failures`` count *individual experts*, so the three expert
+    counters sum to the total experts requested across all calls. Don't
+    mix units — ``hit_rate()`` (the only published ratio) deliberately
+    divides hits by hits+misses, both in the expert-units bucket.
+    """
+
+    load_calls: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    load_failures: int = 0
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
+
+    def record(self, hits: int, misses: int, failures: int = 0) -> None:
+        with self._lock:
+            self.load_calls += 1
+            self.cache_hits += hits
+            self.cache_misses += misses
+            self.load_failures += failures
+
+    def hit_rate(self) -> float:
+        with self._lock:
+            total = self.cache_hits + self.cache_misses
+            return self.cache_hits / total if total > 0 else 0.0
+
+    def snapshot(self) -> dict[str, int]:
+        """Return a snapshot of current counters."""
+        with self._lock:
+            return {
+                "load_calls": self.load_calls,
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "load_failures": self.load_failures,
+            }
+
+
 _ExpertCache = LayerLruCache[int, dict[str, Any]]
 
 
@@ -91,6 +135,7 @@ class FlashMoeWeightStore:
         self._quant_mode = self._layout_config.get("quant_mode", "affine")
         self._layouts = self._load_layouts()
         self._fds: dict[int, int] = {}
+        self.stats = ExpertCacheStats()
         try:
             self._fds = open_fds(
                 {idx: layout.file_path for idx, layout in self._layouts.items()},
@@ -290,25 +335,43 @@ class FlashMoeWeightStore:
         cached = self._cache.get_batch(layer_idx, expert_indices)
         missing = [idx for idx in expert_indices if idx not in cached]
 
+        hits = len(expert_indices) - len(missing)
+        misses = len(missing)
+        failures = 0
+
         # Load missing experts via parallel I/O; consume in completion order so
-        # slow readers do not block fast ones. On error cancel any queued-but-
-        # not-started futures (already-running reads run to completion anyway,
-        # but we avoid piling more work on the executor).
-        if missing:
-            future_to_idx = {
-                self._executor.submit(self._read_expert, layer_idx, idx): idx
-                for idx in missing
-            }
-            try:
+        # slow readers do not block fast ones. On first error, cancel any
+        # queued-but-not-started futures so a systematically broken store
+        # (corrupt ``.flashexperts`` file) doesn't burn through every I/O
+        # thread before reporting. Already-running futures are drained so
+        # ``failures`` accurately counts every failed expert in the batch
+        # (keeping the metric in the same per-expert unit as
+        # ``cache_hits``/``cache_misses``).
+        first_exc: Exception | None = None
+        try:
+            if missing:
+                future_to_idx = {
+                    self._executor.submit(self._read_expert, layer_idx, idx): idx
+                    for idx in missing
+                }
                 for future in as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    data = future.result()
-                    cached[idx] = data
-                    self._cache.put(layer_idx, idx, data)
-            except Exception:
-                for f in future_to_idx:
-                    f.cancel()
-                raise
+                    try:
+                        idx = future_to_idx[future]
+                        data = future.result()
+                        cached[idx] = data
+                        self._cache.put(layer_idx, idx, data)
+                    except Exception as exc:
+                        failures += 1
+                        if first_exc is None:
+                            first_exc = exc
+                            for f in future_to_idx:
+                                if not f.running():
+                                    f.cancel()
+        finally:
+            self.stats.record(hits, misses, failures)
+
+        if first_exc is not None:
+            raise first_exc
 
         # Build index map and stack arrays in input order
         expert_index_map = {eidx: i for i, eidx in enumerate(expert_indices)}
