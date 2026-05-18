@@ -1024,17 +1024,6 @@ class ModelManager:
         # arrays alive through the GC pass — the exact leak pattern behind
         # issue #223.
         #
-        # Null only on success of resource-close steps (prefetcher / weight_store
-        # / speculative_decoder): if a resource raised, the re-entry drain in
-        # _close_evictees may call _close_loaded_model a second time.  Nulling
-        # lm.model early would cause the prefetcher-close guard at line 966
-        # (``getattr(lm.model, "prefetcher", None)``) to silently skip the
-        # close on re-entry — the field must stay set so re-entry reaches
-        # every resource.  Same pattern as weight_store / speculative_decoder
-        # where the reference is preserved on failure (issue #315).
-        if not resource_errors:
-            lm.model = None
-            lm.tokenizer = None
         # ``lm.model.prefetcher`` is intentionally not nulled — it lives on
         # the FlashModelWrapper, not on the LM bookkeeping, and the wrapper
         # goes away with the LM.
@@ -1115,6 +1104,17 @@ class ModelManager:
                     # noisy in logs if both run to completion.
                     evictees.append(evicted)
                     raise
+                # Null model and tokenizer HERE on the event loop (NOT in
+                # the worker thread) to avoid a race: between
+                # ensure_loaded() returning and the caller accessing
+                # lm.model, the worker thread could set it to None and
+                # crash the caller.  See the _expire_stale contract: "the
+                # caller still holds a Python reference, so the model/
+                # tokenizer stay alive."  No await between null and del
+                # — back on the event loop after the thread join — so
+                # no other coroutine can observe the nulled field.
+                evicted.model = None
+                evicted.tokenizer = None
                 del evicted
         finally:
             # On normal exit ``evictees`` is empty and this is a no-op. On
@@ -1129,6 +1129,8 @@ class ModelManager:
                     self._close_loaded_model(lm)
                 except ExceptionGroup:
                     pass  # already logged per-resource inside _close_loaded_model
+                lm.model = None
+                lm.tokenizer = None
                 del lm
 
     async def ensure_loaded(

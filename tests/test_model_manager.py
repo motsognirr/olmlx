@@ -3503,12 +3503,17 @@ class TestEvictLruIfNeeded:
         cache_store.clear.assert_called_once()
         assert lm.prompt_cache_store is None
 
-    def test_close_loaded_model_nulls_model_and_tokenizer(self, registry, mock_store):
-        """_close_loaded_model must null model/tokenizer for prompt GC.
+    def test_close_loaded_model_preserves_model_for_caller_nulling(
+        self, registry, mock_store
+    ):
+        """_close_loaded_model must NOT null model/tokenizer — caller does it.
 
-        On a clean close path (no prior errors), the LoadedModel's .model
-        and .tokenizer fields must be None so the caller's subsequent
-        ``gc.collect()`` can reclaim the Metal buffers.
+        Model/tokenizer nulling moved from _close_loaded_model (worker
+        thread) to _close_evictees (event loop) to prevent a race: between
+        ensure_loaded() returning and the caller accessing lm.model, the
+        worker thread could null it and crash the caller. The caller
+        (_close_evictees) sets model=None after the thread joins, with no
+        await between null and del.
         """
         manager = ModelManager(registry, mock_store)
         mock_model = MagicMock()
@@ -3520,22 +3525,23 @@ class TestEvictLruIfNeeded:
             tokenizer=mock_tok,
         )
         manager._close_loaded_model(lm)
-        assert lm.model is None
-        assert lm.tokenizer is None
+        # _close_loaded_model preserves fields; caller (_close_evictees)
+        # nulls them on the event loop.
+        assert lm.model is mock_model
+        assert lm.tokenizer is mock_tok
 
     def test_close_loaded_model_preserves_model_on_prior_failure(
         self, registry, mock_store
     ):
-        """Nulls are skipped when a prior close step failed (re-entry contract).
+        """_close_loaded_model never nulls model/tokenizer (caller does it).
 
         The ``_close_evictees`` finally-drain path may call
         ``_close_loaded_model`` a second time after a first call raised.
-        If the first call nulled ``lm.model`` unconditionally, the
-        re-entry's ``getattr(lm.model, "prefetcher", None)`` would crash
-        with ``AttributeError``. The nulls must be guarded by
-        ``if not resource_errors:`` (not plain ``errors`` — a prompt-cache
-        failure must not block model nulling) so re-entry finds
-        the fields intact.
+        Model/tokenizer nulling is handled by _close_evictees on the
+        event loop (not in the worker thread) to prevent a race between
+        ensure_loaded() return and the worker thread nulling the fields.
+        This test verifies the model/tokenizer survive a failed close so
+        re-entry can inspect lm.model.
         """
         manager = ModelManager(registry, mock_store)
         weight_store = MagicMock()
@@ -3552,14 +3558,12 @@ class TestEvictLruIfNeeded:
 
         with pytest.raises(ExceptionGroup):
             manager._close_loaded_model(lm)
-        # weight_store.close() raised → errors non-empty → model/tokenizer
-        # MUST remain set so a re-entry close can still inspect lm.model.
+        # Model and tokenizer are always preserved by _close_loaded_model
+        # (nulling happens in _close_evictees, on the event loop).
         assert lm.model is mock_model
         assert lm.tokenizer is mock_tok
 
-    def test_prefetcher_close_called_once_on_partial_failure(
-        self, registry, mock_store
-    ):
+    def test_prefetcher_close_call_count_on_partial_failure(self, registry, mock_store):
         """Prefetcher.close() must be called exactly once on a partial-failure path.
 
         On re-entry from the _close_evictees drain, weight_store and
@@ -3600,6 +3604,32 @@ class TestEvictLruIfNeeded:
         with pytest.raises(ExceptionGroup):
             manager._close_loaded_model(lm)
         assert prefetcher.close.call_count == 2  # known limitation; must not regress
+
+    @pytest.mark.asyncio
+    async def test_close_evictees_nulls_model_on_event_loop(self, registry, mock_store):
+        """_close_evictees nulls model/tokenizer after the worker thread joins.
+
+        Nulling must happen on the event loop (not in the worker thread) to
+        prevent a race: between ensure_loaded() returning and the caller
+        accessing lm.model, the worker thread could null it and crash the
+        caller. Since _close_evictees runs on the event loop and has no
+        await between null and del, no other coroutine can observe the
+        nulled field.
+        """
+        manager = ModelManager(registry, mock_store)
+        mock_model = MagicMock()
+        mock_tok = MagicMock()
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=mock_model,
+            tokenizer=mock_tok,
+        )
+        await manager._close_evictees([old])
+        # After _close_evictees completes, model/tokenizer must be None
+        # so the caller's gc.collect() can reclaim Metal buffers.
+        assert old.model is None
+        assert old.tokenizer is None
 
     @pytest.mark.asyncio
     async def test_close_evictees_absorbs_close_failure(
