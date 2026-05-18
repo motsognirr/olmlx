@@ -15,7 +15,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from olmlx.config import settings, surface_legacy_flash_env as _surface_legacy_flash_env
+from olmlx.config import (
+    settings,
+    surface_legacy_flash_env as _surface_legacy_flash_env,
+    surface_legacy_flash_moe_env as _surface_legacy_flash_moe_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -576,130 +580,6 @@ def _surface_legacy_distributed_env() -> None:
             )
 
 
-_DEPRECATED_FLASH_MOE_ENV_VARS = (
-    "OLMLX_EXPERIMENTAL_FLASH_MOE",
-    "OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS",
-    "OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS",
-)
-
-_LEGACY_FLASH_MOE_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], ...] = (
-    (
-        "OLMLX_EXPERIMENTAL_FLASH_MOE",
-        "OLMLX_FLASH_MOE",
-        "flash_moe",
-        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
-    ),
-    (
-        "OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS",
-        "OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS",
-        "flash_moe_cache_budget_experts",
-        int,
-    ),
-    (
-        "OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS",
-        "OLMLX_FLASH_MOE_IO_THREADS",
-        "flash_moe_io_threads",
-        int,
-    ),
-)
-
-
-def _surface_legacy_flash_moe_env() -> None:
-    """Warn about and forward legacy ``OLMLX_EXPERIMENTAL_FLASH_MOE*``
-    env vars (shell or ``.env``) to the new ``OLMLX_FLASH_MOE*`` names."""
-    from olmlx.config import settings as _settings
-
-    dotenv_values = _legacy_flash_moe_values_in_dotenv()
-    shell_stale = [v for v in _DEPRECATED_FLASH_MOE_ENV_VARS if os.environ.get(v)]
-    stale = sorted({*shell_stale, *dotenv_values.keys()})
-    if stale:
-        logger.warning(
-            "Deprecated env vars detected: %s. They will be honoured for "
-            "this release but should be renamed to OLMLX_FLASH_MOE, "
-            "OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS, OLMLX_FLASH_MOE_IO_THREADS.",
-            ", ".join(stale),
-        )
-        _forward_legacy_flash_moe_env(_settings, dotenv_values)
-
-
-def _legacy_flash_moe_values_in_dotenv() -> dict[str, str]:
-    """Return ``{name: value}`` for any ``_DEPRECATED_FLASH_MOE_ENV_VARS``
-    found in the project ``.env`` file."""
-    dotenv_path = Path(".env")
-    try:
-        text = dotenv_path.read_text()
-    except (FileNotFoundError, OSError):
-        return {}
-    found: dict[str, str] = {}
-    legacy = set(_DEPRECATED_FLASH_MOE_ENV_VARS)
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if key.startswith("export "):
-            key = key[len("export ") :].strip()
-        value = value.strip()
-        if not (
-            len(value) >= 2 and (value[0] in ('"', "'") and value[-1] in ('"', "'"))
-        ):
-            comment_idx = value.find("#")
-            if comment_idx != -1:
-                value = value[:comment_idx].rstrip()
-        is_quoted = len(value) >= 2 and (
-            (value.startswith('"') and value.endswith('"'))
-            or (value.startswith("'") and value.endswith("'"))
-        )
-        if is_quoted:
-            value = value[1:-1]
-        if key in legacy and key not in found:
-            found[key] = value
-    return found
-
-
-def _forward_legacy_flash_moe_env(
-    settings_obj,
-    dotenv_values: dict[str, str] | None = None,
-) -> None:
-    """Apply legacy flash_moe env var values to the new Settings when the
-    new env var is unset."""
-    from olmlx.config import Settings
-
-    if dotenv_values is None:
-        dotenv_values = _legacy_flash_moe_values_in_dotenv()
-    for legacy, new, attr, parse in _LEGACY_FLASH_MOE_FORWARD:
-        legacy_val = os.environ.get(legacy, dotenv_values.get(legacy))
-        if legacy_val is None:
-            continue
-        if os.environ.get(new) is not None:
-            continue
-        field_default = Settings.model_fields[attr].default
-        if getattr(settings_obj, attr) != field_default:
-            continue
-        try:
-            value = parse(legacy_val)
-            setattr(settings_obj, attr, value)
-            logger.warning(
-                "Forwarding legacy %s=%r → settings.%s. The new env var "
-                "%s would take precedence if explicitly set in the shell.",
-                legacy,
-                legacy_val,
-                attr,
-                new,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Could not forward legacy env var %s=%r to %s: %s",
-                legacy,
-                legacy_val,
-                new,
-                exc,
-            )
-
-
 def _apply_serve_overrides(args) -> None:
     """Apply CLI flags to the global Settings before the server starts.
 
@@ -1076,9 +956,6 @@ def _audit_speculative_config(
     The registry is loaded from disk; failures are logged and treated
     as "nothing to validate" so this never blocks startup on its own.
     """
-    from olmlx.config import experimental as global_exp
-    from olmlx.config import resolve_experimental
-
     if registry is None:
         registry = _load_registry_for_audit()
     if registry is None:
@@ -1122,27 +999,11 @@ def _audit_speculative_config(
             global_draft_used = True
         if enabled:
             # Resolve the full experimental config (global defaults
-            # merged with per-model overrides) for the advanced/MoE
-            # knobs that still live under ``experimental``. Flash
-            # primary knobs are now promoted to top-level and resolved
-            # via ``mc.resolved_flash()``.
-            #
-            # The two ``resolve_*`` calls cover independent conflict
-            # checks (flash vs flash-MoE/dflash), so a failure in one
-            # must not skip the other. Track each result separately and
-            # guard the per-result check on a successful resolution.
-            resolved_exp = None
+            # merged with per-model overrides) for ``flash`` and via
+            # ``mc.resolved_flash_moe()`` for ``flash_moe``. Both are
+            # promoted to top-level fields; ``experimental`` no longer
+            # carries them.
             resolved_flash = None
-            try:
-                resolved_exp = resolve_experimental(global_exp, mc.experimental)
-            except Exception as exc:
-                logger.warning(
-                    "Skipping flash-MoE conflict check for %s: could not "
-                    "resolve experimental overrides: %s",
-                    name,
-                    exc,
-                    exc_info=True,
-                )
             try:
                 resolved_flash = mc.resolved_flash()
             except Exception as exc:
@@ -1346,7 +1207,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
     import atexit
     import shlex
 
-    from olmlx.config import experimental, settings
+    from olmlx.config import settings
 
     hostfile_path = Path(settings.distributed_hostfile).expanduser()
     if not hostfile_path.exists():

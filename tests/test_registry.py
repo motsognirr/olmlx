@@ -550,8 +550,6 @@ class TestModelConfig:
 
     def test_flash_moe_in_experimental_raises_migration_error(self):
         """flash_moe in the experimental block should raise a clear migration error."""
-        from olmlx.engine import registry
-
         with pytest.raises(ValueError, match="'flash_moe' to the top level"):
             ModelConfig.from_entry(
                 {

@@ -444,6 +444,132 @@ def surface_legacy_flash_env() -> None:
     )
 
 
+_DEPRECATED_FLASH_MOE_ENV_VARS = (
+    "OLMLX_EXPERIMENTAL_FLASH_MOE",
+    "OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS",
+    "OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS",
+)
+
+_LEGACY_FLASH_MOE_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], ...] = (
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_MOE",
+        "OLMLX_FLASH_MOE",
+        "flash_moe",
+        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS",
+        "OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS",
+        "flash_moe_cache_budget_experts",
+        int,
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS",
+        "OLMLX_FLASH_MOE_IO_THREADS",
+        "flash_moe_io_threads",
+        int,
+    ),
+)
+
+
+def _legacy_flash_moe_values_in_dotenv() -> dict[str, str]:
+    """Return ``{name: value}`` for any ``_DEPRECATED_FLASH_MOE_ENV_VARS``
+    found in the project ``.env`` file."""
+    dotenv_path = Path(".env")
+    try:
+        text = dotenv_path.read_text()
+    except (FileNotFoundError, OSError):
+        return {}
+    found: dict[str, str] = {}
+    legacy = set(_DEPRECATED_FLASH_MOE_ENV_VARS)
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        value = value.strip()
+        # Quoted values keep ``#`` literal; unquoted values strip trailing
+        # inline comments. Match opening and closing quote characters to
+        # avoid treating ``'foo"`` (mismatched) as quoted.
+        is_paired_quoted = len(value) >= 2 and (
+            (value.startswith('"') and value.endswith('"'))
+            or (value.startswith("'") and value.endswith("'"))
+        )
+        if not is_paired_quoted:
+            comment_idx = value.find("#")
+            if comment_idx != -1:
+                value = value[:comment_idx].rstrip()
+        if is_paired_quoted:
+            value = value[1:-1]
+        if key in legacy and key not in found:
+            found[key] = value
+    return found
+
+
+def _forward_legacy_flash_moe_env(
+    settings_obj: "Settings",
+    dotenv_values: dict[str, str] | None = None,
+) -> None:
+    """Apply legacy flash_moe env var values to the new Settings when the
+    new env var is unset."""
+    if dotenv_values is None:
+        dotenv_values = _legacy_flash_moe_values_in_dotenv()
+    for legacy, new, attr, parse in _LEGACY_FLASH_MOE_FORWARD:
+        legacy_val = os.environ.get(legacy, dotenv_values.get(legacy))
+        if legacy_val is None:
+            continue
+        if os.environ.get(new) is not None:
+            continue
+        field_default = Settings.model_fields[attr].default
+        if getattr(settings_obj, attr) != field_default:
+            continue
+        try:
+            value = parse(legacy_val)
+            setattr(settings_obj, attr, value)
+            logger.warning(
+                "Forwarding legacy %s=%r → settings.%s. The new env var "
+                "%s would take precedence if explicitly set in the shell.",
+                legacy,
+                legacy_val,
+                attr,
+                new,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not forward legacy env var %s=%r to %s: %s",
+                legacy,
+                legacy_val,
+                new,
+                exc,
+            )
+
+
+def surface_legacy_flash_moe_env() -> None:
+    """Warn about and forward legacy ``OLMLX_EXPERIMENTAL_FLASH_MOE*``
+    env vars (shell or ``.env``) to the new ``OLMLX_FLASH_MOE*`` names.
+
+    Defined in ``olmlx.config`` (alongside ``surface_legacy_flash_env``)
+    so the distributed-worker entry point can reuse it without importing
+    ``olmlx.cli``.
+    """
+    dotenv_values = _legacy_flash_moe_values_in_dotenv()
+    shell_stale = [v for v in _DEPRECATED_FLASH_MOE_ENV_VARS if os.environ.get(v)]
+    stale = sorted({*shell_stale, *dotenv_values.keys()})
+    if stale:
+        logger.warning(
+            "Deprecated env vars detected: %s. They will be honoured for "
+            "this release but should be renamed to OLMLX_FLASH_MOE, "
+            "OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS, OLMLX_FLASH_MOE_IO_THREADS.",
+            ", ".join(stale),
+        )
+        _forward_legacy_flash_moe_env(settings, dotenv_values)
+
+
 def resolve_experimental(
     base: ExperimentalSettings,
     overrides: dict,

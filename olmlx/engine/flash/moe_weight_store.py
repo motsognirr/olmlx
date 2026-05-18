@@ -332,30 +332,32 @@ class FlashMoeWeightStore:
         failures = 0
 
         # Load missing experts via parallel I/O; consume in completion order so
-        # slow readers do not block fast ones. On error cancel any queued-but-
-        # not-started futures (already-running reads run to completion anyway,
-        # but we avoid piling more work on the executor).
+        # slow readers do not block fast ones. Drain all futures before
+        # re-raising so ``failures`` accurately counts every failed expert
+        # in the batch (not just the first to surface). This keeps the metric
+        # in the same per-expert unit as ``cache_hits``/``cache_misses``.
+        first_exc: Exception | None = None
         try:
             if missing:
                 future_to_idx = {
                     self._executor.submit(self._read_expert, layer_idx, idx): idx
                     for idx in missing
                 }
-                failed = 0
                 for future in as_completed(future_to_idx):
                     try:
                         idx = future_to_idx[future]
                         data = future.result()
                         cached[idx] = data
                         self._cache.put(layer_idx, idx, data)
-                    except Exception:
-                        failed += 1
-                        for f in future_to_idx:
-                            f.cancel()
-                        failures = failed
-                        raise
+                    except Exception as exc:
+                        failures += 1
+                        if first_exc is None:
+                            first_exc = exc
         finally:
             self.stats.record(hits, misses, failures)
+
+        if first_exc is not None:
+            raise first_exc
 
         # Build index map and stack arrays in input order
         expert_index_map = {eidx: i for i, eidx in enumerate(expert_indices)}
