@@ -4186,7 +4186,9 @@ class TestSpeculativeLoading:
         monkeypatch.setattr(
             manager,
             "_load_flash_moe_model",
-            lambda hf_path, load_path, flash_moe_dir, *, flash_moe_config: sentinel_load,
+            lambda hf_path, load_path, flash_moe_dir, *, flash_moe_config: (
+                sentinel_load
+            ),
         )
         sentinel_decoder = object()
         monkeypatch.setattr(

@@ -641,11 +641,10 @@ def _legacy_flash_moe_values_in_dotenv() -> dict[str, str]:
         key, _, value = line.partition("=")
         key = key.strip()
         if key.startswith("export "):
-            key = key[len("export "):].strip()
+            key = key[len("export ") :].strip()
         value = value.strip()
         if not (
-            len(value) >= 2
-            and (value[0] in ('"', "'") and value[-1] in ('"', "'"))
+            len(value) >= 2 and (value[0] in ('"', "'") and value[-1] in ('"', "'"))
         ):
             comment_idx = value.find("#")
             if comment_idx != -1:

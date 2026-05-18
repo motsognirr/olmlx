@@ -152,7 +152,9 @@ class TestResolveExperimental:
     def test_multiple_overrides(self, monkeypatch):
         monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE", raising=False)
         monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_IO_THREADS", raising=False)
-        monkeypatch.delenv("OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS", raising=False)
+        monkeypatch.delenv(
+            "OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS", raising=False
+        )
         base = ExperimentalSettings()
         result = resolve_experimental(
             base,

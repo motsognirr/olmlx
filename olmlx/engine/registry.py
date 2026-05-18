@@ -602,9 +602,7 @@ class ModelConfig:
             flash_max_active_neurons = entry.get("flash_max_active_neurons")
             flash_memory_budget_fraction = entry.get("flash_memory_budget_fraction")
             flash_moe = entry.get("flash_moe")
-            flash_moe_cache_budget_experts = entry.get(
-                "flash_moe_cache_budget_experts"
-            )
+            flash_moe_cache_budget_experts = entry.get("flash_moe_cache_budget_experts")
             flash_moe_io_threads = entry.get("flash_moe_io_threads")
 
             kv_cache_quant_raw = entry.get("kv_cache_quant")
@@ -714,9 +712,9 @@ class ModelConfig:
         if self.flash_moe is not None:
             result["flash_moe"] = self.flash_moe
         if self.flash_moe_cache_budget_experts is not None:
-            result[
-                "flash_moe_cache_budget_experts"
-            ] = self.flash_moe_cache_budget_experts
+            result["flash_moe_cache_budget_experts"] = (
+                self.flash_moe_cache_budget_experts
+            )
         if self.flash_moe_io_threads is not None:
             result["flash_moe_io_threads"] = self.flash_moe_io_threads
         # Filter known keys defensively — from_entry() already excludes them,
