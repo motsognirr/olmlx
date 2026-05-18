@@ -1005,6 +1005,36 @@ class TestBuildParser:
         assert dflash_moe == ["moe-dflash/m:latest"]
         assert global_used is False
 
+    def test_audit_eagle_flash_moe_conflicts(self, monkeypatch, tmp_path):
+        """eagle + Flash-MoE also populates the dflash_moe_conflicts bucket."""
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "moe-eagle/m:latest": {
+                        "hf_path": "moe-eagle/m",
+                        "speculative": True,
+                        "speculative_strategy": "eagle",
+                        "speculative_draft_model": "moe-eagle/draft",
+                        "flash_moe": True,
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+
+        bad, dormant, flash, dflash_moe, global_used = _audit_speculative_config()
+        assert bad == []
+        assert dormant == []
+        assert flash == []
+        assert dflash_moe == ["moe-eagle/m:latest"]
+        assert global_used is False
+
     def test_per_model_flash_mismatch_in_distributed_exits(
         self, monkeypatch, tmp_path, capsys
     ):

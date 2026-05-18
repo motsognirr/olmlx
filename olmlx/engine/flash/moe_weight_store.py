@@ -72,9 +72,17 @@ class LoadedExperts:
 
 @dataclass
 class ExpertCacheStats:
-    """Counters for monitoring expert cache effectiveness."""
+    """Counters for monitoring expert cache effectiveness.
 
-    requests: int = 0
+    ``load_calls`` counts ``load_experts()`` invocations (one per
+    MoE-layer forward pass). ``cache_hits``, ``cache_misses``, and
+    ``load_failures`` count *individual experts*, so the three expert
+    counters sum to the total experts requested across all calls. Don't
+    mix units — ``hit_rate()`` (the only published ratio) deliberately
+    divides hits by hits+misses, both in the expert-units bucket.
+    """
+
+    load_calls: int = 0
     cache_hits: int = 0
     cache_misses: int = 0
     load_failures: int = 0
@@ -84,7 +92,7 @@ class ExpertCacheStats:
 
     def record(self, hits: int, misses: int, failures: int = 0) -> None:
         with self._lock:
-            self.requests += 1
+            self.load_calls += 1
             self.cache_hits += hits
             self.cache_misses += misses
             self.load_failures += failures
@@ -98,7 +106,7 @@ class ExpertCacheStats:
         """Return a snapshot of current counters."""
         with self._lock:
             return {
-                "requests": self.requests,
+                "load_calls": self.load_calls,
                 "cache_hits": self.cache_hits,
                 "cache_misses": self.cache_misses,
                 "load_failures": self.load_failures,
@@ -332,10 +340,13 @@ class FlashMoeWeightStore:
         failures = 0
 
         # Load missing experts via parallel I/O; consume in completion order so
-        # slow readers do not block fast ones. Drain all futures before
-        # re-raising so ``failures`` accurately counts every failed expert
-        # in the batch (not just the first to surface). This keeps the metric
-        # in the same per-expert unit as ``cache_hits``/``cache_misses``.
+        # slow readers do not block fast ones. On first error, cancel any
+        # queued-but-not-started futures so a systematically broken store
+        # (corrupt ``.flashexperts`` file) doesn't burn through every I/O
+        # thread before reporting. Already-running futures are drained so
+        # ``failures`` accurately counts every failed expert in the batch
+        # (keeping the metric in the same per-expert unit as
+        # ``cache_hits``/``cache_misses``).
         first_exc: Exception | None = None
         try:
             if missing:
@@ -353,6 +364,9 @@ class FlashMoeWeightStore:
                         failures += 1
                         if first_exc is None:
                             first_exc = exc
+                            for f in future_to_idx:
+                                if not f.running():
+                                    f.cancel()
         finally:
             self.stats.record(hits, misses, failures)
 
