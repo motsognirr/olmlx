@@ -339,7 +339,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -375,7 +375,7 @@ class TestBuildParser:
         # Stub out registry-walking helpers so the test is hermetic.
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -418,7 +418,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -445,7 +445,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -473,7 +473,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -510,7 +510,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -540,7 +540,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], [], [], False),
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -564,7 +564,8 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], [], False)
+            "olmlx.cli._audit_speculative_config",
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -592,7 +593,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: (["bad/model:latest"], [], [], [], False),
+            lambda registry=None: (["bad/model:latest"], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -648,7 +649,8 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config", lambda: ([], [], [], [], False)
+            "olmlx.cli._audit_speculative_config",
+            lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -693,7 +695,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: (["m:latest"], [], ["m:latest"], [], False),
+            lambda registry=None: (["m:latest"], [], ["m:latest"], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -721,7 +723,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], [], ["flash/model:latest"], [], False),
+            lambda registry=None: ([], [], ["flash/model:latest"], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -745,7 +747,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
             "olmlx.cli._audit_speculative_config",
-            lambda: ([], ["dormant/model:latest"], [], [], False),
+            lambda registry=None: ([], ["dormant/model:latest"], [], [], False),
         )
         monkeypatch.setattr(
             "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
@@ -1003,14 +1005,13 @@ class TestBuildParser:
         assert dflash_moe == ["moe-dflash/m:latest"]
         assert global_used is False
 
-    def test_warn_per_model_flash_in_distributed_fires(
-        self, monkeypatch, tmp_path, caplog
+    def test_per_model_flash_mismatch_in_distributed_exits(
+        self, monkeypatch, tmp_path, capsys
     ):
-        """A per-model ``flash: true`` in models.json under distributed
-        mode logs a warning at startup (the worker path ignores per-model
-        Flash because the registry isn't loaded on workers)."""
-        import logging
-
+        """Per-model ``flash: true`` while ``settings.flash=False`` (or
+        vice versa) under distributed mode must hard-exit at startup —
+        the coordinator and workers would load structurally different
+        models and crash the ring all_sum at first inference."""
         from olmlx.cli import _warn_per_model_flash_in_distributed
         from olmlx.config import settings as _settings
 
@@ -1027,17 +1028,51 @@ class TestBuildParser:
         )
         monkeypatch.setattr(_settings, "models_config", models_json)
         monkeypatch.setattr(_settings, "distributed", True)
+        monkeypatch.setattr(_settings, "flash", False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _warn_per_model_flash_in_distributed()
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "qwen/m:latest" in err
+        assert "structurally different models" in err
+
+    def test_per_model_flash_numeric_only_in_distributed_warns(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A per-model numeric override (e.g. ``flash_sparsity_threshold``)
+        with matching on/off only logs a warning — the registry isn't
+        consulted on workers, so the override is silently dropped."""
+        import logging
+
+        from olmlx.cli import _warn_per_model_flash_in_distributed
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "qwen/m:latest": {
+                        "hf_path": "qwen/m",
+                        "flash_sparsity_threshold": 0.3,
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "distributed", True)
+        monkeypatch.setattr(_settings, "flash", False)
 
         with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
             _warn_per_model_flash_in_distributed()
 
-        assert "per-model Flash" in caplog.text
+        assert "per-model Flash numeric overrides" in caplog.text
         assert "qwen/m:latest" in caplog.text
 
-    def test_warn_per_model_flash_silent_without_distributed(
-        self, monkeypatch, tmp_path, caplog
+    def test_per_model_flash_silent_without_distributed(
+        self, monkeypatch, tmp_path, caplog, capsys
     ):
-        """No warning when distributed is off, even with per-model flash set."""
+        """No diagnostics when distributed is off, even with per-model flash set."""
         import logging
 
         from olmlx.cli import _warn_per_model_flash_in_distributed
@@ -1052,8 +1087,9 @@ class TestBuildParser:
 
         with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
             _warn_per_model_flash_in_distributed()
-
+        # No exit, no warning.
         assert "per-model Flash" not in caplog.text
+        assert "structurally different models" not in capsys.readouterr().err
 
     def test_audit_moe_check_survives_flash_resolution_failure(
         self, monkeypatch, tmp_path

@@ -359,33 +359,47 @@ def surface_legacy_flash_env() -> None:
     if not pending:
         return
 
-    # Pre-validate cross-field constraints across the *pending* set
-    # before any setattr lands. Without this, an inverted legacy
-    # min/max pair would apply min successfully (max still ``None``
-    # passes the validator) and then reject max — leaving the user
-    # with a high min and no max cap at all, the opposite of the
-    # ceiling they tried to set. Today the only cross-field check on
-    # the promoted knobs is the neuron-range pair, so handle it
-    # explicitly here; add more cases if new cross-field validators
-    # land on these fields.
+    # Pre-validate cross-field constraints by combining the *pending*
+    # set with the *live* Settings for the non-pending bound. Without
+    # this, three failure modes would slip through to the per-field
+    # setattr — caught only by the generic "Could not forward" log,
+    # with the migration banner suppressed so the user never sees the
+    # rename nudge:
+    #   (a) pending min + pending max, inverted (round-7 case).
+    #   (b) pending min only, but live max (e.g. from ``.env``) is
+    #       below the pending min.
+    #   (c) pending max only, but live min is above the pending max.
+    # All three are handled the same way: drop both flash neuron-range
+    # entries from ``pending`` and emit one explicit warning naming
+    # the effective pair.
     pending_attrs = {attr: value for _, _, attr, value in pending}
     pending_min = pending_attrs.get("flash_min_active_neurons")
     pending_max = pending_attrs.get("flash_max_active_neurons")
+    effective_min = (
+        pending_min if pending_min is not None else settings.flash_min_active_neurons
+    )
+    effective_max = (
+        pending_max if pending_max is not None else settings.flash_max_active_neurons
+    )
+    has_neuron_pending = (
+        "flash_min_active_neurons" in pending_attrs
+        or "flash_max_active_neurons" in pending_attrs
+    )
     if (
-        pending_min is not None
-        and pending_max is not None
-        and pending_min > pending_max
+        has_neuron_pending
+        and effective_max is not None
+        and effective_min > effective_max
     ):
         logger.warning(
-            "Refusing to forward legacy flash neuron-range pair "
-            "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS=%r + "
-            "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS=%r: min > max. "
-            "Both legacy values are dropped (applying only one would "
-            "leave the other unset and silently remove the user's "
-            "intended bound). Rename to OLMLX_FLASH_MIN_ACTIVE_NEURONS "
-            "and OLMLX_FLASH_MAX_ACTIVE_NEURONS with a consistent pair.",
-            pending_min,
-            pending_max,
+            "Refusing to forward legacy flash neuron-range values: the "
+            "resulting pair (min=%r, max=%r) would have min > max. "
+            "Dropping the legacy flash_min/flash_max forwards (any "
+            "partial apply would leave one bound unset and silently "
+            "remove the user's intended ceiling/floor). Rename to "
+            "OLMLX_FLASH_MIN_ACTIVE_NEURONS / "
+            "OLMLX_FLASH_MAX_ACTIVE_NEURONS with a consistent pair.",
+            effective_min,
+            effective_max,
         )
         pending = [
             (legacy, new, attr, value)

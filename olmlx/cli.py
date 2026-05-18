@@ -458,7 +458,7 @@ def _surface_legacy_kv_cache_quant_env() -> None:
 # distributed-worker entry point can reuse it without pulling in
 # argparse/uvicorn. Re-exported here so existing call sites and tests
 # continue to work.
-from olmlx.config import surface_legacy_flash_env as _surface_legacy_flash_env  # noqa: E402, F401
+from olmlx.config import surface_legacy_flash_env as _surface_legacy_flash_env  # noqa: E402
 
 
 def _warn_kv_cache_quant_incompatibilities() -> None:
@@ -647,8 +647,12 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(1)
 
+    # Share one ``ModelRegistry`` instance across the audit helpers so
+    # the disk read happens once. Each helper still degrades gracefully
+    # to "no audit" if the load returned ``None``.
+    audit_registry = _load_registry_for_audit()
     bad, dormant_drafts, flash_conflicts, dflash_moe_conflicts, global_draft_used = (
-        _audit_speculative_config()
+        _audit_speculative_config(audit_registry)
     )
     if dormant_drafts:
         logger.warning(
@@ -721,53 +725,85 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(1)
 
-    _warn_per_model_flash_in_distributed()
+    _warn_per_model_flash_in_distributed(audit_registry)
 
 
-def _warn_per_model_flash_in_distributed() -> None:
-    """Warn when distributed mode is enabled and any models.json entry
-    has per-model Flash configuration.
+def _warn_per_model_flash_in_distributed(registry: "Any | None" = None) -> None:
+    """Audit per-model Flash settings against distributed-mode invariants.
 
-    The distributed worker path reads Flash settings from ``settings.*``
-    (global) — ``_launch_distributed_workers`` forwards globals and
-    ``worker_main`` consults them. The registry isn't loaded on
-    workers, so per-model overrides for the five promoted Flash fields
-    are silently ignored under distributed. This is a documented
-    limitation (CLAUDE.md "Distributed caveat"); the warning surfaces
-    it at startup so users notice before debugging "why is flash off
-    on rank 1".
+    Two failure modes to surface at startup:
+
+    * **Hard error — coordinator/worker model-structure mismatch.** If
+      any per-model ``resolved_flash().enabled`` differs from
+      ``settings.flash``, the coordinator and workers would load
+      structurally different models (one with ``FlashModelWrapper``
+      replacing FFN layers, the other dense). The ring ``all_sum``
+      then operates over mismatched layer shapes and crashes
+      inference. Bail at startup with a clear migration nudge instead
+      of letting the cluster spin up only to die during the first
+      request. Mirrors the existing flash + pipeline-strategy guard.
+
+    * **Warning — silently ignored per-model overrides.** When
+      ``resolved_flash().enabled`` matches the global but a model has
+      per-model values for the four numeric Flash knobs
+      (``sparsity_threshold``, ``min/max_active_neurons``,
+      ``memory_budget_fraction``), those overrides are honoured only
+      on the coordinator. The worker path reads globals via
+      ``_load_flash_tensor_worker`` and never consults the registry,
+      so the per-model values are silently dropped. Log a warning so
+      the operator notices before debugging "why is the neuron cap
+      different on rank 1".
     """
     if not settings.distributed:
         return
-    try:
-        from olmlx.engine.registry import ModelRegistry
-
-        registry = ModelRegistry()
-        registry.load()
-    except Exception as exc:
-        logger.debug("Skipping per-model flash + distributed audit: %s", exc)
-        return
-    flash_fields = (
-        "flash",
+    if registry is None:
+        registry = _load_registry_for_audit()
+        if registry is None:
+            return
+    numeric_fields = (
         "flash_sparsity_threshold",
         "flash_min_active_neurons",
         "flash_max_active_neurons",
         "flash_memory_budget_fraction",
     )
-    affected: list[str] = []
+    mismatched: list[str] = []
+    numeric_only: list[str] = []
     for name, mc in registry.list_models().items():
-        if any(getattr(mc, field, None) is not None for field in flash_fields):
-            affected.append(name)
-    if affected:
+        try:
+            resolved = mc.resolved_flash()
+        except Exception as exc:
+            logger.debug("Skipping flash distributed audit for %s: %s", name, exc)
+            continue
+        if resolved.enabled != settings.flash:
+            mismatched.append(name)
+            continue
+        if any(getattr(mc, field, None) is not None for field in numeric_fields):
+            numeric_only.append(name)
+
+    if mismatched:
+        print(
+            "Error: distributed mode is enabled and the following "
+            "models.json entries have a per-model Flash on/off that "
+            "disagrees with the global OLMLX_FLASH setting "
+            f"({settings.flash}): {', '.join(mismatched)}. The "
+            "coordinator and workers would load structurally different "
+            "models (one Flash-wrapped, one dense) and crash on the "
+            "ring all_sum. Either remove the per-model 'flash' override "
+            "from these entries, or set OLMLX_FLASH globally to match.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if numeric_only:
         logger.warning(
             "Distributed mode is enabled and the following models.json "
-            "entries have per-model Flash configuration: %s. Per-model "
-            "Flash overrides are honoured only in single-node mode; the "
-            "distributed worker path uses the global OLMLX_FLASH* "
-            "settings. Set the desired Flash values globally (env var "
-            "or --flash on `olmlx serve`) for these models to take "
-            "effect under distributed.",
-            ", ".join(affected),
+            "entries have per-model Flash numeric overrides "
+            "(sparsity_threshold/min/max/memory_budget_fraction): %s. "
+            "Per-model numeric overrides are honoured only on the "
+            "coordinator; the distributed worker path uses the global "
+            "OLMLX_FLASH_* settings. Set the desired values globally "
+            "for them to take effect on every rank.",
+            ", ".join(numeric_only),
         )
 
 
@@ -820,9 +856,30 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
     return bad
 
 
-def _audit_speculative_config() -> tuple[
-    list[str], list[str], list[str], list[str], bool
-]:
+def _load_registry_for_audit() -> "Any":
+    """Load the ModelRegistry once for the startup-audit helpers.
+
+    Returns the loaded registry or ``None`` if the load failed (in which
+    case the calling helpers should treat the registry as empty / skip
+    their checks). Centralising this here keeps the three audit helpers
+    in ``_apply_serve_overrides`` from doing redundant disk I/O.
+    """
+    from olmlx.engine.registry import ModelRegistry
+
+    registry = ModelRegistry()
+    try:
+        registry.load()
+    except (ValueError, OSError) as exc:
+        logger.warning(
+            "Skipping startup registry audit: could not load registry: %s", exc
+        )
+        return None
+    return registry
+
+
+def _audit_speculative_config(
+    registry: "Any | None" = None,
+) -> tuple[list[str], list[str], list[str], list[str], bool]:
     """Walk the registry and audit each model's resolved speculative
     config.
 
@@ -852,31 +909,10 @@ def _audit_speculative_config() -> tuple[
     """
     from olmlx.config import experimental as global_exp
     from olmlx.config import resolve_experimental
-    from olmlx.engine.registry import ModelRegistry
 
-    registry = ModelRegistry()
-    try:
-        registry.load()
-    except ValueError as exc:
-        # Validation errors (e.g. a malformed entry that survived
-        # ``_models_with_promoted_keys_in_experimental``) are operator
-        # errors, not transient I/O issues — flag them distinctly.
-        # Note: ``ModelRegistry.load`` itself catches per-entry
-        # ValueError today and logs them, so this branch fires only if
-        # validation moves earlier in the load sequence.
-        logger.warning(
-            "Skipping speculative config validation: invalid models.json entry: %s",
-            exc,
-        )
-        return [], [], [], [], False
-    except OSError as exc:
-        # I/O failures: never block startup. The catch is narrow so
-        # programming errors (typos, missing attributes, etc.) inside
-        # the loop below propagate instead of being swallowed.
-        logger.warning(
-            "Skipping speculative config validation: could not load registry: %s",
-            exc,
-        )
+    if registry is None:
+        registry = _load_registry_for_audit()
+    if registry is None:
         return [], [], [], [], False
     bad: list[str] = []
     dormant: list[str] = []
