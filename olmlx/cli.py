@@ -725,10 +725,10 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(1)
 
-    _warn_per_model_flash_in_distributed(audit_registry)
+    _audit_per_model_flash_in_distributed(audit_registry)
 
 
-def _warn_per_model_flash_in_distributed(registry: "Any | None" = None) -> None:
+def _audit_per_model_flash_in_distributed(registry: "Any | None" = None) -> None:
     """Audit per-model Flash settings against distributed-mode invariants.
 
     Two failure modes to surface at startup:
@@ -777,7 +777,14 @@ def _warn_per_model_flash_in_distributed(registry: "Any | None" = None) -> None:
         if resolved.enabled != settings.flash:
             mismatched.append(name)
             continue
-        if any(getattr(mc, field, None) is not None for field in numeric_fields):
+        # Only warn about numeric overrides when Flash is actually
+        # enabled — overrides on a model that resolves to ``flash=False``
+        # are inert on both coordinator and worker, so claiming they
+        # are "silently dropped on workers" would mislead the user
+        # into thinking Flash was running.
+        if resolved.enabled and any(
+            getattr(mc, field, None) is not None for field in numeric_fields
+        ):
             numeric_only.append(name)
 
     if mismatched:
@@ -869,7 +876,19 @@ def _load_registry_for_audit() -> "Any":
     registry = ModelRegistry()
     try:
         registry.load()
-    except (ValueError, OSError) as exc:
+    except ValueError as exc:
+        # Validation errors (a malformed entry that survived the
+        # ``_models_with_promoted_keys_in_experimental`` raw-JSON
+        # check) are operator errors, not transient I/O issues —
+        # flag them distinctly so the log makes the cause clear.
+        # ``ModelRegistry.load`` itself catches per-entry ValueError
+        # today and logs them, so this branch fires only if validation
+        # moves earlier in the load sequence.
+        logger.warning(
+            "Skipping startup registry audit: invalid models.json entry: %s", exc
+        )
+        return None
+    except OSError as exc:
         logger.warning(
             "Skipping startup registry audit: could not load registry: %s", exc
         )

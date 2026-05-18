@@ -1012,7 +1012,7 @@ class TestBuildParser:
         vice versa) under distributed mode must hard-exit at startup —
         the coordinator and workers would load structurally different
         models and crash the ring all_sum at first inference."""
-        from olmlx.cli import _warn_per_model_flash_in_distributed
+        from olmlx.cli import _audit_per_model_flash_in_distributed
         from olmlx.config import settings as _settings
 
         models_json = tmp_path / "models.json"
@@ -1031,7 +1031,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "flash", False)
 
         with pytest.raises(SystemExit) as exc_info:
-            _warn_per_model_flash_in_distributed()
+            _audit_per_model_flash_in_distributed()
         assert exc_info.value.code == 1
         err = capsys.readouterr().err
         assert "qwen/m:latest" in err
@@ -1041,11 +1041,46 @@ class TestBuildParser:
         self, monkeypatch, tmp_path, caplog
     ):
         """A per-model numeric override (e.g. ``flash_sparsity_threshold``)
-        with matching on/off only logs a warning — the registry isn't
-        consulted on workers, so the override is silently dropped."""
+        on a model whose resolved ``flash`` is True logs a warning —
+        the registry isn't consulted on workers, so the override is
+        silently dropped on every rank but the coordinator."""
         import logging
 
-        from olmlx.cli import _warn_per_model_flash_in_distributed
+        from olmlx.cli import _audit_per_model_flash_in_distributed
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "qwen/m:latest": {
+                        "hf_path": "qwen/m",
+                        "flash_sparsity_threshold": 0.3,
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "distributed", True)
+        # Flash globally on so the model resolves to ``enabled=True``;
+        # the per-model numeric override is the silent-drop case.
+        monkeypatch.setattr(_settings, "flash", True)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _audit_per_model_flash_in_distributed()
+
+        assert "per-model Flash numeric overrides" in caplog.text
+        assert "qwen/m:latest" in caplog.text
+
+    def test_per_model_flash_numeric_inert_when_flash_disabled(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A per-model numeric override on a model that resolves to
+        ``flash=False`` is inert on both coordinator and worker — no
+        warning, no false positive."""
+        import logging
+
+        from olmlx.cli import _audit_per_model_flash_in_distributed
         from olmlx.config import settings as _settings
 
         models_json = tmp_path / "models.json"
@@ -1064,10 +1099,9 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "flash", False)
 
         with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
-            _warn_per_model_flash_in_distributed()
+            _audit_per_model_flash_in_distributed()
 
-        assert "per-model Flash numeric overrides" in caplog.text
-        assert "qwen/m:latest" in caplog.text
+        assert "per-model Flash numeric overrides" not in caplog.text
 
     def test_per_model_flash_silent_without_distributed(
         self, monkeypatch, tmp_path, caplog, capsys
@@ -1075,7 +1109,7 @@ class TestBuildParser:
         """No diagnostics when distributed is off, even with per-model flash set."""
         import logging
 
-        from olmlx.cli import _warn_per_model_flash_in_distributed
+        from olmlx.cli import _audit_per_model_flash_in_distributed
         from olmlx.config import settings as _settings
 
         models_json = tmp_path / "models.json"
@@ -1086,7 +1120,7 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "distributed", False)
 
         with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
-            _warn_per_model_flash_in_distributed()
+            _audit_per_model_flash_in_distributed()
         # No exit, no warning.
         assert "per-model Flash" not in caplog.text
         assert "structurally different models" not in capsys.readouterr().err
@@ -1281,12 +1315,25 @@ class TestBuildParser:
         from olmlx.cli import _apply_serve_overrides
         from olmlx.config import settings as _settings
 
+        # Stub the audit helpers so the test exercises just the flash
+        # branch in ``_apply_serve_overrides`` without hitting the
+        # registry / file system. Mirrors the pattern used by the other
+        # ``_apply_serve_overrides`` tests in this class.
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda registry=None: ([], [], [], [], False),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._audit_per_model_flash_in_distributed",
+            lambda registry=None: None,
+        )
+
         parser = build_parser()
         monkeypatch.setattr(_settings, "flash", True)
         args = parser.parse_args(["serve", "--no-flash"])
-        # ``_apply_serve_overrides`` is heavy (touches registry walk,
-        # legacy shims) — exercise just the flash branch via the same
-        # public entry the live code uses.
         _apply_serve_overrides(args)
         assert _settings.flash is False
 
@@ -1294,6 +1341,18 @@ class TestBuildParser:
         """``--flash`` on the CLI overrides ``OLMLX_FLASH=false`` (the default)."""
         from olmlx.cli import _apply_serve_overrides
         from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(
+            "olmlx.cli._audit_speculative_config",
+            lambda registry=None: ([], [], [], [], False),
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+        )
+        monkeypatch.setattr(
+            "olmlx.cli._audit_per_model_flash_in_distributed",
+            lambda registry=None: None,
+        )
 
         parser = build_parser()
         monkeypatch.setattr(_settings, "flash", False)
