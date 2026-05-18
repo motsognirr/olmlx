@@ -326,13 +326,16 @@ class TestGradeCodeExec:
 
 
 class TestGradeWrapsExceptions:
-    def test_grader_crash_returns_failed_not_raise(self, monkeypatch):
+    def test_grader_crash_returns_ungraded_not_raise(self, monkeypatch):
         def boom(_output, _expected):
             raise RuntimeError("synthetic")
 
         monkeypatch.setitem(GRADERS, "boom", boom)
         r = grade("boom", "x", {})
-        assert r.passed is False
+        # passed=None (ungraded), not False — a grader bug must not
+        # be counted as a model failure.
+        assert r.passed is None
+        assert r.score is None
         assert "grader raised" in r.detail
 
 

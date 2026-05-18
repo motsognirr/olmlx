@@ -46,9 +46,9 @@ def load_golden(bench_dir: Path, model: str, prompt_name: str) -> str | None:
     path = golden_path(bench_dir, model, prompt_name)
     try:
         return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
     except OSError:
+        # FileNotFoundError is a subclass of OSError — one handler covers both
+        # missing files and permission/IO errors.
         return None
 
 

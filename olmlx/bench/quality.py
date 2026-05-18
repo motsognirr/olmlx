@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
@@ -339,23 +340,19 @@ def grade_code_exec(output: str, expected: dict[str, Any]) -> QualityResult:
             pass
 
 
-def _levenshtein_similarity(a: str, b: str) -> float:
-    """1 - edit_distance / max_len. O(len(a)*len(b)) space-optimized to O(min)."""
+def _similarity(a: str, b: str) -> float:
+    """Character-level similarity in [0, 1]. 1.0 means identical strings.
+
+    Uses ``difflib.SequenceMatcher`` (C-accelerated, longest-common-subsequence
+    based) instead of pure-Python edit distance — for a 2k-char model output
+    vs a same-size golden, the difference is roughly 100× per call, and that
+    cost dominated a batch bench run.
+    """
     if a == b:
         return 1.0
     if not a or not b:
         return 0.0
-    if len(a) > len(b):
-        a, b = b, a
-    prev = list(range(len(a) + 1))
-    for i, cb in enumerate(b, 1):
-        curr = [i] + [0] * len(a)
-        for j, ca in enumerate(a, 1):
-            cost = 0 if ca == cb else 1
-            curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
-        prev = curr
-    dist = prev[-1]
-    return 1.0 - dist / max(len(a), len(b))
+    return SequenceMatcher(a=a, b=b, autojunk=False).ratio()
 
 
 def grade_regression_snapshot(output: str, expected: dict[str, Any]) -> QualityResult:
@@ -369,7 +366,7 @@ def grade_regression_snapshot(output: str, expected: dict[str, Any]) -> QualityR
         )
     try:
         reference = Path(ref_path).read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError) as exc:
+    except OSError as exc:
         return QualityResult(
             grader="regression_snapshot",
             passed=None,
@@ -384,7 +381,7 @@ def grade_regression_snapshot(output: str, expected: dict[str, Any]) -> QualityR
         score = 1.0 if passed else 0.0
         detail = "exact match" if passed else "exact mismatch"
     else:
-        score = _levenshtein_similarity(_normalize_ws(output), _normalize_ws(reference))
+        score = _similarity(_normalize_ws(output), _normalize_ws(reference))
         passed = score >= threshold
         detail = f"similarity={score:.3f} threshold={threshold:.3f}"
     return QualityResult(
@@ -418,10 +415,13 @@ def grade(grader_name: str, output: str, expected: dict[str, Any]) -> QualityRes
     try:
         return grader_fn(output, expected)
     except Exception as exc:  # defensive: a bad grader must not crash the run
+        # passed=None (not False) so a grader bug does not silently inflate
+        # the failure count and drag the reported pass rate down — same
+        # sentinel used for "no expected", "disabled", "unknown grader".
         logger.exception("Grader %s raised", grader_name)
         return QualityResult(
             grader=grader_name,
-            passed=False,
-            score=0.0,
+            passed=None,
+            score=None,
             detail=f"grader raised: {exc!r}",
         )
