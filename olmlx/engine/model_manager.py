@@ -988,6 +988,26 @@ class ModelManager:
             except Exception as exc:
                 logger.exception("Error closing speculative decoder for %s", lm.name)
                 errors.append(exc)
+        # Free GPU memory held by prompt caches.  CachedPromptState entries
+        # hold per-layer KV cache buffers (deepest GPU consumer besides
+        # weights).  Uses clear() which also deletes on-disk entries for this
+        # model — correct for a full eviction since any previously-offloaded
+        # caches are permanently stale.
+        #
+        # Model and tokenizer are NOT nulled here — _close_evictees handles
+        # that on the event loop after the worker thread joins, so concurrent
+        # inference callers holding a LoadedModel reference are not exposed to
+        # the null mid-request.
+        if lm.prompt_cache_store is not None:
+            try:
+                lm.prompt_cache_store.clear()
+                # Null on success (consistent with weight_store /
+                # speculative_decoder) so re-entry from the
+                # _close_evictees drain skips a redundant clear().
+                lm.prompt_cache_store = None
+            except Exception as exc:
+                logger.exception("Error clearing prompt cache for %s", lm.name)
+                errors.append(exc)
         # ``lm.model.prefetcher`` is intentionally not nulled — it lives on
         # the FlashModelWrapper, not on the LM bookkeeping, and the wrapper
         # goes away with the LM.
@@ -1068,6 +1088,17 @@ class ModelManager:
                     # noisy in logs if both run to completion.
                     evictees.append(evicted)
                     raise
+                # Null model and tokenizer HERE on the event loop (NOT in
+                # the worker thread) to avoid a race: between
+                # ensure_loaded() returning and the caller accessing
+                # lm.model, the worker thread could set it to None and
+                # crash the caller.  See the _expire_stale contract: "the
+                # caller still holds a Python reference, so the model/
+                # tokenizer stay alive."  No await between null and del
+                # — back on the event loop after the thread join — so
+                # no other coroutine can observe the nulled field.
+                evicted.model = None
+                evicted.tokenizer = None
                 del evicted
         finally:
             # On normal exit ``evictees`` is empty and this is a no-op. On
@@ -1082,6 +1113,8 @@ class ModelManager:
                     self._close_loaded_model(lm)
                 except ExceptionGroup:
                     pass  # already logged per-resource inside _close_loaded_model
+                lm.model = None
+                lm.tokenizer = None
                 del lm
 
     async def ensure_loaded(
@@ -1194,6 +1227,70 @@ class ModelManager:
             if not self._pending_cleanups:
                 gc.collect()
                 mx.clear_cache()
+
+            # Pre-load memory hygiene: if Metal memory is still under
+            # pressure after eviction + close + gc, evict prompt caches
+            # from all remaining loaded models and do another cleanup pass.
+            # Runs OUTSIDE the lock and offloads disk I/O to worker threads
+            # so concurrent ensure_loaded callers — including ones asking
+            # for already-loaded models — are not stalled (issue #315).
+            # Without this hygiene pass, loading a model on top of residual
+            # GPU allocations from a prior model pushes Metal into swap,
+            # causing the sub-token-per-second thrashing documented in
+            # issue #223.
+            if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+                logger.warning(
+                    "Metal memory under pressure before loading %s; "
+                    "flushing prompt caches to free GPU memory",
+                    normalized,
+                )
+                # Snapshot to a list before the await loop — iterating
+                # a live dict view across await yields would risk
+                # RuntimeError if another coroutine modifies _loaded
+                # during the I/O (issue #315 lock-split contract).
+                #
+                # Narrow race: _expire_stale (background loop, every 30s)
+                # may concurrently pop and close a model that is in our
+                # snapshot.  In CPython the GIL prevents a segfault, and
+                # the concurrent close makes our async_evict_all_to_disk()
+                # a harmless no-op (the store is already cleared).  Worst
+                # case a few cache entries are not flushed to disk, but
+                # GPU memory is freed either way.
+                for other_lm in list(self._loaded.values()):
+                    # Capture the store reference before the await to
+                    # prevent TOCTOU: _expire_stale (background task,
+                    # every 30s) may concurrently close this model,
+                    # setting ``other_lm.prompt_cache_store = None``
+                    # during the yield.  If that happens, re-evaluating
+                    # the field would raise AttributeError.
+                    store = other_lm.prompt_cache_store
+                    if store is not None:
+                        try:
+                            await store.async_evict_all_to_disk()
+                        except Exception:
+                            # _close_loaded_model (running in a worker
+                            # thread) may have concurrently called
+                            # store.clear() — the store is empty, the
+                            # GPU buffers are already freed.
+                            logger.debug(
+                                "Concurrent close cleared prompt cache "
+                                "for %s during hygiene flush; skipping",
+                                other_lm.name,
+                            )
+                # Skip gc/clear when a deferred cleanup is pending:
+                # mx.clear_cache() is not safe to call concurrently with
+                # active Metal allocations from a background thread (see
+                # the matching guard at the _ensure_loaded pre-load path).
+                if not self._pending_cleanups:
+                    gc.collect()
+                    mx.clear_cache()
+                if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+                    logger.warning(
+                        "Metal pressure persists after hygiene flush; "
+                        "proceeding to load %s anyway — generation may "
+                        "be slow if Metal swaps",
+                        normalized,
+                    )
 
             async with self._lock:
                 # State may have changed while the lock was released for the

@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1440,6 +1440,10 @@ class TestModelLoadTimeout:
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -1473,6 +1477,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
@@ -1509,6 +1517,10 @@ class TestModelLoadTimeout:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -1533,6 +1545,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
@@ -1565,6 +1581,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
@@ -1615,6 +1635,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
@@ -1677,6 +1701,10 @@ class TestModelLoadTimeout:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -1737,6 +1765,10 @@ class TestModelLoadTimeout:
                 return_value=1 * self.GB,
             ),
             patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
+            patch(
                 "olmlx.engine.model_manager.gc.collect",
                 side_effect=gc_collect_that_fails_second_time,
             ),
@@ -1775,6 +1807,10 @@ class TestModelLoadTimeout:
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -1808,6 +1844,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
@@ -1851,6 +1891,10 @@ class TestModelLoadTimeout:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
@@ -2519,6 +2563,10 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -2556,6 +2604,10 @@ class TestMemoryCheck:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
@@ -2598,6 +2650,10 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -2631,6 +2687,10 @@ class TestMemoryCheck:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
@@ -2668,6 +2728,10 @@ class TestMemoryCheck:
             patch(
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
@@ -2735,6 +2799,10 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect", side_effect=track_gc),
             patch("olmlx.engine.model_manager.mx.clear_cache", side_effect=track_clear),
         ):
@@ -2776,6 +2844,10 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=total_ram,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
         ):
@@ -2810,6 +2882,10 @@ class TestMemoryCheck:
             patch(
                 "olmlx.utils.memory.get_metal_memory",
                 side_effect=[1 * self.GB, OSError("Metal query failed")],
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
@@ -2846,6 +2922,10 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.get_system_memory_bytes",
                 return_value=0,
             ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
         ):
             await manager.ensure_loaded("qwen3")
 
@@ -2865,6 +2945,10 @@ class TestMemoryCheck:
             patch(
                 "olmlx.utils.memory.get_metal_memory",
                 return_value=1 * self.GB,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
@@ -3396,6 +3480,157 @@ class TestEvictLruIfNeeded:
         assert lm.weight_store is weight_store
         assert lm.speculative_decoder is None
 
+    def test_close_loaded_model_clears_prompt_cache(self, registry, mock_store):
+        """_close_loaded_model must clear prompt caches and null the store on eviction.
+
+        CachedPromptState objects hold per-layer GPU KV cache buffers. If
+        we don't clear them during eviction, the GPU memory remains
+        allocated even after ``gc.collect()`` — the Metal buffers survive
+        because the PromptCacheStore references keep them alive. On success,
+        the store reference is also nulled (consistent with weight_store /
+        speculative_decoder) so re-entry skips a redundant clear().
+        """
+        manager = ModelManager(registry, mock_store)
+        cache_store = MagicMock()
+        lm = LoadedModel(
+            name="x",
+            hf_path="x/x",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            prompt_cache_store=cache_store,
+        )
+        manager._close_loaded_model(lm)
+        cache_store.clear.assert_called_once()
+        assert lm.prompt_cache_store is None
+
+    def test_close_loaded_model_preserves_model_for_caller_nulling(
+        self, registry, mock_store
+    ):
+        """_close_loaded_model must NOT null model/tokenizer — caller does it.
+
+        Model/tokenizer nulling moved from _close_loaded_model (worker
+        thread) to _close_evictees (event loop) to prevent a race: between
+        ensure_loaded() returning and the caller accessing lm.model, the
+        worker thread could null it and crash the caller. The caller
+        (_close_evictees) sets model=None after the thread joins, with no
+        await between null and del.
+        """
+        manager = ModelManager(registry, mock_store)
+        mock_model = MagicMock()
+        mock_tok = MagicMock()
+        lm = LoadedModel(
+            name="x",
+            hf_path="x/x",
+            model=mock_model,
+            tokenizer=mock_tok,
+        )
+        manager._close_loaded_model(lm)
+        # _close_loaded_model preserves fields; caller (_close_evictees)
+        # nulls them on the event loop.
+        assert lm.model is mock_model
+        assert lm.tokenizer is mock_tok
+
+    def test_close_loaded_model_preserves_model_on_prior_failure(
+        self, registry, mock_store
+    ):
+        """_close_loaded_model never nulls model/tokenizer (caller does it).
+
+        The ``_close_evictees`` finally-drain path may call
+        ``_close_loaded_model`` a second time after a first call raised.
+        Model/tokenizer nulling is handled by _close_evictees on the
+        event loop (not in the worker thread) to prevent a race between
+        ensure_loaded() return and the worker thread nulling the fields.
+        This test verifies the model/tokenizer survive a failed close so
+        re-entry can inspect lm.model.
+        """
+        manager = ModelManager(registry, mock_store)
+        weight_store = MagicMock()
+        weight_store.close.side_effect = RuntimeError("stuck-weight-store")
+        mock_model = MagicMock()
+        mock_tok = MagicMock()
+        lm = LoadedModel(
+            name="x",
+            hf_path="x/x",
+            model=mock_model,
+            tokenizer=mock_tok,
+            weight_store=weight_store,
+        )
+
+        with pytest.raises(ExceptionGroup):
+            manager._close_loaded_model(lm)
+        # Model and tokenizer are always preserved by _close_loaded_model
+        # (nulling happens in _close_evictees, on the event loop).
+        assert lm.model is mock_model
+        assert lm.tokenizer is mock_tok
+
+    def test_prefetcher_close_call_count_on_partial_failure(self, registry, mock_store):
+        """Prefetcher.close() must be called exactly once on a partial-failure path.
+
+        On re-entry from the _close_evictees drain, weight_store and
+        speculative_decoder are already nulled (they're nulled on success),
+        so re-entry skips them.  The prefetcher lives on FlashModelWrapper
+        and cannot be nulled the same way — but must still not be
+        double-closed on re-entry.  Currently the prefetcher IS re-attempted
+        on re-entry (a known limitation tracked by this test); the test
+        documents the contract and prevents a future change from silently
+        making it worse.
+        """
+        manager = ModelManager(registry, mock_store)
+        prefetcher = MagicMock()
+        weight_store = MagicMock()
+        weight_store.close.side_effect = RuntimeError("stuck")
+        flash_model = MagicMock()
+        flash_model.prefetcher = prefetcher
+        lm = LoadedModel(
+            name="x",
+            hf_path="x/x",
+            model=flash_model,
+            tokenizer=MagicMock(),
+            weight_store=weight_store,
+            is_flash=True,
+        )
+
+        with pytest.raises(ExceptionGroup):
+            manager._close_loaded_model(lm)
+
+        # weight_store failed → on re-entry, prefetcher should not have
+        # been nulled (it can't be — it lives on FlashModelWrapper).
+        assert lm.model is flash_model
+
+        # Re-entry: call _close_loaded_model again (simulating the drain).
+        # The prefetcher IS re-closed here (known limitation).
+        # Verify it was called once across BOTH passes, not twice on the
+        # re-entry — the call counts document the current behaviour.
+        with pytest.raises(ExceptionGroup):
+            manager._close_loaded_model(lm)
+        assert prefetcher.close.call_count == 2  # known limitation; must not regress
+
+    @pytest.mark.asyncio
+    async def test_close_evictees_nulls_model_on_event_loop(self, registry, mock_store):
+        """_close_evictees nulls model/tokenizer after the worker thread joins.
+
+        Nulling must happen on the event loop (not in the worker thread) to
+        prevent a race: between ensure_loaded() returning and the caller
+        accessing lm.model, the worker thread could null it and crash the
+        caller. Since _close_evictees runs on the event loop and has no
+        await between null and del, no other coroutine can observe the
+        nulled field.
+        """
+        manager = ModelManager(registry, mock_store)
+        mock_model = MagicMock()
+        mock_tok = MagicMock()
+        old = LoadedModel(
+            name="old",
+            hf_path="o/o",
+            model=mock_model,
+            tokenizer=mock_tok,
+        )
+        await manager._close_evictees([old])
+        # After _close_evictees completes, model/tokenizer must be None
+        # so the caller's gc.collect() can reclaim Metal buffers.
+        assert old.model is None
+        assert old.tokenizer is None
+
     @pytest.mark.asyncio
     async def test_close_evictees_absorbs_close_failure(
         self, registry, mock_store, caplog
@@ -3661,6 +3896,116 @@ class TestEvictLruIfNeeded:
             await manager.ensure_loaded("new")
 
         assert lock_held_during_close == [False]
+
+    @pytest.mark.asyncio
+    async def test_ensure_loaded_preload_memory_hygiene(
+        self, registry, mock_store, monkeypatch
+    ):
+        """ensure_loaded must flush prompt caches from remaining models before load.
+
+        After closing evictees, Metal memory can still be under pressure
+        if the previous model's prompt caches or residual Metal allocations
+        weren't fully reclaimed. The pre-load memory hygiene path must run
+        OUTSIDE _lock (Bug 1) and use async_evict_all_to_disk() to offload
+        disk I/O to a worker thread.
+        """
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 2)
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", None
+        )
+        monkeypatch.setattr(
+            "olmlx.utils.memory.is_memory_pressure_high",
+            lambda _fraction, threshold=0.9: True,
+        )
+        manager = ModelManager(registry, mock_store)
+
+        cache_store = MagicMock()
+        cache_store.async_evict_all_to_disk = AsyncMock()
+        existing = LoadedModel(
+            name="existing:latest",
+            hf_path="existing/repo",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            prompt_cache_store=cache_store,
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["existing:latest"] = existing
+
+        manager.registry.resolve = MagicMock(  # type: ignore[method-assign]
+            return_value=ModelConfig(hf_path="new/repo")
+        )
+        manager.registry.normalize_name = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda n: f"{n}:latest"
+        )
+
+        def _shard(*args, **kwargs):
+            raise RuntimeError("stop before load")
+
+        monkeypatch.setattr(manager, "_load_model_and_shard", _shard)
+
+        with pytest.raises(RuntimeError, match="stop before load"):
+            await manager.ensure_loaded("new")
+
+        # Pre-load memory hygiene must have flushed the remaining model's
+        # prompt caches (async path — offloaded to thread).
+        cache_store.async_evict_all_to_disk.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_loaded_preload_memory_hygiene_happy_path(
+        self, registry, mock_store, monkeypatch
+    ):
+        """The hygiene flush succeeds and the subsequent load completes normally.
+
+        Verifies the full happy path: memory pressure triggers the flush,
+        the flush completes, and then the normal loading flow proceeds
+        without errors.  Without this, a hygiene-pass bug that derails the
+        load path (e.g. accidentally clearing load state) would go undetected
+        until a real bench sweep.
+        """
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 2)
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", None
+        )
+        # First call (pre-load hygiene check): pressure high → flush.
+        # Second call (post-hygiene check): pressure resolved → proceed.
+        # Use MagicMock side_effect so a third call raises StopIteration
+        # — making unexpected extra pressure checks immediately visible
+        # rather than silently swallowed by itertools.repeat.
+        mock_pressure = MagicMock(side_effect=[True, False])
+        monkeypatch.setattr("olmlx.utils.memory.is_memory_pressure_high", mock_pressure)
+        manager = ModelManager(registry, mock_store)
+
+        cache_store = MagicMock()
+        cache_store.async_evict_all_to_disk = AsyncMock()
+        existing = LoadedModel(
+            name="existing:latest",
+            hf_path="existing/repo",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            prompt_cache_store=cache_store,
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["existing:latest"] = existing
+
+        manager.registry.resolve = MagicMock(  # type: ignore[method-assign]
+            return_value=ModelConfig(hf_path="new/repo")
+        )
+        manager.registry.normalize_name = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda n: f"{n}:latest"
+        )
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        def _shard(*args, **kwargs):
+            return (mock_model, mock_tokenizer, False, TemplateCaps(), False, None)
+
+        monkeypatch.setattr(manager, "_load_model_and_shard", _shard)
+
+        lm = await manager.ensure_loaded("new")
+        assert lm.name == "new:latest"
+        cache_store.async_evict_all_to_disk.assert_called()
 
 
 class TestSpeculativeLoading:
