@@ -460,9 +460,7 @@ _DEPRECATED_FLASH_MOE_ENV_VARS = (
     "OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS",
 )
 
-_LEGACY_FLASH_MOE_FORWARD: tuple[
-    tuple[str, str, str, Callable[[str], Any]], ...
-] = (
+_LEGACY_FLASH_MOE_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], ...] = (
     (
         "OLMLX_EXPERIMENTAL_FLASH_MOE",
         "OLMLX_FLASH_MOE",
@@ -495,9 +493,7 @@ def _surface_legacy_flash_moe_env() -> None:
     from olmlx.config import settings as _settings
 
     dotenv_values = _legacy_flash_moe_values_in_dotenv()
-    shell_stale = [
-        v for v in _DEPRECATED_FLASH_MOE_ENV_VARS if os.environ.get(v)
-    ]
+    shell_stale = [v for v in _DEPRECATED_FLASH_MOE_ENV_VARS if os.environ.get(v)]
     stale = sorted({*shell_stale, *dotenv_values.keys()})
     if stale:
         logger.warning(

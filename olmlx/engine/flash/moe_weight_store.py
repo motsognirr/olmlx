@@ -78,7 +78,9 @@ class ExpertCacheStats:
     cache_hits: int = 0
     cache_misses: int = 0
     load_failures: int = 0
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
 
     def record(self, hits: int, misses: int, failures: int = 0) -> None:
         with self._lock:
@@ -88,8 +90,9 @@ class ExpertCacheStats:
             self.load_failures += failures
 
     def hit_rate(self) -> float:
-        total = self.cache_hits + self.cache_misses
-        return self.cache_hits / total if total > 0 else 0.0
+        with self._lock:
+            total = self.cache_hits + self.cache_misses
+            return self.cache_hits / total if total > 0 else 0.0
 
     def snapshot(self) -> dict[str, int]:
         """Return a snapshot of current counters."""
@@ -332,24 +335,25 @@ class FlashMoeWeightStore:
         # slow readers do not block fast ones. On error cancel any queued-but-
         # not-started futures (already-running reads run to completion anyway,
         # but we avoid piling more work on the executor).
-        if missing:
-            future_to_idx = {
-                self._executor.submit(self._read_expert, layer_idx, idx): idx
-                for idx in missing
-            }
-            try:
-                for future in as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    data = future.result()
-                    cached[idx] = data
-                    self._cache.put(layer_idx, idx, data)
-            except Exception:
-                failures += 1
-                for f in future_to_idx:
-                    f.cancel()
-                raise
-
-        self.stats.record(hits, misses, failures)
+        try:
+            if missing:
+                future_to_idx = {
+                    self._executor.submit(self._read_expert, layer_idx, idx): idx
+                    for idx in missing
+                }
+                try:
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        data = future.result()
+                        cached[idx] = data
+                        self._cache.put(layer_idx, idx, data)
+                except Exception:
+                    failures += 1
+                    for f in future_to_idx:
+                        f.cancel()
+                    raise
+        finally:
+            self.stats.record(hits, misses, failures)
 
         # Build index map and stack arrays in input order
         expert_index_map = {eidx: i for i, eidx in enumerate(expert_indices)}

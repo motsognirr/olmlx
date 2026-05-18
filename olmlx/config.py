@@ -209,7 +209,6 @@ class ExperimentalSettings(BaseSettings):
     flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
 
-
 experimental = ExperimentalSettings()
 
 PRE_SHARDED_DIR_ENV = "OLMLX_DISTRIBUTED_PRE_SHARDED_DIR"
