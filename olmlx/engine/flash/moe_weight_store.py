@@ -79,7 +79,7 @@ class ExpertCacheStats:
     cache_misses: int = 0
     load_failures: int = 0
     _lock: threading.Lock = field(
-        default_factory=threading.Lock, init=False, repr=False
+        default_factory=threading.Lock, init=False, repr=False, compare=False
     )
 
     def record(self, hits: int, misses: int, failures: int = 0) -> None:
@@ -348,7 +348,9 @@ class FlashMoeWeightStore:
                         cached[idx] = data
                         self._cache.put(layer_idx, idx, data)
                 except Exception:
-                    failures += 1
+                    # All requested experts are effectively failed since
+                    # we can't serve a partial cache to the caller.
+                    failures = len(missing)
                     for f in future_to_idx:
                         f.cancel()
                     raise

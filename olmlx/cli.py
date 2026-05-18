@@ -1381,7 +1381,10 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
             for key, val in os.environ.items():
                 if (
                     key.startswith("OLMLX_EXPERIMENTAL_FLASH_")
-                    or key.startswith("OLMLX_FLASH_")
+                    or (
+                        key.startswith("OLMLX_FLASH_")
+                        and not key.startswith("OLMLX_FLASH_MOE")
+                    )
                 ) and key not in env:
                     env[key] = val
         env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
