@@ -548,6 +548,20 @@ class TestModelConfig:
                 }
             )
 
+    def test_flash_moe_in_experimental_raises_migration_error(self):
+        """flash_moe in the experimental block should raise a clear migration error."""
+        from olmlx.engine import registry
+
+        with pytest.raises(
+            ValueError, match="'flash_moe' to the top level"
+        ):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "mo/non-existent",
+                    "experimental": {"flash_moe": True},
+                }
+            )
+
     def test_flash_min_greater_than_max_rejected_per_model(self):
         """Inverted min/max active neurons in a single ModelConfig is rejected."""
         with pytest.raises(ValueError, match="must be <="):
@@ -712,18 +726,6 @@ class TestRegistryModelConfig:
         assert result.hf_path == "mlx-community/DeepSeek-V3.2-4bit"
         assert result.resolved_flash_moe().enabled is True
         assert result.resolved_flash_moe().cache_budget_experts == 6
-
-    def test_flash_moe_in_experimental_raises_migration_error(self):
-        """flash_moe in the experimental block should raise a clear migration error."""
-        from olmlx.engine import registry
-
-        with pytest.raises(ValueError, match="'flash_moe' to the top level"):
-            ModelConfig.from_entry(
-                {
-                    "hf_path": "mo/non-existent",
-                    "experimental": {"flash_moe": True},
-                }
-            )
 
     def test_save_preserves_rich_config(self, tmp_path, monkeypatch):
         """Round-trip: load → save → load preserves config including promoted fields."""

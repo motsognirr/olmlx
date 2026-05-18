@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from olmlx.config import FlashMoeConfig
 from olmlx.engine.model_manager import (
     LoadedModel,
     ModelLoadTimeoutError,
@@ -19,7 +20,6 @@ from olmlx.engine.model_manager import (
     _ensure_tokenizer_eos_in_stops,
     parse_keep_alive,
 )
-from olmlx.config import FlashMoeConfig
 from olmlx.engine.registry import ModelConfig, SpeculativeConfig
 from olmlx.engine.template_caps import TemplateCaps
 
@@ -4186,9 +4186,7 @@ class TestSpeculativeLoading:
         monkeypatch.setattr(
             manager,
             "_load_flash_moe_model",
-            lambda hf_path, load_path, flash_moe_dir, *, flash_moe_config: (
-                sentinel_load
-            ),
+            lambda hf_path, load_path, flash_moe_dir, *, flash_moe_config: sentinel_load,
         )
         sentinel_decoder = object()
         monkeypatch.setattr(

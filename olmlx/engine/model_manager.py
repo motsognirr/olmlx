@@ -18,7 +18,7 @@ import mlx.core as mx
 
 from olmlx.config import FlashMoeConfig, SyncMode, experimental as global_experimental
 from olmlx.config import resolve_experimental, settings
-from olmlx.engine.registry import ModelRegistry, SpeculativeConfig
+from olmlx.engine.registry import ModelRegistry, ResolvedFlashConfig, SpeculativeConfig
 from olmlx.utils import memory as memory_utils
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
 
@@ -1195,6 +1195,11 @@ class ModelManager:
                 # Resolve per-model speculative settings (now top-level, not
                 # under ``experimental``). Falls back to global Settings.
                 spec_config = model_config.resolved_speculative()
+                # Resolve per-model Flash primary-knob settings (also
+                # promoted to top-level). Advanced/tuning Flash fields
+                # still live under ``experimental`` and ride along on
+                # ``model_exp``.
+                flash_config = model_config.resolved_flash()
                 kv_cache_quant = model_config.resolved_kv_cache_quant()
                 flash_moe_config = model_config.resolved_flash_moe()
 
@@ -1319,6 +1324,7 @@ class ModelManager:
                         hf_path,
                         model_exp,
                         spec_config,
+                        flash_config,
                         flash_moe_config,
                     )
                     timeout = settings.model_load_timeout
@@ -2766,11 +2772,17 @@ class ModelManager:
             num_speculative_tokens=num_tokens,
         )
 
-    def _is_flash_enabled(self, model_exp: Any) -> bool:
-        return model_exp.flash
+    def _is_flash_enabled(self, flash_config: ResolvedFlashConfig) -> bool:
+        return flash_config.enabled
 
     def _load_flash_model(
-        self, hf_path: str, load_path: str, flash_dir: Path, *, model_exp: Any
+        self,
+        hf_path: str,
+        load_path: str,
+        flash_dir: Path,
+        *,
+        model_exp: Any,
+        flash_config: ResolvedFlashConfig,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model in flash mode (LLM in a Flash).
 
@@ -2806,17 +2818,17 @@ class ModelManager:
         # Read flash layout for dimensions
         layout_config = json.loads((flash_dir / "flash_layout.json").read_text())
 
-        flash_config = FlashConfig(
+        runtime_flash_config = FlashConfig(
             hidden_size=layout_config["hidden_size"],
             intermediate_size=layout_config["intermediate_size"],
             num_layers=layout_config["num_layers"],
-            sparsity_threshold=model_exp.flash_sparsity_threshold,
-            min_active_neurons=model_exp.flash_min_active_neurons,
-            max_active_neurons=model_exp.flash_max_active_neurons,
+            sparsity_threshold=flash_config.sparsity_threshold,
+            min_active_neurons=flash_config.min_active_neurons,
+            max_active_neurons=flash_config.max_active_neurons,
             window_size=model_exp.flash_window_size,
             io_threads=model_exp.flash_io_threads,
             cache_budget_neurons=model_exp.flash_cache_budget_neurons,
-            memory_budget_fraction=model_exp.flash_memory_budget_fraction,
+            memory_budget_fraction=flash_config.memory_budget_fraction,
             prefetch=model_exp.flash_prefetch,
             prefetch_confidence_threshold=model_exp.flash_prefetch_confidence_threshold,
             prefetch_min_neurons=model_exp.flash_prefetch_min_neurons,
@@ -2826,8 +2838,8 @@ class ModelManager:
 
         weight_store = FlashWeightStore(
             flash_dir,
-            num_io_threads=flash_config.io_threads,
-            cache_budget_neurons=flash_config.cache_budget_neurons,
+            num_io_threads=runtime_flash_config.io_threads,
+            cache_budget_neurons=runtime_flash_config.cache_budget_neurons,
             bypass_cache=model_exp.flash_bypass_os_cache,
             use_preallocated_buffer=model_exp.flash_preallocated_buffer,
         )
@@ -2847,7 +2859,7 @@ class ModelManager:
 
         # Wrap model — this replaces FFN layers and frees original weights
         wrapped = FlashModelWrapper(
-            model, predictor_bank, weight_store, flash_config, lookahead_bank
+            model, predictor_bank, weight_store, runtime_flash_config, lookahead_bank
         )
 
         if model_exp.flash_speculative:
@@ -2975,6 +2987,7 @@ class ModelManager:
         *,
         model_exp: Any = None,
         spec_config: SpeculativeConfig | None = None,
+        flash_config: ResolvedFlashConfig | None = None,
         flash_moe_config: FlashMoeConfig | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
@@ -2986,9 +2999,13 @@ class ModelManager:
         overrides applied). Falls back to global ``Settings`` values
         when ``None``.
 
+        *flash_config* is the resolved Flash primary-knob config
+        (``ModelConfig.resolved_flash()``). Falls back to a fresh
+        resolution from global ``Settings`` values when ``None``.
+
         *flash_moe_config* is the resolved ``FlashMoeConfig`` (per-model
-        overrides applied). Falls back to global ``Settings`` values
-        when ``None``.
+        overrides applied). Falls back to a fresh resolution from
+        global ``Settings`` values when ``None``.
 
         Returns (model, tokenizer, is_vlm, caps, speculative_decoder).
         """
@@ -3005,12 +3022,15 @@ class ModelManager:
             from olmlx.engine.registry import ModelConfig
 
             spec_config = ModelConfig(hf_path=hf_path).resolved_speculative()
-        spec_enabled = spec_config.enabled
+        if flash_config is None:
+            from olmlx.engine.registry import ModelConfig
 
+            flash_config = ModelConfig(hf_path=hf_path).resolved_flash()
         if flash_moe_config is None:
             from olmlx.engine.registry import ModelConfig
 
             flash_moe_config = ModelConfig(hf_path=hf_path).resolved_flash_moe()
+        spec_enabled = spec_config.enabled
 
         # Ensure model is downloaded to the store
         load_path: str = hf_path
@@ -3056,7 +3076,7 @@ class ModelManager:
                 return model, tokenizer, is_vlm, caps, None
 
         # Check for flash-prepared model
-        if self._is_flash_enabled(model_exp):
+        if self._is_flash_enabled(flash_config):
             flash_dir = self._flash_dir(hf_path)
             if flash_dir is not None:
                 if spec_enabled:
@@ -3068,7 +3088,11 @@ class ModelManager:
                         hf_path,
                     )
                 return self._load_flash_model(
-                    hf_path, load_path, flash_dir, model_exp=model_exp
+                    hf_path,
+                    load_path,
+                    flash_dir,
+                    model_exp=model_exp,
+                    flash_config=flash_config,
                 )
 
         kind = self._detect_model_kind(hf_path)
@@ -3139,6 +3163,7 @@ class ModelManager:
         hf_path: str,
         model_exp: Any = None,
         spec_config: SpeculativeConfig | None = None,
+        flash_config: ResolvedFlashConfig | None = None,
         flash_moe_config: FlashMoeConfig | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
@@ -3149,7 +3174,7 @@ class ModelManager:
         *spec_config* is the resolved speculative config tuple
         ``(enabled, draft_model, num_tokens)``.
 
-        *flash_moe_config* is the resolved ``FlashMoeConfig``.
+        *flash_config* is the resolved Flash primary-knob config.
 
         Returns (model, tokenizer, is_vlm, caps, is_distributed, speculative_decoder).
         """
@@ -3157,6 +3182,7 @@ class ModelManager:
             hf_path,
             model_exp=model_exp,
             spec_config=spec_config,
+            flash_config=flash_config,
             flash_moe_config=flash_moe_config,
         )
         is_distributed = False

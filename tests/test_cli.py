@@ -1153,7 +1153,7 @@ class TestBuildParser:
                         # Per-model min crosses the (default) global max
                         # → ``resolved_flash()`` raises "inverted range".
                         "flash_min_active_neurons": 1_000_000,
-                        "experimental": {"flash_moe": True},
+                        "flash_moe": True,
                     },
                 }
             )

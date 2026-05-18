@@ -867,8 +867,8 @@ class TestFileHandleLeak:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
-                distributed_worker_shard_dir="",
                 flash_moe=False,
+                distributed_worker_shard_dir="",
             ),
         )
         monkeypatch.setattr(
@@ -1050,8 +1050,8 @@ class TestSSHFailureDetection:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
-                distributed_worker_shard_dir="",
                 flash_moe=False,
+                distributed_worker_shard_dir="",
             ),
         )
         monkeypatch.setattr(
@@ -1149,8 +1149,8 @@ class TestLogFileHandleLifetime:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
-                distributed_worker_shard_dir="",
                 flash_moe=False,
+                distributed_worker_shard_dir="",
             ),
         )
         monkeypatch.setattr(
@@ -1248,8 +1248,8 @@ class TestRingHostfileGeneration:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
-                distributed_worker_shard_dir="",
                 flash_moe=False,
+                distributed_worker_shard_dir="",
             ),
         )
         monkeypatch.setattr(
@@ -1309,8 +1309,8 @@ class TestRingHostfileGeneration:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
-                distributed_worker_shard_dir="",
                 flash_moe=False,
+                distributed_worker_shard_dir="",
             ),
         )
         monkeypatch.setattr(
@@ -1495,8 +1495,8 @@ class TestSSHCommandConstruction:
                 distributed_remote_working_dir="~/Documents/olmlx_distributed",
                 distributed_remote_python="uv run python",
                 distributed_pre_shard=False,
-                distributed_worker_shard_dir="",
                 flash_moe=False,
+                distributed_worker_shard_dir="",
             ),
         )
         monkeypatch.setattr(
@@ -1550,8 +1550,8 @@ class TestSSHCommandConstruction:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
-                distributed_worker_shard_dir="",
                 flash_moe=False,
+                distributed_worker_shard_dir="",
             ),
         )
         monkeypatch.setattr(
@@ -1604,8 +1604,8 @@ class TestSSHCommandConstruction:
                 distributed_remote_working_dir="",
                 distributed_remote_python="python",
                 distributed_pre_shard=False,
-                distributed_worker_shard_dir="",
                 flash_moe=False,
+                distributed_worker_shard_dir="",
             ),
         )
         monkeypatch.setattr(
