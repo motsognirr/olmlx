@@ -721,6 +721,55 @@ def _apply_serve_overrides(args) -> None:
         )
         sys.exit(1)
 
+    _warn_per_model_flash_in_distributed()
+
+
+def _warn_per_model_flash_in_distributed() -> None:
+    """Warn when distributed mode is enabled and any models.json entry
+    has per-model Flash configuration.
+
+    The distributed worker path reads Flash settings from ``settings.*``
+    (global) — ``_launch_distributed_workers`` forwards globals and
+    ``worker_main`` consults them. The registry isn't loaded on
+    workers, so per-model overrides for the five promoted Flash fields
+    are silently ignored under distributed. This is a documented
+    limitation (CLAUDE.md "Distributed caveat"); the warning surfaces
+    it at startup so users notice before debugging "why is flash off
+    on rank 1".
+    """
+    if not settings.distributed:
+        return
+    try:
+        from olmlx.engine.registry import ModelRegistry
+
+        registry = ModelRegistry()
+        registry.load()
+    except Exception as exc:
+        logger.debug("Skipping per-model flash + distributed audit: %s", exc)
+        return
+    flash_fields = (
+        "flash",
+        "flash_sparsity_threshold",
+        "flash_min_active_neurons",
+        "flash_max_active_neurons",
+        "flash_memory_budget_fraction",
+    )
+    affected: list[str] = []
+    for name, mc in registry.list_models().items():
+        if any(getattr(mc, field, None) is not None for field in flash_fields):
+            affected.append(name)
+    if affected:
+        logger.warning(
+            "Distributed mode is enabled and the following models.json "
+            "entries have per-model Flash configuration: %s. Per-model "
+            "Flash overrides are honoured only in single-node mode; the "
+            "distributed worker path uses the global OLMLX_FLASH* "
+            "settings. Set the desired Flash values globally (env var "
+            "or --flash on `olmlx serve`) for these models to take "
+            "effect under distributed.",
+            ", ".join(affected),
+        )
+
 
 def _models_with_promoted_keys_in_experimental() -> list[str]:
     """Return models.json entry names whose ``experimental`` block still

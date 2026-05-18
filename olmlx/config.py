@@ -323,6 +323,14 @@ def surface_legacy_flash_env() -> None:
         legacy_val = os.environ.get(legacy)
         if legacy_val is None:
             continue
+        # ``os.environ`` only — pydantic-settings reads ``.env`` directly
+        # into the model fields without writing to the shell env, so a
+        # ``.env`` line like ``OLMLX_FLASH=false`` (explicit default)
+        # combined with a legacy shell var would slip past this guard.
+        # The ``getattr != field_default`` check below catches the
+        # non-default case; the only remaining blind spot is a ``.env``
+        # value identical to the schema default. Acceptable during the
+        # one-release deprecation window.
         if os.environ.get(new) is not None:
             continue
         field_default = Settings.model_fields[attr].default
@@ -351,12 +359,48 @@ def surface_legacy_flash_env() -> None:
     if not pending:
         return
 
-    # Apply first; banner names only the vars that actually landed in
-    # Settings. A legacy value rejected by a cross-field Pydantic
-    # validator (e.g. an inverted min/max neuron range built from a
-    # legacy pair) should not be listed as "rename this" — the legacy
-    # value was never honoured, so renaming it would just hit the same
-    # validator again.
+    # Pre-validate cross-field constraints across the *pending* set
+    # before any setattr lands. Without this, an inverted legacy
+    # min/max pair would apply min successfully (max still ``None``
+    # passes the validator) and then reject max — leaving the user
+    # with a high min and no max cap at all, the opposite of the
+    # ceiling they tried to set. Today the only cross-field check on
+    # the promoted knobs is the neuron-range pair, so handle it
+    # explicitly here; add more cases if new cross-field validators
+    # land on these fields.
+    pending_attrs = {attr: value for _, _, attr, value in pending}
+    pending_min = pending_attrs.get("flash_min_active_neurons")
+    pending_max = pending_attrs.get("flash_max_active_neurons")
+    if (
+        pending_min is not None
+        and pending_max is not None
+        and pending_min > pending_max
+    ):
+        logger.warning(
+            "Refusing to forward legacy flash neuron-range pair "
+            "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS=%r + "
+            "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS=%r: min > max. "
+            "Both legacy values are dropped (applying only one would "
+            "leave the other unset and silently remove the user's "
+            "intended bound). Rename to OLMLX_FLASH_MIN_ACTIVE_NEURONS "
+            "and OLMLX_FLASH_MAX_ACTIVE_NEURONS with a consistent pair.",
+            pending_min,
+            pending_max,
+        )
+        pending = [
+            (legacy, new, attr, value)
+            for legacy, new, attr, value in pending
+            if attr not in ("flash_min_active_neurons", "flash_max_active_neurons")
+        ]
+        if not pending:
+            return
+
+    # Apply each pending value; banner names only the vars that
+    # actually landed in Settings. A legacy value rejected by a
+    # single-field Pydantic validator (e.g. ``Field(gt=0)``) should
+    # not be listed as "rename this" — the legacy value was never
+    # honoured, so renaming it would just hit the same validator
+    # again.
     applied: list[str] = []
     for legacy, new, attr, value in pending:
         try:

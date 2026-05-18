@@ -1003,6 +1003,58 @@ class TestBuildParser:
         assert dflash_moe == ["moe-dflash/m:latest"]
         assert global_used is False
 
+    def test_warn_per_model_flash_in_distributed_fires(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A per-model ``flash: true`` in models.json under distributed
+        mode logs a warning at startup (the worker path ignores per-model
+        Flash because the registry isn't loaded on workers)."""
+        import logging
+
+        from olmlx.cli import _warn_per_model_flash_in_distributed
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "qwen/m:latest": {
+                        "hf_path": "qwen/m",
+                        "flash": True,
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "distributed", True)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _warn_per_model_flash_in_distributed()
+
+        assert "per-model Flash" in caplog.text
+        assert "qwen/m:latest" in caplog.text
+
+    def test_warn_per_model_flash_silent_without_distributed(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """No warning when distributed is off, even with per-model flash set."""
+        import logging
+
+        from olmlx.cli import _warn_per_model_flash_in_distributed
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps({"qwen/m:latest": {"hf_path": "qwen/m", "flash": True}})
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "distributed", False)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _warn_per_model_flash_in_distributed()
+
+        assert "per-model Flash" not in caplog.text
+
     def test_audit_moe_check_survives_flash_resolution_failure(
         self, monkeypatch, tmp_path
     ):
@@ -1330,55 +1382,50 @@ class TestBuildParser:
         _surface_legacy_flash_env()
         assert _settings.flash == before
 
-    def test_legacy_flash_rejected_value_not_in_banner(self, monkeypatch, caplog):
-        """An inverted min/max legacy pair triggers the cross-field Pydantic
-        validator on the second setattr. The deprecation banner must name
-        only the vars that actually landed in Settings — listing a
-        rejected var as "rename this" would be misleading because the
-        rename would hit the same validator."""
+    def test_legacy_flash_inverted_neuron_range_drops_both(self, monkeypatch, caplog):
+        """An inverted legacy min/max pair is detected before any setattr,
+        so *both* legacy values are dropped — applying only one would
+        leave the other at its default and silently remove the user's
+        intended ceiling/floor. Verified end-state: Settings retains
+        defaults for both fields."""
         import logging
 
         from olmlx.cli import _surface_legacy_flash_env
         from olmlx.config import Settings, settings as _settings
 
         defaults = Settings.model_fields
-        # Reset live Settings so the shim sees the field defaults.
         monkeypatch.setattr(_settings, "flash", defaults["flash"].default)
-        monkeypatch.setattr(
-            _settings,
-            "flash_min_active_neurons",
-            defaults["flash_min_active_neurons"].default,
-        )
-        monkeypatch.setattr(
-            _settings,
-            "flash_max_active_neurons",
-            defaults["flash_max_active_neurons"].default,
-        )
+        default_min = defaults["flash_min_active_neurons"].default
+        default_max = defaults["flash_max_active_neurons"].default
+        monkeypatch.setattr(_settings, "flash_min_active_neurons", default_min)
+        monkeypatch.setattr(_settings, "flash_max_active_neurons", default_max)
         for new_name in (
             "OLMLX_FLASH",
             "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
             "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
         ):
             monkeypatch.delenv(new_name, raising=False)
-        # Inverted pair: min=200 > max=100. The first setattr lands
-        # (min=200, max still None), the second is rejected by the
-        # cross-field validator.
+        # Inverted pair: min=200 > max=100.
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS", "200")
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS", "100")
 
         with caplog.at_level(logging.WARNING, logger="olmlx.config"):
             _surface_legacy_flash_env()
 
-        # The rejected var is logged via the per-field "Could not
-        # forward" warning, but it must NOT appear in the bulk banner.
-        assert "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS" in caplog.text
-        if "Deprecated env vars detected" in caplog.text:
-            banner_line = next(
-                line
-                for line in caplog.text.splitlines()
-                if "Deprecated env vars detected" in line
-            )
-            assert "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS" not in banner_line
+        # Neither value was applied — Settings retains its defaults.
+        assert _settings.flash_min_active_neurons == default_min
+        assert _settings.flash_max_active_neurons == default_max
+        # A specific warning explains why both were dropped.
+        assert "min > max" in caplog.text
+        # Neither legacy var appears in the bulk migration banner.
+        banner_lines = [
+            line
+            for line in caplog.text.splitlines()
+            if "Deprecated env vars detected" in line
+        ]
+        for line in banner_lines:
+            assert "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS" not in line
+            assert "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS" not in line
 
     def test_legacy_flash_false_value_does_not_warn(self, monkeypatch, caplog):
         """``OLMLX_EXPERIMENTAL_FLASH=false`` parses to the schema default
