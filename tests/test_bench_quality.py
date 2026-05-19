@@ -138,6 +138,16 @@ class TestGradeRegexMatch:
         r = grade_regex_match("x", {"pattern": "", "answer": "y"})
         assert r.passed is None
 
+    def test_default_group_matches_whole_pattern(self):
+        # No explicit group → default 0 → compare the entire match.
+        # Previously defaulted to 1 and would fail confusingly on
+        # patterns without a capture group.
+        r = grade_regex_match(
+            "Final score: 42",
+            {"pattern": r"Final score: 42", "answer": "Final score: 42"},
+        )
+        assert r.passed is True
+
 
 class TestGradeNumeric:
     def test_gsm8k_hash_form(self):

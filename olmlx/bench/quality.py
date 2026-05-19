@@ -117,7 +117,11 @@ def grade_regex_match(output: str, expected: dict[str, Any]) -> QualityResult:
             score=None,
             detail="no pattern specified",
         )
-    group = int(expected.get("group", 1))
+    # Default to group 0 (the whole match) so a pattern without an
+    # explicit capture group still produces a useful comparison. Callers
+    # that need a substring extraction pass `"group": 1` (or higher)
+    # explicitly — MMLU does.
+    group = int(expected.get("group", 0))
     answer = str(expected.get("answer", ""))
     try:
         m = re.search(pattern, output, flags=re.DOTALL)
@@ -245,11 +249,23 @@ def _code_exec_disabled(reason: str) -> QualityResult:
 
 
 def _code_exec_preexec() -> None:  # pragma: no cover — POSIX child
+    # Locally import everything the child needs. preexec_fn runs in the
+    # forked-but-not-yet-exec'd child, so it inherits the parent's
+    # module namespace — but a local import keeps the function
+    # self-contained and obvious to read.
     import resource
+    import sys
 
     cpu = 5
     try:
         resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+    except (ValueError, OSError):
+        pass
+    # Cap output file size at 64 MB — generated code that tries to fill
+    # the disk gets SIGXFSZ instead of running unbounded. 64 MB is
+    # comfortably above any legitimate test output.
+    try:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
     except (ValueError, OSError):
         pass
     # RLIMIT_AS limits the *virtual* address space, not resident memory.
@@ -263,6 +279,15 @@ def _code_exec_preexec() -> None:  # pragma: no cover — POSIX child
         mem = 512 * 1024 * 1024
         try:
             resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+        except (ValueError, OSError):
+            pass
+        # Defense against fork bombs in graded code. (0, 0) bars the
+        # child from creating any more processes. Linux-only: macOS
+        # does not honor RLIMIT_NPROC the same way and the python
+        # subprocess we just spawned already exists, so this caps the
+        # *graded code* itself, not the wrapper.
+        try:
+            resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
         except (ValueError, OSError):
             pass
 
