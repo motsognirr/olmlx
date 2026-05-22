@@ -77,6 +77,7 @@ def _start_server(attempts: int = 3) -> tuple[subprocess.Popen, int]:
                 proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                proc.wait(timeout=5)  # reap so a retried attempt leaves no zombie
     raise SystemExit(
         f"server failed to start after {attempts} attempts (exit={last_exit})"
     )
@@ -147,7 +148,10 @@ def main() -> None:
     # or unwritable destination doesn't surface only after the first _save().
     out_path = Path(args.out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.touch(exist_ok=True)
+    # Writability probe in append mode: raises PermissionError for a bad path
+    # before the slow model load, without truncating an existing result file.
+    with open(out_path, "a"):
+        pass
 
     def _save(results: list[dict]) -> None:
         with open(out_path, "w") as f:
@@ -204,6 +208,7 @@ def main() -> None:
                 proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                proc.wait(timeout=5)
         if results:
             print(f"\nsaved {args.out_path} ({len(results)} results)", file=sys.stderr)
 

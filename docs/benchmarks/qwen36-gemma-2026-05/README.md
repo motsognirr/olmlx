@@ -107,6 +107,12 @@ not directly comparable to the dense plain-decode rows. gpt-oss-120b (115 GB on 
   reuse is unaffected and grading runs one prompt at a time regardless.
 - **code_exec** runs model-generated Python in a subprocess with rlimits
   (opt-in). Acceptable for a single-user local tool.
+- **KV-quant determinism**: `temperature=0`/`seed=42` is deterministic for a
+  fixed model/quant/kv-cache combination, but `turboquant:4` adds KV-cache
+  quantization noise that varies with sequence length. At mini-set sizes this
+  is not load-bearing; for a future full-split sweep, borderline answers could
+  flip on a marginal floating-point accumulation — run such sweeps with an
+  unquantized KV cache if exact reproducibility across lengths matters.
 
 ## Reproducing
 
