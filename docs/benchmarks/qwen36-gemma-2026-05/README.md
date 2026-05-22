@@ -82,12 +82,15 @@ the 6bit is speed-only (same class, quality not separately graded).
 The 4bit is ~1.3× the 6bit's throughput. **Classic speculative *slows both
 down* ~35%**: the target already activates only ~3B params and runs at
 67–87 tok/s, so the draft-forward + verify overhead per step exceeds the
-savings. (No same-version draft exists — Qwen3.6 ships only at 27B and
-35B-A3B — so a cross-version Qwen3.5-0.8B draft was used; its likely-mediocre
-acceptance compounds the loss, but the structural point holds regardless.)
-This is the mirror image of the CLAUDE.md result where classic *helped* the
-slower Qwen3.5-27B target (1.33–1.92×): speculation pays off on
-bandwidth-bound dense targets, not on already-fast A3B MoEs.
+savings. Acceptance was actually *decent* — **~55%** on a reasoning prompt
+(avg 3.19 of λ=4 tokens accepted per step, EMA ~0.71) with the cross-version
+Qwen3.5-0.8B draft — yet it still ran net-slower. That's the key point: this
+isn't a "bad draft" near-miss that a same-version draft would flip; even at
+55% acceptance the A3B target is fast enough that per-step overhead dominates.
+(No same-version draft exists — Qwen3.6 ships only at 27B and 35B-A3B.) Mirror
+image of the CLAUDE.md result where classic *helped* the slower Qwen3.5-27B
+target (~82% acceptance, 1.33–1.92×): speculation pays off on bandwidth-bound
+dense targets, not on already-fast A3B MoEs.
 
 ## Findings
 
@@ -126,9 +129,10 @@ bandwidth-bound dense targets, not on already-fast A3B MoEs.
   scored 42/50 at the 1024 cap (GSM8K 14/20); all 8 misses were unfinished
   reasoning and every one passed at 2048. Its `<think>` block can't be turned
   off over `/api/chat` — the template honors `enable_thinking=False`, but only
-  the Anthropic `/v1/messages` route wires that switch. So for verbose reasoning
-  models the practical options are a higher cap (used here: 2048) or grading via
-  the Anthropic route with thinking disabled. "Generous default" is model-relative.
+  the Anthropic `/v1/messages` route wires that switch (tracked in issue #334).
+  So for verbose reasoning models the practical options are a higher cap (used
+  here: 2048) or grading via the Anthropic route with thinking disabled.
+  "Generous default" is model-relative.
 
 ## Caveats
 

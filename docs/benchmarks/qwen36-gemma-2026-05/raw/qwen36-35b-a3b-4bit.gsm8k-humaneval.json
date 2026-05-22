@@ -1,5 +1,6 @@
 {
   "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+  "max_tokens": 2048,
   "results": [
     {
       "set": "gsm8k",
