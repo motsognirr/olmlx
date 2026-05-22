@@ -52,10 +52,14 @@ not directly comparable to the dense plain-decode rows. gpt-oss-120b (115 GB on 
 reasoning model whose `<think>` block can't be disabled over `/api/chat` (the
 template's `enable_thinking=False` switch is only wired into the Anthropic
 `/v1/messages` route), so at 1024 it scored a truncation-contaminated 42/50
-(GSM8K 14/20) — all 8 misses were unfinished reasoning, and every one flips to
-PASS at 2048. The 50/50 is its true score; the lower cap just measured
-verbosity. Both runs are archived for comparison: `raw/qwen36-35b-a3b-4bit-1024.*`
-(42/50) vs `raw/qwen36-35b-a3b-4bit.*` (50/50). See "Lessons".
+(GSM8K 14/20). All 8 misses stem from truncated `<think>` blocks but show three
+grader outcomes: 5 are wrong intermediate values the grader pulled from the
+incomplete chain-of-thought (e.g. `extracted=3.0` for an answer of 540), 2 are
+no-match (no answer pattern reached before the cap), and 1 is a SyntaxError from
+truncated code. Every one flips to PASS at 2048, so the 50/50 is its true score;
+the lower cap just measured verbosity. Both runs are archived for comparison:
+`raw/qwen36-35b-a3b-4bit-1024.*` (42/50) vs `raw/qwen36-35b-a3b-4bit.*` (50/50).
+See "Lessons".
 
 ### Qwen3.6-27B: 8bit → 4bit quant
 
@@ -72,7 +76,10 @@ verbosity. Both runs are archived for comparison: `raw/qwen36-35b-a3b-4bit-1024.
 
 A3B MoE (`qwen3_5_moe`, 256 experts, ~3B active), in-RAM plain decode,
 `turboquant:4`. The 4bit is graded in the main table (50/50 at a 2048 cap);
-the 6bit is speed-only (same class, quality not separately graded).
+the 6bit is speed-only (same class, quality not separately graded). Speed
+figures are single `olmlx bench run` measurements (the 7-prompt suite,
+`--scenarios turboquant-4` / `speculative`, seed=42) — spot numbers, not
+multi-run averages; the acceptance breakdown below is from one reasoning prompt.
 
 | | 4bit | 6bit |
 |---|---:|---:|
@@ -129,8 +136,9 @@ dense targets, not on already-fast A3B MoEs.
 - **Verbosity differs by model**, so a fixed cap silently penalizes the more
   verbose ones — a fairness problem, not just a measurement one.
 - **The artifact recurred at 1024 on the most verbose model.** Qwen3.6-35B-A3B
-  scored 42/50 at the 1024 cap (GSM8K 14/20); all 8 misses were unfinished
-  reasoning and every one passed at 2048. Its `<think>` block can't be turned
+  scored 42/50 at the 1024 cap (GSM8K 14/20); all 8 misses trace to truncated
+  `<think>` blocks (5 wrong intermediate values extracted, 2 no-match, 1
+  SyntaxError) and every one passed at 2048. Its `<think>` block can't be turned
   off over `/api/chat` — the template honors `enable_thinking=False`, but only
   the Anthropic `/v1/messages` route wires that switch (tracked in issue #334).
   So for verbose reasoning models the practical options are a higher cap (used
