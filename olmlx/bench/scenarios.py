@@ -80,6 +80,19 @@ def _requires_flash_moe(model_path: Path) -> str | None:
     return None
 
 
+def _requires_flash_and_speculative_draft(model_path: Path) -> str | None:
+    """Skip flash+spec unless Flash is prepared AND a draft model is set."""
+    reason = _requires_flash(model_path)
+    if reason is not None:
+        return reason
+    if not os.environ.get("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL"):
+        return (
+            "Set OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL to a draft model HF path "
+            "to run this scenario"
+        )
+    return None
+
+
 def _requires_speculative_draft(_model_path: Path) -> str | None:
     """Skip if no draft model is configured for speculative decoding.
 
@@ -205,6 +218,21 @@ SCENARIOS: list[Scenario] = [
         ),
         env_overrides={"OLMLX_SPECULATIVE": "true"},
         should_skip=_requires_speculative_draft,
+    ),
+    Scenario(
+        name="flash+prefetch",
+        description="Flash inference + speculative neuron prefetch",
+        env_overrides={"OLMLX_FLASH": "true", "OLMLX_FLASH_PREFETCH": "true"},
+        should_skip=_requires_flash,
+    ),
+    Scenario(
+        name="flash+spec",
+        description=(
+            "Flash inference + speculative decoding "
+            "(set OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL to a draft model HF path)"
+        ),
+        env_overrides={"OLMLX_FLASH": "true", "OLMLX_FLASH_SPECULATIVE": "true"},
+        should_skip=_requires_flash_and_speculative_draft,
     ),
     Scenario(
         name="flash-moe",

@@ -4,7 +4,12 @@ import json
 
 import pytest
 
-from olmlx.bench.scenarios import SCENARIOS, Scenario, get_scenarios
+from olmlx.bench.scenarios import (
+    SCENARIOS,
+    Scenario,
+    _requires_flash_and_speculative_draft,
+    get_scenarios,
+)
 
 
 class TestScenario:
@@ -23,7 +28,7 @@ class TestScenario:
 
 class TestScenariosList:
     def test_has_scenarios(self):
-        assert len(SCENARIOS) >= 11  # 9 standard + 2 distributed
+        assert len(SCENARIOS) >= 16  # 14 standard + 2 distributed
 
     def test_all_have_required_fields(self):
         for s in SCENARIOS:
@@ -45,6 +50,22 @@ class TestScenariosList:
         baseline = [s for s in SCENARIOS if s.name == "baseline"]
         assert len(baseline) == 1
         assert baseline[0].env_overrides == {}
+
+    def test_flash_prefetch_and_speculative_scenarios_present(self):
+        names = {s.name for s in SCENARIOS}
+        assert "flash+prefetch" in names
+        assert "flash+spec" in names
+
+        by_name = {s.name: s for s in SCENARIOS}
+        assert by_name["flash+prefetch"].env_overrides.get("OLMLX_FLASH") == "true"
+        assert (
+            by_name["flash+prefetch"].env_overrides.get("OLMLX_FLASH_PREFETCH")
+            == "true"
+        )
+        assert by_name["flash+spec"].env_overrides.get("OLMLX_FLASH") == "true"
+        assert (
+            by_name["flash+spec"].env_overrides.get("OLMLX_FLASH_SPECULATIVE") == "true"
+        )
 
 
 class TestGetScenarios:
@@ -131,6 +152,33 @@ class TestSkipChecks:
         (tmp_path / "config.json").write_text("not json")
         moe = get_scenarios(["flash-moe"])[0]
         assert moe.should_skip(tmp_path)
+
+    def test_flash_and_spec_skips_without_flash_layout(self, tmp_path, monkeypatch):
+        """No flash_layout.json — should skip (flash not prepared)."""
+        monkeypatch.delenv("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL", raising=False)
+        reason = _requires_flash_and_speculative_draft(tmp_path)
+        assert reason is not None
+        assert "flash" in reason.lower()
+
+    def test_flash_and_spec_skips_without_draft_model(self, tmp_path, monkeypatch):
+        """Flash is prepared but draft model env var is unset — should skip."""
+        flash_dir = tmp_path / "flash"
+        flash_dir.mkdir()
+        (flash_dir / "flash_layout.json").write_text("{}")
+        monkeypatch.delenv("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL", raising=False)
+        reason = _requires_flash_and_speculative_draft(tmp_path)
+        assert reason is not None
+        assert "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL" in reason
+
+    def test_flash_and_spec_runs_with_layout_and_draft_model(
+        self, tmp_path, monkeypatch
+    ):
+        """Flash is prepared and draft model env var is set — should not skip."""
+        flash_dir = tmp_path / "flash"
+        flash_dir.mkdir()
+        (flash_dir / "flash_layout.json").write_text("{}")
+        monkeypatch.setenv("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL", "some/draft-model")
+        assert _requires_flash_and_speculative_draft(tmp_path) is None
 
 
 class TestDistributedScenarios:
