@@ -1575,6 +1575,43 @@ class TestGenerateCompletion:
         assert prompt_arg == "vlm formatted prompt"
 
     @pytest.mark.asyncio
+    async def test_vlm_generate_default_forwards_thinking_off(self, mock_manager):
+        """/api/generate is off-by-default uniformly: a VLM call with `think`
+        omitted forwards enable_thinking=False (the coerced default) to the VLM
+        template — not None — so the explicit instruction matches the
+        thinking_expected signal the router consumes."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference._full_completion",
+                    new_callable=AsyncMock,
+                    return_value={"text": "Hi", "done": True},
+                ):
+                    result = await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=True,
+                        # enable_thinking omitted -> None -> coerced to False
+                    )
+
+        assert (
+            mock_mlx_vlm.apply_chat_template.call_args.kwargs["enable_thinking"]
+            is False
+        )
+        # ...and the surfaced signal agrees.
+        assert result["thinking_expected"] is False
+
+    @pytest.mark.asyncio
     async def test_apply_chat_template_vlm_with_system(self, mock_manager):
         """VLM models include system message in chat template."""
         mock_mx = MagicMock()

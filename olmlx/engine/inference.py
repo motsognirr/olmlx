@@ -1799,6 +1799,12 @@ async def generate_completion(
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         try:
+            # Forward the *coerced* effective_thinking (not raw enable_thinking)
+            # so VLM /api/generate is off-by-default like the text path, and so
+            # the explicit instruction matches the thinking_expected signal
+            # computed below.  We deliberately don't defer to the VLM template's
+            # own default: we can't introspect it, so passing an explicit bool
+            # is the only way to keep the thinking-splitter consistent.
             prompt = _apply_chat_template_vlm(
                 lm.tokenizer, lm.model, messages, enable_thinking=effective_thinking
             )

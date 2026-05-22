@@ -132,12 +132,13 @@ class TestResolveOpenAIThink:
         # An empty string is not a real effort value; truthiness, not is-not-None.
         assert resolve_openai_think("", None) is None
 
-    def test_disable_word_reasoning_effort_does_not_enable(self):
-        # Out-of-spec but likely-mistake values meaning "off" must not enable.
-        assert resolve_openai_think("none", None) is None
-        assert resolve_openai_think("off", None) is None
-        assert resolve_openai_think("disabled", None) is None
-        assert resolve_openai_think("NONE", None) is None
+    def test_disable_word_reasoning_effort_returns_false(self):
+        # Out-of-spec but likely-mistake "off" values must DISABLE thinking
+        # (return False), not fall through to None (engine default = think).
+        assert resolve_openai_think("none", None) is False
+        assert resolve_openai_think("off", None) is False
+        assert resolve_openai_think("disabled", None) is False
+        assert resolve_openai_think("NONE", None) is False
 
     def test_chat_template_kwargs_enable_thinking_true(self):
         assert resolve_openai_think(None, {"enable_thinking": True}) is True

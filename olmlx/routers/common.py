@@ -39,16 +39,14 @@ def resolve_openai_think(
     """
     if chat_template_kwargs and "enable_thinking" in chat_template_kwargs:
         return bool(chat_template_kwargs["enable_thinking"])
-    # Per the design's "presence -> on" framing: any real reasoning_effort
-    # enables thinking.  OpenAI defines only "low"/"medium"/"high", but guard
-    # the likely-mistake disable words ("none"/"off"/"disabled") so a client
-    # sending them isn't silently inverted to *on*.  (The authoritative OFF
-    # switch remains chat_template_kwargs.enable_thinking=false.)
-    if reasoning_effort and reasoning_effort.strip().lower() not in (
-        "none",
-        "off",
-        "disabled",
-    ):
+    if reasoning_effort:
+        # OpenAI defines only "low"/"medium"/"high" (presence -> on).  Map the
+        # likely-mistake disable words to an explicit OFF (False) rather than
+        # None: returning None would fall through to the engine default
+        # ("think unless tools"), silently inverting a caller who sent
+        # reasoning_effort="none" expecting thinking off.
+        if reasoning_effort.strip().lower() in ("none", "off", "disabled"):
+            return False
         return True
     return None
 
