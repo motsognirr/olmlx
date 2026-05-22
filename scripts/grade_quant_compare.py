@@ -22,7 +22,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
+from olmlx.bench.prompts import BenchPrompt
 from olmlx.bench.quality import grade
 from olmlx.bench.task_prompts import PROMPT_SETS
 
@@ -80,7 +82,9 @@ def _start_server(attempts: int = 3) -> tuple[subprocess.Popen, int]:
     )
 
 
-def _chat(port: int, model: str, prompt, max_tokens: int | None = None) -> str:
+def _chat(
+    port: int, model: str, prompt: BenchPrompt, max_tokens: int | None = None
+) -> str:
     body = {
         "model": model,
         "stream": False,
@@ -88,7 +92,7 @@ def _chat(port: int, model: str, prompt, max_tokens: int | None = None) -> str:
         "options": {
             "seed": 42,
             "temperature": 0.0,
-            "num_predict": max_tokens or prompt.max_tokens,
+            "num_predict": max_tokens if max_tokens is not None else prompt.max_tokens,
         },
     }
     req = urllib.request.Request(
@@ -113,9 +117,9 @@ def main() -> None:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=None,
+        default=1024,  # low per-prompt defaults (MMLU 128) truncate reasoning models
         dest="max_tokens",
-        help="Override num_predict for every prompt",
+        help="num_predict for every prompt (default: 1024)",
     )
     args = parser.parse_args()
     set_names = args.sets.split(",")
@@ -125,18 +129,32 @@ def main() -> None:
             f"valid: {', '.join(sorted(PROMPT_SETS))}"
         )
 
+    # Fail fast on a bad output path before the (slow) model load, so a typo'd
+    # or unwritable destination doesn't surface only after the first _save().
+    out_path = Path(args.out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.touch(exist_ok=True)
+
     def _save(results: list[dict]) -> None:
-        with open(args.out_path, "w") as f:
+        with open(out_path, "w") as f:
             json.dump({"model": args.model, "results": results}, f, indent=2)
 
     proc, port = _start_server()
     results: list[dict] = []
+    code_exec_announced = False
     try:
         for set_name in set_names:
             for p in PROMPT_SETS[set_name]:
                 expected = dict(p.expected)
                 if p.grader == "code_exec":
                     expected["_enabled"] = True
+                    if not code_exec_announced:
+                        print(
+                            "  [INFO] code_exec enabled — model-generated Python "
+                            "will run in a sandboxed subprocess",
+                            file=sys.stderr,
+                        )
+                        code_exec_announced = True
                 try:
                     out = _chat(port, args.model, p, args.max_tokens)
                     q = grade(p.grader, out, expected)
