@@ -83,7 +83,11 @@ def _start_server(attempts: int = 3) -> tuple[subprocess.Popen, int]:
 
 
 def _chat(
-    port: int, model: str, prompt: BenchPrompt, max_tokens: int | None = None
+    port: int,
+    model: str,
+    prompt: BenchPrompt,
+    max_tokens: int | None = None,
+    timeout: float = 1800,
 ) -> str:
     body = {
         "model": model,
@@ -101,7 +105,9 @@ def _chat(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=600) as r:
+    # stream=False means the socket is silent during the whole load+decode
+    # window, so this is effectively a wall-clock budget for one request.
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode()).get("message", {}).get("content", "")
 
 
@@ -121,6 +127,14 @@ def main() -> None:
         dest="max_tokens",
         help="num_predict for every prompt (default: 1024)",
     )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=1800,
+        dest="request_timeout",
+        help="per-request wall-clock budget in seconds; raise for slow cold "
+        "loads of large models (default: 1800)",
+    )
     args = parser.parse_args()
     set_names = args.sets.split(",")
     if unknown := set(set_names) - PROMPT_SETS.keys():
@@ -138,6 +152,7 @@ def main() -> None:
     def _save(results: list[dict]) -> None:
         with open(out_path, "w") as f:
             json.dump({"model": args.model, "results": results}, f, indent=2)
+            f.write("\n")
 
     proc, port = _start_server()
     results: list[dict] = []
@@ -156,7 +171,9 @@ def main() -> None:
                         )
                         code_exec_announced = True
                 try:
-                    out = _chat(port, args.model, p, args.max_tokens)
+                    out = _chat(
+                        port, args.model, p, args.max_tokens, args.request_timeout
+                    )
                     q = grade(p.grader, out, expected)
                     entry = {
                         "set": set_name,
@@ -174,7 +191,7 @@ def main() -> None:
                         "name": p.name,
                         "grader": p.grader,
                         "passed": None,
-                        "score": 0.0,
+                        "score": None,  # ungraded ≠ graded-wrong (quality.py convention)
                         "detail": f"request failed: {type(e).__name__}: {e}",
                     }
                     print(f"  [ERR ] {p.name}: {entry['detail']}", file=sys.stderr)
