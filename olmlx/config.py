@@ -499,16 +499,15 @@ _LEGACY_FLASH_MOE_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], ...
 )
 
 
-def _legacy_flash_moe_values_in_dotenv() -> dict[str, str]:
-    """Return ``{name: value}`` for any ``_DEPRECATED_FLASH_MOE_ENV_VARS``
-    found in the project ``.env`` file."""
+def _legacy_values_in_dotenv(names: tuple[str, ...]) -> dict[str, str]:
+    """Return ``{name: value}`` for any *names* found in the project ``.env`` file."""
     dotenv_path = Path(".env")
     try:
         text = dotenv_path.read_text()
     except (FileNotFoundError, OSError):
         return {}
     found: dict[str, str] = {}
-    legacy = set(_DEPRECATED_FLASH_MOE_ENV_VARS)
+    legacy = set(names)
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -545,7 +544,7 @@ def _forward_legacy_flash_moe_env(
     """Apply legacy flash_moe env var values to the new Settings when the
     new env var is unset."""
     if dotenv_values is None:
-        dotenv_values = _legacy_flash_moe_values_in_dotenv()
+        dotenv_values = _legacy_values_in_dotenv(_DEPRECATED_FLASH_MOE_ENV_VARS)
     for legacy, new, attr, parse in _LEGACY_FLASH_MOE_FORWARD:
         legacy_val = os.environ.get(legacy, dotenv_values.get(legacy))
         if legacy_val is None:
@@ -584,7 +583,7 @@ def surface_legacy_flash_moe_env() -> None:
     so the distributed-worker entry point can reuse it without importing
     ``olmlx.cli``.
     """
-    dotenv_values = _legacy_flash_moe_values_in_dotenv()
+    dotenv_values = _legacy_values_in_dotenv(_DEPRECATED_FLASH_MOE_ENV_VARS)
     shell_stale = [v for v in _DEPRECATED_FLASH_MOE_ENV_VARS if os.environ.get(v)]
     stale = sorted({*shell_stale, *dotenv_values.keys()})
     if stale:
@@ -595,6 +594,89 @@ def surface_legacy_flash_moe_env() -> None:
             ", ".join(stale),
         )
         _forward_legacy_flash_moe_env(settings, dotenv_values)
+
+
+_DEPRECATED_FLASH_PREFETCH_SPECULATIVE_ENV_VARS = (
+    "OLMLX_EXPERIMENTAL_FLASH_PREFETCH",
+    "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE",
+    "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL",
+    "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS",
+)
+
+_LEGACY_FLASH_PREFETCH_SPECULATIVE_FORWARD: tuple[
+    tuple[str, str, str, Callable[[str], Any]], ...
+] = (
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_PREFETCH",
+        "OLMLX_FLASH_PREFETCH",
+        "flash_prefetch",
+        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE",
+        "OLMLX_FLASH_SPECULATIVE",
+        "flash_speculative",
+        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL",
+        "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL",
+        "flash_speculative_draft_model",
+        str,
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS",
+        "OLMLX_FLASH_SPECULATIVE_TOKENS",
+        "flash_speculative_tokens",
+        int,
+    ),
+)
+
+
+def surface_legacy_flash_prefetch_speculative_env() -> None:
+    """Forward legacy ``OLMLX_EXPERIMENTAL_FLASH_PREFETCH`` /
+    ``OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE*`` to the promoted
+    ``OLMLX_FLASH_PREFETCH`` / ``OLMLX_FLASH_SPECULATIVE*`` names.
+
+    Same "new var wins, non-default not clobbered" semantics as
+    ``surface_legacy_flash_moe_env``. The four prefetch *tuning* env vars
+    keep the experimental prefix and pass through untouched. Lives in
+    ``olmlx.config`` so the distributed worker can reuse it without
+    importing argparse/uvicorn.
+    """
+    dotenv_values = _legacy_values_in_dotenv(
+        _DEPRECATED_FLASH_PREFETCH_SPECULATIVE_ENV_VARS
+    )
+    shell_stale = [
+        v for v in _DEPRECATED_FLASH_PREFETCH_SPECULATIVE_ENV_VARS if os.environ.get(v)
+    ]
+    stale = sorted({*shell_stale, *dotenv_values.keys()})
+    if not stale:
+        return
+    logger.warning(
+        "Deprecated env vars detected: %s. They will be honoured for this "
+        "release but should be renamed to OLMLX_FLASH_PREFETCH, "
+        "OLMLX_FLASH_SPECULATIVE, OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL, "
+        "OLMLX_FLASH_SPECULATIVE_TOKENS.",
+        ", ".join(stale),
+    )
+    for legacy, new, attr, parse in _LEGACY_FLASH_PREFETCH_SPECULATIVE_FORWARD:
+        legacy_val = os.environ.get(legacy, dotenv_values.get(legacy))
+        if legacy_val is None or os.environ.get(new) is not None:
+            continue
+        field_default = Settings.model_fields[attr].default
+        if getattr(settings, attr) != field_default:
+            continue
+        try:
+            setattr(settings, attr, parse(legacy_val))
+        except Exception as exc:
+            logger.warning(
+                "Could not forward legacy env var %s=%r to %s: %s",
+                legacy,
+                legacy_val,
+                new,
+                exc,
+            )
 
 
 def resolve_experimental(

@@ -185,6 +185,7 @@ def worker_main() -> None:
         settings as _settings_early,
         surface_legacy_flash_env,
         surface_legacy_flash_moe_env,
+        surface_legacy_flash_prefetch_speculative_env,
     )
 
     # Honour the one-release deprecation window for ``OLMLX_EXPERIMENTAL_FLASH*``
@@ -197,6 +198,7 @@ def worker_main() -> None:
     # (and its argparse/uvicorn baggage).
     surface_legacy_flash_env()
     surface_legacy_flash_moe_env()
+    surface_legacy_flash_prefetch_speculative_env()
 
     if _settings_early.flash_moe:
         logger.error(

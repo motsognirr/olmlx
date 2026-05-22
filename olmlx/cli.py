@@ -19,6 +19,7 @@ from olmlx.config import (
     settings,
     surface_legacy_flash_env as _surface_legacy_flash_env,
     surface_legacy_flash_moe_env as _surface_legacy_flash_moe_env,
+    surface_legacy_flash_prefetch_speculative_env as _surface_legacy_flash_prefetch_speculative_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -593,6 +594,7 @@ def _apply_serve_overrides(args) -> None:
     _surface_legacy_dflash_env()
     _surface_legacy_flash_env()
     _surface_legacy_flash_moe_env()
+    _surface_legacy_flash_prefetch_speculative_env()
 
     # ``getattr`` defends programmatic callers that hand a bare
     # ``argparse.Namespace`` (e.g. tests) without populating these
@@ -1773,6 +1775,7 @@ def cmd_chat(args):
     _surface_legacy_speculative_env()
     _surface_legacy_kv_cache_quant_env()
     _surface_legacy_flash_env()
+    _surface_legacy_flash_prefetch_speculative_env()
     _warn_kv_cache_quant_incompatibilities()
 
     model_name = args.model_name
@@ -2125,6 +2128,7 @@ def cmd_config_show(_args):
     _surface_legacy_kv_cache_quant_env()
     _surface_legacy_distributed_env()
     _surface_legacy_flash_env()
+    _surface_legacy_flash_prefetch_speculative_env()
 
     print(f"Host:                   {settings.host}")
     print(f"Port:                   {settings.port}")
@@ -2637,6 +2641,7 @@ def cmd_flash_info(args):
     # an operator would see from ``olmlx config show`` / ``olmlx serve``
     # when they've only renamed the new env vars in some shells.
     _surface_legacy_flash_env()
+    _surface_legacy_flash_prefetch_speculative_env()
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
     hf_path = _resolved.hf_path if _resolved is not None else args.model
