@@ -21,9 +21,10 @@ survey. Later additions extend the survey to the extremes of the size range:
   - **GSM8K** (20 problems) — `numeric` grader on the `#### N` final line.
   - **MMLU** (20 four-choice) — `regex_match` on the trailing `Answer: X`.
   - **HumanEval** (10 problems) — sandboxed `code_exec` (opt-in enabled).
-- **Token caps:** GSM8K/HumanEval @ **1024**, MMLU @ **1024**. The original
-  defaults (MMLU 128, GSM8K/HumanEval 512) truncated these verbose reasoning
-  models before they emitted the graded answer — see "Lessons" below.
+- **Token caps:** GSM8K/HumanEval @ **1024**, MMLU @ **1024** (**2048** for
+  Qwen3.6-35B-A3B — see footnote 2). The original defaults (MMLU 128,
+  GSM8K/HumanEval 512) truncated these verbose reasoning models before they
+  emitted the graded answer — see "Lessons" below.
 
 Driver script: [`scripts/grade_quant_compare.py`](../../../scripts/grade_quant_compare.py).
 Raw per-prompt grader output is under [`raw/`](./raw).
@@ -147,6 +148,12 @@ bandwidth-bound dense targets, not on already-fast A3B MoEs.
   RAM at 4-bit. As a hybrid SSM model its KV cache is not reused across requests
   (same `ArraysCache` exclusion as Qwen3.5/Qwen3-Next, issue #284); within-request
   reuse is unaffected and grading runs one prompt at a time regardless.
+- **Qwen3.6-35B-A3B (`qwen3_5_moe`) has the same cross-request KV-cache
+  exclusion.** Its config carries `layer_types` with 30 `linear_attention` + 10
+  `full_attention` layers (256 experts, top-8, ~3B active), so it falls under
+  the same `ArraysCache` issue #284 as Nemotron/Qwen3.5 — with
+  `OLMLX_PROMPT_CACHE=true` it silently gets no cross-request reuse. Within-request
+  reuse and these one-prompt-at-a-time grades are unaffected.
 - **code_exec** runs model-generated Python in a subprocess with rlimits
   (opt-in). Acceptable for a single-user local tool.
 - **KV-quant determinism**: `temperature=0`/`seed=42` is deterministic for a
@@ -168,4 +175,8 @@ olmlx bench run --model <hf-path> --scenarios flash-moe+tq4
 python scripts/grade_quant_compare.py <hf-path> out.json --sets gsm8k,humaneval --max-tokens 1024
 python scripts/grade_quant_compare.py <hf-path> out_mmlu.json --sets mmlu --max-tokens 1024
 # for gpt-oss-120b, prefix with OLMLX_FLASH_MOE=true OLMLX_KV_CACHE_QUANT=turboquant:4
+
+# Qwen3.6-35B-A3B is verbose — use --max-tokens 2048, or 1024 truncates <think>
+# before the answer line and yields 42/50 instead of the table's 50/50 (footnote 2):
+python scripts/grade_quant_compare.py mlx-community/Qwen3.6-35B-A3B-4bit out.json --sets gsm8k,humaneval,mmlu --max-tokens 2048
 ```
