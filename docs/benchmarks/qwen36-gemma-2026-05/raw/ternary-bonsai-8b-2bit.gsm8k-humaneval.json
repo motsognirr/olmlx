@@ -1,0 +1,245 @@
+{
+  "model": "prism-ml/Ternary-Bonsai-8B-mlx-2bit",
+  "results": [
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-01-janet-eggs",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=18.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-02-robe-bolts",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-03-weng-babysitting",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=10.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-04-betty-wallet",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=5.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-05-julie-book",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=42.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-06-james-sprints",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=540.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-07-ken-gift-box",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=16.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-08-alexis-shopping",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=41.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-09-tim-quiz",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=100.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-10-marcy-lipstick",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=16.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-11-farm-chickens",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=552.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-12-book-pages",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=7.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-13-john-cars",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=200.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-14-pizza-slices",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=25.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-15-bus-riders",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=20.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-16-savings",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=13.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-17-pencils",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=30.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-18-train-speed",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=160.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-19-apples",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=12.0"
+    },
+    {
+      "set": "gsm8k",
+      "name": "gsm8k-20-rectangle",
+      "grader": "numeric",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=60.0"
+    },
+    {
+      "set": "humaneval",
+      "name": "humaneval-01-add",
+      "grader": "code_exec",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed"
+    },
+    {
+      "set": "humaneval",
+      "name": "humaneval-02-strlen",
+      "grader": "code_exec",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed"
+    },
+    {
+      "set": "humaneval",
+      "name": "humaneval-03-flip-case",
+      "grader": "code_exec",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed"
+    },
+    {
+      "set": "humaneval",
+      "name": "humaneval-04-get-positive",
+      "grader": "code_exec",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed"
+    },
+    {
+      "set": "humaneval",
+      "name": "humaneval-05-is-palindrome",
+      "grader": "code_exec",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed"
+    },
+    {
+      "set": "humaneval",
+      "name": "humaneval-06-fibonacci",
+      "grader": "code_exec",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed"
+    },
+    {
+      "set": "humaneval",
+      "name": "humaneval-07-digit-sum",
+      "grader": "code_exec",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed"
+    },
+    {
+      "set": "humaneval",
+      "name": "humaneval-08-largest-divisor",
+      "grader": "code_exec",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed"
+    },
+    {
+      "set": "humaneval",
+      "name": "humaneval-09-max-element",
+      "grader": "code_exec",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed"
+    },
+    {
+      "set": "humaneval",
+      "name": "humaneval-10-count-vowels",
+      "grader": "code_exec",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed"
+    }
+  ]
+}
