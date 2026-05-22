@@ -1,5 +1,5 @@
 {
-  "model": "lmstudio-community/Devstral-Small-2505-MLX-6bit",
+  "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
   "max_tokens": 1024,
   "results": [
     {
@@ -22,9 +22,9 @@
       "set": "gsm8k",
       "name": "gsm8k-03-weng-babysitting",
       "grader": "numeric",
-      "passed": true,
-      "score": 1.0,
-      "detail": "extracted=10.0"
+      "passed": false,
+      "score": 0.0,
+      "detail": "no number found in output"
     },
     {
       "set": "gsm8k",
@@ -46,17 +46,17 @@
       "set": "gsm8k",
       "name": "gsm8k-06-james-sprints",
       "grader": "numeric",
-      "passed": true,
-      "score": 1.0,
-      "detail": "extracted=540.0"
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=3.0"
     },
     {
       "set": "gsm8k",
       "name": "gsm8k-07-ken-gift-box",
       "grader": "numeric",
-      "passed": true,
-      "score": 1.0,
-      "detail": "extracted=16.0"
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=3.0"
     },
     {
       "set": "gsm8k",
@@ -110,17 +110,17 @@
       "set": "gsm8k",
       "name": "gsm8k-14-pizza-slices",
       "grader": "numeric",
-      "passed": true,
-      "score": 1.0,
-      "detail": "extracted=25.0"
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=3.0"
     },
     {
       "set": "gsm8k",
       "name": "gsm8k-15-bus-riders",
       "grader": "numeric",
-      "passed": true,
-      "score": 1.0,
-      "detail": "extracted=20.0"
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=30.0"
     },
     {
       "set": "gsm8k",
@@ -150,9 +150,9 @@
       "set": "gsm8k",
       "name": "gsm8k-19-apples",
       "grader": "numeric",
-      "passed": true,
-      "score": 1.0,
-      "detail": "extracted=12.0"
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=48.0"
     },
     {
       "set": "gsm8k",
@@ -214,9 +214,9 @@
       "set": "humaneval",
       "name": "humaneval-07-digit-sum",
       "grader": "code_exec",
-      "passed": true,
-      "score": 1.0,
-      "detail": "tests passed"
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: invalid syntax"
     },
     {
       "set": "humaneval",

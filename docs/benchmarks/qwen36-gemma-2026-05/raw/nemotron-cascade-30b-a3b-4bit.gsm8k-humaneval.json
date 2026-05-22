@@ -1,5 +1,6 @@
 {
   "model": "mlx-community/Nemotron-Cascade-2-30B-A3B-4bit",
+  "max_tokens": 1024,
   "results": [
     {
       "set": "gsm8k",

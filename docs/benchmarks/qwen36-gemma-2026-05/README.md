@@ -54,7 +54,8 @@ template's `enable_thinking=False` switch is only wired into the Anthropic
 `/v1/messages` route), so at 1024 it scored a truncation-contaminated 42/50
 (GSM8K 14/20) — all 8 misses were unfinished reasoning, and every one flips to
 PASS at 2048. The 50/50 is its true score; the lower cap just measured
-verbosity. See "Lessons".
+verbosity. Both runs are archived for comparison: `raw/qwen36-35b-a3b-4bit-1024.*`
+(42/50) vs `raw/qwen36-35b-a3b-4bit.*` (50/50). See "Lessons".
 
 ### Qwen3.6-27B: 8bit → 4bit quant
 

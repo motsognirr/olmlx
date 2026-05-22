@@ -1,5 +1,6 @@
 {
   "model": "mlx-community/gemma-4-e2b-it-OptiQ-4bit",
+  "max_tokens": 1024,
   "results": [
     {
       "set": "mmlu",

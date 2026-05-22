@@ -1,5 +1,6 @@
 {
   "model": "unsloth/Qwen3.6-27B-MLX-8bit",
+  "max_tokens": 1024,
   "results": [
     {
       "set": "gsm8k",

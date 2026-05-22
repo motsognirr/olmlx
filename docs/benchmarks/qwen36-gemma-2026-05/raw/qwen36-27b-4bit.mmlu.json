@@ -1,5 +1,6 @@
 {
   "model": "mlx-community/Qwen3.6-27B-4bit",
+  "max_tokens": 1024,
   "results": [
     {
       "set": "mmlu",

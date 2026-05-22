@@ -1,5 +1,6 @@
 {
   "model": "lmstudio-community/Devstral-Small-2505-MLX-6bit",
+  "max_tokens": 1024,
   "results": [
     {
       "set": "mmlu",
