@@ -4,23 +4,29 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+# Likely-mistake strings that mean "thinking off".  Shared by both resolvers
+# so the Ollama `think` and OpenAI `reasoning_effort` routes agree (a client
+# sending "none" must never get thinking silently enabled on either).
+_DISABLE_WORDS = ("none", "off", "disabled")
+
 
 def resolve_think_flag(value: bool | str | None) -> bool | None:
     """Map an Ollama-style ``think`` value to the engine's ``enable_thinking``.
 
     ``None`` preserves the engine default; a bool passes through.  Strings are
-    handled defensively: a stringified bool (``"true"``/``"false"``, any case)
-    or empty string maps to the corresponding bool so a weakly-typed client
-    sending ``"false"`` is not silently inverted to *on*.  Any other non-empty
-    string is treated as a gpt-oss thinking level (``"low"/"medium"/"high"``)
-    and collapses to ``True`` because the engine toggle is bool-only.
+    handled defensively: a stringified bool (``"true"``/``"false"``, any case),
+    an empty string, or a disable word (``"none"/"off"/"disabled"``) maps to
+    the corresponding bool so a weakly-typed client sending ``"false"`` or
+    ``"none"`` is not silently inverted to *on*.  Any other non-empty string is
+    treated as a gpt-oss thinking level (``"low"/"medium"/"high"``) and
+    collapses to ``True`` because the engine toggle is bool-only.
     """
     if value is None:
         return None
     if isinstance(value, bool):
         return value
     normalized = value.strip().lower()
-    if normalized in ("", "false"):
+    if normalized in ("", "false", *_DISABLE_WORDS):
         return False
     if normalized == "true":
         return True
@@ -45,7 +51,7 @@ def resolve_openai_think(
         # None: returning None would fall through to the engine default
         # ("think unless tools"), silently inverting a caller who sent
         # reasoning_effort="none" expecting thinking off.
-        if reasoning_effort.strip().lower() in ("none", "off", "disabled"):
+        if reasoning_effort.strip().lower() in _DISABLE_WORDS:
             return False
         return True
     return None

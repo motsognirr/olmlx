@@ -1804,7 +1804,13 @@ async def generate_completion(
             # the explicit instruction matches the thinking_expected signal
             # computed below.  We deliberately don't defer to the VLM template's
             # own default: we can't introspect it, so passing an explicit bool
-            # is the only way to keep the thinking-splitter consistent.
+            # is the only way to keep the thinking-splitter consistent.  This
+            # differs intentionally from generate_chat's no-tools VLM path,
+            # which passes None and lets _apply_chat_template_vlm's guard skip
+            # the kwarg (preserving the template default).  Consequence: every
+            # /api/generate VLM request passes enable_thinking (incl. False) to
+            # the template even for non-thinking VLMs — harmless because HF
+            # templates ignore unknown kwargs.
             prompt = _apply_chat_template_vlm(
                 lm.tokenizer, lm.model, messages, enable_thinking=effective_thinking
             )

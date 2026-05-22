@@ -111,6 +111,13 @@ async def generate(req: GenerateRequest, request: Request):
         )
         now = datetime.now(timezone.utc).isoformat()
         stats = result.get("stats")
+        # NOTE: the non-streaming path extracts thinking via parse_model_output
+        # (engine/tool_parser.py), while the streaming path above uses
+        # split_thinking_streaming (routers/thinking_split.py, driven by
+        # _THINKING_PAIRS).  They agree on well-formed output but recognize tags
+        # via separate tables — extend BOTH when adding a new thinking-tag
+        # format.  (parse_model_output also does not apply the streaming-only
+        # INIT_ORPHAN_DETECT_LIMIT.)
         thinking, visible_text, _ = parse_model_output(
             result.get("text", ""),
             has_tools=False,

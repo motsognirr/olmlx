@@ -120,6 +120,14 @@ class TestResolveThinkFlag:
     def test_empty_string_is_off(self):
         assert resolve_think_flag("") is False
 
+    def test_disable_words_are_off(self):
+        # Must mirror resolve_openai_think: "none"/"off"/"disabled" disable
+        # thinking rather than falling through to the level catch-all (on).
+        assert resolve_think_flag("none") is False
+        assert resolve_think_flag("off") is False
+        assert resolve_think_flag("disabled") is False
+        assert resolve_think_flag("NONE") is False
+
 
 class TestResolveOpenAIThink:
     def test_both_none_returns_none(self):
