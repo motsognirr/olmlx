@@ -1,0 +1,165 @@
+{
+  "model": "mlx-community/Nemotron-Cascade-2-30B-A3B-4bit",
+  "results": [
+    {
+      "set": "mmlu",
+      "name": "mmlu-01-em-multiplication",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='C'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-02-em-fraction",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='B'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-03-em-perimeter",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='B'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-04-em-division",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='D'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-05-em-percent",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='C'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-06-hist-ww2",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='D'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-07-hist-fr-rev",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='D'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-08-hist-berlin",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='C'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-09-hist-rome",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='B'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-10-hist-printing-press",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='B'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-11-sci-photosynthesis",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='C'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-12-sci-water",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='A'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-13-sci-light",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='C'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-14-sci-dna",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='A'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-15-sci-planet",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='D'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-16-prog-big-o",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='B'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-17-prog-python-list",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='A'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-18-prog-http",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='D'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-19-prog-git",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='C'"
+    },
+    {
+      "set": "mmlu",
+      "name": "mmlu-20-prog-sql",
+      "grader": "regex_match",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted='B'"
+    }
+  ]
+}
