@@ -1356,6 +1356,33 @@ class TestGenerateCompletion:
         assert call_args[1]["enable_thinking"] is True
 
     @pytest.mark.asyncio
+    async def test_raw_mode_thinking_expected_false(self, mock_manager):
+        """Raw mode injects no thinking instruction, so thinking_expected must
+        be False even with enable_thinking=True — otherwise the generate
+        router arms the orphan-</think> heuristic on un-templated output."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_lm = MagicMock()
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="out",
+                ):
+                    result = await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=False,
+                        enable_thinking=True,
+                    )
+
+        assert result["thinking_expected"] is False
+
+    @pytest.mark.asyncio
     async def test_non_streaming_surfaces_thinking_expected(self, mock_manager):
         """Non-streaming result carries thinking_expected so routers can split."""
         mock_mx = MagicMock()

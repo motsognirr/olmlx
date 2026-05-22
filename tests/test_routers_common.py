@@ -117,6 +117,10 @@ class TestResolveOpenAIThink:
     def test_reasoning_effort_present_returns_true(self):
         assert resolve_openai_think("high", None) is True
 
+    def test_empty_reasoning_effort_does_not_enable(self):
+        # An empty string is not a real effort value; truthiness, not is-not-None.
+        assert resolve_openai_think("", None) is None
+
     def test_chat_template_kwargs_enable_thinking_true(self):
         assert resolve_openai_think(None, {"enable_thinking": True}) is True
 

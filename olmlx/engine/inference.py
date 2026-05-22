@@ -1824,9 +1824,16 @@ async def generate_completion(
 
     # Tell routers whether to wait for a (possibly orphaned) `</think>` when
     # splitting thinking from the response (issue #307) — shares the rules
-    # with `generate_chat`.  Completions never carry tools.
+    # with `generate_chat`.  Completions never carry tools.  In raw mode no
+    # chat template is applied, so no thinking instruction reached the model:
+    # leave thinking_expected False so the router doesn't arm the orphan-close
+    # heuristic on un-templated output (a literal `</think>` in code/prose).
     caps = lm.template_caps or TemplateCaps()
-    thinking_expected = _resolve_thinking_active(caps, None, enable_thinking)
+    thinking_expected = (
+        _resolve_thinking_active(caps, None, enable_thinking)
+        if apply_chat_template
+        else False
+    )
 
     if stream:
         return _prepend_meta(

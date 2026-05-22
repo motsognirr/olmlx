@@ -168,6 +168,7 @@ def flush_split_thinking(state: dict) -> tuple[str, str]:
     state["buffer"] = ""
     state["phase"] = "detect"
     state["expected_close"] = ""
+    state["thinking_expected"] = False
     if not buf:
         return "", ""
     if phase == "in_think":

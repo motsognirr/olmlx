@@ -34,6 +34,13 @@ class TestSplitThinkingStreaming:
         assert tail_thinking == "easoning"
         assert tail_content == ""
 
+    def test_flush_resets_thinking_expected(self):
+        """flush_split_thinking resets all managed keys, including
+        thinking_expected, so a reused state dict starts a fresh stream."""
+        state: dict = {"thinking_expected": True, "buffer": "x", "phase": "detect"}
+        flush_split_thinking(state)
+        assert not state.get("thinking_expected")
+
 
 class TestChatRouter:
     @pytest.mark.asyncio

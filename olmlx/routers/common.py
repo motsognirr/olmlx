@@ -31,7 +31,7 @@ def resolve_openai_think(
     """
     if chat_template_kwargs and "enable_thinking" in chat_template_kwargs:
         return bool(chat_template_kwargs["enable_thinking"])
-    if reasoning_effort is not None:
+    if reasoning_effort:
         return True
     return None
 
