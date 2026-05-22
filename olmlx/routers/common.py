@@ -46,6 +46,12 @@ def resolve_openai_think(
     Note: only the ``enable_thinking`` key of ``chat_template_kwargs`` is
     consumed — other keys are intentionally ignored (this server uses the dict
     solely as the thinking switch, not a general template-kwargs passthrough).
+
+    Asymmetry with :func:`resolve_think_flag`: an empty ``reasoning_effort``
+    returns ``None`` (engine default) here, whereas an empty Ollama ``think``
+    string returns ``False``.  This is deliberate — the OpenAI chat route has
+    no off-by-default contract, so an empty/absent value should fall through to
+    the engine default rather than force thinking off.
     """
     if chat_template_kwargs and "enable_thinking" in chat_template_kwargs:
         return bool(chat_template_kwargs["enable_thinking"])

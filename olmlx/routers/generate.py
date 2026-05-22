@@ -112,12 +112,20 @@ async def generate(req: GenerateRequest, request: Request):
         now = datetime.now(timezone.utc).isoformat()
         stats = result.get("stats")
         # NOTE: the non-streaming path extracts thinking via parse_model_output
-        # (engine/tool_parser.py), while the streaming path above uses
-        # split_thinking_streaming (routers/thinking_split.py, driven by
-        # _THINKING_PAIRS).  They agree on well-formed output but recognize tags
-        # via separate tables — extend BOTH when adding a new thinking-tag
-        # format.  (parse_model_output also does not apply the streaming-only
-        # INIT_ORPHAN_DETECT_LIMIT.)
+        # (engine/tool_parser.py); the streaming path above uses
+        # split_thinking_streaming (routers/thinking_split.py, _THINKING_PAIRS).
+        # These do NOT have parity, and closing the gap is out of scope here
+        # (it's a pre-existing characteristic shared with /api/chat's streaming
+        # splitter):
+        #   * parse_model_output also handles the gpt-oss channel format and
+        #     prefix-less Gemma 4 `thought\n...` blocks; the streaming splitter
+        #     handles neither (a bare `thought\n` open tag can't be matched
+        #     incrementally without false-positiving on ordinary prose).
+        #   * parse_model_output does not apply the streaming-only
+        #     INIT_ORPHAN_DETECT_LIMIT.
+        # Practical impact: a gpt-oss model with think=true + stream=true leaks
+        # its channel-format thinking into `response`. When extending the tag
+        # set, update both sites where the format is safe to match in a stream.
         thinking, visible_text, _ = parse_model_output(
             result.get("text", ""),
             has_tools=False,
