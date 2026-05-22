@@ -621,6 +621,19 @@ def _apply_serve_overrides(args) -> None:
     if flash_flag is not None:
         _settings.flash = flash_flag
 
+    fs = getattr(args, "flash_speculative", None)
+    fs_draft = getattr(args, "flash_speculative_draft_model", None)
+    fs_tokens = getattr(args, "flash_speculative_tokens", None)
+    fp = getattr(args, "flash_prefetch", None)
+    if fs is not None:
+        _settings.flash_speculative = fs
+    if fs_draft is not None:
+        _settings.flash_speculative_draft_model = fs_draft
+    if fs_tokens is not None:
+        _settings.flash_speculative_tokens = fs_tokens
+    if fp is not None:
+        _settings.flash_prefetch = fp
+
     _surface_legacy_kv_cache_quant_env()
 
     _warn_kv_cache_quant_incompatibilities()
@@ -704,9 +717,9 @@ def _apply_serve_overrides(args) -> None:
             "%s. Once Flash is prepared and loads, standalone "
             "speculative decoding is dropped — use the per-model "
             "``flash_speculative`` field (or "
-            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE / "
-            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL / "
-            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS) instead. "
+            "OLMLX_FLASH_SPECULATIVE / "
+            "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL / "
+            "OLMLX_FLASH_SPECULATIVE_TOKENS) instead. "
             "Note: flash-speculative is still experimental.",
             ", ".join(flash_conflicts_actionable),
         )
@@ -2785,6 +2798,34 @@ def build_parser() -> argparse.ArgumentParser:
             "backed neuron loading). Overrides OLMLX_FLASH. Requires the "
             "model to be prepared first via 'olmlx flash prepare'."
         ),
+    )
+    serve_p.add_argument(
+        "--flash-prefetch",
+        dest="flash_prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable Flash speculative neuron prefetch (overrides OLMLX_FLASH_PREFETCH).",
+    )
+    serve_p.add_argument(
+        "--flash-speculative",
+        dest="flash_speculative",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable Flash + speculative decoding (overrides OLMLX_FLASH_SPECULATIVE).",
+    )
+    serve_p.add_argument(
+        "--flash-speculative-draft-model",
+        dest="flash_speculative_draft_model",
+        type=_non_empty_str,
+        default=None,
+        help="HuggingFace path of the draft model used for Flash speculative decoding.",
+    )
+    serve_p.add_argument(
+        "--flash-speculative-tokens",
+        dest="flash_speculative_tokens",
+        type=_positive_int,
+        default=None,
+        help="Tokens drafted per verification step for Flash speculative (default: 4).",
     )
 
     svc = sub.add_parser("service", help="Manage the launchd service")

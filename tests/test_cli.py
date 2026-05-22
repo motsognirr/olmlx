@@ -2791,3 +2791,25 @@ class TestLegacyFlashPrefetchSpeculativeForwarding:
 
         assert settings.flash_prefetch is True
         assert "OLMLX_FLASH_PREFETCH" in caplog.text
+
+
+class TestServeFlashPrefetchSpeculativeFlags:
+    def test_flags_apply_to_settings(self, monkeypatch):
+        import argparse
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings
+
+        monkeypatch.setattr(settings, "flash_speculative", False, raising=False)
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=False)
+        args = argparse.Namespace(
+            flash_speculative=True,
+            flash_speculative_draft_model="d/m",
+            flash_speculative_tokens=5,
+            flash_prefetch=True,
+        )
+        _apply_serve_overrides(args)
+        assert settings.flash_speculative is True
+        assert settings.flash_speculative_draft_model == "d/m"
+        assert settings.flash_speculative_tokens == 5
+        assert settings.flash_prefetch is True
