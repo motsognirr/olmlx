@@ -1,5 +1,6 @@
 {
   "model": "prism-ml/Ternary-Bonsai-8B-mlx-2bit",
+  "max_tokens": 1024,
   "results": [
     {
       "set": "mmlu",

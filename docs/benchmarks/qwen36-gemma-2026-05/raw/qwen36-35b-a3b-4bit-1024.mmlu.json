@@ -1,5 +1,5 @@
 {
-  "model": "mlx-community/gemma-4-31B-it-OptiQ-4bit",
+  "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
   "max_tokens": 1024,
   "results": [
     {
@@ -14,9 +14,9 @@
       "set": "mmlu",
       "name": "mmlu-02-em-fraction",
       "grader": "regex_match",
-      "passed": true,
-      "score": 1.0,
-      "detail": "extracted='B'"
+      "passed": false,
+      "score": 0.0,
+      "detail": "no regex match"
     },
     {
       "set": "mmlu",

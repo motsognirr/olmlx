@@ -1,5 +1,6 @@
 {
   "model": "mlx-community/gpt-oss-120b-MXFP4-Q4",
+  "max_tokens": 1024,
   "results": [
     {
       "set": "gsm8k",

@@ -155,7 +155,15 @@ def main() -> None:
 
     def _save(results: list[dict]) -> None:
         with open(out_path, "w") as f:
-            json.dump({"model": args.model, "results": results}, f, indent=2)
+            json.dump(
+                {
+                    "model": args.model,
+                    "max_tokens": args.max_tokens,
+                    "results": results,
+                },
+                f,
+                indent=2,
+            )
             f.write("\n")
 
     proc, port = _start_server()

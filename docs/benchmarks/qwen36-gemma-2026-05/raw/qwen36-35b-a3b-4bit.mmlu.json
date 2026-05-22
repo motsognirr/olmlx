@@ -1,6 +1,6 @@
 {
-  "model": "mlx-community/gemma-4-31B-it-OptiQ-4bit",
-  "max_tokens": 1024,
+  "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+  "max_tokens": 2048,
   "results": [
     {
       "set": "mmlu",
