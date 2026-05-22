@@ -239,6 +239,11 @@ class TestGenerateRouter:
         assert response == "visible answer"
         assert "<think>" not in response
         assert thinking == "reasoning"
+        # The done frame must be emitted last and well-formed: the done-chunk
+        # handler returns list[str] (multi-line flush), so this also guards the
+        # safe_ndjson_stream list-return contract.
+        assert lines[-1]["done"] is True
+        assert lines[-1]["done_reason"] == "stop"
 
     @pytest.mark.asyncio
     async def test_generate_streaming_error_mid_stream(self, app_client):
