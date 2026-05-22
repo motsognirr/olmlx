@@ -2365,8 +2365,6 @@ def _cmd_flash_dense_prepare(args, model_path):
     print(f"  Training epochs: {args.epochs}")
     print()
 
-    from olmlx.config import experimental
-
     output_dir = prepare_model_for_flash(
         model_path=model_path,
         rank=args.rank,
@@ -2376,7 +2374,7 @@ def _cmd_flash_dense_prepare(args, model_path):
         calibration_dataset=args.calibration_dataset,
         activation_threshold=args.threshold,
         epochs=args.epochs,
-        train_lookahead=experimental.flash_prefetch,
+        train_lookahead=settings.flash_prefetch,
         progress_callback=_flash_progress,
     )
 

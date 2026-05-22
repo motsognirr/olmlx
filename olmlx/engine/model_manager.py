@@ -2829,7 +2829,7 @@ class ModelManager:
             io_threads=model_exp.flash_io_threads,
             cache_budget_neurons=model_exp.flash_cache_budget_neurons,
             memory_budget_fraction=flash_config.memory_budget_fraction,
-            prefetch=model_exp.flash_prefetch,
+            prefetch=flash_config.prefetch,
             prefetch_confidence_threshold=model_exp.flash_prefetch_confidence_threshold,
             prefetch_min_neurons=model_exp.flash_prefetch_min_neurons,
             prefetch_max_neurons=model_exp.flash_prefetch_max_neurons,
@@ -2847,7 +2847,7 @@ class ModelManager:
         # Load lookahead predictors if available (for speculative prefetching)
         lookahead_bank = None
         lookahead_path = flash_dir / "lookahead_predictors"
-        if model_exp.flash_prefetch and lookahead_path.exists():
+        if flash_config.prefetch and lookahead_path.exists():
             try:
                 lookahead_bank = LookaheadBank.load(lookahead_path)
                 logger.info("Loaded lookahead predictor bank from %s", lookahead_path)
@@ -2862,21 +2862,21 @@ class ModelManager:
             model, predictor_bank, weight_store, runtime_flash_config, lookahead_bank
         )
 
-        if model_exp.flash_speculative:
+        if flash_config.flash_speculative:
             from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
 
-            if not model_exp.flash_speculative_draft_model:
+            if not flash_config.flash_speculative_draft_model:
                 raise ValueError(
                     "flash_speculative requires flash_speculative_draft_model to be set "
-                    "(OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL)"
+                    "(OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL)"
                 )
 
             logger.info(
                 "Loading draft model %s for speculative decoding",
-                model_exp.flash_speculative_draft_model,
+                flash_config.flash_speculative_draft_model,
             )
             draft_model, draft_tokenizer = load_model_with_strict_fallback(
-                model_exp.flash_speculative_draft_model, lazy=False
+                flash_config.flash_speculative_draft_model, lazy=False
             )
 
             # Verify vocabulary compatibility — a mismatch causes silent token ID errors
@@ -2898,7 +2898,7 @@ class ModelManager:
             decoder = SpeculativeFlashDecoder(
                 draft_model=draft_model,
                 target_model=wrapped,
-                num_speculative_tokens=model_exp.flash_speculative_tokens,
+                num_speculative_tokens=flash_config.flash_speculative_tokens,
                 prefetcher=wrapped.prefetcher,
             )
             return wrapped, tokenizer, is_vlm, caps, decoder
@@ -3058,11 +3058,11 @@ class ModelManager:
                         "speculative_strategy='classic' or remove the "
                         "speculative settings."
                     )
-                if model_exp.flash_speculative:
+                if flash_config.flash_speculative:
                     raise ValueError(
                         "flash_speculative is not supported on Flash-MoE "
                         "targets. Remove flash_speculative from models.json "
-                        "(or unset OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE) and "
+                        "(or unset OLMLX_FLASH_SPECULATIVE) and "
                         "use speculative instead."
                     )
                 model, tokenizer, is_vlm, caps = self._load_flash_moe_model(
@@ -3082,7 +3082,7 @@ class ModelManager:
                 if spec_enabled:
                     logger.warning(
                         "OLMLX_SPECULATIVE is enabled but %s is loaded via "
-                        "Flash, which uses OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE "
+                        "Flash, which uses OLMLX_FLASH_SPECULATIVE "
                         "for speculative decoding; the OLMLX_SPECULATIVE "
                         "setting will be ignored.",
                         hf_path,
@@ -3118,11 +3118,11 @@ class ModelManager:
                         "speculative_strategy='classic' or remove the "
                         "speculative settings."
                     )
-                if model_exp.flash_speculative:
+                if flash_config.flash_speculative:
                     raise ValueError(
                         "flash_speculative is not supported on VLM targets; "
                         "remove flash_speculative from models.json (or unset "
-                        "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE) and use "
+                        "OLMLX_FLASH_SPECULATIVE) and use "
                         "speculative instead"
                     )
                 if spec_enabled:
@@ -3141,7 +3141,7 @@ class ModelManager:
         # Text or unknown — try mlx-lm first, fall back to mlx-vlm
         model, tokenizer, is_vlm, caps = self._try_lm_then_vlm(load_path, hf_path)
 
-        if spec_enabled and model_exp.flash_speculative:
+        if spec_enabled and flash_config.flash_speculative:
             raise ValueError(
                 "Only one speculative decoder can be active at a time; "
                 "got both 'speculative' and 'flash_speculative'."

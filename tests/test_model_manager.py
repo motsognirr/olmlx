@@ -4242,6 +4242,7 @@ class TestSpeculativeLoading:
     def test_flash_moe_path_rejects_flash_speculative(self, monkeypatch):
         """Flash-MoE + flash_speculative should raise ValueError."""
         from olmlx.config import ExperimentalSettings
+        from olmlx.engine.registry import ResolvedFlashConfig
 
         registry = MagicMock()
         store = MagicMock()
@@ -4253,9 +4254,17 @@ class TestSpeculativeLoading:
             manager, "_flash_moe_dir", lambda hf_path: Path("/tmp/test-moe/flash_moe")
         )
 
-        model_exp = ExperimentalSettings(_env_file=None, flash_speculative=True)
+        model_exp = ExperimentalSettings(_env_file=None)
         spec_config = SpeculativeConfig(False, None, 4)
         fm_config = FlashMoeConfig(enabled=True, cache_budget_experts=48, io_threads=32)
+        flash_config = ResolvedFlashConfig(
+            enabled=False,
+            sparsity_threshold=0.0,
+            min_active_neurons=0,
+            max_active_neurons=None,
+            memory_budget_fraction=None,
+            flash_speculative=True,
+        )
 
         with pytest.raises(
             ValueError, match="flash_speculative.*not supported on Flash-MoE"
@@ -4265,6 +4274,7 @@ class TestSpeculativeLoading:
                 model_exp=model_exp,
                 spec_config=spec_config,
                 flash_moe_config=fm_config,
+                flash_config=flash_config,
             )
 
 
