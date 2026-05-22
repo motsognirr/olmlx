@@ -1,11 +1,12 @@
 # Benchmark: Qwen3.6-27B (8bit vs 4bit) vs Gemma 4 family — May 2026
 
-Speed + quality comparison across nine locally-served models, run through the
+Speed + quality comparison across ten locally-served models, run through the
 olmlx server (`/api/chat`) on Apple Silicon. The original question was an
 8bit-vs-4bit quant comparison of `Qwen3.6-27B`; it grew into a small cross-model
-survey. Two later additions extend the survey to the extremes of the size range:
-`gpt-oss-120b` (120B MoE, run via flash-MoE since it is ~2× the machine's RAM)
-and `Nemotron-Cascade-2-30B-A3B` (a `nemotron_h` hybrid Mamba/attention MoE).
+survey. Later additions extend the survey to the extremes of the size range:
+`gpt-oss-120b` (120B MoE, run via flash-MoE since it is ~2× the machine's RAM),
+`Nemotron-Cascade-2-30B-A3B` (a `nemotron_h` hybrid Mamba/attention MoE), and
+`Qwen3.6-35B-A3B` (a `qwen3_5_moe` A3B model, also benchmarked with speculative).
 
 ## Methodology
 
@@ -39,11 +40,20 @@ Raw per-prompt grader output is under [`raw/`](./raw).
 | Devstral-Small 2505 6bit | dense (code) | 12.7 | 20/20 | 20/20 | 10/10 | **50/50** |
 | Ternary-Bonsai-8B 2bit | 2-bit 8B | 82.1 | 20/20 | 20/20 | 10/10 | **50/50** |
 | Nemotron-Cascade-2-30B-A3B 4bit | hybrid MoE (nemotron_h) | 95.1 | 20/20 | 20/20 | 10/10 | **50/50** |
+| Qwen3.6-35B-A3B 4bit | A3B MoE (qwen3_5_moe) | 86.7 | 20/20 | 20/20 | 10/10 | **50/50**² |
 | gpt-oss-120b MXFP4-Q4 | 120B MoE (flash-MoE) | 7.1¹ | 20/20 | 20/20 | 10/10 | **50/50** |
 
 ¹ gemma-4-26B-A4B and gpt-oss-120b speeds are **flash-MoE (SSD expert offload)**,
 not directly comparable to the dense plain-decode rows. gpt-oss-120b (115 GB on a
 64 GB machine) is SSD-I/O-bound on nearly every expert load.
+
+² Qwen3.6-35B-A3B was graded at a **2048** cap, not 1024. It is a verbose
+reasoning model whose `<think>` block can't be disabled over `/api/chat` (the
+template's `enable_thinking=False` switch is only wired into the Anthropic
+`/v1/messages` route), so at 1024 it scored a truncation-contaminated 42/50
+(GSM8K 14/20) — all 8 misses were unfinished reasoning, and every one flips to
+PASS at 2048. The 50/50 is its true score; the lower cap just measured
+verbosity. See "Lessons".
 
 ### Qwen3.6-27B: 8bit → 4bit quant
 
@@ -56,12 +66,11 @@ not directly comparable to the dense plain-decode rows. gpt-oss-120b (115 GB on 
 ≈2× faster and half the footprint for a 2-point quality delta (−3 GSM8K,
 −1 MMLU, +2 HumanEval) that is within noise at n=10–20 per set.
 
-### Qwen3.6-35B-A3B: quant + classic speculative (speed only)
+### Qwen3.6-35B-A3B: quant + classic speculative
 
 A3B MoE (`qwen3_5_moe`, 256 experts, ~3B active), in-RAM plain decode,
-`turboquant:4`. Quality not graded — the mini-suites are saturated for this
-class (the sibling Nemotron-Cascade A3B scored 50/50), so only throughput is
-informative here.
+`turboquant:4`. The 4bit is graded in the main table (50/50 at a 2048 cap);
+the 6bit is speed-only (same class, quality not separately graded).
 
 | | 4bit | 6bit |
 |---|---:|---:|
@@ -81,8 +90,8 @@ bandwidth-bound dense targets, not on already-fast A3B MoEs.
 
 ## Findings
 
-- **The mini-suites are saturated.** Eight of nine models score 46–50/50, and
-  the four perfect scores span a 2-bit 8B, a 6bit code model, a hybrid MoE, and
+- **The mini-suites are saturated.** Nine of ten models score 46–50/50, and
+  the five perfect scores span a 2-bit 8B, a 6bit code model, two A3B MoEs, and
   a 120B MoE. A ~2B model (e2b) ties the 27B-8bit. These 10–20-problem sets
   discriminate "broken vs working," not fine quality — any ranking within this
   band is noise-limited. Real discrimination needs the full splits (GSM8K 1319,
@@ -112,6 +121,13 @@ bandwidth-bound dense targets, not on already-fast A3B MoEs.
   scored 20/20. Any future grading harness should default to a generous cap.
 - **Verbosity differs by model**, so a fixed cap silently penalizes the more
   verbose ones — a fairness problem, not just a measurement one.
+- **The artifact recurred at 1024 on the most verbose model.** Qwen3.6-35B-A3B
+  scored 42/50 at the 1024 cap (GSM8K 14/20); all 8 misses were unfinished
+  reasoning and every one passed at 2048. Its `<think>` block can't be turned
+  off over `/api/chat` — the template honors `enable_thinking=False`, but only
+  the Anthropic `/v1/messages` route wires that switch. So for verbose reasoning
+  models the practical options are a higher cap (used here: 2048) or grading via
+  the Anthropic route with thinking disabled. "Generous default" is model-relative.
 
 ## Caveats
 
