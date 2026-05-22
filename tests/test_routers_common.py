@@ -109,6 +109,17 @@ class TestResolveThinkFlag:
     def test_arbitrary_nonempty_string_is_on(self):
         assert resolve_think_flag("yes") is True
 
+    def test_stringified_bool_parsed_not_inverted(self):
+        # A weakly-typed client sending the JSON string "false"/"true" must not
+        # get the opposite of its intent (silent footgun).
+        assert resolve_think_flag("false") is False
+        assert resolve_think_flag("False") is False
+        assert resolve_think_flag("true") is True
+        assert resolve_think_flag("TRUE") is True
+
+    def test_empty_string_is_off(self):
+        assert resolve_think_flag("") is False
+
 
 class TestResolveOpenAIThink:
     def test_both_none_returns_none(self):

@@ -1618,7 +1618,7 @@ def _apply_chat_template_vlm(
     # apply_chat_template, so enable_thinking reaches the Jinja template
     # (templates that don't declare the variable ignore it).  Only forward
     # when explicitly set so the template's own default is preserved otherwise.
-    extra_kwargs: dict = {}
+    extra_kwargs: dict[str, Any] = {}
     if enable_thinking is not None:
         extra_kwargs["enable_thinking"] = enable_thinking
     # Pass the full message list so the model gets proper conversation context
@@ -1760,6 +1760,13 @@ async def generate_completion(
         lm = await manager.ensure_loaded(model_name, keep_alive)
     stats.load_duration = load_timer.duration_ns
 
+    # /api/generate defaults thinking OFF when unspecified (None), unlike the
+    # chat route's "think unless tools".  Coerce once so the template
+    # instruction and the downstream thinking_expected signal stay consistent
+    # (otherwise the splitter would arm the orphan-</think> buffer for thinking
+    # the model was told not to produce).
+    effective_thinking = enable_thinking if enable_thinking is not None else False
+
     if apply_chat_template and not lm.is_vlm:
         messages: list[dict] = []
         if system:
@@ -1770,9 +1777,7 @@ async def generate_completion(
                 lm.text_tokenizer,
                 messages,
                 caps=lm.template_caps,
-                enable_thinking=enable_thinking
-                if enable_thinking is not None
-                else False,
+                enable_thinking=effective_thinking,
             )
             logger.info(
                 "Applied chat template for /api/generate (prompt length: %d chars)",
@@ -1795,7 +1800,7 @@ async def generate_completion(
         messages.append({"role": "user", "content": prompt})
         try:
             prompt = _apply_chat_template_vlm(
-                lm.tokenizer, lm.model, messages, enable_thinking=enable_thinking
+                lm.tokenizer, lm.model, messages, enable_thinking=effective_thinking
             )
             logger.info(
                 "Applied VLM chat template for /api/generate (prompt length: %d chars)",
@@ -1830,7 +1835,7 @@ async def generate_completion(
     # heuristic on un-templated output (a literal `</think>` in code/prose).
     caps = lm.template_caps or TemplateCaps()
     thinking_expected = (
-        _resolve_thinking_active(caps, None, enable_thinking)
+        _resolve_thinking_active(caps, None, effective_thinking)
         if apply_chat_template
         else False
     )

@@ -1356,6 +1356,45 @@ class TestGenerateCompletion:
         assert call_args[1]["enable_thinking"] is True
 
     @pytest.mark.asyncio
+    async def test_default_generate_thinking_expected_matches_template(
+        self, mock_manager
+    ):
+        """For the default /api/generate case (enable_thinking=None) the text
+        template is told not to think (None->False), so thinking_expected must
+        also be False — otherwise the splitter arms the 1024-char orphan buffer
+        for thinking the model was never asked to produce."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_lm = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+        # Thinking-capable model (mock fixture sets supports_enable_thinking=True).
+        lm.text_tokenizer.apply_chat_template.return_value = "templated"
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="out",
+                ):
+                    result = await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=True,
+                        # enable_thinking omitted -> None (default off for generate)
+                    )
+
+        # Template was told not to think...
+        assert (
+            lm.text_tokenizer.apply_chat_template.call_args[1]["enable_thinking"]
+            is False
+        )
+        # ...so thinking_expected must agree.
+        assert result["thinking_expected"] is False
+
+    @pytest.mark.asyncio
     async def test_raw_mode_thinking_expected_false(self, mock_manager):
         """Raw mode injects no thinking instruction, so thinking_expected must
         be False even with enable_thinking=True — otherwise the generate
