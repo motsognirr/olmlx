@@ -12,7 +12,7 @@ from olmlx.engine.tool_parser import (
     parse_model_output,
     resolve_tool_names,
 )
-from olmlx.routers.common import format_error
+from olmlx.routers.common import format_error, resolve_think_flag
 from olmlx.schemas.chat import ChatRequest, Message, ToolCall, ToolCallFunction
 from olmlx.utils.streaming import safe_ndjson_stream
 
@@ -357,6 +357,7 @@ async def chat(req: ChatRequest, request: Request):
     tools = [t.model_dump(exclude_none=True) for t in req.tools] if req.tools else None
     max_tokens = options.pop("num_predict", 512)
     cache_id = request.headers.get("x-cache-id", "")[:256]
+    enable_thinking = resolve_think_flag(req.think)
 
     if req.stream:
         result = await generate_chat(
@@ -369,6 +370,7 @@ async def chat(req: ChatRequest, request: Request):
             keep_alive=req.keep_alive,
             max_tokens=max_tokens,
             cache_id=cache_id,
+            enable_thinking=enable_thinking,
         )
 
         if tools:
@@ -482,6 +484,7 @@ async def chat(req: ChatRequest, request: Request):
             keep_alive=req.keep_alive,
             max_tokens=max_tokens,
             cache_id=cache_id,
+            enable_thinking=enable_thinking,
         )
         now = datetime.now(timezone.utc).isoformat()
         stats = result.get("stats")

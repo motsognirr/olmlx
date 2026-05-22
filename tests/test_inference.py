@@ -1286,6 +1286,61 @@ class TestGenerateCompletion:
         assert call_args[1]["enable_thinking"] is False
 
     @pytest.mark.asyncio
+    async def test_apply_chat_template_enable_thinking_true(self, mock_manager):
+        """enable_thinking=True is forwarded to the chat template (not forced off)."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_lm = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.text_tokenizer.apply_chat_template.return_value = "templated"
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="out",
+                ):
+                    await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=True,
+                        enable_thinking=True,
+                    )
+
+        call_args = lm.text_tokenizer.apply_chat_template.call_args
+        assert call_args[1]["enable_thinking"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_surfaces_thinking_expected(self, mock_manager):
+        """Non-streaming result carries thinking_expected so routers can split."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_lm = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.text_tokenizer.apply_chat_template.return_value = "templated"
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="out",
+                ):
+                    result = await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=True,
+                        enable_thinking=True,
+                    )
+
+        assert result["thinking_expected"] is True
+
+    @pytest.mark.asyncio
     async def test_apply_chat_template_with_system(self, mock_manager):
         """System prompt becomes a proper system role message, not part of user content."""
         mock_mx = MagicMock()
@@ -1515,6 +1570,45 @@ class TestGenerateCompletion:
             done_stats.prompt_eval_duration + done_stats.eval_duration
             <= done_stats.total_duration
         )
+
+    @pytest.mark.asyncio
+    async def test_streaming_prepends_thinking_expected_meta(self, mock_manager):
+        """Streaming completion yields a thinking_expected meta chunk first."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+        empty_iter = iter([])
+
+        async def anext_impl():
+            try:
+                return next(empty_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.text_tokenizer.apply_chat_template.return_value = "templated"
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch(
+                "olmlx.engine.inference.async_mlx_stream", return_value=mock_stream
+            ):
+                gen = await generate_completion(
+                    mock_manager,
+                    "qwen3",
+                    "Hello",
+                    stream=True,
+                    apply_chat_template=True,
+                    enable_thinking=True,
+                )
+                chunks = [chunk async for chunk in gen]
+
+        assert chunks[0] == {"thinking_expected": True}
 
 
 class TestGenerateChat:
@@ -4288,7 +4382,7 @@ class TestInferenceTimeout:
         done_chunk = chunks[-1]
         assert done_chunk["done"] is True
         assert "done_reason" not in done_chunk
-        text_chunks = [c for c in chunks if not c.get("done")]
+        text_chunks = [c for c in chunks if not c.get("done") and "text" in c]
         assert len(text_chunks) == 3
 
     @pytest.mark.asyncio

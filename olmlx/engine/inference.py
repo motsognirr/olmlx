@@ -1737,6 +1737,7 @@ async def generate_completion(
     images: list[str] | None = None,
     apply_chat_template: bool = False,
     system: str | None = None,
+    enable_thinking: bool | None = None,
 ) -> AsyncGenerator[dict, None] | dict:
     """Generate a text completion, streaming or not.
 
@@ -1762,7 +1763,7 @@ async def generate_completion(
                 lm.text_tokenizer,
                 messages,
                 caps=lm.template_caps,
-                enable_thinking=False,
+                enable_thinking=enable_thinking if enable_thinking is not None else False,
             )
             logger.info(
                 "Applied chat template for /api/generate (prompt length: %d chars)",
@@ -1784,7 +1785,9 @@ async def generate_completion(
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         try:
-            prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages)
+            prompt = _apply_chat_template_vlm(
+                lm.tokenizer, lm.model, messages, enable_thinking=enable_thinking
+            )
             logger.info(
                 "Applied VLM chat template for /api/generate (prompt length: %d chars)",
                 len(prompt),
@@ -1810,10 +1813,21 @@ async def generate_completion(
     gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
+    # Tell routers whether to wait for a (possibly orphaned) `</think>` when
+    # splitting thinking from the response (issue #307) — shares the rules
+    # with `generate_chat`.  Completions never carry tools.
+    caps = lm.template_caps or TemplateCaps()
+    thinking_expected = _resolve_thinking_active(caps, None, enable_thinking)
+
     if stream:
-        return _stream_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        return _prepend_meta(
+            _stream_completion(lm, prompt, mt, gen_kwargs, stats, images),
+            {"thinking_expected": thinking_expected},
+        )
     else:
-        return await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        result = await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        result["thinking_expected"] = thinking_expected
+        return result
 
 
 @dataclasses.dataclass

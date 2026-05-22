@@ -2,7 +2,12 @@
 
 import json
 
-from olmlx.routers.common import build_inference_options, format_error
+from olmlx.routers.common import (
+    build_inference_options,
+    format_error,
+    resolve_openai_think,
+    resolve_think_flag,
+)
 
 
 class TestFormatError:
@@ -82,3 +87,53 @@ class TestBuildInferenceOptions:
     def test_none_fields_omitted(self):
         opts = build_inference_options(temperature=0.5, top_p=None, top_k=None)
         assert opts == {"temperature": 0.5}
+
+
+class TestResolveThinkFlag:
+    def test_none_returns_none(self):
+        # Omitted -> engine default applies.
+        assert resolve_think_flag(None) is None
+
+    def test_true_passthrough(self):
+        assert resolve_think_flag(True) is True
+
+    def test_false_passthrough(self):
+        assert resolve_think_flag(False) is False
+
+    def test_string_level_maps_to_true(self):
+        # gpt-oss thinking levels collapse to on (engine is bool-only).
+        assert resolve_think_flag("low") is True
+        assert resolve_think_flag("medium") is True
+        assert resolve_think_flag("high") is True
+
+    def test_arbitrary_nonempty_string_is_on(self):
+        assert resolve_think_flag("yes") is True
+
+
+class TestResolveOpenAIThink:
+    def test_both_none_returns_none(self):
+        assert resolve_openai_think(None, None) is None
+
+    def test_reasoning_effort_present_returns_true(self):
+        assert resolve_openai_think("high", None) is True
+
+    def test_chat_template_kwargs_enable_thinking_true(self):
+        assert resolve_openai_think(None, {"enable_thinking": True}) is True
+
+    def test_chat_template_kwargs_enable_thinking_false(self):
+        # The clean OFF switch.
+        assert resolve_openai_think(None, {"enable_thinking": False}) is False
+
+    def test_chat_template_kwargs_overrides_reasoning_effort(self):
+        # Explicit enable_thinking is authoritative even when effort is set.
+        assert resolve_openai_think("high", {"enable_thinking": False}) is False
+
+    def test_chat_template_kwargs_without_enable_thinking_falls_through(self):
+        # Unrelated kwargs don't force a decision; effort presence still wins.
+        assert resolve_openai_think("low", {"foo": "bar"}) is True
+        assert resolve_openai_think(None, {"foo": "bar"}) is None
+
+    def test_chat_template_kwargs_enable_thinking_coerced(self):
+        # Truthy/falsey values are coerced to bool.
+        assert resolve_openai_think(None, {"enable_thinking": 0}) is False
+        assert resolve_openai_think(None, {"enable_thinking": 1}) is True

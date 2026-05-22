@@ -6,7 +6,9 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from olmlx.engine.inference import generate_completion
-from olmlx.routers.common import format_error
+from olmlx.engine.tool_parser import parse_model_output
+from olmlx.routers.chat import _flush_split_thinking, _split_thinking_streaming
+from olmlx.routers.common import format_error, resolve_think_flag
 from olmlx.schemas.generate import GenerateRequest
 from olmlx.utils.streaming import safe_ndjson_stream
 
@@ -22,6 +24,7 @@ async def generate(req: GenerateRequest, request: Request):
 
     prompt = req.prompt
     max_tokens = options.pop("num_predict", 512)
+    enable_thinking = resolve_think_flag(req.think)
 
     if req.stream:
         result = await generate_completion(
@@ -35,12 +38,35 @@ async def generate(req: GenerateRequest, request: Request):
             images=req.images,
             apply_chat_template=not req.raw,
             system=req.system if not req.raw else None,
+            enable_thinking=enable_thinking,
         )
 
+        think_state: dict = {}
+
+        def _frame(now: str, response: str, thinking: str) -> dict:
+            frame = {
+                "model": req.model,
+                "created_at": now,
+                "response": response,
+                "done": False,
+            }
+            if thinking:
+                frame["thinking"] = thinking
+            return frame
+
         def format_chunk(chunk):
+            if "thinking_expected" in chunk:
+                think_state["thinking_expected"] = bool(chunk["thinking_expected"])
+                return None
             now = datetime.now(timezone.utc).isoformat()
             if chunk.get("done"):
+                thinking_tail, content_tail = _flush_split_thinking(think_state)
                 stats = chunk.get("stats")
+                lines = []
+                if thinking_tail or content_tail:
+                    lines.append(
+                        json.dumps(_frame(now, content_tail, thinking_tail)) + "\n"
+                    )
                 final = {
                     "model": req.model,
                     "created_at": now,
@@ -50,18 +76,14 @@ async def generate(req: GenerateRequest, request: Request):
                 }
                 if stats:
                     final.update(stats.to_dict())
-                return json.dumps(final) + "\n"
-            return (
-                json.dumps(
-                    {
-                        "model": req.model,
-                        "created_at": now,
-                        "response": chunk.get("text", ""),
-                        "done": False,
-                    }
-                )
-                + "\n"
+                lines.append(json.dumps(final) + "\n")
+                return lines
+            thinking_chunk, content_chunk = _split_thinking_streaming(
+                chunk.get("text", ""), think_state
             )
+            if not thinking_chunk and not content_chunk:
+                return None
+            return json.dumps(_frame(now, content_chunk, thinking_chunk)) + "\n"
 
         return StreamingResponse(
             safe_ndjson_stream(
@@ -85,16 +107,24 @@ async def generate(req: GenerateRequest, request: Request):
             images=req.images,
             apply_chat_template=not req.raw,
             system=req.system if not req.raw else None,
+            enable_thinking=enable_thinking,
         )
         now = datetime.now(timezone.utc).isoformat()
         stats = result.get("stats")
+        thinking, visible_text, _ = parse_model_output(
+            result.get("text", ""),
+            has_tools=False,
+            thinking_expected=bool(result.get("thinking_expected")),
+        )
         response = {
             "model": req.model,
             "created_at": now,
-            "response": result.get("text", ""),
+            "response": visible_text,
             "done": True,
             "done_reason": result.get("done_reason", "stop"),
         }
+        if thinking:
+            response["thinking"] = thinking
         if stats:
             response.update(stats.to_dict())
         return response

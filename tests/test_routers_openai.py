@@ -500,6 +500,60 @@ class TestOpenAIRouter:
         assert options["stop"] == ["END"]
 
     @pytest.mark.asyncio
+    async def test_chat_enable_thinking_default_none(self, app_client):
+        """No reasoning_effort/chat_template_kwargs -> enable_thinking=None (default)."""
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs["enable_thinking"] is None
+
+    @pytest.mark.asyncio
+    async def test_chat_reasoning_effort_enables_thinking(self, app_client):
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "reasoning_effort": "high",
+                },
+            )
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs["enable_thinking"] is True
+
+    @pytest.mark.asyncio
+    async def test_chat_template_kwargs_disables_thinking(self, app_client):
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            )
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs["enable_thinking"] is False
+
+    @pytest.mark.asyncio
     async def test_chat_default_penalties_not_forwarded(self, app_client):
         """Unset frequency/presence_penalty must not be forwarded to the engine
         (otherwise mlx-lm logs an 'unsupported' warning on every request)."""

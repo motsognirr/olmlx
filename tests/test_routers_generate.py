@@ -146,6 +146,101 @@ class TestGenerateRouter:
         assert mock_gen.call_args.kwargs["apply_chat_template"] is False
 
     @pytest.mark.asyncio
+    async def test_generate_think_default_none(self, app_client):
+        """No `think` field -> enable_thinking=None (off-by-default preserved)."""
+        mock_result = {"text": "out", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/generate",
+                json={"model": "qwen3", "prompt": "Hello", "stream": False},
+            )
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs["enable_thinking"] is None
+
+    @pytest.mark.asyncio
+    async def test_generate_think_true(self, app_client):
+        mock_result = {"text": "out", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "Hello",
+                    "stream": False,
+                    "think": True,
+                },
+            )
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs["enable_thinking"] is True
+
+    @pytest.mark.asyncio
+    async def test_generate_non_streaming_splits_thinking(self, app_client):
+        """<think> blocks are routed to the `thinking` field, not `response`."""
+        mock_result = {
+            "text": "<think>reasoning here</think>the answer",
+            "done": True,
+            "thinking_expected": True,
+            "stats": TimingStats(),
+        }
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "Hello",
+                    "stream": False,
+                    "think": True,
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["response"] == "the answer"
+        assert data["thinking"] == "reasoning here"
+
+    @pytest.mark.asyncio
+    async def test_generate_streaming_splits_thinking(self, app_client):
+        """Streaming routes thinking into a `thinking` field across chunks."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "<think>reason", "done": False}
+                yield {"text": "ing</think>", "done": False}
+                yield {"text": "visible answer", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch(
+            "olmlx.routers.generate.generate_completion", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "Hello",
+                    "stream": True,
+                    "think": True,
+                },
+            )
+        assert resp.status_code == 200
+        lines = [json.loads(ln) for ln in resp.text.strip().split("\n") if ln.strip()]
+        response = "".join(ln.get("response", "") for ln in lines)
+        thinking = "".join(ln.get("thinking") or "" for ln in lines)
+        assert response == "visible answer"
+        assert "<think>" not in response
+        assert thinking == "reasoning"
+
+    @pytest.mark.asyncio
     async def test_generate_streaming_error_mid_stream(self, app_client):
         """Error during streaming emits an NDJSON error line instead of crashing."""
 

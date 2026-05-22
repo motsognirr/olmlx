@@ -54,6 +54,8 @@ class OpenAIChatRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     seed: int | None = None
     response_format: ResponseFormat | None = None
+    reasoning_effort: str | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
 
     @field_validator("max_tokens", "max_completion_tokens")
     @classmethod

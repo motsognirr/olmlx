@@ -18,6 +18,7 @@ class GenerateRequest(BaseModel):
     stream: bool = True
     raw: bool = False
     format: str | None = None
+    think: bool | str | None = None
     options: ModelOptions | None = None
     keep_alive: str | None = None
 
@@ -31,6 +32,7 @@ class GenerateResponse(BaseModel):
     model: str
     created_at: str
     response: str
+    thinking: str | None = None
     done: bool
     done_reason: str | None = None
     context: list[int] | None = None

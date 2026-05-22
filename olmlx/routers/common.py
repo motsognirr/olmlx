@@ -2,6 +2,38 @@
 
 import json
 from datetime import datetime, timezone
+from typing import Any
+
+
+def resolve_think_flag(value: bool | str | None) -> bool | None:
+    """Map an Ollama-style ``think`` value to the engine's ``enable_thinking``.
+
+    ``None`` preserves the engine default; a bool passes through; a string
+    thinking level (gpt-oss ``"low"/"medium"/"high"``) collapses to ``True``
+    because the engine toggle is bool-only.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return True
+
+
+def resolve_openai_think(
+    reasoning_effort: str | None,
+    chat_template_kwargs: dict[str, Any] | None,
+) -> bool | None:
+    """Resolve ``enable_thinking`` from OpenAI-compatible request fields.
+
+    Precedence: an explicit ``chat_template_kwargs["enable_thinking"]``
+    (vLLM/SGLang convention, the only clean OFF switch) wins; otherwise the
+    presence of ``reasoning_effort`` means on; otherwise ``None`` (default).
+    """
+    if chat_template_kwargs and "enable_thinking" in chat_template_kwargs:
+        return bool(chat_template_kwargs["enable_thinking"])
+    if reasoning_effort is not None:
+        return True
+    return None
 
 
 def format_error(model: str) -> str:

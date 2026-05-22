@@ -18,7 +18,7 @@ from olmlx.engine.tool_parser import (
     parse_model_output,
     resolve_tool_names,
 )
-from olmlx.routers.common import build_inference_options
+from olmlx.routers.common import build_inference_options, resolve_openai_think
 from olmlx.utils.streaming import flush_thinking_buffer, strip_thinking_streaming
 from olmlx.schemas.openai import (
     OpenAIChatMessage,
@@ -339,6 +339,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
     chat_id = _make_id()
     created = int(time.time())
     cache_id = request.headers.get("x-cache-id", "")[:256]
+    enable_thinking = resolve_openai_think(req.reasoning_effort, req.chat_template_kwargs)
 
     if req.stream:
         result = await generate_chat(
@@ -350,6 +351,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             stream=True,
             max_tokens=max_tokens,
             cache_id=cache_id,
+            enable_thinking=enable_thinking,
         )
 
         if req.tools:
@@ -391,6 +393,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             stream=False,
             max_tokens=max_tokens,
             cache_id=cache_id,
+            enable_thinking=enable_thinking,
         )
         text = result.get("text", "")
         # Use raw_text for tool parsing (preserves gpt-oss channel tokens);
