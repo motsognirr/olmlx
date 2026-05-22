@@ -82,9 +82,11 @@ the 6bit is speed-only (same class, quality not separately graded).
 The 4bit is ~1.3× the 6bit's throughput. **Classic speculative *slows both
 down* ~35%**: the target already activates only ~3B params and runs at
 67–87 tok/s, so the draft-forward + verify overhead per step exceeds the
-savings. Acceptance was actually *decent* — **~55%** on a reasoning prompt
-(avg 3.19 of λ=4 tokens accepted per step, EMA ~0.71) with the cross-version
-Qwen3.5-0.8B draft — yet it still ran net-slower. That's the key point: this
+savings. Acceptance was actually *decent* — on a reasoning prompt the engine
+logged **0.55 draft-token acceptance** (274 of 500 proposed across 125 verify
+steps) with the cross-version Qwen3.5-0.8B draft, i.e. ~2.2 of every 4 drafted
+tokens accepted, or ~3.2 total tokens emitted per step once the +1 bonus target
+token is counted — yet it still ran net-slower. That's the key point: this
 isn't a "bad draft" near-miss that a same-version draft would flip; even at
 55% acceptance the A3B target is fast enough that per-step overhead dominates.
 (No same-version draft exists — Qwen3.6 ships only at 27B and 35B-A3B.) Mirror
