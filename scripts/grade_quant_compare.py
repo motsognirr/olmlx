@@ -6,8 +6,9 @@ Usage: python scripts/grade_quant_compare.py <hf-path> <out.json>
 Starts its own `olmlx serve` subprocess (like the bench worker), sends each
 task prompt over HTTP with temp=0/seed=42, then grades the output with the
 existing olmlx.bench.quality graders. code_exec is enabled for HumanEval.
-A failed request is recorded (passed=null) and the run continues; partial
-results are always written, even on early exit.
+A failed request is recorded (passed=null) and the run continues; results are
+written incrementally after each prompt, so partial output survives an early
+exit or hard crash (at most the in-flight prompt is lost).
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ def _start_server(attempts: int = 3) -> tuple[subprocess.Popen, int]:
     fails to come up. `_free_port()` releases the socket before the subprocess
     binds it, so a collision is possible under load — retrying makes that race
     non-fatal instead of dying with a misleading "server failed to start"."""
-    last_exit: int | None = None
+    last_exit: int | str | None = None
     for _ in range(attempts):
         port = _free_port()
         proc = subprocess.Popen(
@@ -64,8 +65,11 @@ def _start_server(attempts: int = 3) -> tuple[subprocess.Popen, int]:
         )
         if _wait(port, proc):
             return proc, port
-        last_exit = proc.poll()
-        if proc.poll() is None:
+        # poll() is None when the server is alive but never answered (timeout);
+        # report that distinctly rather than a misleading "exit=None".
+        exit_code = proc.poll()
+        last_exit = "timeout" if exit_code is None else exit_code
+        if exit_code is None:
             proc.terminate()
             try:
                 proc.wait(timeout=15)
@@ -115,6 +119,15 @@ def main() -> None:
     )
     args = parser.parse_args()
     set_names = args.sets.split(",")
+    if unknown := set(set_names) - PROMPT_SETS.keys():
+        parser.error(
+            f"unknown task sets: {', '.join(sorted(unknown))}; "
+            f"valid: {', '.join(sorted(PROMPT_SETS))}"
+        )
+
+    def _save(results: list[dict]) -> None:
+        with open(args.out_path, "w") as f:
+            json.dump({"model": args.model, "results": results}, f, indent=2)
 
     proc, port = _start_server()
     results: list[dict] = []
@@ -148,6 +161,7 @@ def main() -> None:
                     }
                     print(f"  [ERR ] {p.name}: {entry['detail']}", file=sys.stderr)
                 results.append(entry)
+                _save(results)  # incremental: survives a hard crash mid-run
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -156,8 +170,6 @@ def main() -> None:
             except subprocess.TimeoutExpired:
                 proc.kill()
         if results:
-            with open(args.out_path, "w") as f:
-                json.dump({"model": args.model, "results": results}, f, indent=2)
             print(f"\nsaved {args.out_path} ({len(results)} results)", file=sys.stderr)
 
 
