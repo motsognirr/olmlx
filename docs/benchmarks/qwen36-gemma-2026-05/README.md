@@ -56,6 +56,29 @@ not directly comparable to the dense plain-decode rows. gpt-oss-120b (115 GB on 
 ≈2× faster and half the footprint for a 2-point quality delta (−3 GSM8K,
 −1 MMLU, +2 HumanEval) that is within noise at n=10–20 per set.
 
+### Qwen3.6-35B-A3B: quant + classic speculative (speed only)
+
+A3B MoE (`qwen3_5_moe`, 256 experts, ~3B active), in-RAM plain decode,
+`turboquant:4`. Quality not graded — the mini-suites are saturated for this
+class (the sibling Nemotron-Cascade A3B scored 50/50), so only throughput is
+informative here.
+
+| | 4bit | 6bit |
+|---|---:|---:|
+| Baseline decode | **86.7 tok/s** | **67.1 tok/s** |
+| + classic speculative (Qwen3.5-0.8B draft, λ=4) | 56.5 tok/s | 42.3 tok/s |
+| Speculative vs baseline | **0.65× (−35%)** | **0.63× (−37%)** |
+
+The 4bit is ~1.3× the 6bit's throughput. **Classic speculative *slows both
+down* ~35%**: the target already activates only ~3B params and runs at
+67–87 tok/s, so the draft-forward + verify overhead per step exceeds the
+savings. (No same-version draft exists — Qwen3.6 ships only at 27B and
+35B-A3B — so a cross-version Qwen3.5-0.8B draft was used; its likely-mediocre
+acceptance compounds the loss, but the structural point holds regardless.)
+This is the mirror image of the CLAUDE.md result where classic *helped* the
+slower Qwen3.5-27B target (1.33–1.92×): speculation pays off on
+bandwidth-bound dense targets, not on already-fast A3B MoEs.
+
 ## Findings
 
 - **The mini-suites are saturated.** Eight of nine models score 46–50/50, and
@@ -69,6 +92,9 @@ not directly comparable to the dense plain-decode rows. gpt-oss-120b (115 GB on 
   (the latter SSD-bound under flash-MoE); the 26B MoE's 21 tok/s shows flash-MoE
   working well.
 - **Quant cost on Qwen3.6-27B is small** (8→4bit: 46→44, ≈2× speedup).
+- **Speculative decoding hurts fast A3B MoEs.** Classic speculative slowed
+  Qwen3.6-35B-A3B by ~35% at both 4bit and 6bit — plain decode is the fast
+  path for this class (see the A3B speed table above).
 - **A3B activation is the sweet spot here.** Nemotron-Cascade-2-30B-A3B keeps
   ~3B params hot while the 30B capacity fits in RAM at 4-bit, landing near-e2b
   throughput (95 tok/s) at a perfect 50/50 — the best speed-at-50/50 in the set.
