@@ -89,7 +89,10 @@ class Settings(BaseSettings):
     # Configured via hostfile (``distributed_hostfile``), launched by
     # ``olmlx serve``.
     distributed: bool = False
-    distributed_strategy: Literal["tensor", "pipeline"] = "tensor"
+    # Distributed inference is tensor-only. The dormant pipeline.py /
+    # pre_shard_pipeline / worker pipeline branches are unreachable and
+    # kept for a future PR (#273).
+    distributed_strategy: Literal["tensor"] = "tensor"
     distributed_hostfile: Path = Path("~/.olmlx/hostfile.json")
     distributed_backend: str = "ring"
     distributed_port: int = 32323

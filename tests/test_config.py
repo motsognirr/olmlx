@@ -425,3 +425,12 @@ class TestFlashPrefetchSpeculativePromotion:
         assert e.flash_prefetch_io_threads == 8
         # The promoted toggle is no longer an ExperimentalSettings field.
         assert "flash_prefetch" not in ExperimentalSettings.model_fields
+
+
+class TestDistributedTensorOnly:
+    def test_pipeline_strategy_rejected(self):
+        with pytest.raises(ValidationError):
+            Settings(distributed_strategy="pipeline")
+
+    def test_tensor_strategy_accepted(self):
+        assert Settings(distributed_strategy="tensor").distributed_strategy == "tensor"

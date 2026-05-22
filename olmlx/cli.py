@@ -1252,9 +1252,11 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
         sys.exit(1)
 
     strategy = hostfile.get("strategy", "tensor")
-    if strategy not in ("tensor", "pipeline"):
+    if strategy != "tensor":
         print(
-            f"Error: hostfile strategy must be 'tensor' or 'pipeline', got {strategy!r}",
+            f"Error: distributed inference is tensor-only; hostfile strategy "
+            f"must be 'tensor', got {strategy!r}. The pipeline strategy is not "
+            f"supported.",
             file=sys.stderr,
         )
         sys.exit(1)
