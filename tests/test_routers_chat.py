@@ -5,7 +5,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from olmlx.routers.chat import _flush_split_thinking, _split_thinking_streaming
+from olmlx.routers.thinking_split import (
+    flush_split_thinking,
+    split_thinking_streaming,
+)
 from olmlx.utils.timing import TimingStats
 
 
@@ -17,7 +20,7 @@ class TestSplitThinkingStreaming:
         buffer must be returned as thinking content (not silently lost)."""
         # Walk through chunks ending mid-think.
         state: dict = {}
-        thinking, content = _split_thinking_streaming("<think>partial reasoning", state)
+        thinking, content = split_thinking_streaming("<think>partial reasoning", state)
         # `<think>` consumed; "partial reasoning" is 17 chars in `in_think`
         # phase — the splitter emits all but the last 8 chars and holds the
         # tail in case `</think>` is straddling a chunk boundary.
@@ -27,7 +30,7 @@ class TestSplitThinkingStreaming:
         assert state["buffer"] == "easoning"
 
         # Stream ends — flush must surface the buffered remainder as thinking.
-        tail_thinking, tail_content = _flush_split_thinking(state)
+        tail_thinking, tail_content = flush_split_thinking(state)
         assert tail_thinking == "easoning"
         assert tail_content == ""
 

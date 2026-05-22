@@ -7,8 +7,8 @@ from fastapi.responses import StreamingResponse
 
 from olmlx.engine.inference import generate_completion
 from olmlx.engine.tool_parser import parse_model_output
-from olmlx.routers.chat import _flush_split_thinking, _split_thinking_streaming
 from olmlx.routers.common import format_error, resolve_think_flag
+from olmlx.routers.thinking_split import flush_split_thinking, split_thinking_streaming
 from olmlx.schemas.generate import GenerateRequest
 from olmlx.utils.streaming import safe_ndjson_stream
 
@@ -60,7 +60,7 @@ async def generate(req: GenerateRequest, request: Request):
                 return None
             now = datetime.now(timezone.utc).isoformat()
             if chunk.get("done"):
-                thinking_tail, content_tail = _flush_split_thinking(think_state)
+                thinking_tail, content_tail = flush_split_thinking(think_state)
                 stats = chunk.get("stats")
                 lines = []
                 if thinking_tail or content_tail:
@@ -78,7 +78,7 @@ async def generate(req: GenerateRequest, request: Request):
                     final.update(stats.to_dict())
                 lines.append(json.dumps(final) + "\n")
                 return lines
-            thinking_chunk, content_chunk = _split_thinking_streaming(
+            thinking_chunk, content_chunk = split_thinking_streaming(
                 chunk.get("text", ""), think_state
             )
             if not thinking_chunk and not content_chunk:

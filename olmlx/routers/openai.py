@@ -339,7 +339,9 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
     chat_id = _make_id()
     created = int(time.time())
     cache_id = request.headers.get("x-cache-id", "")[:256]
-    enable_thinking = resolve_openai_think(req.reasoning_effort, req.chat_template_kwargs)
+    enable_thinking = resolve_openai_think(
+        req.reasoning_effort, req.chat_template_kwargs
+    )
 
     if req.stream:
         result = await generate_chat(

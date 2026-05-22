@@ -1614,9 +1614,16 @@ def _apply_chat_template_vlm(
 
     config = model.config if hasattr(model, "config") else {}
     num_images = len(images) if images else 0
+    # mlx_vlm.apply_chat_template forwards **kwargs to the tokenizer's
+    # apply_chat_template, so enable_thinking reaches the Jinja template
+    # (templates that don't declare the variable ignore it).  Only forward
+    # when explicitly set so the template's own default is preserved otherwise.
+    extra_kwargs: dict = {}
+    if enable_thinking is not None:
+        extra_kwargs["enable_thinking"] = enable_thinking
     # Pass the full message list so the model gets proper conversation context
     result = mlx_vlm.apply_chat_template(
-        processor, config, messages, num_images=num_images
+        processor, config, messages, num_images=num_images, **extra_kwargs
     )
     if not isinstance(result, str):
         raise TypeError(
@@ -1763,7 +1770,9 @@ async def generate_completion(
                 lm.text_tokenizer,
                 messages,
                 caps=lm.template_caps,
-                enable_thinking=enable_thinking if enable_thinking is not None else False,
+                enable_thinking=enable_thinking
+                if enable_thinking is not None
+                else False,
             )
             logger.info(
                 "Applied chat template for /api/generate (prompt length: %d chars)",

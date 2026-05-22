@@ -940,6 +940,48 @@ class TestApplyChatTemplateVlm:
             )
         assert result == "result"
 
+    def test_vlm_template_forwards_enable_thinking(self):
+        """No-tools VLM path forwards enable_thinking to mlx_vlm (-> tokenizer)."""
+        from olmlx.engine.inference import _apply_chat_template_vlm
+
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+        mock_model = MagicMock()
+        mock_model.config = {"model_type": "qwen2_vl"}
+
+        with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+            _apply_chat_template_vlm(
+                MagicMock(),
+                mock_model,
+                [{"role": "user", "content": "describe"}],
+                enable_thinking=False,
+            )
+
+        assert (
+            mock_mlx_vlm.apply_chat_template.call_args.kwargs["enable_thinking"]
+            is False
+        )
+
+    def test_vlm_template_omits_enable_thinking_when_none(self):
+        """enable_thinking=None must not be forwarded (preserve template default)."""
+        from olmlx.engine.inference import _apply_chat_template_vlm
+
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+        mock_model = MagicMock()
+        mock_model.config = {"model_type": "qwen2_vl"}
+
+        with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+            _apply_chat_template_vlm(
+                MagicMock(),
+                mock_model,
+                [{"role": "user", "content": "describe"}],
+            )
+
+        assert (
+            "enable_thinking" not in mock_mlx_vlm.apply_chat_template.call_args.kwargs
+        )
+
 
 class TestNormalizeToolCallsInMessages:
     """Normalise OpenAI-format tool_calls to flat format for chat templates."""

@@ -211,9 +211,7 @@ class TestChatSchemas:
             ChatRequest(model="test", messages=[])
 
     def test_chat_request_think_defaults_none(self):
-        req = ChatRequest(
-            model="test", messages=[Message(role="user", content="hi")]
-        )
+        req = ChatRequest(model="test", messages=[Message(role="user", content="hi")])
         assert req.think is None
 
     def test_chat_request_think_bool(self):
