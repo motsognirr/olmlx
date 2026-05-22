@@ -1,14 +1,18 @@
 """Ad-hoc quality grading: run a model over the mini task-sets and grade.
 
-Usage: python scripts/grade_quant_compare.py <hf-path> <out.json> [--sets gsm8k,mmlu,humaneval]
+Usage: python scripts/grade_quant_compare.py <hf-path> <out.json>
+           [--sets gsm8k,mmlu,humaneval] [--max-tokens N]
 
 Starts its own `olmlx serve` subprocess (like the bench worker), sends each
 task prompt over HTTP with temp=0/seed=42, then grades the output with the
 existing olmlx.bench.quality graders. code_exec is enabled for HumanEval.
+A failed request is recorded (passed=null) and the run continues; partial
+results are always written, even on early exit.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import socket
@@ -44,6 +48,34 @@ def _wait(port: int, proc: subprocess.Popen, timeout: float = 180) -> bool:
     return False
 
 
+def _start_server(attempts: int = 3) -> tuple[subprocess.Popen, int]:
+    """Start `olmlx serve` on a free port, retrying on a fresh port if it
+    fails to come up. `_free_port()` releases the socket before the subprocess
+    binds it, so a collision is possible under load — retrying makes that race
+    non-fatal instead of dying with a misleading "server failed to start"."""
+    last_exit: int | None = None
+    for _ in range(attempts):
+        port = _free_port()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "olmlx", "serve"],
+            env={**os.environ, "OLMLX_PORT": str(port)},
+            stdout=subprocess.DEVNULL,
+            stderr=sys.stderr,
+        )
+        if _wait(port, proc):
+            return proc, port
+        last_exit = proc.poll()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    raise SystemExit(
+        f"server failed to start after {attempts} attempts (exit={last_exit})"
+    )
+
+
 def _chat(port: int, model: str, prompt, max_tokens: int | None = None) -> str:
     body = {
         "model": model,
@@ -66,36 +98,36 @@ def _chat(port: int, model: str, prompt, max_tokens: int | None = None) -> str:
 
 
 def main() -> None:
-    model = sys.argv[1]
-    out_path = sys.argv[2]
-    set_names = ["gsm8k", "mmlu", "humaneval"]
-    max_tokens_override: int | None = None
-    for i, a in enumerate(sys.argv):
-        if a == "--sets":
-            set_names = sys.argv[i + 1].split(",")
-        if a == "--max-tokens":
-            max_tokens_override = int(sys.argv[i + 1])
-
-    port = _free_port()
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "olmlx", "serve"],
-        env={**os.environ, "OLMLX_PORT": str(port)},
-        stdout=subprocess.DEVNULL,
-        stderr=sys.stderr,
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("model", help="Model name or HF path to serve and grade")
+    parser.add_argument("out_path", help="Where to write the results JSON")
+    parser.add_argument(
+        "--sets",
+        default="gsm8k,mmlu,humaneval",
+        help="Comma-separated task sets (default: gsm8k,mmlu,humaneval)",
     )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        dest="max_tokens",
+        help="Override num_predict for every prompt",
+    )
+    args = parser.parse_args()
+    set_names = args.sets.split(",")
+
+    proc, port = _start_server()
     results: list[dict] = []
     try:
-        if not _wait(port, proc):
-            raise SystemExit(f"server failed to start (exit={proc.poll()})")
         for set_name in set_names:
             for p in PROMPT_SETS[set_name]:
                 expected = dict(p.expected)
                 if p.grader == "code_exec":
                     expected["_enabled"] = True
-                out = _chat(port, model, p, max_tokens_override)
-                q = grade(p.grader, out, expected)
-                results.append(
-                    {
+                try:
+                    out = _chat(port, args.model, p, args.max_tokens)
+                    q = grade(p.grader, out, expected)
+                    entry = {
                         "set": set_name,
                         "name": p.name,
                         "grader": p.grader,
@@ -103,9 +135,19 @@ def main() -> None:
                         "score": q.score,
                         "detail": q.detail,
                     }
-                )
-                mark = {True: "PASS", False: "FAIL", None: "----"}[q.passed]
-                print(f"  [{mark}] {p.name}: {q.detail}", file=sys.stderr)
+                    mark = {True: "PASS", False: "FAIL", None: "----"}[q.passed]
+                    print(f"  [{mark}] {p.name}: {q.detail}", file=sys.stderr)
+                except Exception as e:  # noqa: BLE001 — one bad request shouldn't lose the run
+                    entry = {
+                        "set": set_name,
+                        "name": p.name,
+                        "grader": p.grader,
+                        "passed": None,
+                        "score": 0.0,
+                        "detail": f"request failed: {type(e).__name__}: {e}",
+                    }
+                    print(f"  [ERR ] {p.name}: {entry['detail']}", file=sys.stderr)
+                results.append(entry)
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -113,10 +155,10 @@ def main() -> None:
                 proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 proc.kill()
-
-    with open(out_path, "w") as f:
-        json.dump({"model": model, "results": results}, f, indent=2)
-    print(f"\nsaved {out_path}", file=sys.stderr)
+        if results:
+            with open(args.out_path, "w") as f:
+                json.dump({"model": args.model, "results": results}, f, indent=2)
+            print(f"\nsaved {args.out_path} ({len(results)} results)", file=sys.stderr)
 
 
 if __name__ == "__main__":
