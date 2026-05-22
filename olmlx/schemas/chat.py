@@ -33,6 +33,7 @@ class ChatRequest(BaseModel):
     tools: list[Tool] | None = None
     format: str | None = None
     stream: bool = True
+    think: bool | str | None = None
     options: ModelOptions | None = None
     keep_alive: str | None = None
 

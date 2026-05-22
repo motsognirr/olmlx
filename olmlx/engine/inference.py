@@ -1614,9 +1614,16 @@ def _apply_chat_template_vlm(
 
     config = model.config if hasattr(model, "config") else {}
     num_images = len(images) if images else 0
+    # mlx_vlm.apply_chat_template forwards **kwargs to the tokenizer's
+    # apply_chat_template, so enable_thinking reaches the Jinja template
+    # (templates that don't declare the variable ignore it).  Only forward
+    # when explicitly set so the template's own default is preserved otherwise.
+    extra_kwargs: dict[str, Any] = {}
+    if enable_thinking is not None:
+        extra_kwargs["enable_thinking"] = enable_thinking
     # Pass the full message list so the model gets proper conversation context
     result = mlx_vlm.apply_chat_template(
-        processor, config, messages, num_images=num_images
+        processor, config, messages, num_images=num_images, **extra_kwargs
     )
     if not isinstance(result, str):
         raise TypeError(
@@ -1737,6 +1744,7 @@ async def generate_completion(
     images: list[str] | None = None,
     apply_chat_template: bool = False,
     system: str | None = None,
+    enable_thinking: bool | None = None,
 ) -> AsyncGenerator[dict, None] | dict:
     """Generate a text completion, streaming or not.
 
@@ -1752,6 +1760,13 @@ async def generate_completion(
         lm = await manager.ensure_loaded(model_name, keep_alive)
     stats.load_duration = load_timer.duration_ns
 
+    # /api/generate defaults thinking OFF when unspecified (None), unlike the
+    # chat route's "think unless tools".  Coerce once so the template
+    # instruction and the downstream thinking_expected signal stay consistent
+    # (otherwise the splitter would arm the orphan-</think> buffer for thinking
+    # the model was told not to produce).
+    effective_thinking = enable_thinking if enable_thinking is not None else False
+
     if apply_chat_template and not lm.is_vlm:
         messages: list[dict] = []
         if system:
@@ -1762,7 +1777,7 @@ async def generate_completion(
                 lm.text_tokenizer,
                 messages,
                 caps=lm.template_caps,
-                enable_thinking=False,
+                enable_thinking=effective_thinking,
             )
             logger.info(
                 "Applied chat template for /api/generate (prompt length: %d chars)",
@@ -1784,7 +1799,21 @@ async def generate_completion(
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         try:
-            prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages)
+            # Forward the *coerced* effective_thinking (not raw enable_thinking)
+            # so VLM /api/generate is off-by-default like the text path, and so
+            # the explicit instruction matches the thinking_expected signal
+            # computed below.  We deliberately don't defer to the VLM template's
+            # own default: we can't introspect it, so passing an explicit bool
+            # is the only way to keep the thinking-splitter consistent.  This
+            # differs intentionally from generate_chat's no-tools VLM path,
+            # which passes None and lets _apply_chat_template_vlm's guard skip
+            # the kwarg (preserving the template default).  Consequence: every
+            # /api/generate VLM request passes enable_thinking (incl. False) to
+            # the template even for non-thinking VLMs — harmless because HF
+            # templates ignore unknown kwargs.
+            prompt = _apply_chat_template_vlm(
+                lm.tokenizer, lm.model, messages, enable_thinking=effective_thinking
+            )
             logger.info(
                 "Applied VLM chat template for /api/generate (prompt length: %d chars)",
                 len(prompt),
@@ -1810,10 +1839,28 @@ async def generate_completion(
     gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
+    # Tell routers whether to wait for a (possibly orphaned) `</think>` when
+    # splitting thinking from the response (issue #307) — shares the rules
+    # with `generate_chat`.  Completions never carry tools.  In raw mode no
+    # chat template is applied, so no thinking instruction reached the model:
+    # leave thinking_expected False so the router doesn't arm the orphan-close
+    # heuristic on un-templated output (a literal `</think>` in code/prose).
+    caps = lm.template_caps or TemplateCaps()
+    thinking_expected = (
+        _resolve_thinking_active(caps, None, effective_thinking)
+        if apply_chat_template
+        else False
+    )
+
     if stream:
-        return _stream_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        return _prepend_meta(
+            _stream_completion(lm, prompt, mt, gen_kwargs, stats, images),
+            {"thinking_expected": thinking_expected},
+        )
     else:
-        return await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        result = await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        result["thinking_expected"] = thinking_expected
+        return result
 
 
 @dataclasses.dataclass
@@ -2973,13 +3020,23 @@ async def generate_chat(
         elif tools:
             vlm_messages = _inject_tools_into_system(list(messages), tools)
             prompt = _apply_chat_template_vlm(
-                lm.tokenizer, lm.model, vlm_messages, images
+                lm.tokenizer,
+                lm.model,
+                vlm_messages,
+                images,
+                enable_thinking=vlm_thinking,
             )
             logger.info(
                 "VLM chat prompt with %d tools (injected into system)", len(tools)
             )
         else:
-            prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages, images)
+            prompt = _apply_chat_template_vlm(
+                lm.tokenizer,
+                lm.model,
+                messages,
+                images,
+                enable_thinking=vlm_thinking,
+            )
         logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
         logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
         if enable_thinking is not None and vlm_thinking is None:

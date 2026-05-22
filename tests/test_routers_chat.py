@@ -5,7 +5,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from olmlx.routers.chat import _flush_split_thinking, _split_thinking_streaming
+from olmlx.routers.thinking_split import (
+    flush_split_thinking,
+    split_thinking_streaming,
+)
 from olmlx.utils.timing import TimingStats
 
 
@@ -17,7 +20,7 @@ class TestSplitThinkingStreaming:
         buffer must be returned as thinking content (not silently lost)."""
         # Walk through chunks ending mid-think.
         state: dict = {}
-        thinking, content = _split_thinking_streaming("<think>partial reasoning", state)
+        thinking, content = split_thinking_streaming("<think>partial reasoning", state)
         # `<think>` consumed; "partial reasoning" is 17 chars in `in_think`
         # phase — the splitter emits all but the last 8 chars and holds the
         # tail in case `</think>` is straddling a chunk boundary.
@@ -27,12 +30,83 @@ class TestSplitThinkingStreaming:
         assert state["buffer"] == "easoning"
 
         # Stream ends — flush must surface the buffered remainder as thinking.
-        tail_thinking, tail_content = _flush_split_thinking(state)
+        tail_thinking, tail_content = flush_split_thinking(state)
         assert tail_thinking == "easoning"
         assert tail_content == ""
 
+    def test_flush_resets_thinking_expected(self):
+        """flush_split_thinking resets all managed keys, including
+        thinking_expected, so a reused state dict starts a fresh stream."""
+        state: dict = {"thinking_expected": True, "buffer": "x", "phase": "detect"}
+        flush_split_thinking(state)
+        assert not state.get("thinking_expected")
+
 
 class TestChatRouter:
+    @pytest.mark.asyncio
+    async def test_chat_think_default_none(self, app_client):
+        """No `think` field -> enable_thinking=None (engine default)."""
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                },
+            )
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs["enable_thinking"] is None
+
+    @pytest.mark.asyncio
+    async def test_chat_think_false_disables(self, app_client):
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                    "think": False,
+                },
+            )
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs["enable_thinking"] is False
+
+    @pytest.mark.asyncio
+    async def test_chat_think_true_streaming_enables(self, app_client):
+        captured = {}
+
+        async def mock_stream(*args, **kwargs):
+            captured.update(kwargs)
+
+            async def gen():
+                yield {"text": "hi", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                    "think": True,
+                },
+            )
+        assert resp.status_code == 200
+        assert captured["enable_thinking"] is True
+
     @pytest.mark.asyncio
     async def test_chat_non_streaming_strips_gemma4_channel(self, app_client):
         """Gemma 4 channel-thinking tokens must not leak into message.content (#306)."""

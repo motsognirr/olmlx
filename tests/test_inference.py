@@ -940,6 +940,48 @@ class TestApplyChatTemplateVlm:
             )
         assert result == "result"
 
+    def test_vlm_template_forwards_enable_thinking(self):
+        """No-tools VLM path forwards enable_thinking to mlx_vlm (-> tokenizer)."""
+        from olmlx.engine.inference import _apply_chat_template_vlm
+
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+        mock_model = MagicMock()
+        mock_model.config = {"model_type": "qwen2_vl"}
+
+        with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+            _apply_chat_template_vlm(
+                MagicMock(),
+                mock_model,
+                [{"role": "user", "content": "describe"}],
+                enable_thinking=False,
+            )
+
+        assert (
+            mock_mlx_vlm.apply_chat_template.call_args.kwargs["enable_thinking"]
+            is False
+        )
+
+    def test_vlm_template_omits_enable_thinking_when_none(self):
+        """enable_thinking=None must not be forwarded (preserve template default)."""
+        from olmlx.engine.inference import _apply_chat_template_vlm
+
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+        mock_model = MagicMock()
+        mock_model.config = {"model_type": "qwen2_vl"}
+
+        with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+            _apply_chat_template_vlm(
+                MagicMock(),
+                mock_model,
+                [{"role": "user", "content": "describe"}],
+            )
+
+        assert (
+            "enable_thinking" not in mock_mlx_vlm.apply_chat_template.call_args.kwargs
+        )
+
 
 class TestNormalizeToolCallsInMessages:
     """Normalise OpenAI-format tool_calls to flat format for chat templates."""
@@ -1286,6 +1328,127 @@ class TestGenerateCompletion:
         assert call_args[1]["enable_thinking"] is False
 
     @pytest.mark.asyncio
+    async def test_apply_chat_template_enable_thinking_true(self, mock_manager):
+        """enable_thinking=True is forwarded to the chat template (not forced off)."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_lm = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.text_tokenizer.apply_chat_template.return_value = "templated"
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="out",
+                ):
+                    await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=True,
+                        enable_thinking=True,
+                    )
+
+        call_args = lm.text_tokenizer.apply_chat_template.call_args
+        assert call_args[1]["enable_thinking"] is True
+
+    @pytest.mark.asyncio
+    async def test_default_generate_thinking_expected_matches_template(
+        self, mock_manager
+    ):
+        """For the default /api/generate case (enable_thinking=None) the text
+        template is told not to think (None->False), so thinking_expected must
+        also be False — otherwise the splitter arms the 1024-char orphan buffer
+        for thinking the model was never asked to produce."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_lm = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+        # Thinking-capable model (mock fixture sets supports_enable_thinking=True).
+        lm.text_tokenizer.apply_chat_template.return_value = "templated"
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="out",
+                ):
+                    result = await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=True,
+                        # enable_thinking omitted -> None (default off for generate)
+                    )
+
+        # Template was told not to think...
+        assert (
+            lm.text_tokenizer.apply_chat_template.call_args[1]["enable_thinking"]
+            is False
+        )
+        # ...so thinking_expected must agree.
+        assert result["thinking_expected"] is False
+
+    @pytest.mark.asyncio
+    async def test_raw_mode_thinking_expected_false(self, mock_manager):
+        """Raw mode injects no thinking instruction, so thinking_expected must
+        be False even with enable_thinking=True — otherwise the generate
+        router arms the orphan-</think> heuristic on un-templated output."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_lm = MagicMock()
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="out",
+                ):
+                    result = await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=False,
+                        enable_thinking=True,
+                    )
+
+        assert result["thinking_expected"] is False
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_surfaces_thinking_expected(self, mock_manager):
+        """Non-streaming result carries thinking_expected so routers can split."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_lm = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.text_tokenizer.apply_chat_template.return_value = "templated"
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="out",
+                ):
+                    result = await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=True,
+                        enable_thinking=True,
+                    )
+
+        assert result["thinking_expected"] is True
+
+    @pytest.mark.asyncio
     async def test_apply_chat_template_with_system(self, mock_manager):
         """System prompt becomes a proper system role message, not part of user content."""
         mock_mx = MagicMock()
@@ -1412,6 +1575,43 @@ class TestGenerateCompletion:
         assert prompt_arg == "vlm formatted prompt"
 
     @pytest.mark.asyncio
+    async def test_vlm_generate_default_forwards_thinking_off(self, mock_manager):
+        """/api/generate is off-by-default uniformly: a VLM call with `think`
+        omitted forwards enable_thinking=False (the coerced default) to the VLM
+        template — not None — so the explicit instruction matches the
+        thinking_expected signal the router consumes."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference._full_completion",
+                    new_callable=AsyncMock,
+                    return_value={"text": "Hi", "done": True},
+                ):
+                    result = await generate_completion(
+                        mock_manager,
+                        "qwen3",
+                        "Hello",
+                        stream=False,
+                        apply_chat_template=True,
+                        # enable_thinking omitted -> None -> coerced to False
+                    )
+
+        assert (
+            mock_mlx_vlm.apply_chat_template.call_args.kwargs["enable_thinking"]
+            is False
+        )
+        # ...and the surfaced signal agrees.
+        assert result["thinking_expected"] is False
+
+    @pytest.mark.asyncio
     async def test_apply_chat_template_vlm_with_system(self, mock_manager):
         """VLM models include system message in chat template."""
         mock_mx = MagicMock()
@@ -1515,6 +1715,45 @@ class TestGenerateCompletion:
             done_stats.prompt_eval_duration + done_stats.eval_duration
             <= done_stats.total_duration
         )
+
+    @pytest.mark.asyncio
+    async def test_streaming_prepends_thinking_expected_meta(self, mock_manager):
+        """Streaming completion yields a thinking_expected meta chunk first."""
+        mock_mx = MagicMock()
+        mock_mx.core = mock_mx
+
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+        empty_iter = iter([])
+
+        async def anext_impl():
+            try:
+                return next(empty_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.text_tokenizer.apply_chat_template.return_value = "templated"
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch(
+                "olmlx.engine.inference.async_mlx_stream", return_value=mock_stream
+            ):
+                gen = await generate_completion(
+                    mock_manager,
+                    "qwen3",
+                    "Hello",
+                    stream=True,
+                    apply_chat_template=True,
+                    enable_thinking=True,
+                )
+                chunks = [chunk async for chunk in gen]
+
+        assert chunks[0] == {"thinking_expected": True}
 
 
 class TestGenerateChat:
@@ -1808,6 +2047,78 @@ class TestGenerateChatVlm:
         # VLM should use VLM template, not text template
         mock_text_tpl.assert_not_called()
         mock_mlx_vlm.apply_chat_template.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_vlm_no_tools_forwards_enable_thinking(self, mock_manager):
+        """No-tools VLM chat path must honor enable_thinking (think=false) on a
+        thinking-capable VLM — not silently drop it."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        lm.template_caps = TemplateCaps(
+            supports_tools=True, supports_enable_thinking=True
+        )
+
+        mock_mx = MagicMock()
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="response",
+                ):
+                    await generate_chat(
+                        mock_manager,
+                        "qwen3",
+                        [{"role": "user", "content": "describe"}],
+                        stream=False,
+                        enable_thinking=False,
+                    )
+
+        # No tools -> the bare no-tools branch must still forward enable_thinking.
+        assert (
+            mock_mlx_vlm.apply_chat_template.call_args.kwargs["enable_thinking"]
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_vlm_tool_injection_forwards_enable_thinking(self, mock_manager):
+        """Tool-injection VLM fallback (template lacks native tool support) must
+        also forward enable_thinking."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        # supports_tools=False forces the system-injection fallback branch.
+        lm.template_caps = TemplateCaps(
+            supports_tools=False, supports_enable_thinking=True
+        )
+
+        mock_mx = MagicMock()
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="response",
+                ):
+                    await generate_chat(
+                        mock_manager,
+                        "qwen3",
+                        [{"role": "user", "content": "describe"}],
+                        tools=tools,
+                        stream=False,
+                        enable_thinking=False,
+                    )
+
+        assert (
+            mock_mlx_vlm.apply_chat_template.call_args.kwargs["enable_thinking"]
+            is False
+        )
 
     @pytest.mark.asyncio
     async def test_vlm_enable_thinking_warns_when_unsupported(
@@ -4288,7 +4599,7 @@ class TestInferenceTimeout:
         done_chunk = chunks[-1]
         assert done_chunk["done"] is True
         assert "done_reason" not in done_chunk
-        text_chunks = [c for c in chunks if not c.get("done")]
+        text_chunks = [c for c in chunks if not c.get("done") and "text" in c]
         assert len(text_chunks) == 3
 
     @pytest.mark.asyncio

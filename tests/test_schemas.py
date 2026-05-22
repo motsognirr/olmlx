@@ -150,6 +150,34 @@ class TestGenerateSchemas:
         assert resp.response == "hello"
         assert resp.done is True
 
+    def test_generate_request_think_defaults_none(self):
+        req = GenerateRequest(model="test", prompt="hi")
+        assert req.think is None
+
+    def test_generate_request_think_bool(self):
+        assert GenerateRequest(model="test", prompt="hi", think=True).think is True
+        assert GenerateRequest(model="test", prompt="hi", think=False).think is False
+
+    def test_generate_request_think_string_level(self):
+        req = GenerateRequest(model="test", prompt="hi", think="low")
+        assert req.think == "low"
+
+    def test_generate_response_thinking_field(self):
+        resp = GenerateResponse(
+            model="test",
+            created_at="now",
+            response="hello",
+            done=True,
+            thinking="reasoning",
+        )
+        assert resp.thinking == "reasoning"
+
+    def test_generate_response_thinking_defaults_none(self):
+        resp = GenerateResponse(
+            model="test", created_at="now", response="hello", done=True
+        )
+        assert resp.thinking is None
+
 
 class TestChatSchemas:
     def test_message(self):
@@ -181,6 +209,23 @@ class TestChatSchemas:
     def test_chat_request_rejects_empty_messages(self):
         with pytest.raises(ValidationError, match="messages"):
             ChatRequest(model="test", messages=[])
+
+    def test_chat_request_think_defaults_none(self):
+        req = ChatRequest(model="test", messages=[Message(role="user", content="hi")])
+        assert req.think is None
+
+    def test_chat_request_think_bool(self):
+        msgs = [Message(role="user", content="hi")]
+        assert ChatRequest(model="test", messages=msgs, think=True).think is True
+        assert ChatRequest(model="test", messages=msgs, think=False).think is False
+
+    def test_chat_request_think_string_level(self):
+        req = ChatRequest(
+            model="test",
+            messages=[Message(role="user", content="hi")],
+            think="high",
+        )
+        assert req.think == "high"
 
 
 class TestModelSchemas:
@@ -315,6 +360,24 @@ class TestOpenAISchemas:
         assert req.stream is False
         assert req.n == 1
         assert req.frequency_penalty is None
+        assert req.reasoning_effort is None
+        assert req.chat_template_kwargs is None
+
+    def test_chat_request_reasoning_effort(self):
+        req = OpenAIChatRequest(
+            model="test",
+            messages=[OpenAIChatMessage(role="user", content="hi")],
+            reasoning_effort="high",
+        )
+        assert req.reasoning_effort == "high"
+
+    def test_chat_request_chat_template_kwargs(self):
+        req = OpenAIChatRequest(
+            model="test",
+            messages=[OpenAIChatMessage(role="user", content="hi")],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        assert req.chat_template_kwargs == {"enable_thinking": False}
 
     def test_chat_response(self):
         resp = OpenAIChatResponse(
