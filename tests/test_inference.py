@@ -2049,6 +2049,78 @@ class TestGenerateChatVlm:
         mock_mlx_vlm.apply_chat_template.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_vlm_no_tools_forwards_enable_thinking(self, mock_manager):
+        """No-tools VLM chat path must honor enable_thinking (think=false) on a
+        thinking-capable VLM — not silently drop it."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        lm.template_caps = TemplateCaps(
+            supports_tools=True, supports_enable_thinking=True
+        )
+
+        mock_mx = MagicMock()
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="response",
+                ):
+                    await generate_chat(
+                        mock_manager,
+                        "qwen3",
+                        [{"role": "user", "content": "describe"}],
+                        stream=False,
+                        enable_thinking=False,
+                    )
+
+        # No tools -> the bare no-tools branch must still forward enable_thinking.
+        assert (
+            mock_mlx_vlm.apply_chat_template.call_args.kwargs["enable_thinking"]
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_vlm_tool_injection_forwards_enable_thinking(self, mock_manager):
+        """Tool-injection VLM fallback (template lacks native tool support) must
+        also forward enable_thinking."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        # supports_tools=False forces the system-injection fallback branch.
+        lm.template_caps = TemplateCaps(
+            supports_tools=False, supports_enable_thinking=True
+        )
+
+        mock_mx = MagicMock()
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+                with patch(
+                    "olmlx.engine.inference.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                    return_value="response",
+                ):
+                    await generate_chat(
+                        mock_manager,
+                        "qwen3",
+                        [{"role": "user", "content": "describe"}],
+                        tools=tools,
+                        stream=False,
+                        enable_thinking=False,
+                    )
+
+        assert (
+            mock_mlx_vlm.apply_chat_template.call_args.kwargs["enable_thinking"]
+            is False
+        )
+
+    @pytest.mark.asyncio
     async def test_vlm_enable_thinking_warns_when_unsupported(
         self, mock_manager, caplog
     ):

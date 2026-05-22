@@ -42,6 +42,10 @@ def resolve_openai_think(
     Precedence: an explicit ``chat_template_kwargs["enable_thinking"]``
     (vLLM/SGLang convention, the only clean OFF switch) wins; otherwise the
     presence of ``reasoning_effort`` means on; otherwise ``None`` (default).
+
+    Note: only the ``enable_thinking`` key of ``chat_template_kwargs`` is
+    consumed — other keys are intentionally ignored (this server uses the dict
+    solely as the thinking switch, not a general template-kwargs passthrough).
     """
     if chat_template_kwargs and "enable_thinking" in chat_template_kwargs:
         return bool(chat_template_kwargs["enable_thinking"])

@@ -3020,13 +3020,23 @@ async def generate_chat(
         elif tools:
             vlm_messages = _inject_tools_into_system(list(messages), tools)
             prompt = _apply_chat_template_vlm(
-                lm.tokenizer, lm.model, vlm_messages, images
+                lm.tokenizer,
+                lm.model,
+                vlm_messages,
+                images,
+                enable_thinking=vlm_thinking,
             )
             logger.info(
                 "VLM chat prompt with %d tools (injected into system)", len(tools)
             )
         else:
-            prompt = _apply_chat_template_vlm(lm.tokenizer, lm.model, messages, images)
+            prompt = _apply_chat_template_vlm(
+                lm.tokenizer,
+                lm.model,
+                messages,
+                images,
+                enable_thinking=vlm_thinking,
+            )
         logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
         logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
         if enable_thinking is not None and vlm_thinking is None:

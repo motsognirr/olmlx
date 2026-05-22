@@ -55,7 +55,13 @@ class OpenAIChatRequest(BaseModel):
     seed: int | None = None
     response_format: ResponseFormat | None = None
     reasoning_effort: str | None = None
-    chat_template_kwargs: dict[str, Any] | None = None
+    chat_template_kwargs: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Only the 'enable_thinking' key is honored (the thinking on/off "
+            "switch); other keys are not forwarded to the chat template."
+        ),
+    )
 
     @field_validator("max_tokens", "max_completion_tokens")
     @classmethod
