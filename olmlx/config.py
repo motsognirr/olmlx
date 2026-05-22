@@ -146,6 +146,18 @@ class Settings(BaseSettings):
     flash_moe_cache_budget_experts: Annotated[int, Field(ge=0)] = 48
     flash_moe_io_threads: Annotated[int, Field(gt=0)] = 32
 
+    # Flash prefetch — promoted toggle. Advanced prefetch tuning
+    # (confidence_threshold, min/max_neurons, io_threads) stays on
+    # ``ExperimentalSettings``. Controls both runtime prefetch and whether
+    # ``olmlx flash prepare`` trains the LookaheadBank.
+    flash_prefetch: bool = False
+
+    # Flash + speculative decoding (SpeculativeFlashDecoder). Per-model
+    # overrides live on ``ModelConfig`` in ``olmlx.engine.registry``.
+    flash_speculative: bool = False
+    flash_speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
+    flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
+
     @model_validator(mode="after")
     def validate_auto_calibrate(self) -> "Settings":
         if self.kv_cache_auto_calibrate and (
@@ -196,6 +208,22 @@ class Settings(BaseSettings):
             )
         return stripped
 
+    @field_validator("flash_speculative_draft_model")
+    @classmethod
+    def validate_flash_speculative_draft_model(cls, v: str | None) -> str | None:
+        # ``Field(min_length=1)`` already rejects ``""``, but a
+        # whitespace-only value (``"   "``) has length > 0 and would
+        # otherwise reach the load path and surface as a misleading
+        # "flash draft not set" error. Strip and reject empty here.
+        if v is None:
+            return v
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError(
+                "flash_speculative_draft_model must be a non-empty HuggingFace path"
+            )
+        return stripped
+
     @field_validator("anthropic_models")
     @classmethod
     def validate_anthropic_model_keys(cls, v: dict[str, str]) -> dict[str, str]:
@@ -226,6 +254,9 @@ class ExperimentalSettings(BaseSettings):
     # not need to set. Per-model overrides for advanced knobs still go
     # under the ``experimental`` block in models.json. (``distributed_*``
     # was promoted to ``Settings`` in #326 and removed from here too.)
+    # ``flash_prefetch`` (toggle) and ``flash_speculative*`` were promoted
+    # to ``Settings`` in #275/#276; only the prefetch *tuning* knobs
+    # (confidence_threshold, min/max_neurons, io_threads) remain here.
     flash_window_size: Annotated[int, Field(gt=0)] = 5
     flash_io_threads: Annotated[int, Field(gt=0)] = 32
     flash_cache_budget_neurons: Annotated[int, Field(ge=0)] = 1024
@@ -234,14 +265,10 @@ class ExperimentalSettings(BaseSettings):
     flash_predictor_sensitive_rank_multiplier: Annotated[int, Field(gt=0)] = 4
     flash_bypass_os_cache: bool = False
     flash_preallocated_buffer: bool = False
-    flash_prefetch: bool = False
     flash_prefetch_confidence_threshold: Annotated[float, Field(gt=0, le=1.0)] = 0.3
     flash_prefetch_min_neurons: Annotated[int, Field(gt=0)] = 64
     flash_prefetch_max_neurons: Annotated[int, Field(gt=0)] | None = None
     flash_prefetch_io_threads: Annotated[int, Field(gt=0)] = 16
-    flash_speculative: bool = False
-    flash_speculative_draft_model: str | None = None
-    flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
 
 experimental = ExperimentalSettings()
