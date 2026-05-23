@@ -2078,6 +2078,12 @@ class ModelManager:
             # falling into the except handler's defaults.  Currently both
             # probes are pure string-set lookups that can't raise, but the
             # pattern is cheap and removes the ordering dependency.
+            # ``persist_layout_ok`` is a third intermediate computed here
+            # and consumed in the logging dispatch outside the try, but
+            # its read site is gated on ``probe_succeeded`` — if any
+            # fallible logic is later inserted between the two probes,
+            # an exception there leaves ``persist_layout_ok = False`` with
+            # ``probe_succeeded = False`` and the dispatch is skipped.
             trim_ok = _cache_supports_trim(probe_cache)
             # Raw layout-persistence result from the allowlist, kept
             # separately from the post-#343 effective flag so the
@@ -2099,13 +2105,14 @@ class ModelManager:
             # short-circuit the store/load path entirely.  Trim implies
             # persist; persist without trim does not, post-#343.
             #
-            # Note: with the current allowlists (_TRIMMABLE_CACHE_CLASSES
-            # ⊂ _PERSISTABLE_CACHE_CLASSES), ``trim_ok=True`` already
-            # implies ``persist_layout_ok=True``, so this is functionally
-            # equivalent to ``persist_ok = trim_ok``.  The two-term form
-            # is intentional: if a future class is added that is
-            # trimmable but not persistable, the formula stays correct
-            # without further changes.
+            # Today ``trim_ok ⇒ persist_layout_ok`` holds because
+            # _TRIMMABLE_CACHE_CLASSES ⊂ _PERSISTABLE_CACHE_CLASSES, but
+            # the two-term form is kept on purpose so the formula self-
+            # corrects if that subset relation ever breaks (e.g. a
+            # future cache class added to the trim allowlist but not the
+            # persist allowlist).  Do not simplify to ``persist_ok =
+            # trim_ok``: that would silently over-persist any such class
+            # at the next mlx-lm release.
             persist_ok = persist_layout_ok and trim_ok
             lm.supports_cache_trim = trim_ok
             lm.supports_cache_persistence = persist_ok
