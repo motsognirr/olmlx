@@ -1094,7 +1094,7 @@ async def _inference_locked(
 
 
 @contextlib.contextmanager
-def _inference_ref(lm: LoadedModel):
+def _inference_ref(lm: LoadedModel, keep_alive: str | None = None):
     """Track active inference on a model to prevent expiry during use.
 
     Note: there is a small window between ``ensure_loaded()`` (which returns
@@ -1108,6 +1108,10 @@ def _inference_ref(lm: LoadedModel):
     Bug #118: Python ``+=`` on int is not atomic. Concurrent async tasks can
     race on ``active_refs``. Use the model's ``_active_refs_lock`` to protect
     increments and decrements.
+
+    Bug #338: *keep_alive* overrides the global default for expiry refresh.
+    When a request passes a specific keep_alive, that value is honoured after
+    inference instead of being silently replaced with the global default.
     """
     with lm._active_refs_lock:
         lm.active_refs += 1
@@ -1116,10 +1120,15 @@ def _inference_ref(lm: LoadedModel):
     finally:
         with lm._active_refs_lock:
             lm.active_refs -= 1
-        # Refresh expiry so the model doesn't expire immediately after inference
-        ka = parse_keep_alive(settings.default_keep_alive)
+        # Refresh expiry so the model doesn't expire immediately after inference.
+        # Honour per-request keep_alive when available (fix #338).
+        ka = parse_keep_alive(
+            keep_alive if keep_alive is not None else settings.default_keep_alive
+        )
         if ka is not None:
             lm.expires_at = time.time() + ka
+        else:
+            lm.expires_at = None
 
 
 def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
@@ -1854,11 +1863,11 @@ async def generate_completion(
 
     if stream:
         return _prepend_meta(
-            _stream_completion(lm, prompt, mt, gen_kwargs, stats, images),
+            _stream_completion(lm, prompt, mt, gen_kwargs, stats, images, keep_alive=keep_alive),
             {"thinking_expected": thinking_expected},
         )
     else:
-        result = await _full_completion(lm, prompt, mt, gen_kwargs, stats, images)
+        result = await _full_completion(lm, prompt, mt, gen_kwargs, stats, images, keep_alive=keep_alive)
         result["thinking_expected"] = thinking_expected
         return result
 
@@ -2387,6 +2396,7 @@ async def _stream_completion(
     use_prompt_cache: bool = False,
     prompt_tokens: list[int] | None = None,
     cache_id: str = "",
+    keep_alive: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
@@ -2553,7 +2563,7 @@ async def _stream_completion(
         )
         timed_out = False
 
-        with _inference_ref(lm), Timer() as total_timer:
+        with _inference_ref(lm, keep_alive=keep_alive), Timer() as total_timer:
             with Timer() as eval_timer:
                 inf_start = time.monotonic()
                 token = None
@@ -2716,13 +2726,14 @@ async def _full_completion(
     use_prompt_cache: bool = False,
     prompt_tokens: list[int] | None = None,
     cache_id: str = "",
+    keep_alive: str | None = None,
 ) -> dict:
     # inference_timeout is not enforced for non-streaming: the GPU thread
     # cannot be safely cancelled (releasing the lock while Metal is still
     # running causes concurrent command buffer access).  Streaming handles
     # this via CancellableStream.cancel() + drain_and_join().
     async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
-        with _inference_ref(lm):
+        with _inference_ref(lm, keep_alive=keep_alive):
             # Cache setup must happen under the inference lock so two
             # concurrent requests can't race to read/mutate the same store
             # entry.  The gate at the call site has already excluded VLM
@@ -3210,6 +3221,7 @@ async def generate_chat(
                 use_prompt_cache=use_prompt_cache,
                 prompt_tokens=prompt_tokens,
                 cache_id=cache_id,
+                keep_alive=keep_alive,
             ),
             {"thinking_expected": thinking_expected},
         )
@@ -3225,6 +3237,7 @@ async def generate_chat(
             use_prompt_cache=use_prompt_cache,
             prompt_tokens=prompt_tokens,
             cache_id=cache_id,
+            keep_alive=keep_alive,
         )
         # Mirror the streaming meta chunk so non-streaming routers can gate
         # orphan `</think>` handling on the same signal (issue #307).
@@ -3292,7 +3305,7 @@ async def generate_embeddings(
     lm = await manager.ensure_loaded(model_name, keep_alive)
 
     async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
-        with _inference_ref(lm):
+        with _inference_ref(lm, keep_alive=keep_alive):
             embeddings = []
 
             tokenizer = lm.text_tokenizer

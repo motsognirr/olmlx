@@ -723,3 +723,153 @@ class TestKVCacheMemorySafetyFactor:
         """Zero tokens should still return 0."""
         model = MagicMock()
         assert estimate_kv_cache_bytes(model, 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Bug #338: _inference_ref expiry refresh ignores per-request keep_alive
+# ---------------------------------------------------------------------------
+class TestInferenceRefKeepAlive:
+    """_inference_ref must honour per-request keep_alive (fix #338)."""
+
+    # The multi-threaded test above (test_concurrent_inference_ref_no_race)
+    # patches parse_keep_alive concurrently in 10 threads.  unittest.mock.patch
+    # is not thread-safe for the same target — a thread may restore another
+    # thread's mock as the "original", leaking the mock into subsequent tests.
+    # Work around by restoring the real function before each test.
+    @staticmethod
+    def setup_method() -> None:
+        import olmlx.engine.model_manager as _mm
+
+        _inf_mod.parse_keep_alive = _mm.parse_keep_alive  # type: ignore[attr-defined]
+
+    def test_uses_per_request_keep_alive(self):
+        """_inference_ref(keep_alive='1s') should set expiry to ~1 second."""
+        real_lm = LoadedModel(
+            name="test",
+            hf_path="test/test",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        with _inference_ref(real_lm, keep_alive="1s"):
+            pass
+
+        assert real_lm.expires_at is not None
+        assert real_lm.expires_at <= time.time() + 2, (
+            f"expires_at should be ~1s from now, got {real_lm.expires_at - time.time():.1f}s"
+        )
+
+    def test_uses_zero_keep_alive(self):
+        """_inference_ref(keep_alive='0') should set expiry to now."""
+        real_lm = LoadedModel(
+            name="test",
+            hf_path="test/test",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        with _inference_ref(real_lm, keep_alive="0"):
+            pass
+
+        assert real_lm.expires_at is not None
+        assert real_lm.expires_at <= time.time() + 1, (
+            f"expires_at should be ~0s from now, got {real_lm.expires_at - time.time():.1f}s"
+        )
+
+    def test_never_expire_keep_alive(self):
+        """_inference_ref(keep_alive='-1') should set expires_at to None."""
+        real_lm = LoadedModel(
+            name="test",
+            hf_path="test/test",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        real_lm.expires_at = time.time() + 300
+        with _inference_ref(real_lm, keep_alive="-1"):
+            pass
+
+        assert real_lm.expires_at is None, (
+            f"expires_at should be None for keep_alive=-1, got {real_lm.expires_at}"
+        )
+
+    def test_falls_back_to_default_keep_alive(self):
+        """_inference_ref() without keep_alive should use settings.default_keep_alive."""
+        real_lm = LoadedModel(
+            name="test",
+            hf_path="test/test",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        with patch.object(
+            _inf_mod.settings, "default_keep_alive", "2m"
+        ):
+            with _inference_ref(real_lm):
+                pass
+
+        assert real_lm.expires_at is not None
+        assert 110 <= (real_lm.expires_at - time.time()) <= 130, (
+            f"expires_at should be ~120s (2m) from now, "
+            f"got {real_lm.expires_at - time.time():.1f}s"
+        )
+
+    def test_none_setting_default_regression(self):
+        """When keep_alive is None and settings is also None, no refresh happens.
+
+        This is the pre-fix behaviour for the default path (unchanged).
+        """
+        real_lm = LoadedModel(
+            name="test",
+            hf_path="test/test",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        with patch.object(_inf_mod.settings, "default_keep_alive", "0"):
+            with _inference_ref(real_lm):
+                pass
+
+        assert real_lm.expires_at is not None
+        assert real_lm.expires_at <= time.time() + 1, (
+            f"expires_at should be ~0s from now, got {real_lm.expires_at - time.time():.1f}s"
+        )
+
+    def test_speculative_refresh_does_not_overwrite_never(self):
+        """When keep_alive='-1', _inference_ref should not overwrite with default.
+
+        Regression test: before #338, _inference_ref would clobber expires_at=None
+        with the global default even when the request asked for -1.
+        """
+        real_lm = LoadedModel(
+            name="test",
+            hf_path="test/test",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        real_lm.expires_at = None
+
+        with patch.object(
+            _inf_mod.settings, "default_keep_alive", "5m"
+        ):
+            with _inference_ref(real_lm, keep_alive="-1"):
+                pass
+
+        assert real_lm.expires_at is None, (
+            "keep_alive='-1' must keep expires_at=None even when default_keep_alive=5m"
+        )
+
+    def test_request_keep_alive_overrides_default(self):
+        """Per-request keep_alive='1s' must override settings.default_keep_alive='5m'"""
+        real_lm = LoadedModel(
+            name="test",
+            hf_path="test/test",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+        )
+        with patch.object(
+            _inf_mod.settings, "default_keep_alive", "5m"
+        ):
+            with _inference_ref(real_lm, keep_alive="1s"):
+                pass
+
+        assert real_lm.expires_at is not None
+        assert real_lm.expires_at <= time.time() + 2, (
+            f"Per-request keep_alive='1s' must win over default '5m', "
+            f"got {real_lm.expires_at - time.time():.1f}s"
+        )
