@@ -47,6 +47,11 @@ def _capture_bench_env() -> dict[str, str]:
     back to engine default) does **not** land in the saved JSON, so an
     operator reading the run record can trust that what's there reflects
     the run that happened.
+
+    Maintenance: when adding a new experiment-defining env var, extend
+    this function explicitly. The enumeration is deliberately not
+    pattern-based (no ``OLMLX_BENCH_*`` glob) so operational variables
+    aren't accidentally promoted to the experiment record.
     """
     from olmlx.bench.worker import is_recognized_think_value
 
@@ -114,6 +119,18 @@ def build_prompts(prompt_set: str) -> list[BenchPrompt]:
     from olmlx.bench.task_prompts import PROMPT_SETS
 
     graded = [p for sets in PROMPT_SETS.values() for p in sets]
+    # Same collision rationale as the ``all`` branch below, but within the
+    # graded set itself — if two entries across the GSM8K / MMLU / HumanEval
+    # sub-sets ever share a name, ``apply_graders``'s ``by_name`` dict
+    # silently keeps the last and mis-grades the first matching result.
+    graded_dupes = sorted(
+        n for n, c in Counter(p.name for p in graded).items() if c > 1
+    )
+    if graded_dupes:
+        raise ValueError(
+            f"Duplicate prompt names within quality set: {graded_dupes!r}. "
+            f"Rename to keep prompt names unique."
+        )
     if prompt_set == "quality":
         return graded
     if prompt_set == "all":
@@ -264,6 +281,18 @@ def run_bench(
     # from the same single read of ``OLMLX_BENCH_WORKER_TIMEOUT``.
     worker_timeout = _worker_timeout()
     logger.info("Bench worker timeout: %.0fs", worker_timeout)
+    # If think is being toggled while running ``--prompt-set all``, the
+    # throughput probes run in think mode too. The summary line later
+    # combines tok/s and quality, but the tok/s figure won't be a
+    # standard baseline comparable to a non-think throughput run; warn
+    # so the operator doesn't misread.
+    if prompt_set == "all" and os.environ.get("OLMLX_BENCH_THINK"):
+        print(
+            "  note: OLMLX_BENCH_THINK is set with --prompt-set all — throughput "
+            "probes also run in thinking mode, so the tok/s figure is not a "
+            "standard baseline.",
+            file=sys.stderr,
+        )
 
     scenario_results: list[ScenarioResult] = []
 

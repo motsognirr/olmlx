@@ -71,6 +71,36 @@ class TestBuildPrompts:
             "BenchPrompt.to_dict() did not surface grader to apply_graders"
         )
 
+    def test_quality_set_raises_on_within_set_duplicate(self, monkeypatch):
+        # Same collision concern as ``"all"`` but within the graded set:
+        # if two task_prompts entries ever share a name, apply_graders's
+        # by-name dict silently keeps the last one. Synthesize a collision
+        # via PROMPT_SETS monkeypatch and verify build_prompts catches it
+        # for the ``"quality"`` path too — not just ``"all"``.
+        import pytest
+
+        from olmlx.bench.prompts import BenchPrompt
+
+        a = BenchPrompt(
+            name="dup",
+            category="gsm8k",
+            messages=[{"role": "user", "content": "x"}],
+            grader="numeric",
+            expected={"answer": 1},
+        )
+        b = BenchPrompt(
+            name="dup",
+            category="mmlu",
+            messages=[{"role": "user", "content": "y"}],
+            grader="numeric",
+            expected={"answer": 2},
+        )
+        monkeypatch.setattr(
+            "olmlx.bench.task_prompts.PROMPT_SETS", {"set_a": [a], "set_b": [b]}
+        )
+        with pytest.raises(ValueError, match="Duplicate prompt names within quality"):
+            build_prompts("quality")
+
     def test_all_set_raises_on_duplicate_names(self, monkeypatch):
         import pytest
 
