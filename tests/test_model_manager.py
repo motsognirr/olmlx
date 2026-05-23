@@ -782,6 +782,73 @@ class TestProbeCacheCapabilities:
         assert lm.supports_cache_trim is True
         assert lm.supports_cache_persistence is True
 
+    def test_non_trimmable_persistable_layout_logs_343(
+        self, registry, mock_store, caplog
+    ):
+        """A hybrid sliding-window layout (RotatingKVCache) is in the
+        persist allowlist but not the trim allowlist.  After #343 the
+        probe forces persistence False; the load-time log must cite
+        #343 and reference the RotatingKVCache family — not #284 or
+        ArraysCache."""
+        import logging
+
+        class _FakeRotating:
+            pass
+
+        _FakeRotating.__name__ = "RotatingKVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+
+        with (
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[_FakeRotating(), _FakeRotating()],
+            ),
+            caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"),
+        ):
+            manager._probe_cache_capabilities(lm)
+
+        assert "issue #343" in caplog.text
+        # #284 is the ArraysCache reason — must not be attributed here.
+        assert "issue #284" not in caplog.text
+        assert "RotatingKVCache" in caplog.text or "sliding-window" in caplog.text
+
+    def test_non_persistable_layout_logs_284(self, registry, mock_store, caplog):
+        """A hybrid SSM layout (ArraysCache) is in neither allowlist:
+        trim=False, layout-persist=False.  The load-time log must cite
+        #284 / ArraysCache — not #343 / RotatingKVCache.  This is the
+        regression the first PR cut of #343 introduced: gating the
+        secondary log on ``supports_cache_trim`` made it unreachable for
+        ArraysCache models, and the non-trimmable log misattributed them
+        as RotatingKVCache + #343."""
+        import logging
+
+        class _FakeArrays:
+            pass
+
+        _FakeArrays.__name__ = "ArraysCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+
+        with (
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[_FakeArrays(), _FakeArrays()],
+            ),
+            caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"),
+        ):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is False
+        assert lm.supports_cache_persistence is False
+        assert "issue #284" in caplog.text
+        # #343 is the RotatingKVCache reason — must not be attributed
+        # to ArraysCache models.
+        assert "issue #343" not in caplog.text
+        assert "RotatingKVCache" not in caplog.text
+
     def test_probe_failure_warns_and_disables_persistence(
         self, registry, mock_store, caplog
     ):

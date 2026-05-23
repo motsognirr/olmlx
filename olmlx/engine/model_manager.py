@@ -2059,6 +2059,13 @@ class ModelManager:
         )
         probe_cache: list | None = None
         probe_succeeded = False
+        # Raw layout-persistence result before the #343 trim-implies-persist
+        # fold.  Hoisted out of the try block so the logging dispatch below
+        # can read it: distinguishes #343 (layout persistable, trim False)
+        # from #284 (layout itself non-persistable).  Only meaningful when
+        # probe_succeeded is True; the probe-failure path emits its own
+        # WARNING and bypasses this dispatch.
+        persist_layout_ok = False
         try:
             probe_cache = make_prompt_cache(cache_model)
             # Stage both results before assigning so a hypothetical raise
@@ -2067,7 +2074,12 @@ class ModelManager:
             # probes are pure string-set lookups that can't raise, but the
             # pattern is cheap and removes the ordering dependency.
             trim_ok = _cache_supports_trim(probe_cache)
-            persist_ok = _cache_supports_persistence(probe_cache)
+            # Raw layout-persistence result from the allowlist, kept
+            # separately from the post-#343 effective flag so the
+            # logging dispatch below can distinguish the two non-
+            # persistable sub-cases (#343 RotatingKVCache vs #284
+            # ArraysCache) and emit the correct attribution.
+            persist_layout_ok = _cache_supports_persistence(probe_cache)
             # Issue #343: non-trimmable cache layouts (RotatingKVCache,
             # ChunkedKVCache) can never realign their stored prompt +
             # generated state with the next request's tokens.  In real
@@ -2081,8 +2093,7 @@ class ModelManager:
             # ArraysCache (#284): disable persistence at probe time and
             # short-circuit the store/load path entirely.  Trim implies
             # persist; persist without trim does not, post-#343.
-            if not trim_ok:
-                persist_ok = False
+            persist_ok = persist_layout_ok and trim_ok
             lm.supports_cache_trim = trim_ok
             lm.supports_cache_persistence = persist_ok
             probe_succeeded = True
@@ -2111,37 +2122,39 @@ class ModelManager:
                 gc.collect()
                 mx.clear_cache()
 
-        if not lm.supports_cache_trim:
-            # The non-trimmable branch fully describes the consequence
-            # for this model; the non-persistable info log below is
-            # gated to skip when non-trim was the reason, avoiding a
-            # duplicate line citing #284 for a #343 disable.
-            logger.info(
-                "Model %s uses a non-trimmable hybrid cache (e.g. "
-                "RotatingKVCache); cross-request prompt cache reuse is "
-                "disabled (issue #343).",
-                lm.name,
-            )
-        # Only log the layout reason when the probe actually inspected
-        # the cache.  The probe-failure path already emits its own WARNING
-        # above with the real cause.  Message is generic ("hybrid
-        # SSM/ArraysCache or unclassified") because an empty cache_list
-        # also returns False from the persistence check — the message
-        # would otherwise misattribute the disable to ArraysCache when
-        # the layout had nothing to do with it.  Gate on
-        # ``supports_cache_trim`` so non-trimmable models (whose
-        # persistence is now forced off by #343) don't double-log.
-        if (
-            not lm.supports_cache_persistence
-            and lm.supports_cache_trim
-            and probe_succeeded
-        ):
-            logger.info(
-                "Model %s uses a non-persistable cache (hybrid SSM/"
-                "ArraysCache or unclassified); prompt cache will not be "
-                "stored across requests (issue #284).",
-                lm.name,
-            )
+        # Single load-time log site for "cross-request reuse disabled."
+        # Distinguishes the two disable reasons by inspecting the raw
+        # layout-persistence result captured above:
+        #
+        #   layout-persistable + non-trimmable → #343 (RotatingKVCache,
+        #       ChunkedKVCache); the layout itself could persist but the
+        #       fold in _probe forces it off because stored state can't
+        #       realign across requests.
+        #
+        #   layout non-persistable              → #284 (ArraysCache /
+        #       hybrid SSM, or an unclassified cache type that's not on
+        #       either allowlist).
+        #
+        # The two reasons are mutually exclusive given the current
+        # allowlists (_TRIMMABLE_CACHE_CLASSES ⊂ _PERSISTABLE_CACHE_CLASSES),
+        # so this is exactly one line per affected model with correct
+        # attribution.  Probe-failure path already WARNED above and is
+        # skipped here.
+        if probe_succeeded and not lm.supports_cache_persistence:
+            if persist_layout_ok:
+                logger.info(
+                    "Model %s uses a non-trimmable hybrid sliding-window "
+                    "cache (RotatingKVCache/ChunkedKVCache); cross-request "
+                    "prompt cache reuse is disabled (issue #343).",
+                    lm.name,
+                )
+            else:
+                logger.info(
+                    "Model %s uses a non-persistable cache (hybrid SSM/"
+                    "ArraysCache or unclassified); cross-request prompt "
+                    "cache reuse is disabled (issue #284).",
+                    lm.name,
+                )
         # One-pass cleanup of any stale pre-PR on-disk entries for this
         # model.  Gated on BOTH probe_succeeded and not-persistable so we
         # only wipe disk when we KNOW the model is non-persistable.  On a
