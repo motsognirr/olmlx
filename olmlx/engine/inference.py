@@ -2686,7 +2686,9 @@ async def _stream_completion(
                         accumulated_text += token.text or ""
                         for stop_seq in stop_sequences:
                             idx = accumulated_text.find(stop_seq)
-                            if idx != -1 and (stop_match_idx == -1 or idx < stop_match_idx):
+                            if idx != -1 and (
+                                stop_match_idx == -1 or idx < stop_match_idx
+                            ):
                                 stop_match_idx = idx
                         if stop_match_idx != -1:
                             prev_len = len(accumulated_text) - len(token.text or "")
