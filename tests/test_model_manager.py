@@ -761,6 +761,36 @@ class TestProbeCacheCapabilities:
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
 
+    def test_chunked_kv_cache_layout_disables_persistence(
+        self, registry, mock_store
+    ):
+        """``ChunkedKVCache`` is the other non-trimmable layout cited by
+        #343 and CLAUDE.md (mlx-lm's chunk-based cache; affects newer
+        Apple-published checkpoints).  Like ``RotatingKVCache`` it sits
+        in the persist allowlist but not the trim allowlist, so the
+        #343 fold must force the effective persist flag to False.
+        Companion to ``test_non_trimmable_layout_disables_persistence``
+        — guards against a future contributor accidentally promoting
+        ``ChunkedKVCache`` into ``_TRIMMABLE_CACHE_CLASSES`` when
+        adding support for a new model family and silently re-enabling
+        the wasted store-then-discard cycle this PR removes."""
+
+        class _FakeChunked:
+            pass
+
+        _FakeChunked.__name__ = "ChunkedKVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+        lm.supports_cache_persistence = True
+
+        probe_cache = [_FakeChunked(), _FakeChunked()]
+        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is False
+        assert lm.supports_cache_persistence is False
+
     def test_mixed_layout_kv_plus_rotating_disables_persistence(
         self, registry, mock_store
     ):
