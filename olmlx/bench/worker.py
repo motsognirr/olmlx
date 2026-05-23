@@ -19,7 +19,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +48,22 @@ def _wait_for_server(port: int, proc: subprocess.Popen, timeout: float) -> bool:
     return False
 
 
-_THINK_TRUE = {"true", "1", "on", "yes"}
-_THINK_FALSE = {"false", "0", "off", "no"}
+THINK_TRUE = {"true", "1", "on", "yes"}
+THINK_FALSE = {"false", "0", "off", "no"}
 
 
-def _resolve_bench_think(env: dict[str, str]) -> bool | None:
+def is_recognized_think_value(raw: str) -> bool:
+    """Whether ``raw`` parses as a valid ``OLMLX_BENCH_THINK`` value.
+
+    Shared with ``runner._capture_bench_env`` so ``bench_env`` only records
+    values the worker will actually honour — otherwise a typo'd
+    ``OLMLX_BENCH_THINK=tru`` would land in the saved A/B JSON as if think
+    were toggled, even though the worker fell back to the engine default.
+    """
+    return raw.strip().lower() in THINK_TRUE | THINK_FALSE
+
+
+def _resolve_bench_think(env: Mapping[str, str]) -> bool | None:
     """Resolve the bench thinking toggle from ``OLMLX_BENCH_THINK``.
 
     Returns ``True``/``False`` to force the Ollama ``think`` field on/off,
@@ -68,15 +81,15 @@ def _resolve_bench_think(env: dict[str, str]) -> bool | None:
     raw = raw_str.strip().lower()
     if not raw:
         return None
-    if raw in _THINK_TRUE:
+    if raw in THINK_TRUE:
         return True
-    if raw in _THINK_FALSE:
+    if raw in THINK_FALSE:
         return False
     logger.warning(
         "Ignoring OLMLX_BENCH_THINK=%r: expected one of %s; falling back to "
         "engine default",
         raw_str,
-        sorted(_THINK_TRUE | _THINK_FALSE),
+        sorted(THINK_TRUE | THINK_FALSE),
     )
     return None
 
@@ -90,7 +103,7 @@ def _run_prompts(
     results = []
     for prompt in prompts:
         tok_limit = max_tokens_override or prompt.get("max_tokens", 256)
-        body: dict = {
+        body: dict[str, Any] = {
             "model": model,
             "stream": False,
             "messages": prompt["messages"],

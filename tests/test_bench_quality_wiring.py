@@ -275,6 +275,22 @@ class TestBenchEnvCapture:
         # Operational knob, intentionally excluded from the experiment record.
         assert _capture_bench_env() == {}
 
+    def test_unrecognized_think_is_not_captured(self, monkeypatch):
+        # A typo'd value (e.g. ``"tru"``) falls back to engine default in
+        # the worker. Recording it in bench_env would imply think was
+        # toggled when the run actually used engine default — defeats the
+        # self-describing-A/B purpose.
+        from olmlx.bench.runner import _capture_bench_env
+
+        monkeypatch.setenv("OLMLX_BENCH_THINK", "tru")
+        assert _capture_bench_env() == {}
+
+    def test_recognized_think_is_captured_verbatim(self, monkeypatch):
+        from olmlx.bench.runner import _capture_bench_env
+
+        monkeypatch.setenv("OLMLX_BENCH_THINK", "False")
+        assert _capture_bench_env() == {"OLMLX_BENCH_THINK": "False"}
+
 
 class TestWorkerTimeout:
     """`OLMLX_BENCH_WORKER_TIMEOUT` must never silently disable the kill

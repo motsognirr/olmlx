@@ -32,21 +32,27 @@ from olmlx.bench.scenarios import Scenario, get_scenarios
 logger = logging.getLogger(__name__)
 
 
-# Bench-level env vars worth recording in the saved run. Limited to the
-# experiment-defining toggles so a saved run's ``bench_env`` is a clean
-# record of the A/B variable(s). Operational knobs like the worker kill
-# timeout are intentionally excluded — they don't change how to interpret
-# the result and are logged separately at run start.
-_RECORDED_BENCH_ENV = ("OLMLX_BENCH_THINK",)
-
-
 def _capture_bench_env() -> dict[str, str]:
-    """Capture the bench-relevant env knobs set when ``run_bench`` was called."""
+    """Capture the bench-relevant env knobs set when ``run_bench`` was called.
+
+    Limited to the experiment-defining toggles so a saved run's
+    ``bench_env`` is a clean record of the A/B variable(s). Operational
+    knobs like the worker kill timeout are intentionally excluded — they
+    don't change how to interpret the result and are logged separately at
+    run start.
+
+    Only records values the worker will actually honour — a typo'd
+    ``OLMLX_BENCH_THINK=tru`` (which the worker warns about and falls
+    back to engine default) does **not** land in the saved JSON, so an
+    operator reading the run record can trust that what's there reflects
+    the run that happened.
+    """
+    from olmlx.bench.worker import is_recognized_think_value
+
     captured: dict[str, str] = {}
-    for key in _RECORDED_BENCH_ENV:
-        value = os.environ.get(key)
-        if value is not None and value != "":
-            captured[key] = value
+    think_raw = os.environ.get("OLMLX_BENCH_THINK", "")
+    if think_raw and is_recognized_think_value(think_raw):
+        captured["OLMLX_BENCH_THINK"] = think_raw
     return captured
 
 
@@ -282,7 +288,13 @@ def run_bench(
         # who omits ``--enable-code-exec`` sees e.g. ``quality 20/40``
         # without realising 10 HumanEval prompts were excluded from the
         # denominator. Counts results where the grader ran but returned
-        # passed=None, which is the disabled-code_exec signature.
+        # passed=None. Gated on ``enable_code_exec=False`` so this only
+        # triggers in the actually-disabled case: under that gate
+        # ``grade_code_exec`` returns its disabled sentinel without
+        # executing anything, so the grade()-level exception path
+        # (also passed=None) is unreachable for code_exec here. A
+        # passed=None code_exec result we see here is therefore the
+        # disabled path, not a crashing grader.
         if not enable_code_exec:
             excluded = sum(
                 1
