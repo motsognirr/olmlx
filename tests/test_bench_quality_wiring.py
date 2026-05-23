@@ -39,6 +39,31 @@ class TestBuildPrompts:
         with pytest.raises(ValueError):
             build_prompts("bogus")
 
+    def test_all_set_currently_has_unique_names(self):
+        # Build succeeds today — no collisions. Catches future regressions
+        # at construction rather than letting them mis-grade a saved run.
+        build_prompts("all")
+
+    def test_all_set_raises_on_duplicate_names(self, monkeypatch):
+        import pytest
+
+        from olmlx.bench.prompts import BenchPrompt
+        from olmlx.bench.task_prompts import PROMPT_SETS
+
+        # Synthesize a collision: pick any real graded prompt name and add
+        # a fake throughput probe with the same name. ``build_prompts`` must
+        # reject the union with a clear error rather than silently shipping
+        # the collision into apply_graders.
+        any_graded_name = next(iter(PROMPT_SETS.values()))[0].name
+        dup = BenchPrompt(
+            name=any_graded_name,
+            category="throughput",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        monkeypatch.setattr("olmlx.bench.runner.PROMPTS", (dup,))
+        with pytest.raises(ValueError, match="Duplicate prompt names"):
+            build_prompts("all")
+
 
 class TestApplyGraders:
     def _result(self, name, output, status=200):
@@ -229,6 +254,26 @@ class TestRunResultMetadata:
         run = RunResult.from_dict(legacy)
         assert run.prompt_set is None
         assert run.bench_env == {}
+
+
+class TestBenchEnvCapture:
+    """``bench_env`` should record only experiment-defining variables, not
+    operational knobs — the timeout is a safety rail that doesn't change
+    how to interpret an A/B result."""
+
+    def test_think_is_captured(self, monkeypatch):
+        from olmlx.bench.runner import _capture_bench_env
+
+        monkeypatch.setenv("OLMLX_BENCH_THINK", "true")
+        assert _capture_bench_env() == {"OLMLX_BENCH_THINK": "true"}
+
+    def test_worker_timeout_is_not_captured(self, monkeypatch):
+        from olmlx.bench.runner import _capture_bench_env
+
+        monkeypatch.setenv("OLMLX_BENCH_WORKER_TIMEOUT", "1800")
+        monkeypatch.delenv("OLMLX_BENCH_THINK", raising=False)
+        # Operational knob, intentionally excluded from the experiment record.
+        assert _capture_bench_env() == {}
 
 
 class TestWorkerTimeout:

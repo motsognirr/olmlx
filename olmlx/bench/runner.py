@@ -33,9 +33,11 @@ logger = logging.getLogger(__name__)
 
 
 # Bench-level env vars worth recording in the saved run. Limited to the
-# operator-facing toggles so the saved JSON stays a clean record of the
-# A/B variable(s) without dragging in unrelated process environment.
-_RECORDED_BENCH_ENV = ("OLMLX_BENCH_THINK", "OLMLX_BENCH_WORKER_TIMEOUT")
+# experiment-defining toggles so a saved run's ``bench_env`` is a clean
+# record of the A/B variable(s). Operational knobs like the worker kill
+# timeout are intentionally excluded — they don't change how to interpret
+# the result and are logged separately at run start.
+_RECORDED_BENCH_ENV = ("OLMLX_BENCH_THINK",)
 
 
 def _capture_bench_env() -> dict[str, str]:
@@ -108,7 +110,20 @@ def build_prompts(prompt_set: str) -> list[BenchPrompt]:
     if prompt_set == "quality":
         return graded
     if prompt_set == "all":
-        return list(PROMPTS) + graded
+        combined = list(PROMPTS) + graded
+        # apply_graders joins PromptResult → prompt by name. A duplicate
+        # name across throughput and graded sets would silently grade a
+        # throughput result against the colliding graded prompt's grader.
+        # Catch the collision here, at construction, rather than letting it
+        # slip through into a saved run.
+        names = [p.name for p in combined]
+        if len(names) != len(set(names)):
+            dupes = sorted({n for n in names if names.count(n) > 1})
+            raise ValueError(
+                f"Duplicate prompt names across throughput + quality sets: "
+                f"{dupes!r}. Rename to keep prompt names unique."
+            )
+        return combined
     raise ValueError(
         f"Unknown prompt set {prompt_set!r}. Available: throughput, quality, all"
     )
@@ -139,16 +154,18 @@ def apply_graders(
     ``_enabled`` flag injected into a *copy* of the expected payload (the
     caller's dict is never mutated).
     """
-    by_name = {p["name"]: p for p in prompts}
+    # Only graded prompts can match — excluding ungraded throughput
+    # prompts from the lookup avoids a last-wins collision in the dict
+    # comprehension if a graded and an ungraded prompt ever share a name
+    # under ``--prompt-set all``.
+    by_name = {p["name"]: p for p in prompts if p.get("grader")}
     for r in results:
         prompt = by_name.get(r.prompt_name)
         if prompt is None:
             continue
-        grader_name = prompt.get("grader")
-        if not grader_name:
-            continue
         if r.status_code != 200:
             continue
+        grader_name = prompt["grader"]
         expected = dict(prompt.get("expected") or {})
         if grader_name == "code_exec" and enable_code_exec:
             expected["_enabled"] = True
@@ -187,9 +204,11 @@ def run_bench(
     scenarios = get_scenarios(scenario_names)
     model_path = _resolve_model_path(model)
     prompts_data = [p.to_dict() for p in build_prompts(prompt_set)]
-    # Log the resolved worker timeout once so a post-hoc "why did my run
-    # get killed" investigation has a record of what limit was in effect.
-    logger.info("Bench worker timeout: %.0fs", _worker_timeout())
+    # Resolve the worker timeout once so the value logged and the value
+    # actually passed to ``subprocess.run`` can never diverge — both come
+    # from the same single read of ``OLMLX_BENCH_WORKER_TIMEOUT``.
+    worker_timeout = _worker_timeout()
+    logger.info("Bench worker timeout: %.0fs", worker_timeout)
 
     scenario_results: list[ScenarioResult] = []
 
@@ -221,7 +240,9 @@ def run_bench(
                 model, scenario, prompts_data, max_tokens
             )
         else:
-            prompt_results = _run_worker(model, scenario, prompts_data, max_tokens)
+            prompt_results = _run_worker(
+                model, scenario, prompts_data, max_tokens, worker_timeout
+            )
 
         # Grade in the parent (the worker only returns raw output_text).
         apply_graders(prompt_results, prompts_data, enable_code_exec)
@@ -252,6 +273,25 @@ def run_bench(
             f"avg {avg_tps:.1f} tok/s{quality_str}",
             file=sys.stderr,
         )
+        # Surface code_exec exclusion explicitly — otherwise an operator
+        # who omits ``--enable-code-exec`` sees e.g. ``quality 20/40``
+        # without realising 10 HumanEval prompts were excluded from the
+        # denominator. Counts results where the grader ran but returned
+        # passed=None, which is the disabled-code_exec signature.
+        if not enable_code_exec:
+            excluded = sum(
+                1
+                for r in prompt_results
+                if r.grader == "code_exec"
+                and r.quality is not None
+                and r.quality.passed is None
+            )
+            if excluded:
+                print(
+                    f"  ({excluded} code_exec prompts excluded — pass "
+                    "--enable-code-exec to grade them)",
+                    file=sys.stderr,
+                )
 
         scenario_results.append(sc_result)
 
@@ -285,6 +325,7 @@ def _run_worker(
     scenario: Scenario,
     prompts_data: list[dict],
     max_tokens: int | None,
+    worker_timeout: float,
 ) -> list[PromptResult]:
     """Spawn a subprocess for a single scenario and collect results."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -313,7 +354,6 @@ def _run_worker(
         if max_tokens is not None:
             cmd.extend(["--max-tokens", str(max_tokens)])
 
-        worker_timeout = _worker_timeout()
         try:
             result = subprocess.run(
                 cmd,

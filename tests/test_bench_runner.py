@@ -54,7 +54,9 @@ class TestRunWorker:
         with patch(
             "olmlx.bench.runner.subprocess.run", side_effect=fake_subprocess_run
         ):
-            results = _run_worker("test-model", scenario, prompts_data, None)
+            results = _run_worker(
+                "test-model", scenario, prompts_data, None, worker_timeout=600.0
+            )
 
         assert len(results) == 1
         assert results[0].prompt_name == "factual"
@@ -71,7 +73,7 @@ class TestRunWorker:
             stdout = ""
 
         with patch("olmlx.bench.runner.subprocess.run", return_value=FakeResult()):
-            results = _run_worker("model", scenario, [], None)
+            results = _run_worker("model", scenario, [], None, worker_timeout=600.0)
 
         assert len(results) == 1
         assert results[0].prompt_name == "__worker_error__"
@@ -87,7 +89,7 @@ class TestRunWorker:
             "olmlx.bench.runner.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd="test", timeout=600),
         ):
-            results = _run_worker("model", scenario, [], None)
+            results = _run_worker("model", scenario, [], None, worker_timeout=600.0)
 
         assert len(results) == 1
         assert "timed out" in results[0].error.lower()
@@ -116,7 +118,7 @@ class TestRunWorker:
             return FakeResult()
 
         with patch("olmlx.bench.runner.subprocess.run", side_effect=capture_run):
-            _run_worker("model", scenario, [], None)
+            _run_worker("model", scenario, [], None, worker_timeout=600.0)
 
         assert captured_env.get("OLMLX_KV_CACHE_QUANT") == "turboquant:4"
 
@@ -139,7 +141,7 @@ class TestRunWorker:
             return FakeResult()
 
         with patch("olmlx.bench.runner.subprocess.run", side_effect=capture_run):
-            _run_worker("model", scenario, [], max_tokens=64)
+            _run_worker("model", scenario, [], max_tokens=64, worker_timeout=600.0)
 
         assert "--max-tokens" in captured_cmd
         assert "64" in captured_cmd
