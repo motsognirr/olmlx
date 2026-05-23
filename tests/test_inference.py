@@ -4,6 +4,7 @@ import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 import olmlx.engine.inference as _inf_mod
@@ -11,6 +12,9 @@ from olmlx.engine.inference import (
     _acquire_inference_lock,
     _apply_seed,
     _build_generate_kwargs,
+    _full_completion,
+    _make_frequency_penalty_processor,
+    _make_presence_penalty_processor,
     estimate_kv_cache_bytes,
     _extract_images,
     _inference_lock,
@@ -216,38 +220,55 @@ class TestBuildGenerateKwargs:
         # seed in kwargs for _apply_seed to consume before generation
         assert result["seed"] == 42
 
-    def test_stop_warns_and_ignored_for_text_model(self, caplog):
-        """stop is silently ignored with a warning (not rejected) for text models."""
-        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
-            result = _build_generate_kwargs({"stop": [".", "\n"]})
-        assert "stop" not in result
-        assert any("stop" in r.message for r in caplog.records)
+    def test_stop_forwarded_in_kwargs(self):
+        """stop sequences are returned in kwargs for downstream use."""
+        result = _build_generate_kwargs({"stop": [".", "\n"]})
+        assert "stop" in result
+        assert result["stop"] == [".", "\n"]
 
-    def test_stop_vlm_ignored(self):
+    def test_stop_single_string_normalized(self):
+        """A single stop string is kept as-is in the options dict."""
+        result = _build_generate_kwargs({"stop": "."})
+        assert result["stop"] == "."
+
+    def test_stop_vlm_forwarded(self):
         result = _build_generate_kwargs({"stop": [".", "\n"]}, is_vlm=True)
+        assert "stop" in result
+        assert result["stop"] == [".", "\n"]
+
+    def test_stop_empty_list_excluded(self):
+        """Empty stop list should not be included in kwargs."""
+        result = _build_generate_kwargs({"stop": []})
         assert "stop" not in result
 
-    def test_frequency_presence_penalty_dropped_with_warning(self, caplog):
-        """frequency_penalty/presence_penalty dropped with warning."""
-        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
-            result = _build_generate_kwargs(
-                {"frequency_penalty": 0.5, "presence_penalty": 0.3}
-            )
+    def test_frequency_presence_penalty_creates_processors(self):
+        """frequency_penalty/presence_penalty create logits processors."""
+        result = _build_generate_kwargs(
+            {"frequency_penalty": 0.5, "presence_penalty": 0.3}
+        )
         assert "frequency_penalty" not in result
         assert "presence_penalty" not in result
-        assert any("frequency_penalty" in r.message for r in caplog.records)
-        assert any("presence_penalty" in r.message for r in caplog.records)
+        assert "logits_processors" in result
+        assert len(result["logits_processors"]) == 2
+        assert callable(result["logits_processors"][0])
+        assert callable(result["logits_processors"][1])
 
-    def test_zero_penalty_warns(self, caplog):
-        """Even 0.0 values should warn when explicitly set."""
-        with caplog.at_level(logging.WARNING, logger="olmlx.engine.inference"):
-            result = _build_generate_kwargs(
-                {"frequency_penalty": 0.0, "presence_penalty": 0.0}
-            )
-        assert "frequency_penalty" not in result
-        assert "presence_penalty" not in result
-        assert any("frequency_penalty" in r.message for r in caplog.records)
-        assert any("presence_penalty" in r.message for r in caplog.records)
+    def test_zero_penalty_skipped(self):
+        """Zero values for frequency/presence penalty are skipped."""
+        result = _build_generate_kwargs(
+            {"frequency_penalty": 0.0, "presence_penalty": 0.0}
+        )
+        assert "logits_processors" not in result
+
+    def test_frequency_penalty_combined_with_repeat(self):
+        """Frequency penalty appends to repeat_penalty processors."""
+        result = _build_generate_kwargs(
+            {"repeat_penalty": 1.1, "frequency_penalty": 0.5}
+        )
+        assert "logits_processors" in result
+        assert len(result["logits_processors"]) == 2
+        assert callable(result["logits_processors"][0])
+        assert callable(result["logits_processors"][1])
 
     def test_unknown_options_ignored(self):
         result = _build_generate_kwargs({"unknown_key": 99})
@@ -296,6 +317,146 @@ class TestBuildGenerateKwargs:
         """
         result = _build_generate_kwargs({"top_k": 40})
         assert "sampler" not in result
+
+
+class TestFrequencyPenaltyProcessor:
+    """Unit tests for _make_frequency_penalty_processor."""
+
+    def test_no_tokens_returns_unchanged(self):
+        processor = _make_frequency_penalty_processor(0.5)
+        logits = mx.array([1.0, 2.0, 3.0])
+        result = processor([], logits)
+        assert mx.allclose(result, logits).item()
+
+    def test_zero_penalty_returns_unchanged(self):
+        processor = _make_frequency_penalty_processor(0.0)
+        logits = mx.array([1.0, 2.0])
+        result = processor([0, 1, 0], logits)
+        assert mx.allclose(result, logits).item()
+
+    def test_penalty_applied_by_frequency(self):
+        """Token 0 appears twice → gets 2x penalty; token 1 appears once → gets 1x."""
+        processor = _make_frequency_penalty_processor(0.5)
+        logits = mx.array([10.0, 10.0, 10.0])
+        result = processor([0, 1, 0], logits)
+        expected = mx.array([9.0, 9.5, 10.0])
+        assert mx.allclose(result, expected).item()
+
+    def test_multiple_tokens_same_penalty(self):
+        processor = _make_frequency_penalty_processor(1.0)
+        logits = mx.array([5.0, 5.0, 5.0, 5.0])
+        result = processor([0, 0, 0, 2], logits)
+        expected = mx.array([2.0, 5.0, 4.0, 5.0])
+        assert mx.allclose(result, expected).item()
+
+
+class TestPresencePenaltyProcessor:
+    """Unit tests for _make_presence_penalty_processor."""
+
+    def test_no_tokens_returns_unchanged(self):
+        processor = _make_presence_penalty_processor(0.5)
+        logits = mx.array([1.0, 2.0, 3.0])
+        result = processor([], logits)
+        assert mx.allclose(result, logits).item()
+
+    def test_zero_penalty_returns_unchanged(self):
+        processor = _make_presence_penalty_processor(0.0)
+        logits = mx.array([1.0, 2.0])
+        result = processor([0, 1], logits)
+        assert mx.allclose(result, logits).item()
+
+    def test_penalty_applied_by_presence(self):
+        """Token 0 and 1 appear → penalized once each regardless of frequency."""
+        processor = _make_presence_penalty_processor(0.5)
+        logits = mx.array([10.0, 10.0, 10.0])
+        result = processor([0, 0, 1], logits)
+        expected = mx.array([9.5, 9.5, 10.0])
+        assert mx.allclose(result, expected).item()
+
+    def test_out_of_range_token_ignored(self):
+        processor = _make_presence_penalty_processor(0.5)
+        logits = mx.array([10.0, 10.0])
+        result = processor([0, 5], logits)
+        expected = mx.array([9.5, 10.0])
+        assert mx.allclose(result, expected).item()
+
+
+class TestStopSequenceHandling:
+    """Tests for stop sequence handling in _full_completion."""
+
+    @patch("olmlx.engine.inference._inference_locked")
+    @patch("olmlx.engine.inference._inference_ref")
+    @patch("olmlx.engine.inference._full_completion_inner")
+    async def test_stop_sequences_truncate_text(
+        self, mock_inner, mock_ref, mock_locked
+    ):
+        """_full_completion should truncate text at the first stop sequence."""
+        gen_kwargs = {"stop": ["D"]}
+        stats = MagicMock()
+        lm = MagicMock()
+        lm.inference_queue_timeout = 30.0
+        lm.sync_mode = None
+
+        mock_locked.return_value.__aenter__.return_value = None
+        mock_ref.return_value.__enter__.return_value = None
+        mock_inner.return_value = {"text": "A B C D E F G", "done": True, "stats": stats}
+
+        result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
+        assert result["text"] == "A B C "
+
+    @patch("olmlx.engine.inference._inference_locked")
+    @patch("olmlx.engine.inference._inference_ref")
+    @patch("olmlx.engine.inference._full_completion_inner")
+    async def test_multiple_stop_sequences(self, mock_inner, mock_ref, mock_locked):
+        """First matching stop sequence should be used."""
+        gen_kwargs = {"stop": ["cd", "ef"]}
+        stats = MagicMock()
+        lm = MagicMock()
+        lm.inference_queue_timeout = 30.0
+        lm.sync_mode = None
+
+        mock_locked.return_value.__aenter__.return_value = None
+        mock_ref.return_value.__enter__.return_value = None
+        mock_inner.return_value = {"text": "ab cd ef", "done": True, "stats": stats}
+
+        result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
+        assert result["text"] == "ab "
+
+    @patch("olmlx.engine.inference._inference_locked")
+    @patch("olmlx.engine.inference._inference_ref")
+    @patch("olmlx.engine.inference._full_completion_inner")
+    async def test_no_stop_match(self, mock_inner, mock_ref, mock_locked):
+        """When no stop sequence matches, text remains unchanged."""
+        gen_kwargs = {"stop": ["D"]}
+        stats = MagicMock()
+        lm = MagicMock()
+        lm.inference_queue_timeout = 30.0
+        lm.sync_mode = None
+
+        mock_locked.return_value.__aenter__.return_value = None
+        mock_ref.return_value.__enter__.return_value = None
+        mock_inner.return_value = {"text": "A B C", "done": True, "stats": stats}
+
+        result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
+        assert result["text"] == "A B C"
+
+    @patch("olmlx.engine.inference._inference_locked")
+    @patch("olmlx.engine.inference._inference_ref")
+    @patch("olmlx.engine.inference._full_completion_inner")
+    async def test_stop_not_in_kwargs_no_effect(self, mock_inner, mock_ref, mock_locked):
+        """When stop is not in gen_kwargs, text passes through unchanged."""
+        gen_kwargs = {}
+        stats = MagicMock()
+        lm = MagicMock()
+        lm.inference_queue_timeout = 30.0
+        lm.sync_mode = None
+
+        mock_locked.return_value.__aenter__.return_value = None
+        mock_ref.return_value.__enter__.return_value = None
+        mock_inner.return_value = {"text": "A B C D", "done": True, "stats": stats}
+
+        result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
+        assert result["text"] == "A B C D"
 
 
 class TestApplySeed:
