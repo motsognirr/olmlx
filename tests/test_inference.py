@@ -227,9 +227,9 @@ class TestBuildGenerateKwargs:
         assert result["stop"] == [".", "\n"]
 
     def test_stop_single_string_normalized(self):
-        """A single stop string is kept as-is in the options dict."""
+        """A single stop string is normalized to a list."""
         result = _build_generate_kwargs({"stop": "."})
-        assert result["stop"] == "."
+        assert result["stop"] == ["."]
 
     def test_stop_vlm_forwarded(self):
         result = _build_generate_kwargs({"stop": [".", "\n"]}, is_vlm=True)
@@ -399,17 +399,24 @@ class TestStopSequenceHandling:
 
         mock_locked.return_value.__aenter__.return_value = None
         mock_ref.return_value.__enter__.return_value = None
-        mock_inner.return_value = {"text": "A B C D E F G", "done": True, "stats": stats}
+        mock_inner.return_value = {
+            "text": "A B C D E F G",
+            "done": True,
+            "stats": stats,
+        }
 
         result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
         assert result["text"] == "A B C "
+        assert result["finish_reason"] == "stop"
 
     @patch("olmlx.engine.inference._inference_locked")
     @patch("olmlx.engine.inference._inference_ref")
     @patch("olmlx.engine.inference._full_completion_inner")
-    async def test_multiple_stop_sequences(self, mock_inner, mock_ref, mock_locked):
-        """First matching stop sequence should be used."""
-        gen_kwargs = {"stop": ["cd", "ef"]}
+    async def test_multiple_stop_sequences_earliest_wins(
+        self, mock_inner, mock_ref, mock_locked
+    ):
+        """Earliest match across all stop sequences should be used (not list-order)."""
+        gen_kwargs = {"stop": ["ef", "cd"]}
         stats = MagicMock()
         lm = MagicMock()
         lm.inference_queue_timeout = 30.0
@@ -421,6 +428,26 @@ class TestStopSequenceHandling:
 
         result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
         assert result["text"] == "ab "
+        assert result["finish_reason"] == "stop"
+
+    @patch("olmlx.engine.inference._inference_locked")
+    @patch("olmlx.engine.inference._inference_ref")
+    @patch("olmlx.engine.inference._full_completion_inner")
+    async def test_prefix_stop_ordering(self, mock_inner, mock_ref, mock_locked):
+        """When one stop is a prefix of another, the earlier position wins."""
+        gen_kwargs = {"stop": ["X", "aX"]}
+        stats = MagicMock()
+        lm = MagicMock()
+        lm.inference_queue_timeout = 30.0
+        lm.sync_mode = None
+
+        mock_locked.return_value.__aenter__.return_value = None
+        mock_ref.return_value.__enter__.return_value = None
+        mock_inner.return_value = {"text": "aXb", "done": True, "stats": stats}
+
+        result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
+        assert result["text"] == ""
+        assert result["finish_reason"] == "stop"
 
     @patch("olmlx.engine.inference._inference_locked")
     @patch("olmlx.engine.inference._inference_ref")
@@ -439,11 +466,14 @@ class TestStopSequenceHandling:
 
         result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
         assert result["text"] == "A B C"
+        assert "finish_reason" not in result
 
     @patch("olmlx.engine.inference._inference_locked")
     @patch("olmlx.engine.inference._inference_ref")
     @patch("olmlx.engine.inference._full_completion_inner")
-    async def test_stop_not_in_kwargs_no_effect(self, mock_inner, mock_ref, mock_locked):
+    async def test_stop_not_in_kwargs_no_effect(
+        self, mock_inner, mock_ref, mock_locked
+    ):
         """When stop is not in gen_kwargs, text passes through unchanged."""
         gen_kwargs = {}
         stats = MagicMock()
@@ -457,6 +487,7 @@ class TestStopSequenceHandling:
 
         result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
         assert result["text"] == "A B C D"
+        assert "finish_reason" not in result
 
 
 class TestApplySeed:

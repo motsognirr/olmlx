@@ -56,16 +56,28 @@ def _make_frequency_penalty_processor(frequency_penalty: float):
     Positive values penalize new tokens based on their existing frequency
     in the text so far, decreasing the model's likelihood to repeat the
     same line verbatim.
+
+    Uses an incremental frequency dict (O(1) per step) to avoid O(n²)
+    rebuilds for long generations.  The dict is seeded from the initial
+    token list on first call then incremented by one per step.
     """
+    freq: dict[int, int] = {}
+    _initialised = False
 
     def processor(tokens: list[int], logits: mx.array) -> mx.array:
+        nonlocal freq, _initialised
         if not tokens or frequency_penalty == 0:
             return logits
         vocab_size = logits.shape[-1]
-        freq: dict[int, int] = {}
-        for tid in tokens:
-            if 0 <= tid < vocab_size:
-                freq[tid] = freq.get(tid, 0) + 1
+        if not _initialised:
+            for tid in tokens:
+                if 0 <= tid < vocab_size:
+                    freq[tid] = freq.get(tid, 0) + 1
+            _initialised = True
+        else:
+            new_tid = tokens[-1]
+            if 0 <= new_tid < vocab_size:
+                freq[new_tid] = freq.get(new_tid, 0) + 1
         for tid, count in freq.items():
             logits[..., tid] -= frequency_penalty * count
         return logits
@@ -79,18 +91,34 @@ def _make_presence_penalty_processor(presence_penalty: float):
     Positive values penalize new tokens based on whether they appear
     in the text so far, increasing the model's likelihood to talk about
     new topics.
+
+    Uses an incremental seen set (O(1) per step) to avoid O(n²)
+    set-builds for long generations.  The set is seeded from the
+    initial token list on first call then incremented by one per step.
     """
+    seen: set[int] = set()
+    _initialised = False
 
     def processor(tokens: list[int], logits: mx.array) -> mx.array:
+        nonlocal seen, _initialised
         if not tokens or presence_penalty == 0:
             return logits
         vocab_size = logits.shape[-1]
-        for tid in set(tokens):
-            if 0 <= tid < vocab_size:
-                logits[..., tid] -= presence_penalty
+        if not _initialised:
+            for tid in tokens:
+                if 0 <= tid < vocab_size and tid not in seen:
+                    seen.add(tid)
+                    logits[..., tid] -= presence_penalty
+            _initialised = True
+        else:
+            new_tid = tokens[-1]
+            if 0 <= new_tid < vocab_size and new_tid not in seen:
+                seen.add(new_tid)
+                logits[..., new_tid] -= presence_penalty
         return logits
 
     return processor
+
 
 # gpt-oss special tokens used by the streaming filter
 _GPT_OSS_STRUCTURAL_TOKENS = frozenset(
@@ -1210,7 +1238,8 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
                 kwargs[mlx_key] = options[ollama_key]
         # Forward stop sequences for downstream (popped before passing to mlx-vlm)
         if "stop" in options and options["stop"]:
-            kwargs["stop"] = options["stop"]
+            raw = options["stop"]
+            kwargs["stop"] = [raw] if isinstance(raw, str) else raw
     else:
         # mlx-lm ≥ 0.30.7: sampling via make_sampler / make_logits_processors
         sampler_args = {}
@@ -1260,7 +1289,8 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
 
         # Forward stop sequences for downstream (popped before passing to mlx-lm)
         if "stop" in options and options["stop"]:
-            kwargs["stop"] = options["stop"]
+            raw = options["stop"]
+            kwargs["stop"] = [raw] if isinstance(raw, str) else raw
 
         # Build custom logits processors for frequency/presence penalty
         # and merge with any existing repeat_penalty processors.
@@ -2628,6 +2658,7 @@ async def _stream_completion(
             else settings.inference_timeout
         )
         timed_out = False
+        stop_hit = False
 
         with _inference_ref(lm, keep_alive=keep_alive), Timer() as total_timer:
             with Timer() as eval_timer:
@@ -2649,22 +2680,28 @@ async def _stream_completion(
 
                     # Check stop sequences against the full decoded text so far.
                     # Must be done before yielding so we can truncate the current token.
-                    stop_hit = False
+                    # Use the earliest (minimum-index) match across all stop sequences.
+                    stop_match_idx = -1
                     if stop_sequences:
                         accumulated_text += token.text or ""
                         for stop_seq in stop_sequences:
                             idx = accumulated_text.find(stop_seq)
-                            if idx != -1:
-                                prev_len = len(accumulated_text) - len(token.text or "")
-                                text_before_stop = accumulated_text[:idx]
-                                token_part = text_before_stop[prev_len:] if prev_len < idx else ""
-                                if token_part:
-                                    if channel_filter is None:
-                                        yield {"text": token_part, "done": False}
-                                    elif channel_filter.should_yield(token_part):
-                                        yield {"text": token_part, "done": False}
-                                stop_hit = True
-                                break
+                            if idx != -1 and (stop_match_idx == -1 or idx < stop_match_idx):
+                                stop_match_idx = idx
+                        if stop_match_idx != -1:
+                            prev_len = len(accumulated_text) - len(token.text or "")
+                            text_before_stop = accumulated_text[:stop_match_idx]
+                            token_part = (
+                                text_before_stop[prev_len:]
+                                if prev_len < stop_match_idx
+                                else ""
+                            )
+                            if token_part:
+                                if channel_filter is None:
+                                    yield {"text": token_part, "done": False}
+                                elif channel_filter.should_yield(token_part):
+                                    yield {"text": token_part, "done": False}
+                            stop_hit = True
 
                     if stop_hit:
                         break
@@ -2736,6 +2773,8 @@ async def _stream_completion(
             done_chunk["raw_text"] = raw_text
         if timed_out:
             done_chunk["done_reason"] = "timeout"
+        if stop_hit:
+            done_chunk["done_reason"] = "stop"
         yield done_chunk
     finally:
         # Release GPU-backed references from gen_kwargs so they can be
@@ -2903,10 +2942,14 @@ async def _full_completion(
                     lm.prompt_cache_store.remove(cache_id)
     if stop_sequences and result_dict:
         text = result_dict.get("text", "")
+        earliest = -1
         for stop_seq in stop_sequences:
             idx = text.find(stop_seq)
-            if idx != -1:
-                text = text[:idx]
+            if idx != -1 and (earliest == -1 or idx < earliest):
+                earliest = idx
+        if earliest != -1:
+            text = text[:earliest]
+            result_dict["finish_reason"] = "stop"
         result_dict["text"] = text
     return result_dict
 
