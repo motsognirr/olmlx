@@ -924,6 +924,254 @@ class TestCacheDisabledViaConfig:
         assert "prompt_cache" not in call_args[1]
 
 
+def _make_gen_response(text, token, prompt_tokens, generation_tokens):
+    """Build a stream_generate-style response for the non-streaming inner path."""
+    resp = MagicMock()
+    resp.text = text
+    resp.token = token
+    resp.prompt_tokens = prompt_tokens
+    resp.generation_tokens = generation_tokens
+    resp.prompt_tps = 100.0
+    resp.generation_tps = 50.0
+    return resp
+
+
+class TestNonStreamingCacheHit:
+    """Issue #342: non-streaming requests must also benefit from prompt caching."""
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_creates_and_stores_cache(self, mock_manager):
+        """First non-streaming chat creates a fresh cache and stores it.
+
+        Result dict surfaces ``cache_creation_tokens`` (full prompt) and
+        ``cache_read_tokens`` (0 on cold start) so the Anthropic router's
+        usage counters are populated correctly.
+        """
+        import mlx_lm
+
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50])
+
+        responses = [
+            _make_gen_response("Hello", 100, prompt_tokens=5, generation_tokens=1),
+            _make_gen_response(" world", 101, prompt_tokens=5, generation_tokens=2),
+        ]
+        mock_stream_generate = MagicMock(return_value=iter(responses))
+
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        mock_mx = MagicMock()
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch.object(mlx_lm, "stream_generate", mock_stream_generate),
+            patch("olmlx.engine.inference.make_prompt_cache", mock_make_cache),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            result = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=False,
+            )
+
+        # Fresh cache was created and stored
+        mock_make_cache.assert_called_once_with(lm.model)
+        stored = lm.prompt_cache_store.get("")
+        assert stored is not None
+        assert isinstance(stored, CachedPromptState)
+        assert stored.tokens[:5] == [10, 20, 30, 40, 50]
+        # 5 prompt + 2 generated
+        assert len(stored.tokens) == 7
+
+        # Result dict surfaces cache token counts (issue #342)
+        assert result.get("cache_read_tokens") == 0
+        assert result.get("cache_creation_tokens") == 5
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_reuses_cache_on_prefix_match(self, mock_manager):
+        """Second non-streaming chat with a shared prefix reuses cache.
+
+        Inner generation receives only the suffix tokens (not the full
+        prompt), and the result dict reports the reused prefix length.
+        """
+        import mlx_lm
+
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt v2")
+        lm.tokenizer.bos_token = None
+
+        existing_cache = [MagicMock()]
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50, 100, 101],
+                cache=existing_cache,
+            ),
+        )
+
+        # Shares first 5 tokens with the cached prefix, adds 3 more
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50, 60, 70, 80])
+
+        responses = [
+            _make_gen_response("X", 200, prompt_tokens=3, generation_tokens=1),
+        ]
+        mock_stream_generate = MagicMock(return_value=iter(responses))
+        mock_trim = MagicMock(return_value=2)
+        mock_mx = MagicMock()
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch.object(mlx_lm, "stream_generate", mock_stream_generate),
+            patch("olmlx.engine.inference.trim_prompt_cache", mock_trim),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            result = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi again"}],
+                stream=False,
+            )
+
+        # Cache was trimmed by 2 (the prior generated tokens beyond the prefix)
+        mock_trim.assert_called_once()
+        assert mock_trim.call_args[0][1] == 2
+
+        # stream_generate received only the 3 suffix tokens, with prompt_cache
+        call_kwargs = mock_stream_generate.call_args.kwargs
+        assert call_kwargs.get("prompt") == [60, 70, 80]
+        assert call_kwargs.get("prompt_cache") is existing_cache
+
+        # Result dict reports the reused prefix and the new suffix size
+        assert result.get("cache_read_tokens") == 5
+        assert result.get("cache_creation_tokens") == 3
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_cache_disabled_for_speculative(self, mock_manager):
+        """Speculative decoders manage their own internal caches and would
+        receive a suffix-only prompt on a hit. Keep prompt cache OFF for
+        non-streaming speculative to avoid feeding a misaligned prompt."""
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.speculative_decoder = MagicMock()  # is_speculative becomes True
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30])
+
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        mock_mx = MagicMock()
+
+        # Make speculative_stream_generate yield a single token then stop
+        spec_response = _make_gen_response(
+            "hi", 50, prompt_tokens=3, generation_tokens=1
+        )
+        spec_response.finish_reason = "stop"
+
+        def fake_spec_stream(*args, **kwargs):
+            yield spec_response
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.speculative_stream.speculative_stream_generate",
+                fake_spec_stream,
+            ),
+            patch("olmlx.engine.inference.make_prompt_cache", mock_make_cache),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            result = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=False,
+            )
+
+        # No prompt cache created; no cache counters surfaced as positive
+        mock_make_cache.assert_not_called()
+        assert lm.prompt_cache_store.get("") is None
+        # Counters are either absent or zero; both signal "no cache"
+        assert (result.get("cache_read_tokens") or 0) == 0
+        assert (result.get("cache_creation_tokens") or 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_error_invalidates_cache(self, mock_manager):
+        """If generation raises after cache setup, the store entry must be
+        removed so a retry doesn't reuse a half-populated cache."""
+        import mlx_lm
+
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50])
+
+        # Pre-populate the store so we can observe its removal on failure.
+        from olmlx.engine.model_manager import CachedPromptState
+
+        existing_cache = [MagicMock()]
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50],
+                cache=existing_cache,
+            ),
+        )
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("simulated mlx-lm failure")
+
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        mock_mx = MagicMock()
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch.object(mlx_lm, "stream_generate", boom),
+            patch("olmlx.engine.inference.make_prompt_cache", mock_make_cache),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            with pytest.raises(RuntimeError, match="simulated mlx-lm failure"):
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                )
+
+        # The finally block in _full_completion removes the cache entry
+        # because generation_complete stayed False — guards against
+        # subsequent requests reusing a half-populated cache.
+        assert lm.prompt_cache_store.get("") is None
+
+
 class TestVlmUsesCache:
     def _setup_vlm(self, mock_manager):
         """Set up a VLM model for cache testing."""

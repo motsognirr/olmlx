@@ -1765,7 +1765,10 @@ class TestGenerateChat:
             return_value="formatted prompt"
         )
 
-        with patch("olmlx.engine.inference.mx", mock_mx):
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings.prompt_cache", False),
+        ):
             with patch(
                 "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
             ) as mock_thread:
@@ -1788,7 +1791,10 @@ class TestGenerateChat:
             return_value="formatted prompt with tools"
         )
 
-        with patch("olmlx.engine.inference.mx", mock_mx):
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings.prompt_cache", False),
+        ):
             with patch(
                 "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
             ) as mock_thread:
@@ -1814,7 +1820,10 @@ class TestGenerateChatEnableThinking:
             return_value="formatted prompt"
         )
 
-        with patch("olmlx.engine.inference.mx", mock_mx):
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings.prompt_cache", False),
+        ):
             with patch(
                 "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
             ) as mock_thread:
@@ -1841,7 +1850,10 @@ class TestGenerateChatEnableThinking:
             return_value="formatted prompt"
         )
 
-        with patch("olmlx.engine.inference.mx", mock_mx):
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings.prompt_cache", False),
+        ):
             with patch(
                 "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
             ) as mock_thread:
