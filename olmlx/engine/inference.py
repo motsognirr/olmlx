@@ -49,6 +49,77 @@ from olmlx.utils.timing import Timer, TimingStats
 
 logger = logging.getLogger(__name__)
 
+
+def _make_frequency_penalty_processor(frequency_penalty: float):
+    """Create a logits processor that applies OpenAI-style frequency penalty.
+
+    Positive values penalize new tokens based on their existing frequency
+    in the text so far, decreasing the model's likelihood to repeat the
+    same line verbatim.
+
+    Uses an incremental frequency dict (O(1) per step) to avoid O(n²)
+    rebuilds for long generations.  The dict is seeded from the initial
+    token list on first call then incremented by one per step.
+    """
+    freq: dict[int, int] = {}
+    _initialised = False
+
+    def processor(tokens: list[int], logits: mx.array) -> mx.array:
+        nonlocal freq, _initialised
+        if not tokens or frequency_penalty == 0:
+            return logits
+        vocab_size = logits.shape[-1]
+        if not _initialised:
+            for tid in tokens:
+                if 0 <= tid < vocab_size:
+                    freq[tid] = freq.get(tid, 0) + 1
+            _initialised = True
+        else:
+            new_tid = tokens[-1]
+            if 0 <= new_tid < vocab_size:
+                freq[new_tid] = freq.get(new_tid, 0) + 1
+        for tid, count in freq.items():
+            logits[..., tid] -= frequency_penalty * count
+        return logits
+
+    return processor
+
+
+def _make_presence_penalty_processor(presence_penalty: float):
+    """Create a logits processor that applies OpenAI-style presence penalty.
+
+    Positive values penalize new tokens based on whether they appear
+    in the text so far, increasing the model's likelihood to talk about
+    new topics.
+
+    Uses an incremental seen set (O(1) per step) to avoid O(n²)
+    set-builds for long generations.  The set is seeded from the
+    initial token list on first call then incremented by one per step.
+    """
+    seen: set[int] = set()
+    _initialised = False
+
+    def processor(tokens: list[int], logits: mx.array) -> mx.array:
+        nonlocal seen, _initialised
+        if not tokens or presence_penalty == 0:
+            return logits
+        vocab_size = logits.shape[-1]
+        if not _initialised:
+            for tid in tokens:
+                if 0 <= tid < vocab_size and tid not in seen:
+                    seen.add(tid)
+                    logits[..., tid] -= presence_penalty
+            _initialised = True
+        else:
+            new_tid = tokens[-1]
+            if 0 <= new_tid < vocab_size and new_tid not in seen:
+                seen.add(new_tid)
+                logits[..., new_tid] -= presence_penalty
+        return logits
+
+    return processor
+
+
 # gpt-oss special tokens used by the streaming filter
 _GPT_OSS_STRUCTURAL_TOKENS = frozenset(
     {
@@ -1165,6 +1236,10 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
         for ollama_key, mlx_key in vlm_mappings.items():
             if ollama_key in options:
                 kwargs[mlx_key] = options[ollama_key]
+        # Forward stop sequences for downstream (popped before passing to mlx-vlm)
+        if "stop" in options and options["stop"]:
+            raw = options["stop"]
+            kwargs["stop"] = [raw] if isinstance(raw, str) else raw
     else:
         # mlx-lm ≥ 0.30.7: sampling via make_sampler / make_logits_processors
         sampler_args = {}
@@ -1212,14 +1287,22 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
         if "seed" in options:
             kwargs["seed"] = options["seed"]
 
-        if "stop" in options:
-            logger.warning("stop sequences not supported by mlx-lm >= 0.30.7; ignored")
+        # Forward stop sequences for downstream (popped before passing to mlx-lm)
+        if "stop" in options and options["stop"]:
+            raw = options["stop"]
+            kwargs["stop"] = [raw] if isinstance(raw, str) else raw
 
-        for penalty_key in ("frequency_penalty", "presence_penalty"):
-            if penalty_key in options:
-                logger.warning(
-                    "%s not supported by mlx-lm >= 0.30.7; ignored", penalty_key
-                )
+        # Build custom logits processors for frequency/presence penalty
+        # and merge with any existing repeat_penalty processors.
+        _existing = kwargs.pop("logits_processors", [])
+        fp = options.get("frequency_penalty")
+        if fp is not None and fp != 0:
+            _existing.append(_make_frequency_penalty_processor(fp))
+        pp = options.get("presence_penalty")
+        if pp is not None and pp != 0:
+            _existing.append(_make_presence_penalty_processor(pp))
+        if _existing:
+            kwargs["logits_processors"] = _existing
 
     return kwargs
 
@@ -2453,6 +2536,9 @@ async def _stream_completion(
     # Save original string prompt before cache setup may replace it with token IDs.
     # prompt is always str at entry; cache setup may later reassign it to list[int].
     original_prompt = prompt
+    # Pop stop sequences before cache setup / stream creation so they are not
+    # forwarded to mlx-lm (which does not support them).
+    stop_sequences: list[str] | None = gen_kwargs.pop("stop", None)
     try:
         # Cache setup — must happen after lock to prevent concurrent cache corruption
         if use_prompt_cache:
@@ -2572,11 +2658,13 @@ async def _stream_completion(
             else settings.inference_timeout
         )
         timed_out = False
+        stop_hit = False
 
         with _inference_ref(lm, keep_alive=keep_alive), Timer() as total_timer:
             with Timer() as eval_timer:
                 inf_start = time.monotonic()
                 token = None
+                accumulated_text = ""
                 async for token in stream:
                     # Always accumulate for prompt cache (raw stream, not filtered)
                     stats.eval_count = token.generation_tokens
@@ -2589,6 +2677,37 @@ async def _stream_completion(
                             "(cache token sequence will be incomplete)",
                             token.generation_tokens,
                         )
+
+                    # Check stop sequences against the full decoded text so far.
+                    # Must be done before yielding so we can truncate the current token.
+                    # Use the earliest (minimum-index) match across all stop sequences.
+                    stop_match_idx = -1
+                    if stop_sequences:
+                        accumulated_text += token.text or ""
+                        for stop_seq in stop_sequences:
+                            idx = accumulated_text.find(stop_seq)
+                            if idx != -1 and (
+                                stop_match_idx == -1 or idx < stop_match_idx
+                            ):
+                                stop_match_idx = idx
+                        if stop_match_idx != -1:
+                            prev_len = len(accumulated_text) - len(token.text or "")
+                            text_before_stop = accumulated_text[:stop_match_idx]
+                            token_part = (
+                                text_before_stop[prev_len:]
+                                if prev_len < stop_match_idx
+                                else ""
+                            )
+                            if token_part:
+                                if channel_filter is None:
+                                    yield {"text": token_part, "done": False}
+                                elif channel_filter.should_yield(token_part):
+                                    yield {"text": token_part, "done": False}
+                            stop_hit = True
+
+                    if stop_hit:
+                        break
+
                     # Yield text only if the filter allows it (or no filter).
                     # When channel filter is active, always include raw_text so
                     # downstream consumers (e.g. tool call parsers) can
@@ -2656,6 +2775,8 @@ async def _stream_completion(
             done_chunk["raw_text"] = raw_text
         if timed_out:
             done_chunk["done_reason"] = "timeout"
+        if stop_hit:
+            done_chunk["done_reason"] = "stop"
         yield done_chunk
     finally:
         # Release GPU-backed references from gen_kwargs so they can be
@@ -2742,6 +2863,8 @@ async def _full_completion(
     # cannot be safely cancelled (releasing the lock while Metal is still
     # running causes concurrent command buffer access).  Streaming handles
     # this via CancellableStream.cancel() + drain_and_join().
+    # Pop stop sequences before passing gen_kwargs to mlx-lm (unsupported).
+    stop_sequences: list[str] | None = gen_kwargs.pop("stop", None)
     async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
         with _inference_ref(lm, keep_alive=keep_alive):
             # Cache setup must happen under the inference lock so two
@@ -2754,6 +2877,7 @@ async def _full_completion(
             cache_setup_done = False
             generation_complete = False
             generated_tokens: list[int] = []
+            result_dict: dict = {}
             try:
                 if use_prompt_cache:
                     cs = await _setup_prompt_cache(
@@ -2804,7 +2928,7 @@ async def _full_completion(
                         stats.eval_count,
                         cache_id,
                     )
-                return result_dict
+                _result = result_dict
             finally:
                 # Drop GPU-backed references from gen_kwargs so they can be
                 # garbage-collected.  ``prompt_cache`` is either persisted in
@@ -2818,6 +2942,18 @@ async def _full_completion(
                         "Cache invalidated: non-streaming generation did not complete"
                     )
                     lm.prompt_cache_store.remove(cache_id)
+    if stop_sequences and result_dict:
+        text = result_dict.get("text", "")
+        earliest = -1
+        for stop_seq in stop_sequences:
+            idx = text.find(stop_seq)
+            if idx != -1 and (earliest == -1 or idx < earliest):
+                earliest = idx
+        if earliest != -1:
+            text = text[:earliest]
+            result_dict["finish_reason"] = "stop"
+        result_dict["text"] = text
+    return result_dict
 
 
 async def _full_completion_inner(
