@@ -102,23 +102,34 @@ class TestApplyGraders:
         assert results[0].quality is not None
         assert results[0].quality.passed is None
 
-    def test_code_exec_enabled_injects_flag(self):
-        results = [self._result("p1", "```python\ndef f():\n    return 1\n```")]
-        prompts = [
-            {
-                "name": "p1",
-                "grader": "code_exec",
-                "expected": {
-                    "prompt": "",
-                    "tests": "def check(f):\n    assert f() == 1\n",
-                    "entry_point": "f",
-                },
-            }
-        ]
+    def test_code_exec_enabled_injects_flag(self, monkeypatch):
+        # Verifies the injection contract without actually running a
+        # subprocess — the real code_exec execution is covered in
+        # test_bench_quality.py. Stubs ``grade`` in the runner namespace
+        # to capture what apply_graders hands it.
+        captured: dict = {}
+
+        def fake_grade(grader_name, output, expected):
+            captured["grader"] = grader_name
+            captured["expected"] = expected
+            return QualityResult(grader=grader_name, passed=True, score=1.0, detail="")
+
+        monkeypatch.setattr("olmlx.bench.runner.grade", fake_grade)
+
+        results = [self._result("p1", "irrelevant")]
+        original_expected = {
+            "prompt": "",
+            "tests": "def check(f):\n    assert f() == 1\n",
+            "entry_point": "f",
+        }
+        prompts = [{"name": "p1", "grader": "code_exec", "expected": original_expected}]
         apply_graders(results, prompts, enable_code_exec=True)
-        assert results[0].quality.passed is True
+
+        assert captured["grader"] == "code_exec"
+        assert captured["expected"]["_enabled"] is True
         # Caller's expected dict must not be mutated with the private flag.
-        assert "_enabled" not in prompts[0]["expected"]
+        assert "_enabled" not in original_expected
+        assert results[0].quality.passed is True
 
 
 class TestQualitySerialization:

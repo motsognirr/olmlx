@@ -187,6 +187,9 @@ def run_bench(
     scenarios = get_scenarios(scenario_names)
     model_path = _resolve_model_path(model)
     prompts_data = [p.to_dict() for p in build_prompts(prompt_set)]
+    # Log the resolved worker timeout once so a post-hoc "why did my run
+    # get killed" investigation has a record of what limit was in effect.
+    logger.info("Bench worker timeout: %.0fs", _worker_timeout())
 
     scenario_results: list[ScenarioResult] = []
 
