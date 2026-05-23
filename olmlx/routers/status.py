@@ -1,9 +1,11 @@
+import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse
 
 from olmlx import __version__
+from olmlx.schemas.models import ModelDetails
 from olmlx.schemas.status import PsResponse, RunningModel, VersionResponse
 
 router = APIRouter()
@@ -27,19 +29,48 @@ async def version():
 @router.get("/api/ps")
 async def ps(request: Request):
     manager = request.app.state.model_manager
+    store = request.app.state.model_store
     loaded = manager.get_loaded()
     models = []
     for lm in loaded:
         expires = ""
         if lm.expires_at is not None:
             expires = datetime.fromtimestamp(lm.expires_at, tz=timezone.utc).isoformat()
+
+        # Read metadata from the manifest (backfilled at load time) to avoid
+        # expensive _dir_size / _extract_metadata calls on the event loop.
+        size = lm.size_bytes
+        meta = {"family": "", "parameter_size": "", "quantization_level": ""}
+        digest = ""
+        if store is not None:
+            local_dir = store.local_path(lm.hf_path)
+            manifest_path = local_dir / "manifest.json"
+            if manifest_path.exists():
+                try:
+                    m = json.loads(manifest_path.read_text())
+                    if size == 0:
+                        size = m.get("size", 0)
+                    digest = m.get("digest", "")
+                    meta["family"] = m.get("family", "")
+                    meta["parameter_size"] = m.get("parameter_size", "")
+                    meta["quantization_level"] = m.get("quantization_level", "")
+                except Exception:
+                    pass
+
         models.append(
             RunningModel(
                 name=lm.name,
                 model=lm.hf_path,
-                size=lm.size_bytes,
+                size=size,
+                digest=digest,
+                details=ModelDetails(
+                    format="mlx",
+                    family=meta["family"],
+                    parameter_size=meta["parameter_size"],
+                    quantization_level=meta["quantization_level"],
+                ),
                 expires_at=expires,
-                size_vram=lm.size_bytes,
+                size_vram=size,
                 active_refs=lm.active_refs,
             )
         )
