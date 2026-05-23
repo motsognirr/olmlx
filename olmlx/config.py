@@ -625,7 +625,7 @@ _LEGACY_FLASH_PREFETCH_SPECULATIVE_FORWARD: tuple[
         "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL",
         "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL",
         "flash_speculative_draft_model",
-        lambda v: v.strip(),
+        lambda v: v.strip() or None,
     ),
     (
         "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS",

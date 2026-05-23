@@ -2792,6 +2792,25 @@ class TestLegacyFlashPrefetchSpeculativeForwarding:
         assert settings.flash_prefetch is True
         assert "OLMLX_FLASH_PREFETCH" in caplog.text
 
+    def test_whitespace_draft_model_becomes_none(self, monkeypatch, tmp_path):
+        """Whitespace-only OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL → None.
+
+        Regression for the strip()-only parser that returned "" (empty string)
+        instead of None, which would later fail the min_length=1 validator.
+        """
+        from olmlx.config import settings, surface_legacy_flash_prefetch_speculative_env
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL", "   ")
+        monkeypatch.delenv("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL", raising=False)
+        monkeypatch.setattr(
+            settings, "flash_speculative_draft_model", None, raising=False
+        )
+
+        surface_legacy_flash_prefetch_speculative_env()
+
+        assert settings.flash_speculative_draft_model is None
+
     def test_cmd_flash_prepare_calls_legacy_shim(self, monkeypatch):
         """cmd_flash_prepare must surface legacy env vars before reading settings.
 

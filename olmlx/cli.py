@@ -1800,6 +1800,7 @@ def cmd_chat(args):
     _surface_legacy_speculative_env()
     _surface_legacy_kv_cache_quant_env()
     _surface_legacy_flash_env()
+    _surface_legacy_flash_moe_env()
     _surface_legacy_flash_prefetch_speculative_env()
     _warn_kv_cache_quant_incompatibilities()
 
@@ -2153,6 +2154,7 @@ def cmd_config_show(_args):
     _surface_legacy_kv_cache_quant_env()
     _surface_legacy_distributed_env()
     _surface_legacy_flash_env()
+    _surface_legacy_flash_moe_env()
     _surface_legacy_flash_prefetch_speculative_env()
 
     print(f"Host:                   {settings.host}")
@@ -2345,6 +2347,7 @@ def cmd_flash_prepare(args):
     # reaches settings.flash_prefetch before _cmd_flash_dense_prepare reads it
     # via train_lookahead=settings.flash_prefetch.
     _surface_legacy_flash_env()
+    _surface_legacy_flash_moe_env()
     _surface_legacy_flash_prefetch_speculative_env()
 
     store = _create_store()
@@ -2671,6 +2674,7 @@ def cmd_flash_info(args):
     # an operator would see from ``olmlx config show`` / ``olmlx serve``
     # when they've only renamed the new env vars in some shells.
     _surface_legacy_flash_env()
+    _surface_legacy_flash_moe_env()
     _surface_legacy_flash_prefetch_speculative_env()
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
