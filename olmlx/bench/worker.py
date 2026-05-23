@@ -56,14 +56,28 @@ def _resolve_bench_think(env: dict[str, str]) -> bool | None:
     Returns ``True``/``False`` to force the Ollama ``think`` field on/off,
     or ``None`` to omit it (engine default: think-unless-tools). Lets a bench
     operator A/B the same model with and without thinking without touching the
-    prompt set. Unrecognized values fall back to the engine default rather than
-    silently picking a side.
+    prompt set.
+
+    An unset or empty value resolves to ``None`` quietly (engine default). A
+    *non-empty* unrecognized value (e.g. ``"tru"``, ``"enabled"``) also
+    resolves to ``None`` but warns — otherwise an A/B with a typo on one
+    arm silently runs engine-default on both arms with no signal anything
+    went wrong.
     """
-    raw = env.get("OLMLX_BENCH_THINK", "").strip().lower()
+    raw_str = env.get("OLMLX_BENCH_THINK", "")
+    raw = raw_str.strip().lower()
+    if not raw:
+        return None
     if raw in _THINK_TRUE:
         return True
     if raw in _THINK_FALSE:
         return False
+    logger.warning(
+        "Ignoring OLMLX_BENCH_THINK=%r: expected one of %s; falling back to "
+        "engine default",
+        raw_str,
+        sorted(_THINK_TRUE | _THINK_FALSE),
+    )
     return None
 
 

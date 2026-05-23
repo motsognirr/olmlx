@@ -169,8 +169,13 @@ def apply_graders(
         expected = dict(prompt.get("expected") or {})
         if grader_name == "code_exec" and enable_code_exec:
             expected["_enabled"] = True
+        # Compute first, assign together — if ``grade`` ever raises (its
+        # current contract says it can't), the exception propagates with
+        # ``r.grader`` and ``r.quality`` both still ``None``, preserving
+        # the documented invariant against a future regression.
+        quality = grade(grader_name, r.output_text, expected)
         r.grader = grader_name
-        r.quality = grade(grader_name, r.output_text, expected)
+        r.quality = quality
 
 
 def _find_free_port() -> int:
@@ -400,7 +405,7 @@ def _run_worker(
                     category="error",
                     output_text="",
                     status_code=0,
-                    error=f"Worker timed out after {worker_timeout}s",
+                    error=f"Worker timed out after {worker_timeout:.0f}s",
                 )
             ]
 
