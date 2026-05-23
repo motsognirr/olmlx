@@ -22,7 +22,7 @@ class CreateRequest(BaseModel):
 
 class WarmupRequest(BaseModel):
     model: ModelName
-    keep_alive: str | None = None
+    keep_alive: int | str | None = None
 
 
 class AbortRequest(BaseModel):

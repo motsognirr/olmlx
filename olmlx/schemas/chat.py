@@ -35,7 +35,7 @@ class ChatRequest(BaseModel):
     stream: bool = True
     think: bool | str | None = None
     options: ModelOptions | None = None
-    keep_alive: str | None = None
+    keep_alive: int | str | None = None
 
     @field_validator("messages")
     @classmethod
