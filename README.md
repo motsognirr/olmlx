@@ -355,10 +355,10 @@ Advanced tuning (rarely needed; left under the experimental prefix):
 | `OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS` | `1024` | Budget for cached neurons in memory |
 | `OLMLX_EXPERIMENTAL_FLASH_BYPASS_OS_CACHE` | `false` | `O_DIRECT`/`F_NOCACHE` reads (skip page cache) |
 | `OLMLX_EXPERIMENTAL_FLASH_PREALLOCATED_BUFFER` | `false` | Use a single preallocated read buffer per worker |
-| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE` | `false` | Enable speculative decoding with draft model |
-| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL` | `None` | Draft model name or HuggingFace path |
-| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS` | `4` | Candidate tokens per speculative step |
-| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH` | `false` | Enable speculative neuron prefetching |
+| `OLMLX_FLASH_SPECULATIVE` | `false` | Enable speculative decoding with draft model (requires Flash) |
+| `OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL` | `None` | Draft model name or HuggingFace path |
+| `OLMLX_FLASH_SPECULATIVE_TOKENS` | `4` | Candidate tokens per speculative step |
+| `OLMLX_FLASH_PREFETCH` | `false` | Enable speculative neuron prefetching |
 
 ### Flash-MoE settings
 
@@ -376,7 +376,7 @@ The legacy names `OLMLX_EXPERIMENTAL_FLASH_MOE*` are still honoured for a deprec
 |---|---|---|
 | `OLMLX_DISTRIBUTED` | `false` | Enable distributed inference |
 | `OLMLX_DISTRIBUTED_HOSTFILE` | `~/.olmlx/hostfile.json` | Path to hostfile with hosts and model |
-| `OLMLX_DISTRIBUTED_BACKEND` | `ring` | MLX distributed backend |
+| `OLMLX_DISTRIBUTED_BACKEND` | `ring` | MLX distributed backend (tensor parallelism only; `pipeline` strategy removed) |
 | `OLMLX_DISTRIBUTED_PORT` | `32323` | Base port for ring backend (increments per rank) |
 | `OLMLX_DISTRIBUTED_SIDEBAND_PORT` | `32400` | TCP port for coordinator↔worker sideband |
 | `OLMLX_DISTRIBUTED_SECRET` | *(empty)* | Shared secret for worker authentication |
@@ -470,7 +470,7 @@ olmlx serve --flash
 
 ### Supported architectures
 
-Flash dense (sparse FFN with SSD-backed neurons) is validated on Qwen3-family text models today (`Qwen3`, `Qwen3-Coder`, and the hybrid linear-attention variants `Qwen3.5` / `Qwen3-Coder-Next` text towers). Architectures with non-standard FFN shapes (gated MoE, vision encoders, hybrid Mamba blocks) may need adapter work. For Mixture-of-Experts targets use Flash-MoE instead — it routes through a separate code path (`OLMLX_EXPERIMENTAL_FLASH_MOE=true`).
+Flash dense (sparse FFN with SSD-backed neurons) is validated on Qwen3-family text models today (`Qwen3`, `Qwen3-Coder`, and the hybrid linear-attention variants `Qwen3.5` / `Qwen3-Coder-Next` text towers). Architectures with non-standard FFN shapes (gated MoE, vision encoders, hybrid Mamba blocks) may need adapter work. For Mixture-of-Experts targets use Flash-MoE instead — it routes through a separate code path (`OLMLX_FLASH_MOE=true`).
 
 ### Tuning the sparsity threshold
 
@@ -482,12 +482,57 @@ Combine flash with a small draft model for faster token generation:
 
 ```bash
 OLMLX_FLASH=true \
-OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE=true \
-OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+OLMLX_FLASH_SPECULATIVE=true \
+OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit \
 olmlx serve
 ```
 
+Or with CLI flags:
+
+```bash
+olmlx serve \
+  --flash \
+  --flash-speculative \
+  --flash-speculative-draft-model mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --flash-speculative-tokens 4
+```
+
+You can also pin per-model defaults in `~/.olmlx/models.json`:
+
+```json
+{
+  "mlx-community/Qwen2.5-32B-Instruct-4bit:latest": {
+    "hf_path": "mlx-community/Qwen2.5-32B-Instruct-4bit",
+    "flash_speculative": true,
+    "flash_speculative_draft_model": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+    "flash_speculative_tokens": 4
+  }
+}
+```
+
 The draft model generates candidate tokens in-memory, then the flash model verifies them in one pass — producing multiple tokens per SSD read.
+
+### Neuron prefetching
+
+Prefetching predicts and pre-loads neuron weights from SSD before they are needed, hiding I/O latency during Flash inference. It is gated on `OLMLX_FLASH_PREFETCH=true` (or `--flash-prefetch` on `olmlx serve`) and provides two complementary paths:
+
+| Configuration | Prefetch path(s) active | How it works |
+|---|---|---|
+| Flash, no speculative | Path A — cross-layer only | While layer L computes, predicts layer L+1's active neurons and starts background SSD reads |
+| Flash + speculative | Path A + Path B — both | Path A fires continuously; during draft generation, draft hidden states are used to prefetch all target layers before verification begins |
+| Dense, no speculative | — (no Flash, no prefetch) | Standard in-memory inference; prefetch is a Flash-only feature |
+| Dense + speculative | — (no Flash, no prefetch) | Standard speculative decoding without SSD neuron prefetch |
+
+`LookaheadBank` opt-in: when `OLMLX_FLASH_PREFETCH=true` is set during `olmlx flash prepare`, dedicated cross-layer predictors are trained for Path A (otherwise falls back to reusing the layer L+1 sparsity predictor).
+
+The four prefetch tuning knobs remain under the experimental prefix:
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_CONFIDENCE_THRESHOLD` | `0.3` | Minimum predictor confidence for prefetching |
+| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_MIN_NEURONS` | `64` | Minimum neurons per prefetch batch |
+| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_MAX_NEURONS` | *(unset)* | Maximum neurons per prefetch batch |
+| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_IO_THREADS` | `16` | I/O threads for prefetch loading |
 
 ### Migration from `OLMLX_EXPERIMENTAL_FLASH_*`
 
@@ -500,8 +545,12 @@ Flash inference's primary knobs have been promoted out of `experimental`. Rename
 | `OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS` | `OLMLX_FLASH_MIN_ACTIVE_NEURONS` |
 | `OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS` | `OLMLX_FLASH_MAX_ACTIVE_NEURONS` |
 | `OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION` | `OLMLX_FLASH_MEMORY_BUDGET_FRACTION` |
+| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH` | `OLMLX_FLASH_PREFETCH` |
+| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE` | `OLMLX_FLASH_SPECULATIVE` |
+| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL` | `OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL` |
+| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS` | `OLMLX_FLASH_SPECULATIVE_TOKENS` |
 
-The legacy `OLMLX_EXPERIMENTAL_FLASH*` names for these five fields are still honoured for one release with a deprecation warning. Per-model `models.json` entries that previously placed these keys under `"experimental": {...}` now go at the top level — loading an old config raises a clear migration error pointing at the new location. Advanced tuning fields (`OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE`, `..._IO_THREADS`, `..._CACHE_BUDGET_NEURONS`, `..._BYPASS_OS_CACHE`, `..._PREALLOCATED_BUFFER`, `..._PREFETCH*`, `..._SPECULATIVE*`) and the Flash-MoE knobs (`OLMLX_EXPERIMENTAL_FLASH_MOE*`) remain under the experimental prefix.
+The legacy names for all nine fields above are still honoured for one release with a deprecation warning. Per-model `models.json` entries that previously placed these keys under `"experimental": {...}` now go at the top level — loading an old config raises a clear migration error pointing at the new location. Advanced tuning fields (`OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE`, `..._IO_THREADS`, `..._CACHE_BUDGET_NEURONS`, `..._BYPASS_OS_CACHE`, `..._PREALLOCATED_BUFFER`, `..._PREFETCH_CONFIDENCE_THRESHOLD`, `..._PREFETCH_MIN_NEURONS`, `..._PREFETCH_MAX_NEURONS`, `..._PREFETCH_IO_THREADS`) and the Flash-MoE knobs (`OLMLX_EXPERIMENTAL_FLASH_MOE*`) remain under the experimental prefix.
 
 ### Flash-MoE
 
@@ -536,6 +585,8 @@ OLMLX_KV_CACHE_QUANT=spectral:4
 Note: TurboQuant and SpectralQuant are incompatible with disk cache offload.
 
 ## Distributed Inference (Experimental)
+
+> **Tensor parallelism only.** Distributed inference uses tensor (all-reduce) parallelism exclusively. The `pipeline` strategy was removed in this release. All ranks load the full model and each rank owns a slice of the attention/MLP weight tensors; `all_sum` synchronizes partial results across ranks.
 
 Run models across multiple Apple Silicon machines connected via network (Thunderbolt recommended for best performance). This lets you run models that don't fit on a single machine — e.g. a 72B model split across two 64GB Mac Minis.
 
