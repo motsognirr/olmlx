@@ -314,9 +314,12 @@ def _cache_supports_trim(cache_list: list) -> bool:
 # - QuantizedKVCache: same, with mx.quantize/dequantize wrappers.
 # - ConcatenateKVCache: same, used by AFM-7 family.
 # - RotatingKVCache: ring buffer over fixed window (Gemma 4); writes
-#   in place via mx.assign at modular offsets.
+#   in place via mx.assign at modular offsets.  Non-trimmable, so
+#   ``_probe_cache_capabilities`` folds this to effective persist=False
+#   (issue #343) — listed here only because the bare layout itself is
+#   Metal-safe to store.
 # - ChunkedKVCache: chunked layout (afm7); same semantics as KVCache
-#   bounded by chunk_size.
+#   bounded by chunk_size.  Also non-trimmable, same #343 fold applies.
 # If a future mlx-lm release adds metal_kernel-style state to any of
 # these, that class must be removed from the allowlist.
 #

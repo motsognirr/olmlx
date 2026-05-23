@@ -602,15 +602,22 @@ class TestCachePersistenceProbe:
         )
 
 
-class TestNonTrimmableModelSkipsTrim:
+class TestNonPersistableLookupShortCircuit:
+    """Post-#343 contract for non-trimmable cache layouts: the probe
+    folds ``supports_cache_persistence`` to False, so the lookup in
+    ``_setup_prompt_cache`` short-circuits at the persistence gate before
+    consulting the trim check.  Both a divergent next-turn prompt
+    (cache discarded) and an artificial strict-extension turn (would
+    have been reusable pre-#343) land in the fresh-cache branch without
+    ever calling ``trim_prompt_cache``.  Pre-fix this class was named
+    ``TestNonTrimmableModelSkipsTrim`` — that suggested trim was the
+    gate being skipped, but post-#343 trim is never reached at all."""
+
     @pytest.mark.asyncio
-    async def test_non_trimmable_skips_trim_call(self, mock_manager):
-        """Issue #343: a non-trimmable cache layout (RotatingKVCache,
-        ChunkedKVCache) is also non-persistable post-#343 — the probe
-        forces ``supports_cache_persistence = False`` so the lookup
-        short-circuits before reaching the trim check.  Verify the
-        post-#343 flag combination (both False) lands in the fresh-cache
-        branch without ever calling ``trim_prompt_cache``."""
+    async def test_diverging_prompt_creates_fresh(self, mock_manager):
+        """Divergent next-turn prompt against a non-persistable cache
+        lands in the fresh-cache branch.  Trim must NOT be consulted
+        — the persistence gate already short-circuited the lookup."""
         from olmlx.engine.inference import generate_chat
         from olmlx.engine.model_manager import CachedPromptState
 
