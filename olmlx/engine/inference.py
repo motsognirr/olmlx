@@ -2706,7 +2706,7 @@ async def _stream_completion(
 
 async def _full_completion(
     lm: LoadedModel,
-    prompt: str,
+    prompt: str | list[int],
     max_tokens: int,
     gen_kwargs: dict,
     stats: TimingStats,
@@ -2801,7 +2801,7 @@ async def _full_completion(
 
 async def _full_completion_inner(
     lm: LoadedModel,
-    prompt: str,
+    prompt: str | list[int],
     max_tokens: int,
     gen_kwargs: dict,
     stats: TimingStats,
