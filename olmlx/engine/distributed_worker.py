@@ -361,7 +361,7 @@ def worker_main() -> None:
                 mx.eval(model.parameters())
     else:
         logger.error(
-            "Unknown distributed strategy %r (expected 'pipeline' or 'tensor')",
+            "Unknown distributed strategy %r (expected 'tensor'; pipeline strategy was removed in this release)",
             strategy,
         )
         worker.close()

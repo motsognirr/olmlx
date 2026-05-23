@@ -3244,7 +3244,7 @@ class ModelManager:
                 mx.clear_cache()
                 raise ValueError(
                     f"Unknown distributed strategy {self._distributed_strategy!r}. "
-                    f"Supported: 'tensor', 'pipeline'."
+                    f"Supported: 'tensor' (pipeline strategy was removed in this release)."
                 )
 
         return model, tokenizer, is_vlm, caps, is_distributed, speculative_decoder

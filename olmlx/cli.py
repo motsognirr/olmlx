@@ -719,8 +719,7 @@ def _apply_serve_overrides(args) -> None:
             "``flash_speculative`` field (or "
             "OLMLX_FLASH_SPECULATIVE / "
             "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL / "
-            "OLMLX_FLASH_SPECULATIVE_TOKENS) instead. "
-            "Note: flash-speculative is still experimental.",
+            "OLMLX_FLASH_SPECULATIVE_TOKENS) instead.",
             ", ".join(flash_conflicts_actionable),
         )
     # dflash on Flash-MoE models will raise ValueError at load time once
@@ -2331,6 +2330,11 @@ def cmd_spectral_prepare(args):
 def cmd_flash_prepare(args):
     """Prepare a model for flash inference (auto-detects MoE vs dense)."""
     _configure_logging()
+    # Forward legacy env vars so OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true
+    # reaches settings.flash_prefetch before _cmd_flash_dense_prepare reads it
+    # via train_lookahead=settings.flash_prefetch.
+    _surface_legacy_flash_env()
+    _surface_legacy_flash_prefetch_speculative_env()
 
     store = _create_store()
     _resolved = store.registry.resolve(args.model)

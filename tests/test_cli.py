@@ -2792,6 +2792,28 @@ class TestLegacyFlashPrefetchSpeculativeForwarding:
         assert settings.flash_prefetch is True
         assert "OLMLX_FLASH_PREFETCH" in caplog.text
 
+    def test_cmd_flash_prepare_calls_legacy_shim(self, monkeypatch):
+        """cmd_flash_prepare must surface legacy env vars before reading settings.
+
+        Regression test for the fix that adds _surface_legacy_flash_env() and
+        _surface_legacy_flash_prefetch_speculative_env() at the top of
+        cmd_flash_prepare — without this, OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true
+        was silently ignored and no LookaheadBank was trained.
+        """
+        import inspect
+        import olmlx.cli as cli_mod
+
+        src = inspect.getsource(cli_mod.cmd_flash_prepare)
+        assert "_surface_legacy_flash_prefetch_speculative_env" in src, (
+            "cmd_flash_prepare must call _surface_legacy_flash_prefetch_speculative_env() "
+            "so that OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true reaches settings.flash_prefetch "
+            "before _cmd_flash_dense_prepare reads train_lookahead=settings.flash_prefetch."
+        )
+        assert "_surface_legacy_flash_env" in src, (
+            "cmd_flash_prepare must also call _surface_legacy_flash_env() "
+            "for consistency with other commands that surface both shims."
+        )
+
 
 class TestServeFlashPrefetchSpeculativeFlags:
     def test_flags_apply_to_settings(self, monkeypatch):
