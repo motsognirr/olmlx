@@ -280,8 +280,10 @@ def _cache_supports_trim(cache_list: list) -> bool:
     Used at model load time to decide whether `trim_prompt_cache()` is worth
     attempting on this model.  Hybrid sliding-window models (Gemma 4,
     Qwen3-Next, etc.) include `RotatingKVCache` layers and return False —
-    such models still benefit from strict-extension cache reuse but cannot
-    be trimmed back on prompt divergence.
+    post-#343 such models also have cross-request persistence force-disabled
+    by `_probe_cache_capabilities` (trim implies persist; persist without
+    trim doesn't), so they get zero cross-request prompt cache reuse and
+    fall back to a fresh prefill on every request.
     """
     return all(type(layer).__name__ in _TRIMMABLE_CACHE_CLASSES for layer in cache_list)
 
@@ -2093,6 +2095,14 @@ class ModelManager:
             # ArraysCache (#284): disable persistence at probe time and
             # short-circuit the store/load path entirely.  Trim implies
             # persist; persist without trim does not, post-#343.
+            #
+            # Note: with the current allowlists (_TRIMMABLE_CACHE_CLASSES
+            # ⊂ _PERSISTABLE_CACHE_CLASSES), ``trim_ok=True`` already
+            # implies ``persist_layout_ok=True``, so this is functionally
+            # equivalent to ``persist_ok = trim_ok``.  The two-term form
+            # is intentional: if a future class is added that is
+            # trimmable but not persistable, the formula stays correct
+            # without further changes.
             persist_ok = persist_layout_ok and trim_ok
             lm.supports_cache_trim = trim_ok
             lm.supports_cache_persistence = persist_ok

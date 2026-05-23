@@ -476,8 +476,16 @@ class TestCachePersistenceProbe:
         assert _cache_supports_persistence([_FakeKVCache(), _FakeKVCache()]) is True
 
     def test_kvcache_plus_rotating_supports_persistence(self):
-        """Gemma 4 / hybrid sliding-window models still benefit from
-        strict-extension cache reuse — only ArraysCache is unsafe."""
+        """Gemma 4 / hybrid sliding-window models pass the layout-level
+        persistence check (``RotatingKVCache`` is in the persist
+        allowlist), but ``_probe_cache_capabilities`` folds the result
+        with the trim check post-#343 — so the effective
+        ``lm.supports_cache_persistence`` is False for these models and
+        they get zero cross-request prompt cache reuse.  This test
+        asserts the raw layout signal only; the probe-level fold is
+        covered by
+        ``TestProbeCacheCapabilities::test_non_trimmable_layout_disables_persistence``
+        in ``tests/test_model_manager.py``."""
         from olmlx.engine.model_manager import _cache_supports_persistence
 
         assert (

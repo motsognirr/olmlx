@@ -761,6 +761,41 @@ class TestProbeCacheCapabilities:
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
 
+    def test_mixed_layout_kv_plus_rotating_disables_persistence(
+        self, registry, mock_store
+    ):
+        """Real Gemma 4 layout: full-attention layers produce ``KVCache``
+        (trimmable + persistable), sliding-window layers produce
+        ``RotatingKVCache`` (non-trimmable, layout-persistable).  With
+        ``all(...)`` semantics in both allowlist checks, the mixed list
+        reports trim=False (RotatingKVCache breaks the universal
+        quantifier) and layout-persist=True (both classes are in the
+        persist allowlist) — so the #343 fold takes effect and forces
+        the effective persist flag to False.  This guards against a
+        future allowlist change silently breaking the universal
+        quantifier on the heterogeneous layout that the affected models
+        actually use."""
+
+        class _FakeKV:
+            pass
+
+        class _FakeRotating:
+            pass
+
+        _FakeKV.__name__ = "KVCache"
+        _FakeRotating.__name__ = "RotatingKVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+        lm.supports_cache_persistence = True
+
+        probe_cache = [_FakeKV(), _FakeRotating(), _FakeKV(), _FakeRotating()]
+        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is False
+        assert lm.supports_cache_persistence is False
+
     def test_trimmable_layout_keeps_persistence(self, registry, mock_store):
         """Guard the inverse: a fully trimmable layout (plain ``KVCache``
         layers) must still report persistence True after the #343 fix.
