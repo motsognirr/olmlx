@@ -310,6 +310,7 @@ class ModelStore:
                 # No valid manifest — try to derive one from config.json
                 config_path = d / "config.json"
                 if config_path.exists():
+                    manifest: ModelManifest | None = None
                     try:
                         info = dir_to_info.get(d.name)
                         if info is not None:
@@ -324,9 +325,11 @@ class ModelStore:
                             short_name = hf_path
                         manifest = _derive_manifest(d, short_name, hf_path)
                         manifest.save(manifest_path)
-                        models.append(manifest)
                     except Exception:
                         logger.debug("Failed to derive manifest for %s", d)
+                    # Include the model even if save failed (disk full, etc.)
+                    if manifest is not None:
+                        models.append(manifest)
         return models
 
     def show(self, name: str) -> ModelManifest | None:
