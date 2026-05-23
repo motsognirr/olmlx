@@ -1462,6 +1462,7 @@ class ModelManager:
                             if _manifest_path.exists():
                                 try:
                                     import json
+
                                     _model_size = json.loads(
                                         _manifest_path.read_text()
                                     ).get("size", 0)
@@ -3061,10 +3062,7 @@ class ModelManager:
             load_path = str(local_dir)
             # Backfill manifest.json when missing so show() and list_local()
             # don't need to derive metadata on every access.
-            if (
-                local_dir.exists()
-                and not (local_dir / "manifest.json").exists()
-            ):
+            if local_dir.exists() and not (local_dir / "manifest.json").exists():
                 from olmlx.models.store import _derive_manifest
 
                 # Find the Ollama short name for this hf_path, falling back

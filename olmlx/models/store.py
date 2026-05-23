@@ -318,9 +318,7 @@ class ModelStore:
                         else:
                             # Unknown model — reverse the safe_dir_name heuristic
                             hf_path = (
-                                d.name.replace("_", "/", 1)
-                                if "_" in d.name
-                                else d.name
+                                d.name.replace("_", "/", 1) if "_" in d.name else d.name
                             )
                             short_name = hf_path
                         manifest = _derive_manifest(d, short_name, hf_path)

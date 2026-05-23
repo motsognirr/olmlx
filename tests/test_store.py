@@ -568,6 +568,7 @@ class TestResolveModelDir:
             json.dumps({"name": "test:latest", "hf_path": "test/model"})
         )
         from olmlx.engine.registry import ModelConfig
+
         mock_store.registry._mappings["test:latest"] = ModelConfig(hf_path="test/model")
 
         result = mock_store._resolve_model_dir("test")
@@ -582,6 +583,7 @@ class TestResolveModelDir:
         local_dir.mkdir(parents=True)
         (local_dir / "config.json").write_text("{}")
         from olmlx.engine.registry import ModelConfig
+
         mock_store.registry._mappings["test:latest"] = ModelConfig(hf_path="test/model")
 
         result = mock_store._resolve_model_dir("test")
