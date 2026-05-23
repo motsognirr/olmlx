@@ -1116,6 +1116,61 @@ class TestNonStreamingCacheHit:
         assert (result.get("cache_read_tokens") or 0) == 0
         assert (result.get("cache_creation_tokens") or 0) == 0
 
+    @pytest.mark.asyncio
+    async def test_non_streaming_error_invalidates_cache(self, mock_manager):
+        """If generation raises after cache setup, the store entry must be
+        removed so a retry doesn't reuse a half-populated cache."""
+        import mlx_lm
+
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50])
+
+        # Pre-populate the store so we can observe its removal on failure.
+        from olmlx.engine.model_manager import CachedPromptState
+
+        existing_cache = [MagicMock()]
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50],
+                cache=existing_cache,
+            ),
+        )
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("simulated mlx-lm failure")
+
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        mock_mx = MagicMock()
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch.object(mlx_lm, "stream_generate", boom),
+            patch("olmlx.engine.inference.make_prompt_cache", mock_make_cache),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            with pytest.raises(RuntimeError, match="simulated mlx-lm failure"):
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                )
+
+        # The finally block in _full_completion removes the cache entry
+        # because generation_complete stayed False — guards against
+        # subsequent requests reusing a half-populated cache.
+        assert lm.prompt_cache_store.get("") is None
+
 
 class TestVlmUsesCache:
     def _setup_vlm(self, mock_manager):
