@@ -2811,6 +2811,37 @@ class TestLegacyFlashPrefetchSpeculativeForwarding:
 
         assert settings.flash_speculative_draft_model is None
 
+    def test_dotenv_new_var_opt_out_not_clobbered_by_legacy_shell(
+        self, monkeypatch, tmp_path
+    ):
+        """OLMLX_FLASH_PREFETCH=false in .env must not be clobbered by legacy shell var.
+
+        Regression for the .env blind spot: when the new var is written only to
+        .env (not the shell env), os.environ.get(new) returns None and the old
+        guard failed to detect the explicit opt-out, allowing the legacy shell
+        var to overwrite the user's intended False value.
+        """
+        from olmlx.config import settings, surface_legacy_flash_prefetch_speculative_env
+
+        monkeypatch.chdir(tmp_path)
+        # New var set only in .env — pydantic-settings picks it up but does
+        # NOT write it to os.environ, so os.environ.get("OLMLX_FLASH_PREFETCH")
+        # returns None even though the user explicitly opted out.
+        (tmp_path / ".env").write_text("OLMLX_FLASH_PREFETCH=false\n")
+        # Legacy var is in the shell env, simulating a user who hasn't cleaned
+        # up their shell after the rename.
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_PREFETCH", "true")
+        # Ensure the new shell var is absent (only in .env).
+        monkeypatch.delenv("OLMLX_FLASH_PREFETCH", raising=False)
+        # Settings reflect the .env opt-out (False == default, but the user
+        # explicitly wrote it — the bug scenario).
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=False)
+
+        surface_legacy_flash_prefetch_speculative_env()
+
+        # The legacy shell var must NOT have clobbered the explicit .env opt-out.
+        assert settings.flash_prefetch is False
+
     def test_cmd_flash_prepare_calls_legacy_shim(self, monkeypatch):
         """cmd_flash_prepare must surface legacy env vars before reading settings.
 

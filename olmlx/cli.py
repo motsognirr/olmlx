@@ -2190,6 +2190,11 @@ def cmd_config_show(_args):
 def cmd_bench_run(args):
     """Run benchmark scenarios."""
     _configure_logging()
+    _surface_legacy_flash_env()
+    _surface_legacy_flash_moe_env()
+    _surface_legacy_flash_prefetch_speculative_env()
+    _surface_legacy_speculative_env()
+    _surface_legacy_kv_cache_quant_env()
     from pathlib import Path
 
     from olmlx.bench.runner import run_bench

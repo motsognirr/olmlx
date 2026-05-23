@@ -650,6 +650,14 @@ def surface_legacy_flash_prefetch_speculative_env() -> None:
     dotenv_values = _legacy_values_in_dotenv(
         _DEPRECATED_FLASH_PREFETCH_SPECULATIVE_ENV_VARS
     )
+    # Read the NEW var names from .env so that an explicit opt-out like
+    # ``OLMLX_FLASH_PREFETCH=false`` in .env is not overwritten by a
+    # legacy shell var.  ``os.environ.get(new)`` is None when the new name
+    # lives only in .env (pydantic-settings reads .env directly without
+    # writing to the shell env).
+    dotenv_new_values = _legacy_values_in_dotenv(
+        tuple(new for _, new, _, _ in _LEGACY_FLASH_PREFETCH_SPECULATIVE_FORWARD)
+    )
     shell_stale = [
         v for v in _DEPRECATED_FLASH_PREFETCH_SPECULATIVE_ENV_VARS if os.environ.get(v)
     ]
@@ -665,7 +673,11 @@ def surface_legacy_flash_prefetch_speculative_env() -> None:
     )
     for legacy, new, attr, parse in _LEGACY_FLASH_PREFETCH_SPECULATIVE_FORWARD:
         legacy_val = os.environ.get(legacy, dotenv_values.get(legacy))
-        if legacy_val is None or os.environ.get(new) is not None:
+        if (
+            legacy_val is None
+            or os.environ.get(new) is not None
+            or new in dotenv_new_values
+        ):
             continue
         field_default = Settings.model_fields[attr].default
         if getattr(settings, attr) != field_default:

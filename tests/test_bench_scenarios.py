@@ -28,7 +28,9 @@ class TestScenario:
 
 class TestScenariosList:
     def test_has_scenarios(self):
-        assert len(SCENARIOS) >= 16  # 14 standard + 2 distributed
+        assert (
+            len(SCENARIOS) >= 16
+        )  # baseline was 14 standard + 2 distributed; +2 added here
 
     def test_all_have_required_fields(self):
         for s in SCENARIOS:
