@@ -360,12 +360,10 @@ def worker_main() -> None:
                 # buffer can exceed the ~10s GPU timeout for large models (32B+).
                 mx.eval(model.parameters())
     else:
-        logger.error(
-            "Unknown distributed strategy %r (expected 'tensor'; pipeline strategy has been removed)",
-            strategy,
+        assert False, (
+            "unreachable: distributed_strategy is Literal['tensor']; "
+            "pydantic rejects any other value at config parse"
         )
-        worker.close()
-        sys.exit(1)
     worker.send_ready(secret=secret)
     logger.info("Model sharded, ready signal sent, entering inference loop")
 

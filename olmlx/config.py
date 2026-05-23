@@ -543,16 +543,19 @@ def _legacy_values_in_dotenv(names: tuple[str, ...]) -> dict[str, str]:
 def _forward_legacy_flash_moe_env(
     settings_obj: "Settings",
     dotenv_values: dict[str, str] | None = None,
+    dotenv_new_values: dict[str, str] | None = None,
 ) -> None:
     """Apply legacy flash_moe env var values to the new Settings when the
     new env var is unset."""
     if dotenv_values is None:
         dotenv_values = _legacy_values_in_dotenv(_DEPRECATED_FLASH_MOE_ENV_VARS)
+    if dotenv_new_values is None:
+        dotenv_new_values = {}
     for legacy, new, attr, parse in _LEGACY_FLASH_MOE_FORWARD:
         legacy_val = os.environ.get(legacy, dotenv_values.get(legacy))
         if legacy_val is None:
             continue
-        if os.environ.get(new) is not None:
+        if os.environ.get(new) is not None or new in dotenv_new_values:
             continue
         field_default = Settings.model_fields[attr].default
         if getattr(settings_obj, attr) != field_default:
@@ -587,6 +590,14 @@ def surface_legacy_flash_moe_env() -> None:
     ``olmlx.cli``.
     """
     dotenv_values = _legacy_values_in_dotenv(_DEPRECATED_FLASH_MOE_ENV_VARS)
+    # Read the NEW var names from .env so that an explicit opt-out like
+    # ``OLMLX_FLASH_MOE=false`` in .env is not overwritten by a legacy
+    # shell var.  ``os.environ.get(new)`` is None when the new name lives
+    # only in .env (pydantic-settings reads .env directly without writing
+    # to the shell env).
+    dotenv_new_values = _legacy_values_in_dotenv(
+        tuple(new for _, new, _, _ in _LEGACY_FLASH_MOE_FORWARD)
+    )
     shell_stale = [v for v in _DEPRECATED_FLASH_MOE_ENV_VARS if os.environ.get(v)]
     stale = sorted({*shell_stale, *dotenv_values.keys()})
     if stale:
@@ -596,7 +607,7 @@ def surface_legacy_flash_moe_env() -> None:
             "OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS, OLMLX_FLASH_MOE_IO_THREADS.",
             ", ".join(stale),
         )
-        _forward_legacy_flash_moe_env(settings, dotenv_values)
+        _forward_legacy_flash_moe_env(settings, dotenv_values, dotenv_new_values)
 
 
 _DEPRECATED_FLASH_PREFETCH_SPECULATIVE_ENV_VARS = (

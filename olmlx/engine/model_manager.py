@@ -3239,12 +3239,9 @@ class ModelManager:
                 is_distributed = True
                 logger.info("Model %s sharded for distributed inference", hf_path)
             else:
-                del model, tokenizer
-                gc.collect()
-                mx.clear_cache()
-                raise ValueError(
-                    f"Unknown distributed strategy {self._distributed_strategy!r}. "
-                    f"Supported: 'tensor' (pipeline strategy has been removed)."
+                assert False, (
+                    "unreachable: distributed_strategy is Literal['tensor']; "
+                    "pydantic rejects any other value at config parse"
                 )
 
         return model, tokenizer, is_vlm, caps, is_distributed, speculative_decoder
