@@ -82,6 +82,40 @@ def _dir_size(path: Path) -> int:
     return total
 
 
+def _derive_manifest(local_dir: Path, name: str, hf_path: str) -> ModelManifest:
+    """Dynamically build a ModelManifest from on-disk files.
+
+    Reads ``config.json`` and ``quantize_config.json`` for metadata,
+    computes directory size, and generates a digest.  Used as a fallback
+    when ``manifest.json`` is missing (e.g. models downloaded via mlx-lm
+    rather than ``/api/pull``).
+
+    When *local_dir* does not exist on disk, returns a manifest with
+    size=0 and an empty modified_at.
+    """
+    meta = _extract_metadata(local_dir)
+    size = _dir_size(local_dir) if local_dir.exists() else 0
+    modified_at = ""
+    if local_dir.exists():
+        try:
+            modified_at = datetime.fromtimestamp(
+                local_dir.stat().st_mtime, tz=timezone.utc
+            ).isoformat()
+        except OSError:
+            pass
+    return ModelManifest(
+        name=name,
+        hf_path=hf_path,
+        size=size,
+        modified_at=modified_at,
+        digest=ModelManifest.compute_digest(name),
+        format="mlx",
+        family=meta["family"],
+        parameter_size=meta["parameter_size"],
+        quantization_level=meta["quantization_level"],
+    )
+
+
 class ModelStore:
     def __init__(self, registry: ModelRegistry):
         self.registry = registry
@@ -101,20 +135,31 @@ class ModelStore:
             local / ".downloading"
         ).exists()
 
-    def _resolve_model_dir(self, name: str) -> Path | None:
-        """Resolve a model name to its local directory, trying HF-path-based naming first."""
+    def _resolve_model_dir(self, name: str) -> tuple[Path, bool] | None:
+        """Resolve a model name to its local directory.
+
+        Returns ``(path, has_manifest)`` where *has_manifest* is ``True``
+        when a ``manifest.json`` exists, ``False`` when only ``config.json``
+        was found (model is downloaded but no manifest was written yet).
+
+        Returns ``None`` when the model cannot be found at all.
+        """
         resolved = self.registry.resolve(name)
         hf_path = resolved.hf_path if resolved is not None else None
         if hf_path is not None:
             d = self.local_path(hf_path)
             if (d / "manifest.json").exists():
-                return d
+                return (d, True)
+            if (d / "config.json").exists():
+                return (d, False)
         # Fall back to old name-based directories
         normalized = self.registry.normalize_name(name)
         for candidate in [_safe_dir_name(normalized), _safe_dir_name(name)]:
             d = self.models_dir / candidate
             if (d / "manifest.json").exists():
-                return d
+                return (d, True)
+            if (d / "config.json").exists():
+                return (d, False)
         return None
 
     def _pull_lock(self, hf_path: str) -> asyncio.Lock:
@@ -242,7 +287,7 @@ class ModelStore:
             yield {"status": "success"}
 
     def list_local(self) -> list[ModelManifest]:
-        """List all locally stored models."""
+        """List all locally stored models, deriving manifests for directories that lack one."""
         models = []
         if not self.models_dir.exists():
             return models
@@ -252,22 +297,47 @@ class ModelStore:
                 if manifest_path.exists():
                     try:
                         models.append(ModelManifest.load(manifest_path))
+                        continue
                     except Exception:
                         logger.warning("Failed to load manifest: %s", manifest_path)
+                # No valid manifest — try to derive one from config.json
+                config_path = d / "config.json"
+                if config_path.exists():
+                    try:
+                        # Extract name and hf_path from directory name heuristics.
+                        # The dir name is _safe_dir_name(hf_path), so we try to
+                        # reverse it by finding the matching HF path in the registry.
+                        dir_name = d.name
+                        hf_path = dir_name.replace("_", "/", 1) if "_" in dir_name else dir_name
+                        # Use the normalized short name if we can resolve it
+                        manifest = _derive_manifest(d, hf_path, hf_path)
+                        manifest.save(manifest_path)
+                        models.append(manifest)
+                    except Exception:
+                        logger.debug("Failed to derive manifest for %s", d)
         return models
 
     def show(self, name: str) -> ModelManifest | None:
-        model_dir = self._resolve_model_dir(name)
-        if model_dir is not None:
+        resolved = self._resolve_model_dir(name)
+        if resolved is None:
+            return None
+        model_dir, has_manifest = resolved
+        if has_manifest:
             return ModelManifest.load(model_dir / "manifest.json")
-        return None
+        # Derive manifest on demand and backfill so subsequent calls are fast.
+        normalized = self.registry.normalize_name(name)
+        resolved_cfg = self.registry.resolve(name)
+        hf_path = resolved_cfg.hf_path if resolved_cfg is not None else name
+        manifest = _derive_manifest(model_dir, normalized, hf_path)
+        manifest.save(model_dir / "manifest.json")
+        return manifest
 
     def delete(self, name: str) -> bool:
         import shutil
 
-        model_dir = self._resolve_model_dir(name)
-        if model_dir is not None:
-            shutil.rmtree(model_dir)
+        resolved = self._resolve_model_dir(name)
+        if resolved is not None:
+            shutil.rmtree(resolved[0])
             return True
         return False
 

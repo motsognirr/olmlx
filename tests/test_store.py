@@ -478,3 +478,136 @@ class TestEnsureDownloaded:
 
         assert call_count == 1
         assert all(r == mock_store.local_path("Qwen/Qwen3-8B-MLX") for r in results)
+
+
+class TestDeriveManifest:
+    def test_derive_manifest_no_config(self, tmp_path):
+        """_derive_manifest works even without config.json (returns empty metadata)."""
+        from olmlx.models.store import _derive_manifest
+
+        manifest = _derive_manifest(tmp_path, "test:latest", "test/model")
+        assert manifest.name == "test:latest"
+        assert manifest.hf_path == "test/model"
+        assert manifest.family == ""
+        assert manifest.parameter_size == ""
+        assert manifest.quantization_level == ""
+        assert manifest.format == "mlx"
+        assert manifest.digest != ""
+
+    def test_derive_manifest_with_config(self, tmp_path):
+        """_derive_manifest reads metadata from config.json."""
+        from olmlx.models.store import _derive_manifest
+
+        config = {
+            "model_type": "qwen2",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "quantization": {"bits": 4},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        manifest = _derive_manifest(tmp_path, "test:latest", "test/model")
+        assert manifest.family == "qwen2"
+        assert manifest.quantization_level == "4-bit"
+        assert manifest.size > 0  # at least the config.json bytes
+
+
+class TestShowWithoutManifest:
+    def test_show_derives_manifest_when_missing(self, mock_store, tmp_path):
+        """show() returns derived manifest when manifest.json is absent."""
+        # Create a model dir with config.json but no manifest.json
+        local_dir = mock_store.local_path("test/model")
+        local_dir.mkdir(parents=True)
+        config = {
+            "model_type": "llama",
+            "hidden_size": 2048,
+            "num_hidden_layers": 16,
+        }
+        (local_dir / "config.json").write_text(json.dumps(config))
+        # Register the mapping so resolve works
+        from olmlx.engine.registry import ModelConfig
+
+        mock_store.registry._mappings["test:latest"] = ModelConfig(hf_path="test/model")
+
+        result = mock_store.show("test")
+        assert result is not None
+        assert result.name == "test:latest"
+        assert result.family == "llama"
+        # After calling show(), manifest.json should be backfilled
+        assert (local_dir / "manifest.json").exists()
+
+    def test_show_backfilled_manifest_is_valid(self, mock_store, tmp_path):
+        """After backfill, subsequent show() calls load from manifest."""
+        local_dir = mock_store.local_path("test/model")
+        local_dir.mkdir(parents=True)
+        config = {"model_type": "llama"}
+        (local_dir / "config.json").write_text(json.dumps(config))
+        from olmlx.engine.registry import ModelConfig
+
+        mock_store.registry._mappings["test:latest"] = ModelConfig(hf_path="test/model")
+
+        # First call derives and backfills
+        result1 = mock_store.show("test")
+        # Second call loads from backfilled manifest
+        result2 = mock_store.show("test")
+        assert result1 is not None
+        assert result2 is not None
+        assert result1.name == result2.name
+        assert result1.family == result2.family
+
+
+class TestResolveModelDir:
+    def test_resolve_returns_none_for_unknown(self, mock_store):
+        assert mock_store._resolve_model_dir("nonexistent") is None
+
+    def test_resolve_returns_path_with_manifest_flag(self, mock_store, tmp_path):
+        """_resolve_model_dir returns (path, True) when manifest.json exists."""
+        local_dir = mock_store.local_path("test/model")
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text("{}")
+        (local_dir / "manifest.json").write_text(
+            json.dumps({"name": "test:latest", "hf_path": "test/model"})
+        )
+        from olmlx.engine.registry import ModelConfig
+        mock_store.registry._mappings["test:latest"] = ModelConfig(hf_path="test/model")
+
+        result = mock_store._resolve_model_dir("test")
+        assert result is not None
+        path, has_manifest = result
+        assert path == local_dir
+        assert has_manifest is True
+
+    def test_resolve_returns_path_without_manifest(self, mock_store, tmp_path):
+        """_resolve_model_dir returns (path, False) when only config.json exists."""
+        local_dir = mock_store.local_path("test/model")
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text("{}")
+        from olmlx.engine.registry import ModelConfig
+        mock_store.registry._mappings["test:latest"] = ModelConfig(hf_path="test/model")
+
+        result = mock_store._resolve_model_dir("test")
+        assert result is not None
+        path, has_manifest = result
+        assert path == local_dir
+        assert has_manifest is False
+
+
+class TestListLocalWithoutManifest:
+    def test_list_local_includes_dirs_without_manifest(self, mock_store, tmp_path):
+        """list_local() includes model directories that lack manifest.json."""
+        local_dir = mock_store.local_path("test/model")
+        local_dir.mkdir(parents=True)
+        config = {"model_type": "llama", "hidden_size": 2048, "num_hidden_layers": 16}
+        (local_dir / "config.json").write_text(json.dumps(config))
+
+        results = mock_store.list_local()
+        assert len(results) == 1
+        assert results[0].family == "llama"
+        # Manifest should have been backfilled
+        assert (local_dir / "manifest.json").exists()
+
+    def test_list_local_skips_dirs_without_config(self, mock_store, tmp_path):
+        """list_local() skips directories that have neither manifest.json nor config.json."""
+        empty_dir = tmp_path / "models" / "empty_dir"
+        empty_dir.mkdir(parents=True)
+        results = mock_store.list_local()
+        assert len(results) == 0

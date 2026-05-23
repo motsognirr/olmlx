@@ -25,7 +25,7 @@ from olmlx.engine.template_caps import TemplateCaps, detect_caps
 if TYPE_CHECKING:
     from olmlx.models.store import ModelStore
 
-from olmlx.models.store import _strip_ollama_tag
+from olmlx.models.store import _dir_size, _strip_ollama_tag
 
 logger = logging.getLogger(__name__)
 
@@ -1451,6 +1451,13 @@ class ModelManager:
                     # close it. Non-Flash models leave this at None.
                     _weight_store = getattr(model, "_weight_store", None)
 
+                    # Compute on-disk size for the model directory.
+                    _model_size = 0
+                    if self.store is not None:
+                        _local_dir = self.store.local_path(hf_path)
+                        if _local_dir.exists():
+                            _model_size = await asyncio.to_thread(_dir_size, _local_dir)
+
                     # _find_spectral_dir may trigger multi-minute calibration.
                     # Run it in a thread so it does not block the event loop.
                     _spectral_dir = await asyncio.to_thread(
@@ -1469,6 +1476,7 @@ class ModelManager:
                         weight_store=_weight_store,
                         template_caps=caps,
                         expires_at=expires,
+                        size_bytes=_model_size,
                         kv_cache_quant=kv_cache_quant,
                         spectral_calibration_dir=_spectral_dir,
                         default_options=dict(model_config.options),
@@ -3037,6 +3045,20 @@ class ModelManager:
         if self.store is not None:
             local_dir = self.store.ensure_downloaded(hf_path)
             load_path = str(local_dir)
+            # Backfill manifest.json when missing so show() and list_local()
+            # don't need to derive metadata on every access.
+            if (
+                local_dir.exists()
+                and not (local_dir / "manifest.json").exists()
+            ):
+                from olmlx.models.store import _derive_manifest
+
+                manifest = _derive_manifest(
+                    local_dir,
+                    self.registry.normalize_name(hf_path),
+                    hf_path,
+                )
+                manifest.save(local_dir / "manifest.json")
 
         # Check for flash-MoE-prepared model
         if self._is_flash_moe_enabled(flash_moe_config):
