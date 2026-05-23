@@ -1406,3 +1406,107 @@ class TestDiskMergeOnSave:
         assert saved["modelC:latest"] == "org/model-c"
         assert "modelA:latest" not in saved
         assert "modelB:latest" not in saved
+
+
+class TestFlashPrefetchSpeculativePromotionRegistry:
+    def test_promoted_keys_in_experimental_raise(self):
+        import pytest
+        from olmlx.engine.registry import ModelConfig
+
+        for key in (
+            "flash_prefetch",
+            "flash_speculative",
+            "flash_speculative_draft_model",
+            "flash_speculative_tokens",
+        ):
+            with pytest.raises(ValueError, match="promoted out of 'experimental'"):
+                ModelConfig.from_entry(
+                    {
+                        "hf_path": "Qwen/Qwen3-8B",
+                        "experimental": {
+                            key: True
+                            if key in ("flash_prefetch", "flash_speculative")
+                            else ("x" if "draft" in key else 4)
+                        },
+                    }
+                )
+
+    def test_prefetch_tuning_keys_still_allowed_in_experimental(self):
+        from olmlx.engine.registry import ModelConfig
+
+        mc = ModelConfig.from_entry(
+            {
+                "hf_path": "Qwen/Qwen3-8B",
+                "experimental": {"flash_prefetch_io_threads": 8},
+            }
+        )
+        assert mc.experimental == {"flash_prefetch_io_threads": 8}
+
+    def test_promoted_fields_top_level_resolve(self):
+        from olmlx.engine.registry import ModelConfig
+
+        mc = ModelConfig.from_entry(
+            {
+                "hf_path": "Qwen/Qwen3-8B",
+                "flash_prefetch": True,
+                "flash_speculative": True,
+                "flash_speculative_draft_model": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+                "flash_speculative_tokens": 5,
+            }
+        )
+        rf = mc.resolved_flash()
+        assert rf.prefetch is True
+        assert rf.flash_speculative is True
+        assert (
+            rf.flash_speculative_draft_model
+            == "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+        )
+        assert rf.flash_speculative_tokens == 5
+
+    def test_to_entry_round_trips_promoted_fields(self):
+        from olmlx.engine.registry import ModelConfig
+
+        entry = {
+            "hf_path": "Qwen/Qwen3-8B",
+            "flash_speculative": True,
+            "flash_speculative_draft_model": "d/m",
+            "flash_speculative_tokens": 3,
+            "flash_prefetch": True,
+        }
+        assert ModelConfig.from_entry(entry).to_entry() == entry
+
+    def test_flash_speculative_tokens_rejects_bool(self):
+        import pytest
+        from olmlx.engine.registry import ModelConfig
+
+        with pytest.raises(ValueError, match="flash_speculative_tokens"):
+            ModelConfig(hf_path="Qwen/Qwen3-8B", flash_speculative_tokens=True)
+
+    def test_flash_speculative_tokens_rejects_nonpositive(self):
+        import pytest
+        from olmlx.engine.registry import ModelConfig
+
+        with pytest.raises(ValueError, match="flash_speculative_tokens"):
+            ModelConfig(hf_path="Qwen/Qwen3-8B", flash_speculative_tokens=0)
+
+    def test_flash_speculative_draft_model_strips_whitespace(self):
+        """ModelConfig.__post_init__ must store the stripped value, not the original."""
+        from olmlx.engine.registry import ModelConfig
+
+        mc = ModelConfig(
+            hf_path="Qwen/Qwen3-8B",
+            flash_speculative_draft_model="  org/model  ",
+        )
+        assert mc.flash_speculative_draft_model == "org/model"
+
+    def test_flash_speculative_draft_model_from_entry_strips_whitespace(self):
+        """from_entry round-trip preserves the stripped value."""
+        from olmlx.engine.registry import ModelConfig
+
+        mc = ModelConfig.from_entry(
+            {
+                "hf_path": "Qwen/Qwen3-8B",
+                "flash_speculative_draft_model": "  org/model  ",
+            }
+        )
+        assert mc.flash_speculative_draft_model == "org/model"

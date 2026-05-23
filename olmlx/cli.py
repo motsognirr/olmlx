@@ -19,6 +19,7 @@ from olmlx.config import (
     settings,
     surface_legacy_flash_env as _surface_legacy_flash_env,
     surface_legacy_flash_moe_env as _surface_legacy_flash_moe_env,
+    surface_legacy_flash_prefetch_speculative_env as _surface_legacy_flash_prefetch_speculative_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -593,6 +594,7 @@ def _apply_serve_overrides(args) -> None:
     _surface_legacy_dflash_env()
     _surface_legacy_flash_env()
     _surface_legacy_flash_moe_env()
+    _surface_legacy_flash_prefetch_speculative_env()
 
     # ``getattr`` defends programmatic callers that hand a bare
     # ``argparse.Namespace`` (e.g. tests) without populating these
@@ -618,6 +620,30 @@ def _apply_serve_overrides(args) -> None:
     flash_flag = getattr(args, "flash", None)
     if flash_flag is not None:
         _settings.flash = flash_flag
+
+    fs = getattr(args, "flash_speculative", None)
+    fs_draft = getattr(args, "flash_speculative_draft_model", None)
+    fs_tokens = getattr(args, "flash_speculative_tokens", None)
+    fp = getattr(args, "flash_prefetch", None)
+    if fs is not None:
+        _settings.flash_speculative = fs
+    if fs_draft is not None:
+        _settings.flash_speculative_draft_model = fs_draft
+    if fs_tokens is not None:
+        _settings.flash_speculative_tokens = fs_tokens
+    if fp is not None:
+        _settings.flash_prefetch = fp
+
+    if _settings.flash_speculative and not _settings.flash:
+        logger.warning(
+            "flash_speculative is set but flash is not enabled globally; "
+            "it will only take effect for models with flash:true in models.json."
+        )
+    if _settings.flash_prefetch and not _settings.flash:
+        logger.warning(
+            "flash_prefetch is set but flash is not enabled globally; "
+            "it will only take effect for models with flash:true in models.json."
+        )
 
     _surface_legacy_kv_cache_quant_env()
 
@@ -702,10 +728,9 @@ def _apply_serve_overrides(args) -> None:
             "%s. Once Flash is prepared and loads, standalone "
             "speculative decoding is dropped — use the per-model "
             "``flash_speculative`` field (or "
-            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE / "
-            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL / "
-            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS) instead. "
-            "Note: flash-speculative is still experimental.",
+            "OLMLX_FLASH_SPECULATIVE / "
+            "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL / "
+            "OLMLX_FLASH_SPECULATIVE_TOKENS) instead.",
             ", ".join(flash_conflicts_actionable),
         )
     # dflash on Flash-MoE models will raise ValueError at load time once
@@ -1237,9 +1262,11 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
         sys.exit(1)
 
     strategy = hostfile.get("strategy", "tensor")
-    if strategy not in ("tensor", "pipeline"):
+    if strategy != "tensor":
         print(
-            f"Error: hostfile strategy must be 'tensor' or 'pipeline', got {strategy!r}",
+            f"Error: distributed inference is tensor-only; hostfile strategy "
+            f"must be 'tensor', got {strategy!r}. The pipeline strategy is not "
+            f"supported.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1773,6 +1800,8 @@ def cmd_chat(args):
     _surface_legacy_speculative_env()
     _surface_legacy_kv_cache_quant_env()
     _surface_legacy_flash_env()
+    _surface_legacy_flash_moe_env()
+    _surface_legacy_flash_prefetch_speculative_env()
     _warn_kv_cache_quant_incompatibilities()
 
     model_name = args.model_name
@@ -2125,6 +2154,8 @@ def cmd_config_show(_args):
     _surface_legacy_kv_cache_quant_env()
     _surface_legacy_distributed_env()
     _surface_legacy_flash_env()
+    _surface_legacy_flash_moe_env()
+    _surface_legacy_flash_prefetch_speculative_env()
 
     print(f"Host:                   {settings.host}")
     print(f"Port:                   {settings.port}")
@@ -2159,6 +2190,12 @@ def cmd_config_show(_args):
 def cmd_bench_run(args):
     """Run benchmark scenarios."""
     _configure_logging()
+    _surface_legacy_flash_env()
+    _surface_legacy_flash_moe_env()
+    _surface_legacy_flash_prefetch_speculative_env()
+    _surface_legacy_speculative_env()
+    _surface_legacy_dflash_env()
+    _surface_legacy_kv_cache_quant_env()
     from pathlib import Path
 
     from olmlx.bench.runner import run_bench
@@ -2312,6 +2349,12 @@ def cmd_spectral_prepare(args):
 def cmd_flash_prepare(args):
     """Prepare a model for flash inference (auto-detects MoE vs dense)."""
     _configure_logging()
+    # Forward legacy env vars so OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true
+    # reaches settings.flash_prefetch before _cmd_flash_dense_prepare reads it
+    # via train_lookahead=settings.flash_prefetch.
+    _surface_legacy_flash_env()
+    _surface_legacy_flash_moe_env()
+    _surface_legacy_flash_prefetch_speculative_env()
 
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
@@ -2365,8 +2408,6 @@ def _cmd_flash_dense_prepare(args, model_path):
     print(f"  Training epochs: {args.epochs}")
     print()
 
-    from olmlx.config import experimental
-
     output_dir = prepare_model_for_flash(
         model_path=model_path,
         rank=args.rank,
@@ -2376,7 +2417,7 @@ def _cmd_flash_dense_prepare(args, model_path):
         calibration_dataset=args.calibration_dataset,
         activation_threshold=args.threshold,
         epochs=args.epochs,
-        train_lookahead=experimental.flash_prefetch,
+        train_lookahead=settings.flash_prefetch,
         progress_callback=_flash_progress,
     )
 
@@ -2639,6 +2680,8 @@ def cmd_flash_info(args):
     # an operator would see from ``olmlx config show`` / ``olmlx serve``
     # when they've only renamed the new env vars in some shells.
     _surface_legacy_flash_env()
+    _surface_legacy_flash_moe_env()
+    _surface_legacy_flash_prefetch_speculative_env()
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
     hf_path = _resolved.hf_path if _resolved is not None else args.model
@@ -2782,6 +2825,34 @@ def build_parser() -> argparse.ArgumentParser:
             "backed neuron loading). Overrides OLMLX_FLASH. Requires the "
             "model to be prepared first via 'olmlx flash prepare'."
         ),
+    )
+    serve_p.add_argument(
+        "--flash-prefetch",
+        dest="flash_prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable Flash speculative neuron prefetch (overrides OLMLX_FLASH_PREFETCH).",
+    )
+    serve_p.add_argument(
+        "--flash-speculative",
+        dest="flash_speculative",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable Flash + speculative decoding (overrides OLMLX_FLASH_SPECULATIVE).",
+    )
+    serve_p.add_argument(
+        "--flash-speculative-draft-model",
+        dest="flash_speculative_draft_model",
+        type=_non_empty_str,
+        default=None,
+        help="HuggingFace path of the draft model used for Flash speculative decoding.",
+    )
+    serve_p.add_argument(
+        "--flash-speculative-tokens",
+        dest="flash_speculative_tokens",
+        type=_positive_int,
+        default=None,
+        help="Tokens drafted per verification step for Flash speculative (default: 4).",
     )
 
     svc = sub.add_parser("service", help="Manage the launchd service")

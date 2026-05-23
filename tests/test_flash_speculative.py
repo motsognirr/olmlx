@@ -405,3 +405,19 @@ class TestTrimPromptCacheNoneGuard:
                 target_model=target,
                 num_speculative_tokens=3,
             )
+
+
+def test_resolved_flash_carries_speculative_and_prefetch(monkeypatch):
+    from olmlx.config import settings
+    from olmlx.engine.registry import ModelConfig
+
+    monkeypatch.setattr(settings, "flash_speculative", True)
+    monkeypatch.setattr(settings, "flash_speculative_draft_model", "d/m")
+    monkeypatch.setattr(settings, "flash_speculative_tokens", 7)
+    monkeypatch.setattr(settings, "flash_prefetch", True)
+
+    rf = ModelConfig(hf_path="Qwen/Qwen3-8B").resolved_flash()
+    assert rf.flash_speculative is True
+    assert rf.flash_speculative_draft_model == "d/m"
+    assert rf.flash_speculative_tokens == 7
+    assert rf.prefetch is True

@@ -185,6 +185,7 @@ def worker_main() -> None:
         settings as _settings_early,
         surface_legacy_flash_env,
         surface_legacy_flash_moe_env,
+        surface_legacy_flash_prefetch_speculative_env,
     )
 
     # Honour the one-release deprecation window for ``OLMLX_EXPERIMENTAL_FLASH*``
@@ -197,6 +198,7 @@ def worker_main() -> None:
     # (and its argparse/uvicorn baggage).
     surface_legacy_flash_env()
     surface_legacy_flash_moe_env()
+    surface_legacy_flash_prefetch_speculative_env()
 
     if _settings_early.flash_moe:
         logger.error(
@@ -358,12 +360,11 @@ def worker_main() -> None:
                 # buffer can exceed the ~10s GPU timeout for large models (32B+).
                 mx.eval(model.parameters())
     else:
-        logger.error(
-            "Unknown distributed strategy %r (expected 'pipeline' or 'tensor')",
-            strategy,
-        )
         worker.close()
-        sys.exit(1)
+        raise AssertionError(
+            "unreachable: distributed_strategy is Literal['tensor']; "
+            "pydantic rejects any other value at config parse"
+        )
     worker.send_ready(secret=secret)
     logger.info("Model sharded, ready signal sent, entering inference loop")
 

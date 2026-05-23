@@ -89,7 +89,10 @@ class Settings(BaseSettings):
     # Configured via hostfile (``distributed_hostfile``), launched by
     # ``olmlx serve``.
     distributed: bool = False
-    distributed_strategy: Literal["tensor", "pipeline"] = "tensor"
+    # Distributed inference is tensor-only. The dormant pipeline.py /
+    # pre_shard_pipeline / worker pipeline branches are unreachable and
+    # kept for a future PR (#273).
+    distributed_strategy: Literal["tensor"] = "tensor"
     distributed_hostfile: Path = Path("~/.olmlx/hostfile.json")
     distributed_backend: str = "ring"
     distributed_port: int = 32323
@@ -146,6 +149,18 @@ class Settings(BaseSettings):
     flash_moe_cache_budget_experts: Annotated[int, Field(ge=0)] = 48
     flash_moe_io_threads: Annotated[int, Field(gt=0)] = 32
 
+    # Flash prefetch — promoted toggle. Advanced prefetch tuning
+    # (confidence_threshold, min/max_neurons, io_threads) stays on
+    # ``ExperimentalSettings``. Controls both runtime prefetch and whether
+    # ``olmlx flash prepare`` trains the LookaheadBank.
+    flash_prefetch: bool = False
+
+    # Flash + speculative decoding (SpeculativeFlashDecoder). Per-model
+    # overrides live on ``ModelConfig`` in ``olmlx.engine.registry``.
+    flash_speculative: bool = False
+    flash_speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
+    flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
+
     @model_validator(mode="after")
     def validate_auto_calibrate(self) -> "Settings":
         if self.kv_cache_auto_calibrate and (
@@ -196,6 +211,22 @@ class Settings(BaseSettings):
             )
         return stripped
 
+    @field_validator("flash_speculative_draft_model")
+    @classmethod
+    def validate_flash_speculative_draft_model(cls, v: str | None) -> str | None:
+        # ``Field(min_length=1)`` already rejects ``""``, but a
+        # whitespace-only value (``"   "``) has length > 0 and would
+        # otherwise reach the load path and surface as a misleading
+        # "flash draft not set" error. Strip and reject empty here.
+        if v is None:
+            return v
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError(
+                "flash_speculative_draft_model must be a non-empty HuggingFace path"
+            )
+        return stripped
+
     @field_validator("anthropic_models")
     @classmethod
     def validate_anthropic_model_keys(cls, v: dict[str, str]) -> dict[str, str]:
@@ -226,6 +257,9 @@ class ExperimentalSettings(BaseSettings):
     # not need to set. Per-model overrides for advanced knobs still go
     # under the ``experimental`` block in models.json. (``distributed_*``
     # was promoted to ``Settings`` in #326 and removed from here too.)
+    # ``flash_prefetch`` (toggle) and ``flash_speculative*`` were promoted
+    # to ``Settings`` in #275/#276; only the prefetch *tuning* knobs
+    # (confidence_threshold, min/max_neurons, io_threads) remain here.
     flash_window_size: Annotated[int, Field(gt=0)] = 5
     flash_io_threads: Annotated[int, Field(gt=0)] = 32
     flash_cache_budget_neurons: Annotated[int, Field(ge=0)] = 1024
@@ -234,14 +268,10 @@ class ExperimentalSettings(BaseSettings):
     flash_predictor_sensitive_rank_multiplier: Annotated[int, Field(gt=0)] = 4
     flash_bypass_os_cache: bool = False
     flash_preallocated_buffer: bool = False
-    flash_prefetch: bool = False
     flash_prefetch_confidence_threshold: Annotated[float, Field(gt=0, le=1.0)] = 0.3
     flash_prefetch_min_neurons: Annotated[int, Field(gt=0)] = 64
     flash_prefetch_max_neurons: Annotated[int, Field(gt=0)] | None = None
     flash_prefetch_io_threads: Annotated[int, Field(gt=0)] = 16
-    flash_speculative: bool = False
-    flash_speculative_draft_model: str | None = None
-    flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
 
 experimental = ExperimentalSettings()
@@ -472,16 +502,15 @@ _LEGACY_FLASH_MOE_FORWARD: tuple[tuple[str, str, str, Callable[[str], Any]], ...
 )
 
 
-def _legacy_flash_moe_values_in_dotenv() -> dict[str, str]:
-    """Return ``{name: value}`` for any ``_DEPRECATED_FLASH_MOE_ENV_VARS``
-    found in the project ``.env`` file."""
+def _legacy_values_in_dotenv(names: tuple[str, ...]) -> dict[str, str]:
+    """Return ``{name: value}`` for any *names* found in the project ``.env`` file."""
     dotenv_path = Path(".env")
     try:
         text = dotenv_path.read_text()
     except (FileNotFoundError, OSError):
         return {}
     found: dict[str, str] = {}
-    legacy = set(_DEPRECATED_FLASH_MOE_ENV_VARS)
+    legacy = set(names)
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -514,16 +543,19 @@ def _legacy_flash_moe_values_in_dotenv() -> dict[str, str]:
 def _forward_legacy_flash_moe_env(
     settings_obj: "Settings",
     dotenv_values: dict[str, str] | None = None,
+    dotenv_new_values: dict[str, str] | None = None,
 ) -> None:
     """Apply legacy flash_moe env var values to the new Settings when the
     new env var is unset."""
     if dotenv_values is None:
-        dotenv_values = _legacy_flash_moe_values_in_dotenv()
+        dotenv_values = _legacy_values_in_dotenv(_DEPRECATED_FLASH_MOE_ENV_VARS)
+    if dotenv_new_values is None:
+        dotenv_new_values = {}
     for legacy, new, attr, parse in _LEGACY_FLASH_MOE_FORWARD:
         legacy_val = os.environ.get(legacy, dotenv_values.get(legacy))
         if legacy_val is None:
             continue
-        if os.environ.get(new) is not None:
+        if os.environ.get(new) is not None or new in dotenv_new_values:
             continue
         field_default = Settings.model_fields[attr].default
         if getattr(settings_obj, attr) != field_default:
@@ -557,7 +589,15 @@ def surface_legacy_flash_moe_env() -> None:
     so the distributed-worker entry point can reuse it without importing
     ``olmlx.cli``.
     """
-    dotenv_values = _legacy_flash_moe_values_in_dotenv()
+    dotenv_values = _legacy_values_in_dotenv(_DEPRECATED_FLASH_MOE_ENV_VARS)
+    # Read the NEW var names from .env so that an explicit opt-out like
+    # ``OLMLX_FLASH_MOE=false`` in .env is not overwritten by a legacy
+    # shell var.  ``os.environ.get(new)`` is None when the new name lives
+    # only in .env (pydantic-settings reads .env directly without writing
+    # to the shell env).
+    dotenv_new_values = _legacy_values_in_dotenv(
+        tuple(new for _, new, _, _ in _LEGACY_FLASH_MOE_FORWARD)
+    )
     shell_stale = [v for v in _DEPRECATED_FLASH_MOE_ENV_VARS if os.environ.get(v)]
     stale = sorted({*shell_stale, *dotenv_values.keys()})
     if stale:
@@ -567,7 +607,102 @@ def surface_legacy_flash_moe_env() -> None:
             "OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS, OLMLX_FLASH_MOE_IO_THREADS.",
             ", ".join(stale),
         )
-        _forward_legacy_flash_moe_env(settings, dotenv_values)
+        _forward_legacy_flash_moe_env(settings, dotenv_values, dotenv_new_values)
+
+
+_DEPRECATED_FLASH_PREFETCH_SPECULATIVE_ENV_VARS = (
+    "OLMLX_EXPERIMENTAL_FLASH_PREFETCH",
+    "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE",
+    "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL",
+    "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS",
+)
+
+_LEGACY_FLASH_PREFETCH_SPECULATIVE_FORWARD: tuple[
+    tuple[str, str, str, Callable[[str], Any]], ...
+] = (
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_PREFETCH",
+        "OLMLX_FLASH_PREFETCH",
+        "flash_prefetch",
+        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE",
+        "OLMLX_FLASH_SPECULATIVE",
+        "flash_speculative",
+        lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL",
+        "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL",
+        "flash_speculative_draft_model",
+        lambda v: v.strip() or None,
+    ),
+    (
+        "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS",
+        "OLMLX_FLASH_SPECULATIVE_TOKENS",
+        "flash_speculative_tokens",
+        int,
+    ),
+)
+
+
+def surface_legacy_flash_prefetch_speculative_env() -> None:
+    """Forward legacy ``OLMLX_EXPERIMENTAL_FLASH_PREFETCH`` /
+    ``OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE*`` to the promoted
+    ``OLMLX_FLASH_PREFETCH`` / ``OLMLX_FLASH_SPECULATIVE*`` names.
+
+    Same "new var wins, non-default not clobbered" semantics as
+    ``surface_legacy_flash_moe_env``. The four prefetch *tuning* env vars
+    keep the experimental prefix and pass through untouched. Lives in
+    ``olmlx.config`` so the distributed worker can reuse it without
+    importing argparse/uvicorn.
+    """
+    dotenv_values = _legacy_values_in_dotenv(
+        _DEPRECATED_FLASH_PREFETCH_SPECULATIVE_ENV_VARS
+    )
+    # Read the NEW var names from .env so that an explicit opt-out like
+    # ``OLMLX_FLASH_PREFETCH=false`` in .env is not overwritten by a
+    # legacy shell var.  ``os.environ.get(new)`` is None when the new name
+    # lives only in .env (pydantic-settings reads .env directly without
+    # writing to the shell env).
+    dotenv_new_values = _legacy_values_in_dotenv(
+        tuple(new for _, new, _, _ in _LEGACY_FLASH_PREFETCH_SPECULATIVE_FORWARD)
+    )
+    shell_stale = [
+        v for v in _DEPRECATED_FLASH_PREFETCH_SPECULATIVE_ENV_VARS if os.environ.get(v)
+    ]
+    stale = sorted({*shell_stale, *dotenv_values.keys()})
+    if not stale:
+        return
+    logger.warning(
+        "Deprecated env vars detected: %s. They will be honoured for this "
+        "release but should be renamed to OLMLX_FLASH_PREFETCH, "
+        "OLMLX_FLASH_SPECULATIVE, OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL, "
+        "OLMLX_FLASH_SPECULATIVE_TOKENS.",
+        ", ".join(stale),
+    )
+    for legacy, new, attr, parse in _LEGACY_FLASH_PREFETCH_SPECULATIVE_FORWARD:
+        legacy_val = os.environ.get(legacy, dotenv_values.get(legacy))
+        if (
+            legacy_val is None
+            or os.environ.get(new) is not None
+            or new in dotenv_new_values
+        ):
+            continue
+        field_default = Settings.model_fields[attr].default
+        if getattr(settings, attr) != field_default:
+            continue
+        try:
+            setattr(settings, attr, parse(legacy_val))
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "Could not forward legacy env var %s=%r to %s: %s",
+                legacy,
+                legacy_val,
+                new,
+                exc,
+            )
 
 
 def resolve_experimental(

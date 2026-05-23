@@ -35,16 +35,13 @@ PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
         "flash_cache_budget_neurons",
         "flash_bypass_os_cache",
         "flash_preallocated_buffer",
-        # Flash prefetch
-        "flash_prefetch",
+        # Flash prefetch — tuning/advanced knobs only.  The toggle
+        # (``flash_prefetch``) was promoted to the top level — see
+        # ``PROMOTED_EXPERIMENTAL_KEYS``.
         "flash_prefetch_confidence_threshold",
         "flash_prefetch_min_neurons",
         "flash_prefetch_max_neurons",
         "flash_prefetch_io_threads",
-        # Flash speculative
-        "flash_speculative",
-        "flash_speculative_draft_model",
-        "flash_speculative_tokens",
     }
 )
 
@@ -68,6 +65,11 @@ PROMOTED_EXPERIMENTAL_KEYS: dict[str, str] = {
     "flash_moe": "flash_moe",
     "flash_moe_cache_budget_experts": "flash_moe_cache_budget_experts",
     "flash_moe_io_threads": "flash_moe_io_threads",
+    # Flash prefetch toggle + Flash-speculative promoted to top-level.
+    "flash_prefetch": "flash_prefetch",
+    "flash_speculative": "flash_speculative",
+    "flash_speculative_draft_model": "flash_speculative_draft_model",
+    "flash_speculative_tokens": "flash_speculative_tokens",
 }
 
 
@@ -224,8 +226,9 @@ _KNOWN_CONFIG_KEYS: frozenset[str] = frozenset()  # set after ModelConfig is def
 class ResolvedFlashConfig(NamedTuple):
     """Resolved Flash primary-knob config for a single model.
 
-    Only covers the five user-facing knobs that were promoted out of
-    ``experimental``. Advanced tuning fields live in
+    Covers the user-facing knobs promoted out of ``experimental``:
+    the five flash-dense fields, the flash-prefetch toggle, and the
+    three flash-speculative fields. Advanced tuning fields live in
     ``ExperimentalSettings`` and are passed through separately.
 
     Distinct from ``olmlx.engine.flash.flash_model.FlashConfig`` (the
@@ -238,6 +241,14 @@ class ResolvedFlashConfig(NamedTuple):
     min_active_neurons: int
     max_active_neurons: int | None
     memory_budget_fraction: float | None
+    # Maps to ``FlashConfig.prefetch`` (the runtime dataclass in flash_model.py).
+    # The ``flash_`` prefix is dropped here to match that dataclass field name;
+    # the ``flash_speculative*`` fields below keep it to avoid confusion with the
+    # top-level ``ModelConfig.speculative`` field (which is a different concept).
+    prefetch: bool = False
+    flash_speculative: bool = False
+    flash_speculative_draft_model: str | None = None
+    flash_speculative_tokens: int = 4
 
 
 class SpeculativeConfig(NamedTuple):
@@ -297,6 +308,12 @@ class ModelConfig:
     flash_moe: bool | None = None
     flash_moe_cache_budget_experts: int | None = None
     flash_moe_io_threads: int | None = None
+    #: Per-model Flash prefetch + Flash-speculative overrides (promoted from
+    #: ``experimental``). ``None`` means inherit from global ``Settings``.
+    flash_prefetch: bool | None = None
+    flash_speculative: bool | None = None
+    flash_speculative_draft_model: str | None = None
+    flash_speculative_tokens: int | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -391,6 +408,36 @@ class ModelConfig:
             raise ValueError(
                 f"'flash_moe' must be a bool or None, got {self.flash_moe!r}"
             )
+        if self.flash_prefetch is not None and not isinstance(
+            self.flash_prefetch, bool
+        ):
+            raise ValueError(
+                f"'flash_prefetch' must be a bool or None, got {self.flash_prefetch!r}"
+            )
+        if self.flash_speculative is not None and not isinstance(
+            self.flash_speculative, bool
+        ):
+            raise ValueError(
+                f"'flash_speculative' must be a bool or None, "
+                f"got {self.flash_speculative!r}"
+            )
+        if self.flash_speculative_draft_model is not None:
+            stripped = self.flash_speculative_draft_model.strip()
+            if not stripped:
+                raise ValueError(
+                    "'flash_speculative_draft_model' must be a non-empty HuggingFace "
+                    "path or None"
+                )
+            self.flash_speculative_draft_model = stripped
+        if self.flash_speculative_tokens is not None and (
+            isinstance(self.flash_speculative_tokens, bool)
+            or not isinstance(self.flash_speculative_tokens, int)
+            or self.flash_speculative_tokens < 1
+        ):
+            raise ValueError(
+                f"'flash_speculative_tokens' must be a positive integer or None, "
+                f"got {self.flash_speculative_tokens!r}"
+            )
 
     def resolved_speculative(self) -> SpeculativeConfig:
         """Resolve speculative config: per-model overrides global settings.
@@ -435,9 +482,10 @@ class ModelConfig:
     def resolved_flash(self) -> ResolvedFlashConfig:
         """Resolve Flash primary knobs: per-model overrides global settings.
 
-        Only the five user-facing knobs are resolved here. Advanced
-        tuning (window size, IO threads, cache budget, etc.) lives on
-        ``ExperimentalSettings`` and is resolved through
+        Resolves the five flash-dense knobs, the flash-prefetch toggle,
+        and the three flash-speculative fields.
+        Advanced tuning (window size, IO threads, cache budget, etc.) lives
+        on ``ExperimentalSettings`` and is resolved through
         ``resolve_experimental`` on ``ModelConfig.experimental``.
         """
         from olmlx.config import settings
@@ -477,6 +525,26 @@ class ModelConfig:
                 self.flash_memory_budget_fraction
                 if self.flash_memory_budget_fraction is not None
                 else settings.flash_memory_budget_fraction
+            ),
+            prefetch=(
+                self.flash_prefetch
+                if self.flash_prefetch is not None
+                else settings.flash_prefetch
+            ),
+            flash_speculative=(
+                self.flash_speculative
+                if self.flash_speculative is not None
+                else settings.flash_speculative
+            ),
+            flash_speculative_draft_model=(
+                self.flash_speculative_draft_model
+                if self.flash_speculative_draft_model is not None
+                else settings.flash_speculative_draft_model
+            ),
+            flash_speculative_tokens=(
+                self.flash_speculative_tokens
+                if self.flash_speculative_tokens is not None
+                else settings.flash_speculative_tokens
             ),
         )
 
@@ -604,6 +672,10 @@ class ModelConfig:
             flash_moe = entry.get("flash_moe")
             flash_moe_cache_budget_experts = entry.get("flash_moe_cache_budget_experts")
             flash_moe_io_threads = entry.get("flash_moe_io_threads")
+            flash_prefetch = entry.get("flash_prefetch")
+            flash_speculative = entry.get("flash_speculative")
+            flash_speculative_draft_model = entry.get("flash_speculative_draft_model")
+            flash_speculative_tokens = entry.get("flash_speculative_tokens")
 
             kv_cache_quant_raw = entry.get("kv_cache_quant")
             if kv_cache_quant_raw is not None:
@@ -644,6 +716,10 @@ class ModelConfig:
                 flash_moe=flash_moe,
                 flash_moe_cache_budget_experts=flash_moe_cache_budget_experts,
                 flash_moe_io_threads=flash_moe_io_threads,
+                flash_prefetch=flash_prefetch,
+                flash_speculative=flash_speculative,
+                flash_speculative_draft_model=flash_speculative_draft_model,
+                flash_speculative_tokens=flash_speculative_tokens,
                 _extra=extra,
             )
         raise TypeError(
@@ -672,6 +748,10 @@ class ModelConfig:
             and self.flash_moe is None
             and self.flash_moe_cache_budget_experts is None
             and self.flash_moe_io_threads is None
+            and self.flash_prefetch is None
+            and self.flash_speculative is None
+            and self.flash_speculative_draft_model is None
+            and self.flash_speculative_tokens is None
             and not self._extra
         ):
             return self.hf_path
@@ -717,6 +797,14 @@ class ModelConfig:
             )
         if self.flash_moe_io_threads is not None:
             result["flash_moe_io_threads"] = self.flash_moe_io_threads
+        if self.flash_prefetch is not None:
+            result["flash_prefetch"] = self.flash_prefetch
+        if self.flash_speculative is not None:
+            result["flash_speculative"] = self.flash_speculative
+        if self.flash_speculative_draft_model is not None:
+            result["flash_speculative_draft_model"] = self.flash_speculative_draft_model
+        if self.flash_speculative_tokens is not None:
+            result["flash_speculative_tokens"] = self.flash_speculative_tokens
         # Filter known keys defensively — from_entry() already excludes them,
         # but _extra can be set directly via ModelConfig construction.
         result.update(

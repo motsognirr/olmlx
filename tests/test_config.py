@@ -385,3 +385,52 @@ class TestSpeculativeStrategySettings:
     def test_invalid_strategy_rejected(self):
         with pytest.raises(ValidationError):
             Settings(speculative_strategy="bogus", _env_file=None)  # type: ignore[arg-type]
+
+
+class TestFlashPrefetchSpeculativePromotion:
+    def test_promoted_fields_on_settings_via_env(self, monkeypatch):
+        from olmlx.config import Settings
+
+        monkeypatch.setenv("OLMLX_FLASH_PREFETCH", "true")
+        monkeypatch.setenv("OLMLX_FLASH_SPECULATIVE", "true")
+        monkeypatch.setenv(
+            "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL",
+            "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+        )
+        monkeypatch.setenv("OLMLX_FLASH_SPECULATIVE_TOKENS", "6")
+        s = Settings()
+        assert s.flash_prefetch is True
+        assert s.flash_speculative is True
+        assert (
+            s.flash_speculative_draft_model
+            == "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+        )
+        assert s.flash_speculative_tokens == 6
+
+    def test_flash_speculative_draft_model_rejects_blank(self):
+        import pytest
+        from pydantic import ValidationError
+        from olmlx.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(flash_speculative_draft_model="")
+        with pytest.raises(ValidationError):
+            Settings(flash_speculative_draft_model="   ")
+
+    def test_prefetch_tuning_knobs_stay_experimental(self, monkeypatch):
+        from olmlx.config import ExperimentalSettings
+
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_PREFETCH_IO_THREADS", "8")
+        e = ExperimentalSettings()
+        assert e.flash_prefetch_io_threads == 8
+        # The promoted toggle is no longer an ExperimentalSettings field.
+        assert "flash_prefetch" not in ExperimentalSettings.model_fields
+
+
+class TestDistributedTensorOnly:
+    def test_pipeline_strategy_rejected(self):
+        with pytest.raises(ValidationError):
+            Settings(distributed_strategy="pipeline")
+
+    def test_tensor_strategy_accepted(self):
+        assert Settings(distributed_strategy="tensor").distributed_strategy == "tensor"

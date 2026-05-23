@@ -1169,21 +1169,21 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_EXPERIMENTAL_FLASH_BYPASS_OS_CACHE` | bool | `false` | Bypass OS page cache for direct SSD I/O |
 | `OLMLX_EXPERIMENTAL_FLASH_PREALLOCATED_BUFFER` | bool | `false` | Preallocate I/O buffer for weight loading |
 | `OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION` | float/None | `None` | Memory budget as fraction of system RAM |
-| `OLMLX_EXPERIMENTAL_FLASH_PREFETCH` | bool | `false` | Enable speculative neuron prefetching |
+| `OLMLX_FLASH_PREFETCH` | bool | `false` | Enable speculative neuron prefetching (also `--flash-prefetch` on `olmlx serve`) |
 | `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_CONFIDENCE_THRESHOLD` | float | `0.3` | Minimum predictor confidence for prefetching |
 | `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_MIN_NEURONS` | int | `64` | Minimum neurons per prefetch batch |
 | `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_MAX_NEURONS` | int/None | `None` | Maximum neurons per prefetch batch |
 | `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_IO_THREADS` | int | `16` | I/O threads for prefetch loading |
-| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE` | bool | `false` | Enable speculative decoding with draft model |
-| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL` | string/None | `None` | Draft model name or HuggingFace path |
-| `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS` | int | `4` | Number of candidate tokens per speculative step |
+| `OLMLX_FLASH_SPECULATIVE` | bool | `false` | Enable speculative decoding with draft model (also `--flash-speculative`) |
+| `OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL` | string/None | `None` | Draft model name or HuggingFace path (also `--flash-speculative-draft-model`) |
+| `OLMLX_FLASH_SPECULATIVE_TOKENS` | int | `4` | Number of candidate tokens per speculative step (also `--flash-speculative-tokens`) |
 
 ### Distributed Inference Settings (Experimental)
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
 | `OLMLX_DISTRIBUTED` | bool | `false` | Enable distributed inference |
-| `OLMLX_DISTRIBUTED_STRATEGY` | string | `tensor` | Sharding strategy: `tensor` or `pipeline` |
+| `OLMLX_DISTRIBUTED_STRATEGY` | string | `tensor` | Sharding strategy: `tensor` (tensor-only; `pipeline` was removed) |
 | `OLMLX_DISTRIBUTED_HOSTFILE` | path | `~/.olmlx/hostfile.json` | Path to hostfile |
 | `OLMLX_DISTRIBUTED_BACKEND` | string | `ring` | MLX distributed backend |
 | `OLMLX_DISTRIBUTED_PORT` | int | `32323` | Base port for ring backend |
@@ -1503,10 +1503,20 @@ Flash inference can be combined with speculative decoding to reduce per-token la
 Add to your `.env` file or pass as environment variables:
 
 ```bash
-OLMLX_EXPERIMENTAL_FLASH=true
-OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE=true
-OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit
-OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS=4
+OLMLX_FLASH=true
+OLMLX_FLASH_SPECULATIVE=true
+OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit
+OLMLX_FLASH_SPECULATIVE_TOKENS=4
+```
+
+Or with CLI flags:
+
+```bash
+olmlx serve \
+  --flash \
+  --flash-speculative \
+  --flash-speculative-draft-model mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --flash-speculative-tokens 4
 ```
 
 The draft model runs fully in-memory for fast autoregressive generation, while the target flash model verifies all candidates in one pass (loading only the needed neurons from SSD). On average, each step produces multiple accepted tokens, reducing total SSD reads.
@@ -1516,9 +1526,11 @@ The draft model runs fully in-memory for fast autoregressive generation, while t
 Add to your `.env` file or pass as environment variables:
 
 ```bash
-OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true
+OLMLX_FLASH_PREFETCH=true
 OLMLX_EXPERIMENTAL_FLASH_PREFETCH_CONFIDENCE_THRESHOLD=0.3
 ```
+
+The legacy names `OLMLX_EXPERIMENTAL_FLASH_PREFETCH` and `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE*` are still honoured for one release with a deprecation warning. The four prefetch tuning knobs (`CONFIDENCE_THRESHOLD`, `MIN_NEURONS`, `MAX_NEURONS`, `IO_THREADS`) keep the `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_*` prefix.
 
 ### Combining with Distributed Inference
 
@@ -1639,8 +1651,7 @@ The first host is the coordinator (rank 0). Use Thunderbolt IPs for best perform
 |---|---|---|
 | `hosts` | Yes | List of host IPs/hostnames. First = coordinator |
 | `model` | Yes | HuggingFace model path (must be the same on all machines) |
-| `strategy` | No | `"tensor"` (default) or `"pipeline"` |
-| `layers` | No | Layer counts per host for pipeline strategy |
+| `strategy` | No | `"tensor"` (only supported value; `pipeline` was removed) |
 
 **4. Configure coordinator** (`.env` or environment):
 
@@ -1683,10 +1694,11 @@ curl http://coordinator-ip:11434/api/chat -d '{
 
 ### Sharding Strategies
 
+Distributed inference is **tensor-only**. The `pipeline` strategy was removed; the `strategy` field in the hostfile is accepted for backwards compatibility but only `"tensor"` is valid.
+
 | Strategy | Description | Best For |
 |---|---|---|
-| **Tensor** (default) | Splits weight tensors across ranks. All ranks compute every layer with partial tensors, synchronized via `all_sum` | Even memory distribution, models with many large layers |
-| **Pipeline** | Assigns complete layers to different ranks. Each rank processes a subset of layers | Uneven memory machines, reducing communication overhead |
+| **Tensor** | Splits weight tensors across ranks. All ranks compute every layer with partial tensors, synchronized via `all_sum` | Even memory distribution, models with many large layers |
 
 ### Pre-Sharding
 

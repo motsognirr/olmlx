@@ -2674,3 +2674,292 @@ class TestBenchLeaderboardCmd:
         cmd_bench_leaderboard(args)
         out = capsys.readouterr().out
         assert "No bench runs" in out
+
+
+class TestLegacyFlashPrefetchSpeculativeForwarding:
+    def test_legacy_prefetch_speculative_forwarded(self, monkeypatch, caplog):
+        import logging
+        from olmlx.config import settings, surface_legacy_flash_prefetch_speculative_env
+
+        for k in (
+            "flash_prefetch",
+            "flash_speculative",
+            "flash_speculative_draft_model",
+            "flash_speculative_tokens",
+        ):
+            monkeypatch.delenv("OLMLX_" + k.upper(), raising=False)
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=False)
+        monkeypatch.setattr(settings, "flash_speculative", False, raising=False)
+        monkeypatch.setattr(
+            settings, "flash_speculative_draft_model", None, raising=False
+        )
+        monkeypatch.setattr(settings, "flash_speculative_tokens", 4, raising=False)
+
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_PREFETCH", "true")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE", "true")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL", "d/m")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS", "6")
+        with caplog.at_level(logging.WARNING):
+            surface_legacy_flash_prefetch_speculative_env()
+        assert settings.flash_prefetch is True
+        assert settings.flash_speculative is True
+        assert settings.flash_speculative_draft_model == "d/m"
+        assert settings.flash_speculative_tokens == 6
+        assert "OLMLX_FLASH_SPECULATIVE" in caplog.text
+
+    def test_new_env_var_wins_over_legacy(self, monkeypatch):
+        from olmlx.config import settings, surface_legacy_flash_prefetch_speculative_env
+
+        monkeypatch.setenv("OLMLX_FLASH_SPECULATIVE_TOKENS", "9")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS", "6")
+        # Simulate that the new env var already drove Settings to 9.
+        monkeypatch.setattr(settings, "flash_speculative_tokens", 9, raising=False)
+        surface_legacy_flash_prefetch_speculative_env()
+        assert settings.flash_speculative_tokens == 9
+
+    def test_legacy_prefetch_speculative_no_op_when_unset(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """No legacy or new env vars set → no Settings mutation, no warning.
+
+        Uses monkeypatch.chdir(tmp_path) to avoid picking up a stray .env
+        from the developer's working directory (the shim reads Path('.env')
+        relative to cwd).
+        """
+        import logging
+
+        from olmlx.config import settings, surface_legacy_flash_prefetch_speculative_env
+
+        monkeypatch.chdir(tmp_path)
+        for name in (
+            "OLMLX_EXPERIMENTAL_FLASH_PREFETCH",
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE",
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL",
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS",
+            "OLMLX_FLASH_PREFETCH",
+            "OLMLX_FLASH_SPECULATIVE",
+            "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL",
+            "OLMLX_FLASH_SPECULATIVE_TOKENS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=False)
+        monkeypatch.setattr(settings, "flash_speculative", False, raising=False)
+        monkeypatch.setattr(
+            settings, "flash_speculative_draft_model", None, raising=False
+        )
+        monkeypatch.setattr(settings, "flash_speculative_tokens", 4, raising=False)
+
+        with caplog.at_level(logging.WARNING):
+            surface_legacy_flash_prefetch_speculative_env()
+
+        assert settings.flash_prefetch is False
+        assert settings.flash_speculative is False
+        assert settings.flash_speculative_draft_model is None
+        assert settings.flash_speculative_tokens == 4
+        assert not any(rec.levelno >= logging.WARNING for rec in caplog.records), (
+            "Expected no WARNING-level logs but got: " + caplog.text
+        )
+
+    def test_legacy_prefetch_dotenv_forwarding(self, monkeypatch, tmp_path, caplog):
+        """Legacy OLMLX_EXPERIMENTAL_FLASH_PREFETCH in .env (not shell) is forwarded."""
+        import logging
+
+        from olmlx.config import settings, surface_legacy_flash_prefetch_speculative_env
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true\n")
+        for name in (
+            "OLMLX_EXPERIMENTAL_FLASH_PREFETCH",
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE",
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL",
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS",
+            "OLMLX_FLASH_PREFETCH",
+            "OLMLX_FLASH_SPECULATIVE",
+            "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL",
+            "OLMLX_FLASH_SPECULATIVE_TOKENS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=False)
+        monkeypatch.setattr(settings, "flash_speculative", False, raising=False)
+        monkeypatch.setattr(
+            settings, "flash_speculative_draft_model", None, raising=False
+        )
+        monkeypatch.setattr(settings, "flash_speculative_tokens", 4, raising=False)
+
+        with caplog.at_level(logging.WARNING):
+            surface_legacy_flash_prefetch_speculative_env()
+
+        assert settings.flash_prefetch is True
+        assert "OLMLX_FLASH_PREFETCH" in caplog.text
+
+    def test_whitespace_draft_model_becomes_none(self, monkeypatch, tmp_path):
+        """Whitespace-only OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL → None.
+
+        Regression for the strip()-only parser that returned "" (empty string)
+        instead of None, which would later fail the min_length=1 validator.
+        """
+        from olmlx.config import settings, surface_legacy_flash_prefetch_speculative_env
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL", "   ")
+        monkeypatch.delenv("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL", raising=False)
+        monkeypatch.setattr(
+            settings, "flash_speculative_draft_model", None, raising=False
+        )
+
+        surface_legacy_flash_prefetch_speculative_env()
+
+        assert settings.flash_speculative_draft_model is None
+
+    def test_dotenv_new_var_opt_out_not_clobbered_by_legacy_shell(
+        self, monkeypatch, tmp_path
+    ):
+        """OLMLX_FLASH_PREFETCH=false in .env must not be clobbered by legacy shell var.
+
+        Regression for the .env blind spot: when the new var is written only to
+        .env (not the shell env), os.environ.get(new) returns None and the old
+        guard failed to detect the explicit opt-out, allowing the legacy shell
+        var to overwrite the user's intended False value.
+        """
+        from olmlx.config import settings, surface_legacy_flash_prefetch_speculative_env
+
+        monkeypatch.chdir(tmp_path)
+        # New var set only in .env — pydantic-settings picks it up but does
+        # NOT write it to os.environ, so os.environ.get("OLMLX_FLASH_PREFETCH")
+        # returns None even though the user explicitly opted out.
+        (tmp_path / ".env").write_text("OLMLX_FLASH_PREFETCH=false\n")
+        # Legacy var is in the shell env, simulating a user who hasn't cleaned
+        # up their shell after the rename.
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_PREFETCH", "true")
+        # Ensure the new shell var is absent (only in .env).
+        monkeypatch.delenv("OLMLX_FLASH_PREFETCH", raising=False)
+        # Settings reflect the .env opt-out (False == default, but the user
+        # explicitly wrote it — the bug scenario).
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=False)
+
+        surface_legacy_flash_prefetch_speculative_env()
+
+        # The legacy shell var must NOT have clobbered the explicit .env opt-out.
+        assert settings.flash_prefetch is False
+
+    def test_dotenv_new_var_opt_out_not_clobbered_by_legacy_shell_flash_moe(
+        self, monkeypatch, tmp_path
+    ):
+        """OLMLX_FLASH_MOE=false in .env must not be clobbered by legacy shell var.
+
+        Regression for the .env blind spot in surface_legacy_flash_moe_env: when
+        the new var is written only to .env (not the shell env),
+        os.environ.get(new) returns None and the old guard failed to detect the
+        explicit opt-out, allowing the legacy shell var to overwrite the user's
+        intended False value.
+        """
+        from olmlx.config import settings, surface_legacy_flash_moe_env
+
+        monkeypatch.chdir(tmp_path)
+        # New var set only in .env — pydantic-settings picks it up but does
+        # NOT write it to os.environ, so os.environ.get("OLMLX_FLASH_MOE")
+        # returns None even though the user explicitly opted out.
+        (tmp_path / ".env").write_text("OLMLX_FLASH_MOE=false\n")
+        # Legacy var is in the shell env, simulating a user who hasn't cleaned
+        # up their shell after the rename.
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MOE", "true")
+        # Ensure the new shell var is absent (only in .env).
+        monkeypatch.delenv("OLMLX_FLASH_MOE", raising=False)
+        # Settings reflect the .env opt-out (False == default, but the user
+        # explicitly wrote it — the bug scenario).
+        monkeypatch.setattr(settings, "flash_moe", False, raising=False)
+
+        surface_legacy_flash_moe_env()
+
+        # The legacy shell var must NOT have clobbered the explicit .env opt-out.
+        assert settings.flash_moe is False
+
+    def test_cmd_flash_prepare_calls_legacy_shim(self, monkeypatch):
+        """cmd_flash_prepare must surface legacy env vars before reading settings.
+
+        Regression test for the fix that adds _surface_legacy_flash_env() and
+        _surface_legacy_flash_prefetch_speculative_env() at the top of
+        cmd_flash_prepare — without this, OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true
+        was silently ignored and no LookaheadBank was trained.
+        """
+        import inspect
+        import olmlx.cli as cli_mod
+
+        src = inspect.getsource(cli_mod.cmd_flash_prepare)
+        assert "_surface_legacy_flash_prefetch_speculative_env" in src, (
+            "cmd_flash_prepare must call _surface_legacy_flash_prefetch_speculative_env() "
+            "so that OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true reaches settings.flash_prefetch "
+            "before _cmd_flash_dense_prepare reads train_lookahead=settings.flash_prefetch."
+        )
+        assert "_surface_legacy_flash_env" in src, (
+            "cmd_flash_prepare must also call _surface_legacy_flash_env() "
+            "for consistency with other commands that surface both shims."
+        )
+
+
+class TestServeFlashPrefetchSpeculativeFlags:
+    def test_flags_apply_to_settings(self, monkeypatch):
+        import argparse
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings
+
+        monkeypatch.setattr(settings, "flash_speculative", False, raising=False)
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=False)
+        args = argparse.Namespace(
+            flash_speculative=True,
+            flash_speculative_draft_model="d/m",
+            flash_speculative_tokens=5,
+            flash_prefetch=True,
+        )
+        _apply_serve_overrides(args)
+        assert settings.flash_speculative is True
+        assert settings.flash_speculative_draft_model == "d/m"
+        assert settings.flash_speculative_tokens == 5
+        assert settings.flash_prefetch is True
+
+
+class TestFlashWithoutFlashGuards:
+    """Warn when flash_speculative / flash_prefetch are set without flash."""
+
+    def test_flash_speculative_without_flash_warns(self, monkeypatch, caplog):
+        import argparse
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings
+
+        monkeypatch.setattr(settings, "flash", False, raising=True)
+        monkeypatch.setattr(settings, "flash_speculative", False, raising=True)
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=True)
+        args = argparse.Namespace(
+            flash_speculative=True,
+            flash_speculative_draft_model=None,
+            flash_speculative_tokens=None,
+            flash_prefetch=None,
+        )
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        assert (
+            "flash_speculative is set but flash is not enabled globally" in caplog.text
+        )
+
+    def test_flash_prefetch_without_flash_warns(self, monkeypatch, caplog):
+        import argparse
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings
+
+        monkeypatch.setattr(settings, "flash", False, raising=True)
+        monkeypatch.setattr(settings, "flash_speculative", False, raising=True)
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=True)
+        args = argparse.Namespace(
+            flash_speculative=None,
+            flash_speculative_draft_model=None,
+            flash_speculative_tokens=None,
+            flash_prefetch=True,
+        )
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        assert "flash_prefetch is set but flash is not enabled globally" in caplog.text
