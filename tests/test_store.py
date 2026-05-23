@@ -157,6 +157,54 @@ class TestModelStore:
         assert result is not None
         assert result.name == "test:latest"
 
+    def test_show_found_without_manifest(self, mock_store, tmp_path):
+        """Issue #340: show derives metadata from config.json when manifest.json is missing.
+
+        Reproduces dirs populated by mlx-lm download paths or manual moves,
+        which lack manifest.json but have config.json + weights.
+        """
+        local_dir = mock_store.local_path("mlx-community/Qwen3-4B-4bit")
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3",
+                    "hidden_size": 2560,
+                    "num_hidden_layers": 36,
+                    "quantization": {"bits": 4, "group_size": 64},
+                }
+            )
+        )
+        (local_dir / "model.safetensors").write_bytes(b"\x00" * 1024)
+
+        result = mock_store.show("mlx-community/Qwen3-4B-4bit")
+        assert result is not None
+        assert result.hf_path == "mlx-community/Qwen3-4B-4bit"
+        assert result.family == "qwen3"
+        assert result.quantization_level == "4-bit"
+        assert result.size >= 1024
+        assert result.digest != ""
+
+    def test_list_local_includes_dirs_without_manifest(self, mock_store, tmp_path):
+        """Issue #340: list_local surfaces models that lack manifest.json."""
+        local_dir = mock_store.local_path("mlx-community/Qwen3-4B-4bit")
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3",
+                    "quantization": {"bits": 4, "group_size": 64},
+                }
+            )
+        )
+        (local_dir / "model.safetensors").write_bytes(b"\x00" * 256)
+
+        results = mock_store.list_local()
+        assert len(results) == 1
+        assert results[0].hf_path == "mlx-community/Qwen3-4B-4bit"
+        assert results[0].family == "qwen3"
+        assert results[0].quantization_level == "4-bit"
+
     def test_delete_not_found(self, mock_store):
         assert mock_store.delete("nonexistent") is False
 
