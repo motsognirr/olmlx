@@ -127,6 +127,58 @@ class TestApplyGraders:
         assert results[0].quality is not None
         assert results[0].quality.passed is None
 
+    def test_returns_code_exec_excluded_count(self):
+        # apply_graders should *report* the disabled-code_exec count
+        # directly so the runner doesn't have to re-infer it from
+        # ``passed is None`` (which would also match grader exceptions).
+        prompts = [
+            {
+                "name": "p1",
+                "grader": "code_exec",
+                "expected": {
+                    "prompt": "",
+                    "tests": "",
+                    "entry_point": "f",
+                },
+            },
+            {"name": "p2", "grader": "numeric", "expected": {"answer": 1}},
+        ]
+        results = [
+            self._result("p1", "anything"),
+            self._result("p2", "#### 1"),
+        ]
+        stats = apply_graders(results, prompts, enable_code_exec=False)
+        assert stats == {"code_exec_excluded": 1}
+
+    def test_returns_zero_excluded_when_code_exec_enabled(self, monkeypatch):
+        # Stub grade() so we don't actually spawn a subprocess.
+        monkeypatch.setattr(
+            "olmlx.bench.runner.grade",
+            lambda g, o, e: QualityResult(g, True, 1.0, ""),
+        )
+        prompts = [{"name": "p1", "grader": "code_exec", "expected": {}}]
+        results = [self._result("p1", "x")]
+        stats = apply_graders(results, prompts, enable_code_exec=True)
+        assert stats == {"code_exec_excluded": 0}
+
+    def test_grade_exception_caught_and_logged(self, monkeypatch, caplog):
+        # grade() is contracted not to raise, but a future regression
+        # mustn't abort the whole bench run and lose accumulated results.
+        # The fallback preserves the ``r.grader ⇔ r.quality`` invariant.
+        def boom(grader_name, output, expected):
+            raise RuntimeError("simulated grader regression")
+
+        monkeypatch.setattr("olmlx.bench.runner.grade", boom)
+        prompts = [{"name": "p1", "grader": "numeric", "expected": {"answer": 1}}]
+        results = [self._result("p1", "#### 1")]
+        with caplog.at_level("WARNING", logger="olmlx.bench.runner"):
+            apply_graders(results, prompts, enable_code_exec=False)
+        assert results[0].grader == "numeric"
+        assert results[0].quality is not None
+        assert results[0].quality.passed is None
+        assert "simulated grader regression" in results[0].quality.detail
+        assert any("Grader" in rec.getMessage() for rec in caplog.records)
+
     def test_code_exec_enabled_injects_flag(self, monkeypatch):
         # Verifies the injection contract without actually running a
         # subprocess — the real code_exec execution is covered in
@@ -216,6 +268,32 @@ class TestScenarioQualitySummary:
             prompt_results=[PromptResult("d", "factual", "x", 200)],
         )
         assert sc.quality_summary() == (0, 0)
+
+    def test_indeterminate_graded_excluded_from_tally(self):
+        # Prompts that have a grader + a QualityResult but ``passed is
+        # None`` (e.g. ``code_exec`` when ``enable_code_exec`` is false)
+        # must not count toward the denominator — otherwise the reported
+        # pass rate is dragged down by prompts that were never actually
+        # judged.
+        sc = ScenarioResult(
+            scenario_name="baseline",
+            scenario_description="",
+            env_overrides={},
+            prompt_results=[
+                self._graded("a", True),
+                PromptResult(
+                    "b",
+                    "humaneval",
+                    "x",
+                    200,
+                    grader="code_exec",
+                    quality=QualityResult(
+                        "code_exec", None, None, "code_exec disabled"
+                    ),
+                ),
+            ],
+        )
+        assert sc.quality_summary() == (1, 1)
 
 
 class TestRunResultMetadata:
