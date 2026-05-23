@@ -50,6 +50,7 @@ def _wait_for_server(port: int, proc: subprocess.Popen, timeout: float) -> bool:
 
 THINK_TRUE = {"true", "1", "on", "yes"}
 THINK_FALSE = {"false", "0", "off", "no"}
+_ALL_THINK_VALUES = THINK_TRUE | THINK_FALSE
 
 
 def is_recognized_think_value(raw: str) -> bool:
@@ -60,7 +61,7 @@ def is_recognized_think_value(raw: str) -> bool:
     ``OLMLX_BENCH_THINK=tru`` would land in the saved A/B JSON as if think
     were toggled, even though the worker fell back to the engine default.
     """
-    return raw.strip().lower() in THINK_TRUE | THINK_FALSE
+    return raw.strip().lower() in _ALL_THINK_VALUES
 
 
 def _resolve_bench_think(env: Mapping[str, str]) -> bool | None:

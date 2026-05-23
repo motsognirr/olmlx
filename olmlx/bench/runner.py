@@ -13,6 +13,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 from olmlx.bench.prompts import PROMPTS, BenchPrompt
@@ -116,8 +117,6 @@ def build_prompts(prompt_set: str) -> list[BenchPrompt]:
     if prompt_set == "quality":
         return graded
     if prompt_set == "all":
-        from collections import Counter
-
         combined = list(PROMPTS) + graded
         # apply_graders joins PromptResult → prompt by name. A duplicate
         # name across throughput and graded sets would silently grade a
@@ -185,12 +184,25 @@ def apply_graders(
         if r.status_code != 200:
             continue
         grader_name = prompt["grader"]
+        # Enforce the code_exec opt-in *here*, not by trusting
+        # ``grade_code_exec`` to look at an ``_enabled`` key. Otherwise
+        # a future refactor of the grader's internal gate (rename, default
+        # change) would silently let untrusted code run with
+        # ``enable_code_exec=False``. Synthesise the disabled verdict and
+        # skip the grader call entirely.
+        if grader_name == "code_exec" and not enable_code_exec:
+            stats["code_exec_excluded"] += 1
+            r.grader = grader_name
+            r.quality = QualityResult(
+                grader="code_exec",
+                passed=None,
+                score=None,
+                detail="code_exec disabled (pass --enable-code-exec)",
+            )
+            continue
         expected = dict(prompt.get("expected") or {})
         if grader_name == "code_exec":
-            if enable_code_exec:
-                expected["_enabled"] = True
-            else:
-                stats["code_exec_excluded"] += 1
+            expected["_enabled"] = True
         # Wrap defensively: ``grade`` is contracted not to raise (it has
         # its own ``except Exception`` returning ``passed=None``), but a
         # future regression there shouldn't abort a long graded run mid-way

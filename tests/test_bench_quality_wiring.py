@@ -44,6 +44,33 @@ class TestBuildPrompts:
         # at construction rather than letting them mis-grade a saved run.
         build_prompts("all")
 
+    def test_to_dict_carries_grader_fields_into_apply_graders(self):
+        # Integration check: ``build_prompts("quality")`` →
+        # ``BenchPrompt.to_dict()`` → ``apply_graders`` must round-trip
+        # the ``grader`` and ``expected`` fields. If ``to_dict()`` ever
+        # silently dropped either, the quality run would report
+        # ``quality 0/0`` with no error. This test pins the contract.
+        prompts = build_prompts("quality")
+        prompts_data = [p.to_dict() for p in prompts]
+        # Pick the first graded prompt and synthesise a "pass" result.
+        first = prompts[0]
+        assert first.grader is not None
+        result = PromptResult(
+            first.name,
+            first.category,
+            output_text="",  # filled below per grader
+            status_code=200,
+        )
+        # Numeric is the easiest "pass" output to synthesise; if the first
+        # prompt isn't numeric, skip the content check and just confirm the
+        # grader was applied (verdict-shape, not verdict-value).
+        if first.grader == "numeric":
+            result.output_text = f"#### {first.expected['answer']}"
+        apply_graders([result], prompts_data, enable_code_exec=False)
+        assert result.grader == first.grader, (
+            "BenchPrompt.to_dict() did not surface grader to apply_graders"
+        )
+
     def test_all_set_raises_on_duplicate_names(self, monkeypatch):
         import pytest
 
@@ -109,7 +136,18 @@ class TestApplyGraders:
         assert results[0].grader is None
         assert results[0].quality is None
 
-    def test_code_exec_disabled_by_default(self):
+    def test_code_exec_disabled_does_not_call_grade(self, monkeypatch):
+        # Runner enforces the code_exec gate itself; ``grade()`` must not
+        # be invoked at all when ``enable_code_exec=False``. Otherwise a
+        # future change to the grader's internal opt-in flag would silently
+        # let untrusted code execute. Stubs ``grade`` to assert non-call.
+        called = []
+
+        def watch_grade(*args, **kwargs):
+            called.append(args)
+            return QualityResult("code_exec", True, 1.0, "")
+
+        monkeypatch.setattr("olmlx.bench.runner.grade", watch_grade)
         results = [self._result("p1", "```python\ndef f():\n    return 1\n```")]
         prompts = [
             {
@@ -123,9 +161,10 @@ class TestApplyGraders:
             }
         ]
         apply_graders(results, prompts, enable_code_exec=False)
-        # Grader runs but returns ungraded (passed=None) when not enabled.
+        assert called == []
         assert results[0].quality is not None
         assert results[0].quality.passed is None
+        assert results[0].grader == "code_exec"
 
     def test_returns_code_exec_excluded_count(self):
         # apply_graders should *report* the disabled-code_exec count
