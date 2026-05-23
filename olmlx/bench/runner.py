@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import socket
 import subprocess
@@ -47,6 +48,9 @@ def _capture_bench_env() -> dict[str, str]:
     return captured
 
 
+_DEFAULT_WORKER_TIMEOUT = 600.0
+
+
 def _worker_timeout() -> float:
     """Per-scenario worker kill timeout, in seconds.
 
@@ -54,13 +58,35 @@ def _worker_timeout() -> float:
     quality set (especially with thinking on and a high ``--max-tokens``)
     can run much longer, so it is overridable via
     ``OLMLX_BENCH_WORKER_TIMEOUT`` rather than hard-failing a long graded run.
+
+    Rejects ``inf`` / ``nan`` (these would silently disable the kill switch
+    in ``subprocess.run``) and warns on unparseable values so an ignored
+    override is diagnosable instead of vanishing into the default.
     """
     raw = os.environ.get("OLMLX_BENCH_WORKER_TIMEOUT", "")
+    if not raw:
+        return _DEFAULT_WORKER_TIMEOUT
     try:
         value = float(raw)
     except ValueError:
-        return 600.0
-    return value if value > 0 else 600.0
+        logger.warning(
+            "Ignoring OLMLX_BENCH_WORKER_TIMEOUT=%r: not a number; using %.0fs",
+            raw,
+            _DEFAULT_WORKER_TIMEOUT,
+        )
+        return _DEFAULT_WORKER_TIMEOUT
+    # math.isfinite covers inf, -inf, and nan in one call. Negative or zero
+    # values fall through to the same warning rather than silently flipping
+    # to the default with no diagnostic.
+    if not math.isfinite(value) or value <= 0:
+        logger.warning(
+            "Ignoring OLMLX_BENCH_WORKER_TIMEOUT=%r: must be a positive finite "
+            "number; using %.0fs",
+            raw,
+            _DEFAULT_WORKER_TIMEOUT,
+        )
+        return _DEFAULT_WORKER_TIMEOUT
+    return value
 
 
 def build_prompts(prompt_set: str) -> list[BenchPrompt]:
@@ -69,12 +95,16 @@ def build_prompts(prompt_set: str) -> list[BenchPrompt]:
     - ``throughput``: the 7 ungraded throughput probes (tok/s only).
     - ``quality``: GSM8K + MMLU + HumanEval mini-sets (all graded).
     - ``all``: throughput probes followed by the graded sets.
+
+    The throughput path returns before importing ``task_prompts`` so a
+    plain ``olmlx bench run`` doesn't construct the ~50 graded prompts.
     """
+    if prompt_set == "throughput":
+        return list(PROMPTS)
+
     from olmlx.bench.task_prompts import PROMPT_SETS
 
     graded = [p for sets in PROMPT_SETS.values() for p in sets]
-    if prompt_set == "throughput":
-        return list(PROMPTS)
     if prompt_set == "quality":
         return graded
     if prompt_set == "all":
@@ -93,13 +123,21 @@ def apply_graders(
 
     Graders are pure functions run here in the parent (the worker only
     produces ``output_text``). Only successful (HTTP 200) responses to
-    prompts that carry a grader are scored; everything else is left
-    ungraded — both ``r.grader`` and ``r.quality`` stay ``None`` so the
-    pair maintains the invariant ``r.grader is not None ⇔ r.quality is
-    not None``. ``code_exec`` runs untrusted model code, so it stays
-    disabled unless ``enable_code_exec`` is set, signalled to the grader
-    via a private ``_enabled`` flag injected into a *copy* of the expected
-    payload (the caller's dict is never mutated).
+    prompts that carry a grader are scored; non-200 responses and prompts
+    without a grader leave ``r.grader`` and ``r.quality`` untouched (both
+    stay ``None``). The pair always satisfies ``r.grader is not None ⇔
+    r.quality is not None``.
+
+    A grader that runs may still return ``passed=None`` to signal "no
+    verdict reached" — e.g. ``code_exec`` when ``enable_code_exec`` is
+    false. That is a graded verdict, distinct from never having run a
+    grader at all; ``ScenarioResult.quality_summary`` excludes both from
+    its passed/total tally.
+
+    ``code_exec`` runs untrusted model code, so it stays disabled unless
+    ``enable_code_exec`` is set, signalled to the grader via a private
+    ``_enabled`` flag injected into a *copy* of the expected payload (the
+    caller's dict is never mutated).
     """
     by_name = {p["name"]: p for p in prompts}
     for r in results:

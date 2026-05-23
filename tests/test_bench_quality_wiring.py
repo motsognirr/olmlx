@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from olmlx.bench.prompts import PROMPTS
 from olmlx.bench.results import PromptResult, RunResult, ScenarioResult
-from olmlx.bench.runner import apply_graders, build_prompts
+from olmlx.bench.runner import _worker_timeout, apply_graders, build_prompts
 from olmlx.bench.quality import QualityResult
 from olmlx.bench.task_prompts import PROMPT_SETS
 
@@ -218,3 +218,42 @@ class TestRunResultMetadata:
         run = RunResult.from_dict(legacy)
         assert run.prompt_set is None
         assert run.bench_env == {}
+
+
+class TestWorkerTimeout:
+    """`OLMLX_BENCH_WORKER_TIMEOUT` must never silently disable the kill
+    switch (e.g. via ``inf``) and never silently swallow a typo'd value.
+    """
+
+    def test_unset_returns_default(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_BENCH_WORKER_TIMEOUT", raising=False)
+        assert _worker_timeout() == 600.0
+
+    def test_positive_value_used(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_BENCH_WORKER_TIMEOUT", "1800")
+        assert _worker_timeout() == 1800.0
+
+    def test_inf_rejected(self, monkeypatch, caplog):
+        # `subprocess.run(timeout=inf)` waits forever — must never get there.
+        monkeypatch.setenv("OLMLX_BENCH_WORKER_TIMEOUT", "inf")
+        with caplog.at_level("WARNING", logger="olmlx.bench.runner"):
+            assert _worker_timeout() == 600.0
+        assert any("inf" in rec.getMessage().lower() for rec in caplog.records)
+
+    def test_nan_rejected(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_BENCH_WORKER_TIMEOUT", "nan")
+        assert _worker_timeout() == 600.0
+
+    def test_zero_rejected(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_BENCH_WORKER_TIMEOUT", "0")
+        assert _worker_timeout() == 600.0
+
+    def test_negative_rejected(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_BENCH_WORKER_TIMEOUT", "-5")
+        assert _worker_timeout() == 600.0
+
+    def test_unparseable_warns(self, monkeypatch, caplog):
+        monkeypatch.setenv("OLMLX_BENCH_WORKER_TIMEOUT", "abc")
+        with caplog.at_level("WARNING", logger="olmlx.bench.runner"):
+            assert _worker_timeout() == 600.0
+        assert any("abc" in rec.getMessage() for rec in caplog.records)
