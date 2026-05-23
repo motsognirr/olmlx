@@ -929,7 +929,7 @@ class ModelManager:
         self._pending_load_tasks.clear()
         self._loaded.clear()
 
-    def _resolve_keep_alive(self, keep_alive: str | None) -> float | None:
+    def _resolve_keep_alive(self, keep_alive: int | str | None) -> float | None:
         """Parse keep_alive, falling back to the global default."""
         return parse_keep_alive(
             keep_alive if keep_alive is not None else settings.default_keep_alive
@@ -1118,7 +1118,7 @@ class ModelManager:
                 del lm
 
     async def ensure_loaded(
-        self, name: str, keep_alive: str | None = None
+        self, name: str, keep_alive: int | str | None = None
     ) -> LoadedModel:
         """Ensure a model is loaded and return it."""
         normalized = self.registry.normalize_name(name)
