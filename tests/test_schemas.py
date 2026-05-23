@@ -178,6 +178,18 @@ class TestGenerateSchemas:
         )
         assert resp.thinking is None
 
+    def test_generate_request_keep_alive_int(self):
+        # Ollama accepts an integer (seconds); 0 means unload immediately.
+        req = GenerateRequest(model="test", prompt="hi", keep_alive=0)
+        assert req.keep_alive == 0
+        assert (
+            GenerateRequest(model="test", prompt="hi", keep_alive=-1).keep_alive == -1
+        )
+
+    def test_generate_request_keep_alive_string(self):
+        req = GenerateRequest(model="test", prompt="hi", keep_alive="5m")
+        assert req.keep_alive == "5m"
+
 
 class TestChatSchemas:
     def test_message(self):
@@ -226,6 +238,17 @@ class TestChatSchemas:
             think="high",
         )
         assert req.think == "high"
+
+    def test_chat_request_keep_alive_int(self):
+        msgs = [Message(role="user", content="hi")]
+        req = ChatRequest(model="test", messages=msgs, keep_alive=0)
+        assert req.keep_alive == 0
+        assert ChatRequest(model="test", messages=msgs, keep_alive=-1).keep_alive == -1
+
+    def test_chat_request_keep_alive_string(self):
+        msgs = [Message(role="user", content="hi")]
+        req = ChatRequest(model="test", messages=msgs, keep_alive="5m")
+        assert req.keep_alive == "5m"
 
 
 class TestModelSchemas:
@@ -288,6 +311,14 @@ class TestEmbedSchemas:
         with pytest.raises(ValidationError, match="prompt"):
             EmbeddingsRequest(model="test", prompt="")
 
+    def test_embed_request_keep_alive_int(self):
+        req = EmbedRequest(model="test", input="hi", keep_alive=0)
+        assert req.keep_alive == 0
+
+    def test_embeddings_request_keep_alive_int(self):
+        req = EmbeddingsRequest(model="test", prompt="hi", keep_alive=0)
+        assert req.keep_alive == 0
+
 
 class TestManageSchemas:
     def test_copy_request(self):
@@ -318,6 +349,10 @@ class TestManageSchemas:
     def test_abort_request_rejects_empty_model(self):
         with pytest.raises(ValidationError, match="model"):
             AbortRequest(model="")
+
+    def test_warmup_request_keep_alive_int(self):
+        req = WarmupRequest(model="test", keep_alive=0)
+        assert req.keep_alive == 0
 
     def test_unload_request_rejects_empty_model(self):
         with pytest.raises(ValidationError, match="model"):

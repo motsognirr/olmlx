@@ -8,7 +8,7 @@ class EmbedRequest(BaseModel):
     input: str | list[str]
     truncate: bool = True
     options: dict | None = None
-    keep_alive: str | None = None
+    keep_alive: int | str | None = None
 
     @field_validator("input")
     @classmethod
@@ -28,7 +28,7 @@ class EmbeddingsRequest(BaseModel):
     model: ModelName
     prompt: str
     options: dict | None = None
-    keep_alive: str | None = None
+    keep_alive: int | str | None = None
 
     @field_validator("prompt")
     @classmethod
