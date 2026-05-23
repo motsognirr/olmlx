@@ -67,6 +67,11 @@ def mock_loaded_model():
     tokenizer = MagicMock()
     tokenizer.chat_template = "{{ messages }}{{ tools }}"
     tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+    # Real HF tokenizers always expose bos_token (None on models without one).
+    # MagicMock would otherwise return a MagicMock here, which crashes
+    # tokenize_for_cache's startswith heuristic when prompt caching runs for
+    # non-streaming requests (issue #342).
+    tokenizer.bos_token = None
     return LoadedModel(
         name="qwen3:latest",
         hf_path="Qwen/Qwen3-8B-MLX",

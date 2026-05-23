@@ -2712,6 +2712,10 @@ async def _full_completion(
     stats: TimingStats,
     images: list[str] | None = None,
     has_tools: bool = False,
+    *,
+    use_prompt_cache: bool = False,
+    prompt_tokens: list[int] | None = None,
+    cache_id: str = "",
 ) -> dict:
     # inference_timeout is not enforced for non-streaming: the GPU thread
     # cannot be safely cancelled (releasing the lock while Metal is still
@@ -2719,9 +2723,80 @@ async def _full_completion(
     # this via CancellableStream.cancel() + drain_and_join().
     async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
         with _inference_ref(lm):
-            return await _full_completion_inner(
-                lm, prompt, max_tokens, gen_kwargs, stats, images, has_tools=has_tools
-            )
+            # Cache setup must happen under the inference lock so two
+            # concurrent requests can't race to read/mutate the same store
+            # entry.  The gate at the call site has already excluded VLM
+            # and speculative paths (which don't consume ``prompt_cache``).
+            cache_read_tokens = 0
+            cache_creation_tokens = 0
+            full_prompt_tokens: list[int] | None = None
+            cache_setup_done = False
+            generation_complete = False
+            generated_tokens: list[int] = []
+            try:
+                if use_prompt_cache:
+                    cs = await _setup_prompt_cache(
+                        lm,
+                        prompt,
+                        gen_kwargs,
+                        prompt_tokens=prompt_tokens,
+                        cache_id=cache_id,
+                    )
+                    prompt = cs.prompt
+                    cache_read_tokens = cs.cache_read_tokens
+                    cache_creation_tokens = cs.cache_creation_tokens
+                    full_prompt_tokens = cs.full_prompt_tokens
+                    cache_setup_done = cs.cache_setup_done
+
+                    pf = await _kv_cache_preflight_check(
+                        lm,
+                        prompt,
+                        max_tokens,
+                        gen_kwargs,
+                        cache_read_tokens=cache_read_tokens,
+                        cache_creation_tokens=cache_creation_tokens,
+                        full_prompt_tokens=full_prompt_tokens,
+                        cache_id=cache_id,
+                    )
+                    prompt = pf.prompt
+
+                result_dict = await _full_completion_inner(
+                    lm,
+                    prompt,
+                    max_tokens,
+                    gen_kwargs,
+                    stats,
+                    images,
+                    has_tools=has_tools,
+                    generated_tokens_out=generated_tokens,
+                )
+                generation_complete = True
+
+                if cache_setup_done:
+                    result_dict["cache_read_tokens"] = cache_read_tokens
+                    result_dict["cache_creation_tokens"] = cache_creation_tokens
+                    await _store_prompt_cache_after_generation(
+                        lm,
+                        gen_kwargs,
+                        full_prompt_tokens,
+                        generated_tokens,
+                        stats.eval_count,
+                        cache_id,
+                    )
+                return result_dict
+            finally:
+                # Drop GPU-backed references from gen_kwargs so they can be
+                # garbage-collected.  ``prompt_cache`` is either persisted in
+                # the store (success) or should be released; ``input_ids``
+                # is set only for VLM, but the gate excludes VLM here — kept
+                # for symmetry with the streaming finally block.
+                gen_kwargs.pop("prompt_cache", None)
+                gen_kwargs.pop("input_ids", None)
+                if not generation_complete and full_prompt_tokens is not None:
+                    logger.debug(
+                        "Cache invalidated: non-streaming generation did not complete"
+                    )
+                    lm.prompt_cache_store.remove(cache_id)
 
 
 async def _full_completion_inner(
@@ -2732,6 +2807,8 @@ async def _full_completion_inner(
     stats: TimingStats,
     images: list[str] | None = None,
     has_tools: bool = False,
+    *,
+    generated_tokens_out: list[int] | None = None,
 ) -> dict:
     def _generate_sync():
         """Run generate + synchronize in the same thread so GPU work completes
@@ -2815,6 +2892,9 @@ async def _full_completion_inner(
 
             # Use stream_generate to capture token counts (generate() discards them).
             # Accumulate text segments since each yield is incremental.
+            # When prompt caching is active the caller passes a list buffer
+            # via generated_tokens_out so _store_prompt_cache_after_generation
+            # can persist the produced token IDs alongside the prompt prefix.
             result = None
             text_parts = []
             for response in mlx_lm.stream_generate(
@@ -2825,6 +2905,10 @@ async def _full_completion_inner(
                 **gen_kwargs,
             ):
                 text_parts.append(response.text)
+                if generated_tokens_out is not None:
+                    tok_id = getattr(response, "token", None)
+                    if tok_id is not None:
+                        generated_tokens_out.append(tok_id)
                 result = response
             # Store full text on the result for downstream extraction
             if result is not None:
@@ -3067,24 +3151,26 @@ async def generate_chat(
     gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
-    # Prompt caching: streaming only, when enabled.
-    # Disabled in distributed mode because rank 0 processes only suffix tokens
-    # on cache hits while workers process the full prompt, causing all_sum
-    # call count mismatch and deadlock.
+    # Prompt caching applies to both streaming and non-streaming requests
+    # (issue #342).  Disabled in distributed mode because rank 0 processes
+    # only suffix tokens on cache hits while workers process the full
+    # prompt, causing all_sum call count mismatch and deadlock.  For the
+    # non-streaming path, also disabled when the inner generator does not
+    # consume ``prompt_cache``: ``mlx_vlm.generate`` accepts neither
+    # ``prompt_cache`` nor ``input_ids``, and the speculative decoder owns
+    # its own internal target/draft caches and would receive a misaligned
+    # suffix-only prompt on a cache hit.  Streaming behavior is unchanged.
     use_prompt_cache = (
         settings.prompt_cache
-        and stream
         and make_prompt_cache is not None
         and not lm.is_distributed
+        and (stream or (not lm.is_vlm and not lm.is_speculative))
     )
-    # TODO: when enabling prompt cache for non-streaming, also surface
-    # cache_creation_tokens / cache_read_tokens in _full_completion's result
-    # dict — the Anthropic router already reads these keys.
     prompt_tokens = None
     if use_prompt_cache:
         prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
         # Memory-only peek for debug logging; the authoritative lookup happens
-        # inside _stream_completion under the inference lock.
+        # inside _stream_completion/_full_completion under the inference lock.
         cached_state = lm.prompt_cache_store.peek(cache_id)
         logger.debug(
             "Prompt cache enabled: %d prompt tokens, existing cache=%s",
@@ -3093,9 +3179,12 @@ async def generate_chat(
         )
     else:
         logger.debug(
-            "Prompt cache disabled: setting=%s stream=%s make_prompt_cache=%s",
+            "Prompt cache disabled: setting=%s stream=%s vlm=%s speculative=%s "
+            "make_prompt_cache=%s",
             settings.prompt_cache,
             stream,
+            lm.is_vlm,
+            lm.is_speculative,
             make_prompt_cache is not None,
         )
 
@@ -3120,7 +3209,16 @@ async def generate_chat(
         )
     else:
         result = await _full_completion(
-            lm, prompt, mt, gen_kwargs, stats, images, has_tools=bool(tools)
+            lm,
+            prompt,
+            mt,
+            gen_kwargs,
+            stats,
+            images,
+            has_tools=bool(tools),
+            use_prompt_cache=use_prompt_cache,
+            prompt_tokens=prompt_tokens,
+            cache_id=cache_id,
         )
         # Mirror the streaming meta chunk so non-streaming routers can gate
         # orphan `</think>` handling on the same signal (issue #307).
