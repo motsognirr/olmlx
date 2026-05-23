@@ -1882,7 +1882,7 @@ async def _setup_prompt_cache(
     prompt_tokens: list[int] | None,
     cache_id: str,
 ) -> _CacheSetupResult:
-    """Set up prompt cache for a streaming completion.
+    """Set up prompt cache for a streaming or non-streaming completion.
 
     Handles memory pressure eviction, cache lookup, prefix matching,
     and cache hit/miss logic. Mutates gen_kwargs in place (adds
@@ -2768,7 +2768,7 @@ async def _full_completion(
                     stats,
                     images,
                     has_tools=has_tools,
-                    generated_tokens_out=generated_tokens,
+                    generated_tokens_out=generated_tokens if use_prompt_cache else None,
                 )
                 generation_complete = True
 
@@ -2909,6 +2909,12 @@ async def _full_completion_inner(
                     tok_id = getattr(response, "token", None)
                     if tok_id is not None:
                         generated_tokens_out.append(tok_id)
+                    else:
+                        logger.debug(
+                            "Skipping token with None ID at generation step %d "
+                            "(cache token sequence will be incomplete)",
+                            len(generated_tokens_out),
+                        )
                 result = response
             # Store full text on the result for downstream extraction
             if result is not None:
