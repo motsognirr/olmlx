@@ -7,25 +7,31 @@ tested in test_bench_quality.py.
 
 from __future__ import annotations
 
-from olmlx.bench.results import PromptResult, ScenarioResult
+from olmlx.bench.prompts import PROMPTS
+from olmlx.bench.results import PromptResult, RunResult, ScenarioResult
 from olmlx.bench.runner import apply_graders, build_prompts
 from olmlx.bench.quality import QualityResult
+from olmlx.bench.task_prompts import PROMPT_SETS
 
 
 class TestBuildPrompts:
-    def test_throughput_set_has_no_graders(self):
-        prompts = build_prompts("throughput")
-        assert len(prompts) == 7
-        assert all(p.grader is None for p in prompts)
+    def test_throughput_set_matches_canonical_list(self):
+        # Tie the assertion to the source list so adding a throughput probe
+        # in prompts.py doesn't silently require a test edit.
+        assert build_prompts("throughput") == list(PROMPTS)
+        assert all(p.grader is None for p in build_prompts("throughput"))
 
     def test_quality_set_is_all_graded(self):
         prompts = build_prompts("quality")
-        # gsm8k(20) + mmlu(20) + humaneval(10)
-        assert len(prompts) == 50
+        expected_size = sum(len(v) for v in PROMPT_SETS.values())
+        assert len(prompts) == expected_size
         assert all(p.grader is not None for p in prompts)
 
-    def test_all_set_is_union(self):
-        assert len(build_prompts("all")) == 57
+    def test_all_set_is_throughput_plus_quality(self):
+        # Relationship-based: survives any future addition to either set.
+        assert len(build_prompts("all")) == len(build_prompts("throughput")) + len(
+            build_prompts("quality")
+        )
 
     def test_unknown_set_raises(self):
         import pytest
@@ -72,6 +78,10 @@ class TestApplyGraders:
         results = [self._result("p1", "", status=503)]
         prompts = [{"name": "p1", "grader": "numeric", "expected": {"answer": 18}}]
         apply_graders(results, prompts, enable_code_exec=False)
+        # Invariant: r.grader is set iff r.quality is set. A failed request
+        # leaves both as None so consumers don't have to special-case the
+        # "graded prompt but no verdict" combination.
+        assert results[0].grader is None
         assert results[0].quality is None
 
     def test_code_exec_disabled_by_default(self):
@@ -170,3 +180,41 @@ class TestScenarioQualitySummary:
             prompt_results=[PromptResult("d", "factual", "x", 200)],
         )
         assert sc.quality_summary() == (0, 0)
+
+
+class TestRunResultMetadata:
+    """Saved runs must record which prompt set + bench env they ran with so
+    an operator can tell a think run apart from a no-think run, or a
+    throughput run apart from a quality run, from the JSON alone."""
+
+    def _empty_run(self, **kwargs):
+        return RunResult(
+            model="m",
+            timestamp="20260101T000000Z",
+            git_sha=None,
+            scenarios=[],
+            **kwargs,
+        )
+
+    def test_prompt_set_round_trips(self):
+        run = self._empty_run(prompt_set="quality")
+        assert RunResult.from_dict(run.to_dict()).prompt_set == "quality"
+
+    def test_bench_env_round_trips(self):
+        run = self._empty_run(bench_env={"OLMLX_BENCH_THINK": "true"})
+        restored = RunResult.from_dict(run.to_dict())
+        assert restored.bench_env == {"OLMLX_BENCH_THINK": "true"}
+
+    def test_legacy_run_without_new_fields_loads(self):
+        # Old run JSONs (pre-this-PR) have no prompt_set or bench_env.
+        # Loading must default both rather than raise.
+        legacy = {
+            "model": "m",
+            "timestamp": "20260101T000000Z",
+            "git_sha": None,
+            "max_tokens_override": None,
+            "scenarios": [],
+        }
+        run = RunResult.from_dict(legacy)
+        assert run.prompt_set is None
+        assert run.bench_env == {}

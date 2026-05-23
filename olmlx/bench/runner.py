@@ -31,6 +31,22 @@ from olmlx.bench.scenarios import Scenario, get_scenarios
 logger = logging.getLogger(__name__)
 
 
+# Bench-level env vars worth recording in the saved run. Limited to the
+# operator-facing toggles so the saved JSON stays a clean record of the
+# A/B variable(s) without dragging in unrelated process environment.
+_RECORDED_BENCH_ENV = ("OLMLX_BENCH_THINK", "OLMLX_BENCH_WORKER_TIMEOUT")
+
+
+def _capture_bench_env() -> dict[str, str]:
+    """Capture the bench-relevant env knobs set when ``run_bench`` was called."""
+    captured: dict[str, str] = {}
+    for key in _RECORDED_BENCH_ENV:
+        value = os.environ.get(key)
+        if value is not None and value != "":
+            captured[key] = value
+    return captured
+
+
 def _worker_timeout() -> float:
     """Per-scenario worker kill timeout, in seconds.
 
@@ -78,10 +94,12 @@ def apply_graders(
     Graders are pure functions run here in the parent (the worker only
     produces ``output_text``). Only successful (HTTP 200) responses to
     prompts that carry a grader are scored; everything else is left
-    ungraded. ``code_exec`` runs untrusted model code, so it stays disabled
-    unless ``enable_code_exec`` is set, signalled to the grader via a private
-    ``_enabled`` flag injected into a *copy* of the expected payload (the
-    caller's dict is never mutated).
+    ungraded — both ``r.grader`` and ``r.quality`` stay ``None`` so the
+    pair maintains the invariant ``r.grader is not None ⇔ r.quality is
+    not None``. ``code_exec`` runs untrusted model code, so it stays
+    disabled unless ``enable_code_exec`` is set, signalled to the grader
+    via a private ``_enabled`` flag injected into a *copy* of the expected
+    payload (the caller's dict is never mutated).
     """
     by_name = {p["name"]: p for p in prompts}
     for r in results:
@@ -91,12 +109,12 @@ def apply_graders(
         grader_name = prompt.get("grader")
         if not grader_name:
             continue
-        r.grader = grader_name
         if r.status_code != 200:
             continue
         expected = dict(prompt.get("expected") or {})
         if grader_name == "code_exec" and enable_code_exec:
             expected["_enabled"] = True
+        r.grader = grader_name
         r.quality = grade(grader_name, r.output_text, expected)
 
 
@@ -200,6 +218,8 @@ def run_bench(
         model=model,
         scenarios=scenario_results,
         max_tokens_override=max_tokens,
+        prompt_set=prompt_set,
+        bench_env=_capture_bench_env(),
     )
     run_dir = save_run(run, bench_dir)
     print(f"\nResults saved to {run_dir}", file=sys.stderr)

@@ -139,6 +139,15 @@ class RunResult:
     git_sha: str | None
     scenarios: list[ScenarioResult]
     max_tokens_override: int | None = None
+    # Which prompt set was run (throughput / quality / all). None means the
+    # run predates this field — load it as a legacy throughput run rather
+    # than fail to parse.
+    prompt_set: str | None = None
+    # Bench-level env knobs captured at run time so an A/B (e.g. think on
+    # vs off) is self-describing from the saved JSON alone. Scenario-level
+    # ``env_overrides`` cover the per-scenario knobs that the runner sets;
+    # this captures the operator-set, runner-wide ones.
+    bench_env: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -146,6 +155,8 @@ class RunResult:
             "timestamp": self.timestamp,
             "git_sha": self.git_sha,
             "max_tokens_override": self.max_tokens_override,
+            "prompt_set": self.prompt_set,
+            "bench_env": self.bench_env,
             "scenarios": [s.to_dict() for s in self.scenarios],
         }
 
@@ -156,6 +167,8 @@ class RunResult:
             timestamp=d["timestamp"],
             git_sha=d.get("git_sha"),
             max_tokens_override=d.get("max_tokens_override"),
+            prompt_set=d.get("prompt_set"),
+            bench_env=dict(d.get("bench_env") or {}),
             scenarios=[ScenarioResult.from_dict(s) for s in d.get("scenarios", [])],
         )
 
@@ -300,6 +313,8 @@ def create_run_result(
     model: str,
     scenarios: list[ScenarioResult],
     max_tokens_override: int | None = None,
+    prompt_set: str | None = None,
+    bench_env: dict[str, str] | None = None,
 ) -> RunResult:
     return RunResult(
         model=model,
@@ -307,6 +322,8 @@ def create_run_result(
         git_sha=_git_sha(),
         scenarios=scenarios,
         max_tokens_override=max_tokens_override,
+        prompt_set=prompt_set,
+        bench_env=dict(bench_env or {}),
     )
 
 
