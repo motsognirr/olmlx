@@ -732,6 +732,56 @@ class TestProbeCacheCapabilities:
         # Persistence: no evidence of safety → False.
         assert lm.supports_cache_persistence is False
 
+    def test_non_trimmable_layout_disables_persistence(self, registry, mock_store):
+        """Issue #343: a layout containing a ``RotatingKVCache`` layer makes
+        the cache non-trimmable.  In real chat flow the stored prompt +
+        generated tokens can never be aligned with the next request's
+        client-supplied assistant message (which retokenizes differently
+        from the model's actual generation), so every cache lookup fails
+        the trim check and is discarded.  The bug is upstream: storing
+        any cross-request state for these models is wasted disk + Metal
+        I/O.  Treat them like ``ArraysCache`` (#284) — disable persistence
+        at probe time and short-circuit the store/load path entirely."""
+
+        class _FakeRotating:
+            pass
+
+        _FakeRotating.__name__ = "RotatingKVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+        # Start with persistence True to make the test failure mode
+        # unambiguous: the probe must actively flip it back to False.
+        lm.supports_cache_persistence = True
+
+        probe_cache = [_FakeRotating(), _FakeRotating()]
+        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is False
+        assert lm.supports_cache_persistence is False
+
+    def test_trimmable_layout_keeps_persistence(self, registry, mock_store):
+        """Guard the inverse: a fully trimmable layout (plain ``KVCache``
+        layers) must still report persistence True after the #343 fix.
+        Otherwise the fix would silently disable cache reuse for the
+        primary supported model family (Qwen3, Llama-3, etc.)."""
+
+        class _FakeKV:
+            pass
+
+        _FakeKV.__name__ = "KVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+
+        probe_cache = [_FakeKV(), _FakeKV()]
+        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is True
+        assert lm.supports_cache_persistence is True
+
     def test_probe_failure_warns_and_disables_persistence(
         self, registry, mock_store, caplog
     ):

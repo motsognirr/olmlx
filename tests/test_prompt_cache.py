@@ -597,13 +597,18 @@ class TestCachePersistenceProbe:
 class TestNonTrimmableModelSkipsTrim:
     @pytest.mark.asyncio
     async def test_non_trimmable_skips_trim_call(self, mock_manager):
-        """When lm.supports_cache_trim is False and trim would be needed,
-        skip trim_prompt_cache entirely and create a fresh cache."""
+        """Issue #343: a non-trimmable cache layout (RotatingKVCache,
+        ChunkedKVCache) is also non-persistable post-#343 — the probe
+        forces ``supports_cache_persistence = False`` so the lookup
+        short-circuits before reaching the trim check.  Verify the
+        post-#343 flag combination (both False) lands in the fresh-cache
+        branch without ever calling ``trim_prompt_cache``."""
         from olmlx.engine.inference import generate_chat
         from olmlx.engine.model_manager import CachedPromptState
 
         lm = mock_manager._loaded["qwen3:latest"]
         lm.supports_cache_trim = False
+        lm.supports_cache_persistence = False
         lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt v2")
         lm.tokenizer.bos_token = None
 
@@ -659,15 +664,25 @@ class TestNonTrimmableModelSkipsTrim:
         assert call_args.args[2] == [10, 20, 30, 40, 50, 60, 70, 80]
 
     @pytest.mark.asyncio
-    async def test_strict_extension_reuses_hybrid_cache(self, mock_manager):
-        """Even with supports_cache_trim=False, a strict-extension turn
-        (new prompt = cached prompt + suffix, trim_amount==0) reuses the
-        cache. RotatingKVCache supports appending; only trimming back fails."""
+    async def test_non_persistable_strict_extension_creates_fresh(self, mock_manager):
+        """Issue #343: a strict-extension turn (new prompt = cached
+        prompt + suffix, trim_amount==0) on a non-trimmable / non-
+        persistable model must NOT reuse the cache.  Pre-#343 the lookup
+        path would happily reuse the existing cache here — but in real
+        chat flow that strict-extension never fires, because the cached
+        ``tokens`` array includes the model's *generated* tokens which
+        the client retokenizes differently on its next turn.  Post-#343
+        the probe forces ``supports_cache_persistence = False`` for
+        non-trimmable layouts and the lookup short-circuits before
+        examining the prefix.  Assert the fresh-cache fallback fires
+        even on an artificial strict-extension setup."""
         from olmlx.engine.inference import generate_chat
         from olmlx.engine.model_manager import CachedPromptState
 
         lm = mock_manager._loaded["qwen3:latest"]
+        # Post-#343 probe output for a RotatingKVCache model.
         lm.supports_cache_trim = False
+        lm.supports_cache_persistence = False
         lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         lm.tokenizer.bos_token = None
 
@@ -680,15 +695,18 @@ class TestNonTrimmableModelSkipsTrim:
                 cache=existing_cache,
             ),
         )
-        # Strict extension: cached tokens + 2 new
+        # Strict extension: cached tokens + 2 new.  Pre-#343 this would
+        # have hit the strict-extension reuse path; post-#343 the
+        # non-persistable short-circuit at lookup time prevents it.
         lm.tokenizer.encode = MagicMock(
             return_value=[10, 20, 30, 40, 50, 100, 101, 200, 201]
         )
 
-        tokens = _make_stream_tokens("More", prompt_tokens=2)
+        tokens = _make_stream_tokens("More", prompt_tokens=9)
         mock_stream = _make_mock_stream(tokens)
         mock_trim = MagicMock(return_value=0)
-        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        fresh_cache = [MagicMock()]
+        mock_make_cache = MagicMock(return_value=fresh_cache)
 
         mock_mx = MagicMock()
         with (
@@ -715,13 +733,14 @@ class TestNonTrimmableModelSkipsTrim:
             async for _chunk in gen:
                 pass
 
-        # Strict extension: trim not called, fresh cache not made, existing cache reused
+        # Non-persistable: lookup short-circuits, trim never consulted,
+        # a fresh cache is allocated for the full prompt.
         mock_trim.assert_not_called()
-        mock_make_cache.assert_not_called()
+        mock_make_cache.assert_called_once_with(lm.model)
         call_args = mock_async_stream.call_args
-        assert call_args[1].get("prompt_cache") is existing_cache
-        # Only the suffix is fed to stream_generate
-        assert call_args.args[2] == [200, 201]
+        assert call_args[1].get("prompt_cache") is fresh_cache
+        # Full prompt fed to stream_generate (no suffix split).
+        assert call_args.args[2] == [10, 20, 30, 40, 50, 100, 101, 200, 201]
 
 
 class TestCacheMissCreatesFresh:

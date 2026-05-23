@@ -2068,6 +2068,21 @@ class ModelManager:
             # pattern is cheap and removes the ordering dependency.
             trim_ok = _cache_supports_trim(probe_cache)
             persist_ok = _cache_supports_persistence(probe_cache)
+            # Issue #343: non-trimmable cache layouts (RotatingKVCache,
+            # ChunkedKVCache) can never realign their stored prompt +
+            # generated state with the next request's tokens.  In real
+            # chat flow the client-supplied assistant message retokenizes
+            # differently from what the model actually emitted (whitespace,
+            # EOS handling, early-stop, chat-template stop sequences), so
+            # the trim check at lookup time always demands a non-zero
+            # rollback that these caches can't perform — and the cached
+            # entry is discarded.  Storing under those conditions is pure
+            # overhead with no realistic recovery path.  Treat the same as
+            # ArraysCache (#284): disable persistence at probe time and
+            # short-circuit the store/load path entirely.  Trim implies
+            # persist; persist without trim does not, post-#343.
+            if not trim_ok:
+                persist_ok = False
             lm.supports_cache_trim = trim_ok
             lm.supports_cache_persistence = persist_ok
             probe_succeeded = True
@@ -2097,9 +2112,14 @@ class ModelManager:
                 mx.clear_cache()
 
         if not lm.supports_cache_trim:
+            # The non-trimmable branch fully describes the consequence
+            # for this model; the non-persistable info log below is
+            # gated to skip when non-trim was the reason, avoiding a
+            # duplicate line citing #284 for a #343 disable.
             logger.info(
-                "Model %s uses a non-trimmable hybrid cache (e.g. RotatingKVCache); "
-                "prompt cache will only be reused for strict-extension turns.",
+                "Model %s uses a non-trimmable hybrid cache (e.g. "
+                "RotatingKVCache); cross-request prompt cache reuse is "
+                "disabled (issue #343).",
                 lm.name,
             )
         # Only log the layout reason when the probe actually inspected
@@ -2108,8 +2128,14 @@ class ModelManager:
         # SSM/ArraysCache or unclassified") because an empty cache_list
         # also returns False from the persistence check — the message
         # would otherwise misattribute the disable to ArraysCache when
-        # the layout had nothing to do with it.
-        if not lm.supports_cache_persistence and probe_succeeded:
+        # the layout had nothing to do with it.  Gate on
+        # ``supports_cache_trim`` so non-trimmable models (whose
+        # persistence is now forced off by #343) don't double-log.
+        if (
+            not lm.supports_cache_persistence
+            and lm.supports_cache_trim
+            and probe_succeeded
+        ):
             logger.info(
                 "Model %s uses a non-persistable cache (hybrid SSM/"
                 "ArraysCache or unclassified); prompt cache will not be "
