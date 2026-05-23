@@ -311,6 +311,14 @@ class TestEmbedSchemas:
         with pytest.raises(ValidationError, match="prompt"):
             EmbeddingsRequest(model="test", prompt="")
 
+    def test_embed_request_keep_alive_int(self):
+        req = EmbedRequest(model="test", input="hi", keep_alive=0)
+        assert req.keep_alive == 0
+
+    def test_embeddings_request_keep_alive_int(self):
+        req = EmbeddingsRequest(model="test", prompt="hi", keep_alive=0)
+        assert req.keep_alive == 0
+
 
 class TestManageSchemas:
     def test_copy_request(self):
@@ -341,6 +349,10 @@ class TestManageSchemas:
     def test_abort_request_rejects_empty_model(self):
         with pytest.raises(ValidationError, match="model"):
             AbortRequest(model="")
+
+    def test_warmup_request_keep_alive_int(self):
+        req = WarmupRequest(model="test", keep_alive=0)
+        assert req.keep_alive == 0
 
     def test_unload_request_rejects_empty_model(self):
         with pytest.raises(ValidationError, match="model"):
