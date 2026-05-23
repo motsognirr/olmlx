@@ -625,7 +625,7 @@ _LEGACY_FLASH_PREFETCH_SPECULATIVE_FORWARD: tuple[
         "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL",
         "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL",
         "flash_speculative_draft_model",
-        str,
+        lambda v: v.strip(),
     ),
     (
         "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS",
@@ -672,7 +672,7 @@ def surface_legacy_flash_prefetch_speculative_env() -> None:
             continue
         try:
             setattr(settings, attr, parse(legacy_val))
-        except Exception as exc:
+        except (ValueError, TypeError) as exc:
             logger.warning(
                 "Could not forward legacy env var %s=%r to %s: %s",
                 legacy,

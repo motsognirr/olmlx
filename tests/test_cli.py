@@ -2835,3 +2835,47 @@ class TestServeFlashPrefetchSpeculativeFlags:
         assert settings.flash_speculative_draft_model == "d/m"
         assert settings.flash_speculative_tokens == 5
         assert settings.flash_prefetch is True
+
+
+class TestFlashWithoutFlashGuards:
+    """Warn when flash_speculative / flash_prefetch are set without flash."""
+
+    def test_flash_speculative_without_flash_warns(self, monkeypatch, caplog):
+        import argparse
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings
+
+        monkeypatch.setattr(settings, "flash", False, raising=True)
+        monkeypatch.setattr(settings, "flash_speculative", False, raising=True)
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=True)
+        args = argparse.Namespace(
+            flash_speculative=True,
+            flash_speculative_draft_model=None,
+            flash_speculative_tokens=None,
+            flash_prefetch=None,
+        )
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        assert "flash_speculative is set but flash is not enabled" in caplog.text
+
+    def test_flash_prefetch_without_flash_warns(self, monkeypatch, caplog):
+        import argparse
+        import logging
+
+        from olmlx.cli import _apply_serve_overrides
+        from olmlx.config import settings
+
+        monkeypatch.setattr(settings, "flash", False, raising=True)
+        monkeypatch.setattr(settings, "flash_speculative", False, raising=True)
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=True)
+        args = argparse.Namespace(
+            flash_speculative=None,
+            flash_speculative_draft_model=None,
+            flash_speculative_tokens=None,
+            flash_prefetch=True,
+        )
+        with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
+            _apply_serve_overrides(args)
+        assert "flash_prefetch is set but flash is not enabled" in caplog.text

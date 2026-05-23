@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from olmlx.config import settings
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_HOSTFILE = Path("~/.olmlx/hostfile.json").expanduser()
@@ -81,16 +83,27 @@ def _requires_flash_moe(model_path: Path) -> str | None:
 
 
 def _requires_flash_and_speculative_draft(model_path: Path) -> str | None:
-    """Skip flash+spec unless Flash is prepared AND a draft model is set."""
+    """Skip flash+spec unless Flash is prepared AND a draft model is set.
+
+    Accepts any of: the promoted env var ``OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL``,
+    the legacy ``OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL`` (honoured
+    during the deprecation window), or ``settings.flash_speculative_draft_model``
+    set via a per-model ``models.json`` entry.
+    """
     reason = _requires_flash(model_path)
     if reason is not None:
         return reason
-    if not os.environ.get("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL"):
-        return (
-            "Set OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL to a draft model HF path "
-            "to run this scenario"
-        )
-    return None
+    if (
+        os.environ.get("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL")
+        or os.environ.get("OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL")
+        or settings.flash_speculative_draft_model
+    ):
+        return None
+    return (
+        "Set OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL (or configure "
+        "flash_speculative_draft_model per-model in models.json) "
+        "to run this scenario"
+    )
 
 
 def _requires_speculative_draft(_model_path: Path) -> str | None:

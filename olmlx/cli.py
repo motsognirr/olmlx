@@ -634,6 +634,17 @@ def _apply_serve_overrides(args) -> None:
     if fp is not None:
         _settings.flash_prefetch = fp
 
+    if _settings.flash_speculative and not _settings.flash:
+        logger.warning(
+            "flash_speculative is set but flash is not enabled; "
+            "flash_speculative has no effect without OLMLX_FLASH=true."
+        )
+    if _settings.flash_prefetch and not _settings.flash:
+        logger.warning(
+            "flash_prefetch is set but flash is not enabled; "
+            "flash_prefetch has no effect without OLMLX_FLASH=true."
+        )
+
     _surface_legacy_kv_cache_quant_env()
 
     _warn_kv_cache_quant_incompatibilities()

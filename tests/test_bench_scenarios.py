@@ -161,11 +161,19 @@ class TestSkipChecks:
         assert "flash" in reason.lower()
 
     def test_flash_and_spec_skips_without_draft_model(self, tmp_path, monkeypatch):
-        """Flash is prepared but draft model env var is unset — should skip."""
+        """Flash is prepared but draft model env var and settings are unset — should skip."""
+        from olmlx.config import settings
+
         flash_dir = tmp_path / "flash"
         flash_dir.mkdir()
         (flash_dir / "flash_layout.json").write_text("{}")
         monkeypatch.delenv("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL", raising=False)
+        monkeypatch.delenv(
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL", raising=False
+        )
+        monkeypatch.setattr(
+            settings, "flash_speculative_draft_model", None, raising=True
+        )
         reason = _requires_flash_and_speculative_draft(tmp_path)
         assert reason is not None
         assert "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL" in reason
@@ -178,6 +186,22 @@ class TestSkipChecks:
         flash_dir.mkdir()
         (flash_dir / "flash_layout.json").write_text("{}")
         monkeypatch.setenv("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL", "some/draft-model")
+        assert _requires_flash_and_speculative_draft(tmp_path) is None
+
+    def test_flash_and_spec_runs_with_settings_draft_model(self, tmp_path, monkeypatch):
+        """Flash is prepared and settings.flash_speculative_draft_model is set — should not skip."""
+        from olmlx.config import settings
+
+        flash_dir = tmp_path / "flash"
+        flash_dir.mkdir()
+        (flash_dir / "flash_layout.json").write_text("{}")
+        monkeypatch.delenv("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL", raising=False)
+        monkeypatch.delenv(
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL", raising=False
+        )
+        monkeypatch.setattr(
+            settings, "flash_speculative_draft_model", "some/draft-model", raising=True
+        )
         assert _requires_flash_and_speculative_draft(tmp_path) is None
 
 

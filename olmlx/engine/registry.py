@@ -227,10 +227,9 @@ class ResolvedFlashConfig(NamedTuple):
     """Resolved Flash primary-knob config for a single model.
 
     Covers the user-facing knobs promoted out of ``experimental``:
-    the five flash-dense fields, the three flash-moe fields, plus the
-    flash-prefetch toggle and flash-speculative fields. Advanced tuning
-    fields live in ``ExperimentalSettings`` and are passed through
-    separately.
+    the five flash-dense fields, the flash-prefetch toggle, and the
+    three flash-speculative fields. Advanced tuning fields live in
+    ``ExperimentalSettings`` and are passed through separately.
 
     Distinct from ``olmlx.engine.flash.flash_model.FlashConfig`` (the
     low-level runtime dataclass passed to ``FlashModelWrapper``) — the
@@ -483,8 +482,8 @@ class ModelConfig:
     def resolved_flash(self) -> ResolvedFlashConfig:
         """Resolve Flash primary knobs: per-model overrides global settings.
 
-        Resolves the five flash-dense knobs, the three flash-moe fields,
-        the flash-prefetch toggle, and the flash-speculative fields.
+        Resolves the five flash-dense knobs, the flash-prefetch toggle,
+        and the three flash-speculative fields.
         Advanced tuning (window size, IO threads, cache budget, etc.) lives
         on ``ExperimentalSettings`` and is resolved through
         ``resolve_experimental`` on ``ModelConfig.experimental``.
