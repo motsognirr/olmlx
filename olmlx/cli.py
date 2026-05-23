@@ -2213,6 +2213,8 @@ def cmd_bench_run(args):
         scenario_names=scenario_names,
         max_tokens=args.max_tokens,
         bench_dir=bench_dir,
+        prompt_set=args.prompt_set,
+        enable_code_exec=args.enable_code_exec,
     )
 
 
@@ -3340,6 +3342,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Comma-separated scenario names (default: all)",
+    )
+    bench_run.add_argument(
+        "--prompt-set",
+        choices=["throughput", "quality", "all"],
+        default="throughput",
+        help=(
+            "Which prompts to run: 'throughput' (7 tok/s probes, default), "
+            "'quality' (GSM8K+MMLU+HumanEval graded sets), or 'all'"
+        ),
+    )
+    bench_run.add_argument(
+        "--enable-code-exec",
+        action="store_true",
+        help=(
+            "Run model-generated code for the HumanEval code_exec grader in a "
+            "resource-limited subprocess (off by default; only the local user's "
+            "chosen model produces this code)"
+        ),
     )
     bench_run.add_argument(
         "--bench-dir",

@@ -14,7 +14,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from olmlx.bench.prompts import PROMPTS
+from olmlx.bench.prompts import PROMPTS, BenchPrompt
+from olmlx.bench.quality import grade
 from olmlx.bench.results import (
     DEFAULT_BENCH_DIR,
     PromptResult,
@@ -29,7 +30,74 @@ from olmlx.bench.scenarios import Scenario, get_scenarios
 
 logger = logging.getLogger(__name__)
 
-_WORKER_TIMEOUT = 600  # seconds before killing a worker subprocess
+
+def _worker_timeout() -> float:
+    """Per-scenario worker kill timeout, in seconds.
+
+    Defaults to 600s — fine for the 7-prompt throughput set. The 50-prompt
+    quality set (especially with thinking on and a high ``--max-tokens``)
+    can run much longer, so it is overridable via
+    ``OLMLX_BENCH_WORKER_TIMEOUT`` rather than hard-failing a long graded run.
+    """
+    raw = os.environ.get("OLMLX_BENCH_WORKER_TIMEOUT", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 600.0
+    return value if value > 0 else 600.0
+
+
+def build_prompts(prompt_set: str) -> list[BenchPrompt]:
+    """Resolve a prompt-set name to its list of prompts.
+
+    - ``throughput``: the 7 ungraded throughput probes (tok/s only).
+    - ``quality``: GSM8K + MMLU + HumanEval mini-sets (all graded).
+    - ``all``: throughput probes followed by the graded sets.
+    """
+    from olmlx.bench.task_prompts import PROMPT_SETS
+
+    graded = [p for sets in PROMPT_SETS.values() for p in sets]
+    if prompt_set == "throughput":
+        return list(PROMPTS)
+    if prompt_set == "quality":
+        return graded
+    if prompt_set == "all":
+        return list(PROMPTS) + graded
+    raise ValueError(
+        f"Unknown prompt set {prompt_set!r}. Available: throughput, quality, all"
+    )
+
+
+def apply_graders(
+    results: list[PromptResult],
+    prompts: list[dict],
+    enable_code_exec: bool,
+) -> None:
+    """Grade prompt results in place against their prompt metadata.
+
+    Graders are pure functions run here in the parent (the worker only
+    produces ``output_text``). Only successful (HTTP 200) responses to
+    prompts that carry a grader are scored; everything else is left
+    ungraded. ``code_exec`` runs untrusted model code, so it stays disabled
+    unless ``enable_code_exec`` is set, signalled to the grader via a private
+    ``_enabled`` flag injected into a *copy* of the expected payload (the
+    caller's dict is never mutated).
+    """
+    by_name = {p["name"]: p for p in prompts}
+    for r in results:
+        prompt = by_name.get(r.prompt_name)
+        if prompt is None:
+            continue
+        grader_name = prompt.get("grader")
+        if not grader_name:
+            continue
+        r.grader = grader_name
+        if r.status_code != 200:
+            continue
+        expected = dict(prompt.get("expected") or {})
+        if grader_name == "code_exec" and enable_code_exec:
+            expected["_enabled"] = True
+        r.quality = grade(grader_name, r.output_text, expected)
 
 
 def _find_free_port() -> int:
@@ -56,11 +124,13 @@ def run_bench(
     scenario_names: list[str] | None = None,
     max_tokens: int | None = None,
     bench_dir: Path = DEFAULT_BENCH_DIR,
+    prompt_set: str = "throughput",
+    enable_code_exec: bool = False,
 ) -> RunResult:
     """Run all scenarios and return aggregated results."""
     scenarios = get_scenarios(scenario_names)
     model_path = _resolve_model_path(model)
-    prompts_data = [p.to_dict() for p in PROMPTS]
+    prompts_data = [p.to_dict() for p in build_prompts(prompt_set)]
 
     scenario_results: list[ScenarioResult] = []
 
@@ -94,6 +164,16 @@ def run_bench(
         else:
             prompt_results = _run_worker(model, scenario, prompts_data, max_tokens)
 
+        # Grade in the parent (the worker only returns raw output_text).
+        apply_graders(prompt_results, prompts_data, enable_code_exec)
+
+        sc_result = ScenarioResult(
+            scenario_name=scenario.name,
+            scenario_description=scenario.description,
+            env_overrides=scenario.env_overrides,
+            prompt_results=prompt_results,
+        )
+
         # Report summary
         ok = sum(1 for r in prompt_results if r.status_code == 200)
         fail = len(prompt_results) - ok
@@ -104,19 +184,17 @@ def run_bench(
         if tps_values:
             avg_tps = sum(tps_values) / len(tps_values)
         status = "OK" if fail == 0 else f"{fail} FAILED"
+        passed, graded = sc_result.quality_summary()
+        quality_str = ""
+        if graded:
+            quality_str = f", quality {passed}/{graded} ({passed / graded:.0%})"
         print(
-            f"  {status} — {ok}/{len(prompt_results)} prompts, avg {avg_tps:.1f} tok/s",
+            f"  {status} — {ok}/{len(prompt_results)} prompts, "
+            f"avg {avg_tps:.1f} tok/s{quality_str}",
             file=sys.stderr,
         )
 
-        scenario_results.append(
-            ScenarioResult(
-                scenario_name=scenario.name,
-                scenario_description=scenario.description,
-                env_overrides=scenario.env_overrides,
-                prompt_results=prompt_results,
-            )
-        )
+        scenario_results.append(sc_result)
 
     run = create_run_result(
         model=model,
@@ -174,13 +252,14 @@ def _run_worker(
         if max_tokens is not None:
             cmd.extend(["--max-tokens", str(max_tokens)])
 
+        worker_timeout = _worker_timeout()
         try:
             result = subprocess.run(
                 cmd,
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=_WORKER_TIMEOUT,
+                timeout=worker_timeout,
             )
             if result.returncode != 0:
                 logger.error(
@@ -220,7 +299,7 @@ def _run_worker(
                     category="error",
                     output_text="",
                     status_code=0,
-                    error=f"Worker timed out after {_WORKER_TIMEOUT}s",
+                    error=f"Worker timed out after {worker_timeout}s",
                 )
             ]
 

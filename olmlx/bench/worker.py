@@ -46,15 +46,37 @@ def _wait_for_server(port: int, proc: subprocess.Popen, timeout: float) -> bool:
     return False
 
 
+_THINK_TRUE = {"true", "1", "on", "yes"}
+_THINK_FALSE = {"false", "0", "off", "no"}
+
+
+def _resolve_bench_think(env: dict[str, str]) -> bool | None:
+    """Resolve the bench thinking toggle from ``OLMLX_BENCH_THINK``.
+
+    Returns ``True``/``False`` to force the Ollama ``think`` field on/off,
+    or ``None`` to omit it (engine default: think-unless-tools). Lets a bench
+    operator A/B the same model with and without thinking without touching the
+    prompt set. Unrecognized values fall back to the engine default rather than
+    silently picking a side.
+    """
+    raw = env.get("OLMLX_BENCH_THINK", "").strip().lower()
+    if raw in _THINK_TRUE:
+        return True
+    if raw in _THINK_FALSE:
+        return False
+    return None
+
+
 def _run_prompts(
     port: int, model: str, prompts: list[dict], max_tokens_override: int | None
 ) -> list[dict]:
     """Send prompts to a running server over HTTP."""
     url = f"http://127.0.0.1:{port}/api/chat"
+    think = _resolve_bench_think(os.environ)
     results = []
     for prompt in prompts:
         tok_limit = max_tokens_override or prompt.get("max_tokens", 256)
-        body = {
+        body: dict = {
             "model": model,
             "stream": False,
             "messages": prompt["messages"],
@@ -64,6 +86,8 @@ def _run_prompts(
                 "num_predict": tok_limit,
             },
         }
+        if think is not None:
+            body["think"] = think
         try:
             req = urllib.request.Request(
                 url,
