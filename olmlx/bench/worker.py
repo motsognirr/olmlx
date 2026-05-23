@@ -19,7 +19,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -46,15 +48,63 @@ def _wait_for_server(port: int, proc: subprocess.Popen, timeout: float) -> bool:
     return False
 
 
+THINK_TRUE = {"true", "1", "on", "yes"}
+THINK_FALSE = {"false", "0", "off", "no"}
+_ALL_THINK_VALUES = THINK_TRUE | THINK_FALSE
+
+
+def is_recognized_think_value(raw: str) -> bool:
+    """Whether ``raw`` parses as a valid ``OLMLX_BENCH_THINK`` value.
+
+    Shared with ``runner._capture_bench_env`` so ``bench_env`` only records
+    values the worker will actually honour — otherwise a typo'd
+    ``OLMLX_BENCH_THINK=tru`` would land in the saved A/B JSON as if think
+    were toggled, even though the worker fell back to the engine default.
+    """
+    return raw.strip().lower() in _ALL_THINK_VALUES
+
+
+def _resolve_bench_think(env: Mapping[str, str]) -> bool | None:
+    """Resolve the bench thinking toggle from ``OLMLX_BENCH_THINK``.
+
+    Returns ``True``/``False`` to force the Ollama ``think`` field on/off,
+    or ``None`` to omit it (engine default: think-unless-tools). Lets a bench
+    operator A/B the same model with and without thinking without touching the
+    prompt set.
+
+    An unset or empty value resolves to ``None`` quietly (engine default). A
+    *non-empty* unrecognized value (e.g. ``"tru"``, ``"enabled"``) also
+    resolves to ``None`` but warns — otherwise an A/B with a typo on one
+    arm silently runs engine-default on both arms with no signal anything
+    went wrong.
+    """
+    raw_str = env.get("OLMLX_BENCH_THINK", "")
+    raw = raw_str.strip().lower()
+    if not raw:
+        return None
+    if raw in THINK_TRUE:
+        return True
+    if raw in THINK_FALSE:
+        return False
+    logger.warning(
+        "Ignoring OLMLX_BENCH_THINK=%r: expected one of %s; falling back to "
+        "engine default",
+        raw_str,
+        sorted(THINK_TRUE | THINK_FALSE),
+    )
+    return None
+
+
 def _run_prompts(
     port: int, model: str, prompts: list[dict], max_tokens_override: int | None
 ) -> list[dict]:
     """Send prompts to a running server over HTTP."""
     url = f"http://127.0.0.1:{port}/api/chat"
+    think = _resolve_bench_think(os.environ)
     results = []
     for prompt in prompts:
         tok_limit = max_tokens_override or prompt.get("max_tokens", 256)
-        body = {
+        body: dict[str, Any] = {
             "model": model,
             "stream": False,
             "messages": prompt["messages"],
@@ -64,6 +114,8 @@ def _run_prompts(
                 "num_predict": tok_limit,
             },
         }
+        if think is not None:
+            body["think"] = think
         try:
             req = urllib.request.Request(
                 url,

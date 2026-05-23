@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from olmlx.bench.quality import QualityResult
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BENCH_DIR = Path.home() / ".olmlx" / "bench" / "runs"
@@ -26,6 +28,10 @@ class PromptResult:
     prompt_eval_count: int = 0
     prompt_eval_duration_ns: int = 0
     total_duration_ns: int = 0
+    # Quality grading (populated in the parent after the worker returns;
+    # None for pure-throughput prompts that carry no grader).
+    grader: str | None = None
+    quality: QualityResult | None = None
 
     @property
     def tokens_per_second(self) -> float:
@@ -53,10 +59,13 @@ class PromptResult:
             "total_duration_ns": self.total_duration_ns,
             "tokens_per_second": round(self.tokens_per_second, 2),
             "prompt_tokens_per_second": round(self.prompt_tokens_per_second, 2),
+            "grader": self.grader,
+            "quality": self.quality.to_dict() if self.quality else None,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> PromptResult:
+        quality = d.get("quality")
         return cls(
             prompt_name=d["prompt_name"],
             category=d["category"],
@@ -68,6 +77,8 @@ class PromptResult:
             prompt_eval_count=d.get("prompt_eval_count", 0),
             prompt_eval_duration_ns=d.get("prompt_eval_duration_ns", 0),
             total_duration_ns=d.get("total_duration_ns", 0),
+            grader=d.get("grader"),
+            quality=QualityResult.from_dict(quality) if quality else None,
         )
 
 
@@ -79,6 +90,23 @@ class ScenarioResult:
     prompt_results: list[PromptResult]
     skipped: bool = False
     skip_reason: str | None = None
+
+    def quality_summary(self) -> tuple[int, int]:
+        """Return (passed, graded_total) across this scenario's prompts.
+
+        Only prompts whose grader returned a definite verdict
+        (``quality.passed is not None``) count toward the total — ungraded,
+        disabled, or grader-errored prompts are excluded so a skipped grader
+        never drags the reported pass rate down.
+        """
+        passed = 0
+        graded = 0
+        for r in self.prompt_results:
+            if r.quality is not None and r.quality.passed is not None:
+                graded += 1
+                if r.quality.passed:
+                    passed += 1
+        return passed, graded
 
     def to_dict(self) -> dict:
         return {
@@ -111,6 +139,15 @@ class RunResult:
     git_sha: str | None
     scenarios: list[ScenarioResult]
     max_tokens_override: int | None = None
+    # Which prompt set was run (throughput / quality / all). None means the
+    # run predates this field — load it as a legacy throughput run rather
+    # than fail to parse.
+    prompt_set: str | None = None
+    # Bench-level env knobs captured at run time so an A/B (e.g. think on
+    # vs off) is self-describing from the saved JSON alone. Scenario-level
+    # ``env_overrides`` cover the per-scenario knobs that the runner sets;
+    # this captures the operator-set, runner-wide ones.
+    bench_env: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -118,6 +155,8 @@ class RunResult:
             "timestamp": self.timestamp,
             "git_sha": self.git_sha,
             "max_tokens_override": self.max_tokens_override,
+            "prompt_set": self.prompt_set,
+            "bench_env": self.bench_env,
             "scenarios": [s.to_dict() for s in self.scenarios],
         }
 
@@ -128,6 +167,8 @@ class RunResult:
             timestamp=d["timestamp"],
             git_sha=d.get("git_sha"),
             max_tokens_override=d.get("max_tokens_override"),
+            prompt_set=d.get("prompt_set"),
+            bench_env=dict(d.get("bench_env") or {}),
             scenarios=[ScenarioResult.from_dict(s) for s in d.get("scenarios", [])],
         )
 
@@ -272,6 +313,8 @@ def create_run_result(
     model: str,
     scenarios: list[ScenarioResult],
     max_tokens_override: int | None = None,
+    prompt_set: str | None = None,
+    bench_env: dict[str, str] | None = None,
 ) -> RunResult:
     return RunResult(
         model=model,
@@ -279,6 +322,8 @@ def create_run_result(
         git_sha=_git_sha(),
         scenarios=scenarios,
         max_tokens_override=max_tokens_override,
+        prompt_set=prompt_set,
+        bench_env=dict(bench_env or {}),
     )
 
 
