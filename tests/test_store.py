@@ -185,6 +185,49 @@ class TestModelStore:
         assert result.size >= 1024
         assert result.digest != ""
 
+    def test_derive_uses_hf_path_sidecar(self, mock_store, tmp_path):
+        """Sidecar wins over the lossy dir-name reverse for orgs with '_' in name."""
+        # Pick an hf_path whose _safe_dir_name → reverse round-trip would lie.
+        hf_path = "my_org/MyModel"
+        local_dir = mock_store.local_path(hf_path)
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({"model_type": "test"}))
+        (local_dir / ".hf_path").write_text(hf_path)
+
+        result = mock_store.show(hf_path)
+        assert result is not None
+        # Without the sidecar, the dir "my_org_MyModel" reverses to "my/org_MyModel".
+        assert result.hf_path == hf_path
+
+    def test_show_and_list_digests_agree_without_manifest(self, mock_store, tmp_path):
+        """Issue #351 review: digest must match between /api/show and /api/tags."""
+        local_dir = mock_store.local_path("Qwen/Qwen3-8B-MLX")
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+
+        show_via_alias = mock_store.show("qwen3")
+        # show() cached manifest.json on the first call; remove it so the
+        # second show() also re-derives and we're comparing derive paths.
+        (local_dir / "manifest.json").unlink()
+        show_via_hf = mock_store.show("Qwen/Qwen3-8B-MLX")
+        (local_dir / "manifest.json").unlink()
+        listed = [
+            m for m in mock_store.list_local() if m.hf_path == "Qwen/Qwen3-8B-MLX"
+        ]
+        assert len(listed) == 1
+        assert show_via_alias.digest == show_via_hf.digest == listed[0].digest
+        assert show_via_alias.name == "qwen3:latest"
+
+    def test_derive_caches_manifest_to_disk(self, mock_store, tmp_path):
+        """First derive walks the dir; subsequent calls hit manifest.json."""
+        local_dir = mock_store.local_path("org/model")
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({"model_type": "test"}))
+        manifest_path = local_dir / "manifest.json"
+        assert not manifest_path.exists()
+        mock_store.show("org/model")
+        assert manifest_path.exists()
+
     def test_list_local_includes_dirs_without_manifest(self, mock_store, tmp_path):
         """Issue #340: list_local surfaces models that lack manifest.json."""
         local_dir = mock_store.local_path("mlx-community/Qwen3-4B-4bit")

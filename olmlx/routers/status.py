@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
@@ -37,8 +38,10 @@ async def ps(request: Request):
             expires = datetime.fromtimestamp(lm.expires_at, tz=timezone.utc).isoformat()
         # Pull disk-side metadata (family, quantization, digest, on-disk size)
         # from the store — derived from manifest.json when present, or from
-        # config.json + dir contents otherwise (issue #340).
-        manifest = store.show(lm.name)
+        # config.json + dir contents otherwise (issue #340).  The first
+        # derive call walks the model dir (one-time cost; result is cached
+        # to manifest.json), so run it off the event loop.
+        manifest = await asyncio.to_thread(store.show, lm.name)
         if manifest is not None:
             details = ModelDetails(
                 format=manifest.format,

@@ -82,27 +82,46 @@ def _dir_size(path: Path) -> int:
     return total
 
 
+def _read_hf_path_sidecar(model_dir: Path) -> str | None:
+    """Read the .hf_path sidecar written by ensure_downloaded, if present.
+
+    The sidecar exists for dirs we created via /api/pull or model load — it
+    carries the exact HF repo id so _derive_manifest doesn't have to reverse
+    the lossy _safe_dir_name encoding for orgs whose names contain '_'.
+    """
+    sidecar = model_dir / ".hf_path"
+    if not sidecar.exists():
+        return None
+    try:
+        text = sidecar.read_text().strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def _write_hf_path_sidecar(model_dir: Path, hf_path: str) -> None:
+    sidecar = model_dir / ".hf_path"
+    try:
+        sidecar.write_text(hf_path)
+    except OSError:
+        logger.warning("Failed to write hf_path sidecar to %s", sidecar)
+
+
 def _derive_manifest(
     model_dir: Path,
     *,
-    name: str | None = None,
-    hf_path: str | None = None,
+    name: str,
+    hf_path: str,
 ) -> ModelManifest:
     """Synthesize a ModelManifest from on-disk files when manifest.json is absent.
 
     Covers model dirs created outside of /api/pull — mlx-lm's own download
     path, manual moves, etc. — which have config.json + weights but no
-    manifest.json (issue #340).
+    manifest.json (issue #340).  Caller resolves name/hf_path so the result
+    is deterministic across endpoints (see ModelStore._canonicalize_dir).
     """
     meta = _extract_metadata(model_dir)
     size = _dir_size(model_dir)
-    if hf_path is None:
-        # Dir naming convention is _safe_dir_name(hf_path) — for the typical
-        # "org/repo" shape this is "org_repo", so reverse the first underscore.
-        d = model_dir.name
-        hf_path = d.replace("_", "/", 1) if "_" in d else d
-    if name is None:
-        name = hf_path if ":" in hf_path else f"{hf_path}:latest"
     mtime = model_dir.stat().st_mtime
     modified_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
     return ModelManifest(
@@ -136,6 +155,29 @@ class ModelStore:
         return (local / "config.json").exists() and not (
             local / ".downloading"
         ).exists()
+
+    def _canonicalize_dir(self, model_dir: Path) -> tuple[str, str]:
+        """Return the canonical (manifest_name, hf_path) for a model dir.
+
+        Resolution order for hf_path: .hf_path sidecar (authoritative for
+        dirs we created) → reverse the dir-name encoding (lossy fallback
+        for orgs whose names contain '_').  manifest_name prefers the
+        registry's normalized alias for this hf_path, so digests are stable
+        across /api/show, /api/tags, and /api/ps regardless of how the
+        caller spelled the model.
+        """
+        hf_path = _read_hf_path_sidecar(model_dir)
+        if hf_path is None:
+            d = model_dir.name
+            hf_path = d.replace("_", "/", 1) if "_" in d else d
+        canonical_name: str | None = None
+        for cfg_name, cfg in self.registry.list_models().items():
+            if cfg.hf_path == hf_path:
+                canonical_name = self.registry.normalize_name(cfg_name)
+                break
+        if canonical_name is None:
+            canonical_name = hf_path if ":" in hf_path else f"{hf_path}:latest"
+        return canonical_name, hf_path
 
     def _resolve_model_dir(self, name: str) -> Path | None:
         """Resolve a model name to its local directory, trying HF-path-based naming first.
@@ -201,6 +243,9 @@ class ModelStore:
             # resume on retry.  The .downloading marker keeps is_downloaded()
             # safe either way.
             snapshot_download(repo_id=hf_path, local_dir=str(local_dir))
+            # Persist the exact hf_path so future _derive_manifest calls
+            # don't have to reverse the lossy dir-name encoding (issue #340).
+            _write_hf_path_sidecar(local_dir, hf_path)
             try:
                 marker.unlink(missing_ok=True)
             except OSError:
@@ -286,23 +331,34 @@ class ModelStore:
 
             yield {"status": "success"}
 
+    def _derive_and_cache(self, model_dir: Path) -> ModelManifest:
+        """Build a ModelManifest from disk and persist it as manifest.json.
+
+        Caching to disk caps the _dir_size walk to one per model per
+        install (subsequent calls hit the manifest.json fast path).  Write
+        failures are tolerated — the manifest is still returned for this
+        call, the walk just repeats next time.
+        """
+        name, hf_path = self._canonicalize_dir(model_dir)
+        manifest = _derive_manifest(model_dir, name=name, hf_path=hf_path)
+        try:
+            manifest.save(model_dir / "manifest.json")
+        except OSError:
+            logger.warning(
+                "Failed to cache derived manifest at %s", model_dir / "manifest.json"
+            )
+        return manifest
+
     def list_local(self) -> list[ModelManifest]:
         """List all locally stored models.
 
         Dirs without manifest.json but with config.json are still surfaced
-        with metadata derived from disk (issue #340).
+        with metadata derived from disk and cached as manifest.json on
+        first sight (issue #340).
         """
         models = []
         if not self.models_dir.exists():
             return models
-        # Map safe-dir-name → (normalized name, hf_path) so derived manifests
-        # for known models inherit their registry-canonical name/hf_path.
-        by_dir: dict[str, tuple[str, str]] = {}
-        for cfg_name, cfg in self.registry.list_models().items():
-            by_dir.setdefault(
-                _safe_dir_name(cfg.hf_path),
-                (self.registry.normalize_name(cfg_name), cfg.hf_path),
-            )
         for d in self.models_dir.iterdir():
             if not d.is_dir():
                 continue
@@ -318,11 +374,8 @@ class ModelStore:
                     )
             if not (d / "config.json").exists():
                 continue
-            entry = by_dir.get(d.name)
-            name = entry[0] if entry else None
-            hf_path = entry[1] if entry else None
             try:
-                models.append(_derive_manifest(d, name=name, hf_path=hf_path))
+                models.append(self._derive_and_cache(d))
             except Exception:
                 logger.warning("Failed to derive manifest for %s", d)
         return models
@@ -339,10 +392,7 @@ class ModelStore:
                 logger.warning(
                     "Failed to load manifest %s; deriving from disk", manifest_path
                 )
-        resolved = self.registry.resolve(name)
-        hf_path = resolved.hf_path if resolved is not None else None
-        derived_name = self.registry.normalize_name(name) if "/" not in name else None
-        return _derive_manifest(model_dir, name=derived_name, hf_path=hf_path)
+        return self._derive_and_cache(model_dir)
 
     def delete(self, name: str) -> bool:
         import shutil
