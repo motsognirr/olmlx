@@ -2858,7 +2858,9 @@ class TestFlashWithoutFlashGuards:
         )
         with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
             _apply_serve_overrides(args)
-        assert "flash_speculative is set but flash is not enabled" in caplog.text
+        assert (
+            "flash_speculative is set but flash is not enabled globally" in caplog.text
+        )
 
     def test_flash_prefetch_without_flash_warns(self, monkeypatch, caplog):
         import argparse
@@ -2878,4 +2880,4 @@ class TestFlashWithoutFlashGuards:
         )
         with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
             _apply_serve_overrides(args)
-        assert "flash_prefetch is set but flash is not enabled" in caplog.text
+        assert "flash_prefetch is set but flash is not enabled globally" in caplog.text

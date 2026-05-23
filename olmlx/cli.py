@@ -636,13 +636,13 @@ def _apply_serve_overrides(args) -> None:
 
     if _settings.flash_speculative and not _settings.flash:
         logger.warning(
-            "flash_speculative is set but flash is not enabled; "
-            "flash_speculative has no effect without OLMLX_FLASH=true."
+            "flash_speculative is set but flash is not enabled globally; "
+            "it will only take effect for models with flash:true in models.json."
         )
     if _settings.flash_prefetch and not _settings.flash:
         logger.warning(
-            "flash_prefetch is set but flash is not enabled; "
-            "flash_prefetch has no effect without OLMLX_FLASH=true."
+            "flash_prefetch is set but flash is not enabled globally; "
+            "it will only take effect for models with flash:true in models.json."
         )
 
     _surface_legacy_kv_cache_quant_env()
