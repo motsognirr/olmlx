@@ -761,9 +761,7 @@ class TestProbeCacheCapabilities:
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
 
-    def test_chunked_kv_cache_layout_disables_persistence(
-        self, registry, mock_store
-    ):
+    def test_chunked_kv_cache_layout_disables_persistence(self, registry, mock_store):
         """``ChunkedKVCache`` is the other non-trimmable layout cited by
         #343 and CLAUDE.md (mlx-lm's chunk-based cache; affects newer
         Apple-published checkpoints).  Like ``RotatingKVCache`` it sits
