@@ -3239,7 +3239,10 @@ class ModelManager:
                 is_distributed = True
                 logger.info("Model %s sharded for distributed inference", hf_path)
             else:
-                assert False, (
+                del model, tokenizer
+                gc.collect()
+                mx.clear_cache()
+                raise AssertionError(
                     "unreachable: distributed_strategy is Literal['tensor']; "
                     "pydantic rejects any other value at config parse"
                 )

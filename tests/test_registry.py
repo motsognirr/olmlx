@@ -1488,3 +1488,25 @@ class TestFlashPrefetchSpeculativePromotionRegistry:
 
         with pytest.raises(ValueError, match="flash_speculative_tokens"):
             ModelConfig(hf_path="Qwen/Qwen3-8B", flash_speculative_tokens=0)
+
+    def test_flash_speculative_draft_model_strips_whitespace(self):
+        """ModelConfig.__post_init__ must store the stripped value, not the original."""
+        from olmlx.engine.registry import ModelConfig
+
+        mc = ModelConfig(
+            hf_path="Qwen/Qwen3-8B",
+            flash_speculative_draft_model="  org/model  ",
+        )
+        assert mc.flash_speculative_draft_model == "org/model"
+
+    def test_flash_speculative_draft_model_from_entry_strips_whitespace(self):
+        """from_entry round-trip preserves the stripped value."""
+        from olmlx.engine.registry import ModelConfig
+
+        mc = ModelConfig.from_entry(
+            {
+                "hf_path": "Qwen/Qwen3-8B",
+                "flash_speculative_draft_model": "  org/model  ",
+            }
+        )
+        assert mc.flash_speculative_draft_model == "org/model"

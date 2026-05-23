@@ -421,14 +421,14 @@ class ModelConfig:
                 f"'flash_speculative' must be a bool or None, "
                 f"got {self.flash_speculative!r}"
             )
-        if (
-            self.flash_speculative_draft_model is not None
-            and not self.flash_speculative_draft_model.strip()
-        ):
-            raise ValueError(
-                "'flash_speculative_draft_model' must be a non-empty HuggingFace "
-                "path or None"
-            )
+        if self.flash_speculative_draft_model is not None:
+            stripped = self.flash_speculative_draft_model.strip()
+            if not stripped:
+                raise ValueError(
+                    "'flash_speculative_draft_model' must be a non-empty HuggingFace "
+                    "path or None"
+                )
+            self.flash_speculative_draft_model = stripped
         if self.flash_speculative_tokens is not None and (
             isinstance(self.flash_speculative_tokens, bool)
             or not isinstance(self.flash_speculative_tokens, int)

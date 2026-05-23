@@ -360,7 +360,8 @@ def worker_main() -> None:
                 # buffer can exceed the ~10s GPU timeout for large models (32B+).
                 mx.eval(model.parameters())
     else:
-        assert False, (
+        worker.close()
+        raise AssertionError(
             "unreachable: distributed_strategy is Literal['tensor']; "
             "pydantic rejects any other value at config parse"
         )

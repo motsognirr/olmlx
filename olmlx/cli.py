@@ -2194,6 +2194,7 @@ def cmd_bench_run(args):
     _surface_legacy_flash_moe_env()
     _surface_legacy_flash_prefetch_speculative_env()
     _surface_legacy_speculative_env()
+    _surface_legacy_dflash_env()
     _surface_legacy_kv_cache_quant_env()
     from pathlib import Path
 
