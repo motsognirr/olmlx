@@ -798,9 +798,7 @@ class TestInferenceRefKeepAlive:
             model=MagicMock(),
             tokenizer=MagicMock(),
         )
-        with patch.object(
-            _inf_mod.settings, "default_keep_alive", "2m"
-        ):
+        with patch.object(_inf_mod.settings, "default_keep_alive", "2m"):
             with _inference_ref(real_lm):
                 pass
 
@@ -811,9 +809,9 @@ class TestInferenceRefKeepAlive:
         )
 
     def test_none_setting_default_regression(self):
-        """When keep_alive is None and settings is also None, no refresh happens.
+        """_inference_ref() with no per-request keep_alive falls back to settings.default_keep_alive.
 
-        This is the pre-fix behaviour for the default path (unchanged).
+        Patches default to "0" so expiry is set to approximately now.
         """
         real_lm = LoadedModel(
             name="test",
@@ -844,9 +842,7 @@ class TestInferenceRefKeepAlive:
         )
         real_lm.expires_at = None
 
-        with patch.object(
-            _inf_mod.settings, "default_keep_alive", "5m"
-        ):
+        with patch.object(_inf_mod.settings, "default_keep_alive", "5m"):
             with _inference_ref(real_lm, keep_alive="-1"):
                 pass
 
@@ -862,9 +858,7 @@ class TestInferenceRefKeepAlive:
             model=MagicMock(),
             tokenizer=MagicMock(),
         )
-        with patch.object(
-            _inf_mod.settings, "default_keep_alive", "5m"
-        ):
+        with patch.object(_inf_mod.settings, "default_keep_alive", "5m"):
             with _inference_ref(real_lm, keep_alive="1s"):
                 pass
 

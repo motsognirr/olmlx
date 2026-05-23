@@ -1094,7 +1094,7 @@ async def _inference_locked(
 
 
 @contextlib.contextmanager
-def _inference_ref(lm: LoadedModel, keep_alive: str | None = None):
+def _inference_ref(lm: LoadedModel, keep_alive: int | str | None = None):
     """Track active inference on a model to prevent expiry during use.
 
     Note: there is a small window between ``ensure_loaded()`` (which returns
@@ -1122,6 +1122,12 @@ def _inference_ref(lm: LoadedModel, keep_alive: str | None = None):
             lm.active_refs -= 1
         # Refresh expiry so the model doesn't expire immediately after inference.
         # Honour per-request keep_alive when available (fix #338).
+        # Falls back to settings.default_keep_alive when no per-request value
+        # is given.  The else branch (ka is None → expires_at = None, i.e.
+        # never expire) mirrors ensure_loaded's refresh path for already-loaded
+        # models (both paths have the same pre-existing limitation: per-model
+        # keep_alive from models.json is not checked during refresh — only at
+        # initial load time).
         ka = parse_keep_alive(
             keep_alive if keep_alive is not None else settings.default_keep_alive
         )
@@ -1863,11 +1869,15 @@ async def generate_completion(
 
     if stream:
         return _prepend_meta(
-            _stream_completion(lm, prompt, mt, gen_kwargs, stats, images, keep_alive=keep_alive),
+            _stream_completion(
+                lm, prompt, mt, gen_kwargs, stats, images, keep_alive=keep_alive
+            ),
             {"thinking_expected": thinking_expected},
         )
     else:
-        result = await _full_completion(lm, prompt, mt, gen_kwargs, stats, images, keep_alive=keep_alive)
+        result = await _full_completion(
+            lm, prompt, mt, gen_kwargs, stats, images, keep_alive=keep_alive
+        )
         result["thinking_expected"] = thinking_expected
         return result
 
