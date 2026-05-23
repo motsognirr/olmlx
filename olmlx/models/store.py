@@ -291,6 +291,13 @@ class ModelStore:
         models = []
         if not self.models_dir.exists():
             return models
+        # Build a reverse map: safe_dir_name → (short_name, hf_path) from the
+        # registry so we can match unknown model directories to their Ollama name.
+        dir_to_info: dict[str, tuple[str, str]] = {}
+        for short_name, cfg in self.registry.list_models().items():
+            safe = _safe_dir_name(cfg.hf_path)
+            if safe not in dir_to_info:
+                dir_to_info[safe] = (short_name, cfg.hf_path)
         for d in self.models_dir.iterdir():
             if d.is_dir():
                 manifest_path = d / "manifest.json"
@@ -304,13 +311,18 @@ class ModelStore:
                 config_path = d / "config.json"
                 if config_path.exists():
                     try:
-                        # Extract name and hf_path from directory name heuristics.
-                        # The dir name is _safe_dir_name(hf_path), so we try to
-                        # reverse it by finding the matching HF path in the registry.
-                        dir_name = d.name
-                        hf_path = dir_name.replace("_", "/", 1) if "_" in dir_name else dir_name
-                        # Use the normalized short name if we can resolve it
-                        manifest = _derive_manifest(d, hf_path, hf_path)
+                        info = dir_to_info.get(d.name)
+                        if info is not None:
+                            short_name, hf_path = info
+                        else:
+                            # Unknown model — reverse the safe_dir_name heuristic
+                            hf_path = (
+                                d.name.replace("_", "/", 1)
+                                if "_" in d.name
+                                else d.name
+                            )
+                            short_name = hf_path
+                        manifest = _derive_manifest(d, short_name, hf_path)
                         manifest.save(manifest_path)
                         models.append(manifest)
                     except Exception:

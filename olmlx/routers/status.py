@@ -5,7 +5,6 @@ from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse
 
 from olmlx import __version__
-from olmlx.models.store import _dir_size, _extract_metadata
 from olmlx.schemas.models import ModelDetails
 from olmlx.schemas.status import PsResponse, RunningModel, VersionResponse
 
@@ -38,23 +37,25 @@ async def ps(request: Request):
         if lm.expires_at is not None:
             expires = datetime.fromtimestamp(lm.expires_at, tz=timezone.utc).isoformat()
 
-        # Resolve on-disk model metadata for details and size.
+        # Read metadata from the manifest (backfilled at load time) to avoid
+        # expensive _dir_size / _extract_metadata calls on the event loop.
         size = lm.size_bytes
         meta = {"family": "", "parameter_size": "", "quantization_level": ""}
         digest = ""
         if store is not None:
             local_dir = store.local_path(lm.hf_path)
-            if local_dir.exists():
-                if size == 0:
-                    size = _dir_size(local_dir)
-                meta = _extract_metadata(local_dir)
-                manifest_path = local_dir / "manifest.json"
-                if manifest_path.exists():
-                    try:
-                        manifest = json.loads(manifest_path.read_text())
-                        digest = manifest.get("digest", "")
-                    except Exception:
-                        pass
+            manifest_path = local_dir / "manifest.json"
+            if manifest_path.exists():
+                try:
+                    m = json.loads(manifest_path.read_text())
+                    if size == 0:
+                        size = m.get("size", 0)
+                    digest = m.get("digest", "")
+                    meta["family"] = m.get("family", "")
+                    meta["parameter_size"] = m.get("parameter_size", "")
+                    meta["quantization_level"] = m.get("quantization_level", "")
+                except Exception:
+                    pass
 
         models.append(
             RunningModel(

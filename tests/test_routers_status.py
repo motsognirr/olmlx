@@ -55,41 +55,58 @@ class TestStatusRouter:
 
     @pytest.mark.asyncio
     async def test_ps_populates_details_from_config(self, app_client, tmp_path):
-        """ps populates details.family etc. from config.json on disk."""
+        """ps populates details from manifest rather than config.json."""
         lm = app_client._transport.app.state.model_manager._loaded["qwen3:latest"]
-        # Create the model directory with a config.json
         store = app_client._transport.app.state.model_store
         local_dir = store.local_path(lm.hf_path)
         local_dir.mkdir(parents=True, exist_ok=True)
-        config = {
-            "model_type": "llama",
-            "hidden_size": 4096,
-            "num_hidden_layers": 32,
-            "quantization": {"bits": 4},
+        # Write a manifest with the metadata (mimics backfilling at load time)
+        manifest = {
+            "name": lm.name,
+            "hf_path": lm.hf_path,
+            "size": 0,
+            "digest": "sha256:abc123",
+            "format": "mlx",
+            "family": "llama",
+            "parameter_size": "8B",
+            "quantization_level": "4-bit",
         }
-        (local_dir / "config.json").write_text(json.dumps(config))
+        (local_dir / "manifest.json").write_text(json.dumps(manifest))
 
         resp = await app_client.get("/api/ps")
         assert resp.status_code == 200
         data = resp.json()
         model = data["models"][0]
         assert model["details"]["family"] == "llama"
-        assert model["details"]["parameter_size"] != ""
+        assert model["details"]["parameter_size"] == "8B"
         assert model["details"]["quantization_level"] == "4-bit"
         assert model["details"]["format"] == "mlx"
+        assert model["digest"] == "sha256:abc123"
 
     @pytest.mark.asyncio
     async def test_ps_populates_size_and_vram(self, app_client, tmp_path):
-        """ps populates size and size_vram from disk when lm.size_bytes is 0."""
+        """ps populates size and size_vram from the manifest when lm.size_bytes is 0."""
         lm = app_client._transport.app.state.model_manager._loaded["qwen3:latest"]
         store = app_client._transport.app.state.model_store
         local_dir = store.local_path(lm.hf_path)
         local_dir.mkdir(parents=True, exist_ok=True)
-        (local_dir / "weights.safetensors").write_bytes(b"\x00" * 1024)
+        # Write a manifest with the size pre-computed (as _load_model does)
+        manifest = {
+            "name": lm.name,
+            "hf_path": lm.hf_path,
+            "size": 4096,
+            "digest": "",
+            "format": "mlx",
+            "family": "test",
+            "parameter_size": "",
+            "quantization_level": "",
+        }
+        (local_dir / "manifest.json").write_text(json.dumps(manifest))
         (local_dir / "config.json").write_text(json.dumps({"model_type": "test"}))
 
         resp = await app_client.get("/api/ps")
         data = resp.json()
         model = data["models"][0]
-        assert model["size"] == 1024 + len(json.dumps({"model_type": "test"}))
+        assert model["size"] == 4096
         assert model["size_vram"] == model["size"]
+        assert model["details"]["family"] == "test"
