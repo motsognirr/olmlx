@@ -1,0 +1,20 @@
+{
+  "model": "org/qwen-tiny",
+  "tier": "extended",
+  "assignment": "full_core",
+  "warmup_tok_per_s": 95.0,
+  "per_suite_pass_rate": {
+    "humaneval-plus": 0.80,
+    "gsm8k": 0.90,
+    "gpqa": 0.55,
+    "mbpp-plus": 0.74,
+    "math500": 0.60,
+    "mmlu-pro": 0.72,
+    "ifeval": 0.85,
+    "ruler-niah": 1.0
+  },
+  "composite": 0.77,
+  "prompts": [],
+  "speed": {"decode_tok_per_s_p50": 95.0, "ttft_p50_ms": 220.0},
+  "elapsed_seconds": 1234.5
+}
