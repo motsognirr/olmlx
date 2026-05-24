@@ -25,11 +25,7 @@ def _make_tool_use_id() -> str:
 
 # --- Regex patterns ---
 
-_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-# Gemma4 channel format: <|channel>thought\n...<channel|>
-# The <|channel> opening token may be absent in decoded text when
-# skip_special_tokens strips it, so the pattern is optional.
-_GEMMA4_CHANNEL_RE = re.compile(r"(?:<\|channel>)?thought\n(.*?)<channel\|>", re.DOTALL)
+_THINK_RE = re.compile(r"<think>([^<]*)</think>")
 
 # gpt-oss channel format (harmony):
 # <|start|>assistant<|channel|>analysis<|message|>thinking<|end|>
@@ -46,10 +42,8 @@ _GEMMA4_CHANNEL_RE = re.compile(r"(?:<\|channel>)?thought\n(.*?)<channel\|>", re
 # Group 2: channel name (e.g. "commentary", "analysis", "final")
 # Group 3: header content between channel and <|message|> (may contain to=functions.*, <|constrain|>, etc.)
 # Group 4: message content
-_GPT_OSS_BLOCK_RE = re.compile(
-    r"<\|start\|>([^<\|]*?)(?:<\|channel\|>\s*(\w+)(.*?))<\|message\|>(.*?)(?:<\|(?:end|call|return)\|>|(?=<\|start\|>)|\Z)",
-    re.DOTALL,
-)
+_GPT_OSS_CHANNEL_RE = re.compile(r"<\|channel\|>\s*(\w+)")
+_GPT_OSS_END_RE = re.compile(r"<\|(?:end|call|return)\|>")
 _GPT_OSS_TOOL_NAME_RE = re.compile(r"to=functions\.(\w+)")
 _GPT_OSS_DETECT = "<|channel|>"
 # Gemma4 tool call: <|tool_call>call:Name{key:<|"|>val<|"|>}<tool_call|>
@@ -443,15 +437,30 @@ def _parse_gpt_oss_channels(
     if _GPT_OSS_DETECT not in text:
         return None
 
-    thinking_parts = []
-    visible_parts = []
-    tool_uses = []
+    thinking_parts: list[str] = []
+    visible_parts: list[str] = []
+    tool_uses: list[dict] = []
 
-    for match in _GPT_OSS_BLOCK_RE.finditer(text):
-        _role = match.group(1).strip()  # captured but not currently used
-        channel = match.group(2).strip() if match.group(2) else ""
-        header = match.group(3) or ""
-        content = match.group(4).strip()
+    for block in text.split("<|start|>"):
+        if not block:
+            continue
+
+        channel_match = _GPT_OSS_CHANNEL_RE.search(block)
+        if not channel_match:
+            continue
+
+        channel = channel_match.group(1).strip()
+        after_channel = block[channel_match.end() :]
+
+        msg_pos = after_channel.find("<|message|>")
+        if msg_pos < 0:
+            continue
+
+        header = after_channel[:msg_pos]
+        after_msg = after_channel[msg_pos + len("<|message|>") :]
+
+        end_match = _GPT_OSS_END_RE.search(after_msg)
+        content = (after_msg[: end_match.start()] if end_match else after_msg).strip()
 
         if channel == "analysis":
             thinking_parts.append(content)
@@ -490,6 +499,45 @@ def _parse_gpt_oss_channels(
     return thinking, visible, tool_uses
 
 
+def _extract_gemma4_blocks(text: str) -> tuple[str, list[str]]:
+    """Extract gemma4 channel thinking blocks using string operations.
+
+    Recognizes ``<|channel>thought\n...<channel|>`` and ``thought\n...<channel|>``
+    (when ``skip_special_tokens`` strips the opener).  Returns ``(cleaned_text, blocks)``
+    where *cleaned_text* has all matched blocks removed.
+    """
+    blocks: list[str] = []
+    out_parts: list[str] = []
+    pos = 0
+
+    while True:
+        prefixed = text.find("<|channel>thought\n", pos)
+        plain = text.find("thought\n", pos)
+
+        if prefixed < 0 and plain < 0:
+            out_parts.append(text[pos:])
+            break
+
+        if prefixed >= 0 and (plain < 0 or prefixed <= plain):
+            marker_end = prefixed + 18  # len("<|channel>thought\n")
+            out_parts.append(text[pos:prefixed])
+        else:
+            marker_end = plain + 8  # len("thought\n")
+            out_parts.append(text[pos:plain])
+
+        close = text.find("<channel|>", marker_end)
+        if close < 0:
+            break
+
+        content = text[marker_end:close].strip()
+        if content:
+            blocks.append(content)
+
+        pos = close + 10  # len("<channel|>")
+
+    return "".join(out_parts), blocks
+
+
 def parse_model_output(
     text: str,
     has_tools: bool,
@@ -518,10 +566,9 @@ def parse_model_output(
     thinking = ""
 
     # Extract thinking blocks — gemma4 channel format and standard <think> tags
-    gemma4_matches = _GEMMA4_CHANNEL_RE.findall(text)
-    if gemma4_matches:
-        thinking = "\n".join(m.strip() for m in gemma4_matches if m.strip())
-        text = _GEMMA4_CHANNEL_RE.sub("", text)
+    text, gemma4_blocks = _extract_gemma4_blocks(text)
+    if gemma4_blocks:
+        thinking = "\n".join(gemma4_blocks)
 
     think_matches = _THINK_RE.findall(text)
     if think_matches:
