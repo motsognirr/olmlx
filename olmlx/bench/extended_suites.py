@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
+import string
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
@@ -343,6 +345,261 @@ def load_math500(n: int | None = 50) -> list[BenchPrompt]:
                     "group": 1,
                     "answer": r["answer"],
                 },
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# MMLU-Pro loader
+# ---------------------------------------------------------------------------
+
+_MMLU_PRO_FILE = "mmlu_pro.json"
+
+
+def _fetch_mmlu_pro_to(path: Path) -> None:
+    from datasets import load_dataset  # type: ignore[import-not-found]
+
+    ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
+    records = []
+    for r in ds:
+        letter = string.ascii_uppercase[r["answer_index"]]
+        records.append(
+            {
+                "question": r["question"],
+                "options": r["options"],
+                "answer": letter,
+                "category": r["category"],
+            }
+        )
+    path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+
+
+def load_mmlu_pro(n: int | None = 50) -> list[BenchPrompt]:
+    """Load MMLU-Pro as bench prompts. ``n=None`` returns all available records."""
+    cache_path = bench_cache_dir() / _MMLU_PRO_FILE
+    if not cache_path.exists():
+        _fetch_mmlu_pro_to(cache_path)
+    records = json.loads(cache_path.read_text(encoding="utf-8"))
+    if n is not None:
+        records = select_subset(records, n, key=lambda r: r["category"])
+    out: list[BenchPrompt] = []
+    for i, r in enumerate(records):
+        letters = string.ascii_uppercase[: len(r["options"])]
+        option_lines = "\n".join(
+            f"{letters[j]}) {opt}" for j, opt in enumerate(r["options"])
+        )
+        content = (
+            f"Question: {r['question']}\n{option_lines}\n\n"
+            "Respond with a single line at the end: 'Answer: <letter>'."
+        )
+        out.append(
+            BenchPrompt(
+                name=f"mmlu-pro-{i:04d}",
+                category=f"mmlu-pro-{r['category']}",
+                messages=[{"role": "user", "content": content}],
+                max_tokens=1024,
+                grader="regex_match",
+                expected={
+                    "pattern": r"(?i)answer[:\s]*([A-J])",
+                    "group": 1,
+                    "answer": r["answer"],
+                },
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# GPQA-Diamond loader
+# ---------------------------------------------------------------------------
+
+_GPQA_FILE = "gpqa_diamond.json"
+
+
+def _fetch_gpqa_diamond_to(path: Path) -> None:
+    from datasets import load_dataset  # type: ignore[import-not-found]
+
+    ds = load_dataset(
+        "Idavidrein/gpqa", "gpqa_diamond", split="train"
+    )  # GPQA only ships a "train" split
+    records = []
+    for r in ds:
+        records.append(
+            {
+                "question": r["Question"],
+                "correct": r["Correct Answer"],
+                "incorrect": [
+                    r["Incorrect Answer 1"],
+                    r["Incorrect Answer 2"],
+                    r["Incorrect Answer 3"],
+                ],
+                "domain": r.get("High-level domain", "?"),
+            }
+        )
+    path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+
+
+def load_gpqa_diamond(n: int | None = 60) -> list[BenchPrompt]:
+    """Load GPQA-Diamond as bench prompts. ``n=None`` returns all available records."""
+    cache_path = bench_cache_dir() / _GPQA_FILE
+    if not cache_path.exists():
+        _fetch_gpqa_diamond_to(cache_path)
+    records = json.loads(cache_path.read_text(encoding="utf-8"))
+    if n is not None:
+        records = select_subset(records, n, key=lambda r: r.get("domain", "?"))
+    rng = random.Random(42)  # deterministic answer-position shuffling
+    out: list[BenchPrompt] = []
+    for i, r in enumerate(records):
+        options = [r["correct"], *r["incorrect"]]
+        order = list(range(4))
+        rng.shuffle(order)
+        shuffled = [options[j] for j in order]
+        correct_idx = order.index(0)
+        letter = "ABCD"[correct_idx]
+        option_lines = "\n".join(
+            f"{'ABCD'[j]}) {opt}" for j, opt in enumerate(shuffled)
+        )
+        content = (
+            f"Question: {r['question']}\n{option_lines}\n\n"
+            "Respond with a single line at the end: 'Answer: <letter>'."
+        )
+        out.append(
+            BenchPrompt(
+                name=f"gpqa-{i:04d}",
+                category=f"gpqa-{r.get('domain', '?').lower().replace(' ', '-')}",
+                messages=[{"role": "user", "content": content}],
+                max_tokens=1024,
+                grader="regex_match",
+                expected={
+                    "pattern": r"(?i)answer[:\s]*([A-D])",
+                    "group": 1,
+                    "answer": letter,
+                },
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# IFEval loader (verifiable-constraint subset)
+# ---------------------------------------------------------------------------
+
+_IFEVAL_FILE = "ifeval.json"
+
+_VERIFIABLE_IFEVAL_PREFIXES = (
+    "keywords:",
+    "language:",
+    "length_constraints:",
+    "detectable_format:",
+    "detectable_content:",
+    "punctuation:",
+    "startend:",
+    "change_case:",
+    "combination:",
+)
+
+
+def _is_verifiable(instruction_ids: list[str]) -> bool:
+    return all(
+        any(iid.startswith(p) for p in _VERIFIABLE_IFEVAL_PREFIXES)
+        for iid in instruction_ids
+    )
+
+
+def _fetch_ifeval_to(path: Path) -> None:
+    from datasets import load_dataset  # type: ignore[import-not-found]
+
+    ds = load_dataset("google/IFEval", split="train")
+    records = []
+    for r in ds:
+        records.append(
+            {
+                "key": r["key"],
+                "prompt": r["prompt"],
+                "instruction_id_list": r["instruction_id_list"],
+                "kwargs": r["kwargs"],
+            }
+        )
+    path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+
+
+def load_ifeval(n: int | None = 50) -> list[BenchPrompt]:
+    """Load IFEval (verifiable-constraint subset). ``n=None`` returns all."""
+    cache_path = bench_cache_dir() / _IFEVAL_FILE
+    if not cache_path.exists():
+        _fetch_ifeval_to(cache_path)
+    records = json.loads(cache_path.read_text(encoding="utf-8"))
+    records = [r for r in records if _is_verifiable(r["instruction_id_list"])]
+    if n is not None:
+
+        def _family(r: dict) -> str:
+            return r["instruction_id_list"][0].split(":")[0]
+
+        records = select_subset(records, n, key=_family)
+    out: list[BenchPrompt] = []
+    for r in records:
+        out.append(
+            BenchPrompt(
+                name=f"ifeval-{r['key']:04d}",
+                category="ifeval-" + r["instruction_id_list"][0].split(":")[0],
+                messages=[{"role": "user", "content": r["prompt"]}],
+                max_tokens=1024,
+                grader="ifeval",
+                expected={
+                    "instruction_id_list": r["instruction_id_list"],
+                    "kwargs": r["kwargs"],
+                },
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# RULER NIAH generator
+# ---------------------------------------------------------------------------
+
+_RULER_CONTEXT_PARAGRAPH = (
+    "The migratory patterns of Arctic terns span the entire globe. "
+    "Researchers tag individuals to study route choice and longevity. "
+)
+
+
+def make_ruler_niah(
+    context_tokens: int, n: int = 10, seed: int = 42
+) -> list[BenchPrompt]:
+    """Generate single-needle-in-haystack prompts at a given context size.
+
+    Each prompt embeds a unique 6-digit "key" inside a long block of filler
+    text and asks the model to retrieve it. ``context_tokens`` is approximate
+    (4 chars ≈ 1 token under typical BPE tokenizers).
+    """
+    rng = random.Random(seed)
+    target_chars = context_tokens * 4
+    filler = (
+        _RULER_CONTEXT_PARAGRAPH * (target_chars // len(_RULER_CONTEXT_PARAGRAPH) + 1)
+    )[:target_chars]
+    out: list[BenchPrompt] = []
+    for i in range(n):
+        key = f"{rng.randint(100000, 999999)}"
+        pos = round(len(filler) * (i + 1) / (n + 1))
+        needle = f"The magic key is {key}. Remember it. "
+        haystack = (
+            filler[:pos] + needle + filler[pos:][: target_chars - pos - len(needle)]
+        )
+        content = (
+            f"{haystack}\n\n"
+            "What is the magic key mentioned earlier? Respond with just the "
+            "6-digit number."
+        )
+        out.append(
+            BenchPrompt(
+                name=f"ruler-niah-{context_tokens}-{i:03d}",
+                category=f"ruler-niah-{context_tokens}",
+                messages=[{"role": "user", "content": content}],
+                max_tokens=1024,
+                grader="contains",
+                expected={"substrings": [key], "all": True, "ignore_case": False},
             )
         )
     return out

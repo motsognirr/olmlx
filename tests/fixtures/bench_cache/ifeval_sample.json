@@ -1,0 +1,8 @@
+[
+  {
+    "key": 1,
+    "prompt": "Write a one-sentence reply containing the word 'banana'.",
+    "instruction_id_list": ["keywords:existence"],
+    "kwargs": [{"keywords": ["banana"]}]
+  }
+]
