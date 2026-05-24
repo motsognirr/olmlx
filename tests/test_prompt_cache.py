@@ -601,6 +601,36 @@ class TestCachePersistenceProbe:
             f"or confirm the class exists in the installed mlx-lm version."
         )
 
+    def test_trimmable_is_subset_of_persistable(self):
+        """``_TRIMMABLE_CACHE_CLASSES`` ⊂ ``_PERSISTABLE_CACHE_CLASSES``.
+
+        Post-#343 the probe folds ``persist_ok = persist_layout_ok and
+        trim_ok``, which is equivalent to ``persist_ok = trim_ok`` under
+        this subset invariant.  The formula is kept in two-term form on
+        purpose so it self-corrects if a future allowlist edit ever breaks
+        the subset relation (the resulting ``persist_ok`` value would
+        still be safe — False — but the load-time log dispatch would
+        misattribute the model as ``ArraysCache`` (#284) instead of
+        flagging a novel trimmable-but-non-persistable case.  This test
+        catches that drift at test time before it ships.
+        """
+        from olmlx.engine.model_manager import (
+            _PERSISTABLE_CACHE_CLASSES,
+            _TRIMMABLE_CACHE_CLASSES,
+        )
+
+        rogue = _TRIMMABLE_CACHE_CLASSES - _PERSISTABLE_CACHE_CLASSES
+        assert not rogue, (
+            f"Cache classes in _TRIMMABLE_CACHE_CLASSES but not "
+            f"_PERSISTABLE_CACHE_CLASSES: {sorted(rogue)}.  This breaks "
+            f"the subset invariant the #343 fold (persist_ok = "
+            f"persist_layout_ok and trim_ok) relies on for correct "
+            f"log attribution.  Either add each to "
+            f"_PERSISTABLE_CACHE_CLASSES (if its stored state is safe "
+            f"to reuse) or audit _probe_cache_capabilities' log dispatch "
+            f"to handle the trimmable-but-non-persistable case."
+        )
+
 
 class TestNonPersistableLookupShortCircuit:
     """Post-#343 contract for non-trimmable cache layouts: the probe
