@@ -119,6 +119,12 @@ Decode tok/s (steady-state output), prompt-eval tok/s (prefill):
   windows (~2–3s) and are themselves noisier than the longer-output rows.
   Same headline applies — indistinguishable — just don't read the 1.21 as a
   real signal.
+- **`coding` and `multi-turn` hit the 256-token bench cap.** Both rows show
+  `eval_count: 256` for both models — outputs were truncated mid-sentence,
+  not run to natural completion. This doesn't bias the tok/s numbers
+  (tok/s = tokens / decode_time, which is well-defined over a bounded
+  window once the LRU is warm), but the rows aren't measurements of
+  end-to-end generation either.
 - **No quality grading.** The throughput suite uses generic prompts and does
   not run GSM8K/MMLU/HumanEval. The quant choice (4-bit weights +
   TurboQuant-4 KV cache) is plausibly fine for both models but is not
