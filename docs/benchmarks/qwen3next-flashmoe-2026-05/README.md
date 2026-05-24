@@ -12,7 +12,7 @@ grading is out of scope for this round.
   loading and KV cache state are isolated.
 - **Scenario:** `flash-moe+tq4` — `OLMLX_FLASH_MOE=true` +
   `OLMLX_KV_CACHE_QUANT=turboquant:4`. The 80B model cannot fit in RAM at
-  any quant; for the 41 GB Qwen3-Coder-Next checkpoint Flash-MoE is the
+  any quant; for the 42 GB Qwen3-Coder-Next checkpoint Flash-MoE is the
   scenario already configured in `models.json` so both were measured the
   same way for an apples-to-apples comparison.
 - **Speed:** the standard 7-prompt throughput suite from
@@ -37,14 +37,13 @@ This is the crucial fact for interpreting the numbers below — per-token
 Flash-MoE I/O is architecture-shape-bound, not parameter-count-bound, so the
 two should perform very similarly.
 
-| Model | Total params | On-disk weight | Flash-MoE expert bundle |
-|---|---|---:|---:|
-| `mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit` | 80B (3B active) | 42 GB | 41 GB |
-| `mlx-community/Qwen3-Coder-Next-4bit` | not labeled A3B but same shape | 82 GB | 41 GB |
+| Model | Total params | Checkpoint size | Flash-MoE expert bundle | Total on-disk after prep |
+|---|---|---:|---:|---:|
+| `mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit` | 80B (3B active) | 42 GB | 41 GB | 82 GB |
+| `mlx-community/Qwen3-Coder-Next-4bit` | not labeled A3B but same shape | 42 GB | 41 GB | 82 GB |
 
-The 80B checkpoint is more aggressively quantized end-to-end (smaller
-non-expert tensors), but the expert bundles are identical bytes because the
-expert grid is the same shape.
+Identical sizes across the board — expected given the shared MoE shape and
+4-bit weight quantization.
 
 ## Results
 
@@ -76,8 +75,14 @@ Decode tok/s (steady-state output), prompt-eval tok/s (prefill):
 3. **Prefill scales the same way too.** ~178 tok/s on the 12 427-token
    long-context prompt for both models — same ceiling set by parallel
    `pread()` throughput on the expert files combined with `mx.gather_mm`
-   over the loaded expert stacks. Prefill activates a wider expert set per
-   token than decode, which is why it's an order of magnitude faster.
+   over the loaded expert stacks. Each token still routes to exactly k=10
+   experts (router topology is fixed), but prefill processes thousands of
+   tokens in parallel: each expert weight loaded from SSD is reused for
+   every token in the batch that routed to it, and the gather-matmul runs
+   over the full sequence at once. Decode loads the same 480 expert tiles
+   per step (10 experts × 48 layers) but applies them to a single token,
+   so I/O cost per token is unchanged while compute utilization is far
+   lower — which is why decode is the SSD-bound regime.
 4. **Cold-cache warmup costs roughly one prompt.** The `factual` prompt
    (8 output tokens) lands at ~9.7 tok/s on both runs; from `reasoning`
    onward decode settles into the 12–15 tok/s band as the LRU warms.
