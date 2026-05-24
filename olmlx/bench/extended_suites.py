@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
@@ -231,3 +232,117 @@ def load_mbpp_plus(n: int | None = 50) -> list[BenchPrompt]:
             )
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# GSM8K loader
+# ---------------------------------------------------------------------------
+
+_GSM8K_FILE = "gsm8k.json"
+_GSM8K_ANSWER_RE = re.compile(r"####\s*(-?[\d,]+)")
+
+
+def _fetch_gsm8k_to(path: Path) -> None:
+    from datasets import load_dataset  # type: ignore[import-not-found]
+
+    ds = load_dataset("openai/gsm8k", "main", split="test")
+    records = [{"question": r["question"], "answer": r["answer"]} for r in ds]
+    path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+
+
+def _parse_gsm8k_answer(answer_text: str) -> int:
+    m = _GSM8K_ANSWER_RE.search(answer_text)
+    if m is None:
+        raise ValueError(f"no #### marker in: {answer_text!r}")
+    return int(m.group(1).replace(",", ""))
+
+
+def load_gsm8k(n: int | None = 70) -> list[BenchPrompt]:
+    """Load GSM8K test split. ``n=None`` returns all 1319."""
+    cache_path = bench_cache_dir() / _GSM8K_FILE
+    if not cache_path.exists():
+        _fetch_gsm8k_to(cache_path)
+    records = json.loads(cache_path.read_text(encoding="utf-8"))
+    if n is not None:
+
+        def _bucket(r: dict) -> str:
+            n_chars = len(r["answer"])
+            if n_chars < 200:
+                return "short"
+            if n_chars < 500:
+                return "medium"
+            return "long"
+
+        records = select_subset(records, n, key=_bucket)
+    out: list[BenchPrompt] = []
+    for i, r in enumerate(records):
+        ans = _parse_gsm8k_answer(r["answer"])
+        content = (
+            f"{r['question']}\n\n"
+            "Think step by step, then write the final answer on its own line "
+            "as '#### <number>'."
+        )
+        out.append(
+            BenchPrompt(
+                name=f"gsm8k-{i:04d}",
+                category="gsm8k",
+                messages=[{"role": "user", "content": content}],
+                max_tokens=4096,
+                grader="numeric",
+                expected={"answer": ans, "tol": 0.0},
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# MATH-500 loader
+# ---------------------------------------------------------------------------
+
+_MATH500_FILE = "math500.json"
+
+
+def _fetch_math500_to(path: Path) -> None:
+    from datasets import load_dataset  # type: ignore[import-not-found]
+
+    ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
+    records = [
+        {
+            "problem": r["problem"],
+            "answer": r["answer"],
+            "level": r.get("level", "Level ?"),
+        }
+        for r in ds
+    ]
+    path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+
+
+def load_math500(n: int | None = 50) -> list[BenchPrompt]:
+    """Load MATH-500 (HuggingFaceH4 curated subset of MATH test split)."""
+    cache_path = bench_cache_dir() / _MATH500_FILE
+    if not cache_path.exists():
+        _fetch_math500_to(cache_path)
+    records = json.loads(cache_path.read_text(encoding="utf-8"))
+    if n is not None:
+        records = select_subset(records, n, key=lambda r: r.get("level", "?"))
+    out: list[BenchPrompt] = []
+    for i, r in enumerate(records):
+        content = (
+            f"{r['problem']}\n\n"
+            r"Solve step by step. End your answer with \boxed{...}."
+        )
+        out.append(
+            BenchPrompt(
+                name=f"math500-{i:04d}",
+                category=f"math500-{r.get('level', '?').lower().replace(' ', '-')}",
+                messages=[{"role": "user", "content": content}],
+                max_tokens=4096,
+                grader="regex_match",
+                expected={
+                    "pattern": r"\\boxed\{([^{}]+)\}",
+                    "group": 1,
+                    "answer": r["answer"],
+                },
+            )
+        )
+    return out
