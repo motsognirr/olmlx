@@ -1911,16 +1911,24 @@ async def _setup_prompt_cache(
     if memory_too_high or prompt_tokens is None or make_prompt_cache is None:
         return result
 
-    # Issue #284: for non-persistable models (hybrid SSM-style ArraysCache),
-    # any stored entry is unsafe to reuse — loading from disk and feeding it
-    # to mlx-lm would crash the next prefill.  We never store for these
-    # models post-PR, so the only path to a stale entry is pre-PR data.
-    # Skip the disk lookup entirely and clear any in-memory entry.  Gated
-    # on peek() so we don't pay a blocking unlink(ENOENT) syscall on every
-    # request.  Pre-PR on-disk files for non-persistable models can persist
-    # indefinitely — that's harmless because nothing reads from disk for
-    # these models — but they're cleaned up by the disk cache size eviction
-    # in PromptCacheStore eventually.
+    # Cross-request prompt cache reuse is disabled for this model.  Two
+    # families land here, both folded into supports_cache_persistence=False
+    # by _probe_cache_capabilities:
+    #   - Issue #284: hybrid SSM-style ArraysCache (Qwen3.5, Qwen3-Next
+    #     gated-delta layers) — loading the stored entry and feeding it to
+    #     mlx-lm would crash the next prefill with a Metal stream error.
+    #   - Issue #343: non-trimmable hybrid sliding-window layouts
+    #     (RotatingKVCache for Gemma 4, ChunkedKVCache for gpt-oss) — any
+    #     stored entry can't realign with the next request's retokenized
+    #     prompt, so the lookup always discards it; storing was pure waste.
+    # We never store for either family post-PR, so the only path to a stale
+    # entry is pre-PR data.  Skip the disk lookup entirely and clear any
+    # in-memory entry.  Gated on peek() so we don't pay a blocking
+    # unlink(ENOENT) syscall on every request.  Pre-PR on-disk files for
+    # non-persistable models can persist indefinitely — that's harmless
+    # because nothing reads from disk for these models — but they're
+    # cleaned up by the disk cache size eviction in PromptCacheStore
+    # eventually.
     if not lm.supports_cache_persistence:
         if lm.prompt_cache_store.peek(cache_id) is not None:
             lm.prompt_cache_store.remove(cache_id)
@@ -2216,18 +2224,24 @@ async def _store_prompt_cache_after_generation(
     if prompt_cache is None or full_prompt_tokens is None:
         return
 
-    # Issue #284: hybrid SSM-style models (Qwen3.5, Qwen3-Next gated-delta
-    # layers using ArraysCache) cannot have their cache safely persisted
-    # across requests — the next prefill crashes mlx-lm with a Metal stream
-    # error.  Skip storage entirely; the next request will run a fresh
-    # prefill.  No remove() call here: _setup_prompt_cache already removed
-    # any stale entry at request setup time, and we never stored anything
-    # between then and now, so a second remove() would be a guaranteed
-    # no-op disk stat on the event loop.
+    # Skip cross-request storage for any non-persistable model.  Two families
+    # land here, both folded into supports_cache_persistence=False by
+    # _probe_cache_capabilities:
+    #   - Issue #284: hybrid SSM-style models (Qwen3.5, Qwen3-Next gated-delta
+    #     layers using ArraysCache) — the next prefill would crash mlx-lm with
+    #     a Metal stream error.
+    #   - Issue #343: non-trimmable hybrid sliding-window layouts
+    #     (RotatingKVCache for Gemma 4, ChunkedKVCache for gpt-oss) — the
+    #     stored prompt+generated state can never realign with the next
+    #     request's retokenized prompt, so storage was pure waste.
+    # The next request will run a fresh prefill.  No remove() call here:
+    # _setup_prompt_cache already removed any stale entry at request setup
+    # time, and we never stored anything between then and now, so a second
+    # remove() would be a guaranteed no-op disk stat on the event loop.
     if not lm.supports_cache_persistence:
         logger.debug(
-            "Cache not persistable (hybrid SSM/ArraysCache); "
-            "skipping cross-request storage for %s",
+            "Cache not persistable (hybrid SSM/ArraysCache or non-trimmable "
+            "sliding-window); skipping cross-request storage for %s",
             cache_id,
         )
         return
