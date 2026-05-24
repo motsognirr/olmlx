@@ -1,0 +1,8 @@
+[
+  {
+    "task_id": "Mbpp/2",
+    "prompt": "Write a function that returns the n-th smallest item.",
+    "code": "def kth_smallest(arr, k):\n    return sorted(arr)[k-1]\n",
+    "test_list": ["assert kth_smallest([1,2,3], 1) == 1"]
+  }
+]

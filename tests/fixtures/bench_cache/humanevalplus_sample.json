@@ -1,0 +1,14 @@
+[
+  {
+    "task_id": "HumanEval/0",
+    "prompt": "def has_close_elements(numbers, threshold):\n    \"\"\"...\"\"\"\n",
+    "entry_point": "has_close_elements",
+    "test": "def check(candidate):\n    assert candidate([1.0, 2.0, 3.0], 0.5) == False\n"
+  },
+  {
+    "task_id": "HumanEval/1",
+    "prompt": "def separate_paren_groups(s):\n    \"\"\"...\"\"\"\n",
+    "entry_point": "separate_paren_groups",
+    "test": "def check(candidate):\n    assert candidate('( )') == ['()']\n"
+  }
+]

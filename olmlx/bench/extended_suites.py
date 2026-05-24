@@ -13,10 +13,13 @@ each score.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
+
+from olmlx.bench.prompts import BenchPrompt
 
 T = TypeVar("T")
 
@@ -95,3 +98,134 @@ def select_subset(
         else:
             out.extend(bucket[round(j * len(bucket) / take)] for j in range(take))
     return out
+
+
+# ---------------------------------------------------------------------------
+# HumanEval+ loader
+# ---------------------------------------------------------------------------
+
+_HUMANEVAL_PLUS_FILE = "humanevalplus.json"
+_MBPP_PLUS_FILE = "mbppplus.json"
+
+
+def _fetch_humaneval_plus_to(path: Path) -> None:
+    """Download HumanEval+ to ``path`` if not cached.
+
+    Defers the ``datasets`` import so cached runs don't pay the import cost.
+    """
+    from datasets import load_dataset  # type: ignore[import-not-found]
+
+    ds = load_dataset("evalplus/humanevalplus", split="test")
+    records: list[dict[str, Any]] = [
+        {
+            "task_id": r["task_id"],
+            "prompt": r["prompt"],
+            "entry_point": r["entry_point"],
+            "test": r["test"],
+        }
+        for r in ds
+    ]
+    path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+
+
+def load_humaneval_plus(n: int | None = 50) -> list[BenchPrompt]:
+    """Load HumanEval+ as bench prompts. ``n=None`` returns all 164."""
+    cache_path = bench_cache_dir() / _HUMANEVAL_PLUS_FILE
+    if not cache_path.exists():
+        _fetch_humaneval_plus_to(cache_path)
+    records: list[dict[str, Any]] = json.loads(cache_path.read_text(encoding="utf-8"))
+    if n is not None:
+        records = select_subset(records, n)
+    result: list[BenchPrompt] = []
+    for r in records:
+        content = (
+            "Complete the following Python function. Respond with a single "
+            "fenced ```python``` code block containing the full function "
+            "definition (you may include the signature and docstring). Do "
+            "not include explanations.\n\n"
+            f"{r['prompt']}"
+        )
+        result.append(
+            BenchPrompt(
+                name=f"humaneval-plus-{r['task_id'].split('/')[-1]}",
+                category="humaneval-plus",
+                messages=[{"role": "user", "content": content}],
+                max_tokens=4096,
+                grader="code_exec",
+                expected={
+                    "prompt": r["prompt"],
+                    "tests": r["test"],
+                    "entry_point": r["entry_point"],
+                },
+            )
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# MBPP+ loader
+# ---------------------------------------------------------------------------
+
+
+def _mbpp_test_list_to_check(test_list: list[str]) -> str:
+    """Convert a list of assert strings into a ``def check(candidate):`` block."""
+    # Extract the function name from the first assert: ``assert fn_name(...)``
+    first = test_list[0]
+    call_part = first.split("assert", 1)[1].strip()
+    entry = call_part.split("(", 1)[0].strip()
+    indented = "\n    ".join(test_list)
+    return f"def check(candidate):\n    {entry} = candidate\n    {indented}\n"
+
+
+def _fetch_mbpp_plus_to(path: Path) -> None:
+    """Download MBPP+ to ``path`` if not cached."""
+    from datasets import load_dataset  # type: ignore[import-not-found]
+
+    ds = load_dataset("evalplus/mbppplus", split="test")
+    records: list[dict[str, Any]] = [
+        {
+            "task_id": r["task_id"],
+            "prompt": r["prompt"],
+            "test_list": r["test_list"],
+        }
+        for r in ds
+    ]
+    path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+
+
+def load_mbpp_plus(n: int | None = 50) -> list[BenchPrompt]:
+    """Load MBPP+ as bench prompts. ``n=None`` returns all."""
+    cache_path = bench_cache_dir() / _MBPP_PLUS_FILE
+    if not cache_path.exists():
+        _fetch_mbpp_plus_to(cache_path)
+    records: list[dict[str, Any]] = json.loads(cache_path.read_text(encoding="utf-8"))
+    if n is not None:
+        records = select_subset(records, n)
+    result: list[BenchPrompt] = []
+    for r in records:
+        test_list: list[str] = r["test_list"]
+        check_src = _mbpp_test_list_to_check(test_list)
+        # Extract entry point from first assert for the prompt instruction.
+        first_call = test_list[0].split("assert", 1)[1].strip()
+        entry_point = first_call.split("(", 1)[0].strip()
+        content = (
+            "Solve this Python task. Respond with a single fenced ```python``` "
+            "code block containing the full function definition. Do not include "
+            f"explanations.\n\n{r['prompt']}\n\n"
+            f"Your function must be named ``{entry_point}``."
+        )
+        result.append(
+            BenchPrompt(
+                name=f"mbpp-plus-{r['task_id'].split('/')[-1]}",
+                category="mbpp-plus",
+                messages=[{"role": "user", "content": content}],
+                max_tokens=4096,
+                grader="code_exec",
+                expected={
+                    "prompt": "",
+                    "tests": check_src,
+                    "entry_point": entry_point,
+                },
+            )
+        )
+    return result
