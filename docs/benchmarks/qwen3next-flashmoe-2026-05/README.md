@@ -68,8 +68,10 @@ Decode tok/s (steady-state output), prompt-eval tok/s (prefill):
    interactive throughput for a model 2× the host RAM, with KV cache
    quantized to 4 bits.
 2. **Throughput is architecture-shape-bound, not parameter-count-bound.**
-   The two models perform indistinguishably (avg Δ < 0.2 tok/s, per-prompt Δ
-   all < 1 tok/s). This is the predicted behavior: per-token decode loads
+   The two models perform indistinguishably (avg Δ < 0.2 tok/s, per-prompt
+   Δ within ~1 tok/s on every row except `long-context` which is +1.21 —
+   attributed to different output lengths at `temperature=0`, see
+   Caveats). This is the predicted behavior: per-token decode loads
    10 experts × 48 layers = 480 expert tiles from SSD, the same number for
    both checkpoints, and that I/O dominates.
 3. **Prefill scales the same way too.** ~178 tok/s on the 12 427-token
@@ -146,8 +148,13 @@ Things to measure next, in priority order:
    layers. The 80B can't be tested without KV quant on a typical machine —
    KV cache for a 12k context plus the resident expert cache won't both fit.
 2. **`OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS=128` or `256`** (default 48).
-   At ~80 MB per expert per layer, more RAM-resident experts should reduce
-   SSD misses on `factual`-like cold prompts and possibly steady-state too.
+   The unit is per-layer (`LayerLruCache(max_per_layer=...)` in
+   `moe_weight_store.py`), so the default 48 means 48 expert IDs cached
+   per layer × 48 layers ≈ 2300 expert-layer slots resident. Per
+   expert-layer slot is ~1.7 MB (41 GB bundle / 24576 slots), giving a
+   default cache footprint of ~3.9 GB. Doubling to 96 → ~7.8 GB; tripling
+   to 144 → ~11.7 GB. More RAM-resident experts should reduce SSD misses
+   on `factual`-like cold prompts and possibly steady-state too.
 3. **Classic speculative decoding on Flash-MoE.** Classic is the only
    speculative strategy supported on Flash-MoE (`dflash` and `eagle` are
    blocked). A small Qwen3Next draft, if one exists, could hide expert-fetch
@@ -160,15 +167,18 @@ None of these have been measured yet, so there is no empirical pick
 
 ## Reproducing
 
-Measured on branch `fix/343-non-trimmable-skip-storage`, SHA `2656ca0`. That
-branch's only behavioral change is to gate cross-request prompt-cache storage
-for non-trimmable hybrid sliding-window caches (`RotatingKVCache` /
-`ChunkedKVCache` — i.e. Gemma 4, gpt-oss). Qwen3Next uses `ArraysCache` via
-its gated-delta layers and falls under the separate
-`_cache_supports_persistence` gate that was already in place before this
-branch, so the throughput numbers here should reproduce unchanged from
-`main` once the branch lands. Numbers were collected with no other process
-contending for the GPU.
+Measured on branch `fix/343-non-trimmable-skip-storage`, SHA `2656ca0`
+(issue #343 / PR #345). That branch's only behavioral change is to gate
+cross-request prompt-cache storage for non-trimmable hybrid sliding-window
+caches (`RotatingKVCache` / `ChunkedKVCache` — i.e. Gemma 4, gpt-oss).
+Qwen3Next uses `ArraysCache` via its gated-delta layers and falls under the
+separate `_cache_supports_persistence` gate that was already in place
+before this branch, so the throughput numbers here should reproduce
+unchanged from `main` once the branch lands. To confirm the branch has
+landed before reproducing, check that the commit titled `fix(prompt-cache):
+disable persistence for non-trimmable cache layouts (#343) (#345)` is in
+`main`. Numbers were collected with no other process contending for the
+GPU.
 
 ```bash
 # one-time prep (writes ~41 GB to <model-dir>/flash_moe/)
