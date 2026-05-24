@@ -112,7 +112,13 @@ Decode tok/s (steady-state output), prompt-eval tok/s (prefill):
 - **Single scenario, single run.** No confidence intervals — the sub-1 tok/s
   per-prompt deltas are within plausible run-to-run noise, not a measured
   variance. Treat them as "indistinguishable" rather than "the 80B is 0.05
-  tok/s slower on factual."
+  tok/s slower on factual." The one row that crosses the 1 tok/s line is
+  `long-context` (Δ +1.21) — but the two models also emitted different
+  output lengths there at `temperature=0` (80B: 43 tokens; Coder: 25
+  tokens), so the per-model tok/s estimates are over very short decode
+  windows (~2–3s) and are themselves noisier than the longer-output rows.
+  Same headline applies — indistinguishable — just don't read the 1.21 as a
+  real signal.
 - **No quality grading.** The throughput suite uses generic prompts and does
   not run GSM8K/MMLU/HumanEval. The quant choice (4-bit weights +
   TurboQuant-4 KV cache) is plausibly fine for both models but is not
@@ -147,6 +153,16 @@ None of these have been measured yet, so there is no empirical pick
 ("use X, not Y") to write into CLAUDE.md from this round.
 
 ## Reproducing
+
+Measured on branch `fix/343-non-trimmable-skip-storage`, SHA `2656ca0`. That
+branch's only behavioral change is to gate cross-request prompt-cache storage
+for non-trimmable hybrid sliding-window caches (`RotatingKVCache` /
+`ChunkedKVCache` — i.e. Gemma 4, gpt-oss). Qwen3Next uses `ArraysCache` via
+its gated-delta layers and falls under the separate
+`_cache_supports_persistence` gate that was already in place before this
+branch, so the throughput numbers here should reproduce unchanged from
+`main` once the branch lands. Numbers were collected with no other process
+contending for the GPU.
 
 ```bash
 # one-time prep (writes ~41 GB to <model-dir>/flash_moe/)
