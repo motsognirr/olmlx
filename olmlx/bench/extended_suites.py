@@ -105,7 +105,6 @@ def select_subset(
 # ---------------------------------------------------------------------------
 
 _HUMANEVAL_PLUS_FILE = "humanevalplus.json"
-_MBPP_PLUS_FILE = "mbppplus.json"
 
 
 def _fetch_humaneval_plus_to(path: Path) -> None:
@@ -129,7 +128,7 @@ def _fetch_humaneval_plus_to(path: Path) -> None:
 
 
 def load_humaneval_plus(n: int | None = 50) -> list[BenchPrompt]:
-    """Load HumanEval+ as bench prompts. ``n=None`` returns all 164."""
+    """Load HumanEval+ as bench prompts. ``n=None`` returns all available records."""
     cache_path = bench_cache_dir() / _HUMANEVAL_PLUS_FILE
     if not cache_path.exists():
         _fetch_humaneval_plus_to(cache_path)
@@ -166,15 +165,21 @@ def load_humaneval_plus(n: int | None = 50) -> list[BenchPrompt]:
 # MBPP+ loader
 # ---------------------------------------------------------------------------
 
+_MBPP_PLUS_FILE = "mbppplus.json"
 
-def _mbpp_test_list_to_check(test_list: list[str]) -> str:
-    """Convert a list of assert strings into a ``def check(candidate):`` block."""
+
+def _mbpp_test_list_to_check(test_list: list[str]) -> tuple[str, str]:
+    """Convert a list of assert strings into a ``def check(candidate):`` block.
+
+    Returns ``(check_src, entry_point)`` so callers don't need to re-extract
+    the function name themselves.
+    """
     # Extract the function name from the first assert: ``assert fn_name(...)``
-    first = test_list[0]
+    first = test_list[0].strip()
     call_part = first.split("assert", 1)[1].strip()
     entry = call_part.split("(", 1)[0].strip()
-    indented = "\n    ".join(test_list)
-    return f"def check(candidate):\n    {entry} = candidate\n    {indented}\n"
+    indented = "\n    ".join(s.strip() for s in test_list)
+    return f"def check(candidate):\n    {entry} = candidate\n    {indented}\n", entry
 
 
 def _fetch_mbpp_plus_to(path: Path) -> None:
@@ -204,10 +209,7 @@ def load_mbpp_plus(n: int | None = 50) -> list[BenchPrompt]:
     result: list[BenchPrompt] = []
     for r in records:
         test_list: list[str] = r["test_list"]
-        check_src = _mbpp_test_list_to_check(test_list)
-        # Extract entry point from first assert for the prompt instruction.
-        first_call = test_list[0].split("assert", 1)[1].strip()
-        entry_point = first_call.split("(", 1)[0].strip()
+        check_src, entry_point = _mbpp_test_list_to_check(test_list)
         content = (
             "Solve this Python task. Respond with a single fenced ```python``` "
             "code block containing the full function definition. Do not include "

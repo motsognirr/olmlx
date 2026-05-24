@@ -56,3 +56,17 @@ class TestMbppPlus:
         for p in load_mbpp_plus(n=None):
             assert p.grader == "code_exec"
             assert "def check" in p.expected["tests"]
+
+    def test_subset_size(self, coding_cache):
+        # The fixture has 1 row, so n=1 must return 1 (n >= len → all items).
+        prompts = load_mbpp_plus(n=1)
+        assert len(prompts) == 1
+
+    def test_entry_point_set(self, coding_cache):
+        for p in load_mbpp_plus(n=None):
+            assert p.expected["entry_point"], "entry_point must be non-empty"
+
+    def test_category_and_max_tokens(self, coding_cache):
+        for p in load_mbpp_plus(n=None):
+            assert p.category == "mbpp-plus"
+            assert p.max_tokens == 4096
