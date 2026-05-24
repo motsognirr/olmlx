@@ -2053,10 +2053,12 @@ async def _setup_prompt_cache(
     result.full_prompt_tokens = prompt_tokens
 
     # Label for the fresh-cache log line.  Set to "trim-fallback" if
-    # we discard a stale cache because trim_prompt_cache could not
-    # align it (e.g. Qwen3-Next hybrid cache).  Otherwise the log
-    # block below picks "miss" or "init" based on whether `cached`
-    # was populated.
+    # we discard a stale cache because trim_prompt_cache under-delivered.
+    # Otherwise the log block below picks "miss" or "init" based on
+    # whether `cached` was populated.  Non-trimmable models (issue #343)
+    # never reach the enclosing trim block: their early-exit at the
+    # lookup branch sets cached=None, so the fresh-cache path picks
+    # the "init" label.
     fresh_cache_label: str | None = None
 
     # stream_generate requires at least 1 token, so we must back up
@@ -2079,29 +2081,17 @@ async def _setup_prompt_cache(
         if trim_amount > 0 and lm.supports_cache_trim:
             trimmed = trim_prompt_cache(working_cache, trim_amount)
 
-        if trim_amount > 0 and not lm.supports_cache_trim:
-            # Hybrid sliding-window models (RotatingKVCache layers) cannot
-            # be trimmed back; trim_prompt_cache would silently return 0.
-            logger.debug(
-                "Skipping trim on non-trimmable hybrid cache "
-                "(would-be trim=%d); discarding and creating fresh",
-                trim_amount,
-            )
-            del working_cache
-            cached = None
-            gc.collect()
-            mx.clear_cache()
-            _safe_sync()
-            fresh_cache_label = "non-trimmable-hybrid"
-        elif trim_amount > 0 and trimmed != trim_amount:
+        if trim_amount > 0 and trimmed != trim_amount:
             # Defensive path: only reachable for models where
             # supports_cache_trim is True but trim_prompt_cache still
             # under-delivers (e.g. a custom cache type whose trim()
             # silently clamps, or a class the probe allowlist missed).
             # Known-hybrid caches (RotatingKVCache, ChunkedKVCache) are
-            # flagged at load time and hit the skip-trim branch above.
-            # A partial trim would leave the KV state misaligned with
-            # the prompt, so fall through to fresh-cache creation.
+            # flagged at load time as non-trimmable and skip cross-
+            # request lookup entirely (issue #343), so they never reach
+            # this enclosing block.  A partial trim would leave the KV
+            # state misaligned with the prompt, so fall through to
+            # fresh-cache creation.
             logger.warning(
                 "Prompt cache trim incomplete (asked for %d, got %d); "
                 "discarding stale cache and creating fresh",
@@ -2147,10 +2137,11 @@ async def _setup_prompt_cache(
         # cache was already removed before the trim attempt — this
         # remove is then a harmless no-op (PromptCacheStore.remove
         # is idempotent).  Kept for the cache-miss path.  Skip for
-        # non-persistable models — the lookup branch above already
-        # ran the (peek-gated) cleanup, so any further remove() here
-        # would be redundant disk I/O on the event loop hot path.
-        if lm.supports_cache_persistence:
+        # non-persistable (#284) and non-trimmable (#343) models —
+        # the lookup branch above already ran the (peek-gated)
+        # cleanup, so any further remove() here would be redundant
+        # disk I/O on the event loop hot path.
+        if lm.supports_cache_persistence and lm.supports_cache_trim:
             lm.prompt_cache_store.remove(cache_id)
         new_cache = _make_prompt_cache_for_lm(lm)
         gen_kwargs["prompt_cache"] = new_cache

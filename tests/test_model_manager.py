@@ -757,6 +757,35 @@ class TestProbeCacheCapabilities:
         assert lm.supports_cache_persistence is False
         assert "Cache probe raised an exception" in caplog.text
 
+    def test_probe_clears_disk_for_non_trimmable_model(self, registry, mock_store):
+        """Issue #343: at load time, non-trimmable models should get a
+        symmetric clear_disk() sweep to non-persistable models.  Without
+        it, pre-PR on-disk entries for Gemma 4 / gpt-oss survive
+        indefinitely (until disk-size LRU eviction reclaims them).
+        """
+
+        class _FakeRotatingKVCache:
+            pass
+
+        _FakeRotatingKVCache.__name__ = "RotatingKVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+        # Make supports_cache_persistence True so we exercise the
+        # non-trimmable-but-persistable path (Gemma 4 / gpt-oss).
+        lm.supports_cache_persistence = True
+        lm.prompt_cache_store = MagicMock()
+        lm.prompt_cache_store.clear_disk = MagicMock(return_value=2)
+
+        with patch(
+            "mlx_lm.models.cache.make_prompt_cache",
+            return_value=[_FakeRotatingKVCache()],
+        ):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is False
+        lm.prompt_cache_store.clear_disk.assert_called_once()
+
 
 class TestLoadModel:
     def _make_manager(self, registry, mock_store):

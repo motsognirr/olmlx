@@ -4663,6 +4663,45 @@ class TestStorePromptCacheAfterGeneration:
         assert lm.prompt_cache_store.peek("stale-key") is None
 
     @pytest.mark.asyncio
+    async def test_no_double_remove_for_non_trimmable_persistable(self, mock_manager):
+        """Issue #343 follow-up: for non-trimmable-but-persistable models
+        (Gemma 4 / gpt-oss), the early-exit at the lookup branch already
+        runs a peek-gated remove() to clean up any stale entry.  The
+        fresh-cache path must not fire a second remove() — that would be
+        a guaranteed no-op unlink syscall on every subsequent request.
+        """
+        from olmlx.engine.inference import _setup_prompt_cache
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.supports_cache_persistence = True
+        lm.supports_cache_trim = False
+        # No stale entry → peek-gated remove() in early-exit is skipped.
+        # If the fresh-cache path's guard isn't fixed, remove() would
+        # fire here as a redundant unlink syscall.
+        lm.prompt_cache_store.remove = MagicMock(
+            side_effect=AssertionError(
+                "remove() must not be called on non-trimmable model when "
+                "there is no stale entry"
+            )
+        )
+
+        gen_kwargs: dict = {}
+        with patch("olmlx.engine.inference.settings") as mock_settings:
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.memory_limit_fraction = 0.9
+            await _setup_prompt_cache(
+                lm,
+                "the prompt",
+                gen_kwargs,
+                prompt_tokens=[1, 2, 3, 4, 5],
+                cache_id="fresh-key",
+            )
+
+        # A fresh prompt_cache must have been created — sanity check.
+        assert "prompt_cache" in gen_kwargs
+
+    @pytest.mark.asyncio
     async def test_skips_storage_when_cache_not_persistable(self, mock_lm):
         """Issue #284: hybrid SSM-style models (Qwen3.5/Qwen3-Next, ArraysCache
         layers) cannot have their cache safely persisted across requests —
