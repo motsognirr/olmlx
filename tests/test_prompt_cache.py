@@ -1328,7 +1328,7 @@ class TestStreamingSpeculativeCache:
         mock_make_cache.assert_not_called()
         mock_trim.assert_not_called()
         stored = lm.prompt_cache_store.get("")
-        assert stored is existing_cache or stored.cache is existing_cache
+        assert stored is not None and stored.cache is existing_cache
 
 
 class TestVlmUsesCache:
