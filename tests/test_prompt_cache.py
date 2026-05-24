@@ -677,6 +677,12 @@ class TestNonPersistableLookupShortCircuit:
         assert call_args[1].get("prompt_cache") is fresh_cache
         # Full prompt passed
         assert call_args.args[2] == [10, 20, 30, 40, 50, 60, 70, 80]
+        # The pre-populated stale entry must have been removed by the
+        # non-persistable lookup short-circuit (peek/remove branch in
+        # _setup_prompt_cache).  This is the cleanup the PR description
+        # cites as a benefit; without this assertion, a regression that
+        # dropped the remove() call would still pass the other checks.
+        assert lm.prompt_cache_store.peek("") is None
 
     @pytest.mark.asyncio
     async def test_non_persistable_strict_extension_creates_fresh(self, mock_manager):
@@ -756,6 +762,11 @@ class TestNonPersistableLookupShortCircuit:
         assert call_args[1].get("prompt_cache") is fresh_cache
         # Full prompt fed to stream_generate (no suffix split).
         assert call_args.args[2] == [10, 20, 30, 40, 50, 100, 101, 200, 201]
+        # Pre-populated stale entry must have been removed by the
+        # non-persistable lookup short-circuit (peek/remove branch in
+        # _setup_prompt_cache).  Without this assertion, a regression that
+        # dropped the remove() call would still pass the other checks.
+        assert lm.prompt_cache_store.peek("") is None
 
 
 class TestCacheMissCreatesFresh:
