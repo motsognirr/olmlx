@@ -2013,17 +2013,18 @@ async def _setup_prompt_cache(
     if memory_too_high or prompt_tokens is None or make_prompt_cache is None:
         return result
 
-    # Issue #284: for non-persistable models (hybrid SSM-style ArraysCache),
-    # any stored entry is unsafe to reuse — loading from disk and feeding it
-    # to mlx-lm would crash the next prefill.  We never store for these
-    # models post-PR, so the only path to a stale entry is pre-PR data.
-    # Skip the disk lookup entirely and clear any in-memory entry.  Gated
+    # Issue #284 (non-persistable, e.g. ArraysCache): stored entries are
+    # unsafe to reuse — loading would crash the next prefill.
+    # Issue #343 (non-trimmable hybrid, e.g. RotatingKVCache / ChunkedKVCache):
+    # stored entries are safe to load but in real chat flow the client-echoed
+    # assistant tokens almost never match the model-generated ones byte-for-
+    # byte, so trim_amount > 0 and the cache is discarded on virtually every
+    # multi-turn request — paying storage overhead for no prefill savings.
+    # Both cases skip the disk lookup and clear any in-memory entry.  Gated
     # on peek() so we don't pay a blocking unlink(ENOENT) syscall on every
-    # request.  Pre-PR on-disk files for non-persistable models can persist
-    # indefinitely — that's harmless because nothing reads from disk for
-    # these models — but they're cleaned up by the disk cache size eviction
-    # in PromptCacheStore eventually.
-    if not lm.supports_cache_persistence:
+    # request.  Pre-PR on-disk files survive only until disk-cache size
+    # eviction in PromptCacheStore reclaims them.
+    if not lm.supports_cache_persistence or not lm.supports_cache_trim:
         if lm.prompt_cache_store.peek(cache_id) is not None:
             lm.prompt_cache_store.remove(cache_id)
         cached = None
@@ -2308,11 +2309,11 @@ async def _store_prompt_cache_after_generation(
     Handles trimming to max_cache_tokens, eviction pressure cleanup,
     and cache invalidation on trim failure.
 
-    Non-trimmable hybrid caches (e.g. Gemma 4, Qwen3-Next with
-    RotatingKVCache layers) skip the trim path and are stored as-is
-    even when they exceed max_cache_tokens.  The pre-generation setup
-    path handles their eventual discard when alignment requires a trim;
-    this storage just keeps them alive for strict-extension cache hits.
+    Non-trimmable hybrid caches (RotatingKVCache, ChunkedKVCache) skip
+    storage entirely (issue #343): the stored state would include the
+    model's generated tokens, which the client-echoed next-turn tokens
+    almost never match, so trim_amount > 0 on the next request and the
+    cache is discarded anyway.  Skip the storage cost.
     """
     prompt_cache = gen_kwargs.get("prompt_cache")
     if prompt_cache is None or full_prompt_tokens is None:
@@ -2334,55 +2335,26 @@ async def _store_prompt_cache_after_generation(
         )
         return
 
+    # Issue #343: non-trimmable hybrid caches (RotatingKVCache,
+    # ChunkedKVCache) cannot be trimmed back if the next request's
+    # prefix diverges.  Storing post-generation state has no realistic
+    # recovery path because the client-echoed assistant tokens almost
+    # never match the model-generated ones byte-for-byte, so the next
+    # turn computes trim_amount > 0 and discards the cache.  Skip
+    # storage entirely.  No remove() call: _setup_prompt_cache already
+    # cleaned up any prior entry via peek-gated remove(), and we never
+    # stored anything between then and now.
+    if not lm.supports_cache_trim:
+        logger.debug(
+            "Cache not trimmable (hybrid sliding-window); "
+            "skipping cross-request storage for %s",
+            cache_id,
+        )
+        return
+
     stored_tokens = list(full_prompt_tokens) + generated_tokens
     actual_total = len(full_prompt_tokens) + eval_count
     max_cache_tokens = settings.prompt_cache_max_tokens
-
-    # Non-trimmable hybrid caches (RotatingKVCache) can never be trimmed
-    # back.  The pre-generation setup path handles cache alignment by
-    # discarding and creating fresh; here we store as-is or skip entirely
-    # when the metadata is known to be unreliable.
-    if not lm.supports_cache_trim:
-        if eval_count != len(generated_tokens):
-            # None-ID tokens: the ring buffer has stale generation entries
-            # at positions we can't trim out, and the metadata can't
-            # faithfully represent them.  Remove any previous entry from
-            # the store (the mutable cache object was shared) and skip
-            # storage — a corrupt cache is worse than no cache.
-            lm.prompt_cache_store.remove(cache_id)
-            logger.debug(
-                "Non-trimmable cache with misaligned eval_count "
-                "(%d != %d); skipping storage",
-                eval_count,
-                len(generated_tokens),
-            )
-            return
-
-        if max_cache_tokens is not None and actual_total > max_cache_tokens:
-            logger.warning(
-                "Storing non-trimmable cache at %d tokens "
-                "(would-be trim=%d, exceeds limit of %d); "
-                "max_cache_tokens is advisory for hybrid sliding-window models",
-                len(stored_tokens),
-                actual_total - max_cache_tokens,
-                max_cache_tokens,
-            )
-        evicted = await lm.prompt_cache_store.async_set(
-            cache_id,
-            CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
-        )
-        if evicted is not None:
-            del evicted
-            if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
-                gc.collect()
-                mx.clear_cache()
-        logger.debug(
-            "Cache stored (non-trimmable): %d tokens (%d prompt + %d generated)",
-            len(stored_tokens),
-            len(full_prompt_tokens),
-            len(generated_tokens),
-        )
-        return
 
     if max_cache_tokens is not None and actual_total > max_cache_tokens:
         trim_amount = actual_total - max_cache_tokens

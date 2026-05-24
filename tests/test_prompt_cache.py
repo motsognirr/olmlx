@@ -659,10 +659,15 @@ class TestNonTrimmableModelSkipsTrim:
         assert call_args.args[2] == [10, 20, 30, 40, 50, 60, 70, 80]
 
     @pytest.mark.asyncio
-    async def test_strict_extension_reuses_hybrid_cache(self, mock_manager):
-        """Even with supports_cache_trim=False, a strict-extension turn
-        (new prompt = cached prompt + suffix, trim_amount==0) reuses the
-        cache. RotatingKVCache supports appending; only trimming back fails."""
+    async def test_strict_extension_does_not_reuse_hybrid_cache(self, mock_manager):
+        """Issue #343: even when a strict-extension prefix match would
+        line up (trim_amount==0), non-trimmable hybrid caches now skip
+        cross-request reuse entirely.  In real chat flow the client-
+        echoed assistant tokens almost never match the model-generated
+        ones byte-for-byte, so the strict-extension hit was vanishingly
+        rare in practice while the storage and lookup overhead was paid
+        on every request.  The pre-PR stale entry must be cleaned up
+        and a fresh cache used."""
         from olmlx.engine.inference import generate_chat
         from olmlx.engine.model_manager import CachedPromptState
 
@@ -672,7 +677,7 @@ class TestNonTrimmableModelSkipsTrim:
         lm.tokenizer.bos_token = None
 
         existing_cache = [MagicMock()]
-        # Cached: 7 tokens (5 prompt + 2 generated)
+        # Pre-PR stale entry: 7 tokens (5 prompt + 2 generated)
         lm.prompt_cache_store.set(
             "",
             CachedPromptState(
@@ -685,10 +690,11 @@ class TestNonTrimmableModelSkipsTrim:
             return_value=[10, 20, 30, 40, 50, 100, 101, 200, 201]
         )
 
-        tokens = _make_stream_tokens("More", prompt_tokens=2)
+        tokens = _make_stream_tokens("More", prompt_tokens=9)
         mock_stream = _make_mock_stream(tokens)
         mock_trim = MagicMock(return_value=0)
-        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        fresh_cache = [MagicMock()]
+        mock_make_cache = MagicMock(return_value=fresh_cache)
 
         mock_mx = MagicMock()
         with (
@@ -715,13 +721,66 @@ class TestNonTrimmableModelSkipsTrim:
             async for _chunk in gen:
                 pass
 
-        # Strict extension: trim not called, fresh cache not made, existing cache reused
+        # No cross-request reuse: trim never called, fresh cache made,
+        # full prompt re-processed.
         mock_trim.assert_not_called()
-        mock_make_cache.assert_not_called()
+        mock_make_cache.assert_called_once_with(lm.model)
         call_args = mock_async_stream.call_args
-        assert call_args[1].get("prompt_cache") is existing_cache
-        # Only the suffix is fed to stream_generate
-        assert call_args.args[2] == [200, 201]
+        assert call_args[1].get("prompt_cache") is fresh_cache
+        assert call_args.args[2] == [10, 20, 30, 40, 50, 100, 101, 200, 201]
+        # Stale pre-PR entry must be cleaned up so it does not survive a restart.
+        assert lm.prompt_cache_store.peek("") is None
+
+    @pytest.mark.asyncio
+    async def test_non_trimmable_skips_storage(self, mock_manager):
+        """Issue #343: non-trimmable caches must not be stored after
+        generation.  Storing post-generation state has no realistic
+        recovery path on the next turn (the client-echoed assistant
+        tokens rarely match the model-generated ones, so trim_amount > 0
+        almost always, which forces a discard)."""
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.supports_cache_trim = False
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[1, 2, 3, 4, 5])
+
+        tokens = _make_stream_tokens("Out", prompt_tokens=5)
+        mock_stream = _make_mock_stream(tokens)
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+
+        # Spy on async_set to confirm storage never happens.
+        lm.prompt_cache_store.async_set = AsyncMock(
+            side_effect=AssertionError("async_set must not be called")
+        )
+
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=mock_stream,
+            ),
+            patch("olmlx.engine.inference.make_prompt_cache", mock_make_cache),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+            async for _chunk in gen:
+                pass
+
+        # Storage never attempted.
+        assert lm.prompt_cache_store.peek("") is None
 
 
 class TestCacheMissCreatesFresh:

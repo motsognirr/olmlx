@@ -4548,71 +4548,33 @@ class TestStorePromptCacheAfterGeneration:
         mock_lm.prompt_cache_store.async_set.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_non_trimmable_stores_without_trim(self, mock_lm):
-        """When supports_cache_trim=False and total > max, store as-is."""
+    async def test_skips_storage_when_cache_not_trimmable(self, mock_lm):
+        """Issue #343: non-trimmable hybrid caches (RotatingKVCache,
+        ChunkedKVCache) must not be stored post-generation.  The stored
+        state would include the model's generated tokens, which the
+        client-echoed next-turn tokens almost never match — so the next
+        turn would compute trim_amount > 0 and discard the cache anyway.
+        Skip storage entirely; no remove() either (the cache object held
+        in gen_kwargs is the fresh one we created at setup time, and
+        _setup_prompt_cache already cleaned up any prior entry)."""
         from olmlx.engine.inference import _store_prompt_cache_after_generation
 
         mock_lm.supports_cache_trim = False
+        # supports_cache_persistence is irrelevant once supports_cache_trim
+        # gates storage, but set it True to exercise the second guard
+        # rather than the persistence one.
+        mock_lm.supports_cache_persistence = True
         cache = MagicMock()
         gen_kwargs = {"prompt_cache": cache}
         with patch("olmlx.engine.inference.settings") as mock_settings:
-            mock_settings.prompt_cache_max_tokens = 4
+            mock_settings.prompt_cache_max_tokens = 32768
             mock_settings.memory_limit_fraction = 0.9
             await _store_prompt_cache_after_generation(
                 mock_lm, gen_kwargs, [1, 2, 3], [4, 5], 2, "test"
             )
 
-        # Cache stored as-is (3 prompt + 2 gen = 5, exceeding limit of 4)
-        mock_lm.prompt_cache_store.async_set.assert_awaited_once()
-        call_args = mock_lm.prompt_cache_store.async_set.call_args
-        assert call_args[0][0] == "test"
-        stored = call_args[0][1]
-        assert stored.tokens == [1, 2, 3, 4, 5]
-
-    @pytest.mark.asyncio
-    async def test_non_trimmable_misaligned_eval_count(self, mock_lm):
-        """When supports_cache_trim=False and eval_count != len(generated_tokens),
-        skip storage entirely — stale generation entries in the ring buffer
-        can't be trimmed out and would corrupt the next turn."""
-        from olmlx.engine.inference import _store_prompt_cache_after_generation
-
-        mock_lm.supports_cache_trim = False
-        cache = MagicMock()
-        gen_kwargs = {"prompt_cache": cache}
-        # eval_count=7 != len(generated_tokens)=2: None-ID tokens produced
-        with patch("olmlx.engine.inference.settings") as mock_settings:
-            mock_settings.prompt_cache_max_tokens = 4
-            mock_settings.memory_limit_fraction = 0.9
-            await _store_prompt_cache_after_generation(
-                mock_lm, gen_kwargs, [1, 2, 3], [4, 5], 7, "test"
-            )
-
-        # Cache must NOT be stored — stale ring-buffer entries would be unsafe.
-        # The previous entry from a prior turn must be cleaned up since the
-        # mutable ring buffer was shared and is now corrupted.
         mock_lm.prompt_cache_store.async_set.assert_not_awaited()
-        mock_lm.prompt_cache_store.remove.assert_called_once_with("test")
-
-    @pytest.mark.asyncio
-    async def test_non_trimmable_within_limit_stores_as_is(self, mock_lm):
-        """When supports_cache_trim=False and total <= max, store without trimming."""
-        from olmlx.engine.inference import _store_prompt_cache_after_generation
-
-        mock_lm.supports_cache_trim = False
-        cache = MagicMock()
-        gen_kwargs = {"prompt_cache": cache}
-        with patch("olmlx.engine.inference.settings") as mock_settings:
-            mock_settings.prompt_cache_max_tokens = 32768  # well above 5
-            mock_settings.memory_limit_fraction = 0.9
-            await _store_prompt_cache_after_generation(
-                mock_lm, gen_kwargs, [1, 2, 3], [4, 5], 2, "test"
-            )
-
-        mock_lm.prompt_cache_store.async_set.assert_awaited_once()
-        call_args = mock_lm.prompt_cache_store.async_set.call_args
-        assert call_args[0][0] == "test"
-        stored = call_args[0][1]
-        assert stored.tokens == [1, 2, 3, 4, 5]
+        mock_lm.prompt_cache_store.remove.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_lookup_skipped_for_non_persistable_model(self, mock_manager):
@@ -4627,6 +4589,50 @@ class TestStorePromptCacheAfterGeneration:
 
         lm = mock_manager._loaded["qwen3:latest"]
         lm.supports_cache_persistence = False
+        # Stash a stale entry that mimics pre-PR storage.
+        stale_cache = [MagicMock()]
+        lm.prompt_cache_store.set(
+            "stale-key",
+            CachedPromptState(tokens=[1, 2, 3], cache=stale_cache),
+        )
+        # Spy on async_get to confirm it isn't called.
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        lm.prompt_cache_store.async_get = _AsyncMock(
+            side_effect=AssertionError("async_get must not be called")
+        )
+
+        gen_kwargs: dict = {}
+        with patch("olmlx.engine.inference.settings") as mock_settings:
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.memory_limit_fraction = 0.9
+            await _setup_prompt_cache(
+                lm,
+                "the prompt",
+                gen_kwargs,
+                prompt_tokens=[1, 2, 3, 4, 5],
+                cache_id="stale-key",
+            )
+
+        # Stale entry must be removed so it doesn't survive a restart.
+        assert lm.prompt_cache_store.peek("stale-key") is None
+
+    @pytest.mark.asyncio
+    async def test_lookup_skipped_for_non_trimmable_model(self, mock_manager):
+        """Issue #343: at request time, models with
+        supports_cache_trim=False (RotatingKVCache, ChunkedKVCache layers)
+        skip cross-request cache lookup.  The post-PR store is empty for
+        these models, but pre-PR olmlx may have left entries on disk —
+        clean them up so they don't survive a restart.
+        """
+        from olmlx.engine.inference import _setup_prompt_cache
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        # Hybrid sliding-window: safe to persist, but not trim-able.
+        lm.supports_cache_persistence = True
+        lm.supports_cache_trim = False
         # Stash a stale entry that mimics pre-PR storage.
         stale_cache = [MagicMock()]
         lm.prompt_cache_store.set(

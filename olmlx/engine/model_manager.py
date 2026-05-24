@@ -280,8 +280,11 @@ def _cache_supports_trim(cache_list: list) -> bool:
     Used at model load time to decide whether `trim_prompt_cache()` is worth
     attempting on this model.  Hybrid sliding-window models (Gemma 4,
     Qwen3-Next, etc.) include `RotatingKVCache` layers and return False —
-    such models still benefit from strict-extension cache reuse but cannot
-    be trimmed back on prompt divergence.
+    such models skip cross-request prompt cache storage and lookup entirely
+    (issue #343), because the strict-extension hit that would in theory work
+    on a non-trimmable cache is virtually never reachable in real chat flow
+    (client-echoed assistant tokens don't match model-generated ones).
+    Within-request cache reuse during a single generation is unaffected.
     """
     return all(type(layer).__name__ in _TRIMMABLE_CACHE_CLASSES for layer in cache_list)
 
@@ -2099,7 +2102,7 @@ class ModelManager:
         if not lm.supports_cache_trim:
             logger.info(
                 "Model %s uses a non-trimmable hybrid cache (e.g. RotatingKVCache); "
-                "prompt cache will only be reused for strict-extension turns.",
+                "prompt cache will not be stored across requests (issue #343).",
                 lm.name,
             )
         # Only log the layout reason when the probe actually inspected
