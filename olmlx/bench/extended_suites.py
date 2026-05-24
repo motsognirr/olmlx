@@ -41,8 +41,14 @@ def select_subset(
     (e.g. MMLU-Pro category labels), splitting ``n`` as evenly as possible
     and applying the same even-spread rule within each stratum.
 
-    Picks indices ``round(i * len(items) / n)`` for i in 0..n-1, so first
-    and last items are always included.
+    Picks indices ``round(i * len(items) / n)`` for i in 0..n-1, so the
+    first item is always included; the last item is included when ``n`` is
+    large relative to ``len(items)``.
+
+    When ``key`` is provided and all strata can satisfy their allocation,
+    returns exactly ``n`` items.  When some strata are smaller than their
+    allocation, surplus is redistributed to other strata so the total still
+    equals ``n``.
     """
     if n >= len(items):
         return list(items)
@@ -55,9 +61,34 @@ def select_subset(
     labels = sorted(buckets)
     base = n // len(labels)
     remainder = n - base * len(labels)
+    # Initial allocation per bucket.
+    allotments: dict[str, int] = {
+        label: base + (1 if i < remainder else 0) for i, label in enumerate(labels)
+    }
+
+    # Iteratively redistribute slack from exhausted buckets to non-exhausted ones.
+    while True:
+        slack = 0
+        can_absorb: list[str] = []
+        for label in labels:
+            allot = allotments[label]
+            bucket_len = len(buckets[label])
+            if allot >= bucket_len:
+                slack += allot - bucket_len
+                allotments[label] = bucket_len  # cap at bucket size
+            else:
+                can_absorb.append(label)
+        if slack == 0 or not can_absorb:
+            break
+        # Distribute slack evenly across absorbing buckets (priority to earlier labels).
+        per = slack // len(can_absorb)
+        extra = slack - per * len(can_absorb)
+        for i, label in enumerate(can_absorb):
+            allotments[label] += per + (1 if i < extra else 0)
+
     out: list[T] = []
-    for i, label in enumerate(labels):
-        take = base + (1 if i < remainder else 0)
+    for label in labels:
+        take = allotments[label]
         bucket = buckets[label]
         if take >= len(bucket):
             out.extend(bucket)

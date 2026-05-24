@@ -38,6 +38,20 @@ class TestSelectSubset:
             counts[s] = counts.get(s, 0) + 1
         assert counts == {"stratum-0": 2, "stratum-1": 2, "stratum-2": 2}
 
+    def test_stratified_redistributes_when_bucket_too_small(self):
+        # 3 strata: one large, two singletons. n=6 should yield 4 from the large
+        # bucket + 1 + 1 from the singletons (or whatever distribution keeps
+        # len == n). Total must equal n.
+        items = [(i, "big") for i in range(10)] + [(99, "tiny1")] + [(100, "tiny2")]
+        out = select_subset(items, 6, key=lambda x: x[1])
+        assert len(out) == 6
+        labels = [s for _, s in out]
+        # The two singletons must each appear exactly once (they only have one item).
+        assert labels.count("tiny1") == 1
+        assert labels.count("tiny2") == 1
+        # The remainder (4) all come from "big".
+        assert labels.count("big") == 4
+
 
 class TestBenchCacheDir:
     def test_default_path(self):
