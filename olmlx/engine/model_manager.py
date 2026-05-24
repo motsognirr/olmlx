@@ -277,13 +277,14 @@ _TRIMMABLE_CACHE_CLASSES = frozenset(
 def _cache_supports_trim(cache_list: list) -> bool:
     """True iff every layer is in the known-trimmable allowlist.
 
-    Used at model load time to decide whether `trim_prompt_cache()` is worth
-    attempting on this model.  Hybrid sliding-window models (Gemma 4,
-    Qwen3-Next, etc.) include `RotatingKVCache` layers and return False —
-    post-#343 such models also have cross-request persistence force-disabled
-    by `_probe_cache_capabilities` (trim implies persist; persist without
-    trim doesn't), so they get zero cross-request prompt cache reuse and
-    fall back to a fresh prefill on every request.
+    Pure check against ``_TRIMMABLE_CACHE_CLASSES``; no knowledge of the
+    persistence flag.  Used at model load time to decide whether
+    ``trim_prompt_cache()`` is worth attempting on this model.  Hybrid
+    sliding-window models (Gemma 4, Qwen3-Next, etc.) include
+    ``RotatingKVCache`` layers and return False.  The downstream
+    consequence — non-trimmable layouts also lose cross-request
+    persistence (#343) — is applied by ``_probe_cache_capabilities``,
+    not here.
     """
     return all(type(layer).__name__ in _TRIMMABLE_CACHE_CLASSES for layer in cache_list)
 
@@ -2064,12 +2065,9 @@ class ModelManager:
         )
         probe_cache: list | None = None
         probe_succeeded = False
-        # Raw layout-persistence result before the #343 trim-implies-persist
-        # fold.  Hoisted out of the try block so the logging dispatch below
-        # can read it: distinguishes #343 (layout persistable, trim False)
-        # from #284 (layout itself non-persistable).  Only meaningful when
-        # probe_succeeded is True; the probe-failure path emits its own
-        # WARNING and bypasses this dispatch.
+        # Hoisted so the logging dispatch below can read the raw allowlist
+        # result (#343 vs #284 attribution).  Dispatch is gated on
+        # probe_succeeded, so the False default is harmless on exception.
         persist_layout_ok = False
         try:
             probe_cache = make_prompt_cache(cache_model)

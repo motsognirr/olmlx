@@ -652,7 +652,10 @@ class TestNonPersistableLookupShortCircuit:
         from olmlx.engine.model_manager import CachedPromptState
 
         lm = mock_manager._loaded["qwen3:latest"]
-        lm.supports_cache_trim = False
+        # Only the persistence gate drives this branch — _setup_prompt_cache
+        # short-circuits at `not lm.supports_cache_persistence` before any
+        # trim check.  supports_cache_trim is intentionally left at the
+        # fixture default to avoid suggesting trim still gates the lookup.
         lm.supports_cache_persistence = False
         lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt v2")
         lm.tokenizer.bos_token = None
@@ -731,8 +734,11 @@ class TestNonPersistableLookupShortCircuit:
         from olmlx.engine.model_manager import CachedPromptState
 
         lm = mock_manager._loaded["qwen3:latest"]
-        # Post-#343 probe output for a RotatingKVCache model.
-        lm.supports_cache_trim = False
+        # Post-#343 probe output for a RotatingKVCache model: persistence
+        # is the gate that drives this branch.  supports_cache_trim is left
+        # at the fixture default — _setup_prompt_cache short-circuits at
+        # the persistence check before consulting trim, so setting the trim
+        # flag here would suggest a dependency that no longer exists.
         lm.supports_cache_persistence = False
         lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         lm.tokenizer.bos_token = None
