@@ -32,7 +32,7 @@ import pytest
 E2E_ENV = "OLMLX_RUN_E2E_BENCH"
 BASE_URL = "http://localhost:11434"
 SMOKE_MODEL = "mlx-community/Qwen3-0.6B-4bit"
-SMOKE_ALIAS = "qwen3-0.6b-4bit:latest"
+SMOKE_ALIAS = "mlx-community/Qwen3-0.6B-4bit:latest"
 SMOKE_TIER = "core_only"
 SMOKE_BUDGET_SECONDS = 600.0
 
