@@ -204,7 +204,6 @@ CONSTRAINT_CHECKS: dict[str, ConstraintCheck] = {
     "change_case:capital_word_frequency": _change_case_capital_word_frequency,
     "combination:two_responses": _combination_two_responses,
     "combination:repeat_prompt": _combination_repeat_prompt,
-    "language:response_language": _language_response_language,
 }
 
 

@@ -113,7 +113,7 @@ def render_suite_heatmap(results: list[dict[str, Any]], out_path: Path) -> None:
 def render_quant_pairs_chart(results: list[dict[str, Any]], out_path: Path) -> None:
     """Grouped bars: per-suite pass rate for matched 4-bit vs higher-bit pairs."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    by_model = {r["model"]: r for r in results}
+    by_model = {r["model"].removesuffix(":latest"): r for r in results}
     pairs_found = [
         (a, b, n) for a, b, n in QUANT_PAIRS if a in by_model and b in by_model
     ]

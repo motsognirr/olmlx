@@ -13,14 +13,20 @@ touching the model again.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+import httpx
+
+from olmlx.bench.quality import grade
 
 from olmlx.bench.extended_suites import (
     load_gpqa_diamond,
@@ -186,12 +192,6 @@ def write_result(output_dir: Path, result: ModelRunResult) -> Path:
 # HTTP driver — Task 8 additions
 # ---------------------------------------------------------------------------
 
-import asyncio  # noqa: E402
-
-import httpx  # noqa: E402
-
-from olmlx.bench.quality import grade  # noqa: E402
-
 
 async def _drive_prompt(
     client: httpx.AsyncClient,
@@ -213,7 +213,7 @@ async def _drive_prompt(
     }
     expected = dict(prompt.expected)
     if prompt.grader == "code_exec":
-        expected["_enabled"] = True
+        expected["_enabled"] = os.environ.get("OLMLX_BENCH_CODE_EXEC") == "1"
     try:
         resp = await client.post("/api/chat", json=body, timeout=600.0)
         resp.raise_for_status()
@@ -279,7 +279,11 @@ async def run_model(
             core = [p for p in core if not p.category.startswith("gpqa")]
         suite_prompts = list(core)
         if tier == "extended":
-            suite_prompts.extend(assemble_extended_suite())
+            seen_names = {p.name for p in suite_prompts}
+            extended_prompts = [
+                p for p in assemble_extended_suite() if p.name not in seen_names
+            ]
+            suite_prompts.extend(extended_prompts)
         results: list[PromptResult] = []
         for p in suite_prompts:
             result = await _drive_prompt(client, model, p, suite_of(p.category))

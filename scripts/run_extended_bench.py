@@ -65,9 +65,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--budget-hours",
         type=float,
-        default=8.0,
+        default=48.0,
         metavar="H",
-        help="Total wall-clock budget in hours (default: 8).",
+        help="Total wall-clock budget in hours (default: 48).",
     )
     parser.add_argument(
         "--base-url",

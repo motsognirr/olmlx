@@ -25,9 +25,10 @@ def run_dir(tmp_path):
 class TestLoadResults:
     def test_loads_all_json(self, run_dir):
         results = build_extended_report.load_results(run_dir)
-        assert len(results) == 2
+        assert len(results) == 4
         models = {r["model"] for r in results}
-        assert models == {"org/qwen-tiny", "org/big-moe"}
+        assert "org/qwen-tiny" in models
+        assert "org/big-moe" in models
 
 
 class TestFrontierChart:
@@ -51,10 +52,26 @@ class TestSuiteHeatmap:
 
 class TestQuantPairsChart:
     def test_handles_empty_pairs(self, run_dir):
-        # Synthetic fixtures don't include matched quant pairs — render should
-        # produce a placeholder PNG noting "no matched pairs".
+        # The run_dir fixture now includes qwen-pair-4bit and qwen-pair-6bit with
+        # :latest suffix, so this exercises alias resolution rather than empty-pairs.
         out = run_dir / "charts" / "quant_pairs.png"
         build_extended_report.render_quant_pairs_chart(
             build_extended_report.load_results(run_dir), out
         )
         assert out.exists()
+
+
+class TestQuantPairsAliasResolution:
+    def test_renders_with_alias_suffix(self, tmp_path):
+        # Copy fixtures including the new pair, render, verify chart contains actual bars
+        raw = tmp_path / "raw"
+        raw.mkdir()
+        fixtures = Path(__file__).parent / "fixtures" / "extended_run" / "raw"
+        for src in fixtures.glob("*.json"):
+            (raw / src.name).write_bytes(src.read_bytes())
+        results = build_extended_report.load_results(tmp_path)
+        out = tmp_path / "charts" / "quant_pairs.png"
+        build_extended_report.render_quant_pairs_chart(results, out)
+        assert out.exists()
+        # Size sanity: a real-data chart is much larger than the placeholder
+        assert out.stat().st_size > 5000

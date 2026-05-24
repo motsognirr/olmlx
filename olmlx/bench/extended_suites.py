@@ -489,7 +489,6 @@ _IFEVAL_FILE = "ifeval.json"
 
 _VERIFIABLE_IFEVAL_PREFIXES = (
     "keywords:",
-    "language:",
     "length_constraints:",
     "detectable_format:",
     "detectable_content:",

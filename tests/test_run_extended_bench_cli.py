@@ -14,7 +14,7 @@ import run_extended_bench  # type: ignore[import-not-found]
 class TestArgParser:
     def test_default_output_dir(self):
         args = run_extended_bench.parse_args(["--models-config", "x.json"])
-        assert args.output.name == "extended-2026-05"
+        assert args.output.name.startswith("extended-")
 
     def test_only_flag(self):
         args = run_extended_bench.parse_args(

@@ -120,3 +120,50 @@ class TestUnknownConstraint:
         # Unknown constraints leave the prompt ungraded (passed=None) so they
         # don't silently inflate failure counts.
         assert result.passed is None
+
+
+class TestLanguageConstraintFiltering:
+    def test_language_constraint_is_unknown_in_grader(self):
+        """language:response_language must be treated as ungraded (not always-False)."""
+        result = grade(
+            "ifeval",
+            "Bonjour le monde",
+            {
+                "instruction_id_list": ["language:response_language"],
+                "kwargs": [{"language": "fr"}],
+            },
+        )
+        # Since language:response_language is no longer in CONSTRAINT_CHECKS,
+        # it hits the unknown-constraint path and returns passed=None.
+        assert result.passed is None
+
+    def test_language_constraints_are_filtered_out_of_ifeval_load(
+        self, tmp_path, monkeypatch
+    ):
+        """load_ifeval should drop prompts whose only constraint is language:."""
+        import json
+
+        from olmlx.bench.extended_suites import load_ifeval
+
+        monkeypatch.setenv("OLMLX_BENCH_CACHE_DIR", str(tmp_path))
+        # Write a synthetic ifeval cache with one verifiable and one language-only row.
+        records = [
+            {
+                "key": 1,
+                "prompt": "Write containing the word banana.",
+                "instruction_id_list": ["keywords:existence"],
+                "kwargs": [{"keywords": ["banana"]}],
+            },
+            {
+                "key": 2,
+                "prompt": "Reply in French.",
+                "instruction_id_list": ["language:response_language"],
+                "kwargs": [{"language": "fr"}],
+            },
+        ]
+        (tmp_path / "ifeval.json").write_text(json.dumps(records), encoding="utf-8")
+        prompts = load_ifeval(n=None)
+        names = [p.name for p in prompts]
+        # Only the verifiable row (key=1) should survive; language-only is filtered.
+        assert len(prompts) == 1
+        assert "ifeval-0001" in names
