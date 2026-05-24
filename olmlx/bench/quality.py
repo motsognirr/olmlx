@@ -434,6 +434,13 @@ GRADERS: dict[str, Grader] = {
     "regression_snapshot": grade_regression_snapshot,
 }
 
+# Register graders defined in sibling modules. Bottom-of-file import is
+# intentional — keeps the GRADERS table extensible without circular issues
+# at top-of-module import time.
+from olmlx.bench.ifeval_grader import grade_ifeval  # noqa: E402
+
+GRADERS["ifeval"] = grade_ifeval
+
 
 def grade(grader_name: str, output: str, expected: dict[str, Any]) -> QualityResult:
     grader_fn = GRADERS.get(grader_name)
