@@ -41,7 +41,9 @@ show_missing = true
 
 [dependency-groups]
 dev = [
+    "datasets>=3.0",
     "httpx>=0.28.1",
+    "matplotlib>=3.9",
     "pytest>=9.0.2",
     "pytest-asyncio>=0.24",
     "pytest-cov>=7.0.0",
