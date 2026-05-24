@@ -2140,7 +2140,10 @@ async def _setup_prompt_cache(
         # non-persistable (#284) and non-trimmable (#343) models —
         # the lookup branch above already ran the (peek-gated)
         # cleanup, so any further remove() here would be redundant
-        # disk I/O on the event loop hot path.
+        # disk I/O on the event loop hot path.  Both halves of the
+        # guard are load-bearing: the peek-gated cleanup only fires
+        # when an entry exists, so on a fresh-key request a single-
+        # flag guard would still issue an unconditional unlink().
         if lm.supports_cache_persistence and lm.supports_cache_trim:
             lm.prompt_cache_store.remove(cache_id)
         new_cache = _make_prompt_cache_for_lm(lm)

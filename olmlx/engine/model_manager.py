@@ -2137,11 +2137,12 @@ class ModelManager:
         if probe_succeeded and (
             not lm.supports_cache_persistence or not lm.supports_cache_trim
         ):
-            reason = (
-                "non-persistable"
-                if not lm.supports_cache_persistence
-                else "non-trimmable"
-            )
+            reasons = []
+            if not lm.supports_cache_persistence:
+                reasons.append("non-persistable")
+            if not lm.supports_cache_trim:
+                reasons.append("non-trimmable")
+            reason = " and ".join(reasons)
             try:
                 removed = lm.prompt_cache_store.clear_disk()
                 if removed:

@@ -757,6 +757,53 @@ class TestProbeCacheCapabilities:
         assert lm.supports_cache_persistence is False
         assert "Cache probe raised an exception" in caplog.text
 
+    def test_probe_combined_non_persistable_and_non_trimmable(
+        self, registry, mock_store, caplog
+    ):
+        """A future hybrid that uses BOTH unsafe-to-persist AND non-
+        trimmable layers (e.g. ArraysCache + RotatingKVCache) must
+        clear_disk() exactly once, and the operator-facing log must
+        mention both reasons — not silently drop one of them."""
+        import logging
+
+        class _FakeArraysCache:
+            pass
+
+        class _FakeRotatingKVCache:
+            pass
+
+        _FakeArraysCache.__name__ = "ArraysCache"
+        _FakeRotatingKVCache.__name__ = "RotatingKVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+        lm.supports_cache_persistence = True  # let probe flip it
+        lm.prompt_cache_store = MagicMock()
+        lm.prompt_cache_store.clear_disk = MagicMock(return_value=3)
+
+        with (
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[_FakeArraysCache(), _FakeRotatingKVCache()],
+            ),
+            caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"),
+        ):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_persistence is False
+        assert lm.supports_cache_trim is False
+        # clear_disk fires exactly once (one-pass cleanup, both predicates
+        # gated by the same `or` branch — not once per reason).
+        lm.prompt_cache_store.clear_disk.assert_called_once()
+        # The clear_disk log line mentions BOTH reasons, not just one.
+        # (Filter to that specific message — "non-trimmable" appears in
+        # an unrelated load-time log too, which would otherwise mask the
+        # bug where the ternary drops the second reason silently.)
+        clear_disk_logs = [r.message for r in caplog.records if "Removed" in r.message]
+        assert clear_disk_logs, "Expected a clear_disk log entry"
+        assert all("non-persistable" in m for m in clear_disk_logs)
+        assert all("non-trimmable" in m for m in clear_disk_logs)
+
     def test_probe_clears_disk_for_non_trimmable_model(self, registry, mock_store):
         """Issue #343: at load time, non-trimmable models should get a
         symmetric clear_disk() sweep to non-persistable models.  Without
