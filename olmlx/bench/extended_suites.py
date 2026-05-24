@@ -14,6 +14,7 @@ each score.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
@@ -25,6 +26,8 @@ from typing import Any, TypeVar
 from olmlx.bench.prompts import BenchPrompt
 
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 
 def bench_cache_dir() -> Path:
@@ -221,7 +224,7 @@ def load_mbpp_plus(n: int | None = 50) -> list[BenchPrompt]:
         )
         result.append(
             BenchPrompt(
-                name=f"mbpp-plus-{r['task_id'].split('/')[-1]}",
+                name=f"mbpp-plus-{str(r['task_id']).split('/')[-1]}",
                 category="mbpp-plus",
                 messages=[{"role": "user", "content": content}],
                 max_tokens=4096,
@@ -326,7 +329,7 @@ def load_math500(n: int | None = 50) -> list[BenchPrompt]:
         _fetch_math500_to(cache_path)
     records = json.loads(cache_path.read_text(encoding="utf-8"))
     if n is not None:
-        records = select_subset(records, n, key=lambda r: r.get("level", "?"))
+        records = select_subset(records, n, key=lambda r: str(r.get("level", "?")))
     out: list[BenchPrompt] = []
     for i, r in enumerate(records):
         content = (
@@ -336,7 +339,7 @@ def load_math500(n: int | None = 50) -> list[BenchPrompt]:
         out.append(
             BenchPrompt(
                 name=f"math500-{i:04d}",
-                category=f"math500-{r.get('level', '?').lower().replace(' ', '-')}",
+                category=f"math500-{str(r.get('level', '?')).lower().replace(' ', '-')}",
                 messages=[{"role": "user", "content": content}],
                 max_tokens=4096,
                 grader="regex_match",
@@ -441,10 +444,25 @@ def _fetch_gpqa_diamond_to(path: Path) -> None:
 
 
 def load_gpqa_diamond(n: int | None = 60) -> list[BenchPrompt]:
-    """Load GPQA-Diamond as bench prompts. ``n=None`` returns all available records."""
+    """Load GPQA-Diamond as bench prompts. ``n=None`` returns all available records.
+
+    GPQA is a gated dataset on HuggingFace. If access has not been granted,
+    the fetch raises an error; we log a warning with instructions and return
+    an empty list so the rest of Core can still run. The composite score is
+    unaffected because aggregate_per_suite only counts suites with grades.
+    """
     cache_path = bench_cache_dir() / _GPQA_FILE
     if not cache_path.exists():
-        _fetch_gpqa_diamond_to(cache_path)
+        try:
+            _fetch_gpqa_diamond_to(cache_path)
+        except Exception as exc:
+            logger.warning(
+                "GPQA-Diamond unavailable: %s. Visit "
+                "https://huggingface.co/datasets/Idavidrein/gpqa to request "
+                "access, then re-run. Returning empty list for now.",
+                exc,
+            )
+            return []
     records = json.loads(cache_path.read_text(encoding="utf-8"))
     if n is not None:
         records = select_subset(records, n, key=lambda r: r.get("domain", "?"))
