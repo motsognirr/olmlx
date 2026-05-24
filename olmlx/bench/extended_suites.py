@@ -117,7 +117,7 @@ def _fetch_humaneval_plus_to(path: Path) -> None:
     """
     from datasets import load_dataset  # type: ignore[import-not-found]
 
-    ds = load_dataset("evalplus/humanevalplus", split="test")
+    ds: Any = load_dataset("evalplus/humanevalplus", split="test")
     records: list[dict[str, Any]] = [
         {
             "task_id": r["task_id"],
@@ -189,7 +189,7 @@ def _fetch_mbpp_plus_to(path: Path) -> None:
     """Download MBPP+ to ``path`` if not cached."""
     from datasets import load_dataset  # type: ignore[import-not-found]
 
-    ds = load_dataset("evalplus/mbppplus", split="test")
+    ds: Any = load_dataset("evalplus/mbppplus", split="test")
     records: list[dict[str, Any]] = [
         {
             "task_id": r["task_id"],
@@ -247,7 +247,7 @@ _GSM8K_ANSWER_RE = re.compile(r"####\s*(-?[\d,]+)")
 def _fetch_gsm8k_to(path: Path) -> None:
     from datasets import load_dataset  # type: ignore[import-not-found]
 
-    ds = load_dataset("openai/gsm8k", "main", split="test")
+    ds: Any = load_dataset("openai/gsm8k", "main", split="test")
     records = [{"question": r["question"], "answer": r["answer"]} for r in ds]
     path.write_text(json.dumps(records, indent=2), encoding="utf-8")
 
@@ -307,7 +307,7 @@ _MATH500_FILE = "math500.json"
 def _fetch_math500_to(path: Path) -> None:
     from datasets import load_dataset  # type: ignore[import-not-found]
 
-    ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
+    ds: Any = load_dataset("HuggingFaceH4/MATH-500", split="test")
     records = [
         {
             "problem": r["problem"],
@@ -360,7 +360,7 @@ _MMLU_PRO_FILE = "mmlu_pro.json"
 def _fetch_mmlu_pro_to(path: Path) -> None:
     from datasets import load_dataset  # type: ignore[import-not-found]
 
-    ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
+    ds: Any = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
     records = []
     for r in ds:
         letter = string.ascii_uppercase[r["answer_index"]]
@@ -420,7 +420,7 @@ _GPQA_FILE = "gpqa_diamond.json"
 def _fetch_gpqa_diamond_to(path: Path) -> None:
     from datasets import load_dataset  # type: ignore[import-not-found]
 
-    ds = load_dataset(
+    ds: Any = load_dataset(
         "Idavidrein/gpqa", "gpqa_diamond", split="train"
     )  # GPQA only ships a "train" split
     records = []
@@ -510,7 +510,7 @@ def _is_verifiable(instruction_ids: list[str]) -> bool:
 def _fetch_ifeval_to(path: Path) -> None:
     from datasets import load_dataset  # type: ignore[import-not-found]
 
-    ds = load_dataset("google/IFEval", split="train")
+    ds: Any = load_dataset("google/IFEval", split="train")
     records = []
     for r in ds:
         records.append(
