@@ -3331,17 +3331,19 @@ async def generate_chat(
     # Prompt caching applies to both streaming and non-streaming requests
     # (issue #342).  Disabled in distributed mode because rank 0 processes
     # only suffix tokens on cache hits while workers process the full
-    # prompt, causing all_sum call count mismatch and deadlock.  For the
-    # non-streaming path, also disabled when the inner generator does not
-    # consume ``prompt_cache``: ``mlx_vlm.generate`` accepts neither
-    # ``prompt_cache`` nor ``input_ids``, and the speculative decoder owns
-    # its own internal target/draft caches and would receive a misaligned
-    # suffix-only prompt on a cache hit.  Streaming behavior is unchanged.
+    # prompt, causing all_sum call count mismatch and deadlock.  Disabled
+    # for speculative regardless of stream mode (issue #346): the
+    # speculative decoder owns its own internal target/draft caches and
+    # would receive a misaligned suffix-only prompt on a cache hit —
+    # ``async_speculative_stream`` does not consume ``gen_kwargs['prompt_cache']``.
+    # Also disabled for VLMs on the non-streaming path because
+    # ``mlx_vlm.generate`` accepts neither ``prompt_cache`` nor ``input_ids``.
     use_prompt_cache = (
         settings.prompt_cache
         and make_prompt_cache is not None
         and not lm.is_distributed
-        and (stream or (not lm.is_vlm and not lm.is_speculative))
+        and not lm.is_speculative
+        and (stream or not lm.is_vlm)
     )
     prompt_tokens = None
     if use_prompt_cache:
