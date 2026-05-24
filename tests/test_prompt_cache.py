@@ -1253,6 +1253,84 @@ class TestNonStreamingCacheHit:
         assert lm.prompt_cache_store.get("") is None
 
 
+class TestStreamingSpeculativeCache:
+    """Issue #346: streaming + speculative must not feed the speculative
+    decoder a suffix-only prompt on a prompt-cache hit.
+
+    ``async_speculative_stream`` does not consume ``gen_kwargs['prompt_cache']``,
+    so if the cache layer rewrites ``prompt`` to the suffix tokens, the
+    speculative decoder will prefill against an incomplete context and
+    silently produce wrong output. The streaming gate must therefore
+    disable prompt cache when the model is speculative — matching the
+    existing non-streaming behavior."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_speculative_bypasses_cache(self, mock_manager):
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.speculative_decoder = MagicMock()  # makes is_speculative True
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50, 60, 70, 80])
+
+        # Pre-populate the cache so a hit would happen if the gate let it through.
+        existing_cache = [MagicMock()]
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50, 100, 101],
+                cache=existing_cache,
+            ),
+        )
+
+        spec_response = _make_gen_response(
+            "hi", 50, prompt_tokens=8, generation_tokens=1
+        )
+        spec_response.finish_reason = "stop"
+
+        def fake_spec_stream(*args, **kwargs):
+            yield spec_response
+
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        mock_mx = MagicMock()
+        mock_trim = MagicMock(return_value=0)
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.speculative_stream.speculative_stream_generate",
+                fake_spec_stream,
+            ),
+            patch("olmlx.engine.inference.make_prompt_cache", mock_make_cache),
+            patch("olmlx.engine.inference.trim_prompt_cache", mock_trim),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+            async for _ in gen:
+                pass
+
+        # Gate must short-circuit before the cache layer runs: no new cache
+        # created, no trim attempted on the pre-populated entry, and the
+        # pre-populated entry is left untouched (we did not consume or
+        # rewrite it).
+        mock_make_cache.assert_not_called()
+        mock_trim.assert_not_called()
+        stored = lm.prompt_cache_store.get("")
+        assert stored is not None and stored.cache is existing_cache
+
+
 class TestVlmUsesCache:
     def _setup_vlm(self, mock_manager):
         """Set up a VLM model for cache testing."""
