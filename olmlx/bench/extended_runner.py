@@ -89,6 +89,7 @@ class ModelRunResult:
     prompts: list[PromptResult] = field(default_factory=list)
     speed: dict[str, Any] = field(default_factory=dict)
     elapsed_seconds: float = 0.0
+    timed_out: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -260,14 +261,27 @@ async def _warmup(client: httpx.AsyncClient, model: str) -> float:
     return max(eval_count, 1) / max(elapsed, 0.001)
 
 
+# Per-model wall-clock cap. Once a model exceeds this many seconds in
+# run_model, we break out of the prompt loop, write what we have, and let
+# the orchestrator move on. Prevents a single pathological model
+# (e.g. flash-MoE thrashing on 503s) from eating the entire budget.
+PER_MODEL_TIMEOUT_SECONDS = 4 * 3600  # 4 hours
+
+
 async def run_model(
     model: str,
     tier: str,
     base_url: str,
     output_dir: Path,
     remaining_seconds: float,
+    per_model_timeout: float = PER_MODEL_TIMEOUT_SECONDS,
 ) -> ModelRunResult:
-    """Cold-load a model, warm it up, run the assigned suites, write JSON."""
+    """Cold-load a model, warm it up, run the assigned suites, write JSON.
+
+    Breaks out of the prompt loop if ``per_model_timeout`` seconds elapse,
+    so one slow/pathological model can't consume the entire wall-clock
+    budget. Partial results are still written.
+    """
     t_start = time.monotonic()
     async with httpx.AsyncClient(base_url=base_url) as client:
         warmup_tps = await _warmup(client, model)
@@ -285,7 +299,18 @@ async def run_model(
             ]
             suite_prompts.extend(extended_prompts)
         results: list[PromptResult] = []
+        timed_out = False
         for p in suite_prompts:
+            if time.monotonic() - t_start > per_model_timeout:
+                logger.warning(
+                    "Per-model timeout (%ds) reached for %s after %d prompts; "
+                    "breaking out and moving on.",
+                    int(per_model_timeout),
+                    model,
+                    len(results),
+                )
+                timed_out = True
+                break
             result = await _drive_prompt(client, model, p, suite_of(p.category))
             results.append(result)
             # Persist every prompt as it lands, so a mid-run crash leaves
@@ -308,6 +333,7 @@ async def run_model(
         composite=composite_score(per_suite),
         prompts=results,
         elapsed_seconds=time.monotonic() - t_start,
+        timed_out=timed_out,
     )
     write_result(output_dir, final)
     return final

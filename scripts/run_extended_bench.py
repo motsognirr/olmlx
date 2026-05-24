@@ -185,11 +185,22 @@ async def _run_all(
     t0 = time.monotonic()
     summary: list[dict[str, Any]] = []
 
+    # Import here so safe_model_name lives next to its only caller.
+    from olmlx.bench.extended_runner import safe_model_name
+
     for hf_path, alias in models:
         elapsed = time.monotonic() - t0
         remaining = budget_seconds - elapsed
         if remaining <= 0:
             log.warning("Budget exhausted before reaching %s — skipping.", hf_path)
+            continue
+
+        # Skip if a result already exists on disk for this model.
+        # The runner writes both partials and final JSONs to the same path,
+        # so re-running after a kill/crash naturally resumes at the next model.
+        existing = output_dir / "raw" / f"{safe_model_name(alias)}.json"
+        if existing.exists():
+            log.info("Skipping %s — result already exists at %s", hf_path, existing)
             continue
 
         tier_enum = tier_for(hf_path)
