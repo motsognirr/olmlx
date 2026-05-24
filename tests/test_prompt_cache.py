@@ -594,11 +594,15 @@ class TestCachePersistenceProbe:
         )
 
 
-class TestNonTrimmableModelSkipsTrim:
+class TestNonTrimmableModelSkipsCrossRequestReuse:
     @pytest.mark.asyncio
-    async def test_non_trimmable_skips_trim_call(self, mock_manager):
-        """When lm.supports_cache_trim is False and trim would be needed,
-        skip trim_prompt_cache entirely and create a fresh cache."""
+    async def test_non_trimmable_skips_cross_request_reuse(self, mock_manager):
+        """Issue #343: when lm.supports_cache_trim is False, the request
+        path early-exits at the lookup branch — disk lookup skipped, any
+        stale pre-PR entry removed (peek-gated), full prompt re-fed, a
+        fresh cache created, and trim_prompt_cache is never invoked.
+        The previous in-trim-block discard branch was removed; this test
+        guards the same observable outcome via the new early-exit."""
         from olmlx.engine.inference import generate_chat
         from olmlx.engine.model_manager import CachedPromptState
 
@@ -649,13 +653,13 @@ class TestNonTrimmableModelSkipsTrim:
             async for _chunk in gen:
                 pass
 
-        # Critical: trim_prompt_cache must NOT be called for non-trimmable models
+        # Early-exit invariants: trim never invoked, stale entry cleaned
+        # up, fresh cache created, full prompt fed to the stream.
         mock_trim.assert_not_called()
-        # Fresh cache was created and used
+        assert lm.prompt_cache_store.peek("") is None
         mock_make_cache.assert_called_once_with(lm.model)
         call_args = mock_async_stream.call_args
         assert call_args[1].get("prompt_cache") is fresh_cache
-        # Full prompt passed
         assert call_args.args[2] == [10, 20, 30, 40, 50, 60, 70, 80]
 
     @pytest.mark.asyncio
