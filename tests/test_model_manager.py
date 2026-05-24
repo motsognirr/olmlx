@@ -732,6 +732,186 @@ class TestProbeCacheCapabilities:
         # Persistence: no evidence of safety → False.
         assert lm.supports_cache_persistence is False
 
+    def test_non_trimmable_layout_disables_persistence(self, registry, mock_store):
+        """Issue #343: a layout containing a ``RotatingKVCache`` layer makes
+        the cache non-trimmable.  In real chat flow the stored prompt +
+        generated tokens can never be aligned with the next request's
+        client-supplied assistant message (which retokenizes differently
+        from the model's actual generation), so every cache lookup fails
+        the trim check and is discarded.  The bug is upstream: storing
+        any cross-request state for these models is wasted disk + Metal
+        I/O.  Treat them like ``ArraysCache`` (#284) — disable persistence
+        at probe time and short-circuit the store/load path entirely."""
+
+        class _FakeRotating:
+            pass
+
+        _FakeRotating.__name__ = "RotatingKVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+        # Start with persistence True to make the test failure mode
+        # unambiguous: the probe must actively flip it back to False.
+        lm.supports_cache_persistence = True
+
+        probe_cache = [_FakeRotating(), _FakeRotating()]
+        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is False
+        assert lm.supports_cache_persistence is False
+
+    def test_chunked_kv_cache_layout_disables_persistence(self, registry, mock_store):
+        """``ChunkedKVCache`` is the other non-trimmable layout cited by
+        #343 and CLAUDE.md (mlx-lm's chunk-based cache; affects newer
+        Apple-published checkpoints).  Like ``RotatingKVCache`` it sits
+        in the persist allowlist but not the trim allowlist, so the
+        #343 fold must force the effective persist flag to False.
+        Companion to ``test_non_trimmable_layout_disables_persistence``
+        — guards against a future contributor accidentally promoting
+        ``ChunkedKVCache`` into ``_TRIMMABLE_CACHE_CLASSES`` when
+        adding support for a new model family and silently re-enabling
+        the wasted store-then-discard cycle this PR removes."""
+
+        class _FakeChunked:
+            pass
+
+        _FakeChunked.__name__ = "ChunkedKVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+        lm.supports_cache_persistence = True
+
+        probe_cache = [_FakeChunked(), _FakeChunked()]
+        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is False
+        assert lm.supports_cache_persistence is False
+
+    def test_mixed_layout_kv_plus_rotating_disables_persistence(
+        self, registry, mock_store
+    ):
+        """Real Gemma 4 layout: full-attention layers produce ``KVCache``
+        (trimmable + persistable), sliding-window layers produce
+        ``RotatingKVCache`` (non-trimmable, layout-persistable).  With
+        ``all(...)`` semantics in both allowlist checks, the mixed list
+        reports trim=False (RotatingKVCache breaks the universal
+        quantifier) and layout-persist=True (both classes are in the
+        persist allowlist) — so the #343 fold takes effect and forces
+        the effective persist flag to False.  This guards against a
+        future allowlist change silently breaking the universal
+        quantifier on the heterogeneous layout that the affected models
+        actually use."""
+
+        class _FakeKV:
+            pass
+
+        class _FakeRotating:
+            pass
+
+        _FakeKV.__name__ = "KVCache"
+        _FakeRotating.__name__ = "RotatingKVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+        lm.supports_cache_persistence = True
+
+        probe_cache = [_FakeKV(), _FakeRotating(), _FakeKV(), _FakeRotating()]
+        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is False
+        assert lm.supports_cache_persistence is False
+
+    def test_trimmable_layout_keeps_persistence(self, registry, mock_store):
+        """Guard the inverse: a fully trimmable layout (plain ``KVCache``
+        layers) must still report persistence True after the #343 fix.
+        Otherwise the fix would silently disable cache reuse for the
+        primary supported model family (Qwen3, Llama-3, etc.)."""
+
+        class _FakeKV:
+            pass
+
+        _FakeKV.__name__ = "KVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+
+        probe_cache = [_FakeKV(), _FakeKV()]
+        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is True
+        assert lm.supports_cache_persistence is True
+
+    def test_non_trimmable_persistable_layout_logs_343(
+        self, registry, mock_store, caplog
+    ):
+        """A hybrid sliding-window layout (RotatingKVCache) is in the
+        persist allowlist but not the trim allowlist.  After #343 the
+        probe forces persistence False; the load-time log must cite
+        #343 and reference the RotatingKVCache family — not #284 or
+        ArraysCache."""
+        import logging
+
+        class _FakeRotating:
+            pass
+
+        _FakeRotating.__name__ = "RotatingKVCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+
+        with (
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[_FakeRotating(), _FakeRotating()],
+            ),
+            caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"),
+        ):
+            manager._probe_cache_capabilities(lm)
+
+        assert "issue #343" in caplog.text
+        # #284 is the ArraysCache reason — must not be attributed here.
+        assert "issue #284" not in caplog.text
+        assert "RotatingKVCache" in caplog.text or "sliding-window" in caplog.text
+
+    def test_non_persistable_layout_logs_284(self, registry, mock_store, caplog):
+        """A hybrid SSM layout (ArraysCache) is in neither allowlist:
+        trim=False, layout-persist=False.  The load-time log must cite
+        #284 / ArraysCache — not #343 / RotatingKVCache.  This is the
+        regression the first PR cut of #343 introduced: gating the
+        secondary log on ``supports_cache_trim`` made it unreachable for
+        ArraysCache models, and the non-trimmable log misattributed them
+        as RotatingKVCache + #343."""
+        import logging
+
+        class _FakeArrays:
+            pass
+
+        _FakeArrays.__name__ = "ArraysCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+
+        with (
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[_FakeArrays(), _FakeArrays()],
+            ),
+            caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"),
+        ):
+            manager._probe_cache_capabilities(lm)
+
+        assert lm.supports_cache_trim is False
+        assert lm.supports_cache_persistence is False
+        assert "issue #284" in caplog.text
+        # #343 is the RotatingKVCache reason — must not be attributed
+        # to ArraysCache models.
+        assert "issue #343" not in caplog.text
+        assert "RotatingKVCache" not in caplog.text
+
     def test_probe_failure_warns_and_disables_persistence(
         self, registry, mock_store, caplog
     ):
