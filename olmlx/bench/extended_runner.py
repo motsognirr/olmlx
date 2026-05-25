@@ -265,7 +265,20 @@ async def _warmup(client: httpx.AsyncClient, model: str) -> float:
 # run_model, we break out of the prompt loop, write what we have, and let
 # the orchestrator move on. Prevents a single pathological model
 # (e.g. flash-MoE thrashing on 503s) from eating the entire budget.
-PER_MODEL_TIMEOUT_SECONDS = 4 * 3600  # 4 hours
+#
+# Reduced from 4h to 2h after the first run produced a single 6h-long
+# model. The per-prompt asyncio.wait_for below enforces this hard;
+# loop-top check alone proved insufficient (one model ran 6h apparently
+# without ever re-entering the check — likely because each per-prompt
+# await took 2-3 min and at boundary checks we were "just under" the
+# threshold each time, or something with monotonic in async context).
+PER_MODEL_TIMEOUT_SECONDS = 2 * 3600  # 2 hours
+
+# Per-prompt hard cap. asyncio.wait_for cancels the underlying HTTP
+# request if it exceeds this, guaranteeing the for-loop never blocks
+# longer than this on a single prompt. Backstop against the httpx
+# timeout=600 silently failing to enforce.
+PER_PROMPT_TIMEOUT_SECONDS = 600  # 10 min — same as httpx; double-protects
 
 
 async def run_model(
@@ -300,8 +313,10 @@ async def run_model(
             suite_prompts.extend(extended_prompts)
         results: list[PromptResult] = []
         timed_out = False
+        deadline = t_start + per_model_timeout
         for p in suite_prompts:
-            if time.monotonic() - t_start > per_model_timeout:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 logger.warning(
                     "Per-model timeout (%ds) reached for %s after %d prompts; "
                     "breaking out and moving on.",
@@ -311,7 +326,32 @@ async def run_model(
                 )
                 timed_out = True
                 break
-            result = await _drive_prompt(client, model, p, suite_of(p.category))
+            # asyncio.wait_for() cancels the underlying HTTP request if it
+            # exceeds the prompt budget — hard backstop against any single
+            # prompt hanging the loop. min(remaining, per-prompt cap) so we
+            # never wait longer than the per-model budget for one prompt.
+            prompt_timeout = min(remaining, PER_PROMPT_TIMEOUT_SECONDS)
+            try:
+                result = await asyncio.wait_for(
+                    _drive_prompt(client, model, p, suite_of(p.category)),
+                    timeout=prompt_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Prompt %s on %s exceeded %.0fs wait_for; recording as timeout",
+                    p.name,
+                    model,
+                    prompt_timeout,
+                )
+                result = PromptResult(
+                    name=p.name,
+                    category=p.category,
+                    suite=suite_of(p.category),
+                    passed=False,
+                    score=0.0,
+                    detail=f"asyncio.wait_for timeout after {prompt_timeout:.0f}s",
+                    output_text_clip="",
+                )
             results.append(result)
             # Persist every prompt as it lands, so a mid-run crash leaves
             # partial progress on disk rather than nothing.
