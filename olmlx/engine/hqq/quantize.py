@@ -127,8 +127,11 @@ class HQQLinear(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         w = mx.dequantize(
-            self._quant_weight, self._scales, self._biases,
-            self._group_size, self._bits,
+            self._quant_weight,
+            self._scales,
+            self._biases,
+            self._group_size,
+            self._bits,
         )
         y = x @ w.T
         if "_bias" in self:

@@ -64,9 +64,9 @@ def main() -> None:
     random.seed(42)
 
     shapes = [
-        (4096, 4096),    # large FFN layer
-        (4096, 1024),    # attention projection
-        (8192, 2048),    # MoE expert
+        (4096, 4096),  # large FFN layer
+        (4096, 1024),  # attention projection
+        (8192, 2048),  # MoE expert
     ]
 
     print("HQQ vs MLX Native Quantization Benchmark")

@@ -31,15 +31,9 @@ def validate_weight_quant_format(v: str | None) -> str | None:
         )
     method, bits = parts[0], parts[1]
     if method != "hqq":
-        raise ValueError(
-            f"Invalid weight_quant method={method!r}. "
-            f"Expected 'hqq'."
-        )
+        raise ValueError(f"Invalid weight_quant method={method!r}. Expected 'hqq'.")
     if bits not in ("4", "8"):
-        raise ValueError(
-            f"Invalid weight_quant bits={bits!r}. "
-            f"Expected '4' or '8'."
-        )
+        raise ValueError(f"Invalid weight_quant bits={bits!r}. Expected '4' or '8'.")
     if len(parts) == 3:
         try:
             gs = int(parts[2])
