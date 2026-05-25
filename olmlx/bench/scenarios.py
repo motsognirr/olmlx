@@ -262,6 +262,31 @@ SCENARIOS: list[Scenario] = [
         },
         should_skip=_requires_flash_moe,
     ),
+    Scenario(
+        name="pld",
+        description=(
+            "Prompt-lookup decoding (no draft model). "
+            "Pulls drafts from n-gram matches in the prompt+generated "
+            "history — strong on code edits, JSON, and repeated context."
+        ),
+        env_overrides={
+            "OLMLX_SPECULATIVE": "true",
+            "OLMLX_SPECULATIVE_STRATEGY": "pld",
+        },
+    ),
+    Scenario(
+        name="pld+flash_moe",
+        description=(
+            "Prompt-lookup decoding on top of Flash-MoE. PLD is the only "
+            "speculative strategy that composes with Flash-MoE."
+        ),
+        env_overrides={
+            "OLMLX_FLASH_MOE": "true",
+            "OLMLX_SPECULATIVE": "true",
+            "OLMLX_SPECULATIVE_STRATEGY": "pld",
+        },
+        should_skip=_requires_flash_moe,
+    ),
     # Distributed scenarios — require a valid hostfile with 2+ hosts and SSH
     # connectivity. The model used is taken from the hostfile's "model" field,
     # not the --model CLI flag. These launch `olmlx serve` as a real server.

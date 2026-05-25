@@ -123,14 +123,24 @@ class Settings(BaseSettings):
     #   most targets, at the cost of being autoregressive (one draft
     #   forward per drafted token). Requires a draft whose ``config.json``
     #   carries an ``eagle_config`` block.
-    # ``speculative_tokens`` is reused as DFlash's ``block_size`` and as
-    # EAGLE's per-verify draft-token count. ``None`` means "use the
-    # strategy default": 4 for classic, the draft model's pre-trained
-    # ``block_size`` for DFlash and EAGLE.
+    # - ``pld``: prompt-lookup decoding. No draft model — the "draft" comes
+    #   from n-gram lookup in the prompt+generated history. Free acceptance
+    #   on code edits, repeated context, and JSON/structured replies. Only
+    #   speculative strategy that composes with Flash-MoE.
+    # ``speculative_tokens`` is reused as DFlash's ``block_size``, EAGLE's
+    # per-verify draft-token count, and PLD's max draft length. ``None``
+    # means "use the strategy default": 4 for classic, 10 for PLD, the
+    # draft model's pre-trained ``block_size`` for DFlash and EAGLE.
     speculative: bool = False
-    speculative_strategy: Literal["classic", "dflash", "eagle"] = "classic"
+    speculative_strategy: Literal["classic", "dflash", "eagle", "pld"] = "classic"
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] | None = None
+    #: PLD-only knobs (ignored by other strategies). N-gram sizes for the
+    #: prompt-lookup search: try sizes from ``max`` down to ``min``,
+    #: returning the first match found. Smaller n-grams match more often
+    #: but yield noisier drafts; larger n-grams are more precise.
+    speculative_pld_max_ngram: Annotated[int, Field(gt=0)] = 3
+    speculative_pld_min_ngram: Annotated[int, Field(gt=0)] = 1
 
     # Flash inference (LLM in a Flash). Primary, user-facing knobs.
     # Advanced tuning (window size, IO threads, cache budget, predictor
@@ -170,6 +180,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "OLMLX_KV_CACHE_AUTO_CALIBRATE=true requires "
                 "OLMLX_KV_CACHE_QUANT=spectral:<bits>"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_pld_ngram_range(self) -> "Settings":
+        if self.speculative_pld_min_ngram > self.speculative_pld_max_ngram:
+            raise ValueError(
+                f"speculative_pld_min_ngram ({self.speculative_pld_min_ngram}) "
+                f"must be <= speculative_pld_max_ngram "
+                f"({self.speculative_pld_max_ngram})"
             )
         return self
 

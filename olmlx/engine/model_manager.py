@@ -2852,6 +2852,61 @@ class ModelManager:
             num_speculative_tokens=num_tokens,
         )
 
+    def _load_pld_decoder(
+        self,
+        target_model: Any,
+        spec_config: SpeculativeConfig,
+        *,
+        is_vlm: bool = False,
+    ) -> Any:
+        """Construct a PromptLookupDecoder (no draft model required).
+
+        For VLM targets, decoder runs on the unwrapped language model so
+        the prompt-cache state is the same one mlx-vlm's generate would
+        touch.
+        """
+        from olmlx.config import settings
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        if not spec_config.enabled:
+            raise RuntimeError(
+                "_load_pld_decoder called with spec_config.enabled=False"
+            )
+        # PLD default max-draft is 10 (Saxena's reference value); classic
+        # speculative defaults to 4 but the regime is different — PLD's
+        # per-step compute is dominated by the target forward whose cost
+        # scales sub-linearly with draft length up to a point.
+        num_tokens = spec_config.num_tokens if spec_config.num_tokens is not None else 10
+        if spec_config.draft_model:
+            logger.warning(
+                "speculative_strategy='pld' ignores speculative_draft_model "
+                "(%s) — PLD has no draft model.",
+                spec_config.draft_model,
+            )
+
+        if is_vlm:
+            pld_target = getattr(target_model, "language_model", None)
+            if pld_target is None:
+                raise ValueError(
+                    "VLM model does not expose .language_model; PLD "
+                    "requires direct access to the text decoder"
+                )
+        else:
+            pld_target = target_model
+
+        logger.info(
+            "Constructing PLD decoder (max_draft=%d, ngram=%d..%d)",
+            num_tokens,
+            settings.speculative_pld_min_ngram,
+            settings.speculative_pld_max_ngram,
+        )
+        return PromptLookupDecoder(
+            target_model=pld_target,
+            num_speculative_tokens=num_tokens,
+            max_ngram_size=settings.speculative_pld_max_ngram,
+            min_ngram_size=settings.speculative_pld_min_ngram,
+        )
+
     def _is_flash_enabled(self, flash_config: ResolvedFlashConfig) -> bool:
         return flash_config.enabled
 
@@ -3168,9 +3223,14 @@ class ModelManager:
                     hf_path, load_path, flash_moe_dir, flash_moe_config=flash_moe_config
                 )
                 if spec_enabled:
-                    decoder = self._load_speculative_decoder(
-                        model, hf_path, spec_config, is_vlm=is_vlm
-                    )
+                    if spec_config.strategy == "pld":
+                        decoder = self._load_pld_decoder(
+                            model, spec_config, is_vlm=is_vlm
+                        )
+                    else:
+                        decoder = self._load_speculative_decoder(
+                            model, hf_path, spec_config, is_vlm=is_vlm
+                        )
                     return model, tokenizer, is_vlm, caps, decoder
                 return model, tokenizer, is_vlm, caps, None
 
@@ -3178,7 +3238,19 @@ class ModelManager:
         if self._is_flash_enabled(flash_config):
             flash_dir = self._flash_dir(hf_path)
             if flash_dir is not None:
-                if spec_enabled:
+                # PLD has no draft model and can ride on top of a Flash
+                # wrapper without conflicting with the Flash speculative
+                # path — wire it through after the wrap. Other strategies
+                # collide with ``flash_speculative`` and are warned/ignored
+                # to preserve the prior behaviour.
+                pld_requested = (
+                    spec_enabled and spec_config.strategy == "pld"
+                )
+                if (
+                    spec_enabled
+                    and not pld_requested
+                    and not flash_config.flash_speculative
+                ):
                     logger.warning(
                         "OLMLX_SPECULATIVE is enabled but %s is loaded via "
                         "Flash, which uses OLMLX_FLASH_SPECULATIVE "
@@ -3186,13 +3258,24 @@ class ModelManager:
                         "setting will be ignored.",
                         hf_path,
                     )
-                return self._load_flash_model(
+                if pld_requested and flash_config.flash_speculative:
+                    raise ValueError(
+                        "Cannot enable both flash_speculative and "
+                        "speculative_strategy='pld' on the same model. "
+                        "Pick one."
+                    )
+                model, tokenizer, is_vlm, caps, decoder = self._load_flash_model(
                     hf_path,
                     load_path,
                     flash_dir,
                     model_exp=model_exp,
                     flash_config=flash_config,
                 )
+                if pld_requested:
+                    decoder = self._load_pld_decoder(
+                        model, spec_config, is_vlm=is_vlm
+                    )
+                return model, tokenizer, is_vlm, caps, decoder
 
         kind = self._detect_model_kind(hf_path)
         logger.info("Detected model kind for %s: %s", hf_path, kind)
@@ -3225,9 +3308,14 @@ class ModelManager:
                         "speculative instead"
                     )
                 if spec_enabled:
-                    decoder = self._load_speculative_decoder(
-                        model, hf_path, spec_config, is_vlm=True
-                    )
+                    if spec_config.strategy == "pld":
+                        decoder = self._load_pld_decoder(
+                            model, spec_config, is_vlm=True
+                        )
+                    else:
+                        decoder = self._load_speculative_decoder(
+                            model, hf_path, spec_config, is_vlm=True
+                        )
                     return model, processor, True, caps, decoder
                 return model, processor, True, caps, None
             except OSError as exc:
@@ -3251,6 +3339,8 @@ class ModelManager:
                 decoder = self._load_dflash_decoder(model, spec_config)
             elif spec_config.strategy == "eagle":
                 decoder = self._load_eagle_decoder(model, spec_config)
+            elif spec_config.strategy == "pld":
+                decoder = self._load_pld_decoder(model, spec_config)
             else:
                 decoder = self._load_speculative_decoder(model, hf_path, spec_config)
             return model, tokenizer, is_vlm, caps, decoder
