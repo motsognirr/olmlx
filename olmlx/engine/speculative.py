@@ -795,9 +795,10 @@ class PromptLookupDecoder:
         """
         self.reset()
 
-        if make_prompt_cache is None or trim_prompt_cache is None:
-            raise RuntimeError("mlx_lm.models.cache not available; cannot use PLD")
-
+        # ``__init__`` already enforces ``make_prompt_cache`` /
+        # ``trim_prompt_cache`` non-None at construction, so any
+        # ``PromptLookupDecoder`` that reaches this point has them.
+        # No need to re-check.
         self._target_cache = make_prompt_cache(self._target)
 
         # Same VLM cache-reset rationale as ``SpeculativeDecoder.prefill``.
@@ -836,8 +837,15 @@ class PromptLookupDecoder:
         ``(accepted_tokens, num_draft_proposed)`` — the second value is the
         *actual* draft length (0..lambda), not the configured maximum.
         """
-        assert self._target_cache is not None, "Call prefill() before step()"
-        assert self._pending_token is not None, "Call prefill() before step()"
+        # Explicit ``raise`` (not ``assert``) so the misuse still
+        # surfaces under ``python -O`` — otherwise the stripped
+        # asserts let ``None`` fall through and produce a confusing
+        # ``TypeError`` from the target forward a few lines below.
+        if self._target_cache is None or self._pending_token is None:
+            raise RuntimeError(
+                "PromptLookupDecoder.step() called before prefill(); "
+                "call prefill(prompt) first"
+            )
 
         pending_token = self._pending_token
 
