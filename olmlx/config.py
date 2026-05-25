@@ -197,13 +197,24 @@ class Settings(BaseSettings):
         # valid config that never activates PLD. The per-model
         # resolution in ``ModelConfig.resolved_speculative`` does the
         # equivalent cross-field check when PLD actually loads.
-        if (
-            self.speculative_strategy == "pld"
-            and self.speculative_pld_min_ngram > self.speculative_pld_max_ngram
-        ):
+        if self.speculative_strategy != "pld":
+            return self
+        if self.speculative_pld_min_ngram > self.speculative_pld_max_ngram:
             raise ValueError(
                 f"speculative_pld_min_ngram ({self.speculative_pld_min_ngram}) "
                 f"must be <= speculative_pld_max_ngram "
+                f"({self.speculative_pld_max_ngram})"
+            )
+        # Parallel to the per-model ``ModelConfig.__post_init__`` check
+        # — without this, a bad env pair like ``MAX_NGRAM=3
+        # LOOKUP_WINDOW=1`` would pass startup and only blow up at
+        # first model load with a confusing stack trace from
+        # ``resolved_speculative``.
+        if self.speculative_pld_lookup_window < self.speculative_pld_max_ngram:
+            raise ValueError(
+                f"speculative_pld_lookup_window "
+                f"({self.speculative_pld_lookup_window}) must be >= "
+                f"speculative_pld_max_ngram "
                 f"({self.speculative_pld_max_ngram})"
             )
         return self

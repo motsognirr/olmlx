@@ -535,10 +535,11 @@ class ModelConfig:
         # values may produce inverted/under-sized pairs that pass each
         # layer's local validation. ``Settings`` and
         # ``ModelConfig.__post_init__`` catch within-layer cases; these
-        # catch the cross-layer ones. Scoped to ``strategy == 'pld'``
-        # so a misconfigured PLD pair doesn't break every model load
-        # (classic/dflash/eagle never read these fields).
-        if strategy == "pld":
+        # catch the cross-layer ones. Scoped to ``enabled and
+        # strategy == 'pld'`` so a model that has stray PLD knobs but
+        # disables speculative (or runs classic/dflash/eagle) doesn't
+        # fail to load on a config it would never read.
+        if enabled and strategy == "pld":
             if pld_min_ngram > pld_max_ngram:
                 raise ValueError(
                     f"Resolved speculative_pld_min_ngram ({pld_min_ngram}) "

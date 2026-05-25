@@ -763,6 +763,10 @@ class PromptLookupDecoder:
         self._stats_steps = 0
         self._stats_proposed = 0
         self._stats_accepted_draft = 0
+        # Reset EMA too; ``stats_summary`` is documented as "PLD's
+        # acceptance rate before any step is honestly 0", and that
+        # invariant must hold per-request, not just per-decoder.
+        self._alpha = 0.0
 
     def stats_summary(self) -> dict[str, Any]:
         steps = self._stats_steps
@@ -961,17 +965,20 @@ class PromptLookupDecoder:
                         break
                 if not match:
                     continue
-                # ``start`` is constrained to ``[0, query_start - 1]``
-                # so ``draft_start = start + ngram_size`` is in
-                # ``[ngram_size, L - 1]``. Combined with ``lambda >= 1``,
-                # ``draft`` always contains at least one token, so a
-                # match returns unconditionally. Edge case: when
-                # ``start == query_start - 1`` (the closest match), the
-                # only draft token is ``_seq(L-1) == pending`` — the
-                # decoder proposes the pending token as its own
-                # successor. That's a valid (if unusual) proposal;
-                # verification accepts or rejects it like any other.
+                # Cap ``draft_end`` at ``L - 1`` to exclude the pending
+                # token itself from the draft. The closest-possible
+                # match (``start = query_start - 1``) would otherwise
+                # produce ``draft = [pending]`` — asking the target to
+                # predict the same token twice in a row. That's almost
+                # always rejected and wastes a draft slot's worth of
+                # acceptance-rate accounting. Excluding pending makes
+                # this match yield an empty draft; we fall through to
+                # an earlier match position or a smaller n-gram size.
                 draft_start = start + ngram_size
-                draft_end = min(draft_start + self._lambda, L)
-                return [_seq(i) for i in range(draft_start, draft_end)]
+                draft_end = min(draft_start + self._lambda, L - 1)
+                if draft_end > draft_start:
+                    return [_seq(i) for i in range(draft_start, draft_end)]
+                # Empty draft (this match position only proposed
+                # pending). Continue to earlier match positions at the
+                # current n-gram size, then to smaller n-gram sizes.
         return []

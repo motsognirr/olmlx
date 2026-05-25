@@ -52,43 +52,70 @@ class TestLookupDraft:
 
     def test_unigram_match_returns_following_tokens(self, decoder):
         """A 1-gram match returns the tokens after the matching position."""
-        # Sequence: [9, 7, 8, 5, 4, 9]. Trailing query=[9] at index 5;
-        # matches at position 0 (only prior occurrence). Tokens after
-        # position 0 are seq[1:6] = [7, 8, 5, 4, 9] — capped at
-        # lambda=5. The trailing 9 reappears as the 5th draft token by
-        # coincidence; that's fine — PLD will let target verification
-        # accept or reject it.
+        # Sequence: [9, 7, 8, 5, 4, 9] (L=6). Trailing query=[9] at
+        # index 5; matches at position 0. Tokens after position 0
+        # would be seq[1:6] = [7, 8, 5, 4, 9], but the pending token
+        # at position L-1 is excluded from drafts (predicting pending
+        # as its own successor wastes a slot). So draft = seq[1:5] =
+        # [7, 8, 5, 4].
         self._seed(decoder, [9, 7, 8, 5, 4, 9])
-        assert decoder._lookup_draft() == [7, 8, 5, 4, 9]
+        assert decoder._lookup_draft() == [7, 8, 5, 4]
 
     def test_ngram_size_preference(self, decoder):
         """Longest n-gram wins: a 3-gram match preempts a shorter 2-gram match."""
-        # Sequence: [1, 2, 3, 4, 7, 1, 2, 3]. Trailing 3-gram=[1, 2, 3]
-        # at index 5; matches at position 0; draft_start=3; draft
-        # extends seq[3:8] = [4, 7, 1, 2, 3] (capped at lambda=5).
-        # The shorter 2-gram [2, 3] also matches at position 1 but is
-        # not consulted because a longer n-gram already won.
+        # Sequence: [1, 2, 3, 4, 7, 1, 2, 3] (L=8). Trailing 3-gram=
+        # [1, 2, 3] at index 5; matches at position 0; draft_start=3;
+        # draft extends seq[3:7] = [4, 7, 1, 2] (pending at index 7
+        # is excluded from drafts). The shorter 2-gram [2, 3] also
+        # matches at position 1 but isn't consulted because a longer
+        # n-gram already won.
         self._seed(decoder, [1, 2, 3, 4, 7, 1, 2, 3])
-        assert decoder._lookup_draft() == [4, 7, 1, 2, 3]
+        assert decoder._lookup_draft() == [4, 7, 1, 2]
 
     def test_most_recent_match_wins(self, decoder):
         """When multiple positions match the trailing n-gram, prefer the latest."""
         # Sequence: [5, 6, 9, 5, 6, 7, 8, 5, 6] (L=9). The trailing
-        # 3-gram [8, 5, 6] doesn't recur, so we drop to 2-gram. Trailing
-        # 2-gram=[5, 6] at index 7 matches at positions 0 and 3; the
-        # most recent (position 3) wins. draft_start=5; seq[5:9] =
-        # [7, 8, 5, 6] (bounded by sequence length, not lambda).
+        # 3-gram [8, 5, 6] doesn't recur, so we drop to 2-gram.
+        # Trailing 2-gram=[5, 6] at index 7 matches at positions 0
+        # and 3; the most recent (position 3) wins. draft_start=5;
+        # seq[5:8] = [7, 8, 5] (pending at index 8 is excluded).
         self._seed(decoder, [5, 6, 9, 5, 6, 7, 8, 5, 6])
-        assert decoder._lookup_draft() == [7, 8, 5, 6]
+        assert decoder._lookup_draft() == [7, 8, 5]
 
-    def test_trailing_query_excluded(self, decoder):
-        """The trailing n-gram itself must not be returned as its own match."""
-        # Sequence: [9, 9]. Trailing 1-gram=[9]; the only other position
-        # is 0 (also a 9), which counts. Tokens after position 0 are
-        # [9] — that's the trailing query, but as a *following* token
-        # of a valid prior match it's a legitimate draft.
+    def test_closest_match_pending_only_yields_empty(self, decoder):
+        """A closest-possible match whose only draft candidate would be
+        ``pending`` itself yields an empty draft (PLD doesn't propose
+        the pending token as its own successor — verification almost
+        always rejects, wasting a slot).
+
+        Sequence: [9, 9] (L=2). Trailing 1-gram=[9] at index 1;
+        match at start=0; draft_start=1; draft_end=min(1+5, L-1)=1;
+        draft = []. No earlier match exists at this n-gram size, no
+        smaller n-gram is valid, so the function returns []."""
         self._seed(decoder, [9, 9])
-        assert decoder._lookup_draft() == [9]
+        assert decoder._lookup_draft() == []
+
+    def test_closest_match_empty_falls_through_to_earlier_match(self, decoder):
+        """When the closest match position would yield only the pending
+        token, the lookup falls through to an earlier match at the same
+        n-gram size if one exists, instead of returning empty.
+
+        Sequence: [3, 7, 7, 3] (L=4). Trailing 1-gram=[3] at index 3
+        matches at:
+          - start=2 (seq[2]=7? no) — actually only start=0 (seq[0]=3).
+        So only one match; draft_start=1; draft=[7,7]. (The pending
+        rep edge isn't exercised here; the test below has the
+        explicit fall-through case.)
+        """
+        # Two matches: closest is degenerate (only pending follows),
+        # earlier one yields real tokens. Sequence: [5, 1, 2, 5, 5].
+        # Trailing 1-gram=[5] at index 4. Matches at start=3 (seq[3]=5)
+        # and start=0 (seq[0]=5). Walking backwards from index 3:
+        #   - start=3: draft_start=4; draft_end=min(4+5, 4)=4 → empty.
+        #   - start=0: draft_start=1; draft_end=min(1+5, 4)=4 →
+        #     [1, 2, 5]. Returns [1, 2, 5].
+        self._seed(decoder, [5, 1, 2, 5, 5])
+        assert decoder._lookup_draft() == [1, 2, 5]
 
     def test_caps_at_lambda(self, decoder):
         """Draft is capped at ``num_speculative_tokens``."""
