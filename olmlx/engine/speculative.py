@@ -669,12 +669,14 @@ class PromptLookupDecoder:
         num_speculative_tokens: int = 10,
         max_ngram_size: int = 3,
         min_ngram_size: int = 1,
+        lookup_window: int | None = 8192,
         acceptance_rate_ema: float = 0.9,
     ):
-        if trim_prompt_cache is None:
+        if trim_prompt_cache is None or make_prompt_cache is None:
             raise RuntimeError(
-                "trim_prompt_cache is unavailable (mlx-lm import missing); "
-                "PLD requires it for correct cache trimming"
+                "mlx_lm.models.cache imports failed (trim_prompt_cache / "
+                "make_prompt_cache unavailable); PLD requires both — fail "
+                "fast at construction rather than crashing on first prefill"
             )
         if num_speculative_tokens < 1:
             raise ValueError(
@@ -686,10 +688,20 @@ class PromptLookupDecoder:
                 f"max={max_ngram_size}. Must satisfy "
                 f"1 <= min_ngram_size <= max_ngram_size."
             )
+        if lookup_window is not None and lookup_window < max_ngram_size:
+            raise ValueError(
+                f"lookup_window ({lookup_window}) must be >= max_ngram_size "
+                f"({max_ngram_size}) or None. A window smaller than the "
+                f"largest n-gram makes that n-gram unmatchable."
+            )
         self._target = target_model
         self._lambda = num_speculative_tokens
         self._max_ngram = max_ngram_size
         self._min_ngram = min_ngram_size
+        #: Cap on how many of the most recent ``_tokens`` entries the
+        #: n-gram scan walks. ``None`` disables the cap. The pending
+        #: token is always included regardless of this window.
+        self._lookup_window = lookup_window
         self._alpha = 0.5
         self._alpha_ema = acceptance_rate_ema
 
@@ -860,13 +872,15 @@ class PromptLookupDecoder:
         # plus the pending token plus the first (num_accepted - 1)
         # accepted tokens; the final accepted token (the bonus from
         # verify_draft_greedy) becomes the new pending and is *not* in
-        # the cache yet.
+        # the cache yet. Unlike ``SpeculativeDecoder.step``, we derive
+        # the next pending from ``accepted[-1]`` directly — verify
+        # already did the argmax — so we don't store or eval the
+        # corresponding logit (it would force a Metal round-trip for a
+        # tensor that's immediately discarded).
         self._tokens.append(pending_token)
         if num_accepted > 1:
             self._tokens.extend(accepted[:-1])
         self._cache_seq_len += num_accepted
-        self._last_target_logit = verification_logits[num_accepted - 1]
-        mx.eval(self._last_target_logit)
         self._pending_token = int(accepted[-1])
 
         # 6. Stats. EMA only updates when something was proposed —
@@ -894,18 +908,21 @@ class PromptLookupDecoder:
         occurrence itself) and returns the tokens immediately following
         that match. Returns ``[]`` if no n-gram of any size matches.
 
-        The search corpus is ``self._tokens + [self._pending_token]`` —
-        the pending token is the most recent emitted token and must
-        participate in the lookup so that drafts can match across the
-        prompt/generation boundary.
+        The search corpus is the most recent ``_lookup_window`` tokens
+        of ``self._tokens`` plus ``self._pending_token`` — the pending
+        token is always included so drafts can match across the
+        prompt/generation boundary. The window cap exists because the
+        scan is pure Python and grows with history length: an
+        unbounded history at 128k tokens would add ~30–80 ms per step
+        on Apple Silicon, rivalling the target forward.
         """
-        # Avoid materialising the concatenated list on every step; index
-        # the virtual sequence by offset instead. For a 4k-context with
-        # ``max_ngram=3``, even the slow path is < 12k integer compares
-        # in pure Python — well under one forward pass.
-        history = self._tokens
         pending = self._pending_token
         assert pending is not None
+        full_history = self._tokens
+        if self._lookup_window is not None and len(full_history) > self._lookup_window:
+            history = full_history[-self._lookup_window :]
+        else:
+            history = full_history
         L = len(history) + 1  # virtual sequence length
 
         def _seq(i: int) -> int:
@@ -929,10 +946,12 @@ class PromptLookupDecoder:
                         break
                 if not match:
                     continue
+                # ``start`` is constrained to ``[0, query_start - 1]``
+                # so ``draft_start = start + ngram_size`` is in
+                # ``[ngram_size, L - 1]``. Combined with ``lambda >= 1``,
+                # ``draft`` always contains at least one token, so a
+                # match returns unconditionally.
                 draft_start = start + ngram_size
                 draft_end = min(draft_start + self._lambda, L)
-                draft = [_seq(i) for i in range(draft_start, draft_end)]
-                if draft:
-                    return draft
-                break  # match found but no following tokens — try smaller n
+                return [_seq(i) for i in range(draft_start, draft_end)]
         return []

@@ -148,6 +148,61 @@ class TestLookupDraft:
                 num_speculative_tokens=0,
             )
 
+    def test_lookup_window_caps_search(self):
+        """A lookup_window bounds the search to the most recent N tokens.
+
+        Construct a history where the only matching n-gram lives *outside*
+        the window — the lookup must miss because the window excludes it.
+        With the window large enough to include the match, the same query
+        finds the same draft. This is the load-bearing cap that keeps
+        per-step cost from growing unbounded with context length.
+        """
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        # Sequence: [1, 2, 3, 8, 8, 8, 8, 8, 8, 8, 8, 8, 1] (L=13).
+        # Trailing 1-gram=[1] matches at position 0. With
+        # lookup_window=5, history becomes the last 5 of _tokens =
+        # [8, 8, 8, 8, 8] + pending=1; no match for 1 in [8*5]; draft=[].
+        tokens = [1, 2, 3] + [8] * 9 + [1]
+        windowed = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=5,
+            max_ngram_size=1,
+            min_ngram_size=1,
+            lookup_window=5,
+        )
+        windowed._tokens = tokens[:-1]
+        windowed._pending_token = tokens[-1]
+        assert windowed._lookup_draft() == []
+
+        # Without the window, the same history hits the position-0 match.
+        unbounded = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=5,
+            max_ngram_size=1,
+            min_ngram_size=1,
+            lookup_window=None,
+        )
+        unbounded._tokens = tokens[:-1]
+        unbounded._pending_token = tokens[-1]
+        # Position 0 (token=1); draft = tokens after = [2, 3, 8, 8, 8] (capped at λ=5).
+        assert unbounded._lookup_draft() == [2, 3, 8, 8, 8]
+
+    def test_lookup_window_too_small_rejected(self):
+        """``lookup_window < max_ngram_size`` is rejected at construction."""
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        with pytest.raises(ValueError, match="lookup_window"):
+            PromptLookupDecoder(
+                target_model=target,
+                num_speculative_tokens=4,
+                max_ngram_size=3,
+                min_ngram_size=1,
+                lookup_window=2,
+            )
+
 
 class TestPromptLookupDecoder:
     """End-to-end tests against MockModel: caches populate, step()
@@ -323,3 +378,46 @@ class TestPromptLookupDecoder:
         assert callable(getattr(decoder, "prefill", None))
         assert callable(getattr(decoder, "step", None))
         assert callable(getattr(decoder, "reset", None))
+
+    def test_streaming_handles_no_match_step(self):
+        """PLD ``step()`` can return ``num_drafted=0`` when no n-gram
+        match is found. ``SpeculativeDecoder.step()`` never produces 0
+        (it always drafts ``lambda``), so the streaming adapter is
+        being asked to handle a new value. This test drives the
+        adapter through a prompt of distinct tokens (forcing no
+        match) to confirm the no-match step doesn't crash, divide by
+        zero, or stall the stream.
+        """
+        import threading
+
+        from olmlx.engine.speculative import PromptLookupDecoder
+        from olmlx.engine.speculative_stream import speculative_stream_generate
+
+        target = MockModel(vocab_size=32, hidden_size=16)
+        pld = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=4,
+            # max_ngram=1 with all-distinct prompt tokens guarantees
+            # the first lookup yields no match: every unigram appears
+            # exactly once (as the trailing query).
+            max_ngram_size=1,
+            min_ngram_size=1,
+        )
+        prompt_tokens = [1, 2, 3, 4, 5, 6, 7]  # all distinct
+        tokens = list(
+            speculative_stream_generate(
+                pld,
+                prompt_tokens=prompt_tokens,
+                max_tokens=5,
+                cancel_event=threading.Event(),
+                eos_token_id=None,
+                tokenizer=None,
+            )
+        )
+        # 5 yields, regardless of how many internal steps were no-match.
+        assert len(tokens) == 5
+        # Stats must not divide by zero: a stream where every step
+        # was a no-match yields acceptance_rate=0.0, not NaN/raise.
+        stats = pld.stats_summary()
+        assert isinstance(stats["acceptance_rate"], float)
+        assert 0.0 <= stats["acceptance_rate"] <= 1.0

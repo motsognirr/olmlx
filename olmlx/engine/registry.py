@@ -266,6 +266,13 @@ class SpeculativeConfig(NamedTuple):
     #: decoding, the draft model's pre-trained ``block_size`` for DFlash.
     num_tokens: int | None
     strategy: SpeculativeStrategy = "classic"
+    #: PLD-only n-gram tuning. ``None`` means "use the global
+    #: ``Settings.speculative_pld_*`` value." Threaded through here (not
+    #: read directly from settings) so per-model ``models.json``
+    #: overrides take effect alongside ``num_tokens``.
+    pld_max_ngram: int | None = None
+    pld_min_ngram: int | None = None
+    pld_lookup_window: int | None = None
 
 
 @dataclass
@@ -292,6 +299,10 @@ class ModelConfig:
     speculative_strategy: SpeculativeStrategy | None = None
     speculative_draft_model: str | None = None
     speculative_tokens: int | None = None
+    #: PLD-only per-model overrides; ignored by other strategies.
+    speculative_pld_max_ngram: int | None = None
+    speculative_pld_min_ngram: int | None = None
+    speculative_pld_lookup_window: int | None = None
     #: KV cache quantization method and bits (e.g. "turboquant:4").
     #: ``None`` means inherit the global ``Settings.kv_cache_quant`` value.
     kv_cache_quant: str | None = None
@@ -346,6 +357,29 @@ class ModelConfig:
                 f"'speculative_strategy' must be one of "
                 f"{sorted(_VALID_SPECULATIVE_STRATEGIES)} or None, "
                 f"got {self.speculative_strategy!r}"
+            )
+        for fname in (
+            "speculative_pld_max_ngram",
+            "speculative_pld_min_ngram",
+            "speculative_pld_lookup_window",
+        ):
+            value = getattr(self, fname)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ValueError(
+                    f"{fname!r} must be a positive integer or None, got {value!r}"
+                )
+        if (
+            self.speculative_pld_max_ngram is not None
+            and self.speculative_pld_min_ngram is not None
+            and self.speculative_pld_min_ngram > self.speculative_pld_max_ngram
+        ):
+            raise ValueError(
+                f"'speculative_pld_min_ngram' "
+                f"({self.speculative_pld_min_ngram}) must be <= "
+                f"'speculative_pld_max_ngram' "
+                f"({self.speculative_pld_max_ngram})"
             )
         # Flash primary-knob bounds match the Settings field constraints.
         # Kept here so direct ModelConfig() construction (tests,
@@ -442,12 +476,14 @@ class ModelConfig:
     def resolved_speculative(self) -> SpeculativeConfig:
         """Resolve speculative config: per-model overrides global settings.
 
-        Returns a ``SpeculativeConfig(enabled, draft_model, num_tokens)``.
+        Returns a ``SpeculativeConfig(enabled, draft_model, num_tokens,
+        strategy, pld_max_ngram, pld_min_ngram, pld_lookup_window)``.
         When ``enabled`` is ``False`` the draft slot is forced to
         ``None`` even if a global ``speculative_draft_model`` is
         configured — callers should never see a non-None draft for a
-        disabled model. The token count is always returned so callers
-        that flip enabled at runtime keep a sensible default.
+        disabled model. The token count and PLD knobs are always
+        returned so callers that flip ``enabled`` at runtime keep a
+        sensible default.
         """
         from olmlx.config import settings
 
@@ -464,14 +500,56 @@ class ModelConfig:
             if self.speculative_strategy is not None
             else settings.speculative_strategy
         )
+        pld_max_ngram = (
+            self.speculative_pld_max_ngram
+            if self.speculative_pld_max_ngram is not None
+            else settings.speculative_pld_max_ngram
+        )
+        pld_min_ngram = (
+            self.speculative_pld_min_ngram
+            if self.speculative_pld_min_ngram is not None
+            else settings.speculative_pld_min_ngram
+        )
+        pld_lookup_window = (
+            self.speculative_pld_lookup_window
+            if self.speculative_pld_lookup_window is not None
+            else settings.speculative_pld_lookup_window
+        )
+        # Cross-field check: the per-model override could combine with
+        # the global value to produce an inverted pair. ``Settings`` and
+        # ``ModelConfig.__post_init__`` catch the within-layer case;
+        # this catches the cross-layer one.
+        if pld_min_ngram > pld_max_ngram:
+            raise ValueError(
+                f"Resolved speculative_pld_min_ngram ({pld_min_ngram}) "
+                f"must be <= speculative_pld_max_ngram ({pld_max_ngram}) "
+                f"for {self.hf_path!r} (per-model overrides combined with "
+                f"global Settings produced an inverted range)."
+            )
         if not enabled:
-            return SpeculativeConfig(False, None, tokens, strategy)
+            return SpeculativeConfig(
+                False,
+                None,
+                tokens,
+                strategy,
+                pld_max_ngram,
+                pld_min_ngram,
+                pld_lookup_window,
+            )
         draft = (
             self.speculative_draft_model
             if self.speculative_draft_model is not None
             else settings.speculative_draft_model
         )
-        return SpeculativeConfig(True, draft, tokens, strategy)
+        return SpeculativeConfig(
+            True,
+            draft,
+            tokens,
+            strategy,
+            pld_max_ngram,
+            pld_min_ngram,
+            pld_lookup_window,
+        )
 
     def resolved_kv_cache_quant(self) -> str | None:
         """Resolve KV cache quant config: per-model overrides global settings."""
@@ -660,6 +738,14 @@ class ModelConfig:
                     )
             speculative_tokens = speculative_tokens_raw
 
+            # PLD ngram knobs. Type/bounds validation happens in
+            # ``__post_init__`` (cross-field check included) — pull the
+            # raw values verbatim and let the dataclass validator
+            # produce the canonical error.
+            speculative_pld_max_ngram = entry.get("speculative_pld_max_ngram")
+            speculative_pld_min_ngram = entry.get("speculative_pld_min_ngram")
+            speculative_pld_lookup_window = entry.get("speculative_pld_lookup_window")
+
             # Flash primary-knob fields: type/bounds checks live in
             # ``ModelConfig.__post_init__`` (which fires from the
             # ``cls(...)`` call below). Pull raw values verbatim and let
@@ -707,6 +793,9 @@ class ModelConfig:
                 speculative_strategy=speculative_strategy,
                 speculative_draft_model=speculative_draft_model,
                 speculative_tokens=speculative_tokens,
+                speculative_pld_max_ngram=speculative_pld_max_ngram,
+                speculative_pld_min_ngram=speculative_pld_min_ngram,
+                speculative_pld_lookup_window=speculative_pld_lookup_window,
                 kv_cache_quant=kv_cache_quant_raw,
                 flash=flash,
                 flash_sparsity_threshold=flash_sparsity_threshold,
@@ -739,6 +828,9 @@ class ModelConfig:
             and self.speculative_strategy is None
             and self.speculative_draft_model is None
             and self.speculative_tokens is None
+            and self.speculative_pld_max_ngram is None
+            and self.speculative_pld_min_ngram is None
+            and self.speculative_pld_lookup_window is None
             and self.kv_cache_quant is None
             and self.flash is None
             and self.flash_sparsity_threshold is None
@@ -777,6 +869,12 @@ class ModelConfig:
             result["speculative_draft_model"] = self.speculative_draft_model
         if self.speculative_tokens is not None:
             result["speculative_tokens"] = self.speculative_tokens
+        if self.speculative_pld_max_ngram is not None:
+            result["speculative_pld_max_ngram"] = self.speculative_pld_max_ngram
+        if self.speculative_pld_min_ngram is not None:
+            result["speculative_pld_min_ngram"] = self.speculative_pld_min_ngram
+        if self.speculative_pld_lookup_window is not None:
+            result["speculative_pld_lookup_window"] = self.speculative_pld_lookup_window
         if self.kv_cache_quant is not None:
             result["kv_cache_quant"] = self.kv_cache_quant
         if self.flash is not None:

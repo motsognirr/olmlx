@@ -343,9 +343,9 @@ class TestSpeculativeConfig:
         from olmlx.engine.registry import ModelConfig
 
         mc = ModelConfig.from_entry({"hf_path": "Qwen/Qwen3-32B", "speculative": True})
-        enabled, draft, _tokens, _strategy = mc.resolved_speculative()
-        assert enabled is True
-        assert draft is None
+        resolved = mc.resolved_speculative()
+        assert resolved.enabled is True
+        assert resolved.draft_model is None
 
     def test_resolved_speculative_falls_back_to_settings(self, monkeypatch):
         from olmlx.engine.registry import ModelConfig
@@ -357,7 +357,14 @@ class TestSpeculativeConfig:
         monkeypatch.setattr("olmlx.config.settings.speculative_tokens", 8)
 
         mc = ModelConfig(hf_path="Qwen/Qwen3-32B")
-        assert mc.resolved_speculative() == (True, "Qwen/Qwen3-0.6B", 8, "classic")
+        # Field-by-field check rather than full-tuple equality so the
+        # PLD knobs (added later) don't bind the assertion to specific
+        # defaults — those have their own tests below.
+        resolved = mc.resolved_speculative()
+        assert resolved.enabled is True
+        assert resolved.draft_model == "Qwen/Qwen3-0.6B"
+        assert resolved.num_tokens == 8
+        assert resolved.strategy == "classic"
 
         # Per-model overrides win, and a disabled per-model setting
         # zeros out the draft slot even if a global draft is configured.
@@ -366,7 +373,11 @@ class TestSpeculativeConfig:
             speculative=False,
             speculative_tokens=2,
         )
-        assert mc_override.resolved_speculative() == (False, None, 2, "classic")
+        resolved_override = mc_override.resolved_speculative()
+        assert resolved_override.enabled is False
+        assert resolved_override.draft_model is None
+        assert resolved_override.num_tokens == 2
+        assert resolved_override.strategy == "classic"
 
 
 class TestSpeculativeStrategySettings:

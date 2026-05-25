@@ -992,7 +992,10 @@ def _audit_speculative_config(
     global_draft_used = False
     for name, mc in registry.list_models().items():
         try:
-            enabled, draft, _, strategy = mc.resolved_speculative()
+            resolved = mc.resolved_speculative()
+            enabled = resolved.enabled
+            draft = resolved.draft_model
+            strategy = resolved.strategy
         except Exception as exc:
             # ``resolved_speculative`` reads ``settings`` and could
             # raise if the runtime ``Settings`` is in an unexpected

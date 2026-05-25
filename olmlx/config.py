@@ -141,6 +141,13 @@ class Settings(BaseSettings):
     #: but yield noisier drafts; larger n-grams are more precise.
     speculative_pld_max_ngram: Annotated[int, Field(gt=0)] = 3
     speculative_pld_min_ngram: Annotated[int, Field(gt=0)] = 1
+    #: Cap the lookup history (most recent N tokens) so per-step search
+    #: cost doesn't grow unbounded with context length. Default 8192 is
+    #: roughly the largest history where pure-Python n-gram scan stays
+    #: well under one forward pass on Apple Silicon (~30 ms ceiling on
+    #: max_ngram=3); raise it if you need matches against an older
+    #: prefix, lower it if you're seeing scan-time regressions.
+    speculative_pld_lookup_window: Annotated[int, Field(gt=0)] = 8192
 
     # Flash inference (LLM in a Flash). Primary, user-facing knobs.
     # Advanced tuning (window size, IO threads, cache budget, predictor
@@ -185,7 +192,15 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_pld_ngram_range(self) -> "Settings":
-        if self.speculative_pld_min_ngram > self.speculative_pld_max_ngram:
+        # Scope to ``strategy=pld`` so a stray inverted env var
+        # (e.g. ``PLD_MIN=5, PLD_MAX=3``) doesn't reject an otherwise
+        # valid config that never activates PLD. The per-model
+        # resolution in ``ModelConfig.resolved_speculative`` does the
+        # equivalent cross-field check when PLD actually loads.
+        if (
+            self.speculative_strategy == "pld"
+            and self.speculative_pld_min_ngram > self.speculative_pld_max_ngram
+        ):
             raise ValueError(
                 f"speculative_pld_min_ngram ({self.speculative_pld_min_ngram}) "
                 f"must be <= speculative_pld_max_ngram "

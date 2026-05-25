@@ -2863,9 +2863,11 @@ class ModelManager:
 
         For VLM targets, decoder runs on the unwrapped language model so
         the prompt-cache state is the same one mlx-vlm's generate would
-        touch.
+        touch. All PLD knobs (max-draft, ngram range, lookup window) are
+        read from ``spec_config`` so per-model ``models.json`` overrides
+        compose with the global ``OLMLX_SPECULATIVE_PLD_*`` env vars
+        (``ModelConfig.resolved_speculative`` handles the fallback chain).
         """
-        from olmlx.config import settings
         from olmlx.engine.speculative import PromptLookupDecoder
 
         if not spec_config.enabled:
@@ -2896,17 +2898,27 @@ class ModelManager:
         else:
             pld_target = target_model
 
+        # ``resolved_speculative`` populates these from the global
+        # Settings defaults (3, 1, 8192) when no per-model override is
+        # present, so they are never None at this point. Assert to
+        # narrow the type and to surface a programming error loudly if
+        # a future caller bypasses ``resolved_speculative``.
+        assert spec_config.pld_max_ngram is not None
+        assert spec_config.pld_min_ngram is not None
+        assert spec_config.pld_lookup_window is not None
         logger.info(
-            "Constructing PLD decoder (max_draft=%d, ngram=%d..%d)",
+            "Constructing PLD decoder (max_draft=%d, ngram=%d..%d, lookup_window=%d)",
             num_tokens,
-            settings.speculative_pld_min_ngram,
-            settings.speculative_pld_max_ngram,
+            spec_config.pld_min_ngram,
+            spec_config.pld_max_ngram,
+            spec_config.pld_lookup_window,
         )
         return PromptLookupDecoder(
             target_model=pld_target,
             num_speculative_tokens=num_tokens,
-            max_ngram_size=settings.speculative_pld_max_ngram,
-            min_ngram_size=settings.speculative_pld_min_ngram,
+            max_ngram_size=spec_config.pld_max_ngram,
+            min_ngram_size=spec_config.pld_min_ngram,
+            lookup_window=spec_config.pld_lookup_window,
         )
 
     def _is_flash_enabled(self, flash_config: ResolvedFlashConfig) -> bool:
