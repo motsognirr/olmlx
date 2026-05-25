@@ -996,11 +996,24 @@ def _audit_speculative_config(
             enabled = resolved.enabled
             draft = resolved.draft_model
             strategy = resolved.strategy
+        except ValueError as exc:
+            # Configuration error (e.g. PLD ngram/window cross-field
+            # invariant violated by the global+per-model combination).
+            # Surface as an error rather than a warning so it's not
+            # lost in startup chatter; the request itself will fail
+            # later with the same message, but seeing it at startup
+            # is more diagnosable.
+            logger.error(
+                "Speculative config for %s is invalid and will fail "
+                "at model-load time: %s",
+                name,
+                exc,
+            )
+            continue
         except Exception as exc:
-            # ``resolved_speculative`` reads ``settings`` and could
-            # raise if the runtime ``Settings`` is in an unexpected
-            # state. Skipping the entry is safer than killing
-            # startup with a stack trace.
+            # Unexpected (e.g. settings in an unexpected state).
+            # Skipping the entry is safer than killing startup with
+            # a stack trace from an unrelated cause.
             logger.warning(
                 "Skipping audit of %s: could not resolve speculative config: %s",
                 name,

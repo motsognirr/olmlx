@@ -172,22 +172,27 @@ class TestLookupDraft:
             )
 
     def test_lookup_window_caps_search(self):
-        """A lookup_window bounds the search to the most recent N tokens.
+        """A ``lookup_window`` bounds the search to the most recent N
+        tokens. Construct a prompt where the only matching n-gram for
+        the trailing token lives *outside* the window — the lookup
+        must miss because ``prefill()`` caps ``_tokens`` to the
+        windowed suffix. With a window large enough to include the
+        match, the same prompt finds the draft.
 
-        Construct a history where the only matching n-gram lives *outside*
-        the window — the lookup must miss because the window excludes it.
-        With the window large enough to include the match, the same query
-        finds the same draft. This is the load-bearing cap that keeps
-        per-step cost from growing unbounded with context length.
+        Exercises the cap via the public API (``prefill()``) rather
+        than poking ``_tokens`` directly — the in-lookup cap was
+        removed in favour of enforcing the invariant at
+        prefill/step boundaries, and tests should follow the same
+        contract.
         """
         from olmlx.engine.speculative import PromptLookupDecoder
 
         target = MockModel(32, 16)
-        # Sequence: [1, 2, 3, 8, 8, 8, 8, 8, 8, 8, 8, 8, 1] (L=13).
-        # Trailing 1-gram=[1] matches at position 0. With
-        # lookup_window=5, history becomes the last 5 of _tokens =
-        # [8, 8, 8, 8, 8] + pending=1; no match for 1 in [8*5]; draft=[].
-        tokens = [1, 2, 3] + [8] * 9 + [1]
+        # 13-token prompt: token 1 only at position 0, then nine 8s,
+        # ending on 1 again. With window=5, prefill keeps only the
+        # last 5 prompt tokens = [8, 8, 8, 8, 1]; the trailing 1
+        # has no other 1 in the windowed corpus.
+        prompt_tokens = [1, 2, 3] + [8] * 9 + [1]
         windowed = PromptLookupDecoder(
             target_model=target,
             num_speculative_tokens=5,
@@ -195,11 +200,16 @@ class TestLookupDraft:
             min_ngram_size=1,
             lookup_window=5,
         )
-        windowed._tokens = tokens[:-1]
-        windowed._pending_token = tokens[-1]
+        windowed.prefill(mx.array([prompt_tokens]))
+        # Pending is the first generated token; manually swap in the
+        # query token (1) we want to look up. This is the same
+        # contract the per-step lookup uses — pending is just whatever
+        # token's about to be fed to the target.
+        windowed._pending_token = 1
         assert windowed._lookup_draft() == []
 
-        # Without the window, the same history hits the position-0 match.
+        # Without the window, the full prompt is searched and the
+        # token-1 match at position 0 is found.
         unbounded = PromptLookupDecoder(
             target_model=target,
             num_speculative_tokens=5,
@@ -207,9 +217,12 @@ class TestLookupDraft:
             min_ngram_size=1,
             lookup_window=None,
         )
-        unbounded._tokens = tokens[:-1]
-        unbounded._pending_token = tokens[-1]
-        # Position 0 (token=1); draft = tokens after = [2, 3, 8, 8, 8] (capped at λ=5).
+        unbounded.prefill(mx.array([prompt_tokens]))
+        unbounded._pending_token = 1
+        # _tokens has the full 13 prompt tokens; trailing 1-gram=[1]
+        # matches at positions 0 and 12. Closest match (start=12)
+        # would propose only pending → empty; falls back to start=0:
+        # draft_start=1; draft_end=min(1+5, L-1)=6; seq[1:6]=[2,3,8,8,8].
         assert unbounded._lookup_draft() == [2, 3, 8, 8, 8]
 
     def test_lookup_window_too_small_rejected(self):

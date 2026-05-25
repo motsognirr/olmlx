@@ -959,12 +959,12 @@ class PromptLookupDecoder:
         # a Python frame on every access, and ``_lookup_draft`` does
         # O(window × max_ngram) accesses (≈24k at the defaults).
         # Concatenation costs a single ~window-sized list alloc per
-        # step, which is cheaper than the per-call overhead.
-        full_history = self._tokens
-        if self._lookup_window is not None and len(full_history) > self._lookup_window:
-            seq = full_history[-self._lookup_window :] + [pending]
-        else:
-            seq = full_history + [pending]
+        # step, which is cheaper than the per-call overhead. No need
+        # to re-cap by ``_lookup_window`` here: ``prefill()`` caps
+        # the initial seed and ``step()`` trims at the end of each
+        # call, so ``self._tokens`` is already <= window every time
+        # we reach this point.
+        seq = self._tokens + [pending]
         L = len(seq)
 
         if L < 2:
