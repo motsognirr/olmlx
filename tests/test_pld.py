@@ -100,20 +100,16 @@ class TestLookupDraft:
         token, the lookup falls through to an earlier match at the same
         n-gram size if one exists, instead of returning empty.
 
-        Sequence: [3, 7, 7, 3] (L=4). Trailing 1-gram=[3] at index 3
-        matches at:
-          - start=2 (seq[2]=7? no) — actually only start=0 (seq[0]=3).
-        So only one match; draft_start=1; draft=[7,7]. (The pending
-        rep edge isn't exercised here; the test below has the
-        explicit fall-through case.)
+        Sequence: [5, 1, 2, 5, 5] (L=5). Trailing 1-gram=[5] at
+        index 4. Two matches:
+          - start=3 (seq[3]=5): draft_start=4, draft_end=
+            min(4+5, L-1)=4 → empty (only pending follows).
+          - start=0 (seq[0]=5): draft_start=1, draft_end=
+            min(1+5, L-1)=4 → seq[1:4] = [1, 2, 5].
+        The inner loop walks from start=3 back to start=0; the
+        degenerate closest match yields empty and the earlier match
+        wins.
         """
-        # Two matches: closest is degenerate (only pending follows),
-        # earlier one yields real tokens. Sequence: [5, 1, 2, 5, 5].
-        # Trailing 1-gram=[5] at index 4. Matches at start=3 (seq[3]=5)
-        # and start=0 (seq[0]=5). Walking backwards from index 3:
-        #   - start=3: draft_start=4; draft_end=min(4+5, 4)=4 → empty.
-        #   - start=0: draft_start=1; draft_end=min(1+5, 4)=4 →
-        #     [1, 2, 5]. Returns [1, 2, 5].
         self._seed(decoder, [5, 1, 2, 5, 5])
         assert decoder._lookup_draft() == [1, 2, 5]
 

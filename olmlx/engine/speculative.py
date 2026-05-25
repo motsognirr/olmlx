@@ -885,7 +885,9 @@ class PromptLookupDecoder:
                     accepted=num_accepted - 1,
                     trim=trim_target,
                 )
-            elif trim_prompt_cache is not None:
+            else:
+                # ``trim_prompt_cache`` is guaranteed non-None here
+                # because ``__init__`` enforces it at construction.
                 trim_prompt_cache(self._target_cache, trim_target)
 
         # 5. Update state. The cache now contains the original prompt
@@ -944,16 +946,26 @@ class PromptLookupDecoder:
         on Apple Silicon, rivalling the target forward.
         """
         pending = self._pending_token
-        assert pending is not None
+        if pending is None:
+            # Same defensive philosophy as ``step()``: explicit raise
+            # so the misuse survives ``python -O``. _lookup_draft is
+            # private and only reached via ``step()``, but the
+            # consistency makes the contract clear.
+            raise RuntimeError(
+                "_lookup_draft called with _pending_token=None; call prefill() first"
+            )
+        # Materialise the search corpus once. The alternative — a
+        # closure that branches between history[i] and pending — pays
+        # a Python frame on every access, and ``_lookup_draft`` does
+        # O(window × max_ngram) accesses (≈24k at the defaults).
+        # Concatenation costs a single ~window-sized list alloc per
+        # step, which is cheaper than the per-call overhead.
         full_history = self._tokens
         if self._lookup_window is not None and len(full_history) > self._lookup_window:
-            history = full_history[-self._lookup_window :]
+            seq = full_history[-self._lookup_window :] + [pending]
         else:
-            history = full_history
-        L = len(history) + 1  # virtual sequence length
-
-        def _seq(i: int) -> int:
-            return history[i] if i < len(history) else pending
+            seq = full_history + [pending]
+        L = len(seq)
 
         if L < 2:
             return []
@@ -962,16 +974,11 @@ class PromptLookupDecoder:
             if L < ngram_size + 1:
                 continue
             query_start = L - ngram_size
-            query = [_seq(i) for i in range(query_start, L)]
+            query = seq[query_start:L]
             # Walk backwards through possible match start positions,
             # excluding the trailing query's own position.
             for start in range(query_start - 1, -1, -1):
-                match = True
-                for k in range(ngram_size):
-                    if _seq(start + k) != query[k]:
-                        match = False
-                        break
-                if not match:
+                if seq[start : start + ngram_size] != query:
                     continue
                 # Cap ``draft_end`` at ``L - 1`` to exclude the pending
                 # token itself from the draft. The closest-possible
@@ -985,7 +992,7 @@ class PromptLookupDecoder:
                 draft_start = start + ngram_size
                 draft_end = min(draft_start + self._lambda, L - 1)
                 if draft_end > draft_start:
-                    return [_seq(i) for i in range(draft_start, draft_end)]
+                    return seq[draft_start:draft_end]
                 # Empty draft (this match position only proposed
                 # pending). Continue to earlier match positions at the
                 # current n-gram size, then to smaller n-gram sizes.

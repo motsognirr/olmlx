@@ -4604,6 +4604,74 @@ class TestSpeculativeLoading:
         assert (model, tokenizer, is_vlm, caps) == sentinel_load
         assert decoder is sentinel_decoder
 
+    def test_load_pld_decoder_unwraps_vlm_language_model(self, monkeypatch):
+        """When ``is_vlm=True``, _load_pld_decoder must construct the
+        PromptLookupDecoder against ``target.language_model``, not the
+        VLM wrapper. Mirrors the unwrap that
+        ``_load_speculative_decoder`` does so the decoder operates on
+        the text decoder's KV cache directly.
+        """
+        from olmlx.engine.registry import SpeculativeConfig
+
+        registry = MagicMock()
+        store = MagicMock()
+        manager = ModelManager(registry, store)
+
+        text_decoder = MagicMock(name="language_model")
+        vlm_target = MagicMock(name="vlm")
+        vlm_target.language_model = text_decoder
+        # PromptLookupDecoder probes target_model for find_gdn_class
+        # (named_modules walk) — return empty to skip GDN setup. The
+        # decoder's __init__ doesn't call into the model otherwise.
+        text_decoder.named_modules.return_value = iter([])
+
+        captured = {}
+
+        def fake_decoder_ctor(*args, **kw):
+            captured["target_model"] = kw.get("target_model")
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "olmlx.engine.speculative.PromptLookupDecoder", fake_decoder_ctor
+        )
+        spec_config = SpeculativeConfig(
+            True,
+            None,
+            10,
+            strategy="pld",
+            pld_max_ngram=3,
+            pld_min_ngram=1,
+            pld_lookup_window=8192,
+        )
+        manager._load_pld_decoder(vlm_target, spec_config, is_vlm=True)
+        # The decoder must be built against the inner text decoder,
+        # not the VLM wrapper.
+        assert captured["target_model"] is text_decoder
+
+    def test_load_pld_decoder_rejects_vlm_without_language_model(self, monkeypatch):
+        """A VLM target missing ``.language_model`` must surface as
+        ValueError with a message pointing at the missing attribute,
+        not as a confusing AttributeError deep inside the decoder."""
+        from olmlx.engine.registry import SpeculativeConfig
+
+        registry = MagicMock()
+        store = MagicMock()
+        manager = ModelManager(registry, store)
+
+        # A bare object() has no .language_model attribute.
+        broken_vlm = object()
+        spec_config = SpeculativeConfig(
+            True,
+            None,
+            10,
+            strategy="pld",
+            pld_max_ngram=3,
+            pld_min_ngram=1,
+            pld_lookup_window=8192,
+        )
+        with pytest.raises(ValueError, match="language_model"):
+            manager._load_pld_decoder(broken_vlm, spec_config, is_vlm=True)
+
     def test_text_path_dispatches_pld(self, monkeypatch):
         """speculative_strategy='pld' on a plain text target should route
         to _load_pld_decoder rather than the classic loader."""
