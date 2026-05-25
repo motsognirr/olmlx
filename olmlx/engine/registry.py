@@ -306,6 +306,10 @@ class ModelConfig:
     #: KV cache quantization method and bits (e.g. "turboquant:4").
     #: ``None`` means inherit the global ``Settings.kv_cache_quant`` value.
     kv_cache_quant: str | None = None
+    #: Weight quantization method, bits, and optional group size
+    #: (e.g. "hqq:4", "hqq:8:128").
+    #: ``None`` means inherit the global ``Settings.weight_quant`` value.
+    weight_quant: str | None = None
     #: Per-model Flash overrides for the promoted primary knobs.
     #: ``None`` means inherit from the global ``Settings.flash*`` value.
     #: Advanced/tuning knobs still go under the ``experimental`` block.
@@ -587,6 +591,12 @@ class ModelConfig:
             return self.kv_cache_quant
         return settings.kv_cache_quant
 
+    def resolved_weight_quant(self) -> str | None:
+        """Resolve weight quant config: per-model overrides global settings."""
+        if self.weight_quant is not None:
+            return self.weight_quant
+        return settings.weight_quant
+
     def resolved_flash(self) -> ResolvedFlashConfig:
         """Resolve Flash primary knobs: per-model overrides global settings.
 
@@ -810,6 +820,21 @@ class ModelConfig:
 
                 kv_cache_quant_raw = validate_kv_cache_quant_format(kv_cache_quant_raw)
 
+            weight_quant_raw = entry.get("weight_quant")
+            if weight_quant_raw is not None:
+                if not isinstance(weight_quant_raw, str):
+                    raise ValueError(
+                        f"'weight_quant' must be a string, got {weight_quant_raw!r}"
+                    )
+                if not weight_quant_raw.strip():
+                    raise ValueError(
+                        "'weight_quant' must be a non-empty string; "
+                        "use ``null`` to inherit from the global setting."
+                    )
+                from olmlx.config import validate_weight_quant_format
+
+                weight_quant_raw = validate_weight_quant_format(weight_quant_raw)
+
             extra = {k: v for k, v in entry.items() if k not in _KNOWN_CONFIG_KEYS}
             return cls(
                 hf_path=hf_path,
@@ -827,6 +852,7 @@ class ModelConfig:
                 speculative_pld_min_ngram=speculative_pld_min_ngram,
                 speculative_pld_lookup_window=speculative_pld_lookup_window,
                 kv_cache_quant=kv_cache_quant_raw,
+                weight_quant=weight_quant_raw,
                 flash=flash,
                 flash_sparsity_threshold=flash_sparsity_threshold,
                 flash_min_active_neurons=flash_min_active_neurons,
@@ -862,6 +888,7 @@ class ModelConfig:
             and self.speculative_pld_min_ngram is None
             and self.speculative_pld_lookup_window is None
             and self.kv_cache_quant is None
+            and self.weight_quant is None
             and self.flash is None
             and self.flash_sparsity_threshold is None
             and self.flash_min_active_neurons is None
@@ -907,6 +934,8 @@ class ModelConfig:
             result["speculative_pld_lookup_window"] = self.speculative_pld_lookup_window
         if self.kv_cache_quant is not None:
             result["kv_cache_quant"] = self.kv_cache_quant
+        if self.weight_quant is not None:
+            result["weight_quant"] = self.weight_quant
         if self.flash is not None:
             result["flash"] = self.flash
         if self.flash_sparsity_threshold is not None:

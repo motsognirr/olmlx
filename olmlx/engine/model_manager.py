@@ -757,6 +757,9 @@ class LoadedModel:
     )
     prompt_cache_store: PromptCacheStore = field(default=None)  # type: ignore[assignment]
     kv_cache_quant: str | None = None
+    #: Weight quantization string (e.g. "hqq:4") applied at load time.
+    #: ``None`` means no weight quantization was applied.
+    weight_quant: str | None = None
     # False for hybrid sliding-window models (RotatingKVCache layers).
     # Set by the loader; default True covers direct construction in tests.
     supports_cache_trim: bool = True
@@ -1207,6 +1210,7 @@ class ModelManager:
                 # ``model_exp``.
                 flash_config = model_config.resolved_flash()
                 kv_cache_quant = model_config.resolved_kv_cache_quant()
+                weight_quant_str = model_config.resolved_weight_quant()
                 flash_moe_config = model_config.resolved_flash_moe()
 
                 # Pop LRU evictees under the lock; close them outside the lock
@@ -1332,6 +1336,7 @@ class ModelManager:
                         spec_config,
                         flash_config,
                         flash_moe_config,
+                        weight_quant_str,
                     )
                     timeout = settings.model_load_timeout
                     is_distributed = False
@@ -1499,6 +1504,7 @@ class ModelManager:
                         expires_at=expires,
                         size_bytes=_model_size,
                         kv_cache_quant=kv_cache_quant,
+                        weight_quant=weight_quant_str,
                         spectral_calibration_dir=_spectral_dir,
                         default_options=dict(model_config.options),
                         inference_queue_timeout=model_config.inference_queue_timeout,
@@ -3153,6 +3159,7 @@ class ModelManager:
         spec_config: SpeculativeConfig | None = None,
         flash_config: ResolvedFlashConfig | None = None,
         flash_moe_config: FlashMoeConfig | None = None,
+        weight_quant_str: str | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
 
@@ -3170,6 +3177,9 @@ class ModelManager:
         *flash_moe_config* is the resolved ``FlashMoeConfig`` (per-model
         overrides applied). Falls back to a fresh resolution from
         global ``Settings`` values when ``None``.
+
+        *weight_quant_str* is the resolved weight quantization string
+        (e.g. ``"hqq:4"``). ``None`` means no weight quantization.
 
         Returns (model, tokenizer, is_vlm, caps, speculative_decoder).
         """
@@ -3321,6 +3331,10 @@ class ModelManager:
                 )
                 self._load_chat_template(tok, load_path, hf_path)
                 caps = detect_caps(tok)
+
+                # Apply HQQ weight quantization if configured
+                self._maybe_quantize_model(model, True, weight_quant_str, hf_path)
+
                 if spec_enabled and spec_config.strategy in ("dflash", "eagle"):
                     raise ValueError(
                         f"speculative_strategy={spec_config.strategy!r} is not "
@@ -3356,6 +3370,9 @@ class ModelManager:
         # Text or unknown — try mlx-lm first, fall back to mlx-vlm
         model, tokenizer, is_vlm, caps = self._try_lm_then_vlm(load_path, hf_path)
 
+        # Apply HQQ weight quantization if configured
+        self._maybe_quantize_model(model, is_vlm, weight_quant_str, hf_path)
+
         if spec_enabled and flash_config.flash_speculative:
             raise ValueError(
                 "Only one speculative decoder can be active at a time; "
@@ -3375,6 +3392,49 @@ class ModelManager:
 
         return model, tokenizer, is_vlm, caps, None
 
+    @staticmethod
+    def _maybe_quantize_model(
+        model: Any,
+        is_vlm: bool,
+        weight_quant_str: str | None,
+        hf_path: str,
+    ) -> None:
+        """Apply HQQ weight quantization to the model if configured.
+
+        For VLM models, quantizes the language model portion only.
+        The vision component is left untouched.
+        """
+        if not weight_quant_str:
+            return
+        from olmlx.engine.hqq.quantize import HQQConfig, quantize_model
+
+        cfg = HQQConfig.from_string(weight_quant_str)
+        if cfg is None:
+            return
+
+        if is_vlm:
+            if hasattr(model, "language_model"):
+                target = model.language_model
+            else:
+                logger.warning(
+                    "weight_quant=%s configured for VLM %s but model has no "
+                    "language_model attribute; quantizing the full model",
+                    weight_quant_str,
+                    hf_path,
+                )
+                target = model
+        else:
+            target = model
+
+        logger.info(
+            "Applying HQQ weight quantization (%d-bit, group_size=%d) to %s",
+            cfg.bits,
+            cfg.group_size,
+            hf_path,
+        )
+        quantize_model(target, cfg)
+        mx.eval(model.parameters())
+
     def _load_model_and_shard(
         self,
         hf_path: str,
@@ -3382,6 +3442,7 @@ class ModelManager:
         spec_config: SpeculativeConfig | None = None,
         flash_config: ResolvedFlashConfig | None = None,
         flash_moe_config: FlashMoeConfig | None = None,
+        weight_quant_str: str | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 
@@ -3393,6 +3454,9 @@ class ModelManager:
 
         *flash_config* is the resolved Flash primary-knob config.
 
+        *weight_quant_str* is the resolved weight quantization string
+        (e.g. ``"hqq:4"``). ``None`` means no weight quantization.
+
         Returns (model, tokenizer, is_vlm, caps, is_distributed, speculative_decoder).
         """
         model, tokenizer, is_vlm, caps, speculative_decoder = self._load_model(
@@ -3401,6 +3465,7 @@ class ModelManager:
             spec_config=spec_config,
             flash_config=flash_config,
             flash_moe_config=flash_moe_config,
+            weight_quant_str=weight_quant_str,
         )
         is_distributed = False
 
