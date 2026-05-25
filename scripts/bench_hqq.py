@@ -13,7 +13,6 @@ import time
 from dataclasses import dataclass
 
 import mlx.core as mx
-import mlx.nn as nn
 from mlx.core import random
 
 from olmlx.engine.hqq.quantize import HQQConfig, hqq_quantize_weight
