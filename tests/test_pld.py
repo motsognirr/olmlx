@@ -231,9 +231,11 @@ class TestPromptLookupDecoder:
             assert len(accepted) >= 1
             assert decoder._target_cache[0].offset == decoder._cache_seq_len
             # Sequence visible-so-far is exactly history + pending.
-            assert decoder._tokens[-1] == emitted[-1] or decoder._tokens[
-                -len(accepted) :
-            ] == list(accepted[:-1]) or len(accepted) == 1
+            assert (
+                decoder._tokens[-1] == emitted[-1]
+                or decoder._tokens[-len(accepted) :] == list(accepted[:-1])
+                or len(accepted) == 1
+            )
             emitted.extend(accepted)
 
     def test_output_matches_greedy_reference(self):

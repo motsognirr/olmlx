@@ -2876,7 +2876,9 @@ class ModelManager:
         # speculative defaults to 4 but the regime is different — PLD's
         # per-step compute is dominated by the target forward whose cost
         # scales sub-linearly with draft length up to a point.
-        num_tokens = spec_config.num_tokens if spec_config.num_tokens is not None else 10
+        num_tokens = (
+            spec_config.num_tokens if spec_config.num_tokens is not None else 10
+        )
         if spec_config.draft_model:
             logger.warning(
                 "speculative_strategy='pld' ignores speculative_draft_model "
@@ -3243,9 +3245,7 @@ class ModelManager:
                 # path — wire it through after the wrap. Other strategies
                 # collide with ``flash_speculative`` and are warned/ignored
                 # to preserve the prior behaviour.
-                pld_requested = (
-                    spec_enabled and spec_config.strategy == "pld"
-                )
+                pld_requested = spec_enabled and spec_config.strategy == "pld"
                 if (
                     spec_enabled
                     and not pld_requested
@@ -3272,9 +3272,7 @@ class ModelManager:
                     flash_config=flash_config,
                 )
                 if pld_requested:
-                    decoder = self._load_pld_decoder(
-                        model, spec_config, is_vlm=is_vlm
-                    )
+                    decoder = self._load_pld_decoder(model, spec_config, is_vlm=is_vlm)
                 return model, tokenizer, is_vlm, caps, decoder
 
         kind = self._detect_model_kind(hf_path)

@@ -713,9 +713,7 @@ class PromptLookupDecoder:
         if target_gdn_cls is not None:
             self._gdn_capture = GDNStateCapture(target_gdn_cls)
             try:
-                self._target_gdn_buffer = self._gdn_capture.create_buffer(
-                    target_model
-                )
+                self._target_gdn_buffer = self._gdn_capture.create_buffer(target_model)
             except Exception:
                 self._gdn_capture.close()
                 self._gdn_capture = None
@@ -779,9 +777,7 @@ class PromptLookupDecoder:
         self.reset()
 
         if make_prompt_cache is None or trim_prompt_cache is None:
-            raise RuntimeError(
-                "mlx_lm.models.cache not available; cannot use PLD"
-            )
+            raise RuntimeError("mlx_lm.models.cache not available; cannot use PLD")
 
         self._target_cache = make_prompt_cache(self._target)
 
@@ -850,10 +846,7 @@ class PromptLookupDecoder:
         # them, so trim by (num_drafted + 1) - num_accepted.
         trim_target = max(num_drafted + 1 - num_accepted, 0)
         if trim_target > 0:
-            if (
-                self._target_gdn_buffer is not None
-                and self._gdn_capture is not None
-            ):
+            if self._target_gdn_buffer is not None and self._gdn_capture is not None:
                 self._gdn_capture.rollback_single(
                     self._target_gdn_buffer,
                     self._target_cache,
@@ -883,8 +876,7 @@ class PromptLookupDecoder:
         if num_drafted > 0:
             acceptance = num_accepted_draft / num_drafted
             self._alpha = (
-                self._alpha_ema * self._alpha
-                + (1 - self._alpha_ema) * acceptance
+                self._alpha_ema * self._alpha + (1 - self._alpha_ema) * acceptance
             )
 
         self._stats_steps += 1
