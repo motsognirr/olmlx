@@ -381,6 +381,22 @@ class ModelConfig:
                 f"'speculative_pld_max_ngram' "
                 f"({self.speculative_pld_max_ngram})"
             )
+        # ``PromptLookupDecoder.__init__`` requires the window to cover
+        # at least one full n-gram of the largest size, else the largest
+        # n-gram becomes unmatchable. Catch the within-layer case at
+        # config load so a bad ``models.json`` entry fails at startup
+        # rather than at first model load mid-request.
+        if (
+            self.speculative_pld_lookup_window is not None
+            and self.speculative_pld_max_ngram is not None
+            and self.speculative_pld_lookup_window < self.speculative_pld_max_ngram
+        ):
+            raise ValueError(
+                f"'speculative_pld_lookup_window' "
+                f"({self.speculative_pld_lookup_window}) must be >= "
+                f"'speculative_pld_max_ngram' "
+                f"({self.speculative_pld_max_ngram})"
+            )
         # Flash primary-knob bounds match the Settings field constraints.
         # Kept here so direct ModelConfig() construction (tests,
         # programmatic callers) hits the same validation as from_entry().
@@ -515,19 +531,30 @@ class ModelConfig:
             if self.speculative_pld_lookup_window is not None
             else settings.speculative_pld_lookup_window
         )
-        # Cross-field check: the per-model override could combine with
-        # the global value to produce an inverted pair. ``Settings`` and
-        # ``ModelConfig.__post_init__`` catch the within-layer case;
-        # this catches the cross-layer one. Scope to ``strategy == 'pld'``
+        # Cross-field checks: per-model overrides combined with global
+        # values may produce inverted/under-sized pairs that pass each
+        # layer's local validation. ``Settings`` and
+        # ``ModelConfig.__post_init__`` catch within-layer cases; these
+        # catch the cross-layer ones. Scoped to ``strategy == 'pld'``
         # so a misconfigured PLD pair doesn't break every model load
         # (classic/dflash/eagle never read these fields).
-        if strategy == "pld" and pld_min_ngram > pld_max_ngram:
-            raise ValueError(
-                f"Resolved speculative_pld_min_ngram ({pld_min_ngram}) "
-                f"must be <= speculative_pld_max_ngram ({pld_max_ngram}) "
-                f"for {self.hf_path!r} (per-model overrides combined with "
-                f"global Settings produced an inverted range)."
-            )
+        if strategy == "pld":
+            if pld_min_ngram > pld_max_ngram:
+                raise ValueError(
+                    f"Resolved speculative_pld_min_ngram ({pld_min_ngram}) "
+                    f"must be <= speculative_pld_max_ngram ({pld_max_ngram}) "
+                    f"for {self.hf_path!r} (per-model overrides combined "
+                    f"with global Settings produced an inverted range)."
+                )
+            if pld_lookup_window < pld_max_ngram:
+                raise ValueError(
+                    f"Resolved speculative_pld_lookup_window "
+                    f"({pld_lookup_window}) must be >= "
+                    f"speculative_pld_max_ngram ({pld_max_ngram}) for "
+                    f"{self.hf_path!r} (per-model overrides combined with "
+                    f"global Settings produced a window smaller than the "
+                    f"largest n-gram)."
+                )
         if not enabled:
             return SpeculativeConfig(
                 False,

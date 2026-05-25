@@ -2900,12 +2900,27 @@ class ModelManager:
 
         # ``resolved_speculative`` populates these from the global
         # Settings defaults (3, 1, 8192) when no per-model override is
-        # present, so they are never None at this point. Assert to
-        # narrow the type and to surface a programming error loudly if
-        # a future caller bypasses ``resolved_speculative``.
-        assert spec_config.pld_max_ngram is not None
-        assert spec_config.pld_min_ngram is not None
-        assert spec_config.pld_lookup_window is not None
+        # present, so they are never None at this point in normal use.
+        # Use explicit ``raise`` rather than ``assert`` so the misuse
+        # also surfaces under ``python -O`` (which would otherwise
+        # strip the check and let ``None`` fall through to
+        # ``PromptLookupDecoder.__init__`` with a confusing ``TypeError``
+        # on the ``<`` comparison there).
+        if spec_config.pld_max_ngram is None:
+            raise ValueError(
+                "_load_pld_decoder: spec_config.pld_max_ngram is None; "
+                "caller must go through ModelConfig.resolved_speculative()"
+            )
+        if spec_config.pld_min_ngram is None:
+            raise ValueError(
+                "_load_pld_decoder: spec_config.pld_min_ngram is None; "
+                "caller must go through ModelConfig.resolved_speculative()"
+            )
+        if spec_config.pld_lookup_window is None:
+            raise ValueError(
+                "_load_pld_decoder: spec_config.pld_lookup_window is None; "
+                "caller must go through ModelConfig.resolved_speculative()"
+            )
         logger.info(
             "Constructing PLD decoder (max_draft=%d, ngram=%d..%d, lookup_window=%d)",
             num_tokens,

@@ -517,6 +517,31 @@ class TestModelConfig:
                 }
             )
 
+    def test_pld_lookup_window_below_max_ngram_rejected(self):
+        """Per-model entry where lookup_window < max_ngram is rejected
+        at config load (rather than mid-request when the decoder
+        actually instantiates). Matches the symmetric min/max ngram check."""
+        with pytest.raises(ValueError, match="speculative_pld_lookup_window"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "speculative_pld_max_ngram": 3,
+                    "speculative_pld_lookup_window": 2,
+                }
+            )
+
+    def test_pld_min_ngram_above_max_ngram_rejected(self):
+        """Per-model entry with min > max for PLD ngrams is rejected
+        at config load (within-layer check, doesn't need PLD enabled)."""
+        with pytest.raises(ValueError, match="speculative_pld_min_ngram"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "speculative_pld_min_ngram": 5,
+                    "speculative_pld_max_ngram": 3,
+                }
+            )
+
     def test_kv_cache_quant_in_experimental_rejected(self):
         """kv_cache_quant in the experimental block is rejected as a promoted key."""
         with pytest.raises(ValueError, match="promoted out of 'experimental'"):

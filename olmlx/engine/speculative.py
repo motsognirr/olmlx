@@ -702,7 +702,12 @@ class PromptLookupDecoder:
         #: n-gram scan walks. ``None`` disables the cap. The pending
         #: token is always included regardless of this window.
         self._lookup_window = lookup_window
-        self._alpha = 0.5
+        # Init to 0.0 (not 0.5 as in ``SpeculativeDecoder``): PLD's
+        # acceptance rate before any step has run is honestly 0 (nothing
+        # drafted, nothing accepted), and a 0.5 warm-up would mislead
+        # ``stats_summary`` consumers (bench, streaming layer) into
+        # reporting 50% for the first several steps.
+        self._alpha = 0.0
         self._alpha_ema = acceptance_rate_ema
 
         # Persistent state populated by prefill/step
@@ -960,7 +965,12 @@ class PromptLookupDecoder:
                 # so ``draft_start = start + ngram_size`` is in
                 # ``[ngram_size, L - 1]``. Combined with ``lambda >= 1``,
                 # ``draft`` always contains at least one token, so a
-                # match returns unconditionally.
+                # match returns unconditionally. Edge case: when
+                # ``start == query_start - 1`` (the closest match), the
+                # only draft token is ``_seq(L-1) == pending`` — the
+                # decoder proposes the pending token as its own
+                # successor. That's a valid (if unusual) proposal;
+                # verification accepts or rejects it like any other.
                 draft_start = start + ngram_size
                 draft_end = min(draft_start + self._lambda, L)
                 return [_seq(i) for i in range(draft_start, draft_end)]

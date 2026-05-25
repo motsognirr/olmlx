@@ -203,6 +203,13 @@ class TestLookupDraft:
                 lookup_window=2,
             )
 
+    def test_initial_alpha_is_zero(self, decoder):
+        """``stats_summary().ema_acceptance_rate`` on a fresh decoder
+        must not falsely report 50% acceptance — PLD has done nothing
+        yet, so the honest rate is 0. Guards against bench/streaming
+        readers consuming a biased warm-up value."""
+        assert decoder.stats_summary()["ema_acceptance_rate"] == 0.0
+
     def test_prefill_seed_capped_at_lookup_window(self):
         """A prompt longer than ``lookup_window`` must seed ``_tokens``
         with only the trailing window. The prefix beyond the window
