@@ -3258,6 +3258,14 @@ class ModelManager:
                         "(or unset OLMLX_FLASH_SPECULATIVE) and "
                         "use speculative instead."
                     )
+                if weight_quant_str:
+                    logger.warning(
+                        "weight_quant=%s is set but %s is loaded via "
+                        "Flash-MoE; weight quantization is not applied on "
+                        "the Flash-MoE code path.",
+                        weight_quant_str,
+                        hf_path,
+                    )
                 model, tokenizer, is_vlm, caps = self._load_flash_moe_model(
                     hf_path, load_path, flash_moe_dir, flash_moe_config=flash_moe_config
                 )
@@ -3303,6 +3311,14 @@ class ModelManager:
                         "Cannot enable both flash_speculative and "
                         "speculative_strategy='pld' on the same model. "
                         "Pick one."
+                    )
+                if weight_quant_str:
+                    logger.warning(
+                        "weight_quant=%s is set but %s is loaded via "
+                        "Flash; weight quantization is not applied on "
+                        "the Flash code path.",
+                        weight_quant_str,
+                        hf_path,
                     )
                 model, tokenizer, is_vlm, caps, decoder = self._load_flash_model(
                     hf_path,

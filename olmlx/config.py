@@ -48,10 +48,10 @@ def validate_weight_quant_format(v: str | None) -> str | None:
                 f"Invalid weight_quant group_size={parts[2]!r}. "
                 f"Expected a positive integer."
             )
-        if gs < 1:
+        if gs < 32 or gs % 32 != 0:
             raise ValueError(
                 f"Invalid weight_quant group_size={gs}. "
-                f"Expected a positive integer."
+                f"Expected a multiple of 32 (e.g. 32, 64, 128)."
             )
     return v
 

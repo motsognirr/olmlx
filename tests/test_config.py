@@ -486,6 +486,11 @@ class TestWeightQuant:
         with pytest.raises(ValidationError, match="weight_quant"):
             Settings()
 
+    def test_invalid_group_size_not_multiple_of_32(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_WEIGHT_QUANT", "hqq:4:7")
+        with pytest.raises(ValidationError, match="weight_quant"):
+            Settings()
+
 
 class TestDistributedTensorOnly:
     def test_pipeline_strategy_rejected(self):

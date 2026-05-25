@@ -1434,6 +1434,24 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
                 )
         if _resolved_kvq:
             env["OLMLX_KV_CACHE_QUANT"] = _resolved_kvq
+        _resolved_wq = settings.weight_quant
+        if model:
+            try:
+                from olmlx.engine.registry import ModelRegistry
+
+                reg = ModelRegistry()
+                reg.load()
+                mc = reg.resolve(model)
+                if mc is not None:
+                    _resolved_wq = mc.resolved_weight_quant()
+            except Exception as exc:
+                logger.debug(
+                    "Skipping per-model weight_quant resolution for distributed "
+                    "worker: %s",
+                    exc,
+                )
+        if _resolved_wq:
+            env["OLMLX_WEIGHT_QUANT"] = _resolved_wq
         if settings.flash:
             env["OLMLX_FLASH"] = "true"
             # Forward the *resolved* primary knobs (from ``settings``)

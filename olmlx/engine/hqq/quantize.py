@@ -11,6 +11,9 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -155,6 +158,12 @@ def hqq_quantize_weight(
     out_features, in_features = w.shape
     n_groups = in_features // group_size
 
+    if n_groups == 0:
+        raise ValueError(
+            f"Cannot quantize weight of shape ({out_features}, {in_features}) "
+            f"with group_size={group_size}: in_features must be >= group_size"
+        )
+
     w_grp = w.reshape(out_features, n_groups, group_size)
     q, scales, biases = _hqq_solve_group(w_grp, cfg.n_iters, n_levels)
 
@@ -193,20 +202,12 @@ def _replace_module(
     name: str,
     new_module: nn.Module,
 ) -> None:
-    """Replace a child module in *parent* with *new_module*.
-
-    Uses MLX internal ``_modules`` dict which holds named sub-modules.
-    """
-    if hasattr(parent, "_modules"):
-        if name in parent._modules:
-            parent._modules[name] = new_module
-            return
-    for child_name, child in list(parent.named_modules()):
-        if child is parent:
-            continue
-        if hasattr(child, "_modules") and name in child._modules:
-            child._modules[name] = new_module
-            return
+    """Replace a child module in *parent* by full dotted *name*."""
+    parts = name.split(".")
+    obj = parent
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    setattr(obj, parts[-1], new_module)
 
 
 def quantize_model(
@@ -216,15 +217,24 @@ def quantize_model(
     """Walk model modules and replace all ``nn.Linear`` with ``HQQLinear``.
 
     Skips modules whose name contains any of ``cfg.skip_patterns``
-    (e.g. ``lm_head``, ``embed_tokens``).
+    (e.g. ``lm_head``, ``embed_tokens``) and layers whose input
+    dimension is smaller than ``cfg.group_size``.
     """
-    replacements: list[tuple[nn.Module, str, nn.Linear]] = []
+    replacements: list[tuple[str, nn.Linear]] = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
             if any(p in name for p in cfg.skip_patterns):
                 continue
-            replacements.append((model, name, module))
+            if module.weight.shape[1] < cfg.group_size:
+                logger.debug(
+                    "Skipping %s: in_features=%d < group_size=%d",
+                    name,
+                    module.weight.shape[1],
+                    cfg.group_size,
+                )
+                continue
+            replacements.append((name, module))
 
-    for _parent, name, linear in replacements:
+    for name, linear in replacements:
         hqq_layer = hqq_quantize_linear(linear, cfg)
         _replace_module(model, name, hqq_layer)

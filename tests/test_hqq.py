@@ -2,13 +2,12 @@
 
 import mlx.core as mx
 import numpy as np
-import pytest
 
 from olmlx.engine.hqq.quantize import (
     HQQConfig,
-    HQQLinear,
     hqq_quantize_weight,
     hqq_quantize_linear,
+    quantize_model,
 )
 
 
@@ -72,22 +71,22 @@ class TestHQQQuantizeWeight:
         assert err < 0.05
 
     def test_quantize_dequantize_4bit_hqq_better_than_minmax(self):
-        """HQQ should give lower reconstruction error than naive min/max quantization."""
+        """HQQ should beat naive min/max quantization on reconstruction error."""
         mx.random.seed(42)
         w = mx.random.normal(shape=(128, 128))
         cfg = HQQConfig(bits=4, group_size=64, n_iters=3)
 
         # HQQ
-        hqq_packed, hqq_scales, hqq_biases = hqq_quantize_weight(w, cfg)
-        hqq_restored = mx.dequantize(hqq_packed, hqq_scales, hqq_biases, cfg.group_size, cfg.bits)
-        hqq_err = mx.mean(mx.abs(w - hqq_restored)).item()
+        hqq_p, hqq_s, hqq_b = hqq_quantize_weight(w, cfg)
+        hqq_r = mx.dequantize(hqq_p, hqq_s, hqq_b, cfg.group_size, cfg.bits)
+        hqq_err = mx.mean(mx.abs(w - hqq_r)).item()
 
         # MLX native min/max affine quantization
-        mx_packed, mx_scales, mx_biases = mx.quantize(w, group_size=cfg.group_size, bits=cfg.bits)
-        mx_restored = mx.dequantize(mx_packed, mx_scales, mx_biases, cfg.group_size, cfg.bits)
-        mx_err = mx.mean(mx.abs(w - mx_restored)).item()
+        mx_p, mx_s, mx_b = mx.quantize(w, group_size=cfg.group_size, bits=cfg.bits)
+        mx_r = mx.dequantize(mx_p, mx_s, mx_b, cfg.group_size, cfg.bits)
+        mx_err = mx.mean(mx.abs(w - mx_r)).item()
 
-        assert hqq_err <= mx_err * 1.05  # HQQ should be at least as good or within 5%
+        assert hqq_err <= mx_err * 1.05
 
     def test_output_shapes(self):
         w = mx.random.normal(shape=(256, 128))
@@ -193,3 +192,65 @@ class TestHQQQuantizeLinear:
         hqq_layer = hqq_quantize_linear(layer, cfg)
         out = hqq_layer(x)
         assert out.shape == (4, 32)
+
+
+class TestQuantizeModel:
+    def test_nested_modules_are_replaced(self):
+        import mlx.nn as nn
+
+        class InnerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(128, 64)
+
+            def __call__(self, x):
+                return self.linear(x)
+
+        class OuterModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block0 = InnerBlock()
+                self.block1 = nn.Linear(64, 32)
+
+            def __call__(self, x):
+                return self.block1(self.block0(x))
+
+        model = OuterModel()
+        mx.eval(model.parameters())
+
+        x = mx.random.normal(shape=(4, 128))
+        out_before = model(x)
+
+        cfg = HQQConfig(bits=4, group_size=64, skip_patterns=())
+        quantize_model(model, cfg)
+
+        from olmlx.engine.hqq.quantize import HQQLinear
+
+        assert isinstance(model.block0.linear, HQQLinear)
+        assert isinstance(model.block1, HQQLinear)
+
+        out_after = model(x)
+        assert out_after.shape == out_before.shape
+
+    def test_skip_patterns_are_respected(self):
+        import mlx.nn as nn
+
+        class ModelWithLMHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(128, 256)
+                self.ffn = nn.Linear(128, 128)
+
+            def __call__(self, x):
+                return self.lm_head(self.ffn(x))
+
+        model = ModelWithLMHead()
+        mx.eval(model.parameters())
+
+        cfg = HQQConfig(bits=4, group_size=64)
+        quantize_model(model, cfg)
+
+        from olmlx.engine.hqq.quantize import HQQLinear
+
+        assert not isinstance(model.lm_head, HQQLinear)
+        assert isinstance(model.ffn, HQQLinear)
