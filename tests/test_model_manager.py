@@ -4411,6 +4411,59 @@ class TestSpeculativeLoading:
         # PLD is honoured, so the warn-and-ignore message must NOT fire.
         assert "OLMLX_SPECULATIVE" not in caplog.text
 
+    def test_flash_path_warns_when_classic_spec_set_with_flash_speculative(
+        self, monkeypatch, caplog
+    ):
+        """Flash + flash_speculative=True + OLMLX_SPECULATIVE=true (classic)
+        must still log the warn-and-ignore message. The user's classic
+        spec setting is ignored either way — flash_speculative being on
+        doesn't change that, so suppressing the warning would hide a
+        misconfiguration."""
+        import logging
+
+        from olmlx.config import ExperimentalSettings
+        from olmlx.engine.registry import ResolvedFlashConfig
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-flash")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: True)
+        monkeypatch.setattr(
+            manager, "_flash_dir", lambda hf_path: Path("/tmp/test-flash/flash")
+        )
+        sentinel = (object(), object(), False, TemplateCaps(), object())
+        monkeypatch.setattr(
+            manager,
+            "_load_flash_model",
+            lambda *a, **kw: sentinel,
+        )
+
+        flash_config = ResolvedFlashConfig(
+            enabled=True,
+            sparsity_threshold=0.5,
+            min_active_neurons=128,
+            max_active_neurons=None,
+            memory_budget_fraction=None,
+            prefetch=False,
+            flash_speculative=True,
+            flash_speculative_draft_model="test/draft",
+        )
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = SpeculativeConfig(True, "test/draft", 4, strategy="classic")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            manager._load_model(
+                "test/flash-model",
+                model_exp=model_exp,
+                spec_config=spec_config,
+                flash_config=flash_config,
+            )
+        # The user's OLMLX_SPECULATIVE setting is ignored — warning fires.
+        assert "OLMLX_SPECULATIVE" in caplog.text
+
     def test_flash_path_rejects_pld_with_flash_speculative(self, monkeypatch):
         """Flash + flash_speculative + PLD must raise — two speculative
         decoders fighting over the same target is a configuration error,

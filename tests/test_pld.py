@@ -203,6 +203,50 @@ class TestLookupDraft:
                 lookup_window=2,
             )
 
+    def test_prefill_seed_capped_at_lookup_window(self):
+        """A prompt longer than ``lookup_window`` must seed ``_tokens``
+        with only the trailing window. The prefix beyond the window
+        can never participate in n-gram search anyway, so paying the
+        Metal-to-Python cost for it is pure waste."""
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        decoder = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=2,
+            max_ngram_size=3,
+            min_ngram_size=1,
+            lookup_window=5,
+        )
+        prompt = mx.array([list(range(20))])  # 20 tokens; window=5
+        decoder.prefill(prompt)
+        # Only the trailing 5 prompt tokens land in the lookup table.
+        assert decoder._tokens == [15, 16, 17, 18, 19]
+
+    def test_step_prunes_tokens_to_lookup_window(self):
+        """``_tokens`` must not grow beyond ``lookup_window`` across
+        repeated steps. This is the load-bearing memory invariant for
+        long conversations — without it the list accumulates every
+        generated token for the lifetime of the request."""
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        decoder = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=2,
+            max_ngram_size=2,
+            min_ngram_size=1,
+            lookup_window=8,
+        )
+        prompt = mx.array([list(range(6))])  # under window — no seed cap
+        decoder.prefill(prompt)
+        for _ in range(10):
+            decoder.step()
+        # ``_tokens`` must respect the window after enough steps to
+        # exceed it; the pending token is held separately so total
+        # in-flight history is at most window + 1.
+        assert len(decoder._tokens) <= decoder._lookup_window
+
 
 class TestPromptLookupDecoder:
     """End-to-end tests against MockModel: caches populate, step()
@@ -273,25 +317,30 @@ class TestPromptLookupDecoder:
         decoder.reset()
         assert decoder._target_cache is None
         assert decoder._cache_seq_len == 0
-        assert decoder._last_target_logit is None
         assert decoder._pending_token is None
         assert decoder._tokens == []
 
     def test_multi_step_consistency(self, decoder):
-        prompt = mx.array([[1, 2, 3, 4, 5]])
-        decoder.prefill(prompt)
-        emitted = [decoder._pending_token]
+        """Across many steps, cache offset stays aligned with the
+        emitted token count and ``_tokens + [_pending]`` reconstructs
+        the full emitted sequence (prompt + everything yielded so
+        far). Token-by-token output values depend on MockModel's
+        random init, so the assertion stays on the invariants that
+        hold regardless of which path step() takes."""
+        prompt_ids = [1, 2, 3, 4, 5]
+        prompt = mx.array([prompt_ids])
+        first = decoder.prefill(prompt)
+        emitted: list[int] = [first]
         for _ in range(6):
             accepted, _ = decoder.step()
             assert len(accepted) >= 1
-            assert decoder._target_cache[0].offset == decoder._cache_seq_len
-            # Sequence visible-so-far is exactly history + pending.
-            assert (
-                decoder._tokens[-1] == emitted[-1]
-                or decoder._tokens[-len(accepted) :] == list(accepted[:-1])
-                or len(accepted) == 1
-            )
             emitted.extend(accepted)
+            # KV cache stays in lockstep with what's emitted minus the
+            # not-yet-cached pending token.
+            assert decoder._target_cache[0].offset == decoder._cache_seq_len
+            assert decoder._cache_seq_len == len(prompt_ids) + len(emitted) - 1
+            # ``_tokens + [_pending]`` reproduces the emitted stream.
+            assert decoder._tokens + [decoder._pending_token] == (prompt_ids + emitted)
 
     def test_output_matches_greedy_reference(self):
         """PLD output must equal greedy decoding token-for-token.

@@ -708,7 +708,6 @@ class PromptLookupDecoder:
         # Persistent state populated by prefill/step
         self._target_cache: list | None = None
         self._cache_seq_len: int = 0
-        self._last_target_logit: mx.array | None = None
         self._pending_token: int | None = None
         # Full token history (prompt + cached generated tokens) used as
         # the lookup table. The currently-pending token is tracked
@@ -754,7 +753,6 @@ class PromptLookupDecoder:
     def reset(self) -> None:
         self._target_cache = None
         self._cache_seq_len = 0
-        self._last_target_logit = None
         self._pending_token = None
         self._tokens = []
         self._stats_steps = 0
@@ -802,18 +800,23 @@ class PromptLookupDecoder:
         if self._gdn_capture is not None:
             self._gdn_capture.use_buffer(None)
 
-        self._last_target_logit = _prefill_last_logit(
-            self._target, prompt, self._target_cache
-        )
-        mx.eval(self._last_target_logit)
+        last_logit = _prefill_last_logit(self._target, prompt, self._target_cache)
+        mx.eval(last_logit)
 
         self._cache_seq_len = prompt.shape[1]
         # Seed the lookup table with the prompt tokens. The pending
         # (first generated) token lives in ``_pending_token`` until the
-        # next ``step()`` puts it into the cache.
-        self._tokens = prompt[0].tolist()
+        # next ``step()`` puts it into the cache. Cap the seed to the
+        # lookup window so we don't pay an O(prompt_len) Metal-to-
+        # Python copy for tokens that will never participate in the
+        # n-gram scan (the cached prefix is still in the KV cache;
+        # this list only feeds the lookup heuristic).
+        if self._lookup_window is not None and prompt.shape[1] > self._lookup_window:
+            self._tokens = prompt[0, -self._lookup_window :].tolist()
+        else:
+            self._tokens = prompt[0].tolist()
 
-        first_token = int(mx.argmax(self._last_target_logit).item())
+        first_token = int(mx.argmax(last_logit).item())
         self._pending_token = first_token
         return first_token
 
@@ -880,6 +883,13 @@ class PromptLookupDecoder:
         self._tokens.append(pending_token)
         if num_accepted > 1:
             self._tokens.extend(accepted[:-1])
+        # Keep memory O(lookup_window) regardless of conversation
+        # length: anything beyond the window can never be matched, so
+        # prune in-place to drop both the Python objects and any
+        # downstream slicing cost in ``_lookup_draft``. ``del`` on a
+        # slice is the cheap mutation here — avoids an alloc/copy.
+        if self._lookup_window is not None and len(self._tokens) > self._lookup_window:
+            del self._tokens[: len(self._tokens) - self._lookup_window]
         self._cache_seq_len += num_accepted
         self._pending_token = int(accepted[-1])
 

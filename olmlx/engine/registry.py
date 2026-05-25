@@ -518,8 +518,10 @@ class ModelConfig:
         # Cross-field check: the per-model override could combine with
         # the global value to produce an inverted pair. ``Settings`` and
         # ``ModelConfig.__post_init__`` catch the within-layer case;
-        # this catches the cross-layer one.
-        if pld_min_ngram > pld_max_ngram:
+        # this catches the cross-layer one. Scope to ``strategy == 'pld'``
+        # so a misconfigured PLD pair doesn't break every model load
+        # (classic/dflash/eagle never read these fields).
+        if strategy == "pld" and pld_min_ngram > pld_max_ngram:
             raise ValueError(
                 f"Resolved speculative_pld_min_ngram ({pld_min_ngram}) "
                 f"must be <= speculative_pld_max_ngram ({pld_max_ngram}) "

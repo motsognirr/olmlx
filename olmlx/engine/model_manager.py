@@ -3258,11 +3258,14 @@ class ModelManager:
                 # collide with ``flash_speculative`` and are warned/ignored
                 # to preserve the prior behaviour.
                 pld_requested = spec_enabled and spec_config.strategy == "pld"
-                if (
-                    spec_enabled
-                    and not pld_requested
-                    and not flash_config.flash_speculative
-                ):
+                # Non-PLD strategies still get ignored on Flash regardless
+                # of whether ``flash_speculative`` is also set — the user's
+                # ``OLMLX_SPECULATIVE`` choice doesn't take effect either
+                # way, so the warning must fire. ``flash_speculative`` is
+                # an orthogonal concern (it picks the *flash-side*
+                # speculative implementation; classic/dflash/eagle are
+                # never honoured on a Flash target).
+                if spec_enabled and not pld_requested:
                     logger.warning(
                         "OLMLX_SPECULATIVE is enabled but %s is loaded via "
                         "Flash, which uses OLMLX_FLASH_SPECULATIVE "
