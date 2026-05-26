@@ -167,14 +167,20 @@ class Settings(BaseSettings):
     #   carries an ``eagle_config`` block.
     # - ``pld``: prompt-lookup decoding. No draft model — the "draft" comes
     #   from n-gram lookup in the prompt+generated history. Free acceptance
-    #   on code edits, repeated context, and JSON/structured replies. Only
-    #   speculative strategy that composes with Flash-MoE.
+    #   on code edits, repeated context, and JSON/structured replies.
+    # - ``self_speculative``: LayerSkip-style decoding — uses the target's
+    #   own early layers (0..L-skip-1) as an autoregressive draft, then
+    #   verifies with all L layers in one forward pass. No external draft
+    #   model required. Works under Flash and Flash-MoE.
+    #   Configured with ``speculative_layers_skip`` (default: L//4).
+    # Both ``pld`` and ``self_speculative`` compose with Flash-MoE.
     # ``speculative_tokens`` is reused as DFlash's ``block_size``, EAGLE's
-    # per-verify draft-token count, and PLD's max draft length. ``None``
-    # means "use the strategy default": 4 for classic, 10 for PLD, the
-    # draft model's pre-trained ``block_size`` for DFlash and EAGLE.
+    # per-verify draft-token count, PLD's max draft length, and
+    # self_speculative's draft token count. ``None`` means "use the
+    # strategy default": 4 for classic and self_speculative, 10 for PLD,
+    # the draft model's pre-trained ``block_size`` for DFlash and EAGLE.
     speculative: bool = False
-    speculative_strategy: Literal["classic", "dflash", "eagle", "pld"] = "classic"
+    speculative_strategy: Literal["classic", "dflash", "eagle", "pld", "self_speculative"] = "classic"
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] | None = None
     #: PLD-only knobs (ignored by other strategies). N-gram sizes for the
@@ -190,6 +196,9 @@ class Settings(BaseSettings):
     #: max_ngram=3); raise it if you need matches against an older
     #: prefix, lower it if you're seeing scan-time regressions.
     speculative_pld_lookup_window: Annotated[int, Field(gt=0)] = 8192
+    #: Self-speculative knob — number of layers skipped during the draft
+    #: pass. ``None`` defaults to L//4 at load time.
+    speculative_layers_skip: Annotated[int, Field(ge=1)] | None = None
 
     # Flash inference (LLM in a Flash). Primary, user-facing knobs.
     # Advanced tuning (window size, IO threads, cache budget, predictor
