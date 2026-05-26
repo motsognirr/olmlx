@@ -31,7 +31,11 @@ from olmlx.engine.gdn_rollback import (
 )
 from mlx_lm.models.rope_utils import initialize_rope
 
-from olmlx.engine.dflash.draft_model import DFlashAttention, DFlashDraftModel, DraftConfig
+from olmlx.engine.dflash.draft_model import (
+    DFlashAttention,
+    DFlashDraftModel,
+    DraftConfig,
+)
 from olmlx.engine.speculative_stream import speculative_stream_generate
 
 
@@ -483,7 +487,7 @@ class TestSlidingAttentionMask:
         cache_non_causal: KVCache | RotatingKVCache = KVCache()
 
         x_ctx = mx.random.normal((1, 3, hidden_size))  # S=3
-        x = mx.random.normal((1, 2, hidden_size))       # L=2, S+L=5 > 4
+        x = mx.random.normal((1, 2, hidden_size))  # L=2, S+L=5 > 4
 
         out_causal = attn_causal(x, x_ctx, rope, cache_causal)
         out_non_causal = attn_non_causal(x, x_ctx, rope, cache_non_causal)
@@ -515,7 +519,7 @@ class TestSlidingAttentionMask:
         cache_non_causal: KVCache | RotatingKVCache = KVCache()
 
         x_ctx = mx.random.normal((1, 1, hidden_size))  # S=1
-        x = mx.random.normal((1, 2, hidden_size))       # L=2, S+L=3 <= 4
+        x = mx.random.normal((1, 2, hidden_size))  # L=2, S+L=3 <= 4
 
         out_causal = attn_causal(x, x_ctx, rope, cache_causal)
         out_non_causal = attn_non_causal(x, x_ctx, rope, cache_non_causal)
