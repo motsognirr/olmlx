@@ -254,3 +254,32 @@ class TestQuantizeModel:
 
         assert not isinstance(model.lm_head, HQQLinear)
         assert isinstance(model.ffn, HQQLinear)
+
+    def test_list_based_layers_are_replaced(self):
+        import mlx.nn as nn
+
+        class ListModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = [nn.Linear(128, 128) for _ in range(3)]
+
+            def __call__(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        model = ListModel()
+        mx.eval(model.parameters())
+        x = mx.random.normal(shape=(4, 128))
+        out_before = model(x)
+
+        cfg = HQQConfig(bits=4, group_size=64, skip_patterns=())
+        quantize_model(model, cfg)
+
+        from olmlx.engine.hqq.quantize import HQQLinear
+
+        for i, layer in enumerate(model.layers):
+            assert isinstance(layer, HQQLinear), f"layers.{i} not replaced"
+
+        out_after = model(x)
+        assert out_after.shape == out_before.shape

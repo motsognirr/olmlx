@@ -8,6 +8,7 @@ naive min/max affine quantisation (which is what ``mx.quantize`` does).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -75,7 +76,12 @@ def _hqq_solve_group(
         wc = w_grp - w_mean
         cov = (qc * wc).sum(axis=-1, keepdims=True)
         var = (qc * qc).sum(axis=-1, keepdims=True)
-        scale = cov / mx.maximum(var, eps)
+        scale_new = cov / mx.maximum(var, eps)
+        scale = mx.where(
+            scale_new > 0,
+            scale_new,
+            mx.maximum(delta, eps) / mx.array(float(n_levels), dtype=w_grp.dtype),
+        )
         beta = w_mean - scale * q_mean
 
     q = mx.round((w_grp - beta) / mx.maximum(scale, eps))
@@ -93,11 +99,9 @@ def _pack_indices(q: mx.array, bits: int) -> mx.array:
     elems_per_pack = 32 // bits
     last_dim = q.shape[-1]
     q_shaped = q.reshape(*q.shape[:-1], last_dim // elems_per_pack, elems_per_pack)
-    packed = mx.zeros(q_shaped.shape[:-1], dtype=mx.uint32)
-    for j in range(elems_per_pack):
-        shift = mx.array(j * bits, dtype=mx.uint32)
-        packed = packed | (q_shaped[..., j] << shift)
-    return packed.reshape(*q.shape[:-1], last_dim // elems_per_pack)
+    shifts = mx.array([j * bits for j in range(elems_per_pack)], dtype=mx.uint32)
+    packed = mx.sum(q_shaped << shifts, axis=-1).astype(mx.uint32)
+    return packed
 
 
 class HQQLinear(nn.Module):
@@ -161,10 +165,11 @@ def hqq_quantize_weight(
     out_features, in_features = w.shape
     n_groups = in_features // group_size
 
-    if n_groups == 0:
+    if n_groups == 0 or in_features % group_size != 0:
         raise ValueError(
             f"Cannot quantize weight of shape ({out_features}, {in_features}) "
-            f"with group_size={group_size}: in_features must be >= group_size"
+            f"with group_size={group_size}: in_features must be >= group_size "
+            f"and a multiple of group_size"
         )
 
     w_grp = w.reshape(out_features, n_groups, group_size)
@@ -205,12 +210,25 @@ def _replace_module(
     name: str,
     new_module: nn.Module,
 ) -> None:
-    """Replace a child module in *parent* by full dotted *name*."""
+    """Replace a child module in *parent* by full dotted *name*.
+
+    MLX models store transformer blocks in lists (``model.layers``),
+    so paths like ``"model.layers.0.self_attn.q_proj"`` require
+    list-index access for the ``"0"`` segment.  Everything else uses
+    plain ``getattr`` / ``setattr`` on the ``nn.Module`` tree.
+    """
     parts = name.split(".")
-    obj = parent
+    obj: Any = parent
     for part in parts[:-1]:
-        obj = getattr(obj, part)
-    setattr(obj, parts[-1], new_module)
+        if isinstance(obj, list):
+            obj = obj[int(part)]
+        else:
+            obj = getattr(obj, part)
+    last = parts[-1]
+    if isinstance(obj, list):
+        obj[int(last)] = new_module
+    else:
+        setattr(obj, last, new_module)
 
 
 def quantize_model(
@@ -237,6 +255,13 @@ def quantize_model(
                 )
                 continue
             replacements.append((name, module))
+
+    if not replacements:
+        logger.warning(
+            "weight_quant configured but no quantizable nn.Linear layers found "
+            "(model may already be quantized via config.json); HQQ not applied."
+        )
+        return
 
     for name, linear in replacements:
         hqq_layer = hqq_quantize_linear(linear, cfg)

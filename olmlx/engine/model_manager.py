@@ -3386,8 +3386,11 @@ class ModelManager:
         # Text or unknown — try mlx-lm first, fall back to mlx-vlm
         model, tokenizer, is_vlm, caps = self._try_lm_then_vlm(load_path, hf_path)
 
-        # Apply HQQ weight quantization if configured
-        self._maybe_quantize_model(model, is_vlm, weight_quant_str, hf_path)
+        # Apply HQQ weight quantization if configured.
+        # The text path (including hybrid VLMs routed through mlx-lm)
+        # loads a plain text model — pass is_vlm=False so we quantize
+        # the model directly without looking for .language_model.
+        self._maybe_quantize_model(model, False, weight_quant_str, hf_path)
 
         if spec_enabled and flash_config.flash_speculative:
             raise ValueError(
@@ -3449,7 +3452,7 @@ class ModelManager:
             hf_path,
         )
         quantize_model(target, cfg)
-        mx.eval(model.parameters())
+        mx.eval(target.parameters())
 
     def _load_model_and_shard(
         self,
