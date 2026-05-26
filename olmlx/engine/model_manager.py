@@ -1547,8 +1547,8 @@ class ModelManager:
                         inference_timeout=model_config.inference_timeout,
                         sync_mode=model_config.sync_mode,
                     )
-                    await self._probe_cache_capabilities(lm)
                     self._loaded[normalized] = lm
+                    await self._probe_cache_capabilities(lm)
                     return lm
                 except BaseException:
                     # Drop references and flush Metal allocator so the memory
