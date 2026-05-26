@@ -713,7 +713,8 @@ class TestProbeCacheCapabilities:
         lm.supports_cache_trim = False
         return lm
 
-    def test_probe_empty_cache_list_disables_persistence(self, registry, mock_store):
+    @pytest.mark.asyncio
+    async def test_probe_empty_cache_list_disables_persistence(self, registry, mock_store):
         """If ``make_prompt_cache`` returns an empty list (a degenerate model
         with no cache layers), ``_cache_supports_persistence`` returns
         False — there's no evidence the cache layout is safe — and the
@@ -724,7 +725,7 @@ class TestProbeCacheCapabilities:
         lm = self._make_lm()
 
         with patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]):
-            manager._probe_cache_capabilities(lm)
+            await manager._probe_cache_capabilities(lm)
 
         # Trim is vacuously True — trim of an empty cache is a no-op
         # that mlx-lm handles cleanly, so leaving the flag True is fine.
@@ -732,7 +733,8 @@ class TestProbeCacheCapabilities:
         # Persistence: no evidence of safety → False.
         assert lm.supports_cache_persistence is False
 
-    def test_non_trimmable_layout_disables_persistence(self, registry, mock_store):
+    @pytest.mark.asyncio
+    async def test_non_trimmable_layout_disables_persistence(self, registry, mock_store):
         """Issue #343: a layout containing a ``RotatingKVCache`` layer makes
         the cache non-trimmable.  In real chat flow the stored prompt +
         generated tokens can never be aligned with the next request's
@@ -756,12 +758,13 @@ class TestProbeCacheCapabilities:
 
         probe_cache = [_FakeRotating(), _FakeRotating()]
         with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
-            manager._probe_cache_capabilities(lm)
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
 
-    def test_chunked_kv_cache_layout_disables_persistence(self, registry, mock_store):
+    @pytest.mark.asyncio
+    async def test_chunked_kv_cache_layout_disables_persistence(self, registry, mock_store):
         """``ChunkedKVCache`` is the other non-trimmable layout cited by
         #343 and CLAUDE.md (mlx-lm's chunk-based cache; affects newer
         Apple-published checkpoints).  Like ``RotatingKVCache`` it sits
@@ -784,12 +787,13 @@ class TestProbeCacheCapabilities:
 
         probe_cache = [_FakeChunked(), _FakeChunked()]
         with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
-            manager._probe_cache_capabilities(lm)
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
 
-    def test_mixed_layout_kv_plus_rotating_disables_persistence(
+    @pytest.mark.asyncio
+    async def test_mixed_layout_kv_plus_rotating_disables_persistence(
         self, registry, mock_store
     ):
         """Real Gemma 4 layout: full-attention layers produce ``KVCache``
@@ -819,12 +823,13 @@ class TestProbeCacheCapabilities:
 
         probe_cache = [_FakeKV(), _FakeRotating(), _FakeKV(), _FakeRotating()]
         with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
-            manager._probe_cache_capabilities(lm)
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
 
-    def test_trimmable_layout_keeps_persistence(self, registry, mock_store):
+    @pytest.mark.asyncio
+    async def test_trimmable_layout_keeps_persistence(self, registry, mock_store):
         """Guard the inverse: a fully trimmable layout (plain ``KVCache``
         layers) must still report persistence True after the #343 fix.
         Otherwise the fix would silently disable cache reuse for the
@@ -840,12 +845,13 @@ class TestProbeCacheCapabilities:
 
         probe_cache = [_FakeKV(), _FakeKV()]
         with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
-            manager._probe_cache_capabilities(lm)
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is True
         assert lm.supports_cache_persistence is True
 
-    def test_non_trimmable_persistable_layout_logs_343(
+    @pytest.mark.asyncio
+    async def test_non_trimmable_persistable_layout_logs_343(
         self, registry, mock_store, caplog
     ):
         """A hybrid sliding-window layout (RotatingKVCache) is in the
@@ -870,14 +876,15 @@ class TestProbeCacheCapabilities:
             ),
             caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"),
         ):
-            manager._probe_cache_capabilities(lm)
+            await manager._probe_cache_capabilities(lm)
 
         assert "issue #343" in caplog.text
         # #284 is the ArraysCache reason — must not be attributed here.
         assert "issue #284" not in caplog.text
         assert "RotatingKVCache" in caplog.text or "sliding-window" in caplog.text
 
-    def test_non_persistable_layout_logs_284(self, registry, mock_store, caplog):
+    @pytest.mark.asyncio
+    async def test_non_persistable_layout_logs_284(self, registry, mock_store, caplog):
         """A hybrid SSM layout (ArraysCache) is in neither allowlist:
         trim=False, layout-persist=False.  The load-time log must cite
         #284 / ArraysCache — not #343 / RotatingKVCache.  This is the
@@ -902,7 +909,7 @@ class TestProbeCacheCapabilities:
             ),
             caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"),
         ):
-            manager._probe_cache_capabilities(lm)
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
@@ -912,7 +919,8 @@ class TestProbeCacheCapabilities:
         assert "issue #343" not in caplog.text
         assert "RotatingKVCache" not in caplog.text
 
-    def test_probe_failure_warns_and_disables_persistence(
+    @pytest.mark.asyncio
+    async def test_probe_failure_warns_and_disables_persistence(
         self, registry, mock_store, caplog
     ):
         """When ``make_prompt_cache`` raises, the probe must log at WARNING,
@@ -931,7 +939,7 @@ class TestProbeCacheCapabilities:
             ),
             caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"),
         ):
-            manager._probe_cache_capabilities(lm)
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is True
         assert lm.supports_cache_persistence is False
