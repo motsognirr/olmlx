@@ -275,17 +275,28 @@ class Settings(BaseSettings):
                 f"must be <= speculative_pld_max_ngram "
                 f"({self.speculative_pld_max_ngram})"
             )
-        # Parallel to the per-model ``ModelConfig.__post_init__`` check
-        # — without this, a bad env pair like ``MAX_NGRAM=3
-        # LOOKUP_WINDOW=1`` would pass startup and only blow up at
-        # first model load with a confusing stack trace from
-        # ``resolved_speculative``.
         if self.speculative_pld_lookup_window < self.speculative_pld_max_ngram:
             raise ValueError(
                 f"speculative_pld_lookup_window "
                 f"({self.speculative_pld_lookup_window}) must be >= "
                 f"speculative_pld_max_ngram "
                 f"({self.speculative_pld_max_ngram})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_tree_speculative(self) -> "Settings":
+        if self.tree_speculative and self.flash_speculative:
+            raise ValueError(
+                "OLMLX_TREE_SPECULATIVE=true and OLMLX_FLASH_SPECULATIVE=true "
+                "are incompatible. Tree verification is only supported with "
+                "OLMLX_SPECULATIVE=true (classic strategy). Flash speculative "
+                "decoding uses a separate code path that does not support tree "
+                "drafts (see #358)."
+            )
+        if self.tree_speculative and not self.speculative:
+            raise ValueError(
+                "OLMLX_TREE_SPECULATIVE=true requires OLMLX_SPECULATIVE=true"
             )
         return self
 

@@ -146,15 +146,17 @@ def build_comb_tree(
             f"match primary_tokens length ({n_levels})"
         )
 
-    # Phase 1: primary path
-    #   indices 0..n_levels (root + primary)
+    # Phase 1: primary path — indices 0..n_levels (root + primary).
+    # Stop building the primary path early if it would exceed max_nodes.
     tokens: list[int] = [pending_token]
-    parent_indices: list[int] = [-1]  # root
+    parent_indices: list[int] = [-1]
     depths: list[int] = [0]
-    primary_branch: list[int] = [0]  # root is part of the primary branch
+    primary_branch: list[int] = [0]
 
-    for i, tok in enumerate(primary_tokens):
-        parent_idx = i  # parent is the previous node
+    n_primary = min(n_levels, max_nodes - 1)  # -1 for the already-added root
+    for i in range(n_primary):
+        tok = primary_tokens[i]
+        parent_idx = i
         tokens.append(tok)
         parent_indices.append(parent_idx)
         depths.append(i + 1)
@@ -316,19 +318,23 @@ def verify_tree_greedy(
             accepted.append(draft_token)
         else:
             # Primary mismatch — try siblings at the same depth.
+            # The sibling scan assumes all siblings at depth *d* share
+            # the same parent as the primary node (true for comb trees,
+            # not guaranteed for full trees).  Validate explicitly.
             siblings = nodes_by_depth.get(depth, [])
+            primary_parent = parent_idx
             for sib_idx in siblings:
                 if sib_idx == node_idx:
                     continue
                 sib_parent = tree.parent_indices[sib_idx]
+                if sib_parent != primary_parent:
+                    continue  # skip siblings from other branches
                 sib_token = tree.tokens[sib_idx]
                 if sib_token == int(target_choices[sib_parent].item()):
                     accepted.append(sib_token)
                     # Bonus: what comes after the sibling (target_choices[sib_idx]
                     # is the prediction at the sibling's own position).
-                    accepted.append(
-                        int(target_choices[sib_idx].item())
-                    )
+                    accepted.append(int(target_choices[sib_idx].item()))
                     return accepted, True
 
             # No sibling matched — accept target's choice at the
@@ -349,14 +355,16 @@ def _patch_target_for_tree_forward(
 ) -> Any:
     """Temporarily patch a model to use a sparse tree attention mask.
 
-    Replaces the model's ``__call__`` with a version that passes
-    *tree_mask* to each attention layer instead of creating a causal
-    mask.  Returns the original ``__call__`` so the caller can restore it.
+    Replaces the inner transformer's ``__call__`` with a version that
+    passes *tree_mask* to each attention layer instead of creating a
+    causal mask.  Returns the original ``__call__`` so the caller can
+    restore it.
 
-    Supports Qwen3-family models (``embed_tokens`` / ``layers`` / ``norm``
-    pattern) and wrappers whose ``language_model`` exposes the same
-    pattern.  For other architectures the patch may raise — add a new
-    branch in the dispatch inside the patched function.
+    Supports Qwen3-family models via two common patterns:
+    - Text models (``Qwen3ForCausalLM``): the inner transformer lives at
+      ``target.model``; ``target.lm_head`` is applied by the outer wrapper.
+    - VLM models: the inner transformer lives at
+      ``target.language_model``.
 
     The caller MUST restore the original ``__call__`` after the forward
     pass.  Failure to restore will leak the tree mask into subsequent
@@ -366,6 +374,8 @@ def _patch_target_for_tree_forward(
     inner = target
     if hasattr(target, "language_model") and target.language_model is not None:
         inner = target.language_model
+    elif hasattr(target, "model") and target.model is not None:
+        inner = target.model
 
     # Detect model structure.
     layers = getattr(inner, "layers", None)
@@ -398,6 +408,8 @@ def _restore_target(target: Any, orig_call: Any) -> None:
     inner = target
     if hasattr(target, "language_model") and target.language_model is not None:
         inner = target.language_model
+    elif hasattr(target, "model") and target.model is not None:
+        inner = target.model
     inner.__call__ = orig_call
 
 
@@ -406,6 +418,8 @@ def extract_top_k_from_logits(
     k: int,
 ) -> list[int]:
     """Extract the top-K token IDs from a logit vector.
+
+    Uses ``mx.argpartition`` for k ≪ vocab_size (avoids a full sort).
 
     Args:
         logits: ``(vocab,)`` or ``(batch, vocab)`` logits.
@@ -416,8 +430,16 @@ def extract_top_k_from_logits(
     """
     if k <= 1:
         return [int(mx.argmax(logits, axis=-1).item())]
-    # argsort ascending → negate logits for descending
-    sorted_idx = mx.argsort(-logits, axis=-1)[..., :k]
-    mx.eval(sorted_idx)
-    flat = sorted_idx.flatten()
+
+    vocab = logits.shape[-1]
+    # argpartition places the smallest kth elements before index kth.
+    # We want the largest k, so negate and partition on (k - 1).
+    kth = min(k - 1, vocab - 1)
+    part_idx = mx.argpartition(-logits, kth=kth, axis=-1)[..., :k]
+    # part_idx is not sorted — pull the top-k values and argsort them.
+    top_vals = mx.take(logits, part_idx, axis=-1)
+    sort_idx = mx.argsort(-top_vals, axis=-1)
+    sorted_indices = mx.take(part_idx, sort_idx, axis=-1)
+    mx.eval(sorted_indices)
+    flat = sorted_indices.flatten()
     return [int(flat[i].item()) for i in range(k)]

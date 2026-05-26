@@ -535,9 +535,7 @@ class SpeculativeDecoder:
         orig_call = _patch_target_for_tree_forward(self._target, tree_mask)
         try:
             tree_tokens = mx.array([tree.tokens])
-            target_out = _logits(
-                self._target(tree_tokens, cache=self._target_cache)
-            )
+            target_out = _logits(self._target(tree_tokens, cache=self._target_cache))
             mx.eval(target_out)
         finally:
             _restore_target(self._target, orig_call)
@@ -565,7 +563,6 @@ class SpeculativeDecoder:
         if used_sibling:
             # Rebuild: trim all tree nodes from the target cache, then
             # feed only the accepted tokens to get a contiguous cache.
-            tree_total = tree.num_nodes
             if self._target_gdn_buffer is not None and self._gdn_capture is not None:
                 self._gdn_capture.rollback_single(
                     self._target_gdn_buffer,
@@ -576,9 +573,7 @@ class SpeculativeDecoder:
             elif trim_prompt_cache is not None:
                 trim_prompt_cache(self._target_cache, tree_total)
             accepted_arr = mx.array([accepted])
-            rebuild_out = _logits(
-                self._target(accepted_arr, cache=self._target_cache)
-            )
+            rebuild_out = _logits(self._target(accepted_arr, cache=self._target_cache))
             mx.eval(rebuild_out)
             rebuild_logits = rebuild_out[0]
             self._last_target_logit = rebuild_logits[num_accepted - 1]
@@ -586,7 +581,10 @@ class SpeculativeDecoder:
             # Primary path: trim from the end.
             trim_target = max(tree_total - num_accepted, 0)
             if trim_target > 0:
-                if self._target_gdn_buffer is not None and self._gdn_capture is not None:
+                if (
+                    self._target_gdn_buffer is not None
+                    and self._gdn_capture is not None
+                ):
                     self._gdn_capture.rollback_single(
                         self._target_gdn_buffer,
                         self._target_cache,

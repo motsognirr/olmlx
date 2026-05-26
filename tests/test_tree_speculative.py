@@ -228,7 +228,7 @@ class TestVerifyTreeGreedy:
         vocab_size = 50
         logits = mx.zeros((tree.num_nodes, vocab_size))
         logits = logits.at[0, 10].add(100.0)  # D1 matches
-        logits = logits.at[1, 15].add(50.0)   # D2 mismatches
+        logits = logits.at[1, 15].add(50.0)  # D2 mismatches
         logits = logits.at[1, 21].add(100.0)  # D2_sib matches at parent pos 1
 
         accepted, used_sibling = verify_tree_greedy(tree, logits)
@@ -247,7 +247,7 @@ class TestVerifyTreeGreedy:
         vocab_size = 50
         logits = mx.zeros((tree.num_nodes, vocab_size))
         logits = logits.at[0, 10].add(100.0)  # D1 matches
-        logits = logits.at[1, 15].add(50.0)   # D2 mismatches
+        logits = logits.at[1, 15].add(50.0)  # D2 mismatches
         logits = logits.at[1, 21].add(100.0)  # D2_sib matches
         # Bonus: target_choices[5] (sibling position 5)
         logits = logits.at[5, 42].add(100.0)  # bonus token for sibling
