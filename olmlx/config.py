@@ -180,7 +180,9 @@ class Settings(BaseSettings):
     # strategy default": 4 for classic and self_speculative, 10 for PLD,
     # the draft model's pre-trained ``block_size`` for DFlash and EAGLE.
     speculative: bool = False
-    speculative_strategy: Literal["classic", "dflash", "eagle", "pld", "self_speculative"] = "classic"
+    speculative_strategy: Literal[
+        "classic", "dflash", "eagle", "pld", "self_speculative"
+    ] = "classic"
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] | None = None
     #: PLD-only knobs (ignored by other strategies). N-gram sizes for the

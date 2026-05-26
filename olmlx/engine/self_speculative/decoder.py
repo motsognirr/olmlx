@@ -172,9 +172,7 @@ class SelfSpeculativeDecoder:
             )
         self._norm = _find_module(target_model, _NORM_PATHS)
         if self._norm is None:
-            raise ValueError(
-                f"Cannot find norm on model {type(target_model).__name__}"
-            )
+            raise ValueError(f"Cannot find norm on model {type(target_model).__name__}")
         self._lm_head = _find_module(target_model, _LM_HEAD_PATHS)
         if self._lm_head is None:
             # Tied-embeddings fallback
@@ -315,10 +313,7 @@ class SelfSpeculativeDecoder:
         # --- Update acceptance-rate EMA and stats ---
         num_accepted_draft = min(num_accepted - 1, self._lambda)
         acceptance = num_accepted_draft / max(self._lambda, 1)
-        self._alpha = (
-            self._alpha_ema * self._alpha
-            + (1 - self._alpha_ema) * acceptance
-        )
+        self._alpha = self._alpha_ema * self._alpha + (1 - self._alpha_ema) * acceptance
         self._stats_steps += 1
         self._stats_proposed += self._lambda
         self._stats_accepted_draft += num_accepted_draft
