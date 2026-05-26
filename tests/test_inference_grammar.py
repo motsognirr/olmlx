@@ -48,6 +48,20 @@ class TestResolveModelVocabSize:
         del lm.model.embed_tokens
         assert _resolve_model_vocab_size(lm) == 12345
 
+    def test_prefers_nested_lm_head_over_top_embed_tokens(self):
+        """If ``model.lm_head`` is missing but ``model.embed_tokens`` is
+        present, and ``model.model.lm_head`` exists at the deeper level,
+        the helper should still prefer the deeper lm_head. Round-3 review
+        flagged the prior owner-first traversal as ordering-sensitive."""
+        lm = MagicMock()
+        lm.model.args = None
+        del lm.model.lm_head  # no top-level lm_head
+        lm.model.embed_tokens.weight.shape = (151_643, 4096)  # tokenizer dim
+        lm.model.model.lm_head.weight.shape = (151_936, 4096)  # padded out dim
+        # Attr-first traversal: lm_head at every depth before any
+        # embed_tokens — so the nested lm_head wins.
+        assert _resolve_model_vocab_size(lm) == 151_936
+
     def test_prefers_lm_head_over_embed_tokens(self):
         """For untied or expanded vocab heads the lm_head output dim is
         larger than the embed_tokens input dim. xgrammar sizes the

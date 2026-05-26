@@ -76,11 +76,15 @@ def _resolve_model_vocab_size(lm: "LoadedModel") -> int | None:
     vs = getattr(args, "vocab_size", None) if args is not None else None
     if isinstance(vs, int) and vs > 0:
         return vs
-    # Prefer the lm_head output dimension over the embed_tokens input dim.
-    for owner in (model, getattr(model, "model", None)):
-        if owner is None:
-            continue
-        for attr in ("lm_head", "embed_tokens"):
+    # Prefer the lm_head output dimension over the embed_tokens input dim
+    # AT EVERY nesting depth. Some models nest lm_head under
+    # ``model.model`` while exposing ``embed_tokens`` at the top level;
+    # iterating attr-first avoids returning the top-level embed_tokens
+    # when a deeper lm_head exists.
+    for attr in ("lm_head", "embed_tokens"):
+        for owner in (model, getattr(model, "model", None)):
+            if owner is None:
+                continue
             layer = getattr(owner, attr, None)
             if layer is not None and hasattr(layer, "weight"):
                 try:
@@ -3136,12 +3140,19 @@ async def _full_completion_inner(
 
         _apply_seed(gen_kwargs, consume=not lm.is_vlm)
 
+        # Decide speculative use explicitly (mirrors _stream_completion).
+        # The disable-on-grammar path is taken when both speculative is
+        # loaded and grammar is requested for this request; otherwise
+        # fall through to the speculative branch unchanged.
         if lm.is_speculative and grammar_active and not (lm.is_vlm and images):
             logger.warning(
                 "Speculative decoding disabled for this request: "
                 "grammar-constrained decoding is not yet plumbed through "
                 "the speculative path"
             )
+            use_speculative = False
+        else:
+            use_speculative = lm.is_speculative
 
         if lm.is_vlm and images:
             if lm.is_speculative:
@@ -3162,7 +3173,7 @@ async def _full_completion_inner(
             from mlx_vlm.generate import (
                 generation_stream,
             )  # used by mx.synchronize below
-        elif lm.is_speculative and not grammar_active:
+        elif use_speculative:
             import threading
 
             from olmlx.engine.speculative_stream import (

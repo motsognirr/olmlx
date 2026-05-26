@@ -1022,11 +1022,13 @@ class ModelManager:
         # ``_close_evictees`` nulls the LoadedModel's tokenizer reference
         # and CPython may recycle the address for a future tokenizer;
         # stale id-keyed entries would then return a CompiledGrammar built
-        # for the wrong vocab.
+        # for the wrong vocab. Must use ``lm.text_tokenizer`` (the HF
+        # tokenizer, post-VLM-unwrap) to match what
+        # ``_install_grammar_processor`` keyed the cache on.
         try:
             from olmlx.engine import grammar as _grammar
 
-            _grammar.drop_for_tokenizer(lm.tokenizer)
+            _grammar.drop_for_tokenizer(lm.text_tokenizer)
         except Exception as exc:
             logger.exception("Error dropping grammar cache for %s", lm.name)
             errors.append(exc)

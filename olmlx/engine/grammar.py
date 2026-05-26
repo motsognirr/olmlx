@@ -36,6 +36,13 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+_OPENAI_RESPONSE_FORMAT_TYPES = frozenset({"text", "json_object", "json_schema"})
+
+_JSON_SCHEMA_TYPES = frozenset(
+    {"object", "array", "string", "number", "integer", "boolean", "null"}
+)
+
+
 # ---------------------------------------------------------------------------
 # Spec
 # ---------------------------------------------------------------------------
@@ -120,26 +127,36 @@ def compile_for_tokenizer(tokenizer: Any, vocab_size: int, spec: GrammarSpec) ->
 
     *vocab_size* is the model's lm_head vocab dimension, which may differ
     from ``tokenizer.vocab_size`` (Phi-3, Llama-3.2-Vision, etc.).
+
+    Uses double-checked locking so the ~7 ms compile (and the much
+    heavier first-time GrammarCompiler construction, which walks the
+    full vocabulary) does not serialise all concurrent requests behind
+    a single mutex. The duplicate-compile race in the gap is harmless:
+    compiled grammars are immutable and equivalent, so the loser of the
+    race just discards its result.
     """
     if xgr is None:
         raise RuntimeError(
             "xgrammar is not installed — grammar-constrained decoding unavailable"
         )
     cache_key = (id(tokenizer), spec.cache_key())
-    # Hold the lock across the entire check-compile-store sequence so two
-    # concurrent requests with the same spec don't both miss + recompile
-    # (wasteful) and then race on the store. xgrammar's compile is ~7 ms;
-    # acceptable to serialise across requests for the same model.
     with _compile_cache_lock:
         cached = _compile_cache.get(cache_key)
         if cached is not None:
             return cached
-        compiler = _get_compiler(tokenizer, vocab_size)
-        if spec.kind == "json_object":
-            compiled = compiler.compile_builtin_json_grammar()
-        else:
-            assert spec.schema is not None  # post_init enforces
-            compiled = compiler.compile_json_schema(spec.schema)
+    # Compile outside the lock — see docstring.
+    compiler = _get_compiler(tokenizer, vocab_size)
+    if spec.kind == "json_object":
+        compiled = compiler.compile_builtin_json_grammar()
+    else:
+        assert spec.schema is not None  # post_init enforces
+        compiled = compiler.compile_json_schema(spec.schema)
+    with _compile_cache_lock:
+        # A concurrent compile may have stored already; prefer the
+        # existing entry so callers see object identity stability.
+        existing = _compile_cache.get(cache_key)
+        if existing is not None:
+            return existing
         _compile_cache[cache_key] = compiled
         return compiled
 
@@ -217,13 +234,16 @@ class GrammarLogitsProcessor:
         bitmask_np = self._bitmask.numpy()  # zero-copy view of CPU tensor
         # unpackbits is little-endian per byte; xgrammar packs little-endian
         # within each int32, so a uint8 little-bitorder view matches.
-        unpacked = np.unpackbits(bitmask_np.view(np.uint8), bitorder="little").astype(
-            bool
-        )
+        # numpy.unpackbits returns uint8 (0/1); mx.where treats non-zero
+        # as true, so the .astype(bool) round-trip in the previous
+        # version was an extra ~150 KB per-step allocation for no
+        # behavioural change. (np.unpackbits does not yet accept ``out=``,
+        # so the unpack itself still allocates — would-be reviewer fix
+        # for that is blocked on the numpy API.)
+        unpacked = np.unpackbits(bitmask_np.view(np.uint8), bitorder="little")
         # Trim to the model's vocab_size (the packed array is rounded up
         # to a multiple of 32).
-        allowed = unpacked[: self._vocab_size]
-        allowed_mx = mx.array(allowed)
+        allowed_mx = mx.array(unpacked[: self._vocab_size])
         # mlx-lm logits have shape (1, vocab_size) in the streaming path
         # but can also be (vocab_size,) in other paths; broadcast naturally.
         neg_inf = self._neg_inf_cache.get(logits.dtype)
@@ -302,13 +322,6 @@ def parse_response_format(value: Any) -> GrammarSpec | None:
             "'properties'/'$schema'/'anyOf'/'oneOf' or a JSON-Schema 'type')"
         )
     raise ValueError(f"unsupported grammar format type: {type(value).__name__}")
-
-
-_OPENAI_RESPONSE_FORMAT_TYPES = frozenset({"text", "json_object", "json_schema"})
-
-_JSON_SCHEMA_TYPES = frozenset(
-    {"object", "array", "string", "number", "integer", "boolean", "null"}
-)
 
 
 def clear_caches() -> None:
