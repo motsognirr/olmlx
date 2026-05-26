@@ -134,6 +134,27 @@ class DFlashAttention(nn.Module):
     ``make_cache()`` via ``layer_types``) works alongside the explicit
     spatial mask — the mask bounds the attention dot-product to the
     window while the cache discards keys outside it.
+
+    .. note::
+
+       ``create_causal_mask`` enforces *both* the spatial window and
+       causal ordering within the proposal stream.  When the window is
+       exceeded, proposal token ``i`` cannot attend to proposal token
+       ``j > i`` even when ``attention_causal`` is ``False``.  This
+       matches upstream z-lab/dflash and avoids a train/inference
+       mismatch, but a custom draft architecture that was trained with
+       full bidirectionality for proposal tokens would silently degrade
+       under this mask.
+
+    .. note::
+
+       In steady-state decoding with a full ``RotatingKVCache``,
+       ``ctx_len`` is always ``window`` (the cache holds exactly that
+       many keys), so ``ctx_len + L = window + L > window`` for any
+       proposal length ``L > 0`` — the sliding-causal mask is
+       unconditionally applied.  The ``>`` threshold only matters
+       during the initial cache fill-up phase when the context is
+       still shorter than the window.
     """
 
     def __init__(self, config: DraftConfig, layer_idx: int):
