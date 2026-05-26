@@ -490,7 +490,7 @@ class SpeculativeDecoder:
 
         # 5. Update state
         self._cache_seq_len += num_accepted
-        assert num_accepted >= 1
+        assert num_accepted >= 1, "step(): _verify() must return at least 1 token"
         self._last_target_logit = verification_logits[num_accepted - 1]
         mx.eval(self._last_target_logit)
         self._pending_token = int(mx.argmax(self._last_target_logit).item())
@@ -667,7 +667,7 @@ class SpeculativeDecoder:
 
         # 7. Update state
         self._cache_seq_len += num_accepted
-        assert num_accepted >= 1
+        assert num_accepted >= 1, "step(): _verify() must return at least 1 token"
         self._pending_token = int(mx.argmax(self._last_target_logit).item())
 
         num_accepted_draft = self._update_acceptance_rate(num_accepted)
