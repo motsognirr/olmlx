@@ -1547,6 +1547,12 @@ class ModelManager:
                         inference_timeout=model_config.inference_timeout,
                         sync_mode=model_config.sync_mode,
                     )
+                    # Register before probe so concurrent callers see the
+                    # model while the probe's async Metal flush releases the
+                    # lock.  _probe_cache_capabilities sets all cache flags
+                    # synchronously before its first await (the finally-block
+                    # Metal flush), so no coroutine can observe an incomplete
+                    # probe state between registration and the yield point.
                     self._loaded[normalized] = lm
                     await self._probe_cache_capabilities(lm)
                     return lm
@@ -1681,12 +1687,12 @@ class ModelManager:
         # see the model's allocations still resident in the pool.
         del lm
         # Return freed Metal memory to the OS.  Mirrors the flush
-        # in ``_expire_stale`` and ``ensure_loaded``.  Skipped when
-        # THIS model has a deferred cleanup in flight — a background
-        # thread for the same model may still be allocating Metal
-        # memory (per-model guard, not global, so an unrelated model's
-        # deferred cleanup does not skip the flush).
-        if normalized not in self._pending_cleanups:
+        # in ``_expire_stale`` and ``ensure_loaded``.  Guarded on the
+        # global ``_pending_cleanups`` dict because ``mx.clear_cache()``
+        # flushes the entire Metal allocator — if ANY background thread
+        # is still allocating Metal memory (even for a different model),
+        # the concurrent clear is unsafe.
+        if not self._pending_cleanups:
             await self._flush_metal()
         return True
 

@@ -180,11 +180,16 @@ class TestModelManager:
 
     @pytest.mark.asyncio
     async def test_unload_skips_flush_when_cleanup_pending(self, mock_manager):
-        """If the same model has a deferred cleanup in flight, _flush_metal is skipped."""
+        """If any deferred cleanup is in flight, _flush_metal is skipped.
+        The guard is global because mx.clear_cache() flushes the entire
+        Metal allocator — any background thread allocating Metal memory,
+        even for a different model, makes the concurrent clear unsafe."""
         import asyncio
 
         mock_manager._close_loaded_model = MagicMock()  # type: ignore[method-assign]
-        mock_manager._pending_cleanups["qwen3:latest"] = asyncio.create_task(
+        # Set a deferred cleanup for a DIFFERENT model — the guard is
+        # global, so this should still suppress the flush.
+        mock_manager._pending_cleanups["other:latest"] = asyncio.create_task(
             asyncio.sleep(0)
         )
         try:
@@ -195,7 +200,7 @@ class TestModelManager:
             assert result is True
             mock_flush.assert_not_awaited()
         finally:
-            task = mock_manager._pending_cleanups.pop("qwen3:latest", None)
+            task = mock_manager._pending_cleanups.pop("other:latest", None)
             if task is not None:
                 task.cancel()
 
