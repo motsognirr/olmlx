@@ -714,7 +714,9 @@ class TestProbeCacheCapabilities:
         return lm
 
     @pytest.mark.asyncio
-    async def test_probe_empty_cache_list_disables_persistence(self, registry, mock_store):
+    async def test_probe_empty_cache_list_disables_persistence(
+        self, registry, mock_store
+    ):
         """If ``make_prompt_cache`` returns an empty list (a degenerate model
         with no cache layers), ``_cache_supports_persistence`` returns
         False — there's no evidence the cache layout is safe — and the
@@ -734,7 +736,9 @@ class TestProbeCacheCapabilities:
         assert lm.supports_cache_persistence is False
 
     @pytest.mark.asyncio
-    async def test_non_trimmable_layout_disables_persistence(self, registry, mock_store):
+    async def test_non_trimmable_layout_disables_persistence(
+        self, registry, mock_store
+    ):
         """Issue #343: a layout containing a ``RotatingKVCache`` layer makes
         the cache non-trimmable.  In real chat flow the stored prompt +
         generated tokens can never be aligned with the next request's
@@ -764,7 +768,9 @@ class TestProbeCacheCapabilities:
         assert lm.supports_cache_persistence is False
 
     @pytest.mark.asyncio
-    async def test_chunked_kv_cache_layout_disables_persistence(self, registry, mock_store):
+    async def test_chunked_kv_cache_layout_disables_persistence(
+        self, registry, mock_store
+    ):
         """``ChunkedKVCache`` is the other non-trimmable layout cited by
         #343 and CLAUDE.md (mlx-lm's chunk-based cache; affects newer
         Apple-published checkpoints).  Like ``RotatingKVCache`` it sits
