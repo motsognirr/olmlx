@@ -1041,6 +1041,18 @@ def _audit_speculative_config(
             # per-model override, so the global setting is still
             # logically unused for that model.
             global_draft_used = True
+        if enabled and draft and strategy == "self_speculative":
+            # ``self_speculative`` uses the target's own layers as
+            # draft — an external draft model set in the config is
+            # silently ignored by ``_load_self_speculative_decoder``.
+            # Warn so the operator knows the draft model setting has
+            # no effect while this strategy is active.
+            logger.warning(
+                "speculative_draft_model is set for %r but "
+                "strategy='self_speculative' uses the target's own "
+                "layers — the draft model will be ignored.",
+                name,
+            )
         if enabled:
             # Resolve the full experimental config (global defaults
             # merged with per-model overrides) for ``flash`` and via

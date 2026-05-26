@@ -18,7 +18,8 @@ except ImportError:  # pragma: no cover — mlx-lm is always available at runtim
     make_prompt_cache = None
     trim_prompt_cache = None
 
-from olmlx.engine.gdn_rollback import get_model_layers
+from olmlx.engine.gdn_rollback import find_gdn_class, get_model_layers
+from olmlx.engine.speculative import verify_draft_greedy
 
 logger = logging.getLogger(__name__)
 
@@ -102,26 +103,6 @@ def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
     return _logits(model(last, cache=cache))[0, 0, :]
 
 
-def verify_draft_greedy(
-    draft_tokens: list[int],
-    target_logits: mx.array,
-) -> list[int]:
-    """Verify draft tokens against target logits (greedy)."""
-    n = len(draft_tokens)
-    target_choices = mx.argmax(target_logits, axis=-1)
-    mx.eval(target_choices)
-    accepted: list[int] = []
-    for i in range(n):
-        target_token = int(target_choices[i].item())
-        if draft_tokens[i] == target_token:
-            accepted.append(draft_tokens[i])
-        else:
-            accepted.append(target_token)
-            return accepted
-    accepted.append(int(target_choices[n].item()))
-    return accepted
-
-
 class SelfSpeculativeDecoder:
     """Self-speculative decoding using the target's own early layers.
 
@@ -132,6 +113,19 @@ class SelfSpeculativeDecoder:
 
     Works under Flash and Flash-MoE because no hidden-state hooks or
     target patching are involved — just running the model's own layers.
+
+    Limitations
+    -----------
+    * Hybrid linear-attention targets (Qwen3.5/3.6, Qwen3-Coder-Next)
+      with ``GatedDeltaNet`` layers are **not supported** — their
+      ``ArraysCache`` RNN-style state cannot be rolled back after the
+      autoregressive draft without ``GDNStateCapture`` (planned for a
+      follow-up PR).
+    * Sliding-window attention targets with ``RotatingKVCache`` /
+      ``ChunkedKVCache`` in early layers are **not supported** — the
+      per-step trim between draft and verify fails on non-trimmable
+      caches (the same models gated off from cross-request prompt caching
+      in issue #343).
     """
 
     def __init__(
@@ -183,6 +177,45 @@ class SelfSpeculativeDecoder:
                 raise ValueError(
                     f"Cannot find lm_head on model {type(target_model).__name__}"
                 )
+
+        # --- Guard: hybrid linear-attention targets (GatedDeltaNet) ---
+        # The autoregressive draft pass advances ``ArraysCache`` RNN-state
+        # for any GDN layers among the first N.  ``trim_prompt_cache`` is
+        # a no-op on these, so the state diverges after partial acceptance
+        # and corrupts every subsequent step.  Full GDN rollback
+        # (``GDNStateCapture`` + ``rollback_autoregressive``) is planned
+        # for a follow-up PR.
+        gdn_cls = find_gdn_class(target_model)
+        if gdn_cls is not None:
+            raise NotImplementedError(
+                f"self_speculative is not yet supported on hybrid "
+                f"linear-attention targets ({gdn_cls.__module__}.{gdn_cls.__name__} "
+                "detected). The autoregressive draft mutates GatedDeltaNet "
+                "recurrent state which cannot be rolled back with "
+                "trim_prompt_cache. Planned for a follow-up PR."
+            )
+
+        # --- Guard: non-trimmable caches in early layers ---
+        # Probe the first early-layer cache to see if ``trim()`` is
+        # supported.  RotatingKVCache / ChunkedKVCache in Gemma 4 /
+        # gpt-oss models fail ``trim_prompt_cache`` (issue #343) — the
+        # per-step discard of draft entries would either raise or
+        # silently corrupt offsets.
+        probe_cache = make_prompt_cache(target_model)
+        early_non_trimmable = False
+        for i in range(min(self._N, len(probe_cache))):
+            if not hasattr(probe_cache[i], "trim") or not callable(
+                getattr(probe_cache[i], "trim", None)
+            ):
+                early_non_trimmable = True
+                break
+        if early_non_trimmable:
+            raise NotImplementedError(
+                "self_speculative is not supported on models with "
+                "non-trimmable KV caches in early layers (e.g. "
+                "RotatingKVCache/ChunkedKVCache). The per-step cache "
+                "trim between draft and verify cannot be performed."
+            )
 
         self._lambda = num_speculative_tokens
         self._alpha = 0.5
@@ -262,6 +295,15 @@ class SelfSpeculativeDecoder:
 
         Must call ``prefill()`` first.
         Returns (accepted_tokens, num_draft_generated).
+
+        Cache-length invariant
+        ----------------------
+        After each ``step()``, ``self._cache`` contains exactly
+        ``self._prompt_len`` entries across all layers (the original
+        prompt plus every accepted token).  The pending token is *not*
+        in the cache — it is fed as the first token of the verify batch
+        in the next step.  This matches the ``SpeculativeDecoder``
+        invariant.
         """
         assert self._cache is not None, "Call prefill() before step()"
         assert self._pending_token is not None, "Call prefill() before step()"
@@ -286,10 +328,14 @@ class SelfSpeculativeDecoder:
         # --- Pre-verify: trim early-layer caches back to prompt_len ---
         # The draft advanced cache[0..N-1] by lambda entries; discard
         # them so the verify pass can append uniformly across all layers.
+        # Late layers (N..L-1) were never advanced — they're still at
+        # prompt_len, so trimming them is a no-op (but we only trim
+        # early layers anyway).
         for i in range(self._N):
             trim_prompt_cache([self._cache[i]], self._lambda)
 
         # --- Verify: full model on [pending, D_1, ..., D_lambda] ---
+        # The verify feed is λ+1 tokens.  All layers append uniformly.
         all_tokens = mx.array([[pending] + draft_tokens])
         target_out = _logits(self._target(all_tokens, cache=self._cache))
         mx.eval(target_out)
@@ -300,9 +346,16 @@ class SelfSpeculativeDecoder:
         num_accepted = len(accepted)
 
         # --- Trim caches to accepted prefix ---
+        # After verify the cache grew by λ+1 entries (for all layers).
+        # We keep ``num_accepted`` of those entries; trim the rest.
+        # ``num_accepted`` is always >= 1 (greedy accept guarantees at
+        # least one token).
         trim_count = max(self._lambda + 1 - num_accepted, 0)
         if trim_count > 0:
             trim_prompt_cache(self._cache, trim_count)
+        # Post-trim cache length = old_prompt_len + num_accepted.
+        # ``_prompt_len`` is updated to the same value below so the
+        # invariant holds.
 
         # --- Update state ---
         self._prompt_len += num_accepted
