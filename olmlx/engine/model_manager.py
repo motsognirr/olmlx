@@ -934,6 +934,7 @@ class ModelManager:
             # threads are still allocating and mx.clear_cache() is unsafe.
             if drained:
                 gc.collect()
+                mx.synchronize()
                 mx.clear_cache()
         self._pending_load_tasks.clear()
         self._loaded.clear()
@@ -1252,6 +1253,7 @@ class ModelManager:
             # ``_schedule_deferred_cleanup``) can interleave between the two.
             if not self._pending_cleanups:
                 gc.collect()
+                mx.synchronize()
                 mx.clear_cache()
 
             # Pre-load memory hygiene: if Metal memory is still under
@@ -1309,6 +1311,7 @@ class ModelManager:
                 # the matching guard at the _ensure_loaded pre-load path).
                 if not self._pending_cleanups:
                     gc.collect()
+                    mx.synchronize()
                     mx.clear_cache()
                 if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
                     logger.warning(
@@ -1553,6 +1556,7 @@ class ModelManager:
                     # it after the thread finishes.
                     if normalized not in self._pending_cleanups:
                         gc.collect()
+                        mx.synchronize()
                         mx.clear_cache()
                     raise
 
@@ -1596,6 +1600,7 @@ class ModelManager:
                 try:
                     if not cancelled:
                         gc.collect()
+                        mx.synchronize()
                         mx.clear_cache()
                 finally:
                     self._pending_cleanups.pop(model_name, None)
@@ -1661,6 +1666,14 @@ class ModelManager:
         # that polls ``get_metal_memory()`` immediately after unload may
         # see the model's allocations still resident in the pool.
         del lm
+        # Return freed Metal memory to the OS.  Mirrors the flush
+        # in ``_expire_stale`` and ``ensure_loaded``.  Skipped when
+        # a deferred cleanup is pending — a background thread may still
+        # be allocating Metal memory.
+        if not self._pending_cleanups:
+            gc.collect()
+            mx.synchronize()
+            mx.clear_cache()
         return True
 
     # Config keys that indicate a vision-language model
@@ -2159,6 +2172,7 @@ class ModelManager:
             if probe_cache is not None:
                 del probe_cache
                 gc.collect()
+                mx.synchronize()
                 mx.clear_cache()
 
         # Single load-time log site for "cross-request reuse disabled."
@@ -3562,6 +3576,7 @@ class ModelManager:
             if is_vlm:
                 del model, tokenizer
                 gc.collect()
+                mx.synchronize()
                 mx.clear_cache()
                 raise ValueError(
                     f"VLM models are not supported in distributed mode. "
@@ -3581,6 +3596,7 @@ class ModelManager:
                 except ValueError:
                     del model, tokenizer
                     gc.collect()
+                    mx.synchronize()
                     mx.clear_cache()
                     raise
                 # Materialize parameters — pipeline nullified unowned layers
@@ -3594,6 +3610,7 @@ class ModelManager:
                 if not hasattr(model, "shard"):
                     del model, tokenizer
                     gc.collect()
+                    mx.synchronize()
                     mx.clear_cache()
                     raise ValueError(
                         f"Model {hf_path} does not support distributed inference "
@@ -3612,6 +3629,7 @@ class ModelManager:
             else:
                 del model, tokenizer
                 gc.collect()
+                mx.synchronize()
                 mx.clear_cache()
                 raise AssertionError(
                     "unreachable: distributed_strategy is Literal['tensor']; "
@@ -3671,6 +3689,7 @@ class ModelManager:
         # for a different model may still be allocating Metal memory.
         if flush:
             gc.collect()
+            mx.synchronize()
             mx.clear_cache()
 
     async def _check_expiry_loop(self):

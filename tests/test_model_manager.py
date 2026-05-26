@@ -1666,6 +1666,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(ModelLoadTimeoutError, match="OLMLX_MODEL_LOAD_TIMEOUT"):
                 await manager.ensure_loaded("qwen3")
@@ -1704,6 +1705,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             lm = await manager.ensure_loaded("qwen3")
 
@@ -1743,6 +1745,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             lm = await manager.ensure_loaded("qwen3")
 
@@ -1772,6 +1775,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             with pytest.raises(TimeoutError):
                 await manager.ensure_loaded("qwen3")
@@ -1779,6 +1783,7 @@ class TestModelLoadTimeout:
         # Only pre-load flush — the BaseException handler skips gc/clear
         # when a deferred cleanup is pending (background thread still running).
         assert mock_gc.call_count == 1
+        assert mock_sync.call_count == 1
         assert mock_clear.call_count == 1
         assert "qwen3:latest" not in manager._loaded
 
@@ -1808,12 +1813,14 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             with pytest.raises(TimeoutError):
                 await manager.ensure_loaded("qwen3")
 
             # Only pre-load flush (BaseException handler skips when deferred)
             assert mock_gc.call_count == 1
+            assert mock_sync.call_count == 1
             assert mock_clear.call_count == 1
 
             # Await the cleanup task directly (deterministic, no sleep needed)
@@ -1823,6 +1830,7 @@ class TestModelLoadTimeout:
 
             # Deferred cleanup adds one more call each
             assert mock_gc.call_count == 2
+            assert mock_sync.call_count == 2
             assert mock_clear.call_count == 2
 
     @pytest.mark.asyncio
@@ -1862,6 +1870,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             # First call times out
             with pytest.raises(TimeoutError):
@@ -1927,6 +1936,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             # Timeout on qwen3 — orphaned thread runs for ~0.5s
             with pytest.raises(TimeoutError):
@@ -1993,6 +2003,7 @@ class TestModelLoadTimeout:
                 side_effect=gc_collect_that_fails_second_time,
             ),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(ModelLoadTimeoutError):
                 await manager.ensure_loaded("qwen3")
@@ -2033,6 +2044,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(ModelLoadTimeoutError):
                 await manager.ensure_loaded("qwen3")
@@ -2071,6 +2083,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(ModelLoadTimeoutError):
                 await manager.ensure_loaded("qwen3")
@@ -2118,12 +2131,14 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             with pytest.raises(MemoryError):
                 await manager.ensure_loaded("qwen3")
 
             # gc/clear should have been called for cleanup
             assert mock_gc.call_count >= 1
+            assert mock_sync.call_count >= 1
             assert mock_clear.call_count >= 1
             assert "qwen3:latest" not in manager._loaded
 
@@ -2789,6 +2804,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(MemoryError, match="memory limit"):
                 await manager.ensure_loaded("qwen3")
@@ -2831,6 +2847,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             lm = await manager.ensure_loaded("qwen3")
 
@@ -2876,6 +2893,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             lm = await manager.ensure_loaded("qwen3")
 
@@ -2914,6 +2932,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(MemoryError) as exc_info:
                 await manager.ensure_loaded("qwen3")
@@ -2955,6 +2974,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             with pytest.raises(MemoryError):
                 await manager.ensure_loaded("qwen3")
@@ -2962,6 +2982,7 @@ class TestMemoryCheck:
         # Called twice: once for pre-load cache flush, once for post-rejection cleanup
         assert mock_gc.call_count == 2
         assert mock_clear.call_count == 2
+        assert mock_sync.call_count == 2
 
     @pytest.mark.asyncio
     async def test_cache_flushed_after_eviction(
@@ -2997,6 +3018,9 @@ class TestMemoryCheck:
         def track_clear():
             call_order.append("mx.clear_cache")
 
+        def track_sync():
+            call_order.append("mx.synchronize")
+
         def track_get_metal(*args):
             call_order.append("get_metal")
             return (
@@ -3025,15 +3049,18 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect", side_effect=track_gc),
             patch("olmlx.engine.model_manager.mx.clear_cache", side_effect=track_clear),
+            patch("olmlx.engine.model_manager.mx.synchronize", side_effect=track_sync),
         ):
             lm = await manager.ensure_loaded("qwen3")
 
         assert lm.name == "qwen3:latest"
         # Cache flush must happen before the first memory measurement
         gc_idx = call_order.index("gc.collect")
+        sync_idx = call_order.index("mx.synchronize")
         clear_idx = call_order.index("mx.clear_cache")
         first_metal_idx = call_order.index("get_metal")
         assert gc_idx < first_metal_idx
+        assert sync_idx < first_metal_idx
         assert clear_idx < first_metal_idx
 
     @pytest.mark.asyncio
@@ -3070,6 +3097,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(MemoryError) as exc_info:
                 await manager.ensure_loaded("qwen3")
@@ -3109,6 +3137,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             with pytest.raises(OSError, match="Metal query failed"):
                 await manager.ensure_loaded("qwen3")
@@ -3116,6 +3145,7 @@ class TestMemoryCheck:
         # Cleanup must have been called: once pre-load flush + once post-failure
         assert mock_gc.call_count == 2
         assert mock_clear.call_count == 2
+        assert mock_sync.call_count == 2
         # Model must NOT be in _loaded
         assert "qwen3:latest" not in manager._loaded
 
@@ -3172,6 +3202,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             with pytest.raises(RuntimeError, match="Metal OOM"):
                 await manager.ensure_loaded("qwen3")
@@ -3179,6 +3210,7 @@ class TestMemoryCheck:
         # Pre-load flush + post-failure flush = 2 calls each
         assert mock_gc.call_count == 2
         assert mock_clear.call_count == 2
+        assert mock_sync.call_count == 2
         assert "qwen3:latest" not in manager._loaded
 
 
@@ -3598,9 +3630,11 @@ class TestEvictLruIfNeeded:
         with (
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             await manager._close_evictees([old])
             mock_gc.assert_not_called()
+            mock_sync.assert_not_called()
             mock_clear.assert_not_called()
 
     @pytest.mark.asyncio
