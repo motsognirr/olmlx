@@ -168,6 +168,38 @@ class TestModelManager:
         assert mock_manager._close_loaded_model in to_thread_calls
 
     @pytest.mark.asyncio
+    async def test_unload_calls_flush_metal(self, mock_manager):
+        """unload() must call _flush_metal() after closing the model."""
+        mock_manager._close_loaded_model = MagicMock()  # type: ignore[method-assign]
+        with patch.object(
+            mock_manager, "_flush_metal", new_callable=AsyncMock
+        ) as mock_flush:
+            result = await mock_manager.unload("qwen3")
+        assert result is True
+        mock_flush.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unload_skips_flush_when_cleanup_pending(self, mock_manager):
+        """If the same model has a deferred cleanup in flight, _flush_metal is skipped."""
+        import asyncio
+
+        mock_manager._close_loaded_model = MagicMock()  # type: ignore[method-assign]
+        mock_manager._pending_cleanups["qwen3:latest"] = asyncio.create_task(
+            asyncio.sleep(0)
+        )
+        try:
+            with patch.object(
+                mock_manager, "_flush_metal", new_callable=AsyncMock
+            ) as mock_flush:
+                result = await mock_manager.unload("qwen3")
+            assert result is True
+            mock_flush.assert_not_awaited()
+        finally:
+            task = mock_manager._pending_cleanups.pop("qwen3:latest", None)
+            if task is not None:
+                task.cancel()
+
+    @pytest.mark.asyncio
     async def test_ensure_loaded_cached(self, mock_manager):
         lm = await mock_manager.ensure_loaded("qwen3")
         assert lm.name == "qwen3:latest"
@@ -726,14 +758,16 @@ class TestProbeCacheCapabilities:
         manager = ModelManager(registry, mock_store)
         lm = self._make_lm()
 
-        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]):
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
+        ):
             await manager._probe_cache_capabilities(lm)
 
-        # Trim is vacuously True — trim of an empty cache is a no-op
-        # that mlx-lm handles cleanly, so leaving the flag True is fine.
         assert lm.supports_cache_trim is True
-        # Persistence: no evidence of safety → False.
         assert lm.supports_cache_persistence is False
+        # [] is non-None, so flush should be called
+        mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_non_trimmable_layout_disables_persistence(
@@ -761,11 +795,15 @@ class TestProbeCacheCapabilities:
         lm.supports_cache_persistence = True
 
         probe_cache = [_FakeRotating(), _FakeRotating()]
-        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
+        ):
             await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
+        mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_chunked_kv_cache_layout_disables_persistence(
@@ -792,11 +830,15 @@ class TestProbeCacheCapabilities:
         lm.supports_cache_persistence = True
 
         probe_cache = [_FakeChunked(), _FakeChunked()]
-        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
+        ):
             await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
+        mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_mixed_layout_kv_plus_rotating_disables_persistence(
@@ -828,11 +870,15 @@ class TestProbeCacheCapabilities:
         lm.supports_cache_persistence = True
 
         probe_cache = [_FakeKV(), _FakeRotating(), _FakeKV(), _FakeRotating()]
-        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
+        ):
             await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
+        mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_trimmable_layout_keeps_persistence(self, registry, mock_store):
@@ -850,11 +896,15 @@ class TestProbeCacheCapabilities:
         lm = self._make_lm()
 
         probe_cache = [_FakeKV(), _FakeKV()]
-        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
+        ):
             await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is True
         assert lm.supports_cache_persistence is True
+        mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_non_trimmable_persistable_layout_logs_343(
@@ -881,6 +931,7 @@ class TestProbeCacheCapabilities:
                 return_value=[_FakeRotating(), _FakeRotating()],
             ),
             caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
         ):
             await manager._probe_cache_capabilities(lm)
 
@@ -888,6 +939,7 @@ class TestProbeCacheCapabilities:
         # #284 is the ArraysCache reason — must not be attributed here.
         assert "issue #284" not in caplog.text
         assert "RotatingKVCache" in caplog.text or "sliding-window" in caplog.text
+        mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_non_persistable_layout_logs_284(self, registry, mock_store, caplog):
@@ -914,6 +966,7 @@ class TestProbeCacheCapabilities:
                 return_value=[_FakeArrays(), _FakeArrays()],
             ),
             caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
         ):
             await manager._probe_cache_capabilities(lm)
 
@@ -924,6 +977,7 @@ class TestProbeCacheCapabilities:
         # to ArraysCache models.
         assert "issue #343" not in caplog.text
         assert "RotatingKVCache" not in caplog.text
+        mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_probe_failure_warns_and_disables_persistence(
@@ -944,12 +998,15 @@ class TestProbeCacheCapabilities:
                 side_effect=RuntimeError("simulated probe failure"),
             ),
             caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
         ):
             await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is True
         assert lm.supports_cache_persistence is False
         assert "Cache probe raised an exception" in caplog.text
+        # probe_cache was never created, so flush should NOT be called
+        mock_flush.assert_not_awaited()
 
 
 class TestLoadModel:
@@ -3076,6 +3133,8 @@ class TestMemoryCheck:
         assert gc_idx < first_metal_idx
         assert sync_idx < first_metal_idx
         assert clear_idx < first_metal_idx
+        # Internal ordering: gc → synchronize → clear
+        assert gc_idx < sync_idx < clear_idx
 
     @pytest.mark.asyncio
     async def test_model_mb_not_negative_in_error(self, registry, mock_store):

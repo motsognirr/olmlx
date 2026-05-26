@@ -2185,7 +2185,7 @@ class ModelManager:
         finally:
             if probe_cache is not None:
                 del probe_cache
-            await self._flush_metal()
+                await self._flush_metal()
 
         # Single load-time log site for "cross-request reuse disabled."
         # Distinguishes the two disable reasons by inspecting the raw
