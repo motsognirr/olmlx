@@ -19,6 +19,7 @@ not duplicated in memory.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +28,8 @@ import mlx.nn as nn
 from mlx_lm.models.base import create_causal_mask
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.rope_utils import initialize_rope
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -166,6 +169,35 @@ class DFlashAttention(nn.Module):
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
         self.causal = config.attention_causal
+
+        if self.is_sliding and self.sliding_window is None:
+            raise ValueError(
+                "DFlashAttention layer has is_sliding=True but no "
+                "sliding_window set — a sliding-attention layer "
+                "requires a window size.  This is a DraftConfig bug."
+            )
+        if self.is_sliding and not self.causal:
+            # Locally-trained non-causal sliding drafts were trained
+            # without the sliding-causal mask on these layers.  After
+            # gh#317 Gap 6 the inference path applies the mask
+            # unconditionally — matching upstream z-lab/dflash but
+            # creating a silent train/inference mismatch for any draft
+            # trained with an older olmlx version.  The mismatch is
+            # undetectable at load time because the checkpoint does not
+            # record which code version trained it, so warn the
+            # operator.
+            logger.warning(
+                "DFlashAttention layer %d is sliding_attention with "
+                "attention_causal=False.  As of gh#317 the inference "
+                "path applies a sliding-causal mask whenever "
+                "ctx_len + L > sliding_window regardless of the causal "
+                "flag.  Drafts trained with an older olmlx version "
+                "were trained without this mask and may show degraded "
+                "acceptance rates.  Re-train with the latest "
+                "preparation pipeline if acceptance is unexpectedly "
+                "low.",
+                layer_idx,
+            )
 
         self.q_proj = nn.Linear(
             config.hidden_size, self.n_heads * self.head_dim, bias=False
