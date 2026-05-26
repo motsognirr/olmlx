@@ -440,12 +440,23 @@ class SpeculativeDecoder:
 
         self._after_verify(num_accepted)
 
-        # 4. Roll back caches
+        # 4. Roll back caches to keep only the accepted prefix.
+        #
+        # Target was fed (λ+1) tokens [pending, D_1..D_λ]; keep
+        # ``num_accepted`` of them, so trim by (λ+1) - num_accepted.
+        # Draft was fed λ tokens autoregressively
+        # [pending, D_1..D_{λ-1}]; keep ``num_accepted`` of those if
+        # partial acceptance (= a-1 draft tokens between pending and
+        # the correction/bonus), so trim by λ - num_accepted.
         trim_target = max(self._lambda + 1 - num_accepted, 0)
         trim_draft = max(self._lambda - num_accepted, 0)
 
         if trim_target > 0:
             if self._target_gdn_buffer is not None and self._gdn_capture is not None:
+                # ``rollback_single`` takes ``accepted`` as the number of
+                # *additional* tokens beyond the first to keep
+                # (n = accepted + 1). We want to keep ``num_accepted``
+                # total, so accepted_arg = num_accepted - 1.
                 self._gdn_capture.rollback_single(
                     self._target_gdn_buffer,
                     self._target_cache,
@@ -467,6 +478,11 @@ class SpeculativeDecoder:
             elif trim_prompt_cache is not None:
                 trim_prompt_cache(self._draft_cache, trim_draft)
 
+        # On full acceptance, align draft cache with target cache.
+        # ``use_buffer(None)`` was already called after the target
+        # forward, so the align step's draft forward — which DOES
+        # invoke ``GatedDeltaNet.__call__`` on a hybrid draft — won't
+        # write to either buffer.
         if num_accepted > self._lambda:
             last_draft = mx.array([[draft_tokens[-1]]])
             align_logits = _logits(self._draft(last_draft, cache=self._draft_cache))
@@ -626,6 +642,15 @@ class SpeculativeDecoder:
             align_logits = _logits(self._draft(last_primary, cache=self._draft_cache))
             mx.eval(align_logits)
 
+        # When a sibling was accepted, the draft cache reflects only the
+        # primary path up to the branch point — it is missing the sibling
+        # token.  Feed the sibling so the draft cache is aligned with the
+        # accepted prefix before the next step.
+        if used_sibling:
+            sib_token = accepted[-2]  # sibling is second-to-last in accepted
+            sib_arr = mx.array([[sib_token]])
+            mx.eval(_logits(self._draft(sib_arr, cache=self._draft_cache)))
+
         # 7. Update state
         self._cache_seq_len += num_accepted
         assert num_accepted >= 1
@@ -637,7 +662,7 @@ class SpeculativeDecoder:
         self._stats_proposed += tree.num_nodes - 1  # all non-root nodes
         self._stats_accepted_draft += num_accepted_draft
 
-        return accepted, self._lambda
+        return accepted, tree.num_nodes - 1
 
     def _draft_generate_cached(
         self, pending_token: int, n: int
