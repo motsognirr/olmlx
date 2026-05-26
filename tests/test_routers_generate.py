@@ -279,6 +279,58 @@ class TestGenerateRouter:
         assert "created_at" in last_line
 
 
+class TestFormatField:
+    """Ollama ``format`` field maps to a GrammarSpec (issue #361)."""
+
+    @pytest.mark.asyncio
+    async def test_format_json_string(self, app_client):
+        from olmlx.engine.grammar import GrammarSpec
+
+        mock_result = {"text": '{"a": 1}', "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "hi",
+                    "stream": False,
+                    "format": "json",
+                },
+            )
+        assert resp.status_code == 200
+        spec = mock_gen.call_args.kwargs.get("grammar_spec")
+        assert isinstance(spec, GrammarSpec)
+        assert spec.kind == "json_object"
+
+    @pytest.mark.asyncio
+    async def test_format_schema_dict(self, app_client):
+        from olmlx.engine.grammar import GrammarSpec
+
+        mock_result = {"text": '{"x": 1}', "done": True, "stats": TimingStats()}
+        schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "hi",
+                    "stream": False,
+                    "format": schema,
+                },
+            )
+        assert resp.status_code == 200
+        spec = mock_gen.call_args.kwargs.get("grammar_spec")
+        assert isinstance(spec, GrammarSpec)
+        assert spec.kind == "json_schema"
+        assert spec.schema == schema
+
+
 class TestEmptyPromptRejected:
     @pytest.mark.asyncio
     async def test_api_generate_rejects_empty_prompt(self, app_client):

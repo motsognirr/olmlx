@@ -31,7 +31,9 @@ class ChatRequest(BaseModel):
     model: ModelName
     messages: list[Message]
     tools: list[Tool] | None = None
-    format: str | None = None
+    # Ollama accepts either ``"json"`` (any JSON value) or a JSON Schema
+    # dict (strict adherence). Both are passed through to xgrammar.
+    format: str | dict[str, Any] | None = None
     stream: bool = True
     think: bool | str | None = None
     options: ModelOptions | None = None

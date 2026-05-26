@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field, field_validator
 
 from olmlx.schemas.common import (
@@ -17,7 +19,9 @@ class GenerateRequest(BaseModel):
     context: list[int] | None = None
     stream: bool = True
     raw: bool = False
-    format: str | None = None
+    # Ollama accepts either ``"json"`` (any JSON value) or a JSON Schema
+    # dict (strict adherence). Both are passed through to xgrammar.
+    format: str | dict[str, Any] | None = None
     think: bool | str | None = None
     options: ModelOptions | None = None
     keep_alive: int | str | None = None

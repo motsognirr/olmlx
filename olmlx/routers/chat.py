@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
+from olmlx.engine.grammar import parse_response_format
 from olmlx.engine.inference import generate_chat
 from olmlx.engine.tool_parser import (
     fill_missing_required_args,
@@ -190,6 +191,7 @@ async def chat(req: ChatRequest, request: Request):
     max_tokens = options.pop("num_predict", 512)
     cache_id = request.headers.get("x-cache-id", "")[:256]
     enable_thinking = resolve_think_flag(req.think)
+    grammar_spec = parse_response_format(req.format)
 
     if req.stream:
         result = await generate_chat(
@@ -203,6 +205,7 @@ async def chat(req: ChatRequest, request: Request):
             max_tokens=max_tokens,
             cache_id=cache_id,
             enable_thinking=enable_thinking,
+            grammar_spec=grammar_spec,
         )
 
         if tools:
@@ -317,6 +320,7 @@ async def chat(req: ChatRequest, request: Request):
             max_tokens=max_tokens,
             cache_id=cache_id,
             enable_thinking=enable_thinking,
+            grammar_spec=grammar_spec,
         )
         now = datetime.now(timezone.utc).isoformat()
         stats = result.get("stats")

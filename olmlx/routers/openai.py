@@ -7,6 +7,7 @@ import uuid
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
+from olmlx.engine.grammar import parse_response_format
 from olmlx.engine.inference import (
     INIT_ORPHAN_DETECT_LIMIT,
     generate_chat,
@@ -308,17 +309,25 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
     )
     manager = request.app.state.model_manager
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
+    grammar_spec = None
     if req.response_format and req.response_format.type in (
         "json_object",
         "json_schema",
     ):
+        # Schema-shape problems raise ValueError; let FastAPI's default
+        # error handler turn that into a 4xx rather than silently falling
+        # through to a soft-prompt-only path.
+        grammar_spec = parse_response_format(
+            req.response_format.model_dump(exclude_none=True)
+        )
+        # Belt-and-braces: also prepend the system-message hint so the model
+        # is told what it's being constrained to. The grammar enforces shape;
+        # the hint helps the model produce *meaningful* JSON (correct field
+        # names, sensible values) rather than the shortest grammar-valid
+        # output it can emit.
         if req.response_format.type == "json_schema":
             raw_name = req.response_format.json_schema["name"]
             schema_name = re.sub(r"[^A-Za-z0-9_\-]", "", raw_name)[:64]
-            logger.info(
-                "response_format type 'json_schema' is not enforced; "
-                "output may not conform to the provided schema",
-            )
             json_prompt = (
                 f"Respond with valid JSON only, conforming to the '{schema_name}' schema. "
                 "Do not include any text outside the JSON object."
@@ -354,6 +363,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             max_tokens=max_tokens,
             cache_id=cache_id,
             enable_thinking=enable_thinking,
+            grammar_spec=grammar_spec,
         )
 
         if req.tools:
@@ -396,6 +406,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             max_tokens=max_tokens,
             cache_id=cache_id,
             enable_thinking=enable_thinking,
+            grammar_spec=grammar_spec,
         )
         text = result.get("text", "")
         # Use raw_text for tool parsing (preserves gpt-oss channel tokens);

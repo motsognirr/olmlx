@@ -1,7 +1,6 @@
 """Tests for olmlx.routers.openai."""
 
 import json
-import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -927,36 +926,89 @@ class TestResponseFormat:
         assert resp.status_code == 422
 
     @pytest.mark.asyncio
-    async def test_json_schema_warns_and_injects_system_message(
-        self, app_client, caplog
+    async def test_json_schema_passes_grammar_spec_and_injects_system_message(
+        self, app_client
     ):
+        """json_schema response_format builds a GrammarSpec (issue #361)
+        and still injects the named-schema hint into the system message
+        so the model knows what to fill in. The hint is belt-and-braces;
+        xgrammar enforces shape."""
+        from olmlx.engine.grammar import GrammarSpec
+
         mock_result = {"text": '{"a": 1}', "done": True, "stats": TimingStats()}
 
         with patch(
             "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
         ) as mock_gen:
             mock_gen.return_value = mock_result
-            with caplog.at_level(logging.INFO, logger="olmlx.routers.openai"):
-                resp = await app_client.post(
-                    "/v1/chat/completions",
-                    json={
-                        "model": "qwen3",
-                        "messages": [{"role": "user", "content": "give me json"}],
-                        "response_format": {
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "test",
-                                "schema": {"type": "object"},
-                            },
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "give me json"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "test",
+                            "schema": {"type": "object"},
                         },
                     },
-                )
+                },
+            )
 
         assert resp.status_code == 200
-        assert "json_schema" in caplog.text
         messages = mock_gen.call_args[0][2]
         assert messages[0]["role"] == "system"
         assert "'test' schema" in messages[0]["content"]
+        # grammar_spec is forwarded to the engine — without it xgrammar
+        # cannot enforce shape and the route falls back to soft-prompt mode.
+        grammar_spec = mock_gen.call_args.kwargs.get("grammar_spec")
+        assert isinstance(grammar_spec, GrammarSpec)
+        assert grammar_spec.kind == "json_schema"
+        assert grammar_spec.schema == {"type": "object"}
+
+    @pytest.mark.asyncio
+    async def test_json_object_passes_grammar_spec(self, app_client):
+        from olmlx.engine.grammar import GrammarSpec
+
+        mock_result = {"text": '{"a": 1}', "done": True, "stats": TimingStats()}
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "give me json"}],
+                    "response_format": {"type": "json_object"},
+                },
+            )
+
+        assert resp.status_code == 200
+        grammar_spec = mock_gen.call_args.kwargs.get("grammar_spec")
+        assert isinstance(grammar_spec, GrammarSpec)
+        assert grammar_spec.kind == "json_object"
+
+    @pytest.mark.asyncio
+    async def test_no_response_format_means_no_grammar_spec(self, app_client):
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs.get("grammar_spec") is None
 
     @pytest.mark.asyncio
     async def test_json_schema_merges_existing_system_message(self, app_client):
