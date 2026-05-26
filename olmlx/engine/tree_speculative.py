@@ -441,4 +441,5 @@ def extract_top_k_from_logits(
     sort_idx = mx.argsort(-top_vals, axis=-1)
     sorted_indices = mx.take(part_idx, sort_idx, axis=-1)
     mx.eval(sorted_indices)
-    return sorted_indices.flatten().tolist()
+    flat = sorted_indices.flatten()
+    return [int(flat[i].item()) for i in range(k)]
