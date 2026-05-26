@@ -1,0 +1,515 @@
+"""Tests for prompt-lookup decoding (engine/speculative.py:PromptLookupDecoder)."""
+
+from __future__ import annotations
+
+import mlx.core as mx
+import pytest
+
+from tests.test_flash_speculative import MockModel
+
+
+class TestLookupDraft:
+    """Unit tests for the n-gram lookup primitive (``_lookup_draft``).
+
+    These tests bypass the model forward and exercise the pure-Python
+    search by constructing a decoder with no caches and seeding state
+    directly. They cover the matching rules the property tests rely on:
+    most-recent match wins, longest n-gram size wins, no-match returns
+    [], and the trailing query position is excluded.
+    """
+
+    @pytest.fixture()
+    def decoder(self):
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        # MockModel only exists so PromptLookupDecoder.__init__ can probe
+        # for a GDN class (it won't find one). The forward path isn't
+        # exercised here.
+        target = MockModel(32, 16)
+        return PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=5,
+            max_ngram_size=3,
+            min_ngram_size=1,
+        )
+
+    def _seed(self, decoder, tokens: list[int]) -> None:
+        """Set ``_tokens`` (history) and ``_pending_token`` (last token).
+
+        Mirrors decoder state after some prefill+steps without actually
+        running them. The pending token is the most recent emitted token
+        and participates in the n-gram search.
+        """
+        assert len(tokens) >= 1
+        decoder._tokens = list(tokens[:-1])
+        decoder._pending_token = tokens[-1]
+
+    def test_no_match_returns_empty(self, decoder):
+        """No occurrence of the trailing n-gram → empty draft."""
+        # Distinct tokens, no n-gram of any size has a duplicate.
+        self._seed(decoder, [1, 2, 3, 4, 5])
+        assert decoder._lookup_draft() == []
+
+    def test_unigram_match_returns_following_tokens(self, decoder):
+        """A 1-gram match returns the tokens after the matching position."""
+        # Sequence: [9, 7, 8, 5, 4, 9] (L=6). Trailing query=[9] at
+        # index 5; matches at position 0. Tokens after position 0
+        # would be seq[1:6] = [7, 8, 5, 4, 9], but the pending token
+        # at position L-1 is excluded from drafts (predicting pending
+        # as its own successor wastes a slot). So draft = seq[1:5] =
+        # [7, 8, 5, 4].
+        self._seed(decoder, [9, 7, 8, 5, 4, 9])
+        assert decoder._lookup_draft() == [7, 8, 5, 4]
+
+    def test_ngram_size_preference(self, decoder):
+        """Longest n-gram wins: a 3-gram match preempts a shorter 2-gram match."""
+        # Sequence: [1, 2, 3, 4, 7, 1, 2, 3] (L=8). Trailing 3-gram=
+        # [1, 2, 3] at index 5; matches at position 0; draft_start=3;
+        # draft extends seq[3:7] = [4, 7, 1, 2] (pending at index 7
+        # is excluded from drafts). The shorter 2-gram [2, 3] also
+        # matches at position 1 but isn't consulted because a longer
+        # n-gram already won.
+        self._seed(decoder, [1, 2, 3, 4, 7, 1, 2, 3])
+        assert decoder._lookup_draft() == [4, 7, 1, 2]
+
+    def test_most_recent_match_wins(self, decoder):
+        """When multiple positions match the trailing n-gram, prefer the latest."""
+        # Sequence: [5, 6, 9, 5, 6, 7, 8, 5, 6] (L=9). The trailing
+        # 3-gram [8, 5, 6] doesn't recur, so we drop to 2-gram.
+        # Trailing 2-gram=[5, 6] at index 7 matches at positions 0
+        # and 3; the most recent (position 3) wins. draft_start=5;
+        # seq[5:8] = [7, 8, 5] (pending at index 8 is excluded).
+        self._seed(decoder, [5, 6, 9, 5, 6, 7, 8, 5, 6])
+        assert decoder._lookup_draft() == [7, 8, 5]
+
+    def test_closest_match_pending_only_yields_empty(self, decoder):
+        """A closest-possible match whose only draft candidate would be
+        ``pending`` itself yields an empty draft (PLD doesn't propose
+        the pending token as its own successor — verification almost
+        always rejects, wasting a slot).
+
+        Sequence: [9, 9] (L=2). Trailing 1-gram=[9] at index 1;
+        match at start=0; draft_start=1; draft_end=min(1+5, L-1)=1;
+        draft = []. No earlier match exists at this n-gram size, no
+        smaller n-gram is valid, so the function returns []."""
+        self._seed(decoder, [9, 9])
+        assert decoder._lookup_draft() == []
+
+    def test_closest_match_empty_falls_through_to_earlier_match(self, decoder):
+        """When the closest match position would yield only the pending
+        token, the lookup falls through to an earlier match at the same
+        n-gram size if one exists, instead of returning empty.
+
+        Sequence: [5, 1, 2, 5, 5] (L=5). Trailing 1-gram=[5] at
+        index 4. Two matches:
+          - start=3 (seq[3]=5): draft_start=4, draft_end=
+            min(4+5, L-1)=4 → empty (only pending follows).
+          - start=0 (seq[0]=5): draft_start=1, draft_end=
+            min(1+5, L-1)=4 → seq[1:4] = [1, 2, 5].
+        The inner loop walks from start=3 back to start=0; the
+        degenerate closest match yields empty and the earlier match
+        wins.
+        """
+        self._seed(decoder, [5, 1, 2, 5, 5])
+        assert decoder._lookup_draft() == [1, 2, 5]
+
+    def test_caps_at_lambda(self, decoder):
+        """Draft is capped at ``num_speculative_tokens``."""
+        # Sequence: 0..9 then 0. Trailing 1-gram=[0] matches at position
+        # 0; tokens after are [1, 2, 3, 4, 5, 6, 7, 8, 9] — capped at
+        # lambda=5 → [1, 2, 3, 4, 5].
+        self._seed(decoder, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0])
+        assert decoder._lookup_draft() == [1, 2, 3, 4, 5]
+
+    def test_short_history_returns_empty(self, decoder):
+        """A single pending token with no history has nothing to search."""
+        self._seed(decoder, [7])
+        assert decoder._lookup_draft() == []
+
+    def test_min_ngram_floor(self):
+        """``min_ngram_size=2`` rejects unigram-only matches."""
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        decoder = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=5,
+            max_ngram_size=3,
+            min_ngram_size=2,
+        )
+        # Trailing token=9 has a 1-gram match earlier, but no 2-gram or
+        # 3-gram match. With min_ngram=2 the unigram is ignored.
+        self._seed(decoder, [9, 7, 8, 5, 4, 9])
+        assert decoder._lookup_draft() == []
+
+    def test_invalid_ngram_range_rejected(self):
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        with pytest.raises(ValueError, match="n-gram range"):
+            PromptLookupDecoder(
+                target_model=target,
+                num_speculative_tokens=4,
+                max_ngram_size=1,
+                min_ngram_size=3,
+            )
+        with pytest.raises(ValueError, match="n-gram range"):
+            PromptLookupDecoder(
+                target_model=target,
+                num_speculative_tokens=4,
+                max_ngram_size=3,
+                min_ngram_size=0,
+            )
+
+    def test_invalid_lambda_rejected(self):
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        with pytest.raises(ValueError, match="num_speculative_tokens"):
+            PromptLookupDecoder(
+                target_model=target,
+                num_speculative_tokens=0,
+            )
+
+    def test_lookup_window_caps_search(self):
+        """A ``lookup_window`` bounds the search to the most recent N
+        tokens. Construct a prompt where the only matching n-gram for
+        the trailing token lives *outside* the window — the lookup
+        must miss because ``prefill()`` caps ``_tokens`` to the
+        windowed suffix. With a window large enough to include the
+        match, the same prompt finds the draft.
+
+        Exercises the cap via the public API (``prefill()``) rather
+        than poking ``_tokens`` directly — the in-lookup cap was
+        removed in favour of enforcing the invariant at
+        prefill/step boundaries, and tests should follow the same
+        contract.
+        """
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        # 13-token prompt: token 1 only at position 0, then nine 8s,
+        # ending on 1 again. With window=5, prefill keeps only the
+        # last 5 prompt tokens = [8, 8, 8, 8, 1]; the trailing 1
+        # has no other 1 in the windowed corpus.
+        prompt_tokens = [1, 2, 3] + [8] * 9 + [1]
+        windowed = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=5,
+            max_ngram_size=1,
+            min_ngram_size=1,
+            lookup_window=5,
+        )
+        windowed.prefill(mx.array([prompt_tokens]))
+        # Pending is the first generated token; manually swap in the
+        # query token (1) we want to look up. This is the same
+        # contract the per-step lookup uses — pending is just whatever
+        # token's about to be fed to the target.
+        windowed._pending_token = 1
+        assert windowed._lookup_draft() == []
+
+        # Without the window, the full prompt is searched and the
+        # token-1 match at position 0 is found.
+        unbounded = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=5,
+            max_ngram_size=1,
+            min_ngram_size=1,
+            lookup_window=None,
+        )
+        unbounded.prefill(mx.array([prompt_tokens]))
+        unbounded._pending_token = 1
+        # _tokens has the full 13 prompt tokens; trailing 1-gram=[1]
+        # matches at positions 0 and 12. Closest match (start=12)
+        # would propose only pending → empty; falls back to start=0:
+        # draft_start=1; draft_end=min(1+5, L-1)=6; seq[1:6]=[2,3,8,8,8].
+        assert unbounded._lookup_draft() == [2, 3, 8, 8, 8]
+
+    def test_lookup_window_too_small_rejected(self):
+        """``lookup_window < max_ngram_size`` is rejected at construction."""
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        with pytest.raises(ValueError, match="lookup_window"):
+            PromptLookupDecoder(
+                target_model=target,
+                num_speculative_tokens=4,
+                max_ngram_size=3,
+                min_ngram_size=1,
+                lookup_window=2,
+            )
+
+    def test_initial_alpha_is_zero(self, decoder):
+        """``stats_summary().ema_acceptance_rate`` on a fresh decoder
+        must not falsely report 50% acceptance — PLD has done nothing
+        yet, so the honest rate is 0. Guards against bench/streaming
+        readers consuming a biased warm-up value."""
+        assert decoder.stats_summary()["ema_acceptance_rate"] == 0.0
+
+    def test_prefill_seed_capped_at_lookup_window(self):
+        """A prompt longer than ``lookup_window`` must seed ``_tokens``
+        with only the trailing window. The prefix beyond the window
+        can never participate in n-gram search anyway, so paying the
+        Metal-to-Python cost for it is pure waste."""
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        decoder = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=2,
+            max_ngram_size=3,
+            min_ngram_size=1,
+            lookup_window=5,
+        )
+        prompt = mx.array([list(range(20))])  # 20 tokens; window=5
+        decoder.prefill(prompt)
+        # Only the trailing 5 prompt tokens land in the lookup table.
+        assert decoder._tokens == [15, 16, 17, 18, 19]
+
+    def test_step_prunes_tokens_to_lookup_window(self):
+        """``_tokens`` must not grow beyond ``lookup_window`` across
+        repeated steps. This is the load-bearing memory invariant for
+        long conversations — without it the list accumulates every
+        generated token for the lifetime of the request."""
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        decoder = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=2,
+            max_ngram_size=2,
+            min_ngram_size=1,
+            lookup_window=8,
+        )
+        prompt = mx.array([list(range(6))])  # under window — no seed cap
+        decoder.prefill(prompt)
+        for _ in range(10):
+            decoder.step()
+        # ``_tokens`` must respect the window after enough steps to
+        # exceed it; the pending token is held separately so total
+        # in-flight history is at most window + 1.
+        assert len(decoder._tokens) <= decoder._lookup_window
+
+
+class TestPromptLookupDecoder:
+    """End-to-end tests against MockModel: caches populate, step()
+    returns at least one token, state stays consistent across steps,
+    output matches the greedy reference."""
+
+    @pytest.fixture()
+    def decoder(self):
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        target = MockModel(32, 16)
+        return PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=4,
+            max_ngram_size=3,
+            min_ngram_size=1,
+        )
+
+    def test_prefill_populates_state(self, decoder):
+        prompt = mx.array([[1, 2, 3, 4, 5]])
+        first_token = decoder.prefill(prompt)
+
+        assert decoder._target_cache is not None
+        assert decoder._cache_seq_len == 5
+        assert isinstance(first_token, int)
+        assert 0 <= first_token < 32
+        assert decoder._tokens == [1, 2, 3, 4, 5]
+        assert decoder._pending_token == first_token
+
+    def test_step_returns_at_least_one_token(self, decoder):
+        prompt = mx.array([[1, 2, 3, 4, 5]])
+        decoder.prefill(prompt)
+
+        accepted, num_drafted = decoder.step()
+        assert len(accepted) >= 1
+        assert 0 <= num_drafted <= decoder._lambda
+        # With variable draft length, accepted length is bounded above
+        # by num_drafted + 1 (the bonus from verify_draft_greedy).
+        assert len(accepted) <= num_drafted + 1
+
+    def test_step_advances_cache(self, decoder):
+        prompt = mx.array([[1, 2, 3, 4, 5]])
+        decoder.prefill(prompt)
+        accepted, _ = decoder.step()
+
+        # Cache grows by exactly num_accepted positions.
+        assert decoder._cache_seq_len == 5 + len(accepted)
+        assert decoder._target_cache[0].offset == decoder._cache_seq_len
+
+    def test_history_tracks_pending_and_accepted(self, decoder):
+        """After each step, _tokens grows by pending+accepted[:-1] and
+        _pending_token is set to accepted[-1]."""
+        prompt = mx.array([[1, 2, 3, 4, 5]])
+        first_token = decoder.prefill(prompt)
+        accepted, _ = decoder.step()
+
+        # The pending token from prefill is now in history; so are all
+        # accepted tokens except the last (which is the new pending).
+        expected_tokens = [1, 2, 3, 4, 5, first_token] + list(accepted[:-1])
+        assert decoder._tokens == expected_tokens
+        assert decoder._pending_token == accepted[-1]
+
+    def test_reset_clears_state(self, decoder):
+        prompt = mx.array([[1, 2, 3]])
+        decoder.prefill(prompt)
+        decoder.step()
+
+        decoder.reset()
+        assert decoder._target_cache is None
+        assert decoder._cache_seq_len == 0
+        assert decoder._pending_token is None
+        assert decoder._tokens == []
+
+    def test_multi_step_consistency(self, decoder):
+        """Across many steps, cache offset stays aligned with the
+        emitted token count and ``_tokens + [_pending]`` reconstructs
+        the full emitted sequence (prompt + everything yielded so
+        far). Token-by-token output values depend on MockModel's
+        random init, so the assertion stays on the invariants that
+        hold regardless of which path step() takes."""
+        prompt_ids = [1, 2, 3, 4, 5]
+        prompt = mx.array([prompt_ids])
+        first = decoder.prefill(prompt)
+        emitted: list[int] = [first]
+        for _ in range(6):
+            accepted, _ = decoder.step()
+            assert len(accepted) >= 1
+            emitted.extend(accepted)
+            # KV cache stays in lockstep with what's emitted minus the
+            # not-yet-cached pending token.
+            assert decoder._target_cache[0].offset == decoder._cache_seq_len
+            assert decoder._cache_seq_len == len(prompt_ids) + len(emitted) - 1
+            # ``_tokens + [_pending]`` reproduces the emitted stream.
+            assert decoder._tokens + [decoder._pending_token] == (prompt_ids + emitted)
+
+    def test_output_matches_greedy_reference(self):
+        """PLD output must equal greedy decoding token-for-token.
+
+        PLD uses greedy verification, so the emitted token sequence is
+        identical to running the target greedily one token at a time
+        (as long as the target is deterministic). This is the core
+        correctness guarantee stated in the issue's acceptance criteria.
+
+        The prompt is deliberately constructed with repeated n-grams so
+        PLD actually drafts something to verify, exercising the accept/
+        reject branches rather than the no-match degenerate path.
+        """
+        from mlx_lm.models.cache import make_prompt_cache
+
+        from olmlx.engine.speculative import (
+            PromptLookupDecoder,
+            _logits,
+            _prefill_last_logit,
+        )
+
+        target = MockModel(vocab_size=32, hidden_size=16)
+        # Repeated 3-gram [3, 7, 1] gives PLD a hit on the first step.
+        prompt = mx.array([[3, 7, 1, 5, 9, 2, 4, 6, 8, 3, 7, 1]])
+        max_steps = 12
+
+        # Greedy reference: prefill, then one-at-a-time greedy.
+        ref_cache = make_prompt_cache(target)
+        first_logit = _prefill_last_logit(target, prompt, ref_cache)
+        mx.eval(first_logit)
+        ref_tokens = [int(mx.argmax(first_logit).item())]
+        for _ in range(max_steps - 1):
+            inp = mx.array([[ref_tokens[-1]]])
+            out = _logits(target(inp, cache=ref_cache))[0, -1, :]
+            mx.eval(out)
+            ref_tokens.append(int(mx.argmax(out).item()))
+
+        # PLD: prefill + repeated step() until we have >= max_steps.
+        pld = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=4,
+            max_ngram_size=3,
+            min_ngram_size=1,
+        )
+        pld_tokens = [pld.prefill(prompt)]
+        while len(pld_tokens) < max_steps:
+            accepted, _ = pld.step()
+            pld_tokens.extend(accepted)
+        pld_tokens = pld_tokens[:max_steps]
+
+        assert pld_tokens == ref_tokens, (
+            f"PLD diverged from greedy reference at step "
+            f"{next(i for i, (a, b) in enumerate(zip(pld_tokens, ref_tokens)) if a != b)}: "
+            f"pld={pld_tokens} greedy={ref_tokens}"
+        )
+
+    def test_stats_summary_shape(self, decoder):
+        """``stats_summary`` returns the keys the streaming layer reads."""
+        prompt = mx.array([[1, 2, 3]])
+        decoder.prefill(prompt)
+        decoder.step()
+        s = decoder.stats_summary()
+        for k in (
+            "steps",
+            "proposed",
+            "accepted_draft",
+            "acceptance_rate",
+            "avg_tokens_per_step",
+            "ema_acceptance_rate",
+            "lambda",
+        ):
+            assert k in s, f"missing stats key: {k}"
+        assert s["steps"] == 1
+        assert 0 <= s["acceptance_rate"] <= 1
+        assert s["lambda"] == decoder._lambda
+
+    def test_protocol_conformance(self, decoder):
+        """PLD must satisfy SpeculativeDecoderProtocol so the existing
+        streaming adapter works without modification."""
+        # SpeculativeDecoderProtocol isn't @runtime_checkable, so duck-
+        # check the three method names by hand. If a future refactor
+        # renames any of these, the streaming adapter would break
+        # silently — fail loudly here instead.
+        assert callable(getattr(decoder, "prefill", None))
+        assert callable(getattr(decoder, "step", None))
+        assert callable(getattr(decoder, "reset", None))
+
+    def test_streaming_handles_no_match_step(self):
+        """PLD ``step()`` can return ``num_drafted=0`` when no n-gram
+        match is found. ``SpeculativeDecoder.step()`` never produces 0
+        (it always drafts ``lambda``), so the streaming adapter is
+        being asked to handle a new value. This test drives the
+        adapter through a prompt of distinct tokens (forcing no
+        match) to confirm the no-match step doesn't crash, divide by
+        zero, or stall the stream.
+        """
+        import threading
+
+        from olmlx.engine.speculative import PromptLookupDecoder
+        from olmlx.engine.speculative_stream import speculative_stream_generate
+
+        target = MockModel(vocab_size=32, hidden_size=16)
+        pld = PromptLookupDecoder(
+            target_model=target,
+            num_speculative_tokens=4,
+            # max_ngram=1 with all-distinct prompt tokens guarantees
+            # the first lookup yields no match: every unigram appears
+            # exactly once (as the trailing query).
+            max_ngram_size=1,
+            min_ngram_size=1,
+        )
+        prompt_tokens = [1, 2, 3, 4, 5, 6, 7]  # all distinct
+        tokens = list(
+            speculative_stream_generate(
+                pld,
+                prompt_tokens=prompt_tokens,
+                max_tokens=5,
+                cancel_event=threading.Event(),
+                eos_token_id=None,
+                tokenizer=None,
+            )
+        )
+        # 5 yields, regardless of how many internal steps were no-match.
+        assert len(tokens) == 5
+        # Stats must not divide by zero: a stream where every step
+        # was a no-match yields acceptance_rate=0.0, not NaN/raise.
+        stats = pld.stats_summary()
+        assert isinstance(stats["acceptance_rate"], float)
+        assert 0.0 <= stats["acceptance_rate"] <= 1.0

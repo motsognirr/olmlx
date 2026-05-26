@@ -992,12 +992,28 @@ def _audit_speculative_config(
     global_draft_used = False
     for name, mc in registry.list_models().items():
         try:
-            enabled, draft, _, strategy = mc.resolved_speculative()
+            resolved = mc.resolved_speculative()
+            enabled = resolved.enabled
+            draft = resolved.draft_model
+            strategy = resolved.strategy
+        except ValueError as exc:
+            # Configuration error (e.g. PLD ngram/window cross-field
+            # invariant violated by the global+per-model combination).
+            # Surface as an error rather than a warning so it's not
+            # lost in startup chatter; the request itself will fail
+            # later with the same message, but seeing it at startup
+            # is more diagnosable.
+            logger.error(
+                "Speculative config for %s is invalid and will fail "
+                "at model-load time: %s",
+                name,
+                exc,
+            )
+            continue
         except Exception as exc:
-            # ``resolved_speculative`` reads ``settings`` and could
-            # raise if the runtime ``Settings`` is in an unexpected
-            # state. Skipping the entry is safer than killing
-            # startup with a stack trace.
+            # Unexpected (e.g. settings in an unexpected state).
+            # Skipping the entry is safer than killing startup with
+            # a stack trace from an unrelated cause.
             logger.warning(
                 "Skipping audit of %s: could not resolve speculative config: %s",
                 name,
@@ -2784,13 +2800,15 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument(
         "--speculative-strategy",
         dest="speculative_strategy",
-        choices=("classic", "dflash", "eagle"),
+        choices=("classic", "dflash", "eagle", "pld"),
         default=None,
         help=(
             "Speculative decoding strategy: 'classic' (standalone draft LM), "
             "'dflash' (block-diffusion draft conditioned on target hidden "
-            "states), or 'eagle' (autoregressive draft head conditioned on "
-            "target last-layer hidden, arxiv 2401.15077). Default: classic."
+            "states), 'eagle' (autoregressive draft head conditioned on "
+            "target last-layer hidden, arxiv 2401.15077), or 'pld' "
+            "(prompt-lookup decoding — n-gram lookup in the prompt+generated "
+            "history, no draft model required). Default: classic."
         ),
     )
     serve_p.add_argument(
@@ -2806,8 +2824,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=None,
         help=(
-            "Number of tokens drafted per verification step (default: 4). "
-            "For DFlash this is the block size (excluding the pending token)."
+            "Number of tokens drafted per verification step (default: 4 "
+            "for classic, 10 for PLD). For DFlash this is the block size "
+            "(excluding the pending token); for PLD it's the max draft "
+            "length (actual draft is bounded by the longest n-gram match)."
         ),
     )
     serve_p.add_argument(

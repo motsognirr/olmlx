@@ -640,3 +640,360 @@ class SpeculativeDecoder:
         self._stats_proposed += self._lambda
         self._stats_accepted_draft += num_accepted_draft
         return accepted, self._lambda
+
+
+class PromptLookupDecoder:
+    """Prompt-lookup decoding (PLD): zero-cost draft via n-gram lookup.
+
+    Reference: https://github.com/apoorvumang/prompt-lookup-decoding
+
+    The "draft" comes from searching the prompt+generated history for
+    occurrences of the most recent n-gram suffix; the tokens immediately
+    after the match become the draft candidates. No draft model, no
+    training, no per-token Metal sync — just a small CPU n-gram scan
+    between forward passes.
+
+    Works on any target, including Flash-MoE (which blocks DFlash/EAGLE
+    because those rely on target hidden-state hooks). Particularly
+    effective on code edits, structured output (JSON), and any task with
+    high contextual repetition.
+
+    Implements the same ``prefill`` / ``step`` / ``reset`` protocol as
+    ``SpeculativeDecoder`` so the streaming adapter is shared. Not
+    thread-safe: one decoder instance must serve one request at a time.
+    """
+
+    def __init__(
+        self,
+        target_model: nn.Module,
+        num_speculative_tokens: int = 10,
+        max_ngram_size: int = 3,
+        min_ngram_size: int = 1,
+        lookup_window: int | None = 8192,
+        acceptance_rate_ema: float = 0.9,
+    ):
+        if trim_prompt_cache is None or make_prompt_cache is None:
+            raise RuntimeError(
+                "mlx_lm.models.cache imports failed (trim_prompt_cache / "
+                "make_prompt_cache unavailable); PLD requires both — fail "
+                "fast at construction rather than crashing on first prefill"
+            )
+        if num_speculative_tokens < 1:
+            raise ValueError(
+                f"num_speculative_tokens must be >= 1, got {num_speculative_tokens}"
+            )
+        if min_ngram_size < 1 or max_ngram_size < min_ngram_size:
+            raise ValueError(
+                f"Invalid n-gram range: min={min_ngram_size}, "
+                f"max={max_ngram_size}. Must satisfy "
+                f"1 <= min_ngram_size <= max_ngram_size."
+            )
+        if lookup_window is not None and lookup_window < max_ngram_size:
+            raise ValueError(
+                f"lookup_window ({lookup_window}) must be >= max_ngram_size "
+                f"({max_ngram_size}) or None. A window smaller than the "
+                f"largest n-gram makes that n-gram unmatchable."
+            )
+        self._target = target_model
+        self._lambda = num_speculative_tokens
+        self._max_ngram = max_ngram_size
+        self._min_ngram = min_ngram_size
+        #: Cap on how many of the most recent ``_tokens`` entries the
+        #: n-gram scan walks. ``None`` disables the cap. The pending
+        #: token is always included regardless of this window.
+        self._lookup_window = lookup_window
+        # Init to 0.0 (not 0.5 as in ``SpeculativeDecoder``): PLD's
+        # acceptance rate before any step has run is honestly 0 (nothing
+        # drafted, nothing accepted), and a 0.5 warm-up would mislead
+        # ``stats_summary`` consumers (bench, streaming layer) into
+        # reporting 50% for the first several steps.
+        self._alpha = 0.0
+        self._alpha_ema = acceptance_rate_ema
+
+        # Persistent state populated by prefill/step
+        self._target_cache: list | None = None
+        self._cache_seq_len: int = 0
+        self._pending_token: int | None = None
+        # Full token history (prompt + cached generated tokens) used as
+        # the lookup table. The currently-pending token is tracked
+        # separately in ``_pending_token`` and is virtually appended to
+        # this list during n-gram search.
+        self._tokens: list[int] = []
+
+        # GDN rollback for hybrid linear-attention targets
+        # (Qwen3.5/3.6 GatedDeltaNet). PLD has no draft model, so we
+        # only patch the target — no shared-class invariant to enforce.
+        self._gdn_capture: GDNStateCapture | None = None
+        self._target_gdn_buffer: GDNBuffer | None = None
+        target_gdn_cls = find_gdn_class(target_model)
+        if target_gdn_cls is not None:
+            self._gdn_capture = GDNStateCapture(target_gdn_cls)
+            try:
+                self._target_gdn_buffer = self._gdn_capture.create_buffer(target_model)
+            except Exception:
+                self._gdn_capture.close()
+                self._gdn_capture = None
+                self._target_gdn_buffer = None
+                raise
+
+        # Diagnostic counters (reset on prefill)
+        self._stats_steps: int = 0
+        self._stats_proposed: int = 0
+        self._stats_accepted_draft: int = 0
+
+    def close(self) -> None:
+        """Release the GDN class-level monkey-patch (idempotent)."""
+        if self._gdn_capture is not None:
+            self._gdn_capture.close()
+            self._gdn_capture = None
+            self._target_gdn_buffer = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # Finalisers must never raise.
+            pass
+
+    def reset(self) -> None:
+        self._target_cache = None
+        self._cache_seq_len = 0
+        self._pending_token = None
+        self._tokens = []
+        self._stats_steps = 0
+        self._stats_proposed = 0
+        self._stats_accepted_draft = 0
+        # Reset EMA too; ``stats_summary`` is documented as "PLD's
+        # acceptance rate before any step is honestly 0", and that
+        # invariant must hold per-request, not just per-decoder.
+        self._alpha = 0.0
+
+    def stats_summary(self) -> dict[str, Any]:
+        steps = self._stats_steps
+        proposed = self._stats_proposed
+        accepted_draft = self._stats_accepted_draft
+        acceptance_rate = accepted_draft / proposed if proposed else 0.0
+        avg_tokens_per_step = (accepted_draft + steps) / steps if steps else 0.0
+        return {
+            "steps": steps,
+            "proposed": proposed,
+            "accepted_draft": accepted_draft,
+            "acceptance_rate": acceptance_rate,
+            "avg_tokens_per_step": avg_tokens_per_step,
+            "ema_acceptance_rate": self._alpha,
+            "lambda": self._lambda,
+        }
+
+    def prefill(self, prompt: mx.array) -> int:
+        """Process the prompt through the target, populating its KV cache.
+
+        Args:
+            prompt: (1, seq_len) input token IDs.
+
+        Returns:
+            The first generated token (target's greedy argmax).
+        """
+        self.reset()
+
+        # ``__init__`` already enforces ``make_prompt_cache`` /
+        # ``trim_prompt_cache`` non-None at construction, so any
+        # ``PromptLookupDecoder`` that reaches this point has them.
+        # No need to re-check.
+        self._target_cache = make_prompt_cache(self._target)
+
+        # Same VLM cache-reset rationale as ``SpeculativeDecoder.prefill``.
+        for attr in ("_position_ids", "_rope_deltas"):
+            if hasattr(self._target, attr):
+                setattr(self._target, attr, None)
+
+        # No rollback needed for the prompt forward.
+        if self._gdn_capture is not None:
+            self._gdn_capture.use_buffer(None)
+
+        last_logit = _prefill_last_logit(self._target, prompt, self._target_cache)
+        mx.eval(last_logit)
+
+        self._cache_seq_len = prompt.shape[1]
+        # Seed the lookup table with the prompt tokens. The pending
+        # (first generated) token lives in ``_pending_token`` until the
+        # next ``step()`` puts it into the cache. Cap the seed to the
+        # lookup window so we don't pay an O(prompt_len) Metal-to-
+        # Python copy for tokens that will never participate in the
+        # n-gram scan (the cached prefix is still in the KV cache;
+        # this list only feeds the lookup heuristic).
+        if self._lookup_window is not None and prompt.shape[1] > self._lookup_window:
+            self._tokens = prompt[0, -self._lookup_window :].tolist()
+        else:
+            self._tokens = prompt[0].tolist()
+
+        first_token = int(mx.argmax(last_logit).item())
+        self._pending_token = first_token
+        return first_token
+
+    def step(self) -> tuple[list[int], int]:
+        """One PLD step using the persistent target KV cache.
+
+        Must call ``prefill()`` first. Returns
+        ``(accepted_tokens, num_draft_proposed)`` — the second value is the
+        *actual* draft length (0..lambda), not the configured maximum.
+        """
+        # Explicit ``raise`` (not ``assert``) so the misuse still
+        # surfaces under ``python -O`` — otherwise the stripped
+        # asserts let ``None`` fall through and produce a confusing
+        # ``TypeError`` from the target forward a few lines below.
+        if self._target_cache is None or self._pending_token is None:
+            raise RuntimeError(
+                "PromptLookupDecoder.step() called before prefill(); "
+                "call prefill(prompt) first"
+            )
+
+        pending_token = self._pending_token
+
+        # 1. Build the draft via n-gram lookup. May be empty when no
+        # match is found — that turns the step into a single-token
+        # target forward, equivalent to plain greedy decoding for this
+        # step.
+        draft_tokens = self._lookup_draft()
+        num_drafted = len(draft_tokens)
+
+        # 2. Target forward on [pending, D_1..D_num_drafted].
+        if self._gdn_capture is not None:
+            if self._target_gdn_buffer is not None:
+                self._target_gdn_buffer.clear()
+            self._gdn_capture.use_buffer(self._target_gdn_buffer)
+        all_tokens = mx.array([[pending_token] + draft_tokens])
+        target_out = _logits(self._target(all_tokens, cache=self._target_cache))
+        mx.eval(target_out)
+        if self._gdn_capture is not None:
+            self._gdn_capture.use_buffer(None)
+
+        verification_logits = target_out[0]  # (num_drafted+1, vocab)
+
+        # 3. Greedy verification — identical to SpeculativeDecoder.
+        accepted = verify_draft_greedy(draft_tokens, verification_logits)
+        num_accepted = len(accepted)
+
+        # 4. Trim target cache to keep only the accepted prefix.
+        # Target was fed (num_drafted + 1) tokens; keep num_accepted of
+        # them, so trim by (num_drafted + 1) - num_accepted.
+        trim_target = max(num_drafted + 1 - num_accepted, 0)
+        if trim_target > 0:
+            if self._target_gdn_buffer is not None and self._gdn_capture is not None:
+                self._gdn_capture.rollback_single(
+                    self._target_gdn_buffer,
+                    self._target_cache,
+                    accepted=num_accepted - 1,
+                    trim=trim_target,
+                )
+            else:
+                # ``trim_prompt_cache`` is guaranteed non-None here
+                # because ``__init__`` enforces it at construction.
+                trim_prompt_cache(self._target_cache, trim_target)
+
+        # 5. Update state. The cache now contains the original prompt
+        # plus the pending token plus the first (num_accepted - 1)
+        # accepted tokens; the final accepted token (the bonus from
+        # verify_draft_greedy) becomes the new pending and is *not* in
+        # the cache yet. Unlike ``SpeculativeDecoder.step``, we derive
+        # the next pending from ``accepted[-1]`` directly — verify
+        # already did the argmax — so we don't store or eval the
+        # corresponding logit (it would force a Metal round-trip for a
+        # tensor that's immediately discarded).
+        self._tokens.append(pending_token)
+        if num_accepted > 1:
+            self._tokens.extend(accepted[:-1])
+        # Keep memory O(lookup_window) regardless of conversation
+        # length: anything beyond the window can never be matched, so
+        # prune in-place to drop both the Python objects and any
+        # downstream slicing cost in ``_lookup_draft``. ``del`` on a
+        # slice is the cheap mutation here — avoids an alloc/copy.
+        if self._lookup_window is not None and len(self._tokens) > self._lookup_window:
+            del self._tokens[: len(self._tokens) - self._lookup_window]
+        self._cache_seq_len += num_accepted
+        self._pending_token = int(accepted[-1])
+
+        # 6. Stats. EMA only updates when something was proposed —
+        # otherwise the step would push acceptance rate toward 0 even
+        # though nothing was rejected.
+        num_accepted_draft = min(num_accepted - 1, num_drafted)
+        if num_drafted > 0:
+            acceptance = num_accepted_draft / num_drafted
+            self._alpha = (
+                self._alpha_ema * self._alpha + (1 - self._alpha_ema) * acceptance
+            )
+
+        self._stats_steps += 1
+        self._stats_proposed += num_drafted
+        self._stats_accepted_draft += num_accepted_draft
+
+        return accepted, num_drafted
+
+    def _lookup_draft(self) -> list[int]:
+        """Find up to ``self._lambda`` draft tokens via n-gram lookup.
+
+        Iterates n-gram sizes from ``max_ngram`` down to ``min_ngram``.
+        For each size, walks the sequence backwards looking for the most
+        recent match of the trailing n-gram (excluding the trailing
+        occurrence itself) and returns the tokens immediately following
+        that match. Returns ``[]`` if no n-gram of any size matches.
+
+        The search corpus is the most recent ``_lookup_window`` tokens
+        of ``self._tokens`` plus ``self._pending_token`` — the pending
+        token is always included so drafts can match across the
+        prompt/generation boundary. The window cap exists because the
+        scan is pure Python and grows with history length: an
+        unbounded history at 128k tokens would add ~30–80 ms per step
+        on Apple Silicon, rivalling the target forward.
+        """
+        pending = self._pending_token
+        if pending is None:
+            # Same defensive philosophy as ``step()``: explicit raise
+            # so the misuse survives ``python -O``. _lookup_draft is
+            # private and only reached via ``step()``, but the
+            # consistency makes the contract clear.
+            raise RuntimeError(
+                "_lookup_draft called with _pending_token=None; call prefill() first"
+            )
+        # Materialise the search corpus once. The alternative — a
+        # closure that branches between history[i] and pending — pays
+        # a Python frame on every access, and ``_lookup_draft`` does
+        # O(window × max_ngram) accesses (≈24k at the defaults).
+        # Concatenation costs a single ~window-sized list alloc per
+        # step, which is cheaper than the per-call overhead. No need
+        # to re-cap by ``_lookup_window`` here: ``prefill()`` caps
+        # the initial seed and ``step()`` trims at the end of each
+        # call, so ``self._tokens`` is already <= window every time
+        # we reach this point.
+        seq = self._tokens + [pending]
+        L = len(seq)
+
+        if L < 2:
+            return []
+
+        for ngram_size in range(self._max_ngram, self._min_ngram - 1, -1):
+            if L < ngram_size + 1:
+                continue
+            query_start = L - ngram_size
+            query = seq[query_start:L]
+            # Walk backwards through possible match start positions,
+            # excluding the trailing query's own position.
+            for start in range(query_start - 1, -1, -1):
+                if seq[start : start + ngram_size] != query:
+                    continue
+                # Cap ``draft_end`` at ``L - 1`` to exclude the pending
+                # token itself from the draft. The closest-possible
+                # match (``start = query_start - 1``) would otherwise
+                # produce ``draft = [pending]`` — asking the target to
+                # predict the same token twice in a row. That's almost
+                # always rejected and wastes a draft slot's worth of
+                # acceptance-rate accounting. Excluding pending makes
+                # this match yield an empty draft; we fall through to
+                # an earlier match position or a smaller n-gram size.
+                draft_start = start + ngram_size
+                draft_end = min(draft_start + self._lambda, L - 1)
+                if draft_end > draft_start:
+                    return seq[draft_start:draft_end]
+                # Empty draft (this match position only proposed
+                # pending). Continue to earlier match positions at the
+                # current n-gram size, then to smaller n-gram sizes.
+        return []

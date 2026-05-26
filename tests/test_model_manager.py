@@ -4342,10 +4342,166 @@ class TestSpeculativeLoading:
             result = manager._load_model(
                 "test/flash-model", model_exp=model_exp, spec_config=spec_config
             )
-        # Flash path returns its own tuple unchanged.
-        assert result is sentinel
+        # Flash path forwards its tuple element-for-element (PLD support
+        # added a conditional decoder swap, so identity is no longer
+        # preserved — value equality is the meaningful contract here).
+        assert result == sentinel
         assert "OLMLX_SPECULATIVE" in caplog.text
         assert "Flash" in caplog.text
+
+    def test_flash_path_swaps_in_pld_decoder(self, monkeypatch, caplog):
+        """Flash (non-MoE) + PLD should swap the flash-returned decoder
+        for a PLD decoder — PLD doesn't conflict with the flash forward
+        wrapper, so we honour OLMLX_SPECULATIVE_STRATEGY=pld instead of
+        warning + dropping it (which is what classic/dflash/eagle hit)."""
+        import logging
+
+        from olmlx.config import ExperimentalSettings
+        from olmlx.engine.registry import ResolvedFlashConfig
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-flash")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: True)
+        monkeypatch.setattr(
+            manager, "_flash_dir", lambda hf_path: Path("/tmp/test-flash/flash")
+        )
+        flash_model = object()
+        flash_tok = object()
+        flash_caps = TemplateCaps()
+        # The flash loader returns ``decoder=None`` when flash_speculative
+        # is off; the PLD swap happens in ``_load_model`` after the call.
+        monkeypatch.setattr(
+            manager,
+            "_load_flash_model",
+            lambda *a, **kw: (flash_model, flash_tok, False, flash_caps, None),
+        )
+        sentinel_pld = object()
+        monkeypatch.setattr(
+            manager,
+            "_load_pld_decoder",
+            lambda model, spec_config, *, is_vlm=False: sentinel_pld,
+        )
+
+        flash_config = ResolvedFlashConfig(
+            enabled=True,
+            sparsity_threshold=0.5,
+            min_active_neurons=128,
+            max_active_neurons=None,
+            memory_budget_fraction=None,
+            prefetch=False,
+            flash_speculative=False,
+        )
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = SpeculativeConfig(True, None, 10, strategy="pld")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            model, tok, is_vlm, caps, decoder = manager._load_model(
+                "test/flash-model",
+                model_exp=model_exp,
+                spec_config=spec_config,
+                flash_config=flash_config,
+            )
+        assert model is flash_model
+        assert tok is flash_tok
+        assert decoder is sentinel_pld
+        # PLD is honoured, so the warn-and-ignore message must NOT fire.
+        assert "OLMLX_SPECULATIVE" not in caplog.text
+
+    def test_flash_path_warns_when_classic_spec_set_with_flash_speculative(
+        self, monkeypatch, caplog
+    ):
+        """Flash + flash_speculative=True + OLMLX_SPECULATIVE=true (classic)
+        must still log the warn-and-ignore message. The user's classic
+        spec setting is ignored either way — flash_speculative being on
+        doesn't change that, so suppressing the warning would hide a
+        misconfiguration."""
+        import logging
+
+        from olmlx.config import ExperimentalSettings
+        from olmlx.engine.registry import ResolvedFlashConfig
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-flash")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: True)
+        monkeypatch.setattr(
+            manager, "_flash_dir", lambda hf_path: Path("/tmp/test-flash/flash")
+        )
+        sentinel = (object(), object(), False, TemplateCaps(), object())
+        monkeypatch.setattr(
+            manager,
+            "_load_flash_model",
+            lambda *a, **kw: sentinel,
+        )
+
+        flash_config = ResolvedFlashConfig(
+            enabled=True,
+            sparsity_threshold=0.5,
+            min_active_neurons=128,
+            max_active_neurons=None,
+            memory_budget_fraction=None,
+            prefetch=False,
+            flash_speculative=True,
+            flash_speculative_draft_model="test/draft",
+        )
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = SpeculativeConfig(True, "test/draft", 4, strategy="classic")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            manager._load_model(
+                "test/flash-model",
+                model_exp=model_exp,
+                spec_config=spec_config,
+                flash_config=flash_config,
+            )
+        # The user's OLMLX_SPECULATIVE setting is ignored — warning fires.
+        assert "OLMLX_SPECULATIVE" in caplog.text
+
+    def test_flash_path_rejects_pld_with_flash_speculative(self, monkeypatch):
+        """Flash + flash_speculative + PLD must raise — two speculative
+        decoders fighting over the same target is a configuration error,
+        not a silent override."""
+        from olmlx.config import ExperimentalSettings
+        from olmlx.engine.registry import ResolvedFlashConfig
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-flash")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: True)
+        monkeypatch.setattr(
+            manager, "_flash_dir", lambda hf_path: Path("/tmp/test-flash/flash")
+        )
+
+        flash_config = ResolvedFlashConfig(
+            enabled=True,
+            sparsity_threshold=0.5,
+            min_active_neurons=128,
+            max_active_neurons=None,
+            memory_budget_fraction=None,
+            prefetch=False,
+            flash_speculative=True,
+            flash_speculative_draft_model="test/draft",
+        )
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = SpeculativeConfig(True, None, 10, strategy="pld")
+
+        with pytest.raises(ValueError, match="flash_speculative.*pld"):
+            manager._load_model(
+                "test/flash-model",
+                model_exp=model_exp,
+                spec_config=spec_config,
+                flash_config=flash_config,
+            )
 
     def test_flash_moe_path_supports_classic_speculative(self, monkeypatch, caplog):
         """Flash-MoE + classic speculative should load the decoder (not drop it)."""
@@ -4392,6 +4548,169 @@ class TestSpeculativeLoading:
         assert (model, tokenizer, is_vlm, caps) == sentinel_load
         assert decoder is sentinel_decoder
         assert "OLMLX_SPECULATIVE" not in caplog.text
+
+    def test_flash_moe_path_supports_pld(self, monkeypatch, caplog):
+        """Flash-MoE + PLD should load the PLD decoder — PLD is the only
+        speculative strategy that composes with Flash-MoE because it
+        doesn't need a draft model and doesn't hook target hidden states."""
+        import logging
+
+        from olmlx.config import ExperimentalSettings
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-moe")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: True)
+        monkeypatch.setattr(
+            manager, "_flash_moe_dir", lambda hf_path: Path("/tmp/test-moe/flash_moe")
+        )
+        sentinel_load = (object(), object(), False, TemplateCaps())
+        monkeypatch.setattr(
+            manager,
+            "_load_flash_moe_model",
+            lambda hf_path, load_path, flash_moe_dir, *, flash_moe_config: (
+                sentinel_load
+            ),
+        )
+        sentinel_decoder = object()
+        # The classic loader must NOT be called — failing here means PLD
+        # silently fell back to classic.
+        monkeypatch.setattr(
+            manager,
+            "_load_speculative_decoder",
+            lambda *a, **kw: pytest.fail(
+                "PLD strategy should not invoke _load_speculative_decoder"
+            ),
+        )
+        monkeypatch.setattr(
+            manager,
+            "_load_pld_decoder",
+            lambda model, spec_config, *, is_vlm=False: sentinel_decoder,
+        )
+
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = SpeculativeConfig(True, None, 10, strategy="pld")
+        fm_config = FlashMoeConfig(enabled=True, cache_budget_experts=48, io_threads=32)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+            model, tokenizer, is_vlm, caps, decoder = manager._load_model(
+                "test/moe-model",
+                model_exp=model_exp,
+                spec_config=spec_config,
+                flash_moe_config=fm_config,
+            )
+        assert (model, tokenizer, is_vlm, caps) == sentinel_load
+        assert decoder is sentinel_decoder
+
+    def test_load_pld_decoder_unwraps_vlm_language_model(self, monkeypatch):
+        """When ``is_vlm=True``, _load_pld_decoder must construct the
+        PromptLookupDecoder against ``target.language_model``, not the
+        VLM wrapper. Mirrors the unwrap that
+        ``_load_speculative_decoder`` does so the decoder operates on
+        the text decoder's KV cache directly.
+        """
+        from olmlx.engine.registry import SpeculativeConfig
+
+        registry = MagicMock()
+        store = MagicMock()
+        manager = ModelManager(registry, store)
+
+        text_decoder = MagicMock(name="language_model")
+        vlm_target = MagicMock(name="vlm")
+        vlm_target.language_model = text_decoder
+        # PromptLookupDecoder probes target_model for find_gdn_class
+        # (named_modules walk) — return empty to skip GDN setup. The
+        # decoder's __init__ doesn't call into the model otherwise.
+        text_decoder.named_modules.return_value = iter([])
+
+        captured = {}
+
+        def fake_decoder_ctor(*args, **kw):
+            captured["target_model"] = kw.get("target_model")
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "olmlx.engine.speculative.PromptLookupDecoder", fake_decoder_ctor
+        )
+        spec_config = SpeculativeConfig(
+            True,
+            None,
+            10,
+            strategy="pld",
+            pld_max_ngram=3,
+            pld_min_ngram=1,
+            pld_lookup_window=8192,
+        )
+        manager._load_pld_decoder(vlm_target, spec_config, is_vlm=True)
+        # The decoder must be built against the inner text decoder,
+        # not the VLM wrapper.
+        assert captured["target_model"] is text_decoder
+
+    def test_load_pld_decoder_rejects_vlm_without_language_model(self, monkeypatch):
+        """A VLM target missing ``.language_model`` must surface as
+        ValueError with a message pointing at the missing attribute,
+        not as a confusing AttributeError deep inside the decoder."""
+        from olmlx.engine.registry import SpeculativeConfig
+
+        registry = MagicMock()
+        store = MagicMock()
+        manager = ModelManager(registry, store)
+
+        # A bare object() has no .language_model attribute.
+        broken_vlm = object()
+        spec_config = SpeculativeConfig(
+            True,
+            None,
+            10,
+            strategy="pld",
+            pld_max_ngram=3,
+            pld_min_ngram=1,
+            pld_lookup_window=8192,
+        )
+        with pytest.raises(ValueError, match="language_model"):
+            manager._load_pld_decoder(broken_vlm, spec_config, is_vlm=True)
+
+    def test_text_path_dispatches_pld(self, monkeypatch):
+        """speculative_strategy='pld' on a plain text target should route
+        to _load_pld_decoder rather than the classic loader."""
+        from olmlx.config import ExperimentalSettings
+        from olmlx.engine.registry import SpeculativeConfig
+
+        registry = MagicMock()
+        store = MagicMock()
+        store.ensure_downloaded.return_value = Path("/tmp/test-text")
+
+        manager = ModelManager(registry, store)
+        monkeypatch.setattr(manager, "_is_flash_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: False)
+        monkeypatch.setattr(manager, "_detect_model_kind", lambda *a: "text")
+        monkeypatch.setattr(
+            manager,
+            "_try_lm_then_vlm",
+            lambda *a, **kw: (object(), object(), False, TemplateCaps()),
+        )
+        monkeypatch.setattr(
+            manager,
+            "_load_speculative_decoder",
+            lambda *a, **kw: pytest.fail(
+                "PLD strategy should not invoke _load_speculative_decoder"
+            ),
+        )
+        sentinel = object()
+        monkeypatch.setattr(
+            manager,
+            "_load_pld_decoder",
+            lambda model, spec_config, *, is_vlm=False: sentinel,
+        )
+
+        model_exp = ExperimentalSettings(_env_file=None)
+        spec_config = SpeculativeConfig(True, None, None, strategy="pld")
+        _model, _tok, _is_vlm, _caps, decoder = manager._load_model(
+            "test/text-model", model_exp=model_exp, spec_config=spec_config
+        )
+        assert decoder is sentinel
 
     def test_flash_moe_path_rejects_dflash(self, monkeypatch):
         """Flash-MoE + dflash should raise ValueError."""
