@@ -658,6 +658,24 @@ class TestModelConfig:
         mc = ModelConfig(hf_path="org/model", kv_cache_quant="turboquant:2")
         assert mc.resolved_kv_cache_quant() == "turboquant:2"
 
+    def test_resolved_weight_quant_falls_back_to_global(self, monkeypatch):
+        """When per-model weight_quant is None, the global setting is used."""
+        from olmlx.config import settings as _settings
+        from olmlx.engine.registry import ModelConfig
+
+        monkeypatch.setattr(_settings, "weight_quant", "hqq:4")
+        mc = ModelConfig(hf_path="org/model", weight_quant=None)
+        assert mc.resolved_weight_quant() == "hqq:4"
+
+    def test_resolved_weight_quant_per_model_overrides_global(self, monkeypatch):
+        """Per-model weight_quant takes precedence over the global setting."""
+        from olmlx.config import settings as _settings
+        from olmlx.engine.registry import ModelConfig
+
+        monkeypatch.setattr(_settings, "weight_quant", "hqq:4")
+        mc = ModelConfig(hf_path="org/model", weight_quant="hqq:8")
+        assert mc.resolved_weight_quant() == "hqq:8"
+
 
 class TestRegistryModelConfig:
     def test_load_mixed_format(self, tmp_path, monkeypatch):
@@ -713,6 +731,42 @@ class TestRegistryModelConfig:
         assert result.hf_path == "Qwen/Qwen3-8B-MLX"
         assert result.kv_cache_quant == "turboquant:4"
         assert result.keep_alive == "30m"
+
+    def test_resolve_weight_quant_entry(self, tmp_path, monkeypatch):
+        """weight_quant is parsed from models.json and round-trips."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "weight_quant": "hqq:4:64",
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        result = reg.resolve("qwen3")
+        assert result.weight_quant == "hqq:4:64"
+        assert result.resolved_weight_quant() == "hqq:4:64"
+        entry = result.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["weight_quant"] == "hqq:4:64"
+        assert "weight_quant" not in result._extra
+
+    def test_weight_quant_invalid_rejected(self, tmp_path, monkeypatch):
+        """Invalid weight_quant format is caught at parse time; entry skipped."""
+        config = {
+            "qwen3:latest": {
+                "hf_path": "Qwen/Qwen3-8B-MLX",
+                "weight_quant": "bogus:16",
+            }
+        }
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        assert "qwen3:latest" not in reg._mappings
 
     def test_resolve_hf_path_passthrough_returns_model_config(
         self, tmp_path, monkeypatch

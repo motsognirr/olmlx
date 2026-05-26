@@ -15,6 +15,41 @@ logger = logging.getLogger(__name__)
 SyncMode = Literal["full", "minimal", "none"]
 
 
+def validate_weight_quant_format(v: str | None) -> str | None:
+    """Validate that *v* is a valid ``weight_quant`` value.
+
+    Called by both the Pydantic field validator and the per-model config
+    path (``ModelConfig.from_entry``).
+    """
+    if v is None:
+        return v
+    parts = v.split(":")
+    if len(parts) < 2 or len(parts) > 3:
+        raise ValueError(
+            f"Invalid weight_quant={v!r}. "
+            f"Expected '<method>:<bits>' or '<method>:<bits>:<group_size>'."
+        )
+    method, bits = parts[0], parts[1]
+    if method != "hqq":
+        raise ValueError(f"Invalid weight_quant method={method!r}. Expected 'hqq'.")
+    if bits not in ("4", "8"):
+        raise ValueError(f"Invalid weight_quant bits={bits!r}. Expected '4' or '8'.")
+    if len(parts) == 3:
+        try:
+            gs = int(parts[2])
+        except ValueError:
+            raise ValueError(
+                f"Invalid weight_quant group_size={parts[2]!r}. "
+                f"Expected a positive integer."
+            )
+        if gs < 32 or gs % 32 != 0:
+            raise ValueError(
+                f"Invalid weight_quant group_size={gs}. "
+                f"Expected a multiple of 32 (e.g. 32, 64, 128)."
+            )
+    return v
+
+
 def validate_kv_cache_quant_format(v: str | None) -> str | None:
     """Validate that *v* is a valid ``kv_cache_quant`` value.
 
@@ -84,6 +119,13 @@ class Settings(BaseSettings):
     # (c4) and 64 samples. Set to ``true`` to avoid manual ``olmlx spectral
     # prepare <model>`` on first load.
     kv_cache_auto_calibrate: bool = False
+
+    # Weight quantization (HQQ).
+    # Format: "hqq:<bits>" or "hqq:<bits>:<group_size>" where bits ∈ {4, 8}
+    # and group_size is a positive integer (default 64 for 4-bit, 128 for
+    # 8-bit). Per-model overrides live on ``ModelConfig`` in
+    # ``olmlx.engine.registry``.
+    weight_quant: str | None = None
 
     # Distributed inference — split models across Apple Silicon machines.
     # Configured via hostfile (``distributed_hostfile``), launched by
@@ -240,6 +282,11 @@ class Settings(BaseSettings):
     @classmethod
     def validate_kv_cache_quant(cls, v: str | None) -> str | None:
         return validate_kv_cache_quant_format(v)
+
+    @field_validator("weight_quant")
+    @classmethod
+    def validate_weight_quant(cls, v: str | None) -> str | None:
+        return validate_weight_quant_format(v)
 
     @field_validator("speculative_draft_model")
     @classmethod

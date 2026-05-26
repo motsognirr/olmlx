@@ -438,6 +438,60 @@ class TestFlashPrefetchSpeculativePromotion:
         assert "flash_prefetch" not in ExperimentalSettings.model_fields
 
 
+class TestWeightQuant:
+    """Tests for OLMLX_WEIGHT_QUANT config validation."""
+
+    def test_default_is_none(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_WEIGHT_QUANT", raising=False)
+        s = Settings(_env_file=None)
+        assert s.weight_quant is None
+
+    def test_valid_hqq_4(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_WEIGHT_QUANT", "hqq:4")
+        s = Settings()
+        assert s.weight_quant == "hqq:4"
+
+    def test_valid_hqq_8(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_WEIGHT_QUANT", "hqq:8")
+        s = Settings()
+        assert s.weight_quant == "hqq:8"
+
+    def test_valid_hqq_4_with_group_size(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_WEIGHT_QUANT", "hqq:4:64")
+        s = Settings()
+        assert s.weight_quant == "hqq:4:64"
+
+    def test_valid_hqq_4_with_group_size_128(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_WEIGHT_QUANT", "hqq:4:128")
+        s = Settings()
+        assert s.weight_quant == "hqq:4:128"
+
+    def test_invalid_method(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_WEIGHT_QUANT", "bogus:4")
+        with pytest.raises(ValidationError, match="weight_quant"):
+            Settings()
+
+    def test_invalid_bits(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_WEIGHT_QUANT", "hqq:16")
+        with pytest.raises(ValidationError, match="weight_quant"):
+            Settings()
+
+    def test_invalid_format_no_colon(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_WEIGHT_QUANT", "hqq4")
+        with pytest.raises(ValidationError, match="weight_quant"):
+            Settings()
+
+    def test_invalid_group_size(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_WEIGHT_QUANT", "hqq:4:bad")
+        with pytest.raises(ValidationError, match="weight_quant"):
+            Settings()
+
+    def test_invalid_group_size_not_multiple_of_32(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_WEIGHT_QUANT", "hqq:4:7")
+        with pytest.raises(ValidationError, match="weight_quant"):
+            Settings()
+
+
 class TestDistributedTensorOnly:
     def test_pipeline_strategy_rejected(self):
         with pytest.raises(ValidationError):
