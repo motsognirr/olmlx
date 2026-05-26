@@ -275,6 +275,11 @@ class Settings(BaseSettings):
                 f"must be <= speculative_pld_max_ngram "
                 f"({self.speculative_pld_max_ngram})"
             )
+        # Parallel to the per-model ``ModelConfig.__post_init__`` check
+        # — without this, a bad env pair like ``MAX_NGRAM=3
+        # LOOKUP_WINDOW=1`` would pass startup and only blow up at
+        # first model load with a confusing stack trace from
+        # ``resolved_speculative``.
         if self.speculative_pld_lookup_window < self.speculative_pld_max_ngram:
             raise ValueError(
                 f"speculative_pld_lookup_window "
@@ -297,6 +302,12 @@ class Settings(BaseSettings):
         if self.tree_speculative and not self.speculative:
             raise ValueError(
                 "OLMLX_TREE_SPECULATIVE=true requires OLMLX_SPECULATIVE=true"
+            )
+        if self.tree_speculative and self.speculative_strategy != "classic":
+            raise ValueError(
+                "OLMLX_TREE_SPECULATIVE=true is only supported with "
+                "OLMLX_SPECULATIVE_STRATEGY=classic "
+                f"(got {self.speculative_strategy!r})"
             )
         return self
 

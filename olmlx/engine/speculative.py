@@ -509,6 +509,13 @@ class SpeculativeDecoder:
         Produces a tree of draft alternatives, verifies them against the
         target in one forward pass with a sparse attention mask, and rolls
         back/re-builds caches to keep only the accepted prefix.
+
+        Known limitation: tree nodes are fed as a flat sequence, so sibling
+        nodes inherit sequential RoPE positions from their flat indices rather
+        than their tree depth.  This causes siblings at depth *d* to receive
+        positional encodings intended for later positions, which may degrade
+        acceptance rates.  A future PR should inject per-node position IDs
+        based on ``tree.depths``.
         """
         from olmlx.engine.tree_speculative import (
             _patch_target_for_tree_forward,
@@ -540,15 +547,22 @@ class SpeculativeDecoder:
             max_nodes=self._tree_max_nodes,
         )
 
-        # 3. Build sparse attention mask + patch target
+        # 3. Build sparse attention mask + patch target.
+        # The tree mask only covers the tree nodes; the KV cache already
+        # holds the prompt + previous generation tokens at positions
+        # [0, cache_len).  Every tree node must attend to the full cached
+        # prefix, so we pad the mask with zeros on the key-length axis.
         tree_mask = build_tree_attention_mask(tree)
+        cache_len = self._target_cache[0].offset
+        prefix_mask = mx.zeros((1, 1, tree.num_nodes, cache_len), dtype=mx.float32)
+        full_mask = mx.concatenate([prefix_mask, tree_mask], axis=-1)
 
         if self._gdn_capture is not None:
             if self._target_gdn_buffer is not None:
                 self._target_gdn_buffer.clear()
             self._gdn_capture.use_buffer(self._target_gdn_buffer)
 
-        orig_call = _patch_target_for_tree_forward(self._target, tree_mask)
+        orig_call = _patch_target_for_tree_forward(self._target, full_mask)
         try:
             tree_tokens = mx.array([tree.tokens])
             target_out = _logits(self._target(tree_tokens, cache=self._target_cache))
