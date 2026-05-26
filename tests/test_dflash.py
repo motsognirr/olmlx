@@ -431,11 +431,12 @@ class TestSlidingAttentionMask:
     """
 
     @staticmethod
-    def _make_sliding_attn(
+    def _make_attn(
         attention_causal: bool,
         *,
         hidden_size: int = 16,
         sliding_window: int = 4,
+        layer_types: tuple = ("sliding_attention",),
         seed: int = 42,
     ) -> DFlashAttention:
         cfg = DraftConfig(
@@ -453,7 +454,7 @@ class TestSlidingAttentionMask:
             num_target_layers=1,
             target_layer_ids=[0],
             mask_token_id=0,
-            layer_types=("sliding_attention",),
+            layer_types=layer_types,
             sliding_window=sliding_window,
             attention_causal=attention_causal,
         )
@@ -467,17 +468,17 @@ class TestSlidingAttentionMask:
         """
         window = 4
         hidden_size = 16
-        attn_causal = self._make_sliding_attn(
+        attn_causal = self._make_attn(
             attention_causal=True, hidden_size=hidden_size, sliding_window=window
         )
-        attn_non_causal = self._make_sliding_attn(
+        attn_non_causal = self._make_attn(
             attention_causal=False, hidden_size=hidden_size, sliding_window=window
         )
         # Copy weights so both layers have identical parameters.
-        for src_param, dst_param in zip(
-            attn_causal.parameters().values(), attn_non_causal.parameters().values()
-        ):
-            dst_param.update(src_param)
+        # Use ``nn.Module.update()``, not dict-value mutation —
+        # ``parameters()`` returns a freshly-built dict whose
+        # values are disconnected from the module.
+        attn_non_causal.update(attn_causal.parameters())
 
         rope = initialize_rope(
             hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
@@ -501,16 +502,13 @@ class TestSlidingAttentionMask:
         """
         window = 4
         hidden_size = 16
-        attn_causal = self._make_sliding_attn(
+        attn_causal = self._make_attn(
             attention_causal=True, hidden_size=hidden_size, sliding_window=window
         )
-        attn_non_causal = self._make_sliding_attn(
+        attn_non_causal = self._make_attn(
             attention_causal=False, hidden_size=hidden_size, sliding_window=window
         )
-        for src_param, dst_param in zip(
-            attn_causal.parameters().values(), attn_non_causal.parameters().values()
-        ):
-            dst_param.update(src_param)
+        attn_non_causal.update(attn_causal.parameters())
 
         rope = initialize_rope(
             hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
@@ -526,6 +524,80 @@ class TestSlidingAttentionMask:
         mx.eval(out_causal, out_non_causal)
 
         # Causal mask restricts attention vs no mask — outputs should differ.
+        assert not mx.allclose(out_causal, out_non_causal, atol=1e-5)
+
+    def test_full_attention_layers_unaffected(self):
+        """Full-attention layers are not touched by the sliding-mask
+        change — the ``self.is_sliding`` guard still short-circuits.
+        Causal and non-causal full-attention layers should produce
+        different outputs (causal mask vs no mask) regardless of
+        sequence length.
+        """
+        hidden_size = 16
+        attn_causal = self._make_attn(
+            attention_causal=True,
+            hidden_size=hidden_size,
+            layer_types=("full_attention",),
+        )
+        attn_non_causal = self._make_attn(
+            attention_causal=False,
+            hidden_size=hidden_size,
+            layer_types=("full_attention",),
+        )
+        attn_non_causal.update(attn_causal.parameters())
+
+        rope = initialize_rope(
+            hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
+        )
+        cache_causal: KVCache | RotatingKVCache = KVCache()
+        cache_non_causal: KVCache | RotatingKVCache = KVCache()
+
+        # Long sequence (would trigger sliding mask if this were sliding).
+        x_ctx = mx.random.normal((1, 6, hidden_size))  # S=6
+        x = mx.random.normal((1, 2, hidden_size))  # L=2
+
+        out_causal = attn_causal(x, x_ctx, rope, cache_causal)
+        out_non_causal = attn_non_causal(x, x_ctx, rope, cache_non_causal)
+        mx.eval(out_causal, out_non_causal)
+
+        # Full-attention: causal gets mask, non-causal does not.
+        assert not mx.allclose(out_causal, out_non_causal, atol=1e-5)
+
+    def test_at_window_boundary_no_sliding_mask(self):
+        """ctx_len + L == sliding_window falls on the <= side — no
+        sliding-causal mask is applied. This is intentional: the oldest
+        cached key sits at the edge of what ``RotatingKVCache`` will
+        evict next step, and the zero-token proposal bump keeps the
+        effective span within the window for the current step. A
+        ``>``-only threshold matches the upstream z-lab/dflash
+        behaviour of only applying the explicit spatial mask when the
+        combined sequence strictly *exceeds* the window capacity.
+        """
+        window = 4
+        hidden_size = 16
+        attn_causal = self._make_attn(
+            attention_causal=True, hidden_size=hidden_size, sliding_window=window
+        )
+        attn_non_causal = self._make_attn(
+            attention_causal=False, hidden_size=hidden_size, sliding_window=window
+        )
+        attn_non_causal.update(attn_causal.parameters())
+
+        rope = initialize_rope(
+            hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
+        )
+        cache_causal: KVCache | RotatingKVCache = KVCache()
+        cache_non_causal: KVCache | RotatingKVCache = KVCache()
+
+        # S+L == 4 exactly (window), not >.
+        x_ctx = mx.random.normal((1, 2, hidden_size))  # S=2
+        x = mx.random.normal((1, 2, hidden_size))  # L=2, S+L=4 == window
+
+        out_causal = attn_causal(x, x_ctx, rope, cache_causal)
+        out_non_causal = attn_non_causal(x, x_ctx, rope, cache_non_causal)
+        mx.eval(out_causal, out_non_causal)
+
+        # No sliding mask applied — causal gets "causal", non-causal gets None.
         assert not mx.allclose(out_causal, out_non_causal, atol=1e-5)
 
 
