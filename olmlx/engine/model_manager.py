@@ -2942,6 +2942,46 @@ class ModelManager:
             lookup_window=spec_config.pld_lookup_window,
         )
 
+    def _load_self_speculative_decoder(
+        self,
+        target_model: Any,
+        spec_config: SpeculativeConfig,
+    ) -> Any:
+        """Create a SelfSpeculativeDecoder using the target's own early layers.
+
+        No external draft model is loaded. ``spec_config.layers_skip``
+        determines how many layers the draft skips (defaulting to
+        ``L // 4`` when ``None``).
+        """
+        from olmlx.engine.gdn_rollback import get_model_layers
+        from olmlx.engine.self_speculative import SelfSpeculativeDecoder
+
+        num_tokens = spec_config.num_tokens if spec_config.num_tokens is not None else 4
+
+        total_layers = len(get_model_layers(target_model))
+        if spec_config.layers_skip is not None:
+            layers_skip = spec_config.layers_skip
+        else:
+            layers_skip = max(total_layers // 4, 1)
+        num_early_layers = total_layers - layers_skip
+        if num_early_layers < 1:
+            num_early_layers = 1
+            layers_skip = total_layers - 1
+
+        logger.info(
+            "Self-speculative: draft uses %d/%d layers (skip=%d, λ=%d)",
+            num_early_layers,
+            total_layers,
+            layers_skip,
+            num_tokens,
+        )
+
+        return SelfSpeculativeDecoder(
+            target_model=target_model,
+            num_early_layers=num_early_layers,
+            num_speculative_tokens=num_tokens,
+        )
+
     def _is_flash_enabled(self, flash_config: ResolvedFlashConfig) -> bool:
         return flash_config.enabled
 
@@ -3248,8 +3288,9 @@ class ModelManager:
                     raise ValueError(
                         f"speculative_strategy={spec_config.strategy!r} is "
                         "not supported on Flash-MoE targets. Use "
-                        "speculative_strategy='classic' or remove the "
-                        "speculative settings."
+                        "speculative_strategy='classic' or "
+                        "'self_speculative', or remove the speculative "
+                        "settings."
                     )
                 if flash_config.flash_speculative:
                     raise ValueError(
@@ -3273,6 +3314,10 @@ class ModelManager:
                     if spec_config.strategy == "pld":
                         decoder = self._load_pld_decoder(
                             model, spec_config, is_vlm=is_vlm
+                        )
+                    elif spec_config.strategy == "self_speculative":
+                        decoder = self._load_self_speculative_decoder(
+                            model, spec_config
                         )
                     else:
                         decoder = self._load_speculative_decoder(
@@ -3355,8 +3400,9 @@ class ModelManager:
                     raise ValueError(
                         f"speculative_strategy={spec_config.strategy!r} is not "
                         "supported on VLM targets. Use "
-                        "speculative_strategy='classic' or remove the "
-                        "speculative settings."
+                        "speculative_strategy='classic' or "
+                        "'self_speculative', or remove the speculative "
+                        "settings."
                     )
                 if flash_config.flash_speculative:
                     raise ValueError(
@@ -3369,6 +3415,11 @@ class ModelManager:
                     if spec_config.strategy == "pld":
                         decoder = self._load_pld_decoder(
                             model, spec_config, is_vlm=True
+                        )
+                    elif spec_config.strategy == "self_speculative":
+                        spec_target = getattr(model, "language_model", model)
+                        decoder = self._load_self_speculative_decoder(
+                            spec_target, spec_config
                         )
                     else:
                         decoder = self._load_speculative_decoder(
@@ -3405,6 +3456,8 @@ class ModelManager:
                 decoder = self._load_eagle_decoder(model, spec_config)
             elif spec_config.strategy == "pld":
                 decoder = self._load_pld_decoder(model, spec_config)
+            elif spec_config.strategy == "self_speculative":
+                decoder = self._load_self_speculative_decoder(model, spec_config)
             else:
                 decoder = self._load_speculative_decoder(model, hf_path, spec_config)
             return model, tokenizer, is_vlm, caps, decoder

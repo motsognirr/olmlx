@@ -357,9 +357,6 @@ class TestSpeculativeConfig:
         monkeypatch.setattr("olmlx.config.settings.speculative_tokens", 8)
 
         mc = ModelConfig(hf_path="Qwen/Qwen3-32B")
-        # Field-by-field check rather than full-tuple equality so the
-        # PLD knobs (added later) don't bind the assertion to specific
-        # defaults — those have their own tests below.
         resolved = mc.resolved_speculative()
         assert resolved.enabled is True
         assert resolved.draft_model == "Qwen/Qwen3-0.6B"
