@@ -215,7 +215,13 @@ class DFlashAttention(nn.Module):
 
         ctx_len = keys.shape[2] - L
         mask = "causal" if self.causal else None
-        if self.is_sliding and self.causal and ctx_len + L > (self.sliding_window or 0):
+        if self.is_sliding and ctx_len + L > (self.sliding_window or 0):
+            # Upstream z-lab/dflash always applies a sliding-causal mask on
+            # sliding layers regardless of causal mode (see
+            # dflash/model_mlx.py:110-114). The spatial window constrains
+            # which positions a token can interact with independently of the
+            # causal directionality; matching this avoids a train/inference
+            # mismatch for sliding-attention draft architectures.
             mask = create_causal_mask(
                 L, offset=ctx_len, window_size=self.sliding_window
             )
