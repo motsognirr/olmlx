@@ -111,6 +111,7 @@ def build_comb_tree(
     pending_token: int,
     primary_tokens: list[int],
     alt_tokens_per_step: list[list[int]],
+    max_nodes: int = 16,
 ) -> TreeDraft:
     """Build a tree where the primary path has sibling alternatives at
     each draft level.
@@ -159,17 +160,21 @@ def build_comb_tree(
         depths.append(i + 1)
         primary_branch.append(len(tokens) - 1)
 
-    # Phase 2: siblings — one group per level, after the primary path
+    # Phase 2: siblings — one group per level, after the primary path.
+    # Stop early when the tree would exceed max_nodes.
     for level in range(n_levels):
         alts = alt_tokens_per_step[level]
         if not alts:
             continue
         parent_idx = level  # parent is the primary node at the SAME depth
         for alt_tok in alts:
+            if len(tokens) >= max_nodes:
+                break
             tokens.append(alt_tok)
             parent_indices.append(parent_idx)
             depths.append(level + 1)
-            # NOT added to primary_branch
+        if len(tokens) >= max_nodes:
+            break
 
     return TreeDraft(
         tokens=tokens,
@@ -261,24 +266,19 @@ def verify_tree_greedy(
     """Verify a tree of draft tokens against target logits (greedy).
 
     Walks the primary path first.  At each step, if the target's argmax
-    at the node's position matches the draft token, the token is accepted
-    and we continue.  On a mismatch at the primary path, we scan sibling
-    nodes at the same depth — if any sibling matches, we accept it plus
-    the target's bonus token at the sibling's position and return.
+    at the node's parent position matches the draft token, the token is
+    accepted and we continue.  On a mismatch at the primary path, we scan
+    sibling nodes at the same depth — if any sibling matches, we accept it
+    plus the target's bonus token at the sibling's position and return.
 
     All draft tokens accepted → take the bonus token from the primary
     path's final position.
 
-    Args:
-        tree: A ``TreeDraft`` of draft alternatives.
-        target_logits: ``(num_tree_nodes, vocab)`` target model logits
-            for every tree position, in pre-order.
-
-    Returns:
-        ``(accepted_tokens, used_sibling)`` where *used_sibling* is True
-        iff a sibling node (not on the primary path) was accepted.  This
-        signals the caller that the cache entries for the accepted path
-        are not contiguous and may require a rebuild.
+    The sibling scan assumes all siblings at depth *d* share the same
+    parent as the primary node at depth *d* (true for ``build_comb_tree``,
+    but not guaranteed for ``build_full_tree``).  If ``build_full_tree``
+    is wired in, the sibling loop must additionally validate that the
+    sibling's parent is on the currently accepted prefix path.
     """
     n_logits = target_logits.shape[0]
     n_nodes = tree.num_nodes

@@ -495,7 +495,6 @@ class SpeculativeDecoder:
         back/re-builds caches to keep only the accepted prefix.
         """
         from olmlx.engine.tree_speculative import (
-            TreeDraft,
             _patch_target_for_tree_forward,
             _restore_target,
             build_comb_tree,
@@ -517,11 +516,12 @@ class SpeculativeDecoder:
 
         self._after_draft(draft_ctx)
 
-        # 2. Build the tree
+        # 2. Build the tree, respecting the max-nodes cap.
         tree = build_comb_tree(
             pending_token=pending_token,
             primary_tokens=primary_tokens,
             alt_tokens_per_step=alt_per_step,
+            max_nodes=self._tree_max_nodes,
         )
 
         # 3. Build sparse attention mask + patch target
@@ -563,8 +563,17 @@ class SpeculativeDecoder:
         tree_total = tree.num_nodes
 
         if used_sibling:
-            # Rebuild: trim all tree nodes, then feed accepted tokens.
-            if trim_prompt_cache is not None:
+            # Rebuild: trim all tree nodes from the target cache, then
+            # feed only the accepted tokens to get a contiguous cache.
+            tree_total = tree.num_nodes
+            if self._target_gdn_buffer is not None and self._gdn_capture is not None:
+                self._gdn_capture.rollback_single(
+                    self._target_gdn_buffer,
+                    self._target_cache,
+                    accepted=0,
+                    trim=tree_total,
+                )
+            elif trim_prompt_cache is not None:
                 trim_prompt_cache(self._target_cache, tree_total)
             accepted_arr = mx.array([accepted])
             rebuild_out = _logits(
@@ -591,12 +600,15 @@ class SpeculativeDecoder:
 
         mx.eval(self._last_target_logit)
 
-        # 6. Align draft cache.  The draft generated λ tokens; we keep the
-        # first num_accepted of them.  On full acceptance (num_accepted > λ)
-        # the draft needs to advance by feeding the last primary token.
+        # 6. Align draft cache.  The draft generated λ primary-path tokens
+        # autoregressively.  When a sibling was accepted the accepted path
+        # includes the sibling + bonus but the draft only ran the primary;
+        # we keep only the prefix of primary steps that are still valid.
+        num_draft_keep = (num_accepted - 2) if used_sibling else num_accepted
+        num_draft_keep = max(num_draft_keep, 0)
+
         if self._draft_gdn_buffer is not None and self._gdn_capture is not None:
-            # GDN rollback: replay draft state.
-            num_keep_steps = min(num_accepted, self._lambda)
+            num_keep_steps = min(num_draft_keep, self._lambda)
             trim_draft_steps = self._lambda - num_keep_steps
             if trim_draft_steps > 0:
                 self._gdn_capture.rollback_autoregressive(
@@ -607,11 +619,11 @@ class SpeculativeDecoder:
                     trim=trim_draft_steps,
                 )
         else:
-            trim_draft = max(self._lambda - num_accepted, 0)
+            trim_draft = max(self._lambda - num_draft_keep, 0)
             if trim_draft > 0 and trim_prompt_cache is not None:
                 trim_prompt_cache(self._draft_cache, trim_draft)
 
-        if num_accepted > self._lambda:
+        if num_accepted > self._lambda and not used_sibling:
             last_primary = mx.array([[primary_tokens[-1]]])
             align_logits = _logits(self._draft(last_primary, cache=self._draft_cache))
             mx.eval(align_logits)
@@ -624,7 +636,7 @@ class SpeculativeDecoder:
         num_accepted_draft = self._update_acceptance_rate(num_accepted)
 
         self._stats_steps += 1
-        self._stats_proposed += self._lambda
+        self._stats_proposed += tree.num_nodes - 1  # all non-root nodes
         self._stats_accepted_draft += num_accepted_draft
 
         return accepted, self._lambda

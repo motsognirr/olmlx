@@ -4,7 +4,6 @@ import mlx.core as mx
 import pytest
 
 from olmlx.engine.tree_speculative import (
-    TreeDraft,
     build_comb_tree,
     build_full_tree,
     build_tree_attention_mask,
@@ -164,7 +163,6 @@ class TestAttentionMask:
         )
         mask = build_tree_attention_mask(tree)
         mask_2d = mask[0, 0]
-        n = tree.num_nodes  # 5
         # D1_sib is at index 3 (after primary path)
         # It should see root (0) and itself (3), NOT D1 (1) or D2 (2)
 
