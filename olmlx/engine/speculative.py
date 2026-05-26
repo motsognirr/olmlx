@@ -172,6 +172,8 @@ class SpeculativeDecoder:
         target_model: nn.Module,
         num_speculative_tokens: int = 4,
         acceptance_rate_ema: float = 0.9,
+        tree_width: int = 1,
+        tree_max_nodes: int = 8,
     ):
         if trim_prompt_cache is None:
             raise RuntimeError(
@@ -183,6 +185,9 @@ class SpeculativeDecoder:
         self._lambda = num_speculative_tokens
         self._alpha = 0.5  # initial acceptance rate estimate
         self._alpha_ema = acceptance_rate_ema
+        self._tree_width = max(tree_width, 1)
+        self._tree_max_nodes = max(tree_max_nodes, 3)
+        self._use_tree = self._tree_width >= 2
 
         # Persistent KV cache state (populated by prefill/step)
         self._target_cache: list | None = None
@@ -382,6 +387,10 @@ class SpeculativeDecoder:
 
         Must call ``prefill()`` first to populate caches.
 
+        When ``self._use_tree`` is True, builds a tree of draft
+        alternatives and verifies them against the target in one forward
+        pass using a sparse attention mask.
+
         Returns:
             (accepted_tokens, num_draft_generated).
         """
@@ -391,8 +400,16 @@ class SpeculativeDecoder:
 
         pending_token = self._pending_token
 
+        if self._use_tree:
+            return self._step_tree(pending_token)
+        return self._step_linear(pending_token)
+
+    def _step_linear(self, pending_token: int) -> tuple[list[int], int]:
+        """Linear speculative decoding (the existing algorithm)."""
+        assert self._target_cache is not None
+        assert self._draft_cache is not None
+
         # 1. Draft: feed pending token, then generate lambda candidates.
-        # Route GDN captures to the draft buffer (if draft is hybrid).
         if self._gdn_capture is not None:
             if self._draft_gdn_buffer is not None:
                 self._draft_gdn_buffer.clear()
@@ -401,11 +418,9 @@ class SpeculativeDecoder:
             pending_token, self._lambda
         )
 
-        # Hook for subclasses (e.g. Flash prefetcher submission)
         self._after_draft(draft_ctx)
 
         # 2. Target: feed [pending, D1, ..., D_lambda] in one pass.
-        # Switch GDN capture to the target buffer.
         if self._gdn_capture is not None:
             if self._target_gdn_buffer is not None:
                 self._target_gdn_buffer.clear()
@@ -414,42 +429,23 @@ class SpeculativeDecoder:
         target_out = _logits(self._target(all_tokens, cache=self._target_cache))
         mx.eval(target_out)
 
-        # Capture is done: no more model forwards in this step should
-        # write to either buffer. Subclass hooks (``_after_verify``) and
-        # rollback replays (``rollback_single`` invokes
-        # ``gated_delta_update`` directly, not ``GatedDeltaNet.__call__``)
-        # would otherwise append spurious captures and fail the next
-        # step's buffer-size check.
         if self._gdn_capture is not None:
             self._gdn_capture.use_buffer(None)
 
         verification_logits = target_out[0]  # (lambda+1, vocab)
 
-        # 3. Verify draft tokens against target logits
+        # 3. Verify
         accepted = self._verify(draft_tokens, verification_logits)
         num_accepted = len(accepted)
 
-        # Hook for subclasses (e.g. Flash prefetch cancellation)
         self._after_verify(num_accepted)
 
-        # 4. Roll back caches to keep only the accepted prefix.
-        #
-        # Target was fed (λ+1) tokens [pending, D_1..D_λ]; keep
-        # ``num_accepted`` of them, so trim by (λ+1) - num_accepted.
-        # Draft was fed λ tokens autoregressively
-        # [pending, D_1..D_{λ-1}]; keep ``num_accepted`` of those if
-        # partial acceptance (= a-1 draft tokens between pending and
-        # the correction/bonus), so trim by λ - num_accepted.
+        # 4. Roll back caches
         trim_target = max(self._lambda + 1 - num_accepted, 0)
         trim_draft = max(self._lambda - num_accepted, 0)
 
-        # Target rollback: GDN replay if hybrid, plain trim otherwise.
         if trim_target > 0:
             if self._target_gdn_buffer is not None and self._gdn_capture is not None:
-                # ``rollback_single`` takes ``accepted`` as the number of
-                # *additional* tokens beyond the first to keep
-                # (n = accepted + 1). We want to keep ``num_accepted``
-                # total, so accepted_arg = num_accepted - 1.
                 self._gdn_capture.rollback_single(
                     self._target_gdn_buffer,
                     self._target_cache,
@@ -459,16 +455,8 @@ class SpeculativeDecoder:
             elif trim_prompt_cache is not None:
                 trim_prompt_cache(self._target_cache, trim_target)
 
-        # Draft rollback: GDN autoregressive replay if hybrid, plain
-        # trim otherwise. On full acceptance (num_accepted == λ+1)
-        # trim_draft is 0 and we skip rollback; the align step below
-        # then advances the draft cache by feeding D_λ.
         if trim_draft > 0:
             if self._draft_gdn_buffer is not None and self._gdn_capture is not None:
-                # ``rollback_autoregressive`` keeps the first
-                # ``num_keep_steps`` of ``num_steps`` autoregressive
-                # calls. We fed λ tokens and want to keep
-                # ``num_accepted`` of them.
                 self._gdn_capture.rollback_autoregressive(
                     self._draft_gdn_buffer,
                     self._draft_cache,
@@ -479,11 +467,6 @@ class SpeculativeDecoder:
             elif trim_prompt_cache is not None:
                 trim_prompt_cache(self._draft_cache, trim_draft)
 
-        # On full acceptance, align draft cache with target cache.
-        # ``use_buffer(None)`` was already called after the target
-        # forward, so the align step's draft forward — which DOES
-        # invoke ``GatedDeltaNet.__call__`` on a hybrid draft — won't
-        # write to either buffer.
         if num_accepted > self._lambda:
             last_draft = mx.array([[draft_tokens[-1]]])
             align_logits = _logits(self._draft(last_draft, cache=self._draft_cache))
@@ -491,9 +474,151 @@ class SpeculativeDecoder:
 
         # 5. Update state
         self._cache_seq_len += num_accepted
-        assert num_accepted >= 1, "step(): _verify() must return at least 1 token"
+        assert num_accepted >= 1
         self._last_target_logit = verification_logits[num_accepted - 1]
         mx.eval(self._last_target_logit)
+        self._pending_token = int(mx.argmax(self._last_target_logit).item())
+
+        num_accepted_draft = self._update_acceptance_rate(num_accepted)
+
+        self._stats_steps += 1
+        self._stats_proposed += self._lambda
+        self._stats_accepted_draft += num_accepted_draft
+
+        return accepted, self._lambda
+
+    def _step_tree(self, pending_token: int) -> tuple[list[int], int]:
+        """Tree-based speculative decoding step.
+
+        Produces a tree of draft alternatives, verifies them against the
+        target in one forward pass with a sparse attention mask, and rolls
+        back/re-builds caches to keep only the accepted prefix.
+        """
+        from olmlx.engine.tree_speculative import (
+            TreeDraft,
+            _patch_target_for_tree_forward,
+            _restore_target,
+            build_comb_tree,
+            build_tree_attention_mask,
+            verify_tree_greedy,
+        )
+
+        assert self._target_cache is not None
+        assert self._draft_cache is not None
+
+        # 1. Draft: generate primary path + alternatives per step
+        if self._gdn_capture is not None:
+            if self._draft_gdn_buffer is not None:
+                self._draft_gdn_buffer.clear()
+            self._gdn_capture.use_buffer(self._draft_gdn_buffer)
+        primary_tokens, alt_per_step, draft_ctx = self._draft_generate_tree(
+            pending_token, self._lambda
+        )
+
+        self._after_draft(draft_ctx)
+
+        # 2. Build the tree
+        tree = build_comb_tree(
+            pending_token=pending_token,
+            primary_tokens=primary_tokens,
+            alt_tokens_per_step=alt_per_step,
+        )
+
+        # 3. Build sparse attention mask + patch target
+        tree_mask = build_tree_attention_mask(tree)
+
+        if self._gdn_capture is not None:
+            if self._target_gdn_buffer is not None:
+                self._target_gdn_buffer.clear()
+            self._gdn_capture.use_buffer(self._target_gdn_buffer)
+
+        orig_call = _patch_target_for_tree_forward(self._target, tree_mask)
+        try:
+            tree_tokens = mx.array([tree.tokens])
+            target_out = _logits(
+                self._target(tree_tokens, cache=self._target_cache)
+            )
+            mx.eval(target_out)
+        finally:
+            _restore_target(self._target, orig_call)
+
+        if self._gdn_capture is not None:
+            self._gdn_capture.use_buffer(None)
+
+        verification_logits = target_out[0]  # (num_tree_nodes, vocab)
+
+        # 4. Verify tree
+        accepted, used_sibling = verify_tree_greedy(tree, verification_logits)
+        num_accepted = len(accepted)
+
+        self._after_verify(num_accepted)
+
+        # 5. Roll back / rebuild caches.
+        #
+        # The tree forward appended ``num_tree_nodes`` entries to the
+        # target cache.  If the accepted path follows the primary branch
+        # (the common case), the positions are contiguous and we can
+        # simply trim from the end.  If a sibling was accepted, the
+        # positions are not contiguous; we rebuild from the pre-step state.
+        tree_total = tree.num_nodes
+
+        if used_sibling:
+            # Rebuild: trim all tree nodes, then feed accepted tokens.
+            if trim_prompt_cache is not None:
+                trim_prompt_cache(self._target_cache, tree_total)
+            accepted_arr = mx.array([accepted])
+            rebuild_out = _logits(
+                self._target(accepted_arr, cache=self._target_cache)
+            )
+            mx.eval(rebuild_out)
+            rebuild_logits = rebuild_out[0]
+            self._last_target_logit = rebuild_logits[num_accepted - 1]
+        else:
+            # Primary path: trim from the end.
+            trim_target = max(tree_total - num_accepted, 0)
+            if trim_target > 0:
+                if self._target_gdn_buffer is not None and self._gdn_capture is not None:
+                    self._gdn_capture.rollback_single(
+                        self._target_gdn_buffer,
+                        self._target_cache,
+                        accepted=num_accepted - 1,
+                        trim=trim_target,
+                    )
+                elif trim_prompt_cache is not None:
+                    trim_prompt_cache(self._target_cache, trim_target)
+            last_accepted_tree_idx = tree.primary_branch[num_accepted - 1]
+            self._last_target_logit = verification_logits[last_accepted_tree_idx]
+
+        mx.eval(self._last_target_logit)
+
+        # 6. Align draft cache.  The draft generated λ tokens; we keep the
+        # first num_accepted of them.  On full acceptance (num_accepted > λ)
+        # the draft needs to advance by feeding the last primary token.
+        if self._draft_gdn_buffer is not None and self._gdn_capture is not None:
+            # GDN rollback: replay draft state.
+            num_keep_steps = min(num_accepted, self._lambda)
+            trim_draft_steps = self._lambda - num_keep_steps
+            if trim_draft_steps > 0:
+                self._gdn_capture.rollback_autoregressive(
+                    self._draft_gdn_buffer,
+                    self._draft_cache,
+                    num_steps=self._lambda,
+                    num_keep_steps=num_keep_steps,
+                    trim=trim_draft_steps,
+                )
+        else:
+            trim_draft = max(self._lambda - num_accepted, 0)
+            if trim_draft > 0 and trim_prompt_cache is not None:
+                trim_prompt_cache(self._draft_cache, trim_draft)
+
+        if num_accepted > self._lambda:
+            last_primary = mx.array([[primary_tokens[-1]]])
+            align_logits = _logits(self._draft(last_primary, cache=self._draft_cache))
+            mx.eval(align_logits)
+
+        # 7. Update state
+        self._cache_seq_len += num_accepted
+        assert num_accepted >= 1
         self._pending_token = int(mx.argmax(self._last_target_logit).item())
 
         num_accepted_draft = self._update_acceptance_rate(num_accepted)
@@ -527,6 +652,38 @@ class SpeculativeDecoder:
             tokens.append(next_token)
 
         return tokens, []
+
+    def _draft_generate_tree(
+        self, pending_token: int, n: int
+    ) -> tuple[list[int], list[list[int]], list[mx.array]]:
+        """Generate *n* primary tokens + top-K alternatives per step.
+
+        Only called when ``self._use_tree`` is True.  Returns the primary
+        path tokens and, for each step, the top-K candidate tokens (the
+        first is the primary, the rest are siblings).
+
+        Returns:
+            (primary_tokens, alt_tokens_per_step, context).
+        """
+        assert self._draft_cache is not None
+        from olmlx.engine.tree_speculative import extract_top_k_from_logits
+
+        k = self._tree_width
+        next_token = pending_token
+        primary_tokens: list[int] = []
+        alt_tokens_per_step: list[list[int]] = []
+
+        for _ in range(n):
+            inp = mx.array([[next_token]])
+            logits = _logits(self._draft(inp, cache=self._draft_cache))
+            next_logits = logits[:, -1, :]
+            candidates = extract_top_k_from_logits(next_logits, k)
+            primary = candidates[0]
+            primary_tokens.append(primary)
+            alt_tokens_per_step.append(candidates[1:])  # siblings (may be empty)
+            next_token = primary
+
+        return primary_tokens, alt_tokens_per_step, []
 
     def _after_draft(self, draft_ctx: list[mx.array]) -> None:
         """Hook called after draft generation. Override for prefetch submission."""

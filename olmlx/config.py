@@ -202,6 +202,23 @@ class Settings(BaseSettings):
     #: pass. ``None`` defaults to L//4 at load time.
     speculative_layers_skip: Annotated[int, Field(ge=1)] | None = None
 
+    # Tree-structured speculative verification (#358).  When enabled,
+    # the classic speculative strategy produces a tree of draft alternatives
+    # (top-K candidates per step) and verifies them against the target in
+    # one forward pass using a sparse attention mask.
+    #
+    # ``tree_width`` controls how many candidates are kept per draft step
+    # (1 = linear, ≥2 = tree).  ``tree_max_nodes`` is a hard cap on the
+    # total number of tree nodes (including the root).  The tree automatically
+    # stops growing when it hits either the draft length (``speculative_tokens``)
+    # or ``tree_max_nodes``.
+    #
+    # Setting ``tree_width`` to 1 or ``tree_speculative`` to False falls
+    # back to the existing linear verification path.
+    tree_speculative: bool = False
+    tree_width: Annotated[int, Field(ge=1)] = 2
+    tree_max_nodes: Annotated[int, Field(ge=3)] = 8
+
     # Flash inference (LLM in a Flash). Primary, user-facing knobs.
     # Advanced tuning (window size, IO threads, cache budget, predictor
     # rank, buffer modes) lives on ``ExperimentalSettings`` and the
