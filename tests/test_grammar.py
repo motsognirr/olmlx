@@ -17,6 +17,7 @@ from olmlx.engine.grammar import (
     GrammarSpec,
     clear_caches,
     compile_for_tokenizer,
+    drop_for_tokenizer,
     make_processor,
     parse_response_format,
 )
@@ -47,6 +48,26 @@ class TestParseResponseFormat:
         assert spec is not None
         assert spec.kind == "json_object"
         assert spec.schema is None
+
+    def test_openai_text_type_is_none(self):
+        """``response_format={"type": "text"}`` is the unconstrained default."""
+        assert parse_response_format({"type": "text"}) is None
+
+    def test_unknown_openai_type_raises_not_silently_falls_through(self):
+        """Regression: an unrecognised ``type`` value used to slip into
+        the Ollama schema branch via ``"type" in value`` and try to
+        compile a non-Schema dict (review #384, bug 2)."""
+        with pytest.raises(ValueError, match="unrecognized grammar format dict"):
+            parse_response_format({"type": "image_url"})
+
+    def test_bare_schema_with_valid_jsonschema_type(self):
+        """Ollama accepts ``format: {"type": "string"}`` (or any other
+        JSON-Schema type at the top level)."""
+        for t in ("object", "array", "string", "integer", "number", "boolean", "null"):
+            spec = parse_response_format({"type": t})
+            assert spec is not None, t
+            assert spec.kind == "json_schema"
+            assert spec.schema == {"type": t}
 
     def test_openai_json_schema_dict(self):
         schema = {"type": "object", "properties": {"x": {"type": "string"}}}
@@ -94,6 +115,14 @@ class TestParseResponseFormat:
 
 
 class TestGrammarSpec:
+    def test_not_hashable(self):
+        """The schema field is a dict; the frozen dataclass would
+        otherwise generate a __hash__ that raises TypeError at use site
+        instead of failing fast (review #384, nit)."""
+        spec = GrammarSpec("json_schema", schema={"type": "object"})
+        with pytest.raises(TypeError):
+            hash(spec)
+
     def test_json_object_post_init_rejects_schema(self):
         with pytest.raises(ValueError, match="schema must be None"):
             GrammarSpec(kind="json_object", schema={"type": "string"})
@@ -163,6 +192,27 @@ class TestCompileCache:
         c1 = compile_for_tokenizer(gpt2_tokenizer, gpt2_tokenizer.vocab_size, s1)
         c2 = compile_for_tokenizer(gpt2_tokenizer, gpt2_tokenizer.vocab_size, s2)
         assert c1 is not c2
+
+    def test_drop_for_tokenizer_removes_entries(self, gpt2_tokenizer):
+        """Wire-up safety: ``drop_for_tokenizer`` must remove the cache
+        entries for the *specific* tokenizer being unloaded so that a
+        future tokenizer landing on the same ``id()`` cannot pick up a
+        stale ``CompiledGrammar`` (review #384, bug 1).
+
+        Asserts cache state directly: object identity isn't a reliable
+        signal because xgrammar's own ``GrammarCompiler`` can intern
+        compiled-grammar objects.
+        """
+        from olmlx.engine import grammar as _grammar
+
+        spec = GrammarSpec("json_object")
+        compile_for_tokenizer(gpt2_tokenizer, gpt2_tokenizer.vocab_size, spec)
+        tid = id(gpt2_tokenizer)
+        assert any(k[0] == tid for k in _grammar._compile_cache)
+        assert tid in _grammar._compiler_cache
+        drop_for_tokenizer(gpt2_tokenizer)
+        assert not any(k[0] == tid for k in _grammar._compile_cache)
+        assert tid not in _grammar._compiler_cache
 
 
 class TestLogitsProcessor:

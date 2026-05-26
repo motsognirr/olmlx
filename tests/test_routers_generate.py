@@ -306,6 +306,20 @@ class TestFormatField:
         assert spec.kind == "json_object"
 
     @pytest.mark.asyncio
+    async def test_invalid_format_returns_422_not_500(self, app_client):
+        """Regression: see chat-router twin (review #384, bug 2)."""
+        resp = await app_client.post(
+            "/api/generate",
+            json={
+                "model": "qwen3",
+                "prompt": "hi",
+                "stream": False,
+                "format": "xml",
+            },
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
     async def test_format_schema_dict(self, app_client):
         from olmlx.engine.grammar import GrammarSpec
 

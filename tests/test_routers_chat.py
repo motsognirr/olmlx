@@ -1068,6 +1068,24 @@ class TestFormatField:
         assert spec.schema == schema
 
     @pytest.mark.asyncio
+    async def test_invalid_format_returns_422_not_500(self, app_client):
+        """Regression: ``parse_response_format`` raises ``ValueError`` on
+        unrecognised input; FastAPI's default handler maps uncaught
+        exceptions to 500. Must be caught and turned into 422 so the
+        caller sees a meaningful error (review #384, bug 2)."""
+        resp = await app_client.post(
+            "/api/chat",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+                "format": "xml",
+            },
+        )
+        assert resp.status_code == 422
+        assert "format" in resp.text.lower() or "xml" in resp.text.lower()
+
+    @pytest.mark.asyncio
     async def test_format_omitted_means_no_grammar(self, app_client):
         mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
         with patch(

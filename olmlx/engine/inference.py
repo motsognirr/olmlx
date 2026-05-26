@@ -43,7 +43,11 @@ except ImportError:  # pragma: no cover
     logging.getLogger(__name__).warning(
         "mlx-lm sample_utils unavailable (mlx-lm < 0.30.7?) — sampler/logits_processors disabled"
     )
-from olmlx.engine.grammar import GrammarSpec, make_processor as _make_grammar_processor
+from olmlx.engine.grammar import (
+    GrammarSpec,
+    make_processor as _make_grammar_processor,
+    unwrap_mlx_tokenizer as _unwrap_mlx_tokenizer,
+)
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils.streaming import async_mlx_stream
 from olmlx.utils.timing import Timer, TimingStats
@@ -58,6 +62,13 @@ def _resolve_model_vocab_size(lm: "LoadedModel") -> int | None:
     model's lm_head dim can differ from ``tokenizer.vocab_size`` (Phi-3,
     Llama-3.2-Vision, …) — xgrammar needs the model's number for the mask
     to align with the actual logits tensor.
+
+    Fallback order matters: prefer ``lm_head.weight.shape[0]`` (the actual
+    output dimension) over ``embed_tokens.weight.shape[0]`` (input
+    dimension). For tied embeddings the two are equal; for untied or
+    expanded lm_head the output is larger, and a bitmask sized to the
+    input would truncate the tail of the logit tensor and let
+    out-of-grammar tokens through.
     """
     model = lm.model
     # mlx-lm convention: model.args.vocab_size is set by the loader.
@@ -65,21 +76,28 @@ def _resolve_model_vocab_size(lm: "LoadedModel") -> int | None:
     vs = getattr(args, "vocab_size", None) if args is not None else None
     if isinstance(vs, int) and vs > 0:
         return vs
-    # Fall back to the embedding matrix shape.
-    inner = getattr(model, "model", model)
-    embed = getattr(inner, "embed_tokens", None)
-    if embed is not None and hasattr(embed, "weight"):
-        try:
-            shape = embed.weight.shape  # type: ignore[attr-defined]
-            if shape:
-                return int(shape[0])
-        except Exception:
-            pass
+    # Prefer the lm_head output dimension over the embed_tokens input dim.
+    for owner in (model, getattr(model, "model", None)):
+        if owner is None:
+            continue
+        for attr in ("lm_head", "embed_tokens"):
+            layer = getattr(owner, attr, None)
+            if layer is not None and hasattr(layer, "weight"):
+                try:
+                    shape = layer.weight.shape  # type: ignore[attr-defined]
+                    if shape:
+                        return int(shape[0])
+                except Exception:
+                    pass
     return None
 
 
 def _install_grammar_processor(
-    lm: "LoadedModel", gen_kwargs: dict, grammar_spec: GrammarSpec | None
+    lm: "LoadedModel",
+    gen_kwargs: dict,
+    grammar_spec: GrammarSpec | None,
+    *,
+    has_tools: bool = False,
 ) -> bool:
     """Build and install a grammar logits processor on *gen_kwargs*.
 
@@ -87,7 +105,11 @@ def _install_grammar_processor(
     are not supported (mlx-vlm does not forward ``logits_processors``) and
     return ``False`` with a one-line warning. Distributed mode is also
     rejected: workers don't receive the processor over the sideband and
-    would diverge from rank-0.
+    would diverge from rank-0. Tool-use requests are rejected: the JSON
+    grammar masks the format-specific tool-call tokens (``<tool_call>``,
+    ``[TOOL_CALLS]``, ``<function=...>``, …) so the model could never
+    emit a tool call. Constraining tool *arguments* is the deferred
+    Anthropic case (issue #361) — needs per-template trigger detection.
     """
     if grammar_spec is None:
         return False
@@ -104,6 +126,14 @@ def _install_grammar_processor(
             "in distributed mode; ignoring constraint for this request"
         )
         return False
+    if has_tools:
+        logger.warning(
+            "Grammar-constrained decoding requested alongside tools; "
+            "the JSON grammar would mask tool-call tokens, breaking "
+            "tool use. Ignoring grammar constraint for this request "
+            "(constraining tool arguments specifically is a follow-up)"
+        )
+        return False
     vocab_size = _resolve_model_vocab_size(lm)
     if vocab_size is None:
         logger.warning(
@@ -113,9 +143,10 @@ def _install_grammar_processor(
         return False
     # xgrammar's ``TokenizerInfo.from_huggingface`` does a strict isinstance
     # check against ``PreTrainedTokenizerBase`` and rejects mlx-lm's
-    # ``TokenizerWrapper``. Peel the wrapper to the underlying HF tokenizer
-    # (``_tokenizer`` attr) when present.
-    hf_tokenizer = getattr(lm.text_tokenizer, "_tokenizer", lm.text_tokenizer)
+    # ``TokenizerWrapper``. Peel the wrapper. HF fast tokenizers also
+    # expose ``_tokenizer`` (holding the Rust core) but ``unwrap_mlx_tokenizer``
+    # only peels when the outer class name is ``TokenizerWrapper``.
+    hf_tokenizer = _unwrap_mlx_tokenizer(lm.text_tokenizer)
     processor = _make_grammar_processor(hf_tokenizer, vocab_size, grammar_spec)
     existing = gen_kwargs.get("logits_processors", [])
     gen_kwargs["logits_processors"] = list(existing) + [processor]
@@ -2721,7 +2752,11 @@ async def _stream_completion(
                 "grammar-constrained decoding is not yet plumbed through "
                 "the speculative path"
             )
-        if lm.is_speculative and not images and not grammar_active:
+            use_speculative = False
+        else:
+            use_speculative = lm.is_speculative and not images
+
+        if use_speculative:
             from olmlx.engine.speculative_stream import async_speculative_stream
 
             # Speculative decoding uses greedy argmax; sampling params are not supported.
@@ -3447,7 +3482,9 @@ async def generate_chat(
     gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
-    grammar_active = _install_grammar_processor(lm, gen_kwargs, grammar_spec)
+    grammar_active = _install_grammar_processor(
+        lm, gen_kwargs, grammar_spec, has_tools=bool(tools)
+    )
 
     # Prompt caching applies to both streaming and non-streaming requests
     # (issue #342).  Disabled in distributed mode because rank 0 processes

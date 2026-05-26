@@ -4,7 +4,7 @@ import re
 import time
 import uuid
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from olmlx.engine.grammar import parse_response_format
@@ -314,12 +314,15 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         "json_object",
         "json_schema",
     ):
-        # Schema-shape problems raise ValueError; let FastAPI's default
-        # error handler turn that into a 4xx rather than silently falling
-        # through to a soft-prompt-only path.
-        grammar_spec = parse_response_format(
-            req.response_format.model_dump(exclude_none=True)
-        )
+        # Schema-shape problems are client errors — surface as 422 so the
+        # caller sees a meaningful message instead of FastAPI's default
+        # 500 for uncaught exceptions.
+        try:
+            grammar_spec = parse_response_format(
+                req.response_format.model_dump(exclude_none=True)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         # Belt-and-braces: also prepend the system-message hint so the model
         # is told what it's being constrained to. The grammar enforces shape;
         # the hint helps the model produce *meaningful* JSON (correct field

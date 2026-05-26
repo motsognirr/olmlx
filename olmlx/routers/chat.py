@@ -3,7 +3,7 @@ import logging
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from olmlx.engine.grammar import parse_response_format
@@ -191,7 +191,10 @@ async def chat(req: ChatRequest, request: Request):
     max_tokens = options.pop("num_predict", 512)
     cache_id = request.headers.get("x-cache-id", "")[:256]
     enable_thinking = resolve_think_flag(req.think)
-    grammar_spec = parse_response_format(req.format)
+    try:
+        grammar_spec = parse_response_format(req.format)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     if req.stream:
         result = await generate_chat(

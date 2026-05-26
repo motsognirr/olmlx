@@ -1017,6 +1017,19 @@ class ModelManager:
         # ``lm.model.prefetcher`` is intentionally not nulled — it lives on
         # the FlashModelWrapper, not on the LM bookkeeping, and the wrapper
         # goes away with the LM.
+        # Drop xgrammar compile cache entries keyed on this tokenizer's id
+        # while the tokenizer is still alive. After this returns,
+        # ``_close_evictees`` nulls the LoadedModel's tokenizer reference
+        # and CPython may recycle the address for a future tokenizer;
+        # stale id-keyed entries would then return a CompiledGrammar built
+        # for the wrong vocab.
+        try:
+            from olmlx.engine import grammar as _grammar
+
+            _grammar.drop_for_tokenizer(lm.tokenizer)
+        except Exception as exc:
+            logger.exception("Error dropping grammar cache for %s", lm.name)
+            errors.append(exc)
         if errors:
             raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
 

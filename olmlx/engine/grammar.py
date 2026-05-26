@@ -48,10 +48,18 @@ class GrammarSpec:
     ``kind="json_object"`` allows any well-formed JSON value (xgrammar's
     builtin JSON grammar). ``kind="json_schema"`` requires ``schema`` to be
     a JSON-Schema dict.
+
+    Note: ``frozen=True`` would normally generate ``__hash__``, but the
+    ``schema`` field is a dict and not hashable, so attempting to hash a
+    ``GrammarSpec`` would raise ``TypeError`` at use site instead of
+    failing fast. Explicitly disabling hashing keeps that contract clear;
+    callers wanting a deduplication key should use ``cache_key()``.
     """
 
     kind: Literal["json_object", "json_schema"]
     schema: dict[str, Any] | None = None
+
+    __hash__ = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.kind == "json_schema" and self.schema is None:
@@ -73,12 +81,14 @@ class GrammarSpec:
 
 
 # Module-level cache keyed on (tokenizer id, spec cache_key). Tokenizer ID
-# is ``id(tokenizer)`` — safe because mlx-lm holds a stable reference per
-# loaded model, and entries are dropped on model unload (the tokenizer is
-# garbage-collected, so the id is freed; stale entries are not an issue in
-# practice for this single-user server because there is only one active
-# model at a time). The cache is keyed by spec so repeat requests with the
-# same schema reuse the ~7 ms compile.
+# is ``id(tokenizer)`` — safe only because ``drop_for_tokenizer`` is wired
+# into ``ModelManager._close_loaded_model`` so entries are removed *while
+# the tokenizer is still alive*, before CPython can reuse the freed
+# address for a new allocation. If you change the lifecycle (e.g. clear
+# the cache after the tokenizer is GC'd), switch to a ``WeakKeyDictionary``
+# keyed on the tokenizer object — otherwise the next tokenizer may land
+# on the same ``id`` and return a stale ``CompiledGrammar`` built for a
+# different vocabulary, producing wrong-token masks.
 _compile_cache: dict[tuple[int, str], Any] = {}
 _compile_cache_lock = threading.Lock()
 
@@ -116,21 +126,22 @@ def compile_for_tokenizer(tokenizer: Any, vocab_size: int, spec: GrammarSpec) ->
             "xgrammar is not installed — grammar-constrained decoding unavailable"
         )
     cache_key = (id(tokenizer), spec.cache_key())
+    # Hold the lock across the entire check-compile-store sequence so two
+    # concurrent requests with the same spec don't both miss + recompile
+    # (wasteful) and then race on the store. xgrammar's compile is ~7 ms;
+    # acceptable to serialise across requests for the same model.
     with _compile_cache_lock:
         cached = _compile_cache.get(cache_key)
         if cached is not None:
             return cached
-
-    compiler = _get_compiler(tokenizer, vocab_size)
-    if spec.kind == "json_object":
-        compiled = compiler.compile_builtin_json_grammar()
-    else:
-        assert spec.schema is not None  # post_init enforces
-        compiled = compiler.compile_json_schema(spec.schema)
-
-    with _compile_cache_lock:
+        compiler = _get_compiler(tokenizer, vocab_size)
+        if spec.kind == "json_object":
+            compiled = compiler.compile_builtin_json_grammar()
+        else:
+            assert spec.schema is not None  # post_init enforces
+            compiled = compiler.compile_json_schema(spec.schema)
         _compile_cache[cache_key] = compiled
-    return compiled
+        return compiled
 
 
 # ---------------------------------------------------------------------------
@@ -161,9 +172,10 @@ class GrammarLogitsProcessor:
         self._vocab_size = vocab_size
         # Pre-allocate the int32 packed bitmask buffer (~19 KB for vocab=151k).
         self._bitmask = xgr.allocate_token_bitmask(1, vocab_size)
-        # Cached neg-inf scalar for masking; re-cast per call to match
-        # the logits dtype.
         self._last_token_count: int | None = None
+        # Cache the neg-inf scalar per logits dtype so the hot path avoids
+        # a small Metal allocation every step.
+        self._neg_inf_cache: dict[Any, mx.array] = {}
 
     # The signature must match the existing penalty processors so it can
     # be inserted into the same ``logits_processors`` list.
@@ -214,7 +226,10 @@ class GrammarLogitsProcessor:
         allowed_mx = mx.array(allowed)
         # mlx-lm logits have shape (1, vocab_size) in the streaming path
         # but can also be (vocab_size,) in other paths; broadcast naturally.
-        neg_inf = mx.array(-mx.inf, dtype=logits.dtype)
+        neg_inf = self._neg_inf_cache.get(logits.dtype)
+        if neg_inf is None:
+            neg_inf = mx.array(-mx.inf, dtype=logits.dtype)
+            self._neg_inf_cache[logits.dtype] = neg_inf
         return mx.where(allowed_mx, logits, neg_inf)
 
 
@@ -256,23 +271,44 @@ def parse_response_format(value: Any) -> GrammarSpec | None:
             return GrammarSpec(kind="json_object")
         raise ValueError(f"unsupported grammar format string: {value!r}")
     if isinstance(value, dict):
-        # OpenAI shape.
-        if value.get("type") == "json_object":
-            return GrammarSpec(kind="json_object")
-        if value.get("type") == "json_schema":
+        # OpenAI shape — dispatch only on the values we explicitly support.
+        # An unrecognised ``type`` (e.g. ``{"type": "text"}`` or a future
+        # OpenAI extension) must NOT silently fall through to the Ollama
+        # schema branch via ``"type" in value``, or xgrammar would try to
+        # compile a non-JSON-Schema dict.
+        openai_type = value.get("type")
+        if openai_type in _OPENAI_RESPONSE_FORMAT_TYPES:
+            if openai_type == "text":
+                return None
+            if openai_type == "json_object":
+                return GrammarSpec(kind="json_object")
+            # json_schema
             js = value.get("json_schema") or {}
             schema = js.get("schema")
             if schema is None:
                 raise ValueError("response_format.json_schema.schema is required")
             return GrammarSpec(kind="json_schema", schema=schema)
-        # Ollama shape: format is itself the schema dict.
-        if any(k in value for k in ("type", "properties", "$schema", "anyOf", "oneOf")):
+        # Ollama shape: ``format`` is itself a JSON Schema dict. Accept
+        # only schemas with explicit JSON-Schema markers OR a ``type``
+        # field whose value is a real JSON-Schema type (so an OpenAI-style
+        # ``{"type": "image_url"}`` doesn't sneak through here).
+        if any(k in value for k in ("properties", "$schema", "anyOf", "oneOf")):
+            return GrammarSpec(kind="json_schema", schema=value)
+        if value.get("type") in _JSON_SCHEMA_TYPES:
             return GrammarSpec(kind="json_schema", schema=value)
         raise ValueError(
             "unrecognized grammar format dict (need OpenAI response_format shape "
-            "or a JSON Schema with 'type'/'properties'/'$schema')"
+            "with type in {text,json_object,json_schema}, or a JSON Schema with "
+            "'properties'/'$schema'/'anyOf'/'oneOf' or a JSON-Schema 'type')"
         )
     raise ValueError(f"unsupported grammar format type: {type(value).__name__}")
+
+
+_OPENAI_RESPONSE_FORMAT_TYPES = frozenset({"text", "json_object", "json_schema"})
+
+_JSON_SCHEMA_TYPES = frozenset(
+    {"object", "array", "string", "number", "integer", "boolean", "null"}
+)
 
 
 def clear_caches() -> None:
@@ -281,3 +317,38 @@ def clear_caches() -> None:
         _compile_cache.clear()
     with _compiler_cache_lock:
         _compiler_cache.clear()
+
+
+def unwrap_mlx_tokenizer(tokenizer: Any) -> Any:
+    """Peel mlx-lm's ``TokenizerWrapper`` down to the underlying HF
+    tokenizer (xgrammar's strict isinstance check rejects the wrapper).
+
+    Only peels when the outer class is named ``TokenizerWrapper`` —
+    HF fast tokenizers also expose a ``_tokenizer`` attribute (holding
+    the Rust ``tokenizers.Tokenizer`` core), and peeling there would
+    hand xgrammar an unsupported type AND make the id-keyed cache
+    look up the wrong object.
+    """
+    if type(tokenizer).__name__ == "TokenizerWrapper":
+        inner = getattr(tokenizer, "_tokenizer", None)
+        if inner is not None:
+            return inner
+    return tokenizer
+
+
+def drop_for_tokenizer(tokenizer: Any) -> None:
+    """Drop cache entries keyed on *tokenizer*'s id.
+
+    Must be called *while the tokenizer object is still alive* — the
+    cache key is ``id(tokenizer)`` and CPython can recycle freed
+    addresses for new allocations. Called from
+    ``ModelManager._close_loaded_model`` so eviction runs before the
+    LoadedModel's tokenizer reference is nulled.
+    """
+    tid = id(unwrap_mlx_tokenizer(tokenizer))
+    with _compile_cache_lock:
+        stale = [k for k in _compile_cache if k[0] == tid]
+        for k in stale:
+            del _compile_cache[k]
+    with _compiler_cache_lock:
+        _compiler_cache.pop(tid, None)
