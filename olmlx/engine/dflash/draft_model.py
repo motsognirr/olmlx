@@ -20,7 +20,6 @@ not duplicated in memory.
 from __future__ import annotations
 
 import logging
-import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -175,31 +174,9 @@ class DFlashAttention(nn.Module):
             raise ValueError(
                 "DFlashAttention layer has is_sliding=True but no "
                 "sliding_window set — a sliding-attention layer "
-                "requires a window size.  This is a DraftConfig bug."
-            )
-        if self.is_sliding and not self.causal:
-            # Locally-trained non-causal sliding drafts were trained
-            # without the sliding-causal mask on these layers.  After
-            # gh#317 Gap 6 the inference path applies the mask
-            # unconditionally — matching upstream z-lab/dflash but
-            # creating a silent train/inference mismatch for any draft
-            # trained with an older olmlx version.  The mismatch is
-            # undetectable at load time because the checkpoint does not
-            # record which code version trained it, so warn the
-            # operator once per call-site (warnings.warn deduplicates
-            # by default, resetting between test sessions and on model
-            # reload).
-            warnings.warn(
-                "DFlash draft contains sliding_attention layers "
-                "with attention_causal=False.  As of gh#317 the "
-                "inference path applies a sliding-causal mask "
-                "whenever ctx_len + L > sliding_window regardless "
-                "of the causal flag.  Drafts trained with an "
-                "older olmlx version were trained without this "
-                "mask and may show degraded acceptance rates.  "
-                "Re-train with the latest preparation pipeline "
-                "if acceptance is unexpectedly low.",
-                stacklevel=2,
+                "requires a window size.  This occurs when "
+                "DFlashAttention is constructed directly without "
+                "DraftConfig validation."
             )
 
         self.q_proj = nn.Linear(
@@ -360,6 +337,30 @@ class DFlashDraftModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = _build_rope(config)
+
+        # Locally-trained non-causal sliding drafts were trained without
+        # the sliding-causal mask on those layers (old olmlx versions).
+        # After gh#317 Gap 6 inference applies the mask unconditionally
+        # on sliding layers, creating a silent train/inference mismatch.
+        # The checkpoint does not record which code version trained it,
+        # so the mismatch is undetectable at load time — warn every
+        # model construction (logger.warning fires on every reload even
+        # in long-running servers, unlike warnings.warn).
+        if any(
+            t == "sliding_attention" and not config.attention_causal
+            for t in config.layer_types
+        ):
+            logger.warning(
+                "DFlash draft (%d layers) contains sliding_attention "
+                "layers with attention_causal=False.  As of gh#317 the "
+                "inference path applies a sliding-causal mask whenever "
+                "ctx_len + L > sliding_window regardless of the causal "
+                "flag.  Drafts trained with an older olmlx version were "
+                "trained without this mask and may show degraded "
+                "acceptance rates.  Re-train with the latest preparation "
+                "pipeline if acceptance is unexpectedly low.",
+                config.num_hidden_layers,
+            )
 
         # Populated by ``bind()``. We use ``object.__setattr__`` there to
         # bypass mlx's ``Module.__setattr__`` — assigning an
