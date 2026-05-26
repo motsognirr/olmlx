@@ -29,7 +29,9 @@ from olmlx.engine.gdn_rollback import (
     _order_matches,
     find_gdn_class as _find_gdn_class,
 )
-from olmlx.engine.dflash.draft_model import DFlashDraftModel, DraftConfig
+from mlx_lm.models.rope_utils import initialize_rope
+
+from olmlx.engine.dflash.draft_model import DFlashAttention, DFlashDraftModel, DraftConfig
 from olmlx.engine.speculative_stream import speculative_stream_generate
 
 
@@ -410,6 +412,117 @@ class TestDraftConfig:
                 target_layer_ids=[0, 1],  # length 2 != num_target_layers 3
                 mask_token_id=0,
             )
+
+
+# ---------------------------------------------------------------------------
+# Sliding attention mask (regression for gh#317 Gap 6)
+# ---------------------------------------------------------------------------
+
+
+class TestSlidingAttentionMask:
+    """When ``ctx_len + L > sliding_window``, the sliding-causal mask is
+    applied regardless of ``attention_causal`` — matching upstream
+    z-lab/dflash behaviour. When within the window, ``attention_causal``
+    still controls mask presence.
+    """
+
+    @staticmethod
+    def _make_sliding_attn(
+        attention_causal: bool,
+        *,
+        hidden_size: int = 16,
+        sliding_window: int = 4,
+        seed: int = 42,
+    ) -> DFlashAttention:
+        cfg = DraftConfig(
+            hidden_size=hidden_size,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=hidden_size // 2,
+            intermediate_size=hidden_size * 2,
+            vocab_size=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            max_position_embeddings=2048,
+            block_size=4,
+            num_target_layers=1,
+            target_layer_ids=[0],
+            mask_token_id=0,
+            layer_types=("sliding_attention",),
+            sliding_window=sliding_window,
+            attention_causal=attention_causal,
+        )
+        mx.random.seed(seed)
+        return DFlashAttention(cfg, layer_idx=0)
+
+    def test_sliding_mask_applied_when_window_exceeded(self):
+        """Causal and non-causal sliding layers produce identical output
+        when ctx_len + L > window because both get the same
+        sliding-causal mask.
+        """
+        window = 4
+        hidden_size = 16
+        attn_causal = self._make_sliding_attn(
+            attention_causal=True, hidden_size=hidden_size, sliding_window=window
+        )
+        attn_non_causal = self._make_sliding_attn(
+            attention_causal=False, hidden_size=hidden_size, sliding_window=window
+        )
+        # Copy weights so both layers have identical parameters.
+        for src_param, dst_param in zip(
+            attn_causal.parameters().values(), attn_non_causal.parameters().values()
+        ):
+            dst_param.update(src_param)
+
+        rope = initialize_rope(
+            hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
+        )
+        # Both get the same cache type (KVCache) to isolate mask differences.
+        cache_causal: KVCache | RotatingKVCache = KVCache()
+        cache_non_causal: KVCache | RotatingKVCache = KVCache()
+
+        x_ctx = mx.random.normal((1, 3, hidden_size))  # S=3
+        x = mx.random.normal((1, 2, hidden_size))       # L=2, S+L=5 > 4
+
+        out_causal = attn_causal(x, x_ctx, rope, cache_causal)
+        out_non_causal = attn_non_causal(x, x_ctx, rope, cache_non_causal)
+        mx.eval(out_causal, out_non_causal)
+
+        assert mx.allclose(out_causal, out_non_causal, atol=1e-5)
+
+    def test_no_sliding_mask_when_within_window(self):
+        """When ctx_len + L <= window, attention_causal still controls
+        the mask — non-causal gets None, causal gets "causal".
+        """
+        window = 4
+        hidden_size = 16
+        attn_causal = self._make_sliding_attn(
+            attention_causal=True, hidden_size=hidden_size, sliding_window=window
+        )
+        attn_non_causal = self._make_sliding_attn(
+            attention_causal=False, hidden_size=hidden_size, sliding_window=window
+        )
+        for src_param, dst_param in zip(
+            attn_causal.parameters().values(), attn_non_causal.parameters().values()
+        ):
+            dst_param.update(src_param)
+
+        rope = initialize_rope(
+            hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
+        )
+        cache_causal: KVCache | RotatingKVCache = KVCache()
+        cache_non_causal: KVCache | RotatingKVCache = KVCache()
+
+        x_ctx = mx.random.normal((1, 1, hidden_size))  # S=1
+        x = mx.random.normal((1, 2, hidden_size))       # L=2, S+L=3 <= 4
+
+        out_causal = attn_causal(x, x_ctx, rope, cache_causal)
+        out_non_causal = attn_non_causal(x, x_ctx, rope, cache_non_causal)
+        mx.eval(out_causal, out_non_causal)
+
+        # Causal mask restricts attention vs no mask — outputs should differ.
+        assert not mx.allclose(out_causal, out_non_causal, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

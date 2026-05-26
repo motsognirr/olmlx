@@ -124,10 +124,16 @@ class DFlashAttention(nn.Module):
     context-K (offset by the prior cache offset).
 
     When ``config.attention_causal`` is ``False`` (bidirectional), the
-    mask is ``None`` for both full- and sliding-attention layers.
-    Bidirectional sliding layers rely on ``RotatingKVCache`` eviction
-    (enforced by ``make_cache()`` via ``layer_types``) to limit the
-    effective receptive field — no explicit spatial mask is needed.
+    mask is ``None`` for full-attention layers only. Sliding-attention
+    layers always apply a sliding-causal mask (via
+    ``create_causal_mask``) when the combined context + proposal length
+    exceeds the sliding window — matching upstream z-lab/dflash
+    behaviour regardless of the ``causal`` flag. For sequences shorter
+    than the window the mask remains ``None`` so in-window attention is
+    fully bidirectional. The ``RotatingKVCache`` eviction (enforced by
+    ``make_cache()`` via ``layer_types``) works alongside the explicit
+    spatial mask — the mask bounds the attention dot-product to the
+    window while the cache discards keys outside it.
     """
 
     def __init__(self, config: DraftConfig, layer_idx: int):
