@@ -1560,8 +1560,10 @@ class ModelManager:
                     # Drop references and flush Metal allocator so the memory
                     # is actually reclaimed before we raise.  Also clean up
                     # lm if it was already constructed (exception between
-                    # LoadedModel() and return), and pop from _loaded to
-                    # prevent a zombie entry holding GPU memory.
+                    # LoadedModel() and return).  ``lm`` may be registered
+                    # in ``_loaded`` at this point (it is inserted before
+                    # the async probe); ``pop(normalized, None)`` handles
+                    # both cases (was-only and already-registered).
                     if lm is not None:
                         self._loaded.pop(normalized, None)
                         del lm
@@ -2191,6 +2193,13 @@ class ModelManager:
         finally:
             if probe_cache is not None:
                 del probe_cache
+                # All cache flags (supports_cache_trim,
+                # supports_cache_persistence) are set synchronously above
+                # — this is the method's first await.  Do not insert an
+                # await before the flag assignments without also verifying
+                # that concurrent ensure_loaded callers, which may observe
+                # the registered LoadedModel during this yield, see
+                # fully-configured flags.
                 await self._flush_metal()
 
         # Single load-time log site for "cross-request reuse disabled."
