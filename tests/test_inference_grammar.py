@@ -128,6 +128,48 @@ class TestInstallGrammarProcessor:
         assert installed is True
         assert gen_kwargs["logits_processors"] == [existing, sentinel]
 
+    def test_unwraps_mlx_lm_tokenizer_wrapper(self):
+        """mlx-lm wraps the HF tokenizer in ``TokenizerWrapper`` which
+        xgrammar's ``TokenizerInfo.from_huggingface`` rejects with
+        'Unsupported tokenizer type'. ``_install_grammar_processor`` must
+        peel the wrapper via its ``_tokenizer`` attribute before handing
+        off to the factory."""
+        lm = _make_lm(vocab_size=1024)
+        hf_tokenizer = MagicMock(name="hf_tokenizer")
+        wrapper = MagicMock(name="TokenizerWrapper")
+        wrapper._tokenizer = hf_tokenizer
+        lm.text_tokenizer = wrapper
+
+        sentinel = MagicMock(name="grammar_processor")
+        with patch(
+            "olmlx.engine.inference._make_grammar_processor", return_value=sentinel
+        ) as mock_make:
+            installed = _install_grammar_processor(
+                lm, {}, GrammarSpec("json_object")
+            )
+
+        assert installed is True
+        # The factory must receive the *unwrapped* HF tokenizer, not the
+        # mlx-lm TokenizerWrapper.
+        args, _ = mock_make.call_args
+        assert args[0] is hf_tokenizer
+
+    def test_passes_text_tokenizer_through_when_no_wrapper(self):
+        """A bare HF tokenizer (no ``_tokenizer`` attribute) should be
+        forwarded as-is — the unwrap is opportunistic, not mandatory."""
+        lm = _make_lm(vocab_size=1024)
+        bare = MagicMock(name="bare_hf_tokenizer", spec=["vocab_size", "encode"])
+        lm.text_tokenizer = bare
+
+        sentinel = MagicMock(name="grammar_processor")
+        with patch(
+            "olmlx.engine.inference._make_grammar_processor", return_value=sentinel
+        ) as mock_make:
+            _install_grammar_processor(lm, {}, GrammarSpec("json_object"))
+
+        args, _ = mock_make.call_args
+        assert args[0] is bare
+
 
 class TestGenerateChatForwardsGrammarSpec:
     """Smoke: ``generate_chat`` passes ``grammar_spec`` into the install

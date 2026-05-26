@@ -111,7 +111,12 @@ def _install_grammar_processor(
             "could not be resolved; ignoring constraint for this request"
         )
         return False
-    processor = _make_grammar_processor(lm.text_tokenizer, vocab_size, grammar_spec)
+    # xgrammar's ``TokenizerInfo.from_huggingface`` does a strict isinstance
+    # check against ``PreTrainedTokenizerBase`` and rejects mlx-lm's
+    # ``TokenizerWrapper``. Peel the wrapper to the underlying HF tokenizer
+    # (``_tokenizer`` attr) when present.
+    hf_tokenizer = getattr(lm.text_tokenizer, "_tokenizer", lm.text_tokenizer)
+    processor = _make_grammar_processor(hf_tokenizer, vocab_size, grammar_spec)
     existing = gen_kwargs.get("logits_processors", [])
     gen_kwargs["logits_processors"] = list(existing) + [processor]
     logger.info(
