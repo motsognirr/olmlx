@@ -603,12 +603,17 @@ class TestSlidingAttentionMask:
         # No sliding mask applied — causal gets "causal", non-causal gets None.
         assert not mx.allclose(out_causal, out_non_causal, atol=1e-5)
 
+    @staticmethod
+    def _new_rotating_caches(window: int):
+        return (
+            RotatingKVCache(max_size=max(window - 1, 1), keep=0),
+            RotatingKVCache(max_size=max(window - 1, 1), keep=0),
+        )
+
     def test_sliding_mask_with_rotating_cache_steady_state(self):
-        """With a pre-filled ``RotatingKVCache`` (the production path),
-        the sliding-causal mask is unconditionally applied because
-        ``ctx_len`` is always ``window`` and any proposal creates
-        ``ctx_len + L > window``.  Causal and non-causal sliding layers
-        produce identical output.
+        """Production path: with a pre-filled ``RotatingKVCache`` and
+        multstep decoding, verify the sliding-causal mask produces
+        identical outputs for causal and non-causal sliding layers.
         """
         window = 4
         hidden_size = 16
@@ -623,38 +628,77 @@ class TestSlidingAttentionMask:
         rope = initialize_rope(
             hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
         )
-        # RotatingKVCache mirrors make_cache() for sliding layers.
-        cache_causal: KVCache | RotatingKVCache = RotatingKVCache(
-            max_size=max(window - 1, 1), keep=0
-        )
-        cache_non_causal: KVCache | RotatingKVCache = RotatingKVCache(
-            max_size=max(window - 1, 1), keep=0
-        )
 
-        # Fill the cache with window tokens (two steps to simulate
-        # steady-state decoding after initial fill-up).
-        x_ctx = mx.random.normal((1, 2, hidden_size))
-        x = mx.random.normal((1, 1, hidden_size))
+        # L=2 and L=4 steps over a full RotatingKVCache: both lengths
+        # exceed the window (ctx_len >= window - 1 → ctx_len + L > window
+        # for L >= 2).  Use identical fresh caches for both side-by-side
+        # comparisons so the L=1 intermediate doesn't shift the cache.
+        for L, expect_same in ((2, True), (4, True)):
+            cc, cnc = self._new_rotating_caches(window)
+            cache_causal: KVCache | RotatingKVCache = cc
+            cache_non_causal: KVCache | RotatingKVCache = cnc
+            # Fill to steady state.
+            x_ctx_a = mx.random.normal((1, 2, hidden_size))
+            x_a = mx.random.normal((1, 1, hidden_size))
+            mx.eval(
+                attn_causal(x_a, x_ctx_a, rope, cache_causal),
+                attn_non_causal(x_a, x_ctx_a, rope, cache_non_causal),
+            )
+            x_ctx_b = mx.random.normal((1, 2, hidden_size))
+            x_b = mx.random.normal((1, 1, hidden_size))
+            mx.eval(
+                attn_causal(x_b, x_ctx_b, rope, cache_causal),
+                attn_non_causal(x_b, x_ctx_b, rope, cache_non_causal),
+            )
+            x_ctx = mx.random.normal((1, 1, hidden_size))
+            x_prop = mx.random.normal((1, L, hidden_size))
+            out_c = attn_causal(x_prop, x_ctx, rope, cache_causal)
+            out_nc = attn_non_causal(x_prop, x_ctx, rope, cache_non_causal)
+            mx.eval(out_c, out_nc)
+            assert mx.allclose(out_c, out_nc, atol=1e-5)
+
+        # L=1: with ctx_len == window-1, ctx_len + 1 == window — no
+        # sliding mask triggered.  Causal flag controls.
+        cc, cnc = self._new_rotating_caches(window)
+        cache_causal2: KVCache | RotatingKVCache = cc
+        cache_non_causal2: KVCache | RotatingKVCache = cnc
+        x_ctx_a = mx.random.normal((1, 2, hidden_size))
         mx.eval(
-            attn_causal(x, x_ctx, rope, cache_causal),
-            attn_non_causal(x, x_ctx, rope, cache_non_causal),
+            attn_causal(
+                mx.random.normal((1, 1, hidden_size)), x_ctx_a, rope, cache_causal2
+            ),
+            attn_non_causal(
+                mx.random.normal((1, 1, hidden_size)), x_ctx_a, rope, cache_non_causal2
+            ),
         )
-        x_ctx2 = mx.random.normal((1, 2, hidden_size))
-        x2 = mx.random.normal((1, 1, hidden_size))
         mx.eval(
-            attn_causal(x2, x_ctx2, rope, cache_causal),
-            attn_non_causal(x2, x_ctx2, rope, cache_non_causal),
+            attn_causal(
+                mx.random.normal((1, 1, hidden_size)),
+                mx.random.normal((1, 2, hidden_size)),
+                rope,
+                cache_causal2,
+            ),
+            attn_non_causal(
+                mx.random.normal((1, 1, hidden_size)),
+                mx.random.normal((1, 2, hidden_size)),
+                rope,
+                cache_non_causal2,
+            ),
         )
-
-        # Now ctx_len == window (cache is full). Any L > 0 triggers the
-        # sliding-causal mask.
-        x_ctx3 = mx.random.normal((1, 1, hidden_size))
-        x3 = mx.random.normal((1, 2, hidden_size))
-        out_causal = attn_causal(x3, x_ctx3, rope, cache_causal)
-        out_non_causal = attn_non_causal(x3, x_ctx3, rope, cache_non_causal)
-        mx.eval(out_causal, out_non_causal)
-
-        assert mx.allclose(out_causal, out_non_causal, atol=1e-5)
+        out_c1 = attn_causal(
+            mx.random.normal((1, 1, hidden_size)),
+            mx.random.normal((1, 1, hidden_size)),
+            rope,
+            cache_causal2,
+        )
+        out_nc1 = attn_non_causal(
+            mx.random.normal((1, 1, hidden_size)),
+            mx.random.normal((1, 1, hidden_size)),
+            rope,
+            cache_non_causal2,
+        )
+        mx.eval(out_c1, out_nc1)
+        assert not mx.allclose(out_c1, out_nc1, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
