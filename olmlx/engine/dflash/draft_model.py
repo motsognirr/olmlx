@@ -20,6 +20,7 @@ not duplicated in memory.
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,10 +31,6 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.rope_utils import initialize_rope
 
 logger = logging.getLogger(__name__)
-
-# Tracks how many sliding non-causal layers have been instantiated
-# this process lifetime so the warning fires only once per model load.
-_sliding_non_causal_warn_count = 0
 
 
 @dataclass
@@ -189,22 +186,21 @@ class DFlashAttention(nn.Module):
             # trained with an older olmlx version.  The mismatch is
             # undetectable at load time because the checkpoint does not
             # record which code version trained it, so warn the
-            # operator once per model load.
-            global _sliding_non_causal_warn_count
-            num_warned = _sliding_non_causal_warn_count
-            _sliding_non_causal_warn_count += 1
-            if num_warned == 0:
-                logger.warning(
-                    "DFlash draft contains sliding_attention layers "
-                    "with attention_causal=False.  As of gh#317 the "
-                    "inference path applies a sliding-causal mask "
-                    "whenever ctx_len + L > sliding_window regardless "
-                    "of the causal flag.  Drafts trained with an "
-                    "older olmlx version were trained without this "
-                    "mask and may show degraded acceptance rates.  "
-                    "Re-train with the latest preparation pipeline "
-                    "if acceptance is unexpectedly low."
-                )
+            # operator once per call-site (warnings.warn deduplicates
+            # by default, resetting between test sessions and on model
+            # reload).
+            warnings.warn(
+                "DFlash draft contains sliding_attention layers "
+                "with attention_causal=False.  As of gh#317 the "
+                "inference path applies a sliding-causal mask "
+                "whenever ctx_len + L > sliding_window regardless "
+                "of the causal flag.  Drafts trained with an "
+                "older olmlx version were trained without this "
+                "mask and may show degraded acceptance rates.  "
+                "Re-train with the latest preparation pipeline "
+                "if acceptance is unexpectedly low.",
+                stacklevel=2,
+            )
 
         self.q_proj = nn.Linear(
             config.hidden_size, self.n_heads * self.head_dim, bias=False
@@ -281,6 +277,10 @@ class DFlashAttention(nn.Module):
 
         ctx_len = keys.shape[2] - L
         mask = "causal" if self.causal else None
+        # The ``or 0`` fallback is dead code after the __init__ guard
+        # (raising ValueError when is_sliding=True without a window),
+        # but kept as belt-and-suspenders in case the guard is ever
+        # bypassed (e.g. direct construction in tests).
         if self.is_sliding and ctx_len + L > (self.sliding_window or 0):
             # Upstream z-lab/dflash always applies a sliding-causal mask on
             # sliding layers regardless of causal mode (see

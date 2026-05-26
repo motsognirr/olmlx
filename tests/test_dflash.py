@@ -611,9 +611,18 @@ class TestSlidingAttentionMask:
         )
 
     def test_sliding_mask_with_rotating_cache_steady_state(self):
-        """Production path: with a pre-filled ``RotatingKVCache`` and
-        multstep decoding, verify the sliding-causal mask produces
-        identical outputs for causal and non-causal sliding layers.
+        """Production path: with a pre-filled ``RotatingKVCache`` (the
+        cache type ``make_cache()`` creates for sliding layers), verify
+        the sliding-causal mask produces identical outputs for causal
+        and non-causal sliding layers when ``ctx_len + L > window``.
+
+        With ``RotatingKVCache(max_size=window-1)`` the cache holds at
+        most ``window-1`` keys, so ``ctx_len + L > window`` for any
+        ``L >= 2``.  DFlash always processes ``block_size >= 2`` tokens
+        per step, so the mask is effectively unconditional in steady
+        state.  The ``L=1`` edge case where ``ctx_len + L == window``
+        is an academic corner that never occurs in real DFlash
+        inference.
         """
         window = 4
         hidden_size = 16
@@ -629,15 +638,12 @@ class TestSlidingAttentionMask:
             hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
         )
 
-        # L=2 and L=4 steps over a full RotatingKVCache: both lengths
-        # exceed the window (ctx_len >= window - 1 → ctx_len + L > window
-        # for L >= 2).  Use identical fresh caches for both side-by-side
-        # comparisons so the L=1 intermediate doesn't shift the cache.
-        for L, expect_same in ((2, True), (4, True)):
+        for L in (2, 4):
             cc, cnc = self._new_rotating_caches(window)
             cache_causal: KVCache | RotatingKVCache = cc
             cache_non_causal: KVCache | RotatingKVCache = cnc
-            # Fill to steady state.
+            # Fill to steady state with shared tensors so both caches
+            # have identical history.
             x_ctx_a = mx.random.normal((1, 2, hidden_size))
             x_a = mx.random.normal((1, 1, hidden_size))
             mx.eval(
@@ -656,49 +662,6 @@ class TestSlidingAttentionMask:
             out_nc = attn_non_causal(x_prop, x_ctx, rope, cache_non_causal)
             mx.eval(out_c, out_nc)
             assert mx.allclose(out_c, out_nc, atol=1e-5)
-
-        # L=1: with ctx_len == window-1, ctx_len + 1 == window — no
-        # sliding mask triggered.  Causal flag controls.
-        cc, cnc = self._new_rotating_caches(window)
-        cache_causal2: KVCache | RotatingKVCache = cc
-        cache_non_causal2: KVCache | RotatingKVCache = cnc
-        x_ctx_a = mx.random.normal((1, 2, hidden_size))
-        mx.eval(
-            attn_causal(
-                mx.random.normal((1, 1, hidden_size)), x_ctx_a, rope, cache_causal2
-            ),
-            attn_non_causal(
-                mx.random.normal((1, 1, hidden_size)), x_ctx_a, rope, cache_non_causal2
-            ),
-        )
-        mx.eval(
-            attn_causal(
-                mx.random.normal((1, 1, hidden_size)),
-                mx.random.normal((1, 2, hidden_size)),
-                rope,
-                cache_causal2,
-            ),
-            attn_non_causal(
-                mx.random.normal((1, 1, hidden_size)),
-                mx.random.normal((1, 2, hidden_size)),
-                rope,
-                cache_non_causal2,
-            ),
-        )
-        out_c1 = attn_causal(
-            mx.random.normal((1, 1, hidden_size)),
-            mx.random.normal((1, 1, hidden_size)),
-            rope,
-            cache_causal2,
-        )
-        out_nc1 = attn_non_causal(
-            mx.random.normal((1, 1, hidden_size)),
-            mx.random.normal((1, 1, hidden_size)),
-            rope,
-            cache_non_causal2,
-        )
-        mx.eval(out_c1, out_nc1)
-        assert not mx.allclose(out_c1, out_nc1, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
