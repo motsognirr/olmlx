@@ -3143,9 +3143,7 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.is_memory_pressure_high",
                 return_value=False,
             ),
-            patch.object(
-                manager, "_flush_metal", new_callable=AsyncMock
-            ) as mock_flush,
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
         ):
             with pytest.raises(MemoryError):
                 await manager.ensure_loaded("qwen3")
