@@ -43,11 +43,123 @@ except ImportError:  # pragma: no cover
     logging.getLogger(__name__).warning(
         "mlx-lm sample_utils unavailable (mlx-lm < 0.30.7?) — sampler/logits_processors disabled"
     )
+from olmlx.engine.grammar import (
+    GrammarSpec,
+    make_processor as _make_grammar_processor,
+    unwrap_mlx_tokenizer as _unwrap_mlx_tokenizer,
+)
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils.streaming import async_mlx_stream
 from olmlx.utils.timing import Timer, TimingStats
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_model_vocab_size(lm: "LoadedModel") -> int | None:
+    """Return the model's lm_head vocab dimension, or None if undiscoverable.
+
+    Used by grammar-constrained decoding to size the token bitmask. The
+    model's lm_head dim can differ from ``tokenizer.vocab_size`` (Phi-3,
+    Llama-3.2-Vision, …) — xgrammar needs the model's number for the mask
+    to align with the actual logits tensor.
+
+    Fallback order matters: prefer ``lm_head.weight.shape[0]`` (the actual
+    output dimension) over ``embed_tokens.weight.shape[0]`` (input
+    dimension). For tied embeddings the two are equal; for untied or
+    expanded lm_head the output is larger, and a bitmask sized to the
+    input would truncate the tail of the logit tensor and let
+    out-of-grammar tokens through.
+    """
+    model = lm.model
+    # mlx-lm convention: model.args.vocab_size is set by the loader.
+    args = getattr(model, "args", None)
+    vs = getattr(args, "vocab_size", None) if args is not None else None
+    if isinstance(vs, int) and vs > 0:
+        return vs
+    # Prefer the lm_head output dimension over the embed_tokens input dim
+    # AT EVERY nesting depth. Some models nest lm_head under
+    # ``model.model`` while exposing ``embed_tokens`` at the top level;
+    # iterating attr-first avoids returning the top-level embed_tokens
+    # when a deeper lm_head exists.
+    for attr in ("lm_head", "embed_tokens"):
+        for owner in (model, getattr(model, "model", None)):
+            if owner is None:
+                continue
+            layer = getattr(owner, attr, None)
+            if layer is not None and hasattr(layer, "weight"):
+                try:
+                    shape = layer.weight.shape  # type: ignore[attr-defined]
+                    if shape:
+                        return int(shape[0])
+                except Exception:
+                    pass
+    return None
+
+
+def _install_grammar_processor(
+    lm: "LoadedModel",
+    gen_kwargs: dict,
+    grammar_spec: GrammarSpec | None,
+    *,
+    has_tools: bool = False,
+) -> bool:
+    """Build and install a grammar logits processor on *gen_kwargs*.
+
+    Returns ``True`` when grammar is active for the request. VLM models
+    are not supported (mlx-vlm does not forward ``logits_processors``) and
+    return ``False`` with a one-line warning. Distributed mode is also
+    rejected: workers don't receive the processor over the sideband and
+    would diverge from rank-0. Tool-use requests are rejected: the JSON
+    grammar masks the format-specific tool-call tokens (``<tool_call>``,
+    ``[TOOL_CALLS]``, ``<function=...>``, …) so the model could never
+    emit a tool call. Constraining tool *arguments* is the deferred
+    Anthropic case (issue #361) — needs per-template trigger detection.
+    """
+    if grammar_spec is None:
+        return False
+    if lm.is_vlm:
+        logger.warning(
+            "Grammar-constrained decoding requested but model is a VLM "
+            "(mlx-vlm does not accept logits_processors); ignoring "
+            "constraint for this request"
+        )
+        return False
+    if lm.is_distributed:
+        logger.warning(
+            "Grammar-constrained decoding requested but model is running "
+            "in distributed mode; ignoring constraint for this request"
+        )
+        return False
+    if has_tools:
+        logger.warning(
+            "Grammar-constrained decoding requested alongside tools; "
+            "the JSON grammar would mask tool-call tokens, breaking "
+            "tool use. Ignoring grammar constraint for this request "
+            "(constraining tool arguments specifically is a follow-up)"
+        )
+        return False
+    vocab_size = _resolve_model_vocab_size(lm)
+    if vocab_size is None:
+        logger.warning(
+            "Grammar-constrained decoding requested but model vocab_size "
+            "could not be resolved; ignoring constraint for this request"
+        )
+        return False
+    # xgrammar's ``TokenizerInfo.from_huggingface`` does a strict isinstance
+    # check against ``PreTrainedTokenizerBase`` and rejects mlx-lm's
+    # ``TokenizerWrapper``. Peel the wrapper. HF fast tokenizers also
+    # expose ``_tokenizer`` (holding the Rust core) but ``unwrap_mlx_tokenizer``
+    # only peels when the outer class name is ``TokenizerWrapper``.
+    hf_tokenizer = _unwrap_mlx_tokenizer(lm.text_tokenizer)
+    processor = _make_grammar_processor(hf_tokenizer, vocab_size, grammar_spec)
+    existing = gen_kwargs.get("logits_processors", [])
+    gen_kwargs["logits_processors"] = list(existing) + [processor]
+    logger.info(
+        "Grammar-constrained decoding active: kind=%s vocab_size=%d",
+        grammar_spec.kind,
+        vocab_size,
+    )
+    return True
 
 
 def _make_frequency_penalty_processor(frequency_penalty: float):
@@ -1843,6 +1955,7 @@ async def generate_completion(
     apply_chat_template: bool = False,
     system: str | None = None,
     enable_thinking: bool | None = None,
+    grammar_spec: GrammarSpec | None = None,
 ) -> AsyncGenerator[dict, None] | dict:
     """Generate a text completion, streaming or not.
 
@@ -1937,6 +2050,8 @@ async def generate_completion(
     gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
+    grammar_active = _install_grammar_processor(lm, gen_kwargs, grammar_spec)
+
     # Tell routers whether to wait for a (possibly orphaned) `</think>` when
     # splitting thinking from the response (issue #307) — shares the rules
     # with `generate_chat`.  Completions never carry tools.  In raw mode no
@@ -1953,13 +2068,27 @@ async def generate_completion(
     if stream:
         return _prepend_meta(
             _stream_completion(
-                lm, prompt, mt, gen_kwargs, stats, images, keep_alive=keep_alive
+                lm,
+                prompt,
+                mt,
+                gen_kwargs,
+                stats,
+                images,
+                keep_alive=keep_alive,
+                grammar_active=grammar_active,
             ),
             {"thinking_expected": thinking_expected},
         )
     else:
         result = await _full_completion(
-            lm, prompt, mt, gen_kwargs, stats, images, keep_alive=keep_alive
+            lm,
+            prompt,
+            mt,
+            gen_kwargs,
+            stats,
+            images,
+            keep_alive=keep_alive,
+            grammar_active=grammar_active,
         )
         result["thinking_expected"] = thinking_expected
         return result
@@ -2504,6 +2633,7 @@ async def _stream_completion(
     prompt_tokens: list[int] | None = None,
     cache_id: str = "",
     keep_alive: str | None = None,
+    grammar_active: bool = False,
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
@@ -2616,7 +2746,21 @@ async def _stream_completion(
                 lm, tokens, original_prompt, max_tokens, broadcast_kwargs
             )
 
-        if lm.is_speculative and not images:
+        if lm.is_speculative and not images and grammar_active:
+            # Speculative decoders do not consume gen_kwargs["logits_processors"],
+            # so a grammar-constrained request would bypass the mask entirely.
+            # Disable speculative for this request (issue #361). Constrain-after-
+            # verify across the 4 speculative strategies is a follow-up.
+            logger.warning(
+                "Speculative decoding disabled for this request: "
+                "grammar-constrained decoding is not yet plumbed through "
+                "the speculative path"
+            )
+            use_speculative = False
+        else:
+            use_speculative = lm.is_speculative and not images
+
+        if use_speculative:
             from olmlx.engine.speculative_stream import async_speculative_stream
 
             # Speculative decoding uses greedy argmax; sampling params are not supported.
@@ -2872,6 +3016,7 @@ async def _full_completion(
     prompt_tokens: list[int] | None = None,
     cache_id: str = "",
     keep_alive: str | None = None,
+    grammar_active: bool = False,
 ) -> dict:
     # inference_timeout is not enforced for non-streaming: the GPU thread
     # cannot be safely cancelled (releasing the lock while Metal is still
@@ -2928,6 +3073,7 @@ async def _full_completion(
                     images,
                     has_tools=has_tools,
                     generated_tokens_out=generated_tokens if use_prompt_cache else None,
+                    grammar_active=grammar_active,
                 )
                 generation_complete = True
 
@@ -2980,6 +3126,7 @@ async def _full_completion_inner(
     has_tools: bool = False,
     *,
     generated_tokens_out: list[int] | None = None,
+    grammar_active: bool = False,
 ) -> dict:
     def _generate_sync():
         """Run generate + synchronize in the same thread so GPU work completes
@@ -2992,6 +3139,20 @@ async def _full_completion_inner(
             _maybe_broadcast_distributed(lm, tokens, prompt, max_tokens, gen_kwargs)
 
         _apply_seed(gen_kwargs, consume=not lm.is_vlm)
+
+        # Decide speculative use explicitly (mirrors _stream_completion).
+        # The disable-on-grammar path is taken when both speculative is
+        # loaded and grammar is requested for this request; otherwise
+        # fall through to the speculative branch unchanged.
+        if lm.is_speculative and grammar_active and not (lm.is_vlm and images):
+            logger.warning(
+                "Speculative decoding disabled for this request: "
+                "grammar-constrained decoding is not yet plumbed through "
+                "the speculative path"
+            )
+            use_speculative = False
+        else:
+            use_speculative = lm.is_speculative
 
         if lm.is_vlm and images:
             if lm.is_speculative:
@@ -3012,7 +3173,7 @@ async def _full_completion_inner(
             from mlx_vlm.generate import (
                 generation_stream,
             )  # used by mx.synchronize below
-        elif lm.is_speculative:
+        elif use_speculative:
             import threading
 
             from olmlx.engine.speculative_stream import (
@@ -3183,6 +3344,7 @@ async def generate_chat(
     max_tokens: int = ...,
     cache_id: str = ...,
     enable_thinking: bool | None = ...,
+    grammar_spec: GrammarSpec | None = ...,
 ) -> AsyncGenerator[dict, None]: ...
 
 
@@ -3199,6 +3361,7 @@ async def generate_chat(
     max_tokens: int = ...,
     cache_id: str = ...,
     enable_thinking: bool | None = ...,
+    grammar_spec: GrammarSpec | None = ...,
 ) -> dict: ...
 
 
@@ -3214,6 +3377,7 @@ async def generate_chat(
     max_tokens: int = ...,
     cache_id: str = ...,
     enable_thinking: bool | None = ...,
+    grammar_spec: GrammarSpec | None = ...,
 ) -> AsyncGenerator[dict, None] | dict: ...
 
 
@@ -3228,6 +3392,7 @@ async def generate_chat(
     max_tokens: int = 512,
     cache_id: str = "",
     enable_thinking: bool | None = None,
+    grammar_spec: GrammarSpec | None = None,
 ) -> AsyncGenerator[dict, None] | dict:
     """Generate a chat completion."""
     stats = TimingStats()
@@ -3328,6 +3493,10 @@ async def generate_chat(
     gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
     mt = gen_kwargs.pop("max_tokens", max_tokens)
 
+    grammar_active = _install_grammar_processor(
+        lm, gen_kwargs, grammar_spec, has_tools=bool(tools)
+    )
+
     # Prompt caching applies to both streaming and non-streaming requests
     # (issue #342).  Disabled in distributed mode because rank 0 processes
     # only suffix tokens on cache hits while workers process the full
@@ -3384,6 +3553,7 @@ async def generate_chat(
                 prompt_tokens=prompt_tokens,
                 cache_id=cache_id,
                 keep_alive=keep_alive,
+                grammar_active=grammar_active,
             ),
             {"thinking_expected": thinking_expected},
         )
@@ -3400,6 +3570,7 @@ async def generate_chat(
             prompt_tokens=prompt_tokens,
             cache_id=cache_id,
             keep_alive=keep_alive,
+            grammar_active=grammar_active,
         )
         # Mirror the streaming meta chunk so non-streaming routers can gate
         # orphan `</think>` handling on the same signal (issue #307).

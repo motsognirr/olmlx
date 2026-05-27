@@ -2,9 +2,10 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from olmlx.engine.grammar import parse_response_format
 from olmlx.engine.inference import generate_completion
 from olmlx.engine.tool_parser import parse_model_output
 from olmlx.routers.common import format_error, resolve_think_flag
@@ -25,6 +26,10 @@ async def generate(req: GenerateRequest, request: Request):
     prompt = req.prompt
     max_tokens = options.pop("num_predict", 512)
     enable_thinking = resolve_think_flag(req.think)
+    try:
+        grammar_spec = parse_response_format(req.format)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     if req.stream:
         result = await generate_completion(
@@ -39,6 +44,7 @@ async def generate(req: GenerateRequest, request: Request):
             apply_chat_template=not req.raw,
             system=req.system if not req.raw else None,
             enable_thinking=enable_thinking,
+            grammar_spec=grammar_spec,
         )
 
         think_state: dict = {}
@@ -108,6 +114,7 @@ async def generate(req: GenerateRequest, request: Request):
             apply_chat_template=not req.raw,
             system=req.system if not req.raw else None,
             enable_thinking=enable_thinking,
+            grammar_spec=grammar_spec,
         )
         now = datetime.now(timezone.utc).isoformat()
         stats = result.get("stats")

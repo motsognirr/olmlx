@@ -17,6 +17,7 @@ dependencies = [
     "torchvision>=0.25.0",
     "mcp>=1.0",
     "rich>=13.0",
+    "xgrammar>=0.2.1",
 ]
 
 [project.scripts]
