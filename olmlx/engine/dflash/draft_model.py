@@ -338,14 +338,14 @@ class DFlashDraftModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = _build_rope(config)
 
-        # Locally-trained non-causal sliding drafts were trained without
-        # the sliding-causal mask on those layers (old olmlx versions).
-        # After gh#317 Gap 6 inference applies the mask unconditionally
-        # on sliding layers, creating a silent train/inference mismatch.
-        # The checkpoint does not record which code version trained it,
-        # so the mismatch is undetectable at load time — warn every
-        # model construction (logger.warning fires on every reload even
-        # in long-running servers, unlike warnings.warn).
+        # The warning fires for every non-causal sliding draft —
+        # including correctly-trained ones that were prepared with the
+        # patched pipeline.  The checkpoint format does not record which
+        # code version trained it, so we cannot distinguish legacy
+        # (mask-free) training from post-#317 (mask-applied) training.
+        # Newly-trained drafts correctly expect the mask at inference
+        # time and can safely ignore this warning; the heuristic "if
+        # acceptance is unexpectedly low, re-train" still holds.
         if any(
             t == "sliding_attention" and not config.attention_causal
             for t in config.layer_types
@@ -355,10 +355,10 @@ class DFlashDraftModel(nn.Module):
                 "layers with attention_causal=False.  As of gh#317 the "
                 "inference path applies a sliding-causal mask whenever "
                 "ctx_len + L > sliding_window regardless of the causal "
-                "flag.  Drafts trained with an older olmlx version were "
-                "trained without this mask and may show degraded "
-                "acceptance rates.  Re-train with the latest preparation "
-                "pipeline if acceptance is unexpectedly low.",
+                "flag.  Correctly-trained post-#317 drafts expect this "
+                "mask and can safely ignore this warning.  Older drafts "
+                "trained without the mask may show degraded acceptance "
+                "rates — re-train if acceptance is unexpectedly low.",
                 config.num_hidden_layers,
             )
 

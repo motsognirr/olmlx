@@ -570,7 +570,8 @@ class TestSlidingAttentionMask:
         cache has not yet accumulated ``window`` keys, so
         ``ctx_len + L`` can land exactly at the window boundary.  In
         steady-state decoding with a full ``RotatingKVCache`` the
-        boundary is unreachable (``ctx_len`` is always ``window``), so
+        boundary is unreachable (``ctx_len`` is always ``window - 1``
+        because ``max_size = window - 1``), so
         the ``>`` threshold only matters during the initial cache
         fill-up.  Matching upstream z-lab/dflash, the spatial mask is
         only applied when the combined sequence strictly *exceeds* the
