@@ -1,0 +1,5 @@
+[
+  {"question": "Janet's ducks lay 16 eggs per day. She eats 3 and bakes 4. She sells the rest at $2 each. Daily earnings?", "answer": "She eats 3 and bakes 4, so 16-7=9 left. 9*2=18.\n#### 18"},
+  {"question": "What is 12 + 4?", "answer": "12+4=16.\n#### 16"},
+  {"question": "A train goes 60 mph for 2 hours. Distance?", "answer": "60*2=120.\n#### 120"}
+]

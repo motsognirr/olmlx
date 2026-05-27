@@ -1,0 +1,11 @@
+{
+  "model": "org/big-moe",
+  "tier": "core_only",
+  "assignment": "core_minus_gpqa",
+  "warmup_tok_per_s": 7.5,
+  "per_suite_pass_rate": {"humaneval-plus": 0.90, "gsm8k": 0.95},
+  "composite": 0.925,
+  "prompts": [],
+  "speed": {"decode_tok_per_s_p50": 7.5, "ttft_p50_ms": 850.0},
+  "elapsed_seconds": 8765.4
+}

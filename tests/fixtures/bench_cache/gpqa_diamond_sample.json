@@ -1,0 +1,8 @@
+[
+  {
+    "question": "What is the spin of an electron?",
+    "correct": "1/2",
+    "incorrect": ["1", "0", "3/2"],
+    "domain": "Physics"
+  }
+]

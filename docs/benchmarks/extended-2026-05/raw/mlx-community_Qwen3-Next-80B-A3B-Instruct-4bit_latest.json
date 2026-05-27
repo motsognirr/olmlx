@@ -1,0 +1,1096 @@
+{
+  "model": "mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit:latest",
+  "tier": "core_only",
+  "assignment": "full_core",
+  "warmup_tok_per_s": 16.080186745640752,
+  "per_suite_pass_rate": {
+    "humaneval-plus": 0.94,
+    "gsm8k": 0.9714285714285714
+  },
+  "composite": 0.9557142857142857,
+  "prompts": [
+    {
+      "name": "humaneval-plus-0",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    for i in range(len(numbers)):\n        for j in range(i + 1, len(numbers)):\n            if abs(numbers[i] - numbers[j]) < threshold:\n                return True\n    return False\n```"
+    },
+    {
+      "name": "humaneval-plus-3",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef below_zero(operations: List[int]) -> bool:\n    balance = 0\n    for op in operations:\n        balance += op\n        if balance < 0:\n            return True\n    return False\n```"
+    },
+    {
+      "name": "humaneval-plus-7",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef filter_by_substring(strings: List[str], substring: str) -> List[str]:\n    return [s for s in strings if substring in s]\n```"
+    },
+    {
+      "name": "humaneval-plus-10",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef is_palindrome(string: str) -> bool:\n    \"\"\" Test if given string is a palindrome \"\"\"\n    return string == string[::-1]\n\n\ndef make_palindrome(string: str) -> str:\n    \"\"\" Find the shortest palindrome that begins with a supplied string.\n    Algorithm idea is simple:\n    - Find the longest postfix of supplied string that is a palindrome.\n    - Append to the end of the string reverse of a string prefix that comes before the palindromic suffix.\n    >>> make_palindrome('')\n    ''\n    >>>"
+    },
+    {
+      "name": "humaneval-plus-13",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef greatest_common_divisor(a: int, b: int) -> int:\n    \"\"\" Return a greatest common divisor of two integers a and b\n    >>> greatest_common_divisor(3, 5)\n    1\n    >>> greatest_common_divisor(25, 15)\n    5\n    \"\"\"\n    while b:\n        a, b = b, a % b\n    return abs(a)\n```"
+    },
+    {
+      "name": "humaneval-plus-16",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef count_distinct_characters(string: str) -> int:\n    return len(set(string.lower()))\n```"
+    },
+    {
+      "name": "humaneval-plus-20",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef find_closest_elements(numbers: List[float]) -> Tuple[float, float]:\n    min_diff = float('inf')\n    closest_pair = (numbers[0], numbers[1])\n    \n    for i in range(len(numbers)):\n        for j in range(i + 1, len(numbers)):\n            diff = abs(numbers[i] - numbers[j])\n            if diff < min_diff:\n                min_diff = diff\n                smaller = min(numbers[i], numbers[j])\n                larger = max(numbers[i], numbers[j])\n                closest_pair = (smaller, la"
+    },
+    {
+      "name": "humaneval-plus-23",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef strlen(string: str) -> int:\n    \"\"\" Return length of given string\n    >>> strlen('')\n    0\n    >>> strlen('abc')\n    3\n    \"\"\"\n    return len(string)\n```"
+    },
+    {
+      "name": "humaneval-plus-26",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef remove_duplicates(numbers: List[int]) -> List[int]:\n    count = {}\n    for num in numbers:\n        count[num] = count.get(num, 0) + 1\n    return [num for num in numbers if count[num] == 1]\n```"
+    },
+    {
+      "name": "humaneval-plus-30",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef get_positive(l: list):\n    \"\"\"Return only positive numbers in the list.\n    >>> get_positive([-1, 2, -4, 5, 6])\n    [2, 5, 6]\n    >>> get_positive([5, 3, -5, 2, -3, 3, 9, 0, 123, 1, -10])\n    [5, 3, 2, 3, 9, 123, 1]\n    \"\"\"\n    return [x for x in l if x > 0]\n```"
+    },
+    {
+      "name": "humaneval-plus-33",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef sort_third(l: list):\n    \"\"\"This function takes a list l and returns a list l' such that\n    l' is identical to l in the indicies that are not divisible by three, while its values at the indicies that are divisible by three are equal\n    to the values of the corresponding indicies of l, but sorted.\n    >>> sort_third([1, 2, 3])\n    [1, 2, 3]\n    >>> sort_third([5, 6, 3, 4, 8, 9, 2])\n    [2, 6, 3, 4, 8, 9, 5]\n    \"\"\"\n    # Extract values at indices divisible by 3\n    third_values = "
+    },
+    {
+      "name": "humaneval-plus-36",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef fizz_buzz(n: int):\n    \"\"\"Return the number of times the digit 7 appears in integers less than n which are divisible by 11 or 13.\n    >>> fizz_buzz(50)\n    0\n    >>> fizz_buzz(78)\n    2\n    >>> fizz_buzz(79)\n    3\n    \"\"\"\n    count = 0\n    for i in range(1, n):\n        if i % 11 == 0 or i % 13 == 0:\n            count += str(i).count('7')\n    return count\n```"
+    },
+    {
+      "name": "humaneval-plus-39",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef prime_fib(n: int):\n    \"\"\"\n    prime_fib returns n-th number that is a Fibonacci number and it's also prime.\n    >>> prime_fib(1)\n    2\n    >>> prime_fib(2)\n    3\n    >>> prime_fib(3)\n    5\n    >>> prime_fib(4)\n    13\n    >>> prime_fib(5)\n    89\n    \"\"\"\n    if n <= 0:\n        return None\n\n    def is_prime(num):\n        if num < 2:\n            return False\n        if num == 2:\n            return True\n        if num % 2 == 0:\n            return False\n        for i in range(3, int(num"
+    },
+    {
+      "name": "humaneval-plus-43",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef pairs_sum_to_zero(l):\n    seen = set()\n    for num in l:\n        if -num in seen:\n            return True\n        seen.add(num)\n    return False\n```"
+    },
+    {
+      "name": "humaneval-plus-46",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef fib4(n: int):\n    \"\"\"The Fib4 number sequence is a sequence similar to the Fibbonacci sequnece that's defined as follows:\n    fib4(0) -> 0\n    fib4(1) -> 0\n    fib4(2) -> 2\n    fib4(3) -> 0\n    fib4(n) -> fib4(n-1) + fib4(n-2) + fib4(n-3) + fib4(n-4).\n    Please write a function to efficiently compute the n-th element of the fib4 number sequence.  Do not use recursion.\n    >>> fib4(5)\n    4\n    >>> fib4(6)\n    8\n    >>> fib4(7)\n    14\n    \"\"\"\n    if n == 0:\n        return 0\n    eli"
+    },
+    {
+      "name": "humaneval-plus-49",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef modp(n: int, p: int):\n    \"\"\"Return 2^n modulo p (be aware of numerics).\n    >>> modp(3, 5)\n    3\n    >>> modp(1101, 101)\n    2\n    >>> modp(0, 101)\n    1\n    >>> modp(3, 11)\n    8\n    >>> modp(100, 101)\n    1\n    \"\"\"\n    if p == 1:\n        return 0\n    result = 1\n    base = 2 % p\n    while n > 0:\n        if n % 2 == 1:\n            result = (result * base) % p\n        base = (base * base) % p\n        n //= 2\n    return result\n```"
+    },
+    {
+      "name": "humaneval-plus-52",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef below_threshold(l: list, t: int):\n    \"\"\"Return True if all numbers in the list l are below threshold t.\n    >>> below_threshold([1, 2, 4, 10], 100)\n    True\n    >>> below_threshold([1, 20, 4, 10], 5)\n    False\n    \"\"\"\n    return all(x < t for x in l)\n```"
+    },
+    {
+      "name": "humaneval-plus-56",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef correct_bracketing(brackets: str):\n    \"\"\" brackets is a string of \"<\" and \">\".\n    return True if every opening bracket has a corresponding closing bracket.\n\n    >>> correct_bracketing(\"<\")\n    False\n    >>> correct_bracketing(\"<>\")\n    True\n    >>> correct_bracketing(\"<<><>>\")\n    True\n    >>> correct_bracketing(\"><<>\")\n    False\n    \"\"\"\n    balance = 0\n    for bracket in brackets:\n        if bracket == \"<\":\n            balance += 1\n        else:\n            balance -= 1\n        "
+    },
+    {
+      "name": "humaneval-plus-59",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef largest_prime_factor(n: int):\n    \"\"\"Return the largest prime factor of n. Assume n > 1 and is not a prime.\n    >>> largest_prime_factor(13195)\n    29\n    >>> largest_prime_factor(2048)\n    2\n    \"\"\"\n    factor = 2\n    while factor * factor <= n:\n        while n % factor == 0:\n            n //= factor\n        factor += 1\n    return n\n```"
+    },
+    {
+      "name": "humaneval-plus-62",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef derivative(xs: list):\n    \"\"\" xs represent coefficients of a polynomial.\n    xs[0] + xs[1] * x + xs[2] * x^2 + ....\n     Return derivative of this polynomial in the same form.\n    >>> derivative([3, 1, 2, 4, 5])\n    [1, 4, 12, 20]\n    >>> derivative([1, 2, 3])\n    [2, 6]\n    \"\"\"\n    if len(xs) <= 1:\n        return []\n    return [i * xs[i] for i in range(1, len(xs))]\n```"
+    },
+    {
+      "name": "humaneval-plus-66",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef digitSum(s):\n    return sum(ord(c) for c in s if c.isupper())\n```"
+    },
+    {
+      "name": "humaneval-plus-69",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef search(lst):\n    from collections import Counter\n    \n    freq = Counter(lst)\n    max_val = -1\n    \n    for num, count in freq.items():\n        if num > 0 and count >= num:\n            max_val = max(max_val, num)\n    \n    return max_val\n```"
+    },
+    {
+      "name": "humaneval-plus-72",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef will_it_fly(q, w):\n    return q == q[::-1] and sum(q) <= w\n```"
+    },
+    {
+      "name": "humaneval-plus-75",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef is_multiply_prime(a):\n    if a < 2:\n        return False\n    \n    primes = []\n    n = a\n    d = 2\n    while d * d <= n:\n        while n % d == 0:\n            primes.append(d)\n            n //= d\n        d += 1\n    if n > 1:\n        primes.append(n)\n    \n    return len(primes) == 3 and all(p > 1 for p in primes)\n```"
+    },
+    {
+      "name": "humaneval-plus-79",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef decimal_to_binary(decimal):\n    binary_str = bin(decimal)[2:]\n    return f\"db{binary_str}db\"\n```"
+    },
+    {
+      "name": "humaneval-plus-82",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef prime_length(string):\n    n = len(string)\n    if n < 2:\n        return False\n    if n == 2:\n        return True\n    if n % 2 == 0:\n        return False\n    for i in range(3, int(n**0.5) + 1, 2):\n        if n % i == 0:\n            return False\n    return True\n```"
+    },
+    {
+      "name": "humaneval-plus-85",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef add(lst):\n    \"\"\"Given a non-empty list of integers lst. add the even elements that are at odd indices.\n\n\n    Examples:\n        add([4, 2, 6, 7]) ==> 2 \n    \"\"\"\n    total = 0\n    for i in range(1, len(lst), 2):\n        if lst[i] % 2 == 0:\n            total += lst[i]\n    return total\n```"
+    },
+    {
+      "name": "humaneval-plus-89",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef encrypt(s):\n    result = \"\"\n    for char in s:\n        if char.isalpha():\n            shift = 2 * 2\n            if char.islower():\n                encrypted_char = chr((ord(char) - ord('a') + shift) % 26 + ord('a'))\n            else:\n                encrypted_char = chr((ord(char) - ord('A') + shift) % 26 + ord('A'))\n            result += encrypted_char\n        else:\n            result += char\n    return result\n```"
+    },
+    {
+      "name": "humaneval-plus-92",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef any_int(x, y, z):\n    if not isinstance(x, int) or not isinstance(y, int) or not isinstance(z, int):\n        return False\n    return x == y + z or y == x + z or z == x + y\n```"
+    },
+    {
+      "name": "humaneval-plus-95",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef check_dict_case(dict):\n    if not dict:\n        return False\n    \n    keys = dict.keys()\n    if not all(isinstance(k, str) for k in keys):\n        return False\n    \n    all_lower = all(k.islower() for k in keys)\n    all_upper = all(k.isupper() for k in keys)\n    \n    return all_lower or all_upper\n```"
+    },
+    {
+      "name": "humaneval-plus-98",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef count_upper(s):\n    \"\"\"\n    Given a string s, count the number of uppercase vowels in even indices.\n    \n    For example:\n    count_upper('aBCdEf') returns 1\n    count_upper('abcdefg') returns 0\n    count_upper('dBBE') returns 0\n    \"\"\"\n    uppercase_vowels = {'A', 'E', 'I', 'O', 'U'}\n    count = 0\n    for i in range(0, len(s), 2):\n        if s[i] in uppercase_vowels:\n            count += 1\n    return count\n```"
+    },
+    {
+      "name": "humaneval-plus-102",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef choose_num(x, y):\n    \"\"\"This function takes two positive numbers x and y and returns the\n    biggest even integer number that is in the range [x, y] inclusive. If \n    there's no such number, then the function should return -1.\n\n    For example:\n    choose_num(12, 15) = 14\n    choose_num(13, 12) = -1\n    \"\"\"\n    if x > y:\n        return -1\n    for num in range(y, x - 1, -1):\n        if num % 2 == 0:\n            return num\n    return -1\n```"
+    },
+    {
+      "name": "humaneval-plus-105",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef by_length(arr):\n    digit_names = [\"One\", \"Two\", \"Three\", \"Four\", \"Five\", \"Six\", \"Seven\", \"Eight\", \"Nine\"]\n    filtered = [x for x in arr if 1 <= x <= 9]\n    filtered.sort()\n    filtered.reverse()\n    return [digit_names[x - 1] for x in filtered]\n```"
+    },
+    {
+      "name": "humaneval-plus-108",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef count_nums(arr):\n    def sum_of_digits(n):\n        if n == 0:\n            return 0\n        digits = []\n        if n < 0:\n            digits.append(-int(str(n)[1]))\n            digits.extend(int(d) for d in str(n)[2:])\n        else:\n            digits = [int(d) for d in str(n)]\n        return sum(digits)\n    \n    count = 0\n    for num in arr:\n        if sum_of_digits(num) > 0:\n            count += 1\n    return count\n```"
+    },
+    {
+      "name": "humaneval-plus-112",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef reverse_delete(s, c):\n    result = ''.join(char for char in s if char not in c)\n    is_palindrome = result == result[::-1]\n    return (result, is_palindrome)\n```"
+    },
+    {
+      "name": "humaneval-plus-115",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef max_fill(grid, capacity):\n    total_buckets = 0\n    for well in grid:\n        water_units = sum(well)\n        if water_units > 0:\n            total_buckets += math.ceil(water_units / capacity)\n    return total_buckets\n```"
+    },
+    {
+      "name": "humaneval-plus-118",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef get_closest_vowel(word):\n    vowels = set('aeiouAEIOU')\n    n = len(word)\n    if n < 3:\n        return \"\"\n    \n    for i in range(n - 2, 0, -1):\n        if word[i] in vowels and word[i - 1] not in vowels and word[i + 1] not in vowels:\n            return word[i]\n    return \"\"\n```"
+    },
+    {
+      "name": "humaneval-plus-121",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef solution(lst):\n    total = 0\n    for i in range(0, len(lst), 2):\n        if lst[i] % 2 == 1:\n            total += lst[i]\n    return total\n```"
+    },
+    {
+      "name": "humaneval-plus-125",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef split_words(txt):\n    if ' ' in txt:\n        return txt.split()\n    elif ',' in txt:\n        return txt.split(',')\n    else:\n        count = 0\n        for char in txt:\n            if char.islower() and ord(char) - ord('a') % 2 == 1:\n                count += 1\n        return count\n```"
+    },
+    {
+      "name": "humaneval-plus-128",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef prod_signs(arr):\n    if not arr:\n        return None\n    \n    product_of_signs = 1\n    sum_of_magnitudes = 0\n    \n    for num in arr:\n        if num > 0:\n            product_of_signs *= 1\n        elif num < 0:\n            product_of_signs *= -1\n        else:\n            product_of_signs *= 0\n        sum_of_magnitudes += abs(num)\n    \n    return product_of_signs * sum_of_magnitudes\n```"
+    },
+    {
+      "name": "humaneval-plus-131",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef digits(n):\n    product = 1\n    has_odd = False\n    for digit_char in str(n):\n        digit = int(digit_char)\n        if digit % 2 == 1:\n            product *= digit\n            has_odd = True\n    return product if has_odd else 0\n```"
+    },
+    {
+      "name": "humaneval-plus-134",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef check_if_last_char_is_a_letter(txt):\n    if not txt:\n        return False\n    if not txt[-1].isalpha():\n        return False\n    if len(txt) == 1:\n        return True\n    return txt[-2] == ' '\n```"
+    },
+    {
+      "name": "humaneval-plus-138",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef is_equal_to_sum_even(n):\n    \"\"\"Evaluate whether the given number n can be written as the sum of exactly 4 positive even numbers\n    Example\n    is_equal_to_sum_even(4) == False\n    is_equal_to_sum_even(6) == False\n    is_equal_to_sum_even(8) == True\n    \"\"\"\n    if n < 8:\n        return False\n    return n % 2 == 0\n```"
+    },
+    {
+      "name": "humaneval-plus-141",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef file_name_check(file_name):\n    if file_name.count('.') != 1:\n        return 'No'\n    \n    parts = file_name.split('.')\n    name_part = parts[0]\n    extension_part = parts[1]\n    \n    if not name_part:\n        return 'No'\n    \n    if not name_part[0].isalpha():\n        return 'No'\n    \n    digit_count = sum(1 for char in name_part if char.isdigit())\n    if digit_count > 3:\n        return 'No'\n    \n    if extension_part not in ['txt', 'exe', 'dll']:\n        return 'No'\n    \n    retu"
+    },
+    {
+      "name": "humaneval-plus-144",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef simplify(x, n):\n    num_x, den_x = map(int, x.split('/'))\n    num_n, den_n = map(int, n.split('/'))\n    \n    result_num = num_x * num_n\n    result_den = den_x * den_n\n    \n    return result_num % result_den == 0\n```"
+    },
+    {
+      "name": "humaneval-plus-148",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef bf(planet1, planet2):\n    planets = [\"Mercury\", \"Venus\", \"Earth\", \"Mars\", \"Jupiter\", \"Saturn\", \"Uranus\", \"Neptune\"]\n    if planet1 not in planets or planet2 not in planets:\n        return ()\n    index1 = planets.index(planet1)\n    index2 = planets.index(planet2)\n    if index1 > index2:\n        return tuple(planets[index2 + 1:index1])\n    else:\n        return tuple(planets[index1 + 1:index2])\n```"
+    },
+    {
+      "name": "humaneval-plus-151",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef double_the_difference(lst):\n    total = 0\n    for num in lst:\n        if isinstance(num, int) and num > 0 and num % 2 == 1:\n            total += num ** 2\n    return total\n```"
+    },
+    {
+      "name": "humaneval-plus-154",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef cycpattern_check(a, b):\n    if len(b) > len(a):\n        return False\n    rotated_b = b\n    for _ in range(len(b)):\n        if rotated_b in a:\n            return True\n        rotated_b = rotated_b[1:] + rotated_b[0]\n    return False\n```"
+    },
+    {
+      "name": "humaneval-plus-157",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef right_angle_triangle(a, b, c):\n    sides = sorted([a, b, c])\n    return abs(sides[0]**2 + sides[1]**2 - sides[2]**2) < 1e-9\n```"
+    },
+    {
+      "name": "humaneval-plus-161",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef solve(s):\n    letters = [c for c in s if c.isalpha()]\n    if not letters:\n        return s[::-1]\n    result = []\n    for char in s:\n        if char.isalpha():\n            if char.islower():\n                result.append(char.upper())\n            else:\n                result.append(char.lower())\n        else:\n            result.append(char)\n    return ''.join(result)\n```"
+    },
+    {
+      "name": "gsm8k-0000",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=160.0",
+      "output_text_clip": "Let's break this down step by step.\n\n---\n\n**Step 1: Understand the total file size and normal download speed**\n\n- Total file size: **200 GB**\n- Normal download speed: **2 GB/minute**\n\nSo, without any interruptions, the download would take:\n\n> 200 GB \u00f7 2 GB/min = **100 minutes**\n\n---\n\n**Step 2: What happens 40% of the way through?**\n\n40% of 200 GB is:\n\n> 0.4 \u00d7 200 = **80 GB**\n\nSo, Carla has downloaded 80 GB when the system restarts.\n\nTime taken to download 80 GB at 2 GB/min:\n\n> 80 \u00f7 2 = **40 minu"
+    },
+    {
+      "name": "gsm8k-0001",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=88.0",
+      "output_text_clip": "Let's solve this step by step.\n\nArtie sells three types of flowers with the following original prices:\n\n- Marigolds: $2.74 per pot  \n- Petunias: $1.87 per pot  \n- Begonias: $2.12 per pot  \n\nHe has no change, so he rounds **each price to the nearest dollar**.\n\n### Step 1: Round each price to the nearest dollar\n\n- Marigolds: $2.74 \u2192 The decimal part is 0.74, which is \u2265 0.5, so we round **up** to **$3**\n- Petunias: $1.87 \u2192 The decimal part is 0.87, which is \u2265 0.5, so we round **up** to **$2**\n- Beg"
+    },
+    {
+      "name": "gsm8k-0002",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=272.0",
+      "output_text_clip": "Let's break this down step by step.\n\n### Step 1: Calculate class hours on Mondays, Wednesdays, and Fridays\n- Kimo has **3 classes per day**, each **1 hour** long.\n- So, per day: 3 \u00d7 1 = **3 hours**\n- He has these classes on **3 days per week**: Monday, Wednesday, Friday\n- So per week: 3 days \u00d7 3 hours = **9 hours**\n\n### Step 2: Calculate class hours on Tuesdays and Thursdays\n- Kimo has **2 classes per day**, each **2 hours** long.\n- So, per day: 2 \u00d7 2 = **4 hours**\n- He has these classes on **2 "
+    },
+    {
+      "name": "gsm8k-0003",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=2.0",
+      "output_text_clip": "We are given two teams competing in a 4x400 meter relay. Each team has four runners, each running 400 meters (one lap). We need to compute the total time for each team and find the difference to determine by how many seconds the faster team wins.\n\n---\n\n**Team A (Well-rounded team):**  \nEach of the four runners runs 400 meters in **55 seconds**.  \nSo total time for Team A:  \n4 \u00d7 55 = **220 seconds**\n\n---\n\n**Team B (Less well-rounded team):**  \nTheir runners' times decrease by 3 seconds each time:"
+    },
+    {
+      "name": "gsm8k-0004",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=4.0",
+      "output_text_clip": "Let's solve this step by step.\n\nLet:\n- $ r $ = number of red chickens\n- $ w $ = number of white chickens\n\nWe are told:\n1. Each red chicken produces 3 eggs per day \u2192 total red eggs = $ 3r $\n2. Each white chicken produces 5 eggs per day \u2192 total white eggs = $ 5w $\n3. Total eggs collected per day = 42 \u2192 $ 3r + 5w = 42 $\n4. Jerry has two more white chickens than red chickens \u2192 $ w = r + 2 $\n\nNow substitute equation (4) into equation (3):\n\n$$\n3r + 5(r + 2) = 42\n$$\n\nExpand:\n\n$$\n3r + 5r + 10 = 42\n$$\n\nC"
+    },
+    {
+      "name": "gsm8k-0005",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=45.0",
+      "output_text_clip": "Let's break this down step by step.\n\nBrady has:\n\n1. **100 pennies**  \n   - Each penny is worth $0.01  \n   - So, 100 \u00d7 $0.01 = $1.00\n\n2. **40 nickels**  \n   - Each nickel is worth $0.05  \n   - So, 40 \u00d7 $0.05 = $2.00\n\n3. **20 dimes**  \n   - Each dime is worth $0.10  \n   - So, 20 \u00d7 $0.10 = $2.00\n\n4. **40 pieces of dollar bills**  \n   - Each is $1.00  \n   - So, 40 \u00d7 $1.00 = $40.00\n\nNow, add them all up:\n\n- Pennies: $1.00  \n- Nickels: $2.00  \n- Dimes: $2.00  \n- Dollar bills: $40.00  \n\nTotal = $1.00 +"
+    },
+    {
+      "name": "gsm8k-0006",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=370.0",
+      "output_text_clip": "Let's break this down step by step.\n\n### **Day 1:**\n- Pushups: 100  \n- Squats: 50  \n- Dumbbell presses: 20  \n\nTotal for Day 1:  \n100 + 50 + 20 = **170**\n\n### **Day 2:**\n- Pushups: 20 more than Day 1 \u2192 100 + 20 = **120**  \n- Squats: 10 fewer than Day 1 \u2192 50 - 10 = **40**  \n- Dumbbell presses: doubles Day 1 \u2192 20 \u00d7 2 = **40**\n\nTotal for Day 2:  \n120 + 40 + 40 = **200**\n\n### **Total for both days:**\nDay 1 + Day 2 = 170 + 200 = **370**\n\n#### 370"
+    },
+    {
+      "name": "gsm8k-0007",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=8400.0",
+      "output_text_clip": "Let's calculate the **net pay** for each job step by step.\n\n---\n\n### **Job A:**\n- Hourly wage: $15/hour  \n- Hours per year: 2000  \n- Gross income = 15 \u00d7 2000 = **$30,000**  \n- Tax rate: 20% (total tax rate)  \n- Taxes paid = 20% of $30,000 = 0.20 \u00d7 30,000 = **$6,000**  \n- **Net pay = Gross - Taxes = 30,000 - 6,000 = $24,000**\n\n---\n\n### **Job B:**\n- Gross income: $42,000  \n- Property tax: $6,000 (this is a flat fee, not a percentage)  \n- **Net income after property tax** = 42,000 - 6,000 = **$36,0"
+    },
+    {
+      "name": "gsm8k-0008",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=200.0",
+      "output_text_clip": "Let's solve this step by step.\n\n---\n\n**Step 1: Initial number of cannolis**\n\nWe are told Allan has **40 cannolis** in his house initially.\n\n> \"At Allan's house, there is twice as much corn as cannolis.\"\n\nSo, initial number of **corn** = 2 \u00d7 number of cannolis  \n= 2 \u00d7 40 = **80 corns**\n\n---\n\n**Step 2: Allan buys more items**\n\nHe buys:\n\n- **60 more cannolis**  \n  So, new total cannolis = 40 + 60 = **100 cannolis**\n\n- **40 fewer corns than the number of cannolis he bought**\n\nWait \u2014 \u201c40 fewer corns "
+    },
+    {
+      "name": "gsm8k-0009",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=49.0",
+      "output_text_clip": "Let's solve this step by step.\n\n---\n\n**Initial temperature:**  \nThe house starts at **40 degrees**.\n\n---\n\n**Step 1: Baking for 3 hours**  \nEvery hour the oven is on, the temperature rises by **5 degrees**.  \nSo for 3 hours:  \n3 hours \u00d7 5 degrees/hour = **15 degrees increase**\n\nNew temperature after baking:  \n40 + 15 = **55 degrees**\n\n---\n\n**Step 2: Opening the window for 30 minutes**  \nThe house cools down **2 degrees every 10 minutes**.\n\nSo, in 30 minutes, how many 10-minute intervals are there"
+    },
+    {
+      "name": "gsm8k-0010",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=172.0",
+      "output_text_clip": "We are told:\n\n- Ophelia has 20 sofas.\n- Both Ophelia and Jenna have 2 fewer sofas than chairs.\n- Jenna has 3 times as many chairs as Ophelia.\n\nWe are to find the **total number of sofas and chairs** that they have together.\n\n---\n\n### Step 1: Find Ophelia\u2019s number of chairs\n\nWe are told:  \n> Each has 2 fewer sofas than chairs.\n\nSo, for Ophelia:  \nNumber of sofas = Number of chairs - 2  \n\u2192 20 = chairs - 2  \n\u2192 Ophelia\u2019s chairs = 20 + 2 = **22**\n\n---\n\n### Step 2: Find Jenna\u2019s number of chairs\n\nWe ar"
+    },
+    {
+      "name": "gsm8k-0011",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=1800.0",
+      "output_text_clip": "Let's break this down step by step.\n\n---\n\n**Step 1: Find Ruiz\u2019s chocolate production rate per hour.**\n\nRuiz makes 120 pounds of chocolates in 2 hours.\n\nSo, per hour, Ruiz makes:\n$$\n\\frac{120}{2} = 60 \\text{ pounds per hour}\n$$\n\n---\n\n**Step 2: Find Marissa\u2019s chocolate production rate per hour.**\n\nThe problem says:  \n> Marissa makes 3/4 times as many pounds of chocolates in an hour as Ruiz makes in the two hours.\n\nRuiz makes **120 pounds in 2 hours**, so Marissa makes:\n$$\n\\frac{3}{4} \\times 120 = "
+    },
+    {
+      "name": "gsm8k-0012",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=2450.0",
+      "output_text_clip": "We are told that Helga dances for a total of 5 minutes. During 2 of those minutes, her arms are raised, and during the remaining 3 minutes, her arms are at her sides.\n\nWe need to calculate the total number of foot taps (right foot + left foot) over the entire 5 minutes.\n\n---\n\n### Step 1: Determine tap rates\n\n- **Arms at sides (3 minutes):**\n  - Right foot: 300 taps/minute\n  - Left foot: 250 taps/minute\n  - Total per minute: 300 + 250 = **550 taps/minute**\n\n- **Arms raised (2 minutes):**\n  - Righ"
+    },
+    {
+      "name": "gsm8k-0013",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=89.0",
+      "output_text_clip": "Let's break this problem down step by step.\n\n---\n\n### **Given:**\n\n- **Sticker to Button Values:**\n  - 1 **large sticker** = 1 **large button** OR 3 **small buttons**\n  - 1 **small sticker** = 1 **small button**\n  - 1 **large button** = 3 **small stickers**\n\n> Note: The last point says 1 large button = 3 small stickers. But we also have 1 small sticker = 1 small button. So 1 large button = 3 small buttons.\n\nSo we can summarize the equivalences:\n\n- 1 large sticker = 1 large button = 3 small button"
+    },
+    {
+      "name": "gsm8k-0014",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=70.0",
+      "output_text_clip": "Let's break this down step by step.\n\n---\n\n**Step 1: Find the pass rate for third graders.**\n\n- 340 out of 500 third-graders passed.\n- Pass rate = 340 / 500 = 0.68 or 68%\n\n---\n\n**Step 2: Find the pass rate for fourth graders.**\n\n- 40 out of 100 fourth-graders passed.\n- Pass rate = 40 / 100 = 0.40 or 40%\n\n---\n\n**Step 3: Find the pass rate for fifth graders.**\n\n- The pass rate for fifth graders is **twice** the fourth graders' pass rate.\n- Fourth graders\u2019 pass rate = 40% \u2192 so fifth graders\u2019 pass ra"
+    },
+    {
+      "name": "gsm8k-0015",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=11.0",
+      "output_text_clip": "Let's break this down step by step.\n\nThe total concert time is **2 hours**.  \nConvert that to minutes:  \n2 hours = 2 \u00d7 60 = **120 minutes**\n\nNow, for each group, the time required is:\n\n- 2 minutes to get on stage  \n- 6 minutes to perform  \n- 2 minutes to exit the stage  \n\nSo, total time per group = 2 + 6 + 2 = **10 minutes**\n\nAdditionally, there is a **10-minute intermission**.\n\nSo, the total time taken by the intermission is 10 minutes.\n\nThat leaves:  \n120 minutes (total) - 10 minutes (intermis"
+    },
+    {
+      "name": "gsm8k-0016",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=85000.0",
+      "output_text_clip": "Let's solve this step by step.\n\n### Step 1: Determine the calories in one mini cinnamon roll\n- A normal cinnamon roll has **600 calories**.\n- A mini cinnamon roll has **1/3** of that.\n\nSo:\n$$\n\\frac{1}{3} \\times 600 = 200 \\text{ calories per mini cinnamon roll}\n$$\n\n### Step 2: Determine the calories in one mini blueberry muffin\n- A normal blueberry muffin has **450 calories**.\n- A mini one has **1/3** of that.\n\nSo:\n$$\n\\frac{1}{3} \\times 450 = 150 \\text{ calories per mini blueberry muffin}\n$$\n\n###"
+    },
+    {
+      "name": "gsm8k-0017",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=227.0",
+      "output_text_clip": "We are given:\n\n- 3 racquets to be strung with **synthetic gut** \u2192 15 minutes each  \n- 5 racquets to be strung with **polyester** \u2192 22 minutes each  \n- 4 racquets to be strung with **hybrid** \u2192 18 minutes each  \n\nWe need to calculate the total time for all 12 racquets.\n\n---\n\n**Step 1: Time for synthetic gut racquets**\n\n3 racquets \u00d7 15 minutes = 45 minutes\n\n**Step 2: Time for polyester racquets**\n\n5 racquets \u00d7 22 minutes = 110 minutes\n\n**Step 3: Time for hybrid racquets**\n\n4 racquets \u00d7 18 minutes "
+    },
+    {
+      "name": "gsm8k-0018",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=36.0",
+      "output_text_clip": "Let's solve this step by step.\n\nWe are told:\n\n- Total number of questions: **60**\n- 40% of the questions are **easy**\n- The rest (60%) are **equally divided** between **average** and **difficult**\n\n---\n\n### Step 1: Find number of easy questions\n\n40% of 60 =  \n0.40 \u00d7 60 = **24 easy questions**\n\n---\n\n### Step 2: Find number of average and difficult questions\n\nTotal non-easy questions = 60 - 24 = **36**\n\nThese are equally divided between average and difficult:  \nSo, average = 36 \u00f7 2 = **18**  \nDiff"
+    },
+    {
+      "name": "gsm8k-0019",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=14.0",
+      "output_text_clip": "Let's solve this step by step.\n\n### Step 1: Glee Club\n- Ordered 20 pizzas.\n- Ate 70% of them.\n\nSo, number of pizzas eaten by glee club:\n70% of 20 = 0.70 \u00d7 20 = 14 pizzas eaten.\n\nTherefore, pizzas left from glee club:\n20 - 14 = 6 pizzas left.\n\n### Step 2: Football Team\n- Ordered **twice as many** pizzas as the glee club.\n- Glee club ordered 20, so football team ordered: 2 \u00d7 20 = 40 pizzas.\n- Ate 80% of them.\n\nPizzas eaten by football team:\n80% of 40 = 0.80 \u00d7 40 = 32 pizzas eaten.\n\nPizzas left fro"
+    },
+    {
+      "name": "gsm8k-0020",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=25.0",
+      "output_text_clip": "Let's break this down step by step.\n\n### Step 1: Initial setup\n- Ellen starts with a case of **12 sodas**.\n- She **shakes 3** of them \u2192 so 3 shaken, 9 unshaken.\n- She takes **1 unshaken soda for herself** \u2192 so now:\n  - Shaken sodas left: **3**\n  - Unshaken sodas left: **9 - 1 = 8**\n\n### Step 2: Ellen\u2019s brother takes sodas\n- He takes **1 shaken soda** and **2 unshaken sodas**.\n- So we subtract those from the remaining sodas:\n  - Shaken left: 3 - 1 = **2**\n  - Unshaken left: 8 - 2 = **6**\n\nNow, to"
+    },
+    {
+      "name": "gsm8k-0021",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=18.0",
+      "output_text_clip": "We are told that a toy manufacturer has an order for 400 toys. 5 workers are working a 10-hour shift. We need to find how many toys per hour the fifth worker produces, given that after the shift, they are still 20 toys short.\n\nLet\u2019s break it down step by step.\n\n### Step 1: Determine how many toys the first 4 workers produce.\n\n- **2 workers** produce **6 toys per hour** each.\n  - So together, they produce:  \n    $ 2 \\times 6 = 12 $ toys per hour.\n  - Over 10 hours:  \n    $ 12 \\times 10 = 120 $ to"
+    },
+    {
+      "name": "gsm8k-0022",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=19.0",
+      "output_text_clip": "Let's solve this step by step.\n\nWe are told that bandages come in bulk packs of 50.\n\nLet\u2019s denote the number of bandages they **started with on the first day** as **x**.\n\n---\n\n### **Day 1:**\n- Used: 38 bandages\n- Ordered: 1 bulk pack = 50 bandages\n- So, net change: -38 + 50 = +12 bandages\n- End of Day 1 stock: **x - 38 + 50 = x + 12**\n\n---\n\n### **Day 2:**\n- Used: 10 fewer than Day 1 \u2192 38 - 10 = 28 bandages\n- Ordered: 0 (not mentioned, so assume no order)\n- End of Day 2 stock: (x + 12) - 28 = **x"
+    },
+    {
+      "name": "gsm8k-0023",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3.0",
+      "output_text_clip": "Let's solve this step by step.\n\n### Step 1: Define variables\nLet:\n- $ c $ = number of cupcakes\n- $ b $ = number of brownies\n\nWe\u2019re told:\n> Carly makes 2 less than three times as many brownies as cupcakes.\n\nSo:\n$$\nb = 3c - 2\n$$\n\n### Step 2: Total treats\nCarly\u2019s class has 5 people, and each person gets 2 treats.\n\nSo total number of treats = $ 5 \\times 2 = 10 $\n\nTotal treats = cupcakes + brownies = $ c + b $\n\nSo:\n$$\nc + b = 10\n$$\n\n### Step 3: Substitute\nSubstitute the expression for $ b $ into the "
+    },
+    {
+      "name": "gsm8k-0024",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=70000.0",
+      "output_text_clip": "Let's break this down step by step.\n\n### Step 1: Determine the original value of the house\nJosh bought the house for **$80,000**.\n\n### Step 2: Add the repair costs\nHe spent **$50,000** on repairs.  \nSo his total investment = purchase price + repair costs  \n= $80,000 + $50,000 = **$130,000**\n\n### Step 3: Understand the value increase\nThe repairs **increased the value of the house by 150%**.\n\nThis means the **increase** in value is 150% of the **original value** (not of the total investment).\n\nSo,"
+    },
+    {
+      "name": "gsm8k-0025",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=83.0",
+      "output_text_clip": "We are given:\n\n- Maximum weight the bridge can carry: **5000 pounds**\n- Weight of the driver and empty truck: **3755 pounds**\n- Weight of each box: **15 pounds**\n- We need to find the **maximum number of boxes** that can be loaded without exceeding the bridge\u2019s limit.\n\n---\n\n### Step 1: Find how much weight is available for the boxes\n\nSubtract the weight of the driver and empty truck from the bridge\u2019s maximum capacity:\n\n$$\n5000 - 3755 = 1245 \\text{ pounds}\n$$\n\nSo, **1245 pounds** are available fo"
+    },
+    {
+      "name": "gsm8k-0026",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=500.0",
+      "output_text_clip": "Let's solve this step by step.\n\nPoppy has a 1000-piece jigsaw puzzle.\n\n**Step 1: Poppy places a quarter of the pieces.**\n\nA quarter of 1000 is:\n$$\n\\frac{1}{4} \\times 1000 = 250\n$$\n\nSo, Poppy places 250 pieces.\n\nThat leaves:\n$$\n1000 - 250 = 750 \\text{ pieces remaining}\n$$\n\n**Step 2: Her mom places a third of the remaining pieces.**\n\nA third of 750 is:\n$$\n\\frac{1}{3} \\times 750 = 250\n$$\n\nSo, Mom places 250 pieces.\n\nNow, the number of pieces left to be placed is:\n$$\n750 - 250 = 500\n$$\n\nTherefore, t"
+    },
+    {
+      "name": "gsm8k-0027",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=51.0",
+      "output_text_clip": "We are told there are four birds at the Caboose: Sally Two, Granny Red, Sally Four, and Sally Thirtytwo.\n\nWe are given:\n\n1. **Sally Four is the same age as Sally Thirtytwo.**\n2. **Sally Thirtytwo is 8 years old.**\n   \u2192 So, **Sally Four is also 8 years old.**\n\n3. **Granny Red is two times as old as Sally Four.**\n   \u2192 Sally Four = 8 \u2192 Granny Red = 2 \u00d7 8 = **16 years old**\n\n4. **Sally Two is three years older than Granny Red.**\n   \u2192 Granny Red = 16 \u2192 Sally Two = 16 + 3 = **19 years old**\n\nNow, we h"
+    },
+    {
+      "name": "gsm8k-0028",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=280.0",
+      "output_text_clip": "We are told that there were 1000 students in the hall. After the meeting, they exited through three exits: A, B, and C.\n\n### Step 1: Students exiting through exit A\n30% of the students went out through exit A.\n\nSo, number of students through A:\n$$\n0.30 \\times 1000 = 300\n$$\n\n### Step 2: Remaining students after exit A\nTotal students minus those who left through A:\n$$\n1000 - 300 = 700\n$$\n\n### Step 3: Students exiting through exit B\n3/5 of the remaining students (i.e., of the 700) went out through "
+    },
+    {
+      "name": "gsm8k-0029",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=3700.0",
+      "output_text_clip": "Let's break this down step by step.\n\n### Step 1: Determine how many weeks are in April\nApril has 30 days. Since a week has 7 days, we divide:\n\n30 \u00f7 7 = 4 weeks and 2 days\n\nSo April has **4 full weeks** and 2 extra days.\n\nBut Watson works **5 days a week**, and we need to know how many **workdays** he had in April.\n\nSince April has 30 days, and he works Monday to Friday (5 days a week), we can calculate the number of workdays in April.\n\nIn a 30-day month, there are usually **4 full weeks** (4 \u00d7 5"
+    },
+    {
+      "name": "gsm8k-0030",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=20.0",
+      "output_text_clip": "Let's break this down step by step.\n\n### Step 1: Find the distance from the third city back to the first city.\n\nWe are told:\n- Distance from City 1 to City 2: 75 miles  \n- Distance from City 2 to City 3: 100 miles  \n- Distance from City 3 to City 1: **50 miles less than the combined distance** of the first two legs.\n\nSo, combined distance of first two legs:  \n75 + 100 = 175 miles\n\nThen, distance from City 3 to City 1:  \n175 - 50 = 125 miles\n\n### Step 2: Find the total distance for one complete r"
+    },
+    {
+      "name": "gsm8k-0031",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3000.0",
+      "output_text_clip": "Let's think step by step.\n\n1. Stanley is standing at an elevation of **10,000 feet**.\n2. The comb falls **4,000 feet** from where Stanley is standing.\n   - So, the elevation of the comb = 10,000 - 4,000 = **6,000 feet**.\n3. Oliver is currently at an elevation of **3,000 feet**.\n4. To reach the comb, Oliver must climb from 3,000 feet to 6,000 feet.\n   - The difference in elevation = 6,000 - 3,000 = **3,000 feet**.\n\nSo, Oliver must climb **3,000 feet** to reach the comb.\n\n#### 3000"
+    },
+    {
+      "name": "gsm8k-0032",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3.0",
+      "output_text_clip": "Let's solve this step by step.\n\n1. **Price of the pen**:  \n   Theo bought a pen for **$2**.\n\n2. **Price of the piece of paper**:  \n   The paper costs **$1 less than three times the price of the pen**.  \n   Three times the price of the pen:  \n   $ 3 \\times 2 = 6 $  \n   $1 less than that:  \n   $ 6 - 1 = 5 $  \n   So, the paper costs **$5**.\n\n3. **Total cost**:  \n   Pen + Paper = $ 2 + 5 = 7 $  \n   Total cost is **$7**.\n\n4. **Amount given to cashier**:  \n   Theo gave **$10**.\n\n5. **Change received**"
+    },
+    {
+      "name": "gsm8k-0033",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=9.0",
+      "output_text_clip": "Let's solve this step by step.\n\nJackson is planting two types of tulips: red and blue.\n\n- He can fit **6 red tulips in a row**.\n- He can fit **8 blue tulips in a row**.\n\nHe has:\n- **36 red tulips**\n- **24 blue tulips**\n\nWe need to find out how many **rows** he will plant in total.\n\n---\n\n### Step 1: Calculate number of rows for red tulips\n\nHe has 36 red tulips, and each row holds 6.\n\nSo, number of red rows =  \n36 \u00f7 6 = **6 rows**\n\n---\n\n### Step 2: Calculate number of rows for blue tulips\n\nHe has "
+    },
+    {
+      "name": "gsm8k-0034",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=120.0",
+      "output_text_clip": "Let's break this down step by step.\n\n### Step 1: Determine how many cups and dishes Judy brought.\n\n- Judy bought **a dozen cups**.  \n  A dozen = 12 cups.\n\n- She bought **twice as many dishes as cups**.  \n  So, dishes = 2 \u00d7 12 = **24 dishes**.\n\nSo, Judy brought:\n- **12 cups**\n- **24 dishes**\n\n### Step 2: Determine how many cups and dishes her friend brought.\n\n- Friend brought **40 cups**.\n\n- Friend brought **20 more dishes than Judy had brought**.  \n  Judy brought 24 dishes, so friend brought:  \n"
+    },
+    {
+      "name": "gsm8k-0035",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=43500.0",
+      "output_text_clip": "Let's break down the costs step by step.\n\n1. **Base price of the truck**:  \n   $30,000\n\n2. **King cab upgrade**:  \n   $7,500\n\n3. **Leather seats**:  \n   One-third the cost of the king cab.  \n   So, $ \\frac{1}{3} \\times 7,500 = 2,500 $\n\n4. **Running boards**:  \n   $500 less than the leather seats.  \n   So, $ 2,500 - 500 = 2,000 $\n\n5. **Upgraded exterior light package**:  \n   $1,500\n\nNow, add all the costs together:\n\n- Base: $30,000  \n- King cab: $7,500  \n- Leather seats: $2,500  \n- Running boards"
+    },
+    {
+      "name": "gsm8k-0036",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=7.0",
+      "output_text_clip": "We are told that Manolo bought:\n\n- 5 lollipops  \n- 4 candies  \n- Total cost: $3.20  \n\nEach lollipop costs $0.40.  \n\n### Step 1: Find the cost of 5 lollipops\nEach lollipop = $0.40  \nSo, 5 lollipops = 5 \u00d7 $0.40 = $2.00\n\n### Step 2: Find the cost of 4 candies\nTotal cost = cost of lollipops + cost of candies  \n$3.20 = $2.00 + cost of 4 candies  \n\u2192 Cost of 4 candies = $3.20 - $2.00 = $1.20\n\n### Step 3: Find the cost of 1 candy\nCost of 4 candies = $1.20  \nSo, cost of 1 candy = $1.20 \u00f7 4 = $0.30\n\n### S"
+    },
+    {
+      "name": "gsm8k-0037",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=4000.0",
+      "output_text_clip": "Let's break this down step by step.\n\nWe are told that Candy has a chair rental business with different rental numbers on weekdays and weekends.\n\n### Step 1: Understand the week structure\n- A week has 7 days: 5 weekdays (Monday to Friday) and 2 weekend days (Saturday and Sunday).\n- Weekday rentals: 60 chairs per day\n- Weekend rentals: 100 chairs per day\n\n### Step 2: Calculate chairs rented in one week\n- Weekdays: 5 days \u00d7 60 chairs = 300 chairs\n- Weekends: 2 days \u00d7 100 chairs = 200 chairs\n- Total"
+    },
+    {
+      "name": "gsm8k-0038",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=4.0",
+      "output_text_clip": "Let's solve this step by step.\n\n### Step 1: Determine total number of glass chips Milo has\nMilo has **two bags**, and each bag holds **72 chips**.\n\nSo total chips = 2 \u00d7 72 = **144 chips**\n\n### Step 2: Determine how many square inches of mosaic he can make\nIt takes **12 chips per square inch**.\n\nSo total square inches he can make = total chips \u00f7 chips per square inch  \n= 144 \u00f7 12 = **12 square inches**\n\n### Step 3: Determine the length of the mosaic\nMilo wants his mosaic to be **3 inches tall**.\n"
+    },
+    {
+      "name": "gsm8k-0039",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3430.0",
+      "output_text_clip": "We are told that a plague infects 10 people initially. Each day, every infected person infects 6 others. We need to find the total number of infected people after three days.\n\nLet\u2019s break this down day by day.\n\n---\n\n**Day 0 (Initial):**  \n10 people are infected.\n\n---\n\n**Day 1:**  \nEach of the 10 infected people infects 6 new people.  \nSo, new infections on Day 1: 10 \u00d7 6 = 60  \nTotal infected by end of Day 1:  \nInitial 10 + 60 new = **70**\n\nBut wait \u2014 we need to be careful. The problem says \"ever"
+    },
+    {
+      "name": "gsm8k-0040",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=60.0",
+      "output_text_clip": "Let's solve this step by step.\n\n### Step 1: Calculate the distance the bus traveled.\nThe bus travels at 60 miles per hour for 5 hours.\n\nDistance = Speed \u00d7 Time  \nSo, bus distance = 60 mph \u00d7 5 hours = **300 miles**\n\n### Step 2: Calculate the distance the car traveled.\nThe car travels at 30 miles per hour for 8 hours.\n\nDistance = Speed \u00d7 Time  \nSo, car distance = 30 mph \u00d7 8 hours = **240 miles**\n\n### Step 3: Find the difference in distance.\nBus distance - Car distance = 300 miles - 240 miles = **6"
+    },
+    {
+      "name": "gsm8k-0041",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=7.0",
+      "output_text_clip": "Let's break this down step by step.\n\n**Thursday:**  \nJoe caught 3 pounds of crawfish.\n\n**Friday:**  \nHe caught 4 times the amount he caught on Thursday.  \nSo:  \n4 \u00d7 3 pounds = 12 pounds\n\n**Saturday:**  \nHe caught half the amount he caught on Friday.  \nSo:  \n\u00bd \u00d7 12 pounds = 6 pounds\n\n**Total crawfish caught:**  \nThursday + Friday + Saturday  \n= 3 + 12 + 6 = 21 pounds\n\n**Servings:**  \nEach serving is 3 pounds.  \nSo total servings = total pounds \u00f7 pounds per serving  \n= 21 \u00f7 3 = 7 servings\n\n#### 7"
+    },
+    {
+      "name": "gsm8k-0042",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=450.0",
+      "output_text_clip": "Let's break this down step by step.\n\nWe are told:\n\n- It takes **75 large jelly beans** to fill Grandpa up.\n- He can eat **twice as many medium-sized beans as large beans**.\n- Eating **3 small beans** is the same as eating **1 medium-sized bean**.\n\n---\n\n### Step 1: Determine how many medium beans Grandpa can eat.\n\nSince he can eat **twice as many medium beans as large beans**, and he can eat 75 large beans:\n\n> Medium beans = 2 \u00d7 75 = **150 medium beans**\n\n---\n\n### Step 2: Convert medium beans to "
+    },
+    {
+      "name": "gsm8k-0043",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=30.0",
+      "output_text_clip": "Let's break this down step by step.\n\n---\n\n### Step 1: Normal classes per day\nA normal student has **6 periods** per day.\n\nJohn has **2 extra classes**, so he has:\n\n> 6 + 2 = **8 classes per day**\n\nEach class is **40 minutes** long.\n\nSo, daily class time:\n\n> 8 classes \u00d7 40 minutes = **320 minutes per day**\n\n---\n\n### Step 2: Weekly class time (Monday to Friday)\nHe goes to class **5 days a week**.\n\n> 320 minutes/day \u00d7 5 days = **1600 minutes per week**\n\n---\n\n### Step 3: Extra learning time on Satur"
+    },
+    {
+      "name": "gsm8k-0044",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=20.0",
+      "output_text_clip": "Let's solve this step by step.\n\nWe are told:\n\n- Jim collected **27** seashells.\n- Jim collected **5 more** than Carlos.  \n  So, Carlos collected:  \n  $ 27 - 5 = 22 $ seashells.\n\n- Carlos collected **twice as many** as Carrey.  \n  So, Carrey collected:  \n  $ 22 \\div 2 = 11 $ seashells.\n\nNow, total seashells collected by all three:\n\n- Jim: 27  \n- Carlos: 22  \n- Carrey: 11  \n\nTotal = $ 27 + 22 + 11 = 60 $\n\nThey divided the seashells **equally** among the three.\n\nSo, each person gets:  \n$ 60 \\div 3 "
+    },
+    {
+      "name": "gsm8k-0045",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=448.0",
+      "output_text_clip": "Let's solve this step by step.\n\n### Step 1: Determine the amount of each medicine in one dose.\n\n- First medicine: 14 mL  \n- Second medicine: 3 times the amount of the first medicine  \n  \u2192 3 \u00d7 14 mL = 42 mL\n\n### Step 2: Find the total amount of medicine in one dose.\n\nAdd both medicines together:  \n14 mL + 42 mL = **56 mL per dose**\n\n### Step 3: Find the total amount for 8 doses.\n\nMultiply the amount per dose by 8:  \n56 mL/dose \u00d7 8 doses = **448 mL**\n\n### Final Answer:\n#### 448"
+    },
+    {
+      "name": "gsm8k-0046",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=36.0",
+      "output_text_clip": "Let's break this down step by step.\n\n### Step 1: Understand the base recipe\n- **1 gallon of regular lemonade** requires **1 cup of lemon juice**.\n- **6 lemons** yield **1 cup of lemon juice**.\n\nSo, for **1 gallon**, Tim needs **6 lemons**.\n\n### Step 2: Calculate lemons for the 4 gallons for the party\n- 4 gallons \u00d7 6 lemons/gallon = **24 lemons**\n\n### Step 3: Allen wants an extra gallon that is **twice as tart**\n- \u201cTwice as tart\u201d means **twice as much lemon juice** per gallon.\n- So, instead of 1 "
+    },
+    {
+      "name": "gsm8k-0047",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=18.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1. **Total eggs laid per day**:  \n   Janet\u2019s ducks lay **16 eggs per day**.\n\n2. **Eggs used for breakfast**:  \n   She eats **3 eggs** for breakfast every morning.\n\n3. **Eggs used for baking muffins**:  \n   She uses **4 eggs** to bake muffins for her friends.\n\n4. **Total eggs used (breakfast + baking)**:  \n   3 (breakfast) + 4 (baking) = **7 eggs used**.\n\n5. **Eggs remaining for sale**:  \n   16 (total) - 7 (used) = **9 eggs** left to sell.\n\n6. **Price per egg "
+    },
+    {
+      "name": "gsm8k-0048",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=1430.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1. **Cost of material**: Janet pays $500 for the material.\n\n2. **Cost of construction**: She pays $800 for the jeweler to construct the brooch.\n\nSo, the total cost before insurance is:\n$500 (material) + $800 (construction) = **$1,300**\n\n3. **Insurance cost**: She pays 10% of the total cost ($1,300) to get it insured.\n\n10% of $1,300 = 0.10 \u00d7 1300 = **$130**\n\n4. **Total amount paid**:\n$1,300 (material + construction) + $130 (insurance) = **$1,430**\n\n#### 1430"
+    },
+    {
+      "name": "gsm8k-0049",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=82.0",
+      "output_text_clip": "Let's solve this step by step.\n\n1. Dylan bought **38 chicken sausages**.\n\n2. He bought **6 more fish sausages than chicken sausages**.  \n   So, number of fish sausages = 38 + 6 = **44**.\n\n3. To find the total number of sausages, add chicken and fish sausages together:  \n   Total = chicken sausages + fish sausages  \n   Total = 38 + 44 = **82**\n\nSo, Dylan bought a total of 82 sausages.\n\n#### 82"
+    },
+    {
+      "name": "gsm8k-0050",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=5.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1. **Eggs needed per flan**:  \n   Sandra needs **3 eggs** to make **1 Spanish flan**.\n\n2. **Total flans needed**:  \n   She needs to make **15 Spanish flans**.\n\n3. **Total eggs needed**:  \n   Multiply the number of flans by eggs per flan:  \n   $ 15 \\text{ flans} \\times 3 \\text{ eggs/flan} = 45 \\text{ eggs} $\n\n4. **Eggs per babysitting session**:  \n   Sandra gets **9 eggs** each time she babysits.\n\n5. **Number of babysitting sessions needed**:  \n   Divide total"
+    },
+    {
+      "name": "gsm8k-0051",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=9.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1. **Traveling from New Jersey to Rochester by bus**:  \n   It takes **6 days**.\n\n2. **Traveling by car**:  \n   It takes **half as many days** as by bus.  \n   So, car travel time = 6 \u00f7 2 = **3 days**.\n\n3. **Andrew's plan**:  \n   - Go to Rochester **by bus**: 6 days  \n   - Return from Rochester **by car**: 3 days  \n\n4. **Total travel time**:  \n   6 days (bus) + 3 days (car) = **9 days**\n\n#### 9"
+    },
+    {
+      "name": "gsm8k-0052",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=762.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1. **First bag**:  \n   It has **300** M&Ms.\n\n2. **Second bag**:  \n   It has **12 more** than the first bag.  \n   So:  \n   $ 300 + 12 = 312 $ M&Ms.\n\n3. **Third bag**:  \n   It has a hole, so it has **half** the number of M&Ms as the first bag.  \n   So:  \n   $ \\frac{300}{2} = 150 $ M&Ms.\n\nNow, add them all together:\n\n- First bag: 300  \n- Second bag: 312  \n- Third bag: 150  \n\nTotal:  \n$ 300 + 312 + 150 $\n\nLet\u2019s compute that:\n\n$ 300 + 312 = 612 $  \n$ 612 + 150 = 7"
+    },
+    {
+      "name": "gsm8k-0053",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=1.0",
+      "output_text_clip": "Let's solve this step by step.\n\n1. The book costs $4.\n\n2. The magazine costs half as much as the book.  \n   So, magazine cost = \u00bd \u00d7 $4 = $2.\n\n3. The pen costs $1 less than the magazine.  \n   So, pen cost = $2 - $1 = $1.\n\nTherefore, the pen costs $1.\n\n#### 1"
+    },
+    {
+      "name": "gsm8k-0054",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=21.0",
+      "output_text_clip": "Let's solve this step by step.\n\n1. Rachel initially bought **23 cookies**.\n2. Janet gave her **42 more cookies**.\n   - So, total cookies Rachel has now:  \n     23 + 42 = **65 cookies**\n3. Her brother ate **44 cookies**.\n   - So, we subtract 44 from the total:  \n     65 - 44 = **21 cookies**\n\nTherefore, the number of cookies left for Rachel is:\n\n#### 21"
+    },
+    {
+      "name": "gsm8k-0055",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=240.0",
+      "output_text_clip": "Let's solve this step by step.\n\n1. Marin eats 4 apples per day.\n2. Nancy eats 4 apples per day.\n3. Together, they eat:  \n   4 (Marin) + 4 (Nancy) = 8 apples per day.\n\n4. Over 30 days, the total number of apples they eat is:  \n   8 apples/day \u00d7 30 days = 240 apples.\n\nSo, the total number of apples they eat in 30 days is 240.\n\n#### 240"
+    },
+    {
+      "name": "gsm8k-0056",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=38.0",
+      "output_text_clip": "We are told:\n\n- Brett is currently 14 years old.\n- In four years, Angela will be three times as old as Brett is **now**.\n\nSo, first, find three times Brett\u2019s current age:\n\n3 \u00d7 14 = 42\n\nSo, in four years, Angela will be 42 years old.\n\nThat means Angela\u2019s current age is 42 minus 4:\n\n42 - 4 = 38\n\nSo, Angela is currently 38 years old.\n\n#### 38"
+    },
+    {
+      "name": "gsm8k-0057",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=2.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1. **Hourly wage**: John earns $2 per hour.\n\n2. **Hours per day**: He works 5 hours a day.\n\n   So, daily earnings = $2/hour \u00d7 5 hours = **$10 per day**.\n\n3. **Days per week**: He works 4 days a week.\n\n   So, weekly earnings = $10/day \u00d7 4 days = **$40 per week**.\n\n4. **Goal**: He wants to save $80.\n\n   To find how many weeks it will take, divide total savings goal by weekly earnings:\n\n   $$\n   \\frac{80}{40} = 2\n   $$\n\nSo, it will take John **2 weeks** to save "
+    },
+    {
+      "name": "gsm8k-0058",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=8.0",
+      "output_text_clip": "Let's think step by step.\n\nWe are told that Charmaine will be 16 years old in 12 years.\n\nThat means her current age is:\n\n16 - 12 = 4 years old.\n\nNow, we want to know how old she will be 4 years from now.\n\nSo, we add 4 years to her current age:\n\n4 + 4 = 8 years old.\n\nTherefore, Charmaine will be 8 years old 4 years from now.\n\n#### 8"
+    },
+    {
+      "name": "gsm8k-0059",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=53.0",
+      "output_text_clip": "Let's break this down step by step:\n\n1. A standard basketball game has 4 quarters.\n2. Each quarter is 12 minutes long.\n   - So, 4 quarters \u00d7 12 minutes = 48 minutes of regular game time.\n\n3. In the last quarter, there was a tie, so the game was extended.\n   - The extension is 5 minutes.\n\n4. To find the total game time, add the regular game time and the extension:\n   - 48 minutes + 5 minutes = 53 minutes.\n\nSo, the entire game lasted 53 minutes.\n\n#### 53"
+    },
+    {
+      "name": "gsm8k-0060",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=4.0",
+      "output_text_clip": "Let's break this down step by step.\n\n**Step 1: Find out how many boxes Castle bought this week.**\n\nShe bought:\n- 3 boxes of Coco Crunch\n- 5 boxes of Fruit Loops\n\nSo, total this week = 3 + 5 = **8 boxes**\n\n**Step 2: Note how many boxes she bought last week.**\n\nLast week, she bought **4 boxes** of cereal.\n\n**Step 3: Find the difference between this week and last week.**\n\nThis week: 8 boxes  \nLast week: 4 boxes  \n\nDifference = 8 - 4 = **4 boxes**\n\nSo, Castle bought 4 more boxes of cereal this week "
+    },
+    {
+      "name": "gsm8k-0061",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=142.0",
+      "output_text_clip": "Let's solve this step by step.\n\n1. **Tomato plants:**\n   - Ricardo planted 5 tomato plants.\n   - Each tomato plant yields 22 tomatoes.\n   - So, total tomatoes = 5 \u00d7 22 = 110 tomatoes.\n\n2. **Eggplant plants:**\n   - Ricardo planted 8 eggplant plants.\n   - Each eggplant plant yields 4 eggplants.\n   - So, total eggplants = 8 \u00d7 4 = 32 eggplants.\n\n3. **Total fruits:**\n   - Total fruits = total tomatoes + total eggplants\n   - Total fruits = 110 + 32 = 142 fruits.\n\n#### 142"
+    },
+    {
+      "name": "gsm8k-0062",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3.0",
+      "output_text_clip": "Let's break this down step by step:\n\n1. Jennifer bought **12 oranges** in total.\n\n2. She has **three daughters**, and she gave each daughter **2 oranges**.\n   - So, total oranges given to daughters = 3 daughters \u00d7 2 oranges = **6 oranges**\n\n3. She has **one boy**, and he got **3 oranges**.\n   - So, oranges given to the boy = **3 oranges**\n\n4. Total oranges given away = oranges to daughters + oranges to son\n   - 6 + 3 = **9 oranges**\n\n5. Oranges remaining = total oranges - oranges given away\n   -"
+    },
+    {
+      "name": "gsm8k-0063",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=250.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1. **Calculate total hours rented per month:**\n   John rents his car 10 times a month, and each rental is 3 hours.\n   So, total hours = 10 \u00d7 3 = 30 hours.\n\n2. **Calculate total income from rentals:**\n   He gets paid $25 per hour.\n   So, total income = 30 hours \u00d7 $25/hour = $750.\n\n3. **Subtract the car payment:**\n   His car payment is $500 per month.\n   So, profit = total income - car payment = $750 - $500 = $250.\n\nTherefore, John's profit is $250.\n\n#### 250"
+    },
+    {
+      "name": "gsm8k-0064",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=13.0",
+      "output_text_clip": "Let's break this down step by step:\n\n1. Jasmine was given **15 stickers** for participating in class.  \n   \u2192 So she has **15** stickers now.\n\n2. She **lost 7 stickers** during playtime.  \n   \u2192 We subtract 7 from her current total:  \n   15 - 7 = **8** stickers left.\n\n3. Then, her teacher gave her **another 5 stickers** for helping classmates.  \n   \u2192 We add 5 to her current total:  \n   8 + 5 = **13** stickers.\n\nSo, at the end, Jasmine has **13 stickers**.\n\n#### 13"
+    },
+    {
+      "name": "gsm8k-0065",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=66.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1. Ted buys **3 books**, each costing **$16**.\n   - Cost of books = 3 \u00d7 $16 = $48\n\n2. Ted buys **3 pencils**, each costing **$6**.\n   - Cost of pencils = 3 \u00d7 $6 = $18\n\n3. Total amount spent = cost of books + cost of pencils\n   - Total = $48 + $18 = $66\n\nSo, Ted spent a total of $66.\n\n#### 66"
+    },
+    {
+      "name": "gsm8k-0066",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=30.0",
+      "output_text_clip": "Let's solve this step by step.\n\nWe are told:\n\n- Mike is 24 years old.\n- Martha is 4 years younger than Mike.\n- Jeff is 10 years older than Martha.\n\n**Step 1: Find Martha\u2019s age.**\n\nMartha is 4 years younger than Mike.\n\nMike\u2019s age = 24  \nSo, Martha\u2019s age = 24 - 4 = **20**\n\n**Step 2: Find Jeff\u2019s age.**\n\nJeff is 10 years older than Martha.\n\nMartha\u2019s age = 20  \nSo, Jeff\u2019s age = 20 + 10 = **30**\n\n#### 30"
+    },
+    {
+      "name": "gsm8k-0067",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=32.0",
+      "output_text_clip": "Let's break this down step by step:\n\n1. **3 trees each had 7 blue birds**:  \n   So, 3 \u00d7 7 = 21 blue birds.\n\n2. **2 different trees each had 4 blue birds**:  \n   So, 2 \u00d7 4 = 8 blue birds.\n\n3. **1 final tree had 3 blue birds**:  \n   So, 1 \u00d7 3 = 3 blue birds.\n\nNow, add them all together:  \n21 (from the first group) + 8 (from the second group) + 3 (from the last tree) =  \n21 + 8 = 29  \n29 + 3 = 32\n\nSo, the total number of blue birds is 32.\n\n#### 32"
+    },
+    {
+      "name": "gsm8k-0068",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=100.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1. **Cost of color**:  \n   The problem states that coloring costs **$40**.  \n   So, color cost = $40.\n\n2. **Cost of haircut**:  \n   The haircut costs **$30 per inch** of hair cut off.  \n   May\u2019s hair started at **10 inches** and ended at **8 inches**, so the amount of hair cut off is:  \n   10 inches - 8 inches = **2 inches**.\n\n   So, cost of haircut = 2 inches \u00d7 $30 per inch = **$60**.\n\n3. **Total cost**:  \n   Color + Haircut = $40 + $60 = **$100**.\n\n#### 100"
+    },
+    {
+      "name": "gsm8k-0069",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=12.0",
+      "output_text_clip": "Let's solve this step by step.\n\n### Step 1: Determine John\u2019s new speaking speed\nJohn\u2019s original speaking speed is **150 WPM** (words per minute).\n\nAfter training, he is **2.5 times faster**.\n\nSo, his new speed is:\n```\n150 WPM \u00d7 2.5 = 375 WPM\n```\n\n### Step 2: Calculate total number of words in 10 pages\nEach page has **450 words**.\n\nSo, 10 pages have:\n```\n10 \u00d7 450 = 4500 words\n```\n\n### Step 3: Calculate time to speak 4500 words at 375 WPM\nTime (in minutes) = Total words \u00f7 Words per minute\n\n```\nTim"
+    }
+  ],
+  "speed": {},
+  "elapsed_seconds": 2914.698979333989,
+  "timed_out": false
+}

@@ -325,7 +325,13 @@ def grade_code_exec(output: str, expected: dict[str, Any]) -> QualityResult:
 
         try:
             proc = subprocess.run(
-                [sys.executable, "-I", "-S", script_path],
+                # -I isolates from user environment (no PYTHONPATH, no user
+                # site-packages, no script-dir on sys.path). We deliberately
+                # do NOT add -S — that would skip site.py and break imports
+                # of any third-party package from the active venv (numpy,
+                # which HumanEval+/MBPP+ tests routinely use). -I alone is
+                # restrictive enough for a single-user local tool.
+                [sys.executable, "-I", script_path],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -433,6 +439,13 @@ GRADERS: dict[str, Grader] = {
     "code_exec": grade_code_exec,
     "regression_snapshot": grade_regression_snapshot,
 }
+
+# Register graders defined in sibling modules. Bottom-of-file import is
+# intentional — keeps the GRADERS table extensible without circular issues
+# at top-of-module import time.
+from olmlx.bench.ifeval_grader import grade_ifeval  # noqa: E402
+
+GRADERS["ifeval"] = grade_ifeval
 
 
 def grade(grader_name: str, output: str, expected: dict[str, Any]) -> QualityResult:
