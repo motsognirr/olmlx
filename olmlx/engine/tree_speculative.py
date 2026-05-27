@@ -389,9 +389,9 @@ def _patch_target_for_tree_forward(
             "for this architecture."
         )
 
-    orig_call = inner.__call__
+    orig_call = type(inner).__call__
 
-    def _tree_call(inputs: mx.array, cache: Any = None) -> Any:
+    def _tree_call(self_: Any, inputs: mx.array, cache: Any = None) -> Any:
         h = embed_fn(inputs)
         if cache is None:
             cache = [None] * len(layers)
@@ -399,18 +399,18 @@ def _patch_target_for_tree_forward(
             h = layer(h, tree_mask, c)
         return norm_fn(h)
 
-    inner.__call__ = _tree_call
+    type(inner).__call__ = _tree_call  # type: ignore[method-assign]
     return orig_call
 
 
 def _restore_target(target: Any, orig_call: Any) -> None:
-    """Restore the model's original ``__call__`` after tree forward."""
+    """Restore the model's original __call__ after tree forward."""
     inner = target
     if hasattr(target, "language_model") and target.language_model is not None:
         inner = target.language_model
     elif hasattr(target, "model") and target.model is not None:
         inner = target.model
-    inner.__call__ = orig_call
+    type(inner).__call__ = orig_call  # type: ignore[method-assign]
 
 
 def extract_top_k_from_logits(
