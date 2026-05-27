@@ -211,7 +211,10 @@ class TestModelManager:
         Metal memory will be reclaimed by the next flush."""
         mock_manager._close_loaded_model = MagicMock()  # type: ignore[method-assign]
         with patch.object(
-            mock_manager, "_flush_metal", side_effect=RuntimeError("flush boom")
+            mock_manager,
+            "_flush_metal",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("flush boom"),
         ):
             result = await mock_manager.unload("qwen3")
         assert result is True
@@ -3110,7 +3113,8 @@ class TestMemoryCheck:
 
     @pytest.mark.asyncio
     async def test_cleanup_called_on_rejection(self, registry, mock_store):
-        """gc.collect() and mx.clear_cache() are called when a model is rejected."""
+        """_flush_metal is called twice when a model is rejected:
+        once pre-load and once post-rejection cleanup."""
         manager = ModelManager(registry, mock_store)
 
         mock_model = MagicMock()
@@ -3139,17 +3143,15 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.is_memory_pressure_high",
                 return_value=False,
             ),
-            patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
-            patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
-            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
+            patch.object(
+                manager, "_flush_metal", new_callable=AsyncMock
+            ) as mock_flush,
         ):
             with pytest.raises(MemoryError):
                 await manager.ensure_loaded("qwen3")
 
         # Called twice: once for pre-load cache flush, once for post-rejection cleanup
-        assert mock_gc.call_count == 2
-        assert mock_clear.call_count == 2
-        assert mock_sync.call_count == 2
+        assert mock_flush.await_count == 2
 
     @pytest.mark.asyncio
     async def test_cache_flushed_after_eviction(

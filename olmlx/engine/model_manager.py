@@ -1282,7 +1282,13 @@ class ModelManager:
             # the one that would schedule a deferred cleanup via
             # ``_schedule_deferred_cleanup``) can interleave between the two.
             if not self._pending_cleanups:
-                await self._flush_metal()
+                try:
+                    await self._flush_metal()
+                except Exception:
+                    logger.exception(
+                        "Metal flush failed before load; released "
+                        "memory will be drained on the next flush."
+                    )
 
             # Pre-load memory hygiene: if Metal memory is still under
             # pressure after eviction + close + gc, evict prompt caches
