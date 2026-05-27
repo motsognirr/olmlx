@@ -13,6 +13,7 @@ each score.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -344,7 +345,13 @@ def load_math500(n: int | None = 50) -> list[BenchPrompt]:
                 max_tokens=4096,
                 grader="regex_match",
                 expected={
-                    "pattern": r"\\boxed\{([^{}]+)\}",
+                    # Allow one level of brace nesting (\frac{...}{...},
+                    # \sqrt{...}, etc.) — the inner group can contain
+                    # balanced single-level braces. Previously the pattern
+                    # was [^{}]+ which silently scored 0 for any answer
+                    # containing nested braces (most non-trivial MATH-500
+                    # answers).
+                    "pattern": r"\\boxed\{((?:[^{}]|\{[^{}]*\})+)\}",
                     "group": 1,
                     "answer": r["answer"],
                 },
@@ -466,11 +473,21 @@ def load_gpqa_diamond(n: int | None = 60) -> list[BenchPrompt]:
     records = json.loads(cache_path.read_text(encoding="utf-8"))
     if n is not None:
         records = select_subset(records, n, key=lambda r: r.get("domain", "?"))
-    rng = random.Random(42)  # deterministic answer-position shuffling
     out: list[BenchPrompt] = []
     for i, r in enumerate(records):
         options = [r["correct"], *r["incorrect"]]
         order = list(range(4))
+        # Seed per-record so the same question gets the same shuffled
+        # letter regardless of where it falls in the selected subset.
+        # Previously a single Random(42) was shared across all records,
+        # which made record i's correct letter depend on n (and on how
+        # many records preceded it). hashlib is used instead of hash()
+        # because Python randomizes hash seeds across interpreter sessions.
+        seed = int.from_bytes(
+            hashlib.sha256(("gpqa-shuffle:" + r["question"]).encode()).digest()[:8],
+            "big",
+        )
+        rng = random.Random(seed)
         rng.shuffle(order)
         shuffled = [options[j] for j in order]
         correct_idx = order.index(0)

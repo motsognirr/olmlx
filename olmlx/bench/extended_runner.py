@@ -220,12 +220,17 @@ async def _drive_prompt(
         resp.raise_for_status()
         output = resp.json().get("message", {}).get("content", "")
     except (httpx.HTTPError, ValueError) as exc:
+        # Transport errors are graded as ungraded (passed=None), not failed.
+        # A 5xx or timeout doesn't tell us whether the model would have answered
+        # correctly — recording it as passed=False inflates failure counts and
+        # depresses the composite (see the gpt-oss-120b "5% corrupted" row in
+        # the May 2026 report). aggregate_per_suite skips passed=None.
         return PromptResult(
             name=prompt.name,
             category=prompt.category,
             suite=suite,
-            passed=False,
-            score=0.0,
+            passed=None,
+            score=None,
             detail=f"transport error: {exc!r}",
             output_text_clip="",
         )
@@ -255,7 +260,13 @@ async def _warmup(client: httpx.AsyncClient, model: str) -> float:
     resp.raise_for_status()
     data = resp.json()
     eval_count = data.get("eval_count", 0)
-    eval_duration_ns = data.get("eval_duration", 0) or 1
+    eval_duration_ns = data.get("eval_duration", 0)
+    # Use server-reported decode time when available — that excludes prompt
+    # processing and HTTP overhead. The previous `or 1` short-circuit was a
+    # bug: a missing or zero eval_duration would substitute 1 ns, yielding
+    # ~1B tok/s and always tripping FULL_CORE triage. Treat missing/zero as
+    # "unknown" and fall back to wall-clock (which overstates the model's
+    # decode time but at least gives a finite estimate).
     if eval_count > 0 and eval_duration_ns > 0:
         return eval_count / (eval_duration_ns / 1e9)
     return max(eval_count, 1) / max(elapsed, 0.001)

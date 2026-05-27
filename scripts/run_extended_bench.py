@@ -134,7 +134,7 @@ def _spawn_server(base_url: str) -> subprocess.Popen[bytes]:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    log.info("Spawned olmlx serve (PID %d), waiting for readiness…", proc.returncode)
+    log.info("Spawned olmlx serve (PID %d), waiting for readiness…", proc.pid)
     deadline = time.monotonic() + 60.0
     while time.monotonic() < deadline:
         try:

@@ -156,6 +156,11 @@ def _combination_two_responses(output: str, kwargs: dict[str, Any]) -> bool:
 
 def _combination_repeat_prompt(output: str, kwargs: dict[str, Any]) -> bool:
     prompt_to_repeat = kwargs.get("prompt_to_repeat", "")
+    # An empty/missing kwarg used to pass unconditionally because "" is in
+    # every string. Treat missing-or-empty as "constraint malformed → fail"
+    # rather than silently inflating the IFEval pass rate.
+    if not prompt_to_repeat:
+        return False
     return prompt_to_repeat in output
 
 
