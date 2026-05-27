@@ -606,10 +606,17 @@ class SpeculativeDecoder:
             elif trim_prompt_cache is not None:
                 trim_prompt_cache(self._target_cache, trim_amt)
             # Feed accepted tokens up to (but not including) the bonus.
+            # Re-enable GDN capture for the rebuild so linear-attention
+            # state stays consistent with the KV cache.
+            if self._target_gdn_buffer is not None and self._gdn_capture is not None:
+                self._target_gdn_buffer.clear()
+                self._gdn_capture.use_buffer(self._target_gdn_buffer)
             rebuild_tokens = accepted[:-1]  # [D1, ..., sibling]
             rebuild_arr = mx.array([rebuild_tokens])
             rebuild_out = _logits(self._target(rebuild_arr, cache=self._target_cache))
             mx.eval(rebuild_out)
+            if self._target_gdn_buffer is not None and self._gdn_capture is not None:
+                self._gdn_capture.use_buffer(None)
             rebuild_logits = rebuild_out[0]
             # The logit at the sibling's position predicts the bonus.
             self._last_target_logit = rebuild_logits[len(rebuild_tokens) - 1]
