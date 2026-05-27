@@ -1,0 +1,1096 @@
+{
+  "model": "clowncar/generalist:latest",
+  "tier": "core_only",
+  "assignment": "full_core",
+  "warmup_tok_per_s": 106.85744853050706,
+  "per_suite_pass_rate": {
+    "humaneval-plus": 0.56,
+    "gsm8k": 0.7571428571428571
+  },
+  "composite": 0.6585714285714286,
+  "prompts": [
+    {
+      "name": "humaneval-plus-0",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\" Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n    for i in range(len(numbers)):\n        for j in range(i + 1, len(numbers)):\n            if abs(numbers[i] - numbers[j]) < threshold:\n       "
+    },
+    {
+      "name": "humaneval-plus-3",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\"Detect if the balance of a bank account falls below zero at any point.\n    \n    Args:\n        operations: List of deposit and withdrawal operations.\n        \n    Returns:\n        True if the balance falls below zero at any point, False otherwise.\n    \"\"\"\n    balance = 0\n    for op in operations:\n        balance += op\n        if balance < 0:\n            return True\n    return False\n```"
+    },
+    {
+      "name": "humaneval-plus-7",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef filter_by_substring(strings: List[str], substring: str) -> List[str]:\n    \"\"\" Filter an input list of strings only for ones that contain given substring\n    >>> filter_by_substring([], 'a')\n    []\n    >>> filter_by_substring(['abc', 'bacd', 'cde', 'array'], 'a')\n    ['abc', 'bacd', 'array']\n    \"\"\"\n    return [s for s in strings if substring in s]\n```"
+    },
+    {
+      "name": "humaneval-plus-10",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef make_palindrome(string: str) -> str:\n    \"\"\" Find the shortest palindrome that begins with a supplied string.\n    Algorithm idea is simple:\n    - Find the longest postfix of supplied string that is a palindrome.\n    - Append to the end of the string reverse of a string prefix that comes before the palindromic suffix.\n    >>> make_palindrome('')\n    ''\n    >>> make_palindrome('cat')\n    'catac'\n    >>> make_palindrome('cata')\n    'catac'\n    \"\"\"\n    if not string:\n        return str"
+    },
+    {
+      "name": "humaneval-plus-13",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef greatest_common_divisor(a: int, b: int) -> int:\n    \"\"\" Return a greatest common divisor of two integers a and b\n    >>> greatest_common_divisor(3, 5)\n    1\n    >>> greatest_common_divisor(25, 15)\n    5\n    \"\"\"\n    while b != 0:\n        a, b = b, a % b\n    return a\n```"
+    },
+    {
+      "name": "humaneval-plus-16",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef count_distinct_characters(string: str) -> int:\n    \"\"\" Given a string, find out how many distinct characters (regardless of case) does it consist of\n    >>> count_distinct_characters('xyzXYZ')\n    3\n    >>> count_distinct_characters('Jerry')\n    4\n    \"\"\"\n    return len(set(string))\n```"
+    },
+    {
+      "name": "humaneval-plus-20",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List, Tuple\n\ndef find_closest_elements(numbers: List[float]) -> Tuple[float, float]:\n    \"\"\" From a supplied list of numbers (of length at least two) select and return two that are the closest to each\n    other and return them in order (smaller number, larger number).\n    >>> find_closest_elements([1.0, 2.0, 3.0, 4.0, 5.0, 2.2])\n    (2.0, 2.2)\n    >>> find_closest_elements([1.0, 2.0, 3.0, 4.0, 5.0, 2.0])\n    (2.0, 2.0)\n    \"\"\"\n    if len(numbers) < 2:\n        raise V"
+    },
+    {
+      "name": "humaneval-plus-23",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef strlen(string: str) -> int:\n    \"\"\" Return length of given string\n    >>> strlen('')\n    0\n    >>> strlen('abc')\n    3\n    \"\"\"\n    return len(string)\n```"
+    },
+    {
+      "name": "humaneval-plus-26",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef remove_duplicates(numbers: List[int]) -> List[int]:\n    \"\"\" From a list of integers, remove all elements that occur more than once.\n    Keep order of elements left the same as in the input.\n    >>> remove_duplicates([1, 2, 3, 2, 4])\n    [1, 3, 4]\n    \"\"\"\n    seen = set()\n    result = []\n    for num in numbers:\n        if num not in seen:\n            seen.add(num)\n            result.append(num)\n        else:\n            # Skip the duplicate\n            pass\n"
+    },
+    {
+      "name": "humaneval-plus-30",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef get_positive(l: list) -> list[int]:\n    \"\"\"Return only positive numbers in the list.\n    \n    Args:\n        l: The input list of integers.\n        \n    Returns:\n        A list containing only positive integers from the input list.\n    \"\"\"\n    return [x for x in l if x > 0]\n```"
+    },
+    {
+      "name": "humaneval-plus-33",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef sort_third(l: list) -> list:\n    \"\"\"This function takes a list l and returns a list l' such that\n    l' is identical to l in the indicies that are not divisible by three, while its values at the indicies that are divisible by three are equal\n    to the values of the corresponding indicies of l, but sorted.\n    >>> sort_third([1, 2, 3])\n    [1, 2, 3]\n    >>> sort_third([5, 6, 3, 4, 8, 9, 2])\n    [2, 6, 3, 4, 8, 9, 5]\n    \"\"\"\n    # Extract indices divisible by 3\n    indices = [i for "
+    },
+    {
+      "name": "humaneval-plus-36",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef fizz_buzz(n: int) -> int:\n    \"\"\"Return the number of times the digit 7 appears in integers less than n which are divisible by 11 or 13.\n    \n    Args:\n        n: The upper bound (exclusive).\n        \n    Returns:\n        The count of 7s in numbers < n divisible by 11 or 13.\n    \"\"\"\n    count = 0\n    for i in range(n):\n        if i % 11 == 0 or i % 13 == 0:\n            count += str(i).count('7')\n    return count\n```"
+    },
+    {
+      "name": "humaneval-plus-39",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef prime_fib(n: int) -> int:\n    \"\"\"\n    Returns the n-th Fibonacci number that is also a prime number.\n    \n    Args:\n        n: The index of the sequence to retrieve.\n        \n    Returns:\n        The n-th Fibonacci number that is prime.\n        \n    Examples:\n        >>> prime_fib(1)\n        2\n        >>> prime_fib(2)\n        3\n        >>> prime_fib(3)\n        5\n        >>> prime_fib(4)\n        13\n        >>> prime_fib(5)\n        89\n    \"\"\"\n    # Generate Fibonacci numbers until we"
+    },
+    {
+      "name": "humaneval-plus-43",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef pairs_sum_to_zero(l):\n    \"\"\"\n    pairs_sum_to_zero takes a list of integers as an input.\n    it returns True if there are two distinct elements in the list that\n    sum to zero, and False otherwise.\n    \"\"\"\n    if len(l) < 2:\n        return False\n\n    seen = set()\n    for num in l:\n        if -num in seen:\n            return True\n        seen.add(num)\n    \n    return False\n```"
+    },
+    {
+      "name": "humaneval-plus-46",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "IndexError: list index out of range",
+      "output_text_clip": "```python\ndef fib4(n: int) -> int:\n    \"\"\"The Fib4 number sequence is a sequence similar to the Fibbonacci sequence that's defined as follows:\n    fib4(0) -> 0\n    fib4(1) -> 0\n    fib4(2) -> 2\n    fib4(3) -> 0\n    fib4(n) -> fib4(n-1) + fib4(n-2) + fib4(n-3) + fib4(n-4).\n    Please write a function to efficiently compute the n-th element of the fib4 number sequence.\n    \"\"\"\n    if n < 4:\n        return [0, 0, 2, 0][n]\n    \n    # Initialize the sequence with the first four values\n    fib = [0, 0"
+    },
+    {
+      "name": "humaneval-plus-49",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef modp(n: int, p: int) -> int:\n    \"\"\"Return 2^n modulo p (be aware of numerics).\n    \n    Args:\n        n: The exponent to compute.\n        p: The modulus.\n        \n    Returns:\n        The result of 2^n modulo p.\n    \"\"\"\n    if n < 0:\n        raise ValueError(\"n must be non-negative\")\n    \n    # Handle edge case where p is 1\n    if p == 1:\n        return 0\n    \n    # Efficient computation using modular exponentiation\n    result = pow(2, n, p)\n    return result\n```"
+    },
+    {
+      "name": "humaneval-plus-52",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef below_threshold(l: list, t: int) -> bool:\n    \"\"\"Return True if all numbers in the list l are below threshold t.\n    \n    Args:\n        l: The list of integers to check.\n        t: The threshold value.\n        \n    Returns:\n        True if all elements in l are strictly less than t, False otherwise.\n    \"\"\"\n    return all(x < t for x in l)\n```"
+    },
+    {
+      "name": "humaneval-plus-56",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef correct_bracketing(brackets: str) -> bool:\n    \"\"\" brackets is a string of \"<\" and \">\".\n    return True if every opening bracket has a corresponding closing bracket.\n\n    >>> correct_bracketing(\"<\")\n    False\n    >>> correct_bracketing(\"<>\")\n    True\n    >>> correct_bracketing(\"<<><>>\")\n    True\n    >>> correct_bracketing(\"><<>\")\n    False\n    \"\"\"\n    stack = []\n    for char in brackets:\n        if char == \"<\":\n            stack.append(char)\n        elif char == \">\":\n            if"
+    },
+    {
+      "name": "humaneval-plus-59",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef largest_prime_factor(n: int) -> int:\n    \"\"\"Return the largest prime factor of n. Assume n > 1 and is not a prime.\n    \n    Args:\n        n: The integer to factorize.\n        \n    Returns:\n        The largest prime factor of n.\n    \"\"\"\n    if n == 1:\n        return 1\n    \n    # Start from 2 up to sqrt(n) to find the largest prime factor\n    for i in range(min(n, 1000000), 2, -1):\n        if n % i == 0:\n            return i\n    \n    # If no factor found, n is a prime number (contrad"
+    },
+    {
+      "name": "humaneval-plus-62",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef derivative(xs: list) -> list:\n    \"\"\" xs represent coefficients of a polynomial.\n    xs[0] + xs[1] * x + xs[2] * x^2 + ....\n     Return derivative of this polynomial in the same form.\n    >>> derivative([3, 1, 2, 4, 5])\n    [1, 4, 12, 20]\n    >>> derivative([1, 2, 3])\n    [2, 6]\n    \"\"\"\n    return [i * j for i, j in enumerate(xs)][1:]\n```"
+    },
+    {
+      "name": "humaneval-plus-66",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef digitSum(s):\n    \"\"\"Task\n    Write a function that takes a string as input and returns the sum of the upper characters only'\n    ASCII codes.\n\n    Examples:\n        digitSum(\"\") => 0\n        digitSum(\"abAB\") => 131\n        digitSum(\"abcCd\") => 67\n        digitSum(\"helloE\") => 69\n        digitSum(\"woArBld\") => 131\n        digitSum(\"aAaaaXa\") => 153\n    \"\"\"\n    return sum(ord(c) for c in s if c.isupper())\n```"
+    },
+    {
+      "name": "humaneval-plus-69",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef search(lst):\n    '''\n    You are given a non-empty list of positive integers. Return the greatest integer that is greater than \n    zero, and has a frequency greater than or equal to the value of the integer itself. \n    The frequency of an integer is the number of times it appears in the list.\n    If no such a value exist, return -1.\n    '''\n    from collections import Counter\n\n    counts = Counter(lst)\n    for key, value in counts.items():\n        if key <= value:\n            ret"
+    },
+    {
+      "name": "humaneval-plus-72",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef will_it_fly(q, w):\n    '''\n    Write a function that returns True if the object q will fly, and False otherwise.\n    The object q will fly if it's balanced (it is a palindromic list) and the sum of its elements is less than or equal the maximum possible weight w.\n\n    Example:\n    will_it_fly([1, 2], 5) \u279e False \n    # 1+2 is less than the maximum possible weight, but it's unbalanced.\n\n    will_it_fly([3, 2, 3], 1) \u279e False\n    # it's balanced, but 3+2+3 is more than the maximum poss"
+    },
+    {
+      "name": "humaneval-plus-75",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef is_multiply_prime(a):\n    \"\"\"Write a function that returns true if the given number is the multiplication of 3 prime numbers\n    and false otherwise.\n    Knowing that (a) is less then 100.\n    \"\"\"\n    if a < 2:\n        return False\n\n    primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97]\n\n    for p in primes:\n        if p * p * p > a:\n            break\n        if a % p == 0:\n            count = 0\n            while a % p == 0:\n  "
+    },
+    {
+      "name": "humaneval-plus-79",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef decimal_to_binary(decimal):\n    \"\"\"Converts a decimal number to binary format with 'db' prefix and suffix for format.\n\n    Args:\n        decimal: The decimal number to convert.\n\n    Returns:\n        A string with 'db' at both ends and binary digits in between.\n    \"\"\"\n    if decimal == 0:\n        return \"db0db\"\n    \n    binary_str = bin(decimal)[2:]\n    return f\"db{binary_str}db\"\n```"
+    },
+    {
+      "name": "humaneval-plus-82",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef prime_length(string):\n    \"\"\"Write a function that takes a string and returns True if the string\n    length is a prime number or False otherwise\n    Examples\n    prime_length('Hello') == True\n    prime_length('abcdcba') == True\n    prime_length('kittens') == True\n    prime_length('orange') == False\n    \"\"\"\n    n = len(string)\n    if n < 2:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n```"
+    },
+    {
+      "name": "humaneval-plus-85",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef add(lst):\n    \"\"\"Given a non-empty list of integers lst. add the even elements that are at odd indices.\n\n    Examples:\n        add([4, 2, 6, 7]) ==> 2 \n    \"\"\"\n    return sum(x for i, x in enumerate(lst) if i % 2 == 1 and x % 2 == 0)\n```"
+    },
+    {
+      "name": "humaneval-plus-89",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef encrypt(s):\n    \"\"\"Create a function encrypt that takes a string as an argument and\n    returns a string encrypted with the alphabet being rotated. \n    The alphabet should be rotated in a manner such that the letters \n    shift down by two multiplied to two places.\n    For example:\n    encrypt('hi') returns 'lm'\n    encrypt('asdfghjkl') returns 'ewhjklnop'\n    encrypt('gf') returns 'kj'\n    encrypt('et') returns 'ix'\n    \"\"\"\n    # Define the alphabet and rotation logic\n    alphabe"
+    },
+    {
+      "name": "humaneval-plus-92",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AttributeError: 'int' object has no attribute 'is_integer'",
+      "output_text_clip": "```python\ndef any_int(x, y, z):\n    '''\n    Create a function that takes 3 numbers.\n    Returns true if one of the numbers is equal to the sum of the other two, and all numbers are integers.\n    Returns false in any other cases.\n    \n    Examples\n    any_int(5, 2, 7) \u279e True\n    \n    any_int(3, 2, 2) \u279e False\n\n    any_int(3, -2, 1) \u279e True\n    \n    any_int(3.6, -2.2, 2) \u279e False\n    '''\n    if not (x.is_integer() and y.is_integer() and z.is_integer()):\n        return False\n    \n    return x == y + z"
+    },
+    {
+      "name": "humaneval-plus-95",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef check_dict_case(dict):\n    \"\"\"\n    Given a dictionary, return True if all keys are strings in lower \n    case or all keys are strings in upper case, else return False.\n    The function should return False if the given dictionary is empty.\n    \"\"\"\n    if not dict:\n        return False\n    \n    keys = dict.keys()\n    if not all(isinstance(k, str) for k in keys):\n        return False\n    \n    # Check if all keys are lowercase or all keys are uppercase\n    lower_keys = all(k.islower() "
+    },
+    {
+      "name": "humaneval-plus-98",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef count_upper(s):\n    \"\"\"\n    Given a string s, count the number of uppercase vowels in even indices.\n    \n    For example:\n    count_upper('aBCdEf') returns 1\n    count_upper('abcdefg') returns 0\n    count_upper('dBBE') returns 0\n    \"\"\"\n    vowels = \"AEIOU\"\n    count = 0\n    for i, char in enumerate(s):\n        if i % 2 == 0 and char in vowels:\n            count += 1\n    return count\n```"
+    },
+    {
+      "name": "humaneval-plus-102",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef choose_num(x, y):\n    \"\"\"This function takes two positive numbers x and y and returns the\n    biggest even integer number that is in the range [x, y] inclusive. If \n    there's no such number, then the function should return -1.\n\n    For example:\n    choose_num(12, 15) = 14\n    choose_num(13, 12) = -1\n    \"\"\"\n    if x > y:\n        return -1\n\n    # Find the largest even number <= y\n    largest_even = y if y % 2 == 0 else y - 1\n\n    # If the largest even number is less than x, return"
+    },
+    {
+      "name": "humaneval-plus-105",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef by_length(arr):\n    \"\"\"\n    Given an array of integers, sort the integers that are between 1 and 9 inclusive,\n    reverse the resulting array, and then replace each digit by its corresponding name from\n    \"One\", \"Two\", \"Three\", \"Four\", \"Five\", \"Six\", \"Seven\", \"Eight\", \"Nine\".\n\n    For example:\n      arr = [2, 1, 1, 4, 5, 8, 2, 3]   \n            -> sort arr -> [1, 1, 2, 2, 3, 4, 5, 8] \n            -> reverse arr -> [8, 5, 4, 3, 2, 2, 1, 1]\n      return [\"Eight\", \"Five\", \"Four\", \"Th"
+    },
+    {
+      "name": "humaneval-plus-108",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef count_nums(arr):\n    \"\"\"\n    Write a function count_nums which takes an array of integers and returns\n    the number of elements which has a sum of digits > 0.\n    If a number is negative, then its first signed digit will be negative:\n    e.g. -123 has signed digits -1, 2, and 3.\n    \"\"\"\n    count = 0\n    for num in arr:\n        if num < 0:\n            # Handle negative numbers by taking the absolute value to get the positive digits\n            num = abs(num)\n        # Calculate th"
+    },
+    {
+      "name": "humaneval-plus-112",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef reverse_delete(s, c):\n    \"\"\"Task\n    We are given two strings s and c, you have to deleted all the characters in s that are equal to any character in c\n    then check if the result string is palindrome.\n    A string is called palindrome if it reads the same backward as forward.\n    You should return a tuple containing the result string and True/False for the check.\n    Example\n    For s = \"abcde\", c = \"ae\", the result should be ('bcd',False)\n    For s = \"abcdef\", c = \"b\"  the resu"
+    },
+    {
+      "name": "humaneval-plus-115",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\nimport math\n\ndef max_fill(grid, capacity):\n    \"\"\"\n    You are given a rectangular grid of wells. Each row represents a single well,\n    and each 1 in a row represents a single unit of water.\n    Each well has a corresponding bucket that can be used to extract water from it, \n    and all buckets have the same capacity.\n    Your task is to use the buckets to empty the wells.\n    Output the number of times you need to lower the buckets.\n\n    Example 1:\n        Input: \n            grid : "
+    },
+    {
+      "name": "humaneval-plus-118",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef get_closest_vowel(word: str) -> str:\n    \"\"\"Find the closest vowel that stands between two consonants from the right side of the word.\n    \n    Vowels in the beginning and ending don't count. Return empty string if no vowel meets the condition.\n    \n    Args:\n        word: The input word.\n        \n    Returns:\n        The closest vowel or empty string.\n    \"\"\"\n    vowels = \"aeiou\"\n    word = word.lower()\n    \n    for i in range(len(word)-1, 0, -1):\n        if word[i] in vowels:\n   "
+    },
+    {
+      "name": "humaneval-plus-121",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef solution(lst):\n    \"\"\"Given a non-empty list of integers, return the sum of all of the odd elements that are in even positions.\n\n    Args:\n        lst: A list of integers.\n\n    Returns:\n        The sum of all odd elements at even indices.\n\n    Examples\n    solution([5, 8, 7, 1]) ==> 12\n    solution([3, 3, 3, 3, 3]) ==> 9\n    solution([30, 13, 24, 321]) ==>0\n    \"\"\"\n    return sum(x for i, x in enumerate(lst) if i % 2 == 0 and x % 2 != 0)\n```"
+    },
+    {
+      "name": "humaneval-plus-125",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef split_words(txt):\n    '''\n    Given a string of words, return a list of words split on whitespace, if no whitespaces exists in the text you\n    should split on commas ',' if no commas exists you should return the number of lower-case letters with odd order in the\n    alphabet, ord('a') = 0, ord('b') = 1, ... ord('z') = 25\n    '''\n    if not txt:\n        return []\n    \n    # Check for whitespace\n    if ' ' in txt:\n        return txt.split()\n    \n    # Check for commas\n    if ',' in "
+    },
+    {
+      "name": "humaneval-plus-128",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef prod_signs(arr):\n    \"\"\"\n    You are given an array arr of integers and you need to return\n    sum of magnitudes of integers multiplied by product of all signs\n    of each number in the array, represented by 1, -1 or 0.\n    Note: return None for empty arr.\n\n    Example:\n    >>> prod_signs([1, 2, 2, -4]) == -9\n    >>> prod_signs([0, 1]) == 0\n    >>> prod_signs([]) == None\n    \"\"\"\n    if not arr:\n        return None\n\n    total = 0\n    sign_product = 1\n\n    for num in arr:\n        if "
+    },
+    {
+      "name": "humaneval-plus-131",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef digits(n):\n    \"\"\"Given a positive integer n, return the product of the odd digits.\n    Return 0 if all digits are even.\n    For example:\n    digits(1)  == 1\n    digits(4)  == 0\n    digits(235) == 15\n    \"\"\"\n    product = 1\n    for digit in str(n):\n        if int(digit) % 2 == 0:\n            product = 0\n            break\n        product *= int(digit)\n    return product\n```"
+    },
+    {
+      "name": "humaneval-plus-134",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef check_if_last_char_is_a_letter(txt):\n    '''\n    Create a function that returns True if the last character\n    of a given string is an alphabetical character and is not\n    a part of a word, and False otherwise.\n    Note: \"word\" is a group of characters separated by space.\n\n    Examples:\n    check_if_last_char_is_a_letter(\"apple pie\") \u279e False\n    check_if_last_char_is_a_letter(\"apple pi e\") \u279e True\n    check_if_last_char_is_a_letter(\"apple pi e \") \u279e False\n    check_if_last_char_is_a"
+    },
+    {
+      "name": "humaneval-plus-138",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: invalid syntax",
+      "output_text_clip": "```python\ndef is_equal_to_sum_even(n):\n    \"\"\"Evaluate whether the given number n can be written as the sum of exactly 4 positive even numbers.\n    \n    Args:\n        n: The integer to evaluate.\n        \n    Returns:\n        True if n can be expressed as the sum of exactly 4 positive even numbers, False otherwise.\n    \"\"\"\n    if n < 4:\n        return False\n    \n    # The sum of 4 positive even numbers is at least 2 + 2 + 2 + 2 = 8.\n    # If n < 8, it's impossible.\n    if n < 8:\n        return Fa"
+    },
+    {
+      "name": "humaneval-plus-141",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef file_name_check(file_name):\n    \"\"\"Create a function which takes a string representing a file's name, and returns\n    'Yes' if the the file's name is valid, and returns 'No' otherwise.\n    A file's name is considered to be valid if and only if all the following conditions \n    are met:\n    - There should not be more than three digits ('0'-'9') in the file's name.\n    - The file's name contains exactly one dot '.'.\n    - The substring before the dot should not be empty, and it start"
+    },
+    {
+      "name": "humaneval-plus-144",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef simplify(x, n):\n    \"\"\"Your task is to implement a function that will simplify the expression\n    x * n. The function returns True if x * n evaluates to a whole number and False\n    otherwise. Both x and n, are string representation of a fraction, and have the following format,\n    <numerator>/<denominator> where both numerator and denominator are positive whole numbers.\n\n    You can assume that x, and n are valid fractions, and do not have zero as denominator.\n\n    simplify(\"1/5\","
+    },
+    {
+      "name": "humaneval-plus-148",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef bf(planet1, planet2):\n    '''\n    There are eight planets in our solar system: the closerst to the Sun \n    is Mercury, the next one is Venus, then Earth, Mars, Jupiter, Saturn, \n    Uranus, Neptune.\n    Write a function that takes two planet names as strings planet1 and planet2. \n    The function should return a tuple containing all planets whose orbits are \n    located between the orbit of planet1 and the orbit of planet2, sorted by \n    the proximity to the sun. \n    The functio"
+    },
+    {
+      "name": "humaneval-plus-151",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef double_the_difference(lst):\n    '''\n    Given a list of numbers, return the sum of squares of the numbers\n    in the list that are odd. Ignore numbers that are negative or not integers.\n    \n    double_the_difference([1, 3, 2, 0]) == 1 + 9 + 0 + 0 = 10\n    double_the_difference([-1, -2, 0]) == 0\n    double_the_difference([9, -2]) == 81\n    double_the_difference([0]) == 0  \n   \n    If the input list is empty, return 0.\n    '''\n    return sum(x * x for x in lst if x > 0 and x % 2 == "
+    },
+    {
+      "name": "humaneval-plus-154",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef cycpattern_check(a, b):\n    \"\"\"Check if the second word or any of its rotations is a substring in the first word.\n\n    Args:\n        a: The first word to search within.\n        b: The second word to check for rotations.\n\n    Returns:\n        True if any rotation of b is a substring of a, False otherwise.\n    \"\"\"\n    if len(b) > len(a):\n        return False\n\n    for i in range(len(b)):\n        rotated = b[i:] + b[:i]\n        if rotated in a:\n            return True\n\n    return False"
+    },
+    {
+      "name": "humaneval-plus-157",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef right_angle_triangle(a, b, c):\n    '''\n    Given the lengths of the three sides of a triangle. Return True if the three\n    sides form a right-angled triangle, False otherwise.\n    A right-angled triangle is a triangle in which one angle is right angle or \n    90 degree.\n    Example:\n    right_angle_triangle(3, 4, 5) == True\n    right_angle_triangle(1, 2, 3) == False\n    '''\n    # Sort the sides to find the hypotenuse\n    sides = sorted([a, b, c])\n    # Check if the sum of squares "
+    },
+    {
+      "name": "humaneval-plus-161",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef solve(s: str) -> str:\n    \"\"\"You are given a string s.\n    if s[i] is a letter, reverse its case from lower to upper or vise versa, \n    otherwise keep it as it is.\n    If the string contains no letters, reverse the string.\n    The function should return the resulted string.\n    Examples\n    solve(\"1234\") = \"4321\"\n    solve(\"ab\") = \"AB\"\n    solve(\"#a@C\") = \"#A@c\"\n    \"\"\"\n    # Check if the string contains any letters\n    has_letters = any(c.isalpha() for c in s)\n    \n    if not has"
+    },
+    {
+      "name": "gsm8k-0000",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=180.0",
+      "output_text_clip": "To calculate the total time required for Carla to download the 200 GB file, we break the process into two distinct phases: the **normal download phase** and the **restart/recovery phase**.\n\n### 1. Calculate the Time for the Normal Download\nCarla's normal speed is **2 GB/minute**.\n\nThe total file size is **200 GB**.\n\n$$\n\\text{Time}_{\\text{normal}} = \\frac{200 \\, \\text{GB}}{2 \\, \\text{GB/minute}} = 100 \\, \\text{minutes}\n$$\n\n### 2. Determine the Point of Restart\nThe problem states that **40% of the"
+    },
+    {
+      "name": "gsm8k-0001",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=88.0",
+      "output_text_clip": "To calculate the total amount Artie will make, we first round the prices of the flowers to the nearest dollar and then multiply by the quantities sold.\n\n1. **Round Prices:**\n   - Marigolds: $2.74 \u2192 $3.00\n   - Petunias: $1.87 \u2192 $2.00\n   - Begonias: $2.12 \u2192 $2.00\n\n2. **Calculate Total Revenue:**\n   - Marigolds: $3.00 * 12 pots = $36.00\n   - Petunias: $2.00 * 9 pots = $18.00\n   - Begonias: $2.00 * 17 pots = $34.00\n\n3. **Sum:**\n   $36.00 + $18.00 + $34.00 = $88.00\n\n**Final Answer:** $88.00\n\n#### <nu"
+    },
+    {
+      "name": "gsm8k-0002",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=112.0",
+      "output_text_clip": "To calculate the total class hours for Kimo in one semester, we first break down the weekly schedule:\n\n- **Monday, Wednesday, Friday**: 3 classes \u00d7 1 hour = 3 hours per day\n- **Tuesday, Thursday**: 2 classes \u00d7 2 hours = 4 hours per day\n\n**Total weekly hours** = 3 + 4 = 7 hours\n\n**Total semester hours** = 7 hours/week \u00d7 16 weeks = 112 hours\n\n#### 112"
+    },
+    {
+      "name": "gsm8k-0003",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=2.0",
+      "output_text_clip": "To determine the winning margin, we calculate the total time for both teams and subtract the slower team's total time from the faster team's total time.\n\n**Team A (Fast):**\n- Each runner runs 400 meters in exactly 55 seconds.\n- Total time for 4 runners: $ 4 \\times 55 = 220 $ seconds.\n\n**Team B (Slow):**\n- First runner: 60 seconds.\n- Second runner: $ 60 - 3 = 57 $ seconds.\n- Third runner: $ 57 - 3 = 54 $ seconds.\n- Fourth runner: $ 54 - 3 = 51 $ seconds.\n\nTotal time for Team B:\n$$\n60 + 57 + 54 + "
+    },
+    {
+      "name": "gsm8k-0004",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=4.0",
+      "output_text_clip": "Let $ r $ be the number of red chickens and $ w $ be the number of white chickens.\n\nFrom the problem:\n1.  $ w = r + 2 $ (Two more white than red)\n2.  The total eggs collected per day is 42. The red chickens produce 3 eggs each, and the white chickens produce 5 eggs each. So the total eggs per day is $ 3r + 5w = 42 $.\n\nSubstitute $ w $ from the first equation into the second:\n$$\n3r + 5(r + 2) = 42\n$$\n$$\n3r + 5r + 10 = 42\n$$\n$$\n8r + 10 = 42\n$$\n$$\n8r = 32\n$$\n$$\nr = 4\n$$\n\n**Answer:** Jerry has 4 red"
+    },
+    {
+      "name": "gsm8k-0005",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=45.0",
+      "output_text_clip": "To calculate the total amount in Brady's piggy bank, we calculate the value of each coin type and sum them up.\n\n1. **Pennies**: 100 pennies \u00d7 $0.01 = $1.00\n2. **Nickels**: 40 nickels \u00d7 $0.05 = $2.00\n3. **Dimes**: 20 dimes \u00d7 $0.10 = $2.00\n4. **Dollar Bills**: 40 bills \u00d7 $1.00 = $40.00\n\nNow, summing these values:\n$1.00 + $2.00 + $2.00 + $40.00 = $45.00\n\n#### <number> 45.00"
+    },
+    {
+      "name": "gsm8k-0006",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=380.0",
+      "output_text_clip": "To calculate the total count of activities Darren has done in two days, we break down the numbers per day and sum them.\n\n**Day 1:**\n- Pushups: 100\n- Squats: 50\n- Dumbbell Presses: 20\n\n**Day 2:**\n- Pushups: 20 more than Day 1 = $100 + 20 = 120$\n- Squats: 10 fewer than Day 1 = $50 - 10 = 40$\n- Dumbbell Presses: Doubled = $20 \\times 2 = 40$\n\n**Total Count:**\n$$\n100 + 50 + 20 + 120 + 40 + 40 = 380\n$$\n\n#### <number> 380"
+    },
+    {
+      "name": "gsm8k-0007",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=8400.0",
+      "output_text_clip": "To determine the net pay difference between Job A and Job B, we need to calculate the net income for each job after applying the respective tax rates.\n\n**Job A:**\n- **Hourly Rate:** $15/hour\n- **Hours per Year:** 2000 hours\n- **Total Income:** $15 * 2000 = $30,000\n- **Tax Rate:** 20% of total income\n- **Net Pay:** $30,000 * (1 - 0.20) = $30,000 * 0.80 = **$24,000**\n\n**Job B:**\n- **Annual Salary:** $42,000\n- **Property Tax:** $6,000\n- **Net Income:** $42,000 - $6,000 = $36,000\n- **Tax Rate:** 10%"
+    },
+    {
+      "name": "gsm8k-0008",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=160.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1.  **Initial State**:  \n   The problem states \"there is twice as much corn as cannolis\" and \"he has a total of 40 cannolis in his house.\"  \n   Let the number of cannolis be $ C $.  \n   Then the number of corns is $ 2C $.  \n   The total number of items (corn + cannolis) is $ 2C + C = 3C $.  \n   But the problem says he has a total of 40 cannolis.  \n   Wait, the wording \"there is twice as much corn as cannolis\" usually implies the corn is twice the number of ca"
+    },
+    {
+      "name": "gsm8k-0009",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=49.0",
+      "output_text_clip": "1.  **Initial Temperature**: 40 degrees.\n2.  **Baking Phase**: Marcus spends 3 hours baking. The oven raises the temperature by 5 degrees per hour.\n   $$\n   3 \\times 5 = 15 \\text{ degrees}\n   $$\n   New temperature: $40 + 15 = 55$ degrees.\n3.  **Cooling Phase**: The window is open for 30 minutes. The house cools down 2 degrees for every 10 minutes the window is open.\n   $$\n   \\frac{30}{10} = 3 \\text{ intervals of 10 minutes}\n   $$\n   $$\n   3 \\times 2 = 6 \\text{ degrees}\n   $$\n   New temperature: "
+    },
+    {
+      "name": "gsm8k-0010",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=172.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1.  **Ophelia's Furniture:**\n   - Ophelia has **20 sofas**.\n   - The problem states: \"They each have 2 fewer sofas than chairs.\"\n     - Let $ c $ be the number of chairs Ophelia has.\n     - Then, the number of sofas = $ c - 2 $.\n     - We are told Ophelia has 20 sofas.\n     - Therefore, $ c - 2 = 20 $.\n     - Solving: $ c = 22 $.\n\n2.  **Jenna's Furniture:**\n   - \"Jenna has 3 times as many chairs as Ophelia.\"\n     - Ophelia has 22 chairs.\n     - Jenna has $ 3 "
+    },
+    {
+      "name": "gsm8k-0011",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=990.0",
+      "output_text_clip": "First, we calculate the rate at which Ruiz makes chocolates. Ruiz makes 120 pounds in 2 hours, so his rate is $ \\frac{120}{2} = 60 $ pounds per hour.\n\nNext, we calculate Marissa's rate. She makes $ \\frac{3}{4} $ times as many pounds in an hour as Ruiz makes in the two hours. Since Ruiz makes 60 pounds in 2 hours, his rate is 30 pounds per hour (half of 60). Therefore, Marissa makes $ \\frac{3}{4} \\times 30 = 22.5 $ pounds per hour.\n\nNow, we calculate the total amount they make in 12 hours. Ruiz m"
+    },
+    {
+      "name": "gsm8k-0012",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=2450.0",
+      "output_text_clip": "To calculate the total number of taps, we need to consider the two distinct phases of her dance: the \"fast\" phase (where she dances at her full speed) and the \"slow\" phase (where her arms are raised, reducing her tap rate).\n\n1.  **Determine the duration of the \"fast\" phase:**\n   - She dances for a total of 5 minutes.\n   - Her arms are raised only during 2 of those minutes.\n   - Therefore, the \"fast\" phase lasts $ 5 - 2 = 3 $ minutes.\n\n2.  **Calculate taps during the \"fast\" phase:**\n   - Right fo"
+    },
+    {
+      "name": "gsm8k-0013",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=89.0",
+      "output_text_clip": "To solve this, we need to calculate the total number of small and large buttons Lorraine ends up with after her trades.\n\n1.  **Small Stickers to Large Buttons:**\n   - Lorraine starts with 30 small stickers.\n   - She trades 90% of them for large buttons.\n   - 90% of 30 = 0.9 * 30 = 27 small stickers traded.\n   - Since 1 small sticker = 1 small button, trading 27 small stickers gives her 27 small buttons.\n   - Wait, the problem states \"She trades 90% of her small stickers for large buttons.\"\n     "
+    },
+    {
+      "name": "gsm8k-0014",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=60.0",
+      "output_text_clip": "To calculate the school's overall pass rate, we first determine the total number of students and the total number of passes.\n\n1.  **Third Grade**: 340 out of 500 passed.\n2.  **Fourth Grade**: 40 out of 100 passed.\n3. **Fifth Grade**: The pass rate is twice the fourth grade's rate. Since 40 out of 100 is 40%, the fifth grade pass rate is $ 2 \\times 40\\% = 80\\% $. This means 80% of the fifth grade passed, or $ 0.80 \\times \\text{number of fifth graders} $.\n\nLet's assume the number of fifth graders "
+    },
+    {
+      "name": "gsm8k-0015",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=12.0",
+      "output_text_clip": "To determine how many groups can perform in the concert, we first calculate the total time required for a single group to complete their segment.\n\nEach group requires:\n- **2 minutes** to get on stage\n- **6 minutes** to perform\n- **2 minutes** to exit\n\nTotal time per group = $2 + 6 + 2 = 10$ minutes\n\nThe concert is **2 hours** long, which is $120$ minutes.\n\nNow, we divide the total concert time by the time required per group to find the number of groups that can perform.\n\n$$\n\\text{Number of group"
+    },
+    {
+      "name": "gsm8k-0016",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=85000.0",
+      "output_text_clip": "To calculate the total calories of the pastries Andrew baked, we need to first determine the calorie content of a mini pastry and then multiply by the quantity of each type.\n\n1.  **Determine Calories per Mini Pastry:**\n   - A normal cinnamon roll has 600 calories.\n   - A normal blueberry muffin has 450 calories.\n   - A mini pastry has **1/3** the calories of a normal version.\n   - Since the problem doesn't specify which type of \"normal\" is being compared to the mini, we assume the \"normal\" versi"
+    },
+    {
+      "name": "gsm8k-0017",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=227.0",
+      "output_text_clip": "To calculate the total time Andy needs to string all 12 racquets, we break the work into three distinct categories based on the string type and the average time per racquet for each type.\n\n1.  **Synthetic Gut**:  \n   - RACQUETS: 3  \n   - TIME PER RACQUET: 15 minutes  \n   - **Total Time**: $ 3 \\times 15 = 45 $ minutes\n\n2.  **Polyester String**:  \n   - RACQUETS: 5  \n   - TIME PER RACQUET: 22 minutes  \n   - **Total Time**: $ 5 \\times 22 = 110 $ minutes\n\n3.  **Hybrid Set (Half Synthetic, Half Polyes"
+    },
+    {
+      "name": "gsm8k-0018",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=27.0",
+      "output_text_clip": "To determine the total number of points Aries is sure to get, we first break down the quiz into its three categories: easy, average, and difficult.\n\n1.  **Total Items**: 60\n2.  **Easy Questions**: 40% of 60 = $ 0.4 \\times 60 = 24 $ items\n3.  **Remaining Items**: $ 60 - 24 = 36 $ items (Average + Difficult)\n4.  **Average + Difficult**: Equally divided, so $ 18 $ easy, $ 18 $ average/difficult (or split as per the problem statement, but total 36).\n\n**Calculations**:\n- **Easy**: 75% of 24 = $ 0.75 "
+    },
+    {
+      "name": "gsm8k-0019",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=14.0",
+      "output_text_clip": "First, calculate the number of pizzas eaten by the glee club:  \n70% of 20 = $0.70 \\times 20 = 14$ pizzas.\n\nNext, calculate the number of pizzas ordered by the football team:  \nTwice as many as 20 = $2 \\times 20 = 40$ pizzas.\n\nThen, calculate the number of pizzas eaten by the football team:  \n80% of 40 = $0.80 \\times 40 = 32$ pizzas.\n\nTotal pizzas eaten = $14 + 32 = 46$.\n\nTotal pizzas ordered = $20 + 40 = 60$.\n\nNumber of pizzas left = $60 - 46 = 14$.\n\n#### <number>14</number>"
+    },
+    {
+      "name": "gsm8k-0020",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=25.0",
+      "output_text_clip": "To solve this, we need to calculate the probability that the specific soda Ellen's friend receives is a \"shaken\" soda, given the distribution of shaken vs. unshaken sodas.\n\n1.  **Total Sodas**: 12\n2.  **Shaken Sodas**: 3 (Ellen shook 3)\n3.  **Unshaken Sodas**: 9 (Remaining after 3 shaken)\n\n**Step 1: Determine the probability of getting a shaken soda.**\nThe probability that a specific soda is shaken is the ratio of shaken sodas to total sodas:\n$$\nP(\\text{Shaken}) = \\frac{3}{12} = \\frac{1}{4}\n$$\n\n"
+    },
+    {
+      "name": "gsm8k-0021",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=18.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1.  **Workers and Production Rates:**\n   - 2 workers produce 6 toys/hour: $2 \\times 6 = 12$ toys/hour.\n   - 2 workers produce 4 toys/hour: $2 \\times 4 = 8$ toys/hour.\n   - Total production from these 4 workers: $12 + 8 = 20$ toys/hour.\n\n2. **Time and Total Capacity:**\n   - They work for 10 hours.\n   - Total capacity: $20 \\times 10 = 200$ toys.\n\n3. **Order Requirement:**\n   - The manufacturer needs 400 toys to ship the order.\n   - They have already produced 20"
+    },
+    {
+      "name": "gsm8k-0022",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=169.0",
+      "output_text_clip": "Let's break this down step by step to find the initial number of bandages.\n\n1.  **Day 1**: Used 38 bandages.  \n   *  They ordered 1 bulk pack (50 bandages).  \n   *  Total bandages at the end of Day 1: $ 38 + 50 = 88 $.\n\n2.  **Day 2**: Used 10 fewer bandages than Day 1.  \n   *  Used: $ 38 - 10 = 28 $ bandages.  \n   *  They ordered 1 bulk pack (50 bandages).  \n   *  Total bandages at the end of Day 2: $ 28 + 50 = 78 $.\n\n3.  **Day 3**: Used half a pack (25 bandages) and ordered 2 bulk packs (100 ba"
+    },
+    {
+      "name": "gsm8k-0023",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3.0",
+      "output_text_clip": "Let $ c $ be the number of cupcakes and $ b $ be the number of brownies.\n\nAccording to the problem, she makes 2 less than three times as many brownies as cupcakes:\n$$\nb = 3c - 2\n$$\n\nThe total number of treats is 5 people \u00d7 2 treats = 10.\n\nThe total number of treats is also the sum of cupcakes and brownies:\n$$\nc + b = 10\n$$\n\nSubstitute the expression for $ b $ into the equation:\n$$\nc + (3c - 2) = 10\n$$\n\nSimplify:\n$$\nc + 3c - 2 = 10\n$$\n$$\n4c - 2 = 10\n$$\n$$\n4c = 12\n$$\n$$\nc = 3\n$$\n\nCarly made 3 cupc"
+    },
+    {
+      "name": "gsm8k-0024",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=120000.0",
+      "output_text_clip": "To calculate the profit, we first determine the total value of the house after repairs and then subtract the original cost.\n\n1.  **Original Cost**: $80,000\n2.  **Repairs**: $50,000\n3.  **Total Value**: $80,000 + $50,000 = $130,000\n\nThe problem states the value increased by 150%. This is a percentage increase on the original cost, not the total value. We calculate the increase as follows:\n\n$$\n\\text{Increase} = 150\\% \\times 80,000 = 1.5 \\times 80,000 = 120,000\n$$\n\n**Total Value After Increase**: $"
+    },
+    {
+      "name": "gsm8k-0025",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=83.0",
+      "output_text_clip": "To determine the maximum number of boxes that can be loaded onto the truck without exceeding the bridge's weight limit, we start by calculating the total weight capacity of the bridge and the weight of the loaded truck.\n\n1.  **Bridge Weight Limit**: The bridge can carry no more than 5000 pounds.\n2.  **Truck Weight**: The combined weight of the driver and the empty truck is 3755 pounds.\n3.  **Box Weight**: Each box weighs 15 pounds.\n\n**Step 1: Calculate the remaining weight capacity for boxes.**\n"
+    },
+    {
+      "name": "gsm8k-0026",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=500.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1.  **Total Pieces**: 1000\n2.  **First Move**: Poppy places a quarter of the pieces on the board.\n   $$\n   \\text{Pieces on board} = \\frac{1}{4} \\times 1000 = 250\n   $$\n3.  **Remaining Pieces** after Poppy:\n   $$\n   1000 - 250 = 750\n   $$\n4.  **Second Move**: Her mom places a third of the remaining pieces.\n   $$\n   \\text{Pieces placed by mom} = \\frac{1}{3} \\times 750 = 250\n   $$\n5.  **Remaining Pieces** after mom:\n   $$\n   750 - 250 = 500\n   $$\n\n**Final Answer"
+    },
+    {
+      "name": "gsm8k-0027",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=51.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1.  **Sally Thirtytwo** is explicitly stated to be **8 years old**.\n2.  **Sally Four** is the same age as Sally Thirtytwo.  \n   $$\n   \\text{Sally Four} = 8 \\text{ years}\n   $$\n3.  **Granny Red** is two times as old as Sally Four.  \n   $$\n   \\text{Granny Red} = 2 \\times 8 = 16 \\text{ years}\n   $$\n4.  **Sally Two** is three years older than Granny Red.  \n   $$\n   \\text{Sally Two} = 16 + 3 = 19 \\text{ years}\n   $$\n5.  **Granny Red** is also stated to be two time"
+    },
+    {
+      "name": "gsm8k-0028",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=280.0",
+      "output_text_clip": "We start with the total number of students in the hall, which is 1000.\n\n1.  **Exit A**: 30% of the students went out through exit A.\n   $$\n   \\text{Students through A} = 0.30 \\times 1000 = 300\n   $$\n\n2.  **Remaining Students**: After A, the remaining students are:\n   $$\n   1000 - 300 = 700\n   $$\n\n3.  **Exit B**: 3/5 of the remaining students went out through exit B.\n   $$\n   \\text{Students through B} = \\frac{3}{5} \\times 700 = 420\n   $$\n\n4.  **Exit C**: The rest of the students went out through "
+    },
+    {
+      "name": "gsm8k-0029",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=4300.0",
+      "output_text_clip": "First, calculate the total hours worked in April. Watson works 10 hours per day, 5 days a week. Assuming April has 4 weeks (or 20 days if the company only works 5 days a week but the question implies 4 weeks of work), the total hours are $10 \\times 10 \\times 4 = 400$ hours.\n\nNext, calculate the base pay: $400 \\times \\$10 = \\$4000$.\n\nThen, add the bonus: $4000 + \\$300 = \\$4300$.\n\n**Final Answer:** $4300\n\n#### 4300"
+    },
+    {
+      "name": "gsm8k-0030",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=1.0",
+      "output_text_clip": "First, calculate the total distance of one round trip (first to second to third to first).\n\n- Distance from first to second: 75 miles\n- Distance from second to third: 100 miles\n- Distance from third to first: 50 miles less than the combined distance of the first two legs.\n\n  $$\n  \\text{Third leg} = 75 + 100 - 50 = 125 \\text{ miles}\n  $$\n\nTotal one-way trip: $75 + 100 + 125 = 300$ miles.\n\nSince the train travels this trip 3 times a day, the daily distance is $300 \\times 3 = 900$ miles.\n\nNow, calc"
+    },
+    {
+      "name": "gsm8k-0031",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3000.0",
+      "output_text_clip": "To determine how many feet Oliver must climb to reach the elevation of Stanley's comb, we need to calculate the vertical distance between the two points.\n\n1.  **Stanley's Position**: 10,000 feet (the height of the mountain side).\n2.  **Combin's Fall**: The comb falls 4,000 feet to a ledge below. This implies the comb is now at an elevation of $10,000 - 4,000 = 6,000$ feet.\n3.  **Oliver's Position**: 3,000 feet.\n\nThe distance Oliver must climb is the difference between his current elevation and t"
+    },
+    {
+      "name": "gsm8k-0032",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1.  **Price of the Pen**: $2.\n2.  **Price of the Paper**: It costs $1 less than three times the price of the pen.\n   $$\n   \\text{Price of Paper} = 3 \\times \\text{Price of Pen} - 1 = 3 \\times 2 - 1 = 6 - 1 = 5\n   $$\n3.  **Total Cost**: $2 (pen) + $5 (paper) = $7.\n4.  **Amount Paid**: $10.\n5.  **Change Received**: $10 - $7 = $3.\n\n**Final Answer**: $3."
+    },
+    {
+      "name": "gsm8k-0033",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=2.0",
+      "output_text_clip": "To determine the number of rows Jackson will plant, we need to calculate the total number of tulips and divide by the number of tulips per row.\n\n1. **Total Tulips**: Jackson buys 36 red tulips and 24 blue tulips.\n   $$\n   36 + 24 = 60 \\text{ tulips}\n   $$\n\n2. **Tulips per Row**: He can fit 6 red tulips in a row and 8 blue tulips in a row. The problem asks for the total number of rows, so we assume he plants all tulips in a single row or the sum of rows for each color.\n\n   If he plants all tulips"
+    },
+    {
+      "name": "gsm8k-0034",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=120.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1.  **Judy's Purchase:**\n   - She bought a **dozen cups** = 12 cups.\n   - She bought **twice as many dishes** as cups = 2 * 12 = 24 dishes.\n\n2.  **Total for Judy:**\n   - Cups: 12\n   - Dishes: 24\n   - **Total:** 12 + 24 = 36 utensils\n\n3.  **Friend's Contribution:**\n   - The problem states her friend brought **40 cups**.\n   - The friend also brought **20 more dishes** than Judy brought.\n     - Judy brought 24 dishes.\n     - Friend brought 24 + 20 = 44 dishes.\n\n"
+    },
+    {
+      "name": "gsm8k-0035",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=43500.0",
+      "output_text_clip": "To calculate the total cost of Bill's new truck, we need to sum the base price of the truck with the costs of the additional features he has selected.\n\n1.  **Base Price**: The truck costs $30,000.\n2.  **King Cab Upgrade**: This is an extra cost of $7,500.\n3.  **Leather Seats**: The cost is one-third of the king cab upgrade.  \n   $$\n   \\text{Leather Seats} = \\frac{1}{3} \\times 7,500 = 2,500\n   $$\n4.  **Running Boards**: These are $500 less than the leather seats.  \n   $$\n   \\text{Running Boards} "
+    },
+    {
+      "name": "gsm8k-0036",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=7.0",
+      "output_text_clip": "To find the total cost of 10 lollipops and 10 candies, we first calculate the cost of 10 lollipops and the cost of 10 candies separately, then add them.\n\n1. **Cost of 10 lollipops:**\n   - Each lollipop costs $0.40.\n   - $10 \\times 0.40 = 4.00$.\n\n2. **Cost of 10 candies:**\n   - The total cost for 5 lollipops and 4 candies is $3.20.\n   - We need to find the cost of 1 candy.\n   - Let $x$ be the cost of 1 candy.\n   - $5 \\times 0.40 + 4x = 3.20$.\n   - $2.00 + 4x = 3.20$.\n   - $4x = 1.20$.\n   - $x = 0"
+    },
+    {
+      "name": "gsm8k-0037",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=4400.0",
+      "output_text_clip": "To calculate the total number of chairs rented out in two 4-week months, we need to break the problem into two distinct time periods: **Weekdays** and **Weekends**.\n\n1.  **Weekdays**:  \n   - 60 chairs are rented per day.  \n   - There are 5 weekdays in a week.  \n   - Over 4 weeks: $ 60 \\times 5 \\times 4 $.\n\n2.  **Weekends**:  \n   - 100 chairs are rented per day.  \n   - There are 2 weekend days in a week.  \n   - Over 4 weeks: $ 100 \\times 2 \\times 4 $.\n\n**Calculation:**  \nTotal chairs = Weekdays +"
+    },
+    {
+      "name": "gsm8k-0038",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=4.0",
+      "output_text_clip": "To determine how long Milo can make his mosaic, we need to calculate the total number of glass chips he has and divide by the number of chips required per square inch.\n\n1.  **Total Chips**: He has two bags, each holding 72 chips.  \n   $ 2 \\times 72 = 144 $ chips.\n\n2.  **Chips per Square Inch**: The problem states it takes 12 glass chips to make 1 square inch of the mosaic.\n\n3.  **Calculation**:  \n   $ \\frac{144}{12} = 12 $ square inches.\n\n4.  **Height**: The mosaic is 3 inches tall.  \n   Since t"
+    },
+    {
+      "name": "gsm8k-0039",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3430.0",
+      "output_text_clip": "To solve this problem, we use exponential growth. The formula for the number of infected people after $ n $ days is:\n\n$$\nI_n = I_0 \\times (1 + r)^n\n$$\n\nWhere:\n- $ I_0 = 10 $ (initial infected people)\n- $ r = 6 $ (infection rate per person per day)\n- $ n = 3 $ (days)\n\n$$\nI_3 = 10 \\times (1 + 6)^3 = 10 \\times 7^3 = 10 \\times 343 = 3430\n$$\n\n**Answer:** 3430\n\n#### <number>3430</number>"
+    },
+    {
+      "name": "gsm8k-0040",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=60.0",
+      "output_text_clip": "First, calculate the distance the bus traveled: $60 \\, \\text{mph} \\times 5 \\, \\text{hours} = 300$ miles.\n\nNext, calculate the distance the car traveled: $30 \\, \\text{mph} \\times 8 \\, \\text{hours} = 240$ miles.\n\nNow, find the difference: $300 - 240 = 60$ miles.\n\nThe bus traveled 60 miles farther than the car.\n\n#### 60"
+    },
+    {
+      "name": "gsm8k-0041",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=7.0",
+      "output_text_clip": "First, calculate the total amount of crawfish caught over the three days.\n\n- **Thursday:** 3 pounds\n- **Friday:** 4 times Thursday = $4 \\times 3 = 12$ pounds\n- **Saturday:** Half of Friday = $12 / 2 = 6$ pounds\n\nTotal = $3 + 12 + 6 = 21$ pounds\n\nNext, determine the number of servings. Each serving is 3 pounds.\n\n$$\n\\text{Number of servings} = \\frac{21}{3} = 7\n$$\n\n#### <number>7</number>"
+    },
+    {
+      "name": "gsm8k-0042",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=450.0",
+      "output_text_clip": "To determine how many small jelly beans Grandpa can eat, we need to establish the relationship between the sizes of jelly beans and the total number he can consume.\n\n1.  **Large Beans**: 75 large jelly beans fill him up.\n2.  **Medium Beans**: He can eat **twice as many** medium-sized beans as large beans.  \n   - If he eats 75 large, he eats $ 2 \\times 75 = 150 $ medium-sized beans.\n3.  **Small Beans**: Eating 3 small beans is equivalent to eating 1 medium-sized bean.  \n   - This implies the rati"
+    },
+    {
+      "name": "gsm8k-0043",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=20.44",
+      "output_text_clip": "To calculate the total learning time per week for John, we break the problem into two parts: the standard class time and the extra learning time.\n\n1.  **Standard Class Time:**\n   - There are 6 periods in a day.\n   - Each class is 40 minutes long.\n   - John goes to class 5 days a week.\n   - Total standard time = $6 \\times 40 \\times 5$ minutes.\n\n2.  **Extra Learning Time:**\n   - The problem states he spends $ \\frac{1}{16} $ of his weekly minutes on Saturday and Sunday as extra learning.\n   - First"
+    },
+    {
+      "name": "gsm8k-0044",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=20.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1.  **Jim's Collection**: Jim collected 27 seashells.\n2.  **Carlos's Collection**: Jim collected 5 more than Carlos.  \n   $$\n   \\text{Carlos} = \\text{Jim} - 5 = 27 - 5 = 22\n   $$\n3.  **Carrey's Collection**: Carlos collected twice as many as Carrey.  \n   $$\n   \\text{Carrey} = \\frac{\\text{Carlos}}{2} = \\frac{22}{2} = 11\n   $$\n4.  **Total Seashells**: Add up all three collections.  \n   $$\n   \\text{Total} = \\text{Jim} + \\text{Carlos} + \\text{Carrey} = 27 + 22 + "
+    },
+    {
+      "name": "gsm8k-0045",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=448.0",
+      "output_text_clip": "First, calculate the total volume of medicine per dose: $14\\,mL + 3 \\times 14\\,mL = 14 + 42 = 56\\,mL$.\n\nNext, calculate the total volume for 8 doses: $56\\,mL \\times 8 = 448\\,mL$.\n\n#### <number> 448"
+    },
+    {
+      "name": "gsm8k-0046",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=24.0",
+      "output_text_clip": "To determine the number of lemons Tim needs, we start by calculating the total volume of lemon juice required for 4 gallons of lemonade.\n\n1.  **Volume per gallon**: The recipe requires 1 cup of fresh lemon juice per gallon.\n2.  **Total volume**: $4 \\text{ gallons} \\times 1 \\text{ cup/gallon} = 4 \\text{ cups}$.\n\nNext, we calculate the number of lemons required to yield 4 cups of juice.\n\n1.  **Yield per lemon**: 6 lemons yield 1 cup of juice.\n2.  **Total lemons**: $\\frac{4 \\text{ cups}}{1 \\text{ c"
+    },
+    {
+      "name": "gsm8k-0047",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=18.0",
+      "output_text_clip": "First, calculate the total number of eggs laid per day: 16 eggs.\n\nNext, subtract the eggs eaten for breakfast: 16 - 3 = 13 eggs remaining.\n\nThen, subtract the eggs baked for friends: 13 - 4 = 9 eggs remaining.\n\nFinally, calculate the revenue from selling the remaining eggs at $2 per egg: 9 * 2 = $18.\n\n#### <number> 18"
+    },
+    {
+      "name": "gsm8k-0048",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=1430.0",
+      "output_text_clip": "First, calculate the total cost of material and construction: $500 + $800 = $1300.\n\nNext, calculate the insurance cost, which is 10% of the total cost: $1300 * 0.10 = $130.\n\nFinally, add the insurance cost to the total cost: $1300 + $130 = $1430.\n\n#### <1430>"
+    },
+    {
+      "name": "gsm8k-0049",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=82.0",
+      "output_text_clip": "First, we determine the number of fish sausages. Dylan bought 6 more fish sausages than chicken sausages. Since he bought 38 chicken sausages, the number of fish sausages is $ 38 + 6 = 44 $.\n\nNext, we calculate the total number of sausages by adding the chicken and fish counts: $ 38 + 44 = 82 $.\n\n#### <number>82"
+    },
+    {
+      "name": "gsm8k-0050",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=5.0",
+      "output_text_clip": "To determine how many times Sandra needs to babysit, we start by calculating the total number of eggs required for 15 flans. Since each flan requires 3 eggs, the total number of eggs needed is $ 15 \\times 3 = 45 $ eggs.\n\nSandra receives 9 eggs per babysitting session. To find the number of sessions required, we divide the total number of eggs by the number of eggs per session: $ \\frac{45}{9} = 5 $.\n\nTherefore, Sandra needs to babysit 5 times to gather enough eggs for the 15 flans.\n\n#### <number>"
+    },
+    {
+      "name": "gsm8k-0051",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=9.0",
+      "output_text_clip": "First, we calculate the number of days it takes to travel from New Jersey to Rochester by bus, which is 6 days.\n\nNext, we calculate the number of days it takes to return from Rochester to New Jersey by car, which is half the time it took to go by bus. Half of 6 days is 3 days.\n\nFinally, we add the one-way trip time (6 days) and the return trip time (3 days) to get the total travel duration.\n\n$$\n6 + 3 = 9\n$$\n\n#### <number>9"
+    },
+    {
+      "name": "gsm8k-0052",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=762.0",
+      "output_text_clip": "First, calculate the number of M&Ms in the second bag: 300 + 12 = 312.\n\nNext, calculate the number of M&Ms in the third bag: half of 300 is 150.\n\nFinally, add the numbers together: 300 + 312 + 150 = 762.\n\n#### 762"
+    },
+    {
+      "name": "gsm8k-0053",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=1.0",
+      "output_text_clip": "First, we determine the cost of the magazine. The problem states that a magazine costs half as much as a book, and the book costs $4. Therefore, the magazine costs $4 / 2 = $2.\n\nNext, we calculate the cost of the pen. The pen costs $1 less than the magazine. Since the magazine costs $2, the pen costs $2 - $1 = $1.\n\n#### <number>1"
+    },
+    {
+      "name": "gsm8k-0054",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=21.0",
+      "output_text_clip": "First, calculate the total number of cookies Rachel had before her brother ate any:\n23 (Rachel's cookies) + 42 (Janet's cookies) = 65 cookies.\n\nNext, subtract the number of cookies eaten by her brother:\n65 - 44 = 21.\n\nTherefore, the number of cookies left for Rachel is 21.\n\n#### <number>21</number>"
+    },
+    {
+      "name": "gsm8k-0055",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=240.0",
+      "output_text_clip": "Marin eats 4 apples per day, and Nancy also eats 4 apples per day. Together, they eat $4 + 4 = 8$ apples per day.\n\nOver 30 days, the total consumption is:\n$$\n8 \\, \\text{apples/day} \\times 30 \\, \\text{days} = 240 \\, \\text{apples}\n$$\n\n#### <number>240</number>"
+    },
+    {
+      "name": "gsm8k-0056",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=38.0",
+      "output_text_clip": "Let's break this down step by step.\n\n1.  **Brett's current age**: 14 years.\n2.  **In four years**: Brett will be $14 + 4 = 18$ years old.\n3.  **Angela's future age**: The problem states that in four years, Angela will be three times as old as Brett *now* (14). So, we calculate $3 \\times 14 = 42$.\n4.  **Current age of Angela**: Since we just calculated that in four years she will be 42, and the time gap is 4 years, we subtract 4 from 42 to find her current age: $42 - 4 = 38$.\n\n**Final Answer**: A"
+    },
+    {
+      "name": "gsm8k-0057",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=2.0",
+      "output_text_clip": "First, calculate his daily earnings: $2/hour * 5 hours/day = $10/day.\n\nNext, calculate his weekly earnings: $10/day * 4 days/week = $40/week.\n\nFinally, divide the total savings goal by his weekly earnings: $80 / $40/week = 2 weeks.\n\n#### 2"
+    },
+    {
+      "name": "gsm8k-0058",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=8.0",
+      "output_text_clip": "To find Charmaine's age 4 years from now, we first determine her current age by subtracting 12 years from the future age of 16.\n\n1. **Future Age**: 16 years (as stated).\n2. **Years from Now**: 4 years.\n3. **Current Age**: $ 16 - 12 = 4 $ years.\n4. **Future Age 4 Years from Now**: $ 4 + 4 = 8 $ years.\n\n**Answer**: 8 years old."
+    },
+    {
+      "name": "gsm8k-0059",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=53.0",
+      "output_text_clip": "The game originally lasted 4 quarters, each 12 minutes, totaling $4 \\times 12 = 48$ minutes.\n\nSince the last quarter was a tie, the game was extended by 5 minutes.\n\nTotal duration = $48 + 5 = 53$ minutes.\n\n#### <number>53"
+    },
+    {
+      "name": "gsm8k-0060",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=4.0",
+      "output_text_clip": "To find the difference in the number of cereal boxes bought this week compared to last week, we first calculate the total number of cereal boxes bought this week.\n\nThis week: 3 boxes of Coco Crunch + 5 boxes of Fruit Loops = 8 boxes of cereal.\n\nLast week: 4 boxes of cereal.\n\nThe difference is calculated as: 8 (this week) - 4 (last week) = 4.\n\n#### <4>"
+    },
+    {
+      "name": "gsm8k-0061",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=142.0",
+      "output_text_clip": "To find the total number of fruits, we calculate the total yield for each type of plant and sum them.\n\n1. **Tomato Yield**:  \n   $ 5 \\text{ plants} \\times 22 \\text{ tomatoes/plant} = 110 \\text{ tomatoes} $\n\n2. **Eggplant Yield**:  \n   $ 8 \\text{ plants} \\times 4 \\text{ eggplants/plant} = 32 \\text{ eggplants} $\n\n3. **Total Fruits**:  \n   $ 110 \\text{ tomatoes} + 32 \\text{ eggplants} = 142 \\text{ fruits} $\n\n#### <number> 142"
+    },
+    {
+      "name": "gsm8k-0062",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3.0",
+      "output_text_clip": "First, calculate the total number of oranges given to the daughters: 3 daughters \u00d7 2 oranges = 6 oranges.\n\nNext, add the number of oranges given to the son: 3 oranges.\n\nTotal given away: 6 + 3 = 9 oranges.\n\nOriginal purchase: 12 oranges.\n\nRemaining oranges: 12 - 9 = 3.\n\n#### <number>3"
+    },
+    {
+      "name": "gsm8k-0063",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=250.0",
+      "output_text_clip": "To calculate the profit John makes on his car, we need to consider the total earnings from renting the car and subtract the cost of the car payment.\n\n1.  **Calculate Total Rental Earnings:**\n   - He rents the car 10 times a month.\n   - Each rental is 3 hours.\n   - He gets paid $25 per hour.\n   - Total earnings = $25/hour * 3 hours/rental * 10 rentals = $25 * 3 * 10 = $750.\n\n2.  **Subtract Car Payment:**\n   - His car payment is $500.\n\n3.  **Calculate Profit:**\n   - Profit = Total Earnings - Car P"
+    },
+    {
+      "name": "gsm8k-0064",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=13.0",
+      "output_text_clip": "Jasmine starts with 15 stickers. She loses 7 during playtime, so she has $15 - 7 = 8$ stickers left. Her teacher then gives her 5 more for helping classmates, so she ends up with $8 + 5 = 13$ stickers.\n\n#### <number>13"
+    },
+    {
+      "name": "gsm8k-0065",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=66.0",
+      "output_text_clip": "First, calculate the cost of the books: 3 books \u00d7 $16 = $48.\n\nNext, calculate the cost of the pencils: 3 pencils \u00d7 $6 = $18.\n\nAdd the two amounts: $48 + $18 = $66.\n\nTed spent $66 in total.\n\n#### <number> 66"
+    },
+    {
+      "name": "gsm8k-0066",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=30.0",
+      "output_text_clip": "To find Jeff's age, we start with the information that Mike is 24 years old. Since Martha is 4 years younger than Mike, her age is $ 24 - 4 = 20 $.\n\nNext, we know Jeff is 10 years older than Martha. Therefore, Jeff's age is $ 20 + 10 = 30 $.\n\n#### <number> 30"
+    },
+    {
+      "name": "gsm8k-0067",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=32.0",
+      "output_text_clip": "To find the total number of blue birds in the trees, we add the number of blue birds from each tree.\n\n1. 3 trees each had 7 blue birds: $3 \\times 7 = 21$\n2. 2 different trees each had 4 blue birds: $2 \\times 4 = 8$\n3. 1 final tree had 3 blue birds: $1 \\times 3 = 3$\n\nNow, summing these results: $21 + 8 + 3 = 32$\n\n#### <number>32</number>"
+    },
+    {
+      "name": "gsm8k-0068",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=100.0",
+      "output_text_clip": "First, calculate the total length of hair cut: $10$ inches (start) - $8$ inches (end) = $2$ inches.\n\nNext, calculate the cost of the color: $40$.\n\nThen, calculate the cost of the haircut: $30$ per inch * $2$ inches = $60$.\n\nFinally, add the two costs: $40 + $60 = $100$.\n\n#### <number> 100"
+    },
+    {
+      "name": "gsm8k-0069",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=12.0",
+      "output_text_clip": "First, we calculate John's new speaking speed after training:\n$$\n2.5 \\times 150 = 375 \\text{ words per minute}\n$$\n\nNext, we calculate the total number of words in 10 pages:\n$$\n10 \\times 450 = 4500 \\text{ words}\n$$\n\nNow, we divide the total words by his new speed to find the time required:\n$$\n\\frac{4500}{375} = 12 \\text{ minutes}\n$$\n\n#### <12>"
+    }
+  ],
+  "speed": {},
+  "elapsed_seconds": 541.9046998330014,
+  "timed_out": false
+}

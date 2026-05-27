@@ -1,0 +1,30 @@
+{
+  "model": "mlx-community/MiniMax-M2.7-5bit:latest",
+  "tier": "core_only",
+  "assignment": "full_core",
+  "warmup_tok_per_s": 1.4251822968423864,
+  "per_suite_pass_rate": {},
+  "composite": 0.0,
+  "prompts": [
+    {
+      "name": "humaneval-plus-0",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: ReadTimeout('')",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-3",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '503 Service Unavailable' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/503\")",
+      "output_text_clip": ""
+    }
+  ],
+  "speed": {},
+  "elapsed_seconds": 0.0
+}

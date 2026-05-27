@@ -1,0 +1,1096 @@
+{
+  "model": "mlx-community/gpt-oss-120b-MXFP4-Q4:latest",
+  "tier": "core_only",
+  "assignment": "full_core",
+  "warmup_tok_per_s": 6.216408075150767,
+  "per_suite_pass_rate": {
+    "humaneval-plus": 0.1,
+    "gsm8k": 0.0
+  },
+  "composite": 0.05,
+  "prompts": [
+    {
+      "name": "humaneval-plus-0",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unmatched ')'",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\"Check if any two numbers in *numbers* are closer to each other than *threshold*.\n\n    The function returns ``True`` as soon as it finds a pair ``(a, b)`` such that\n    ``abs(a - b) < threshold``.  If no such pair exists, it returns ``False``.\n\n    Parameters\n    ----------\n    numbers: List[float]\n        List of numeric values to examine.\n    threshold: float\n        Positive distan"
+    },
+    {
+      "name": "humaneval-plus-3",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\"Detect if a sequence of deposit/withdrawal operations causes the account balance\n    to drop below zero at any point.\n\n    The account starts with a balance of zero. Return True as soon as the balance becomes\n    negative; otherwise return False.\n\n    Args:\n        operations: List of integers representing deposits (positive) and withdrawals\n                    (negative).\n\n    Returns:\n        True if the b"
+    },
+    {
+      "name": "humaneval-plus-7",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef filter_by_substring(strings: List[str], substring: str) -> List[str]:\n    \"\"\"Filter an input list of strings, returning only those that contain the given substring.\n\n    Args:\n        strings: List of strings to be filtered.\n        substring: Substring to search for within each string.\n\n    Returns:\n        A list containing only the strings from the input list that include `substring`.\n\n    Examples:\n        >>> filter_by_substring([], 'a')\n        []\n   "
+    },
+    {
+      "name": "humaneval-plus-10",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef make_palindrome(string: str) -> str:\n    \"\"\"Find the shortest palindrome that begins with a supplied string.\n\n    The function looks for the longest suffix of ``string`` that is already a palindrome.\n    It then appends the reverse of the preceding prefix to the end of the original\n    string, thereby producing the shortest palindrome that starts with the original\n    string.\n\n    Examples\n    --------\n    >>> make_palindrome(\"\")\n    ''\n    >>> make_palindrome(\"cat\")\n    'catac'\n  "
+    },
+    {
+      "name": "humaneval-plus-13",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef greatest_common_divisor(a: int, b: int) -> int:\n    \"\"\"Return a greatest common divisor of two integers a and b.\n\n    >>> greatest_common_divisor(3, 5)\n    1\n    >>> greatest_common_divisor(25, 15)\n    5\n    \"\"\"\n    a, b = abs(a), abs(b)\n    while b:\n        a, b = b, a % b\n    return a\n```"
+    },
+    {
+      "name": "humaneval-plus-16",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef count_distinct_characters(string: str) -> int:\n    \"\"\"\n    Return the number of distinct characters in `string`, ignoring case.\n\n    Parameters\n    ----------\n    string : str\n        The input string.\n\n    Returns\n    -------\n    int\n        Number of distinct characters, case\u2011insensitive.\n\n    Examples\n    --------\n    >>> count_distinct_characters('xyzXYZ')\n    3\n    >>> count_distinct_characters('Jerry')\n    4\n    \"\"\"\n    # Convert to a single case to make the comparison case\u2011i"
+    },
+    {
+      "name": "humaneval-plus-20",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-23",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-26",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-30",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-33",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-36",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-39",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-43",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-46",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-49",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-52",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-56",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-59",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-62",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-66",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-69",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-72",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-75",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-79",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-82",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-85",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-89",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-92",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-95",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-98",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-102",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-105",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-108",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-112",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-115",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-118",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-121",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-125",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-128",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-131",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-134",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-138",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-141",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-144",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-148",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-151",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-154",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-157",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "humaneval-plus-161",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0000",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0001",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0002",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0003",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0004",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0005",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0006",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0007",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0008",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0009",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0010",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0011",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0012",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0013",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0014",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0015",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0016",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0017",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0018",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0019",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0020",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0021",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0022",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0023",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0024",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0025",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0026",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0027",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0028",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0029",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0030",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0031",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0032",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0033",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0034",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0035",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0036",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0037",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0038",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0039",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0040",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0041",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0042",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0043",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0044",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0045",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0046",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0047",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0048",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0049",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0050",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0051",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0052",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0053",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0054",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0055",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0056",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0057",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0058",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0059",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0060",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0061",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0062",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0063",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0064",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0065",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0066",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0067",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0068",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    },
+    {
+      "name": "gsm8k-0069",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "transport error: HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "output_text_clip": ""
+    }
+  ],
+  "speed": {},
+  "elapsed_seconds": 406.63981529098237,
+  "timed_out": false
+}

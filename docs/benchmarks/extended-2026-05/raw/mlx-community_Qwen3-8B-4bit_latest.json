@@ -1,0 +1,1636 @@
+{
+  "model": "mlx-community/Qwen3-8B-4bit:latest",
+  "tier": "extended",
+  "assignment": "full_core",
+  "warmup_tok_per_s": 43.680359984042745,
+  "per_suite_pass_rate": {
+    "humaneval-plus": 0.7909090909090909,
+    "gsm8k": 0.8714285714285714
+  },
+  "composite": 0.8311688311688312,
+  "prompts": [
+    {
+      "name": "humaneval-plus-0",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\" Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n    sorted_numbers = sorted(numbers)\n    for i in range(len(sorted_numbers) - 1):\n        if abs(sorted_numbers[i+1] - sorted_numbers[i]) < thr"
+    },
+    {
+      "name": "humaneval-plus-3",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\" You're given a list of deposit and withdrawal operations on a bank account that starts with\n    zero balance. Your task is to detect if at any point the balance of account falls below zero, and\n    at that point function should return True. Otherwise it should return False.\n    >>> below_zero([1, 2, 3])\n    False\n    >>> below_zero([1, 2, -4, 5])\n    True\n    \"\"\"\n    balance = 0\n    for op in operations:\n "
+    },
+    {
+      "name": "humaneval-plus-7",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\n\ndef filter_by_substring(strings: List[str], substring: str) -> List[str]:\n    \"\"\" Filter an input list of strings only for ones that contain given substring\n    >>> filter_by_substring([], 'a')\n    []\n    >>> filter_by_substring(['abc', 'bacd', 'cde', 'array'], 'a')\n    ['abc', 'bacd', 'array']\n    \"\"\"\n    return [s for s in strings if substring in s]\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-10",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef make_palindrome(string: str) -> str:\n    \"\"\" Find the shortest palindrome that begins with a supplied string.\n    Algorithm idea is simple:\n    - Find the longest postfix of supplied string that is a palindrome.\n    - Append to the end of the string reverse of a string prefix that comes before the palindromic suffix.\n    >>> make_palindrome('')\n    ''\n    >>> make_palindrome('cat')\n    'catac'\n    >>> make_palindrome('cata')\n    'catac'\n    \"\"\"\n    if not string:\n        return ''\n"
+    },
+    {
+      "name": "humaneval-plus-13",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef greatest_common_divisor(a: int, b: int) -> int:\n    \"\"\" Return a greatest common divisor of two integers a and b\n    >>> greatest_common_divisor(3, 5)\n    1\n    >>> greatest_common_divisor(25, 15)\n    5\n    \"\"\"\n    while b != 0:\n        a, b = b, a % b\n    return a\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-16",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef count_distinct_characters(string: str) -> int:\n    \"\"\" Given a string, find out how many distinct characters (regardless of case) does it consist of\n    >>> count_distinct_characters('xyzXYZ')\n    3\n    >>> count_distinct_characters('Jerry')\n    4\n    \"\"\"\n    return len(set(string.lower()))\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-20",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 16)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called find_closest_elements that takes a list of numbers and returns a tuple of the two closest numbers in order (smaller first, then larger). Let me think about how to approach this.\n\nFirst, the function needs to process the list. The list has at least two elements, so I don't have to handle empty lists. The goal is to find the pair of numbers with the smallest absolute difference between them. Then return them sorted.\n\nHmm, how to do that? Well,"
+    },
+    {
+      "name": "humaneval-plus-23",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef strlen(string: str) -> int:\n    \"\"\" Return length of given string\n    >>> strlen('')\n    0\n    >>> strlen('abc')\n    3\n    \"\"\"\n    return len(string)\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-26",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\nfrom collections import Counter\n\ndef remove_duplicates(numbers: List[int]) -> List[int]:\n    \"\"\" From a list of integers, remove all elements that occur more than once.\n    Keep order of elements left the same as in the input.\n    >>> remove_duplicates([1, 2, 3, 2, 4])\n    [1, 3, 4]\n    \"\"\"\n    counts = Counter(numbers)\n    result = []\n    for num in numbers:\n        if counts[num] == 1:\n            result.append(num)\n    return result\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-30",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef get_positive(l: list):\n    \"\"\"Return only positive numbers in the list.\n    >>> get_positive([-1, 2, -4, 5, 6])\n    [2, 5, 6]\n    >>> get_positive([5, 3, -5, 2, -3, 3, 9, 0, 123, 1, -10])\n    [5, 3, 2, 3, 9, 123, 1]\n    \"\"\"\n    return [x for x in l if x > 0]\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-33",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef sort_third(l: list):\n    \"\"\"This function takes a list l and returns a list l' such that\n    l' is identical to l in the indicies that are not divisible by three, while its values at the indicies that are divisible by three are equal\n    to the values of the corresponding indicies of l, but sorted.\n    >>> sort_third([1, 2, 3])\n    [1, 2, 3]\n    >>> sort_third([5, 6, 3, 4, 8, 9, 2])\n    [2, 6, 3, 4, 8, 9, 5]\n    \"\"\"\n    special_indices = [i for i in range(len(l)) if i % 3 == 0]\n   "
+    },
+    {
+      "name": "humaneval-plus-36",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef fizz_buzz(n: int):\n    \"\"\"Return the number of times the digit 7 appears in integers less than n which are divisible by 11 or 13.\n    >>> fizz_buzz(50)\n    0\n    >>> fizz_buzz(78)\n    2\n    >>> fizz_buzz(79)\n    3\n    \"\"\"\n    count = 0\n    for i in range(1, n):\n        if i % 11 == 0 or i % 13 == 0:\n            for digit in str(i):\n                if digit == '7':\n                    count += 1\n    return count\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-39",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 19)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called prime_fib that returns the n-th number which is both a Fibonacci number and a prime. Let's think about how to approach this.\n\nFirst, I remember that Fibonacci numbers are a sequence where each number is the sum of the two preceding ones. The sequence starts with 0 and 1, but sometimes people start with 1 and 1. Wait, but the examples given here might help. Let's check the sample inputs.\n\nThe first example is prime_fib(1) returns 2. Let's see"
+    },
+    {
+      "name": "humaneval-plus-43",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 23)",
+      "output_text_clip": "<think>\nOkay, I need to complete the Python function pairs_sum_to_zero. Let me read the problem again. The function should return True if there are two distinct elements in the list that sum to zero. Otherwise, False. \n\nSo, the key points here are: two distinct elements. That means the same number can't be used twice unless there are duplicates. Wait, no. Wait, the elements have to be distinct in their positions, but their values could be same? Wait, the problem says \"two distinct elements\". So,"
+    },
+    {
+      "name": "humaneval-plus-46",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 24)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called fib4 that computes the nth element of this Fib4 sequence. Let me think about the problem.\n\nThe definition says that for n >= 4, fib4(n) is the sum of the previous four terms. But for n=0,1,2,3, the values are 0,0,2,0 respectively. Wait, the examples given are fib4(5) is 4, fib4(6) is 8, fib4(7) is 14. Let me check how that works.\n\nLet me compute the terms step by step. Let's list out the known values:\n\nn=0 \u2192 0\n\nn=1 \u2192 0\n\nn=2 \u2192 2\n\nn=3 \u2192 0\n\nn=4"
+    },
+    {
+      "name": "humaneval-plus-49",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef modp(n: int, p: int):\n    \"\"\"Return 2^n modulo p (be aware of numerics).\n    >>> modp(3, 5)\n    3\n    >>> modp(1101, 101)\n    2\n    >>> modp(0, 101)\n    1\n    >>> modp(3, 11)\n    8\n    >>> modp(100, 101)\n    1\n    \"\"\"\n    return pow(2, n, p)\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-52",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef below_threshold(l: list, t: int):\n    \"\"\"Return True if all numbers in the list l are below threshold t.\n    >>> below_threshold([1, 2, 4, 10], 100)\n    True\n    >>> below_threshold([1, 20, 4, 10], 5)\n    False\n    \"\"\"\n    return all(x < t for x in l)\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-56",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef correct_bracketing(brackets: str) -> bool:\n    \"\"\" brackets is a string of \"<\" and \">\".\n    return True if every opening bracket has a corresponding closing bracket.\n\n    >>> correct_bracketing(\"<\")\n    False\n    >>> correct_bracketing(\"<>\")\n    True\n    >>> correct_bracketing(\"<<><>>\")\n    True\n    >>> correct_bracketing(\"><<>\")\n    False\n    \"\"\"\n    stack = []\n    for char in brackets:\n        if char == '<':\n            stack.append(char)\n        else:\n            if not stack:\n"
+    },
+    {
+      "name": "humaneval-plus-59",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef largest_prime_factor(n: int):\n    \"\"\"Return the largest prime factor of n. Assume n > 1 and is not a prime.\n    >>> largest_prime_factor(13195)\n    29\n    >>> largest_prime_factor(2048)\n    2\n    \"\"\"\n    largest_prime = -1\n    # Handle even factors\n    while n % 2 == 0:\n        largest_prime = 2\n        n = n // 2\n    # Check odd factors\n    i = 3\n    while i * i <= n:\n        while n % i == 0:\n            largest_prime = i\n            n = n // i\n        i += 2\n    # If remaining n"
+    },
+    {
+      "name": "humaneval-plus-62",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef derivative(xs: list):\n    \"\"\" xs represent coefficients of a polynomial.\n    xs[0] + xs[1] * x + xs[2] * x^2 + ....\n     Return derivative of this polynomial in the same form.\n    >>> derivative([3, 1, 2, 4, 5])\n    [1, 4, 12, 20]\n    >>> derivative([1, 2, 3])\n    [2, 6]\n    \"\"\"\n    if len(xs) == 1:\n        return [0]\n    return [i * xs[i] for i in range(1, len(xs))]\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-66",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef digitSum(s):\n    \"\"\"Task\n    Write a function that takes a string as input and returns the sum of the upper characters only'\n    ASCII codes.\n\n    Examples:\n        digitSum(\"\") => 0\n        digitSum(\"abAB\") => 131\n        digitSum(\"abcCd\") => 67\n        digitSum(\"helloE\") => 69\n        digitSum(\"woArBld\") => 131\n        digitSum(\"aAaaaXa\") => 153\n    \"\"\"\n    total = 0\n    for char in s:\n        if char.isupper():\n            total += ord(char)\n    return total\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-69",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom collections import Counter\n\ndef search(lst):\n    '''\n    You are given a non-empty list of positive integers. Return the greatest integer that is greater than \n    zero, and has a frequency greater than or equal to the value of the integer itself. \n    The frequency of an integer is the number of times it appears in the list.\n    If no such a value exist, return -1.\n    Examples:\n        search([4, 1, 2, 2, 3, 1]) == 2\n        search([1, 2, 2, 3, 3, 3, 4, 4, 4]) == 3\n        searc"
+    },
+    {
+      "name": "humaneval-plus-72",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef will_it_fly(q, w):\n    '''\n    Write a function that returns True if the object q will fly, and False otherwise.\n    The object q will fly if it's balanced (it is a palindromic list) and the sum of its elements is less than or equal the maximum possible weight w.\n\n    Example:\n    will_it_fly([1, 2], 5) \ufffd False \n    # 1+2 is less than the maximum possible weight, but it's unbalanced.\n\n    will_it_fly([3, 2, 3], 1) \ufffd False\n    # it's balanced, but 3+2+3 is more than the maximum poss"
+    },
+    {
+      "name": "humaneval-plus-75",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef is_multiply_prime(a):\n    \"\"\"Write a function that returns true if the given number is the multiplication of 3 prime numbers\n    and false otherwise.\n    Knowing that (a) is less than 100. \n    Example:\n    is_multiply_prime(30) == True\n    30 = 2 * 3 * 5\n    \"\"\"\n    if a < 2:\n        return False\n    factors = []\n    # Check for divisibility by 2\n    while a % 2 == 0:\n        factors.append(2)\n        a = a // 2\n    # Check for odd divisors starting from 3\n    i = 3\n    while i * "
+    },
+    {
+      "name": "humaneval-plus-79",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: invalid binary literal",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called decimal_to_binary that converts a decimal number to a binary string, with 'db' at the beginning and end. Let me think about how to do this.\n\nFirst, the function needs to take an integer input. The examples show that for 15, the output is \"db1111db\". So the binary part is the actual binary digits of the number.\n\nHow do I convert a decimal number to binary in Python? Well, there's the bin() function, which returns a string starting with '0b'. "
+    },
+    {
+      "name": "humaneval-plus-82",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef prime_length(string):\n    \"\"\"Write a function that takes a string and returns True if the string\n    length is a prime number or False otherwise\n    Examples\n    prime_length('Hello') == True\n    prime_length('abcdcba') == True\n    prime_length('kittens') == True\n    prime_length('orange') == False\n    \"\"\"\n    n = len(string)\n    if n < 2:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-85",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef add(lst):\n    \"\"\"Given a non-empty list of integers lst. add the even elements that are at odd indices.\n\n\n    Examples:\n        add([4, 2, 6, 7]) ==> 2 \n    \"\"\"\n    total = 0\n    for i in range(len(lst)):\n        if i % 2 == 1:\n            if lst[i] % 2 == 0:\n                total += lst[i]\n    return total\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-89",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef encrypt(s):\n    \"\"\"Create a function encrypt that takes a string as an argument and\n    returns a string encrypted with the alphabet being rotated. \n    The alphabet should be rotated in a manner such that the letters \n    shift down by two multiplied to two places.\n    For example:\n    encrypt('hi') returns 'lm'\n    encrypt('asdfghjkl') returns 'ewhjklnop'\n    encrypt('gf') returns 'kj'\n    encrypt('et') returns 'ix'\n    \"\"\"\n    result = []\n    for c in s:\n        if 'a' <= c <= '"
+    },
+    {
+      "name": "humaneval-plus-92",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef any_int(x, y, z):\n    '''\n    Create a function that takes 3 numbers.\n    Returns true if one of the numbers is equal to the sum of the other two, and all numbers are integers.\n    Returns false in any other cases.\n    \n    Examples\n    any_int(5, 2, 7) \ufffd True\n    \n    any_int(3, 2, 2) \ufffd False\n\n    any_int(3, -2, 1) \ufffd True\n    \n    any_int(3.6, -2.2, 2) \ufffd False\n    '''\n    if not (isinstance(x, int) and isinstance(y, int) and isinstance(z, int)):\n        return False\n    if x == y "
+    },
+    {
+      "name": "humaneval-plus-95",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef check_dict_case(dict):\n    \"\"\"\n    Given a dictionary, return True if all keys are strings in lower \n    case or all keys are strings in upper case, else return False.\n    The function should return False is the given dictionary is empty.\n    Examples:\n    check_dict_case({\"a\":\"apple\", \"b\":\"banana\"}) should return True.\n    check_dict_case({\"a\":\"apple\", \"A\":\"banana\", \"B\":\"banana\"}) should return False.\n    check_dict_case({\"a\":\"apple\", 8:\"banana\", \"a\":\"apple\"}) should return False."
+    },
+    {
+      "name": "humaneval-plus-98",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef count_upper(s):\n    \"\"\"\n    Given a string s, count the number of uppercase vowels in even indices.\n    \n    For example:\n    count_upper('aBCdEf') returns 1\n    count_upper('abcdefg') returns 0\n    count_upper('dBBE') returns 0\n    \"\"\"\n    count = 0\n    vowels = {'A', 'E', 'I', 'O', 'U'}\n    for i in range(len(s)):\n        if i % 2 == 0 and s[i] in vowels:\n            count += 1\n    return count\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-102",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef choose_num(x, y):\n    \"\"\"This function takes two positive numbers x and y and returns the\n    biggest even integer number that is in the range [x, y] inclusive. If \n    there's no such number, then the function should return -1.\n\n    For example:\n    choose_num(12, 15) = 14\n    choose_num(13, 12) = -1\n    \"\"\"\n    if x > y:\n        return -1\n    if y % 2 == 0:\n        return y\n    else:\n        if (y - 1) >= x:\n            return y - 1\n        else:\n            return -1\n```<|im_end"
+    },
+    {
+      "name": "humaneval-plus-105",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef by_length(arr):\n    \"\"\"\n    Given an array of integers, sort the integers that are between 1 and 9 inclusive,\n    reverse the resulting array, and then replace each digit by its corresponding name from\n    \"One\", \"Two\", \"Three\", \"Four\", \"Five\", \"Six\", \"Seven\", \"Eight\", \"Nine\".\n\n    For example:\n      arr = [2, 1, 1, 4, 5, 8, 2, 3]   \n            -> sort arr -> [1, 1, 2, 2, 3, 4, 5, 8] \n            -> reverse arr -> [8, 5, 4, 3, 2, 2, 1, 1]\n      return [\"Eight\", \"Five\", \"Four\", \"Th"
+    },
+    {
+      "name": "humaneval-plus-108",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef count_nums(arr):\n    \"\"\"\n    Write a function count_nums which takes an array of integers and returns\n    the number of elements which has a sum of digits > 0.\n    If a number is negative, then its first signed digit will be negative:\n    e.g. -123 has signed digits -1, 2, and 3.\n    >>> count_nums([]) == 0\n    >>> count_nums([-1, 11, -11]) == 1\n    >>> count_nums([1, 1, 2]) == 3\n    \"\"\"\n    count = 0\n    for num in arr:\n        if num > 0:\n            digits = list(map(int, str(nu"
+    },
+    {
+      "name": "humaneval-plus-112",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef reverse_delete(s, c):\n    \"\"\"Task\n    We are given two strings s and c, you have to deleted all the characters in s that are equal to any character in c\n    then check if the result string is palindrome.\n    A string is called palindrome if it reads the same backward as forward.\n    You should return a tuple containing the result string and True/False for the check.\n    Example\n    For s = \"abcde\", c = \"ae\", the result should be ('bcd',False)\n    For s = \"abcdef\", c = \"b\"  the resu"
+    },
+    {
+      "name": "humaneval-plus-115",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nimport math\n\ndef max_fill(grid, capacity):\n    \"\"\"\n    You are given a rectangular grid of wells. Each row represents a single well,\n    and each 1 in a row represents a single unit of water.\n    Each well has a corresponding bucket that can be used to extract water from it, \n    and all buckets have the same capacity.\n    Your task is to use the buckets to empty the wells.\n    Output the number of times you need to lower the buckets.\n\n    \"\"\"\n    total = 0\n    for row in grid:\n       "
+    },
+    {
+      "name": "humaneval-plus-118",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 29)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called get_closest_vowel that finds the closest vowel between two consonants from the right side of the word. Let me think about how to approach this.\n\nFirst, the problem says the vowel must be between two consonants. Also, vowels at the beginning or end don't count. So I need to check each vowel in the word, but only those that are not at the start or end. But wait, the vowel could be in the middle, but between two consonants. Also, the vowel has "
+    },
+    {
+      "name": "humaneval-plus-121",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef solution(lst):\n    \"\"\"Given a non-empty list of integers, return the sum of all of the odd elements that are in even positions.\n    \n    Examples\n    solution([5, 8, 7, 1]) ==> 12\n    solution([3, 3, 3, 3, 3]) ==> 9\n    solution([30, 13, 24, 321]) ==>0\n    \"\"\"\n    total = 0\n    for i, num in enumerate(lst):\n        if i % 2 == 0 and num % 2 == 1:\n            total += num\n    return total\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-125",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef split_words(txt):\n    '''\n    Given a string of words, return a list of words split on whitespace, if no whitespaces exists in the text you\n    should split on commas ',' if no commas exists you should return the number of lower-case letters with odd order in the\n    alphabet, ord('a') = 0, ord('b') = 1, ... ord('z') = 25\n    Examples\n    split_words(\"Hello world!\") \ufffd [\"Hello\", \"world!\"]\n    split_words(\"Hello,world!\") \ufffd [\"Hello\", \"world!\"]\n    split_words(\"abcdef\") == 3 \n    '''\n "
+    },
+    {
+      "name": "humaneval-plus-128",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef prod_signs(arr):\n    \"\"\"\n    You are given an array arr of integers and you need to return\n    sum of magnitudes of integers multiplied by product of all signs\n    of each number in the array, represented by 1, -1 or 0.\n    Note: return None for empty arr.\n\n    Example:\n    >>> prod_signs([1, 2, 2, -4]) == -9\n    >>> prod_signs([0, 1]) == 0\n    >>> prod_signs([]) == None\n    \"\"\"\n    if not arr:\n        return None\n    sum_abs = sum(abs(x) for x in arr)\n    product_sign = 1\n    for "
+    },
+    {
+      "name": "humaneval-plus-131",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef digits(n):\n    \"\"\"Given a positive integer n, return the product of the odd digits.\n    Return 0 if all digits are even.\n    For example:\n    digits(1)  == 1\n    digits(4)  == 0\n    digits(235) == 15\n    \"\"\"\n    odd_digits = []\n    for digit in str(n):\n        d = int(digit)\n        if d % 2 == 1:\n            odd_digits.append(d)\n    if not odd_digits:\n        return 0\n    product = 1\n    for num in odd_digits:\n        product *= num\n    return product\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-134",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: invalid character '\ufffd' (U+FFFD)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called check_if_last_char_is_a_letter. Let me read the problem statement again carefully.\n\nThe function should return True if the last character of the string is an alphabetical character and is not part of a word. Wait, what's a \"word\" here? The note says a word is a group of characters separated by space. So, the last character is considered not part of a word if it's a letter but after a space? Or maybe the last character is a letter that's not "
+    },
+    {
+      "name": "humaneval-plus-138",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef is_equal_to_sum_even(n):\n    \"\"\"Evaluate whether the given number n can be written as the sum of exactly 4 positive even numbers\n    Example\n    is_equal_to_sum_even(4) == False\n    is_equal_to_sum_even(6) == False\n    is_equal_to_sum_even(8) == True\n    \"\"\"\n    return n % 2 == 0 and n >= 8\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-141",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef file_name_check(file_name):\n    \"\"\"Create a function which takes a string representing a file's name, and returns\n    'Yes' if the the file's name is valid, and returns 'No' otherwise.\n    A file's name is considered to be valid if and only if all the following conditions \n    are met:\n    - There should not be more than three digits ('0'-'9') in the file's name.\n    - The file's name contains exactly one dot '.'.\n    - The substring before the dot should not be empty, and it start"
+    },
+    {
+      "name": "humaneval-plus-144",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef simplify(x, n):\n    \"\"\"Your task is to implement a function that will simplify the expression\n    x * n. The function returns True if x * n evaluates to a whole number and False\n    otherwise. Both x and n, are string representation of a fraction, and have the following format,\n    <numerator>/<denominator> where both numerator and denominator are positive whole numbers.\n\n    You can assume that x, and n are valid fractions, and do not have zero as denominator.\n\n    simplify(\"1/5\","
+    },
+    {
+      "name": "humaneval-plus-148",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef bf(planet1, planet2):\n    '''\n    There are eight planets in our solar system: the closerst to the Sun \n    is Mercury, the next one is Venus, then Earth, Mars, Jupiter, Saturn, \n    Uranus, Neptune.\n    Write a function that takes two planet names as strings planet1 and planet2. \n    The function should return a tuple containing all planets whose orbits are \n    located between the orbit of planet1 and the orbit of planet2, sorted by \n    the proximity to the sun. \n    The functio"
+    },
+    {
+      "name": "humaneval-plus-151",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 16)",
+      "output_text_clip": "<think>\nOkay, let's see. I need to write a Python function called double_the_difference that takes a list of numbers. The goal is to return the sum of the squares of the numbers that are odd. But wait, there are some conditions. I have to ignore numbers that are negative or not integers. Oh right, and if the list is empty, return 0.\n\nWait, the examples given. Let me check the first example: [1,3,2,0]. The sum is 1 +9 +0 +0 =10. Wait, why? Because 1 is odd, 3 is odd, 2 is even, 0 is even. So thei"
+    },
+    {
+      "name": "humaneval-plus-154",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 16)",
+      "output_text_clip": "<think>\nOkay, I need to complete the Python function cycpattern_check(a, b). The goal is to return True if the second word or any of its rotations is a substring of the first word. Let me think about how to approach this.\n\nFirst, let me understand the problem with the examples. For instance, in the first example, cycpattern_check(\"abcd\",\"abd\") returns False. Let's see why. The second word is \"abd\". Its rotations would be \"abd\", \"dab\", \"abd\" again? Wait, rotations of \"abd\" would be shifting the c"
+    },
+    {
+      "name": "humaneval-plus-157",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef right_angle_triangle(a, b, c):\n    '''\n    Given the lengths of the three sides of a triangle. Return True if the three\n    sides form a right-angled triangle, False otherwise.\n    A right-angled triangle is a triangle in which one angle is right angle or \n    90 degree.\n    Example:\n    right_angle_triangle(3, 4, 5) == True\n    right_angle_triangle(1, 2, 3) == False\n    '''\n    sides = sorted([a, b, c])\n    return sides[0]**2 + sides[1]**2 == sides[2]**2\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-161",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef solve(s):\n    \"\"\"You are given a string s.\n    if s[i] is a letter, reverse its case from lower to upper or vise versa, \n    otherwise keep it as it is.\n    If the string contains no letters, reverse the string.\n    The function should return the resulted string.\n    Examples\n    solve(\"1234\") = \"4321\"\n    solve(\"ab\") = \"AB\"\n    solve(\"#a@C\") = \"#A@c\"\n    \"\"\"\n    has_letters = any(c.isalpha() for c in s)\n    if not has_letters:\n        return s[::-1]\n    result = []\n    for c in s:"
+    },
+    {
+      "name": "gsm8k-0000",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=20.0",
+      "output_text_clip": "<think>\nOkay, let's try to figure out how long it takes Carla to download the 200 GB file. So, the problem says she normally downloads at 2 GB per minute. But there's a catch: 40% of the way through the download, Windows forces a restart that takes 20 minutes. Then she has to restart the download from the beginning. Hmm, okay, let me break this down step by step.\n\nFirst, let me find out how much data is 40% of the file. The total file is 200 GB, so 40% of that is 0.4 * 200. Let me calculate that"
+    },
+    {
+      "name": "gsm8k-0001",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=88.0",
+      "output_text_clip": "To determine how much Artie will make, we first need to round each flower's price to the nearest dollar, as he has no change and must round all prices accordingly.\n\n---\n\n### Step 1: Round the flower prices\n\n- **Marigolds:** $2.74 \u2192 Rounds to **$3** (since 0.74 > 0.5)\n- **Petunias:** $1.87 \u2192 Rounds to **$2** (since 0.87 > 0.5)\n- **Begonias:** $2.12 \u2192 Rounds to **$2** (since 0.12 < 0.5)\n\n---\n\n### Step 2: Calculate revenue from each flower\n\n- **Marigolds:** 12 pots \u00d7 $3 = **$36**\n- **Petunias:** 9 "
+    },
+    {
+      "name": "gsm8k-0002",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=272.0",
+      "output_text_clip": "To determine how many hours Kimo spends in classes during one semester, we first analyze his weekly schedule:\n\n- **Monday, Wednesday, and Friday**: 3 classes of 1 hour each \u2192 **3 hours per day**\n- **Tuesday and Thursday**: 2 classes of 2 hours each \u2192 **4 hours per day**\n\nAdding these up for a single week:\n- 3 days \u00d7 3 hours = 9 hours\n- 2 days \u00d7 4 hours = 8 hours\n- **Total per week = 9 + 8 = 17 hours**\n\nSince the semester consists of **16 weeks**, the total class hours are:\n- 17 hours/week \u00d7 16 w"
+    },
+    {
+      "name": "gsm8k-0003",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=2.0",
+      "output_text_clip": "To determine by how many seconds the faster team wins, we analyze the total time for each team in the 4x400 meter relay.\n\n---\n\n### **Team A (Well-Rounded Team)**\n\nEach of the four runners runs their 400-meter leg in **exactly 55 seconds**.\n\n$$\n\\text{Total time for Team A} = 4 \\times 55 = 220 \\text{ seconds}\n$$\n\n---\n\n### **Team B (Less Well-Rounded Team)**\n\nThe first runner runs in **60 seconds**, and each subsequent runner is **3 seconds faster** than the previous one.\n\nSo the times for the four"
+    },
+    {
+      "name": "gsm8k-0004",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=4.0",
+      "output_text_clip": "To determine the number of red chickens Jerry has, we begin by defining variables:\n\n- Let $ R $ represent the number of **red chickens**.\n- Since there are **two more white chickens** than red chickens, the number of **white chickens** is $ R + 2 $.\n\nEach red chicken produces **3 eggs per day**, and each white chicken produces **5 eggs per day**. Therefore, the total number of eggs produced per day is:\n\n$$\n3R + 5(R + 2)\n$$\n\nWe are told that Jerry collects **42 eggs per day**, so we set up the eq"
+    },
+    {
+      "name": "gsm8k-0005",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=45.0",
+      "output_text_clip": "#### 45<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0006",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=370.0",
+      "output_text_clip": "To find the total number of activities Darren completed over two days, we calculate the sum of all exercises done each day and then add them together.\n\n**Day 1:**\n- Pushups: 100  \n- Squats: 50  \n- Dumbbell presses: 20  \n**Total for Day 1:**  \n$ 100 + 50 + 20 = 170 $\n\n**Day 2:**\n- Pushups: $ 100 + 20 = 120 $  \n- Squats: $ 50 - 10 = 40 $  \n- Dumbbell presses: $ 20 \\times 2 = 40 $  \n**Total for Day 2:**  \n$ 120 + 40 + 40 = 200 $\n\n**Total for Two Days:**  \n$ 170 + 200 = 370 $\n\n#### 370<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0007",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=8400.0",
+      "output_text_clip": "Nick's net pay for Job A is calculated as follows:  \n- Gross income: $15/hour \u00d7 2000 hours = **$30,000**  \n- Tax: 20% of $30,000 = **$6,000**  \n- Net pay: $30,000 - $6,000 = **$24,000**  \n\nFor Job B:  \n- Gross income: **$42,000**  \n- Property tax: **$6,000**  \n- Net income after property tax: $42,000 - $6,000 = **$36,000**  \n- Income tax: 10% of $36,000 = **$3,600**  \n- Total taxes: $6,000 + $3,600 = **$9,600**  \n- Net pay: $42,000 - $9,600 = **$32,400**  \n\nDifference in net pay:  \n$32,400 (Job "
+    },
+    {
+      "name": "gsm8k-0008",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=240.0",
+      "output_text_clip": "To determine the total number of corns and cannolis Allan has in his house, we proceed step by step.\n\n---\n\n### **Step 1: Initial Quantities**\n\nWe are told:\n\n- There is **twice as much corn as cannolis** at Allan's house.\n- He has a **total of 40 cannolis** in his house.\n\nFrom this, we can calculate the initial number of corns:\n\n$$\n\\text{Corn} = 2 \\times \\text{Cannolis} = 2 \\times 40 = 80\n$$\n\nSo, initially:\n- **Cannolis = 40**\n- **Corn = 80**\n\n---\n\n### **Step 2: Additional Purchases**\n\nAllan then"
+    },
+    {
+      "name": "gsm8k-0009",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=49.0",
+      "output_text_clip": "Marcus starts with a house temperature of 40 degrees. Over 3 hours of baking, the temperature increases by 5 degrees per hour:  \n**40 + (3 \u00d7 5) = 55 degrees**.  \n\nNext, a window is opened for 30 minutes. The cooling rate is 2 degrees per 10 minutes, so:  \n**30 minutes \ufffd 10 minutes = 3 intervals**.  \n**3 \u00d7 2 = 6 degrees cooled**.  \n\nFinal temperature:  \n**55 - 6 = 49 degrees**.  \n\n#### 49<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0010",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=172.0",
+      "output_text_clip": "Ophelia has 20 sofas. Since each person has 2 fewer sofas than chairs, Ophelia has $20 + 2 = 22$ chairs. Jenna has 3 times as many chairs as Ophelia, so Jenna has $3 \\times 22 = 66$ chairs. Jenna also has $66 - 2 = 64$ sofas. Total sofas: $20 + 64 = 84$. Total chairs: $22 + 66 = 88$. Combined total: $84 + 88 = 172$.\n\n#### 172<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0011",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=1800.0",
+      "output_text_clip": "To determine the total amount of chocolate pounds made by Ruiz and Marissa together in 12 hours, we proceed step by step.\n\n---\n\n### **Step 1: Determine Ruiz's Production Rate**\n\nRuiz makes **120 pounds** of chocolate in **2 hours**.\n\n$$\n\\text{Ruiz's hourly rate} = \\frac{120 \\text{ pounds}}{2 \\text{ hours}} = 60 \\text{ pounds/hour}\n$$\n\n---\n\n### **Step 2: Determine Marissa's Production Rate**\n\nThe problem states:\n\n> \"Marissa makes 3/4 times as many pounds of chocolates in an hour as Ruiz makes in "
+    },
+    {
+      "name": "gsm8k-0012",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=2450.0",
+      "output_text_clip": "To determine the total number of times Helga taps both of her feet during a 5-minute dance, we need to account for two distinct scenarios based on whether her arms are raised or not.\n\n---\n\n### **1. Understanding the Tap Rates**\n\n- **When arms are down:**\n  - Right foot: 300 taps per minute\n  - Left foot: 250 taps per minute\n  - **Total per minute:** $300 + 250 = 550$ taps per minute\n\n- **When arms are raised:**\n  - Each foot (left and right) taps at 200 taps per minute\n  - **Total per minute:** "
+    },
+    {
+      "name": "gsm8k-0013",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=9.0",
+      "output_text_clip": "<think>\nOkay, let me try to figure out this problem step by step. So, Lorraine is trading stickers for buttons. There are different types of buttons and stickers, and I need to track how many she ends up with after all the trades. Let me break it down.\n\nFirst, let me make sure I understand the value conversions. The problem says:\n\n- Each large sticker is worth a large button or three small buttons. So, 1 large sticker = 1 large button or 3 small buttons. That means if she trades a large sticker,"
+    },
+    {
+      "name": "gsm8k-0014",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=70.0",
+      "output_text_clip": "To determine the school's overall pass rate, we need to calculate the total number of students who passed and divide that by the total number of students across all grades.\n\n---\n\n### Step 1: Calculate the number of students who passed in each grade\n\n- **Third Graders**:  \n  340 out of 500 passed  \n  $ \\Rightarrow 340 $ students passed\n\n- **Fourth Graders**:  \n  40 out of 100 passed  \n  $ \\Rightarrow 40 $ students passed\n\n- **Fifth Graders**:  \n  The pass rate is **twice** the fourth grade's pass"
+    },
+    {
+      "name": "gsm8k-0015",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=11.0",
+      "output_text_clip": "To determine how many groups can perform in the 2-hour concert, we need to account for the time required for each group to perform, the intermission, and the total duration of the event.\n\n---\n\n### Step 1: Convert Total Concert Time to Minutes\n\nThe concert lasts **2 hours**, which is:\n\n$$\n2 \\text{ hours} = 120 \\text{ minutes}\n$$\n\n---\n\n### Step 2: Determine Time Per Group\n\nEach group requires the following time:\n\n- **2 minutes** to get on stage  \n- **6 minutes** to perform  \n- **2 minutes** to exi"
+    },
+    {
+      "name": "gsm8k-0016",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=85000.0",
+      "output_text_clip": "To determine the total calories in the pastries Andrew baked, we follow these steps:\n\n1. **Determine calories per mini pastry:**\n   - A normal cinnamon roll has 600 calories, so a mini cinnamon roll has $ \\frac{600}{3} = 200 $ calories.\n   - A normal blueberry muffin has 450 calories, so a mini blueberry muffin has $ \\frac{450}{3} = 150 $ calories.\n\n2. **Calculate total calories for each type:**\n   - For 200 mini cinnamon rolls: $ 200 \\times 200 = 40,000 $ calories.\n   - For 300 mini blueberry m"
+    },
+    {
+      "name": "gsm8k-0017",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=227.0",
+      "output_text_clip": "To determine how long it will take Andy to restring all the racquets, we need to calculate the total time required for each type of stringing and then sum them up.\n\n1. **Synthetic Gut Stringing**:\n   - 3 racquets\n   - Time per racquet: 15 minutes\n   - Total time: $3 \\times 15 = 45$ minutes\n\n2. **Polyester Stringing**:\n   - 5 racquets\n   - Time per racquet: 22 minutes\n   - Total time: $5 \\times 22 = 110$ minutes\n\n3. **Hybrid Stringing**:\n   - 4 racquets\n   - Time per racquet: 18 minutes\n   - Tota"
+    },
+    {
+      "name": "gsm8k-0018",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=36.0",
+      "output_text_clip": "To determine how many points Aries is sure to get on the quiz, we begin by analyzing the distribution of question types and then apply the given success rates.\n\n---\n\n### Step 1: Determine the number of questions in each category\n\n- Total number of questions = 60  \n- Easy questions = 40% of 60 = $ 0.40 \\times 60 = 24 $  \n- Remaining questions = 60 - 24 = 36  \n- These are equally divided between average and difficult:  \n  - Average questions = 18  \n  - Difficult questions = 18  \n\n---\n\n### Step 2: "
+    },
+    {
+      "name": "gsm8k-0019",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=14.0",
+      "output_text_clip": "The glee club ordered 20 pizzas and ate 70%, leaving 20 - (0.7 * 20) = 6 pizzas.  \nThe football team ordered twice as many (40 pizzas) and ate 80%, leaving 40 - (0.8 * 40) = 8 pizzas.  \nTotal pizzas left: 6 + 8 = 14.  \n\n#### 14<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0020",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=25.0",
+      "output_text_clip": "Ellen starts with 12 sodas, 3 of which are shaken. After shaking 3, there are 3 shaken and 9 unshaken sodas. Ellen takes 1 unshaken soda, leaving 3 shaken and 8 unshaken sodas. Her brother then takes 1 shaken and 2 unshaken sodas, leaving 2 shaken and 6 unshaken sodas. \n\nThe probability that Ellen's friend picks a shaken can is the number of shaken cans divided by the total number of remaining cans:\n$$\n\\frac{2}{8} = \\frac{1}{4} = 25\\%\n$$\n\n#### 25<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0021",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=18.0",
+      "output_text_clip": "To determine how many toys per hour the fifth worker produces, we begin by analyzing the total number of toys produced during the 10-hour shift.\n\n---\n\n### **Step 1: Total Toys Needed and Produced**\n\nThe manufacturer needs **400 toys** in total. After the 10-hour shift, they still need **20 more toys** to complete the order. Therefore, the number of toys produced during the shift is:\n\n$$\n400 - 20 = 380 \\text{ toys}\n$$\n\n---\n\n### **Step 2: Production from the First Four Workers**\n\nWe are told:\n\n- *"
+    },
+    {
+      "name": "gsm8k-0022",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=16.0",
+      "output_text_clip": "To determine how many bandages the nurses started with on the first day, we analyze the sequence of events and track the stock of bandages day by day.\n\n---\n\n### **Day 1:**\n- **Used:** 38 bandages  \n- **Ordered:** 1 bulk pack = 50 bandages  \n- **Initial stock:** Let\u2019s denote this as **S**  \n- **Stock after ordering:** $ S + 50 $  \n- **Stock after using 38:** $ S + 50 - 38 = S + 12 $\n\n---\n\n### **Day 2:**\n- **Used:** 10 fewer than Day 1 = $ 38 - 10 = 28 $  \n- **Stock after Day 2:**  \n  $$\n  (S + 12"
+    },
+    {
+      "name": "gsm8k-0023",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3.0",
+      "output_text_clip": "To determine how many cupcakes Carly made, we begin by analyzing the total number of treats required.\n\nCarly's art class has 5 people, and each person receives 2 treats. Therefore, the total number of treats needed is:\n\n$$\n5 \\times 2 = 10 \\text{ treats}\n$$\n\nLet the number of cupcakes be $ C $. According to the problem, the number of brownies is **2 less than three times** the number of cupcakes. That gives us:\n\n$$\n\\text{Brownies} = 3C - 2\n$$\n\nThe total number of treats is the sum of cupcakes and"
+    },
+    {
+      "name": "gsm8k-0024",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=70000.0",
+      "output_text_clip": "Josh buys a house for $80,000 and spends $50,000 on repairs. The repairs increase the house's value by 150%, meaning the new value is 250% of the original value. \n\n1. **Original value of the house**: $80,000  \n2. **Value after repairs**:  \n   $$\n   80,000 \\times 2.5 = 200,000\n   $$  \n3. **Total cost**:  \n   $$\n   80,000 \\text{ (purchase)} + 50,000 \\text{ (repairs)} = 130,000\n   $$  \n4. **Profit**:  \n   $$\n   200,000 \\text{ (selling price)} - 130,000 \\text{ (total cost)} = 70,000\n   $$  \n\n#### 70"
+    },
+    {
+      "name": "gsm8k-0025",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=83.0",
+      "output_text_clip": "To determine the maximum number of boxes that can be loaded onto the delivery truck without exceeding the bridge's weight limit, we begin by analyzing the constraints:\n\n- The **bridge can carry no more than 5000 pounds**.\n- The **combined weight of the driver and empty truck is 3755 pounds**.\n- Each **box weighs 15 pounds**.\n\n---\n\n### Step 1: Define the Total Weight Constraint\n\nLet $ x $ represent the number of boxes. The total weight of the truck plus the boxes is:\n\n$$\n\\text{Total weight} = 375"
+    },
+    {
+      "name": "gsm8k-0026",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=500.0",
+      "output_text_clip": "Poppy places a quarter of the 1000 pieces:  \n$ \\frac{1}{4} \\times 1000 = 250 $ pieces.  \nRemaining after Poppy: $ 1000 - 250 = 750 $ pieces.  \n\nHer mom places a third of the remaining 750 pieces:  \n$ \\frac{1}{3} \\times 750 = 250 $ pieces.  \nRemaining after mom: $ 750 - 250 = 500 $ pieces.  \n\n#### 500<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0027",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=51.0",
+      "output_text_clip": "To determine the total age of the four birds, we analyze the relationships and given data step by step.\n\n---\n\n### Step 1: Define the Variables\n\nLet the ages of the birds be:\n\n- **Sally Two** = $ S_2 $\n- **Granny Red** = $ GR $\n- **Sally Four** = $ S_4 $\n- **Sally Thirtytwo** = $ S_{32} $\n\n---\n\n### Step 2: Use the Given Information\n\n1. **Sally Two is three years older than Granny Red**  \n   $$\n   S_2 = GR + 3\n   $$\n\n2. **Granny Red is two times as old as Sally Four**  \n   $$\n   GR = 2 \\times S_4\n"
+    },
+    {
+      "name": "gsm8k-0028",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=280.0",
+      "output_text_clip": "To determine how many students left through exit C, we follow the sequence of events step by step:\n\n---\n\n### **Step 1: Initial number of students**\nThere are **1000 students** in the hall.\n\n---\n\n### **Step 2: Students leaving through Exit A**\n- 30% of the students left through Exit A.\n- $ 30\\% \\times 1000 = 0.3 \\times 1000 = 300 $ students.\n\n**Remaining students after Exit A:**  \n$ 1000 - 300 = 700 $\n\n---\n\n### **Step 3: Students leaving through Exit B**\n- $ \\frac{3}{5} $ of the remaining 700 stu"
+    },
+    {
+      "name": "gsm8k-0029",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=4.0",
+      "output_text_clip": "<think>\nOkay, let's see. I need to figure out how much Watson made in April, given that the company performed very well, so he gets the $300 bonus each week. Let me break this down step by step.\n\nFirst, Watson works a 10-hour shift each day, five days a week. So, how many hours does he work in a week? Well, 10 hours per day times 5 days. Let me calculate that: 10 * 5 = 50 hours per week.\n\nHe earns $10 per hour. So his weekly earnings from his hourly wage would be 50 hours * $10/hour. Let me do t"
+    },
+    {
+      "name": "gsm8k-0030",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=20.0",
+      "output_text_clip": "To determine how many days the train goes between services, we need to calculate the total distance the train travels in one full trip and then determine how many such trips are completed in a day.\n\n---\n\n### Step 1: Determine the distance of each leg of the trip\n\n- **First city to second city:** 75 miles  \n- **Second city to third city:** 100 miles  \n- **Third city to first city:** 50 miles less than the combined distance of the first two legs  \n  - Combined distance of first two legs = 75 + 100"
+    },
+    {
+      "name": "gsm8k-0031",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3000.0",
+      "output_text_clip": "Stanley was at an elevation of 10,000 feet when his comb fell 4,000 feet to a ledge. This means the comb is now at an elevation of $10,000 - 4,000 = 6,000$ feet. Oliver is at 3,000 feet. To find the distance Oliver must climb, subtract his elevation from the comb's elevation: $6,000 - 3,000 = 3,000$ feet.\n\n#### 3000<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0032",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3.0",
+      "output_text_clip": "Theo bought a pen for $2. The paper cost $1 less than three times the pen's price:  \n3 \u00d7 $2 = $6, then $6 - $1 = $5.  \n\nTotal cost: $2 (pen) + $5 (paper) = $7.  \n\nChange from $10: $10 - $7 = $3.  \n\n#### 3<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0033",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=9.0",
+      "output_text_clip": "To determine how many rows of tulips Jackson can plant, we need to consider the number of tulips he has and how many fit into each row.\n\n- **Red Tulips**: Jackson has 36 red tulips. Each row can hold 6 red tulips.  \n  $$\n  \\text{Number of red rows} = \\frac{36}{6} = 6\n  $$\n\n- **Blue Tulips**: Jackson has 24 blue tulips. Each row can hold 8 blue tulips.  \n  $$\n  \\text{Number of blue rows} = \\frac{24}{8} = 3\n  $$\n\nAdding the rows for both colors gives the total number of rows:\n$$\n6 + 3 = 9\n$$\n\n####"
+    },
+    {
+      "name": "gsm8k-0034",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=120.0",
+      "output_text_clip": "Judy bought 12 cups (a dozen) and twice as many dishes, which is 24 dishes. Her friend brought 40 cups and 20 more dishes than Judy, so 24 + 20 = 44 dishes. Total utensils = 12 cups + 24 dishes + 40 cups + 44 dishes = 120.\n\n#### 120<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0035",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=30000.0",
+      "output_text_clip": "<think>\nOkay, let me try to figure out the total cost of Bill's new truck. So, the base price is $30,000. Then there are several added features: king cab upgrade, towing package, leather seats, running boards, and upgraded exterior lights. Wait, hold on, the problem mentions the features as king cab, towing package, leather seats, running boards, and upgraded exterior lights. But the description says the other features are at extra cost. Wait, the base price is $30k, and the other features are e"
+    },
+    {
+      "name": "gsm8k-0036",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=12.0",
+      "output_text_clip": "<think>\nOkay, let's see. Manolo bought five lollipops and four candies that cost $3.20. Each lollipop is $0.40. I need to find out how much 10 lollipops and 10 candies will cost him. Hmm, let me break this down step by step.\n\nFirst, let me figure out the total cost of the five lollipops and four candies he originally bought. Wait, the problem says that five lollipops and four candies cost $3.20. Wait, no, actually, the wording is a bit confusing. Let me read again.\n\n\"Manolo bought five lollipops"
+    },
+    {
+      "name": "gsm8k-0037",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=4000.0",
+      "output_text_clip": "To determine how many chairs Candy will be able to rent out in two 4-week months, we need to break the problem into manageable parts based on the given information:\n\n---\n\n### **Step 1: Understand the daily rental rates**\n- **Weekdays:** 60 chairs per day\n- **Weekends:** 100 chairs per day\n\nA standard week has:\n- 5 weekdays\n- 2 weekend days\n\n---\n\n### **Step 2: Calculate chairs rented per week**\n- **Weekday chairs:**  \n  $ 5 \\text{ days} \\times 60 = 300 \\text{ chairs} $\n\n- **Weekend chairs:**  \n  "
+    },
+    {
+      "name": "gsm8k-0038",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=4.0",
+      "output_text_clip": "Milo has 2 bags of glass chips, each containing 72 chips, totaling 144 chips. Each square inch of the mosaic requires 12 chips, so the total area he can create is $ \\frac{144}{12} = 12 $ square inches. Since the mosaic is 3 inches tall, the length is calculated by dividing the area by the height: $ \\frac{12}{3} = 4 $ inches.\n\n#### 4<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0039",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3430.0",
+      "output_text_clip": "To determine how many people are infected after three days, we analyze the spread of the plague step by step, assuming that:\n\n- Each infected person infects **exactly 6 new people per day**.\n- Once infected, a person remains infected and continues to infect others each day.\n- There are **no recoveries or immunity** mentioned, so the total number of infected people grows each day.\n\n---\n\n### Day 0 (Initial State)\n- **Infected people:** 10\n\n---\n\n### Day 1\n- Each of the 10 infected people infects 6 "
+    },
+    {
+      "name": "gsm8k-0040",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=60.0",
+      "output_text_clip": "The bus traveled 60 mph for 5 hours:  \n**Distance = 60 \u00d7 5 = 300 miles**.  \n\nThe car traveled 30 mph for 8 hours:  \n**Distance = 30 \u00d7 8 = 240 miles**.  \n\nDifference in distance:  \n**300 - 240 = 60 miles**.  \n\n#### 60<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0041",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=7.0",
+      "output_text_clip": "Joe caught 3 pounds on Thursday, 12 pounds on Friday (4 times Thursday's catch), and 6 pounds on Saturday (half of Friday's catch). Total crawfish caught: 3 + 12 + 6 = 21 pounds. With 1 serving being 3 pounds, the number of servings is 21 \ufffd 3 = 7.\n\n#### 7<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0042",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=450.0",
+      "output_text_clip": "To determine how many small jelly beans Grandpa can eat, we need to analyze the relationships between the sizes of the jelly beans and how they contribute to filling him up.\n\n---\n\n### Step 1: Understand the capacity in terms of large beans\n\nWe are told:\n- **75 large jelly beans** fill Grandpa up.\n\nLet\u2019s denote the \"filling value\" of one large bean as **L**. Then the total capacity is:\n$$\n\\text{Capacity} = 75L\n$$\n\n---\n\n### Step 2: Relate medium beans to large beans\n\nThe problem states:\n- **He can"
+    },
+    {
+      "name": "gsm8k-0043",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=8.0",
+      "output_text_clip": "<think>\nOkay, let's try to figure out how many hours a week John spends learning. Hmm, let me start by breaking down the information given.\n\nFirst, there are 6 periods in a day for a normal student, but John has 2 extra classes. Each class is 40 minutes long. He goes to class 5 days a week. Then, he spends 1/16 of his weekly minutes each on Saturday and Sunday as extra learning time. I need to calculate the total time he spends learning each week and convert that into hours.\n\nLet me start with t"
+    },
+    {
+      "name": "gsm8k-0044",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=20.0",
+      "output_text_clip": "To determine how many seashells each person received, we first calculate the number of seashells each person collected:\n\n- **Jim** collected 27 seashells.\n- **Carlos** collected 5 fewer than Jim:  \n  $$\n  27 - 5 = 22\n  $$\n- **Carrey** collected half as many as Carlos:  \n  $$\n  22 \\div 2 = 11\n  $$\n\nNow, we find the total number of seashells collected by all three:\n$$\n27 + 22 + 11 = 60\n$$\n\nThey divided the seashells equally among themselves:\n$$\n60 \\div 3 = 20\n$$\n\n#### <number>\n20\n#### 20<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0045",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=448.0",
+      "output_text_clip": "To determine the total amount of medicine needed for 8 doses, we first calculate the amount per dose:\n\n- First medicine: **14 mL**\n- Second medicine: **3 \u00d7 14 mL = 42 mL**\n- Total per dose: **14 mL + 42 mL = 56 mL**\n\nFor 8 doses:  \n**56 mL/dose \u00d7 8 doses = 448 mL**\n\n#### 448<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0046",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=36.0",
+      "output_text_clip": "To determine how many lemons Tim needs, we must first understand the recipe and the additional requirement for Allen's extra gallon.\n\n---\n\n### Step 1: Understand the Lemonade Recipe\n\n- **1 gallon of lemonade requires 1 cup of lemon juice.**\n- **6 lemons yield 1 cup of lemon juice.**\n\nThis means:\n- **1 cup of lemon juice = 6 lemons**\n- Therefore, **1 gallon of lemonade = 6 lemons**\n\n---\n\n### Step 2: Calculate the Regular Lemonade (4 Gallons)\n\n- 4 gallons \u00d7 1 cup of lemon juice per gallon = **4 cu"
+    },
+    {
+      "name": "gsm8k-0047",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=18.0",
+      "output_text_clip": "Janet's ducks lay 16 eggs per day. She uses 3 eggs for breakfast and 4 eggs for muffins, totaling 7 eggs. This leaves 16 - 7 = 9 eggs to sell. At $2 per egg, she makes 9 * 2 = $18 daily.\n\n#### 18<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0048",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=1430.0",
+      "output_text_clip": "Janet's total payment includes the cost of materials, the jeweler's construction fee, and the insurance. \n\n1. **Materials**: $500  \n2. **Jeweler's Fee**: $800  \n3. **Insurance**: 10% of the total materials and construction cost  \n   - Total materials and construction: $500 + $800 = $1,300  \n   - Insurance: 10% of $1,300 = $130  \n\n**Total Payment**:  \n$500 (materials) + $800 (jeweler) + $130 (insurance) = **$1,430**\n\n#### 1430<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0049",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=82.0",
+      "output_text_clip": "Dylan bought 38 chicken sausages. He bought 6 more fish sausages than chicken sausages, so fish sausages = 38 + 6 = 44. Total sausages = 38 (chicken) + 44 (fish) = 82.\n\n#### 82<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0050",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=5.0",
+      "output_text_clip": "To determine how many times Sandra needs to babysit, we first calculate the total number of eggs required for 15 Spanish flans. Each flan requires 3 eggs, so:\n\n$$\n15 \\text{ flans} \\times 3 \\text{ eggs/flan} = 45 \\text{ eggs}\n$$\n\nNext, we know Sandra receives 9 eggs per babysitting session. To find the number of sessions needed to obtain 45 eggs:\n\n$$\n\\frac{45 \\text{ eggs}}{9 \\text{ eggs/session}} = 5 \\text{ sessions}\n$$\n\nSince 45 is divisible by 9 with no remainder, Sandra needs exactly 5 babysit"
+    },
+    {
+      "name": "gsm8k-0051",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=9.0",
+      "output_text_clip": "To determine the total number of days Andrew will travel, we need to break the problem into two parts: the trip to Rochester and the return trip.\n\n---\n\n### Step 1: Determine the time to travel to Rochester by bus\n\nThe problem states:\n\n> \"It takes 6 days to travel by bus from New Jersey to Rochester.\"\n\nSo, the one-way trip by bus takes **6 days**.\n\n---\n\n### Step 2: Determine the time to travel to Rochester by car\n\nThe problem also says:\n\n> \"It takes half as many days to travel by car from New Jer"
+    },
+    {
+      "name": "gsm8k-0052",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=762.0",
+      "output_text_clip": "Mary buys three bags of M&Ms.  \n- **First bag**: 300 M&Ms  \n- **Second bag**: 300 + 12 = 312 M&Ms  \n- **Third bag**: Half of the first bag = 300 \ufffd 2 = 150 M&Ms  \n\nTotal M&Ms = 300 + 312 + 150 = **762**  \n\n#### 762<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0053",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=1.0",
+      "output_text_clip": "The book costs $4. The magazine costs half as much as the book, so $4 \ufffd 2 = $2. The pen costs $1 less than the magazine, so $2 - $1 = $1. \n\n#### 1<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0054",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=21.0",
+      "output_text_clip": "Rachel initially had 23 cookies. Janet gave her 42, so total cookies become 23 + 42 = 65. Her brother ate 44, leaving 65 - 44 = 21 cookies. \n\n#### 21<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0055",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": false,
+      "score": 0.0,
+      "detail": "extracted=240.0",
+      "output_text_clip": "Marin and Nancy each eat 4 apples per day. Combined, they eat 4 + 4 = 8 apples per day. Over 30 days, they eat 8 \u00d7 30 = 240 apples.\n\n#### 240<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0056",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=38.0",
+      "output_text_clip": "To determine Angela's current age, we start by analyzing the information provided:\n\n- **Brett's current age** = 14 years\n- **In four years**, Angela's age will be **three times** Brett's **current age**.\n\nLet\u2019s define:\n- Let **A** be Angela's current age.\n\nIn four years, Angela's age will be:\n$$\nA + 4\n$$\n\nAccording to the problem, this future age is three times Brett's current age:\n$$\nA + 4 = 3 \\times 14\n$$\n\nSimplify the right-hand side:\n$$\nA + 4 = 42\n$$\n\nNow solve for **A**:\n$$\nA = 42 - 4 = 38\n"
+    },
+    {
+      "name": "gsm8k-0057",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=2.0",
+      "output_text_clip": "John earns $2 per hour, works 5 hours a day for 4 days a week, so his weekly earnings are $2 * 5 * 4 = $40. To save $80, he needs $80 / $40 per week = 2 weeks.\n\n#### 2<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0058",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=8.0",
+      "output_text_clip": "Charmaine will be 16 years old in 12 years, so her current age is $16 - 12 = 4$. Four years from now, she will be $4 + 4 = 8$ years old.\n\n#### 8<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0059",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=53.0",
+      "output_text_clip": "The original game duration is 4 quarters \u00d7 12 minutes = 48 minutes. The tie in the last quarter added 5 minutes of overtime. Total duration = 48 + 5 = 53 minutes.\n\n#### 53<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0060",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=4.0",
+      "output_text_clip": "Castle bought 3 + 5 = 8 boxes of cereal this week. Last week, she bought 4 boxes. The difference is 8 - 4 = 4. \n\n#### 4<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0061",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=142.0",
+      "output_text_clip": "Ricardo's total fruits are calculated by multiplying the number of plants by their respective yields and summing the results. \n\n- **Tomatoes**: 5 plants \u00d7 22 tomatoes/plant = 110 tomatoes  \n- **Eggplants**: 8 plants \u00d7 4 eggplants/plant = 32 eggplants  \n\nAdding them together: 110 + 32 = **142** fruits.\n\n#### 142<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0062",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=3.0",
+      "output_text_clip": "Jennifer started with 12 oranges.  \nShe gave 3 daughters: 3 daughters \u00d7 2 oranges = **6 oranges**.  \nShe gave her son: **3 oranges**.  \nTotal given away: 6 + 3 = **9 oranges**.  \nOranges remaining: 12 - 9 = **3**.  \n\n#### 3<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0063",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=250.0",
+      "output_text_clip": "John rents his car 10 times a month for 3 hours each, totaling 30 hours. At $25/hour, his revenue is $30 \\times 25 = 750$. Subtracting his car payment of $500, the profit is $750 - 500 = 250$. \n\n#### 250<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0064",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=13.0",
+      "output_text_clip": "Jasmine starts with 15 stickers. After losing 7, she has $15 - 7 = 8$. Adding the 5 stickers she receives for helping classmates: $8 + 5 = 13$. \n\n#### 13<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0065",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=66.0",
+      "output_text_clip": "Ted starts with $200 and makes two purchases:  \n- **Books**: 3 books at $16 each \u2192 $3 \\times 16 = 48$  \n- **Pencils**: 3 pencils at $6 each \u2192 $3 \\times 6 = 18$  \n\nTotal spent: $48 + 18 = 66$  \n\n#### 66<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0066",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=30.0",
+      "output_text_clip": "#### 30<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0067",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=32.0",
+      "output_text_clip": "To find the total number of blue birds, we calculate the contributions from each group of trees:\n\n1. **3 trees with 7 birds each**:  \n   $ 3 \\times 7 = 21 $\n\n2. **2 trees with 4 birds each**:  \n   $ 2 \\times 4 = 8 $\n\n3. **1 tree with 3 birds**:  \n   $ 1 \\times 3 = 3 $\n\nAdding these together:  \n$ 21 + 8 + 3 = 32 $\n\n#### 32<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0068",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=100.0",
+      "output_text_clip": "May's hair was cut from 10 inches to 8 inches, meaning 2 inches were cut. The cost for the haircut is calculated as $30 per inch cut, so 2 inches \u00d7 $30 = $60. Adding the color cost of $40, the total cost is $60 + $40 = $100.\n\n#### 100<|im_end|>"
+    },
+    {
+      "name": "gsm8k-0069",
+      "category": "gsm8k",
+      "suite": "gsm8k",
+      "passed": true,
+      "score": 1.0,
+      "detail": "extracted=12.0",
+      "output_text_clip": "#### 12<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-1",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 22)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called separate_paren_groups that takes a string and returns a list of strings, each being a balanced parentheses group. The input string might have multiple groups separated by spaces, and I need to split them into individual groups. Also, the groups are not nested, so they are balanced and not within each other.\n\nFirst, I should process the input string. The problem says to ignore any spaces, so I need to remove all spaces. Let me think: maybe I "
+    },
+    {
+      "name": "humaneval-plus-2",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef truncate_number(number: float) -> float:\n    \"\"\" Given a positive floating point number, it can be decomposed into\n    and integer part (largest integer smaller than given number) and decimals\n    (leftover part always smaller than 1).\n\n    Return the decimal part of the number.\n    >>> truncate_number(3.5)\n    0.5\n    \"\"\"\n    return number - int(number)\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-4",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef mean_absolute_deviation(numbers: List[float]) -> float:\n    \"\"\" For a given list of input numbers, calculate Mean Absolute Deviation\n    around the mean of this dataset.\n    Mean Absolute Deviation is the average absolute difference between each\n    element and a centerpoint (mean in this case):\n    MAD = average | x - x_mean |\n    >>> mean_absolute_deviation([1.0, 2.0, 3.0, 4.0])\n    1.0\n    \"\"\"\n    mean = sum(numbers) / len(numbers)\n    total = 0.0\n    fo"
+    },
+    {
+      "name": "humaneval-plus-5",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef intersperse(numbers: List[int], delimeter: int) -> List[int]:\n    \"\"\" Insert a number 'delimeter' between every two consecutive elements of input list `numbers'\n    >>> intersperse([], 4)\n    []\n    >>> intersperse([1, 2, 3], 4)\n    [1, 4, 2, 4, 3]\n    \"\"\"\n    if not numbers:\n        return []\n    result = [numbers[0]]\n    for num in numbers[1:]:\n        result.append(delimeter)\n        result.append(num)\n    return result\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-6",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef parse_nested_parens(paren_string: str) -> List[int]:\n    \"\"\" Input to this function is a string represented multiple groups for nested parentheses separated by spaces.\n    For each of the group, output the deepest level of nesting of parentheses.\n    E.g. (()()) has maximum two levels of nesting while ((())) has three.\n\n    >>> parse_nested_parens('(()()) ((())) () ((())()())')\n    [2, 3, 1, 3]\n    \"\"\"\n    groups = paren_string.split()\n    result = []\n    f"
+    },
+    {
+      "name": "humaneval-plus-8",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List, Tuple\n\n\ndef sum_product(numbers: List[int]) -> Tuple[int, int]:\n    \"\"\" For a given list of integers, return a tuple consisting of a sum and a product of all the integers in a list.\n    Empty sum should be equal to 0 and empty product should be equal to 1.\n    >>> sum_product([])\n    (0, 1)\n    >>> sum_product([1, 2, 3, 4])\n    (10, 24)\n    \"\"\"\n    total_sum = sum(numbers)\n    product = 1\n    for num in numbers:\n        product *= num\n    return (total_sum, pro"
+    },
+    {
+      "name": "humaneval-plus-9",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List, Tuple\n\n\ndef rolling_max(numbers: List[int]) -> List[int]:\n    \"\"\" From a given list of integers, generate a list of rolling maximum element found until given moment\n    in the sequence.\n    >>> rolling_max([1, 2, 3, 2, 3, 4, 2])\n    [1, 2, 3, 3, 3, 4, 4]\n    \"\"\"\n    if not numbers:\n        return []\n    result = []\n    current_max = numbers[0]\n    result.append(current_max)\n    for num in numbers[1:]:\n        if num > current_max:\n            current_max = num\n"
+    },
+    {
+      "name": "humaneval-plus-11",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef string_xor(a: str, b: str) -> str:\n    \"\"\" Input are two strings a and b consisting only of 1s and 0s.\n    Perform binary XOR on these inputs and return result also as a string.\n    >>> string_xor('010', '110')\n    '100'\n    \"\"\"\n    result = []\n    for x, y in zip(a, b):\n        result.append(str(int(x) ^ int(y)))\n    return ''.join(result)\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-12",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List, Optional\n\n\ndef longest(strings: List[str]) -> Optional[str]:\n    \"\"\" Out of list of strings, return the longest one. Return the first one in case of multiple\n    strings of the same length. Return None in case the input list is empty.\n    >>> longest([])\n    None\n    >>> longest(['a', 'b', 'c'])\n    'a'\n    >>> longest(['a', 'bb', 'ccc'])\n    'ccc'\n    \"\"\"\n    if not strings:\n        return None\n    max_str = strings[0]\n    for s in strings[1:]:\n        if len("
+    },
+    {
+      "name": "humaneval-plus-14",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef all_prefixes(string: str) -> List[str]:\n    \"\"\" Return list of all prefixes from shortest to longest of the input string\n    >>> all_prefixes('abc')\n    ['a', 'ab', 'abc']\n    \"\"\"\n    prefixes = []\n    for i in range(1, len(string) + 1):\n        prefixes.append(string[:i])\n    return prefixes\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-15",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef string_sequence(n: int) -> str:\n    \"\"\" Return a string containing space-delimited numbers starting from 0 upto n inclusive.\n    >>> string_sequence(0)\n    '0'\n    >>> string_sequence(5)\n    '0 1 2 3 4 5'\n    \"\"\"\n    return ' '.join(str(i) for i in range(n + 1))\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-17",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef parse_music(music_string: str) -> List[int]:\n    \"\"\" Input to this function is a string representing musical notes in a special ASCII format.\n    Your task is to parse this string and return list of integers corresponding to how many beats does each\n    note last.\n\n    Here is a legend:\n    'o' - whole note, lasts four beats\n    'o|' - half note, lasts two beats\n    '.|' - quater note, lasts one beat\n\n    >>> parse_music('o o| .| o| o| .| .| .| .| o o')\n   "
+    },
+    {
+      "name": "humaneval-plus-18",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef how_many_times(string: str, substring: str) -> int:\n    \"\"\" Find how many times a given substring can be found in the original string. Count overlaping cases.\n    >>> how_many_times('', 'a')\n    0\n    >>> how_many_times('aaa', 'a')\n    3\n    >>> how_many_times('aaaa', 'aa')\n    3\n    \"\"\"\n    m = len(substring)\n    n = len(string)\n    if m > n:\n        return 0\n    count = 0\n    for i in range(n - m + 1):\n        if string[i:i+m] == substring:\n            count += 1\n    return count"
+    },
+    {
+      "name": "humaneval-plus-19",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\n\ndef sort_numbers(numbers: str) -> str:\n    \"\"\" Input is a space-delimited string of numberals from 'zero' to 'nine'.\n    Valid choices are 'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight' and 'nine'.\n    Return the string with numbers sorted from smallest to largest\n    >>> sort_numbers('three one five')\n    'one three five'\n    \"\"\"\n    word_to_num = {\n        'zero': 0,\n        'one': 1,\n        'two': 2,\n        'three': 3,\n        'fou"
+    },
+    {
+      "name": "humaneval-plus-21",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef rescale_to_unit(numbers: List[float]) -> List[float]:\n    \"\"\" Given list of numbers (of at least two elements), apply a linear transform to that list,\n    such that the smallest number will become 0 and the largest will become 1\n    >>> rescale_to_unit([1.0, 2.0, 3.0, 4.0, 5.0])\n    [0.0, 0.25, 0.5, 0.75, 1.0]\n    \"\"\"\n    min_val = min(numbers)\n    max_val = max(numbers)\n    if min_val == max_val:\n        return [0.0 for _ in numbers]\n    range_val = max_va"
+    },
+    {
+      "name": "humaneval-plus-22",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\nfrom typing import List, Any\n\n\ndef filter_integers(values: List[Any]) -> List[int]:\n    \"\"\" Filter given list of any python values only for integers\n    >>> filter_integers(['a', 3.14, 5])\n    [5]\n    >>> filter_integers([1, 2, 3, 'abc', {}, []])\n    [1, 2, 3]\n    \"\"\"\n    return [x for x in values if isinstance(x, int)]\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-24",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 10)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called largest_divisor that takes an integer n and returns the largest number smaller than n that divides it evenly. Let's think about how to approach this.\n\nFirst, the problem says the divisor has to be smaller than n. So for example, if n is 15, the divisors are 1, 3, 5. The largest is 5. So the function returns 5.\n\nSo the straightforward way is to check numbers from n-1 down to 1 and find the first one that divides n. But wait, for large n, this"
+    },
+    {
+      "name": "humaneval-plus-25",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef factorize(n: int) -> List[int]:\n    \"\"\" Return list of prime factors of given integer in the order from smallest to largest.\n    Each of the factors should be listed number of times corresponding to how many times it appeares in factorization.\n    Input number should be equal to the product of all factors\n    >>> factorize(8)\n    [2, 2, 2]\n    >>> factorize(25)\n    [5, 5]\n    >>> factorize(70)\n    [2, 5, 7]\n    \"\"\"\n    factors = []\n    # Handle 2\n    while "
+    },
+    {
+      "name": "humaneval-plus-27",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef flip_case(string: str) -> str:\n    \"\"\" For a given string, flip lowercase characters to uppercase and uppercase to lowercase.\n    >>> flip_case('Hello')\n    'hELLO'\n    \"\"\"\n    return string.swapcase()\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-28",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\n\ndef concatenate(strings: List[str]) -> str:\n    \"\"\" Concatenate list of strings into a single string\n    >>> concatenate([])\n    ''\n    >>> concatenate(['a', 'b', 'c'])\n    'abc'\n    \"\"\"\n    return ''.join(strings)\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-29",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nfrom typing import List\n\ndef filter_by_prefix(strings: List[str], prefix: str) -> List[str]:\n    \"\"\" Filter an input list of strings only for ones that start with a given prefix.\n    >>> filter_by_prefix([], 'a')\n    []\n    >>> filter_by_prefix(['abc', 'bcd', 'cde', 'array'], 'a')\n    ['abc', 'array']\n    \"\"\"\n    return [s for s in strings if s.startswith(prefix)]\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-31",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 26)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called is_prime that checks if a number is prime. Let me think about how to approach this.\n\nFirst, the function should return True if the number is prime, False otherwise. Let me recall the definition of a prime number: a number greater than 1 that has no divisors other than 1 and itself.\n\nSo, the first thing to handle is edge cases. For example, if n is less than 2, it's definitely not prime. So the function should return False in that case. Like "
+    },
+    {
+      "name": "humaneval-plus-32",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 26)",
+      "output_text_clip": "<think>\nOkay, I need to complete the find_zero function. Let's read the problem statement again. The function find_zero takes a list of coefficients xs and returns a zero of the polynomial. The examples given are for a linear equation and a cubic. The docstring says that xs has an even number of coefficients and the largest non-zero coefficient guarantees a solution. \n\nWait, the examples: the first example is [1, 2], which is a linear polynomial 1 + 2x. The root is -0.5. The second example is [-"
+    },
+    {
+      "name": "humaneval-plus-34",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef unique(l: list):\n    \"\"\"Return sorted unique elements in a list\n    >>> unique([5, 3, 5, 2, 3, 3, 9, 0, 123])\n    [0, 2, 3, 5, 9, 123]\n    \"\"\"\n    return sorted(set(l))\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-35",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef max_element(l: list):\n    \"\"\"Return maximum element in the list.\n    >>> max_element([1, 2, 3])\n    3\n    >>> max_element([5, 3, -5, 2, -3, 3, 9, 0, 123, 1, -10])\n    123\n    \"\"\"\n    return max(l)\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-37",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef sort_even(l: list):\n    \"\"\"This function takes a list l and returns a list l' such that\n    l' is identical to l in the odd indicies, while its values at the even indicies are equal\n    to the values of the even indicies of l, but sorted.\n    \"\"\"\n    evens = l[::2]\n    sorted_evens = sorted(evens)\n    result = []\n    for i in range(len(l)):\n        if i % 2 == 0:\n            result.append(sorted_evens[i//2])\n        else:\n            result.append(l[i])\n    return result\n```<|im_en"
+    },
+    {
+      "name": "humaneval-plus-38",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef decode_cyclic(s: str):\n    \"\"\"\n    takes as input string encoded with encode_cyclic function. Returns decoded string.\n    \"\"\"\n    groups = [s[(3 * i):min((3 * i + 3), len(s))] for i in range((len(s) + 2) // 3)]\n    groups = [(group[-1] + group[:-1]) if len(group) == 3 else group for group in groups]\n    return \"\".join(groups)\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-40",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef triples_sum_to_zero(l: list):\n    \"\"\"\n    triples_sum_to_zero takes a list of integers as an input.\n    it returns True if there are three elements in the list that\n    sum to zero, and False otherwise.\n\n    >>> triples_sum_to_zero([1, 3, 5, 0])\n    False\n    >>> triples_sum_to_zero([1, 3, -2, 1])\n    True\n    >>> triples_sum_to_zero([1, 2, 3, 7])\n    False\n    >>> triples_sum_to_zero([2, 4, -5, 3, 9, 7])\n    True\n    >>> triples_sum_to_zero([1])\n    False\n    \"\"\"\n    n = len(l)\n  "
+    },
+    {
+      "name": "humaneval-plus-41",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef car_race_collision(n: int):\n    \"\"\"\n    Imagine a road that's a perfectly straight infinitely long line.\n    n cars are driving left to right;  simultaneously, a different set of n cars\n    are driving right to left.   The two sets of cars start out being very far from\n    each other.  All cars move in the same speed.  Two cars are said to collide\n    when a car that's moving left to right hits a car that's moving right to left.\n    However, the cars are infinitely sturdy and stron"
+    },
+    {
+      "name": "humaneval-plus-42",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef incr_list(l: list):\n    \"\"\"Return list with elements incremented by 1.\n    >>> incr_list([1, 2, 3])\n    [2, 3, 4]\n    >>> incr_list([5, 3, 5, 2, 3, 3, 9, 0, 123])\n    [6, 4, 6, 3, 4, 4, 10, 1, 124]\n    \"\"\"\n    return [x + 1 for x in l]\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-44",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef change_base(x: int, base: int):\n    \"\"\"Change numerical base of input number x to base.\n    return string representation after the conversion.\n    base numbers are less than 10.\n    >>> change_base(8, 3)\n    '22'\n    >>> change_base(8, 2)\n    '1000'\n    >>> change_base(7, 2)\n    '111'\n    \"\"\"\n    if x == 0:\n        return '0'\n    digits = []\n    while x > 0:\n        digits.append(x % base)\n        x = x // base\n    digits = digits[::-1]\n    return ''.join(map(str, digits))\n```<|im_"
+    },
+    {
+      "name": "humaneval-plus-45",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef triangle_area(a, h):\n    \"\"\"Given length of a side and high return area for a triangle.\n    >>> triangle_area(5, 3)\n    7.5\n    \"\"\"\n    return (a * h) / 2\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-47",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 18)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called median that takes a list and returns its median. Let me think about how to do this.\n\nFirst, the median is the middle value when the list is sorted. If the list has an odd number of elements, it's the middle one. If even, it's the average of the two middle numbers.\n\nSo the steps are: sort the list, find the middle index, then compute the median.\n\nWait, but how to handle even and odd lengths? Let's see. For example, the first test case is [3,1"
+    },
+    {
+      "name": "humaneval-plus-48",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef is_palindrome(text: str):\n    \"\"\"\n    Checks if given string is a palindrome\n    >>> is_palindrome('')\n    True\n    >>> is_palindrome('aba')\n    True\n    >>> is_palindrome('aaaaa')\n    True\n    >>> is_palindrome('zbcd')\n    False\n    \"\"\"\n    return text == text[::-1]\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-50",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef decode_shift(s: str):\n    \"\"\"\n    takes as input string encoded with encode_shift function. Returns decoded string.\n    \"\"\"\n    return \"\".join([chr(((ord(ch) - 5 - ord(\"a\")) % 26) + ord(\"a\")) for ch in s])\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-51",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef remove_vowels(text):\n    \"\"\"\n    remove_vowels is a function that takes string and returns string without vowels.\n    >>> remove_vowels('')\n    ''\n    >>> remove_vowels(\"abcdef\\nghijklm\")\n    'bcdf\\nghjklm'\n    >>> remove_vowels('abcdef')\n    'bcdf'\n    >>> remove_vowels('aaaaa')\n    ''\n    >>> remove_vowels('aaBAA')\n    'B'\n    >>> remove_vowels('zbcd')\n    'zbcd'\n    \"\"\"\n    vowels = {'a', 'e', 'i', 'o', 'u'}\n    result = []\n    for char in text:\n        if char.lower() not in vo"
+    },
+    {
+      "name": "humaneval-plus-53",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef add(x: int, y: int):\n    \"\"\"Add two numbers x and y\n    >>> add(2, 3)\n    5\n    >>> add(5, 7)\n    12\n    \"\"\"\n    return x + y\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-54",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 25)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called same_chars that checks if two strings have the same characters. Let me think about how to approach this.\n\nSo the problem says that the two words must have the same characters. Wait, does that mean exactly the same characters in the same frequency, or just that each string contains the same set of characters regardless of count? Let me look at the examples.\n\nLooking at the first example: same_chars('eabcdzzzz', 'dddzzzzzzzddeddabc') returns T"
+    },
+    {
+      "name": "humaneval-plus-55",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "AssertionError",
+      "output_text_clip": "```python\ndef fib(n: int):\n    \"\"\"Return n-th Fibonacci number.\n    >>> fib(10)\n    55\n    >>> fib(1)\n    1\n    >>> fib(8)\n    21\n    \"\"\"\n    if n == 1 or n == 2:\n        return 1\n    a, b = 1, 1\n    for _ in range(3, n + 1):\n        c = a + b\n        a = b\n        b = c\n    return b\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-57",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef monotonic(l: list):\n    \"\"\"Return True is list elements are monotonically increasing or decreasing.\n    >>> monotonic([1, 2, 4, 20])\n    True\n    >>> monotonic([1, 20, 4, 10])\n    False\n    >>> monotonic([4, 1, 0, -10])\n    True\n    \"\"\"\n    is_increasing = True\n    for i in range(1, len(l)):\n        if l[i] < l[i-1]:\n            is_increasing = False\n            break\n    is_decreasing = True\n    for i in range(1, len(l)):\n        if l[i] > l[i-1]:\n            is_decreasing = False"
+    },
+    {
+      "name": "humaneval-plus-58",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef common(l1: list, l2: list):\n    \"\"\"Return sorted unique common elements for two lists.\n    >>> common([1, 4, 3, 34, 653, 2, 5], [5, 7, 1, 5, 9, 653, 121])\n    [1, 5, 653]\n    >>> common([5, 3, 2, 8], [3, 2])\n    [2, 3]\n\n    \"\"\"\n    return sorted(set(l1) & set(l2))\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-60",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef sum_to_n(n: int):\n    \"\"\"sum_to_n is a function that sums numbers from 1 to n.\n    >>> sum_to_n(30)\n    465\n    >>> sum_to_n(100)\n    5050\n    >>> sum_to_n(5)\n    15\n    >>> sum_to_n(10)\n    55\n    >>> sum_to_n(1)\n    1\n    \"\"\"\n    return n * (n + 1) // 2\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-61",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef correct_bracketing(brackets: str):\n    \"\"\" brackets is a string of \"(\" and \")\".\n    return True if every opening bracket has a corresponding closing bracket.\n\n    >>> correct_bracketing(\"(\")\n    False\n    >>> correct_bracketing(\"()\")\n    True\n    >>> correct_bracketing(\"(()())\")\n    True\n    >>> correct_bracketing(\")(()\")\n    False\n    \"\"\"\n    balance = 0\n    for char in brackets:\n        if char == '(':\n            balance += 1\n        elif char == ')':\n            balance -= 1\n  "
+    },
+    {
+      "name": "humaneval-plus-63",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef fibfib(n: int):\n    \"\"\"The FibFib number sequence is a sequence similar to the Fibbonacci sequnece that's defined as follows:\n    fibfib(0) == 0\n    fibfib(1) == 0\n    fibfib(2) == 1\n    fibfib(n) == fibfib(n-1) + fibfib(n-2) + fibfib(n-3).\n    Please write a function to efficiently compute the n-th element of the fibfib number sequence.\n    >>> fibfib(1)\n    0\n    >>> fibfib(5)\n    4\n    >>> fibfib(8)\n    24\n    \"\"\"\n    if n == 0:\n        return 0\n    elif n == 1:\n        return 0"
+    },
+    {
+      "name": "humaneval-plus-64",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 20)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called vowels_count that counts the number of vowels in a string. The vowels are a, e, i, o, u, and y is considered a vowel only if it's at the end of the word. Let me think about how to approach this.\n\nFirst, the function should take a string s as input. Then, I need to check each character in the string. For each character, determine if it's a vowel. But wait, y is a vowel only when it's at the end. So, I need to check if the character is y and i"
+    },
+    {
+      "name": "humaneval-plus-65",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef circular_shift(x, shift):\n    \"\"\"Circular shift the digits of the integer x, shift the digits right by shift\n    and return the result as a string.\n    If shift > number of digits, return digits reversed.\n    >>> circular_shift(12, 1)\n    \"21\"\n    >>> circular_shift(12, 2)\n    \"12\"\n    \"\"\"\n    s = str(x)\n    n = len(s)\n    if shift > n:\n        return s[::-1]\n    else:\n        return s[-shift:] + s[:-shift]\n```<|im_end|>"
+    },
+    {
+      "name": "humaneval-plus-67",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef fruit_distribution(s, n):\n    \"\"\"\n    In this task, you will be given a string that represents a number of apples and oranges \n    that are distributed in a basket of fruit this basket contains \n    apples, oranges, and mango fruits. Given the string that represents the total number of \n    the oranges and apples and an integer that represent the total number of the fruits \n    in the basket return the number of the mango fruits in the basket.\n    for examble:\n    fruit_distributio"
+    },
+    {
+      "name": "humaneval-plus-68",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef pluck(arr):\n    \"\"\"\n    Given an array representing a branch of a tree that has non-negative integer nodes\n    your task is to pluck one of the nodes and return it.\n    The plucked node should be the node with the smallest even value.\n    If multiple nodes with the same smallest even value are found return the node that has smallest index.\n\n    The plucked node should be returned in a list, [ smallest_value, its index ],\n    If there are no even values or the given array is empty, "
+    },
+    {
+      "name": "humaneval-plus-70",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef strange_sort_list(lst):\n    '''\n    Given list of integers, return list in strange order.\n    Strange sorting, is when you start with the minimum value,\n    then maximum of the remaining integers, then minimum and so on.\n\n    Examples:\n    strange_sort_list([1, 2, 3, 4]) == [1, 4, 2, 3]\n    strange_sort_list([5, 5, 5, 5]) == [5, 5, 5, 5]\n    strange_sort_list([]) == []\n    '''\n    sorted_lst = sorted(lst)\n    new_lst = []\n    left = 0\n    right = len(sorted_lst) - 1\n    while left "
+    },
+    {
+      "name": "humaneval-plus-71",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\nimport math\n\ndef triangle_area(a, b, c):\n    '''\n    Given the lengths of the three sides of a triangle. Return the area of\n    the triangle rounded to 2 decimal points if the three sides form a valid triangle. \n    Otherwise return -1\n    Three sides make a valid triangle when the sum of any two sides is greater \n    than the third side.\n    Example:\n    triangle_area(3, 4, 5) == 6.00\n    triangle_area(1, 2, 10) == -1\n    '''\n    sorted_sides = sorted([a, b, c])\n    if sorted_sides[0]"
+    },
+    {
+      "name": "humaneval-plus-73",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef smallest_change(arr):\n    \"\"\"\n    Given an array arr of integers, find the minimum number of elements that\n    need to be changed to make the array palindromic. A palindromic array is an array that\n    is read the same backwards and forwards. In one change, you can change one element to any other element.\n\n    For example:\n    smallest_change([1,2,3,5,4,7,9,6]) == 4\n    smallest_change([1, 2, 3, 4, 3, 2, 2]) == 1\n    smallest_change([1, 2, 3, 2, 1]) == 0\n    \"\"\"\n    count = 0\n    n"
+    },
+    {
+      "name": "humaneval-plus-74",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef total_match(lst1, lst2):\n    '''\n    Write a function that accepts two lists of strings and returns the list that has \n    total number of chars in the all strings of the list less than the other list.\n\n    if the two lists have the same number of chars, return the first list.\n\n    Examples\n    total_match([], []) \ufffd []\n    total_match(['hi', 'admin'], ['hI', 'Hi']) \ufffd ['hI', 'Hi']\n    total_match(['hi', 'admin'], ['hi', 'hi', 'admin', 'project']) \ufffd ['hi', 'admin']\n    total_match(['"
+    },
+    {
+      "name": "humaneval-plus-76",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 16)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called is_simple_power that checks if a number x is a simple power of n. The definition says that x is a simple power of n if there's an integer k such that n^k equals x. So, for example, if x is 8 and n is 2, then 2^3 is 8, so it returns True.\n\nLet me think about the steps. The function needs to determine if there exists an integer exponent k where n raised to k equals x. But how do I find that?\n\nFirst, I should handle some edge cases. What if n i"
+    },
+    {
+      "name": "humaneval-plus-77",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 19)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called iscube that takes an integer a and returns True if it's a perfect cube. Let's think about how to approach this.\n\nFirst, what's a perfect cube? It's a number that can be written as n^3 where n is an integer. So for example, 8 is 2^3, so iscube(8) should return True. Similarly, -1 is (-1)^3, so that's True.\n\nThe function needs to check if there exists an integer n such that n^3 equals a.\n\nBut how do I find n? Well, the cube root of a is n. So "
+    },
+    {
+      "name": "humaneval-plus-78",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef hex_key(num):\n    \"\"\"You have been tasked to write a function that receives \n    a hexadecimal number as a string and counts the number of hexadecimal \n    digits that are primes (prime number, or a prime, is a natural number \n    greater than 1 that is not a product of two smaller natural numbers).\n    Hexadecimal digits are 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, A, B, C, D, E, F.\n    Prime numbers are 2, 3, 5, 7, 11, 13, 17,...\n    So you have to determine a number of the following digits"
+    },
+    {
+      "name": "humaneval-plus-80",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef is_happy(s):\n    \"\"\"You are given a string s.\n    Your task is to check if the string is happy or not.\n    A string is happy if its length is at least 3 and every 3 consecutive letters are distinct\n    For example:\n    is_happy(a) => False\n    is_happy(aa) => False\n    is_happy(abcd) => True\n    is_happy(aabb) => False\n    is_happy(adb) => True\n    is_happy(xyy) => False\n    \"\"\"\n    if len(s) < 3:\n        return False\n    for i in range(len(s) - 2):\n        if len(set(s[i:i+3])) < "
+    },
+    {
+      "name": "humaneval-plus-81",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 48)",
+      "output_text_clip": "<think>\nOkay, I need to write a Python function called numerical_letter_grade that takes a list of GPAs and returns the corresponding letter grades based on the given table. Let me think about how to approach this.\n\nFirst, I should look at the grading table. The table has GPA ranges and the corresponding letter grades. The key is to map each GPA to the correct letter. Let me list out the conditions in order from highest to lowest.\n\nThe table says:\n- 4.0 is A+\n- Above 3.7 is A\n- Above 3.3 is A-\n-"
+    },
+    {
+      "name": "humaneval-plus-83",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "SyntaxError: unterminated string literal (detected at line 9)",
+      "output_text_clip": "<think>\nOkay, I need to solve this problem where I have to find the count of n-digit numbers that start or end with 1. Let's think about how to approach this.\n\nFirst, the function is called starts_one_ends and takes a positive integer n. The output is the count of n-digit numbers that either start with 1 or end with 1. \n\nLet me break down the problem. For an n-digit number, the first digit can't be zero. So the range of numbers is from 10^(n-1) to 10^n - 1. For example, if n is 2, numbers are fr"
+    },
+    {
+      "name": "humaneval-plus-84",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": true,
+      "score": 1.0,
+      "detail": "tests passed",
+      "output_text_clip": "```python\ndef solve(N):\n    \"\"\"Given a positive integer N, return the total sum of its digits in binary.\n    \n    Example\n        For N = 1000, the sum of digits will be 1 the output should be \"1\".\n        For N = 150, the sum of digits will be 6 the output should be \"110\".\n        For N = 147, the sum of digits will be 12 the output should be \"1100\".\n    \n    Variables:\n        @N integer\n             Constraints: 0 \u2264 N \u2264 10000.\n    Output:\n         a string of binary number\n    \"\"\"\n    digit_s"
+    },
+    {
+      "name": "humaneval-plus-86",
+      "category": "humaneval-plus",
+      "suite": "humaneval-plus",
+      "passed": false,
+      "score": 0.0,
+      "detail": "asyncio.wait_for timeout after 24s",
+      "output_text_clip": ""
+    }
+  ],
+  "speed": {},
+  "elapsed_seconds": 7200.0041984579875,
+  "timed_out": true
+}
