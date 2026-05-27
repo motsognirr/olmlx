@@ -1604,10 +1604,14 @@ class ModelManager:
                         del load_task
                     # Skip immediate cache flush when a deferred cleanup is
                     # pending — the background thread is still running and
-                    # mx.clear_cache() is not safe to call concurrently with
-                    # active Metal allocations.  The deferred cleanup handles
-                    # it after the thread finishes.
-                    if normalized not in self._pending_cleanups:
+                    # mx.clear_cache() (global Metal allocator) is not safe
+                    # to call concurrently with active Metal allocations.
+                    # The deferred cleanup handles it after the thread
+                    # finishes.  Guarded on the *global* dict (not
+                    # per-model) because a background thread for *any*
+                    # model allocating Metal memory makes a concurrent
+                    # clear unsafe (matching _expire_stale and unload).
+                    if not self._pending_cleanups:
                         await self._flush_metal()
                     raise
 
