@@ -46,6 +46,7 @@ from olmlx.engine.dflash.decoder import (
 from olmlx.engine.gdn_rollback import (
     _HAS_GDN,
     find_gdn_class as _find_gdn_class,
+    GDNBuffer as _GDNBuffer,
     GDNStateCapture as _GDNStateCapture,
     get_model_layers as _get_layers,
 )
@@ -161,8 +162,11 @@ class EagleDecoder:
         # GDN state capture for non-trim-able targets. Created in
         # ``prefill`` only when the target cache is non-trim-able
         # (Qwen3.5/3.6 hybrid linear-attention case). ``None`` for
-        # standard-attention targets that take the trim path.
+        # standard-attention targets that take the trim path. The
+        # capture owns the class-level monkey-patch; the buffer holds
+        # the per-step snapshots that ``rollback_single`` replays.
         self._capture: _GDNStateCapture | None = None
+        self._capture_buffer: _GDNBuffer | None = None
         self._target_can_trim: bool = True
 
         # Stats (reset on prefill).
@@ -190,6 +194,7 @@ class EagleDecoder:
                 self._capture.close()
             finally:
                 self._capture = None
+                self._capture_buffer = None
         if self._patched:
             try:
                 _unpatch_model(self._target)
@@ -328,8 +333,15 @@ class EagleDecoder:
                 # GDN state, which subsequent rollbacks may need to replay
                 # against. ``_GDNStateCapture.__init__`` acquires
                 # ``_GDN_PATCH_LOCK``; ``reset()`` releases it via
-                # ``capture.close()``.
-                self._capture = _GDNStateCapture(self._target)
+                # ``capture.close()``. ``for_model`` locates the GDN class,
+                # constructs the capture and a buffer pre-populated with
+                # the target's GDN modules in forward-pass order, then
+                # registers the buffer as active so subsequent forwards
+                # snapshot into it.
+                self._capture, self._capture_buffer = _GDNStateCapture.for_model(
+                    self._target
+                )
+                self._capture.use_buffer(self._capture_buffer)
 
             # Run the target on the prompt and capture its last-layer hidden.
             # Two-pass: prefix fills the KV cache without materialising the
@@ -468,11 +480,11 @@ class EagleDecoder:
         # *should* follow seed_token (i.e. should match draft[0]),
         # logits[1] should match draft[1], etc.
         # Clear the GDN capture's per-step state so this verify's
-        # snapshots don't pile on top of last step's. ``rollback``
-        # replays positionally over ``self._capture._gdn_inputs``, so
-        # leftover entries would be applied to the wrong layer.
-        if self._capture is not None:
-            self._capture.clear()
+        # snapshots don't pile on top of last step's. ``rollback_single``
+        # replays positionally over the buffer, so leftover entries
+        # would be applied to the wrong layer.
+        if self._capture_buffer is not None:
+            self._capture_buffer.clear()
         # Reset the hidden-capture slot to ``None`` before the verify
         # forward. Without this, a silent hook failure on step 2+ would
         # leave last step's hidden in place and the ``is None`` guard
@@ -525,21 +537,22 @@ class EagleDecoder:
                 # Hybrid linear-attention path. ``_capture`` was created
                 # in prefill; same control-flow invariant guards as
                 # DFlash's ``step``.
-                if self._capture is None:
+                if self._capture is None or self._capture_buffer is None:
                     raise RuntimeError(
                         "EagleDecoder internal invariant violated: target "
                         "cache is non-trim-able but no GDN capture was "
                         "installed. This is an olmlx bug."
                     )
-                # ``rollback(cache, accepted, trim)`` internally slices
-                # the captured GDN inputs to ``q[:, :accepted + 1]``
-                # — i.e. the first ``accepted + 1`` positions of *this
-                # step's* capture. The capture is populated by the
-                # verify forward over ``verify_input = [seed_token,
-                # *draft_tokens]`` (length ``block_size + 1``), so its
-                # position 0 is the seed_token regardless of whether
-                # the seed came from prefill (step 1) or from the
-                # previous step's accepted tail (step 2+).
+                # ``rollback_single(buffer, cache, accepted, trim)``
+                # internally slices the captured GDN inputs to
+                # ``q[:, :accepted + 1]`` — i.e. the first
+                # ``accepted + 1`` positions of *this step's* capture.
+                # The capture is populated by the verify forward over
+                # ``verify_input = [seed_token, *draft_tokens]``
+                # (length ``block_size + 1``), so its position 0 is the
+                # seed_token regardless of whether the seed came from
+                # prefill (step 1) or from the previous step's accepted
+                # tail (step 2+).
                 #
                 # We want to keep ``num_accepted`` positions of this
                 # step's verify in the cache. Passing
@@ -551,7 +564,12 @@ class EagleDecoder:
                 # arithmetic for the same reason — its verify input
                 # is ``[pending, MASK*bs]`` where ``pending`` plays
                 # the same position-0 role as our ``seed_token``.
-                self._capture.rollback(self._target_cache, num_accepted - 1, trim)
+                self._capture.rollback_single(
+                    self._capture_buffer,
+                    self._target_cache,
+                    accepted=num_accepted - 1,
+                    trim=trim,
+                )
         # Draft cache trim — the draft is always a standard-attention
         # transformer with trim-able KVCache, so this path is the same
         # regardless of target architecture.
