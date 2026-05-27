@@ -894,6 +894,7 @@ class ModelManager:
         self._pending_cleanups: dict[str, asyncio.Task] = {}
         self._pending_load_tasks: dict[str, asyncio.Task] = {}
         self._flush_lock = asyncio.Lock()
+        self._flush_thread_lock = threading.Lock()
 
     def start_expiry_checker(self):
         self._expiry_task = asyncio.create_task(self._check_expiry_loop())
@@ -1040,23 +1041,21 @@ class ModelManager:
 
     @staticmethod
     def _flush_metal_sync() -> None:
-        """Release freed Metal memory back to the OS.
-
-        Must run in a worker thread (``asyncio.to_thread``) — the
-        ``mx.synchronize()`` call blocks the calling thread until the Metal
-        GPU command queue drains, which can take seconds for large models.
-
-        Callers on the event loop use :meth:`_flush_metal` which wraps this
-        in ``asyncio.to_thread`` and serialises via ``_flush_lock``.
-        Sync callers already inside a thread pool (e.g.
-        ``_load_model_and_shard``) call this directly — these callers are
-        not serialised by ``_flush_lock`` (that is an ``asyncio.Lock``),
-        but model loading is serialised by ``_inference_lock`` so the
-        practical risk of a thread-pool + event-loop race is low.
-        """
         gc.collect()
         mx.synchronize()
         mx.clear_cache()
+
+    def _flush_metal_sync_thread_safe(self) -> None:
+        """Thread-safe wrapper for :meth:`_flush_metal_sync`.
+
+        Acquires ``_flush_thread_lock`` so that a thread-pool caller
+        (``_load_model_and_shard``) and an event-loop caller
+        (``_flush_metal`` via ``asyncio.to_thread``) cannot run
+        ``mx.clear_cache()`` concurrently — the MLX allocator is not
+        safe under concurrent clear from separate threads."""
+
+        with self._flush_thread_lock:
+            self._flush_metal_sync()
 
     async def _flush_metal(self) -> None:
         """Async wrapper for :meth:`_flush_metal_sync`.
@@ -1065,7 +1064,7 @@ class ModelManager:
         responsive while the GPU command queue drains.
         """
         async with self._flush_lock:
-            await asyncio.to_thread(self._flush_metal_sync)
+            await asyncio.to_thread(self._flush_metal_sync_thread_safe)
 
     def _pop_lru_evictees(self) -> list[LoadedModel]:
         """Pop LRU evictees from ``_loaded`` until below max_loaded_models.
@@ -1568,11 +1567,24 @@ class ModelManager:
                     # lm if it was already constructed (exception between
                     # LoadedModel() and return).  ``lm`` may be registered
                     # in ``_loaded`` at this point (it is inserted before
-                    # the async probe); ``pop(normalized, None)`` handles
-                    # both cases (was-only and already-registered).
+                    # the async probe).  If a concurrent caller retrieved
+                    # ``lm`` during the probe's async yield and started
+                    # inference (``active_refs > 0``), leave it in
+                    # ``_loaded`` — eviction/expiry will clean it up when
+                    # refs drop to zero.  Otherwise ``pop(normalized, None)``
+                    # handles both the was-only and already-registered cases.
                     if lm is not None:
-                        self._loaded.pop(normalized, None)
-                        del lm
+                        if lm.active_refs == 0:
+                            self._loaded.pop(normalized, None)
+                            del lm
+                        else:
+                            logger.warning(
+                                "Load of '%s' cancelled after registration "
+                                "with %d active request(s); model left in "
+                                "_loaded for expiry/eviction to clean up.",
+                                normalized,
+                                lm.active_refs,
+                            )
                     # When _load_model fails, model/tokenizer are still None —
                     # only bother deleting if they hold actual GPU resources.
                     if model is not None:
@@ -3629,7 +3641,7 @@ class ModelManager:
         if self._distributed_group is not None:
             if is_vlm:
                 del model, tokenizer
-                self._flush_metal_sync()
+                self._flush_metal_sync_thread_safe()
                 raise ValueError(
                     f"VLM models are not supported in distributed mode. "
                     f"Model {hf_path} is a vision-language model which cannot "
@@ -3647,7 +3659,7 @@ class ModelManager:
                     )
                 except ValueError:
                     del model, tokenizer
-                    self._flush_metal_sync()
+                    self._flush_metal_sync_thread_safe()
                     raise
                 # Materialize parameters — pipeline nullified unowned layers
                 # so only owned weights are evaluated (no cross-rank ops).
@@ -3659,7 +3671,7 @@ class ModelManager:
             elif self._distributed_strategy == "tensor":
                 if not hasattr(model, "shard"):
                     del model, tokenizer
-                    self._flush_metal_sync()
+                    self._flush_metal_sync_thread_safe()
                     raise ValueError(
                         f"Model {hf_path} does not support distributed inference "
                         f"(no shard() method). Supported architectures include: "
@@ -3676,7 +3688,7 @@ class ModelManager:
                 logger.info("Model %s sharded for distributed inference", hf_path)
             else:
                 del model, tokenizer
-                self._flush_metal_sync()
+                self._flush_metal_sync_thread_safe()
                 raise AssertionError(
                     "unreachable: distributed_strategy is Literal['tensor']; "
                     "pydantic rejects any other value at config parse"
