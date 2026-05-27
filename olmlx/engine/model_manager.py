@@ -893,6 +893,8 @@ class ModelManager:
         self._expiry_task: asyncio.Task | None = None
         self._pending_cleanups: dict[str, asyncio.Task] = {}
         self._pending_load_tasks: dict[str, asyncio.Task] = {}
+        self._flush_lock = asyncio.Lock()
+        self._flush_thread_lock = threading.Lock()
 
     def start_expiry_checker(self):
         self._expiry_task = asyncio.create_task(self._check_expiry_loop())
@@ -933,8 +935,7 @@ class ModelManager:
             # Only flush when all threads finished — if the drain timed out,
             # threads are still allocating and mx.clear_cache() is unsafe.
             if drained:
-                gc.collect()
-                mx.clear_cache()
+                await self._flush_metal()
         self._pending_load_tasks.clear()
         self._loaded.clear()
 
@@ -1037,6 +1038,36 @@ class ModelManager:
             errors.append(exc)
         if errors:
             raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
+
+    @staticmethod
+    def _flush_metal_impl() -> None:
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+
+    def _flush_metal_sync(self) -> None:
+        """Thread-safe wrapper for :meth:`_flush_metal_impl`.
+
+        Acquires ``_flush_thread_lock`` so that a thread-pool caller
+        (``_load_model_and_shard``) and an event-loop caller
+        (``_flush_metal`` via ``asyncio.to_thread``) cannot run
+        ``mx.clear_cache()`` concurrently — the MLX allocator is not
+        safe under concurrent clear from separate threads."""
+
+        with self._flush_thread_lock:
+            self._flush_metal_impl()
+
+    async def _flush_metal(self) -> None:
+        """Async wrapper for :meth:`_flush_metal_sync`.
+
+        Serialises via ``_flush_lock`` so that concurrent callers from the
+        event loop (e.g. eviction flush + deferred cleanup flush arriving
+        together) do not all drain the Metal queue in parallel.  Offloads
+        the actual drain to a worker thread so the event loop stays
+        responsive while the GPU command queue drains.
+        """
+        async with self._flush_lock:
+            await asyncio.to_thread(self._flush_metal_sync)
 
     def _pop_lru_evictees(self) -> list[LoadedModel]:
         """Pop LRU evictees from ``_loaded`` until below max_loaded_models.
@@ -1251,8 +1282,13 @@ class ModelManager:
             # the one that would schedule a deferred cleanup via
             # ``_schedule_deferred_cleanup``) can interleave between the two.
             if not self._pending_cleanups:
-                gc.collect()
-                mx.clear_cache()
+                try:
+                    await self._flush_metal()
+                except Exception:
+                    logger.exception(
+                        "Metal flush failed before load; released "
+                        "memory will be drained on the next flush."
+                    )
 
             # Pre-load memory hygiene: if Metal memory is still under
             # pressure after eviction + close + gc, evict prompt caches
@@ -1308,8 +1344,7 @@ class ModelManager:
                 # active Metal allocations from a background thread (see
                 # the matching guard at the _ensure_loaded pre-load path).
                 if not self._pending_cleanups:
-                    gc.collect()
-                    mx.clear_cache()
+                    await self._flush_metal()
                 if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
                     logger.warning(
                         "Metal pressure persists after hygiene flush; "
@@ -1526,18 +1561,39 @@ class ModelManager:
                         inference_timeout=model_config.inference_timeout,
                         sync_mode=model_config.sync_mode,
                     )
-                    self._probe_cache_capabilities(lm)
+                    # Register before probe so concurrent callers see the
+                    # model while the probe's async Metal flush releases the
+                    # lock.  _probe_cache_capabilities sets all cache flags
+                    # synchronously before its first await (the finally-block
+                    # Metal flush), so no coroutine can observe an incomplete
+                    # probe state between registration and the yield point.
                     self._loaded[normalized] = lm
+                    await self._probe_cache_capabilities(lm)
                     return lm
                 except BaseException:
                     # Drop references and flush Metal allocator so the memory
                     # is actually reclaimed before we raise.  Also clean up
                     # lm if it was already constructed (exception between
-                    # LoadedModel() and return), and pop from _loaded to
-                    # prevent a zombie entry holding GPU memory.
+                    # LoadedModel() and return).  ``lm`` may be registered
+                    # in ``_loaded`` at this point (it is inserted before
+                    # the async probe).  If a concurrent caller retrieved
+                    # ``lm`` during the probe's async yield and started
+                    # inference (``active_refs > 0``), leave it in
+                    # ``_loaded`` — eviction/expiry will clean it up when
+                    # refs drop to zero.  Otherwise ``pop(normalized, None)``
+                    # handles both the was-only and already-registered cases.
                     if lm is not None:
-                        self._loaded.pop(normalized, None)
-                        del lm
+                        if lm.active_refs == 0:
+                            self._loaded.pop(normalized, None)
+                            del lm
+                        else:
+                            logger.warning(
+                                "Load of '%s' cancelled after registration "
+                                "with %d active request(s); model left in "
+                                "_loaded for expiry/eviction to clean up.",
+                                normalized,
+                                lm.active_refs,
+                            )
                     # When _load_model fails, model/tokenizer are still None —
                     # only bother deleting if they hold actual GPU resources.
                     if model is not None:
@@ -1548,12 +1604,15 @@ class ModelManager:
                         del load_task
                     # Skip immediate cache flush when a deferred cleanup is
                     # pending — the background thread is still running and
-                    # mx.clear_cache() is not safe to call concurrently with
-                    # active Metal allocations.  The deferred cleanup handles
-                    # it after the thread finishes.
-                    if normalized not in self._pending_cleanups:
-                        gc.collect()
-                        mx.clear_cache()
+                    # mx.clear_cache() (global Metal allocator) is not safe
+                    # to call concurrently with active Metal allocations.
+                    # The deferred cleanup handles it after the thread
+                    # finishes.  Guarded on the *global* dict (not
+                    # per-model) because a background thread for *any*
+                    # model allocating Metal memory makes a concurrent
+                    # clear unsafe (matching _expire_stale and unload).
+                    if not self._pending_cleanups:
+                        await self._flush_metal()
                     raise
 
     def _schedule_deferred_cleanup(
@@ -1595,8 +1654,7 @@ class ModelManager:
                 # concurrently with Metal allocations.
                 try:
                     if not cancelled:
-                        gc.collect()
-                        mx.clear_cache()
+                        await self._flush_metal()
                 finally:
                     self._pending_cleanups.pop(model_name, None)
                     # Only pop load_task when not cancelled — stop()
@@ -1661,6 +1719,28 @@ class ModelManager:
         # that polls ``get_metal_memory()`` immediately after unload may
         # see the model's allocations still resident in the pool.
         del lm
+        # Return freed Metal memory to the OS.  Mirrors the flush
+        # in ``_expire_stale`` and ``ensure_loaded``.  Guarded on the
+        # global ``_pending_cleanups`` dict because ``mx.clear_cache()``
+        # flushes the entire Metal allocator — if ANY background thread
+        # is still allocating Metal memory (even for a different model),
+        # the concurrent clear is unsafe.
+        if not self._pending_cleanups:
+            try:
+                await self._flush_metal()
+            except Exception:
+                logger.exception(
+                    "Metal flush failed for unload of '%s'; model already "
+                    "unloaded, Metal memory will be reclaimed on next flush.",
+                    normalized,
+                )
+        else:
+            logger.debug(
+                "Skipping Metal flush for unload of '%s': deferred cleanup "
+                "still in flight (global Metal clear unsafe). The deferred "
+                "cleanup task will flush when it completes.",
+                normalized,
+            )
         return True
 
     # Config keys that indicate a vision-language model
@@ -2055,9 +2135,17 @@ class ModelManager:
             return flash_path
         return None
 
-    def _probe_cache_capabilities(self, lm: LoadedModel) -> None:
+    async def _probe_cache_capabilities(self, lm: LoadedModel) -> None:
         """Probe how the model's prompt cache can be safely reused, recording
         the result on ``lm.supports_cache_trim`` and ``lm.supports_cache_persistence``.
+
+        **Caller contract**: the caller must register ``lm`` in ``_loaded``
+        BEFORE calling this method (so concurrent ``ensure_loaded`` callers
+        see the model). This is safe because every ``lm.*`` flag assignment
+        in this method completes synchronously, before the first ``await``
+        (the ``finally`` block's Metal flush).  Do not insert an ``await``
+        before the ``lm.supports_cache_* = ...`` lines without updating the
+        caller-side registration guard accordingly.
 
         Hybrid sliding-window models (Gemma 4, Qwen3-Next) include
         `RotatingKVCache` layers which become non-trimmable once the
@@ -2158,8 +2246,20 @@ class ModelManager:
         finally:
             if probe_cache is not None:
                 del probe_cache
-                gc.collect()
-                mx.clear_cache()
+                # All cache flags (supports_cache_trim,
+                # supports_cache_persistence) are set synchronously above
+                # — this is the method's first await.  Do not insert an
+                # await before the flag assignments without also verifying
+                # that concurrent ensure_loaded callers, which may observe
+                # the registered LoadedModel during this yield, see
+                # fully-configured flags.
+                #
+                # Guarded on _pending_cleanups (matching all other
+                # _flush_metal sites): if a deferred cleanup is still
+                # running, its own _flush_metal will drain the released
+                # probe memory when it completes.
+                if not self._pending_cleanups:
+                    await self._flush_metal()
 
         # Single load-time log site for "cross-request reuse disabled."
         # Distinguishes the two disable reasons by inspecting the raw
@@ -3561,8 +3661,7 @@ class ModelManager:
         if self._distributed_group is not None:
             if is_vlm:
                 del model, tokenizer
-                gc.collect()
-                mx.clear_cache()
+                self._flush_metal_sync()
                 raise ValueError(
                     f"VLM models are not supported in distributed mode. "
                     f"Model {hf_path} is a vision-language model which cannot "
@@ -3580,8 +3679,7 @@ class ModelManager:
                     )
                 except ValueError:
                     del model, tokenizer
-                    gc.collect()
-                    mx.clear_cache()
+                    self._flush_metal_sync()
                     raise
                 # Materialize parameters — pipeline nullified unowned layers
                 # so only owned weights are evaluated (no cross-rank ops).
@@ -3593,8 +3691,7 @@ class ModelManager:
             elif self._distributed_strategy == "tensor":
                 if not hasattr(model, "shard"):
                     del model, tokenizer
-                    gc.collect()
-                    mx.clear_cache()
+                    self._flush_metal_sync()
                     raise ValueError(
                         f"Model {hf_path} does not support distributed inference "
                         f"(no shard() method). Supported architectures include: "
@@ -3611,8 +3708,7 @@ class ModelManager:
                 logger.info("Model %s sharded for distributed inference", hf_path)
             else:
                 del model, tokenizer
-                gc.collect()
-                mx.clear_cache()
+                self._flush_metal_sync()
                 raise AssertionError(
                     "unreachable: distributed_strategy is Literal['tensor']; "
                     "pydantic rejects any other value at config parse"
@@ -3670,8 +3766,7 @@ class ModelManager:
         # Skip when any deferred cleanup is pending — a background thread
         # for a different model may still be allocating Metal memory.
         if flush:
-            gc.collect()
-            mx.clear_cache()
+            await self._flush_metal()
 
     async def _check_expiry_loop(self):
         while True:

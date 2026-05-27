@@ -168,9 +168,140 @@ class TestModelManager:
         assert mock_manager._close_loaded_model in to_thread_calls
 
     @pytest.mark.asyncio
+    async def test_unload_calls_flush_metal(self, mock_manager):
+        """unload() must call _flush_metal() after closing the model."""
+        mock_manager._close_loaded_model = MagicMock()  # type: ignore[method-assign]
+        with patch.object(
+            mock_manager, "_flush_metal", new_callable=AsyncMock
+        ) as mock_flush:
+            result = await mock_manager.unload("qwen3")
+        assert result is True
+        mock_flush.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unload_skips_flush_when_cleanup_pending(self, mock_manager):
+        """If any deferred cleanup is in flight, _flush_metal is skipped.
+        The guard is global because mx.clear_cache() flushes the entire
+        Metal allocator — any background thread allocating Metal memory,
+        even for a different model, makes the concurrent clear unsafe."""
+        import asyncio
+
+        mock_manager._close_loaded_model = MagicMock()  # type: ignore[method-assign]
+        # Set a deferred cleanup for a DIFFERENT model — the guard is
+        # global, so this should still suppress the flush.
+        mock_manager._pending_cleanups["other:latest"] = asyncio.create_task(
+            asyncio.sleep(0)
+        )
+        try:
+            with patch.object(
+                mock_manager, "_flush_metal", new_callable=AsyncMock
+            ) as mock_flush:
+                result = await mock_manager.unload("qwen3")
+            assert result is True
+            mock_flush.assert_not_awaited()
+        finally:
+            task = mock_manager._pending_cleanups.pop("other:latest", None)
+            if task is not None:
+                task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_unload_returns_true_even_when_flush_raises(self, mock_manager):
+        """If _flush_metal() raises, unload() still returns True — the model
+        is already popped from _loaded and resources are closed.
+        Metal memory will be reclaimed by the next flush."""
+        mock_manager._close_loaded_model = MagicMock()  # type: ignore[method-assign]
+        with patch.object(
+            mock_manager,
+            "_flush_metal",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("flush boom"),
+        ):
+            result = await mock_manager.unload("qwen3")
+        assert result is True
+        assert "qwen3:latest" not in mock_manager._loaded
+        mock_manager._close_loaded_model.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_ensure_loaded_cached(self, mock_manager):
         lm = await mock_manager.ensure_loaded("qwen3")
         assert lm.name == "qwen3:latest"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_ensure_loaded_sees_registered_model_during_probe(
+        self, registry, mock_store, monkeypatch
+    ):
+        """A second ensure_loaded during the probe's async flush must return
+        the already-registered model with fully-configured cache flags."""
+        import asyncio
+
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 10)
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.mx.metal.is_available", lambda: True
+        )
+        manager = ModelManager(registry, mock_store)
+
+        probe_in_flight = asyncio.Event()
+        probe_done = asyncio.Event()
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.chat_template = None
+
+        async def _stalling_probe(lm):
+            # Set flags synchronously (matching the real implementation's
+            # contract), then block until the test signals completion.
+            lm.supports_cache_trim = True
+            lm.supports_cache_persistence = True
+            probe_in_flight.set()
+            await probe_done.wait()
+
+        manager._probe_cache_capabilities = _stalling_probe  # type: ignore[method-assign]
+
+        total_ram = 64 * 1024**3
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(model, tokenizer, False, TemplateCaps(), None),
+            ),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                return_value=1 * 1024**3,
+            ),
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
+            patch("olmlx.engine.model_manager.gc.collect"),
+        ):
+            task1 = asyncio.ensure_future(manager.ensure_loaded("qwen3"))
+
+            # Wait for the probe to set flags and signal readiness
+            await asyncio.wait_for(probe_in_flight.wait(), timeout=5.0)
+
+            # Second caller for the same model — must get the cached LM
+            task2 = asyncio.ensure_future(manager.ensure_loaded("qwen3"))
+
+            # Let probe complete
+            probe_done.set()
+
+            lm1 = await asyncio.wait_for(task1, timeout=5.0)
+            lm2 = await asyncio.wait_for(task2, timeout=5.0)
+
+        assert lm1 is lm2
+        # Flags were set synchronously before the probe awaited, so the
+        # second caller sees fully-configured state.
+        assert lm1.supports_cache_trim is True
+        assert lm2.supports_cache_trim is True
+        assert lm1.supports_cache_persistence is True
+        assert lm2.supports_cache_persistence is True
+        assert "qwen3:latest" in manager._loaded
 
     @pytest.mark.asyncio
     async def test_ensure_loaded_refreshes_expiry(self, mock_manager):
@@ -713,7 +844,10 @@ class TestProbeCacheCapabilities:
         lm.supports_cache_trim = False
         return lm
 
-    def test_probe_empty_cache_list_disables_persistence(self, registry, mock_store):
+    @pytest.mark.asyncio
+    async def test_probe_empty_cache_list_disables_persistence(
+        self, registry, mock_store
+    ):
         """If ``make_prompt_cache`` returns an empty list (a degenerate model
         with no cache layers), ``_cache_supports_persistence`` returns
         False — there's no evidence the cache layout is safe — and the
@@ -723,16 +857,21 @@ class TestProbeCacheCapabilities:
         manager = ModelManager(registry, mock_store)
         lm = self._make_lm()
 
-        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]):
-            manager._probe_cache_capabilities(lm)
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
+        ):
+            await manager._probe_cache_capabilities(lm)
 
-        # Trim is vacuously True — trim of an empty cache is a no-op
-        # that mlx-lm handles cleanly, so leaving the flag True is fine.
         assert lm.supports_cache_trim is True
-        # Persistence: no evidence of safety → False.
         assert lm.supports_cache_persistence is False
+        # [] is non-None, so flush should be called
+        mock_flush.assert_awaited_once()
 
-    def test_non_trimmable_layout_disables_persistence(self, registry, mock_store):
+    @pytest.mark.asyncio
+    async def test_non_trimmable_layout_disables_persistence(
+        self, registry, mock_store
+    ):
         """Issue #343: a layout containing a ``RotatingKVCache`` layer makes
         the cache non-trimmable.  In real chat flow the stored prompt +
         generated tokens can never be aligned with the next request's
@@ -755,13 +894,20 @@ class TestProbeCacheCapabilities:
         lm.supports_cache_persistence = True
 
         probe_cache = [_FakeRotating(), _FakeRotating()]
-        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
-            manager._probe_cache_capabilities(lm)
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
+        ):
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
+        mock_flush.assert_awaited_once()
 
-    def test_chunked_kv_cache_layout_disables_persistence(self, registry, mock_store):
+    @pytest.mark.asyncio
+    async def test_chunked_kv_cache_layout_disables_persistence(
+        self, registry, mock_store
+    ):
         """``ChunkedKVCache`` is the other non-trimmable layout cited by
         #343 and CLAUDE.md (mlx-lm's chunk-based cache; affects newer
         Apple-published checkpoints).  Like ``RotatingKVCache`` it sits
@@ -783,13 +929,18 @@ class TestProbeCacheCapabilities:
         lm.supports_cache_persistence = True
 
         probe_cache = [_FakeChunked(), _FakeChunked()]
-        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
-            manager._probe_cache_capabilities(lm)
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
+        ):
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
+        mock_flush.assert_awaited_once()
 
-    def test_mixed_layout_kv_plus_rotating_disables_persistence(
+    @pytest.mark.asyncio
+    async def test_mixed_layout_kv_plus_rotating_disables_persistence(
         self, registry, mock_store
     ):
         """Real Gemma 4 layout: full-attention layers produce ``KVCache``
@@ -818,13 +969,18 @@ class TestProbeCacheCapabilities:
         lm.supports_cache_persistence = True
 
         probe_cache = [_FakeKV(), _FakeRotating(), _FakeKV(), _FakeRotating()]
-        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
-            manager._probe_cache_capabilities(lm)
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
+        ):
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
+        mock_flush.assert_awaited_once()
 
-    def test_trimmable_layout_keeps_persistence(self, registry, mock_store):
+    @pytest.mark.asyncio
+    async def test_trimmable_layout_keeps_persistence(self, registry, mock_store):
         """Guard the inverse: a fully trimmable layout (plain ``KVCache``
         layers) must still report persistence True after the #343 fix.
         Otherwise the fix would silently disable cache reuse for the
@@ -839,13 +995,18 @@ class TestProbeCacheCapabilities:
         lm = self._make_lm()
 
         probe_cache = [_FakeKV(), _FakeKV()]
-        with patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache):
-            manager._probe_cache_capabilities(lm)
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=probe_cache),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
+        ):
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is True
         assert lm.supports_cache_persistence is True
+        mock_flush.assert_awaited_once()
 
-    def test_non_trimmable_persistable_layout_logs_343(
+    @pytest.mark.asyncio
+    async def test_non_trimmable_persistable_layout_logs_343(
         self, registry, mock_store, caplog
     ):
         """A hybrid sliding-window layout (RotatingKVCache) is in the
@@ -869,15 +1030,18 @@ class TestProbeCacheCapabilities:
                 return_value=[_FakeRotating(), _FakeRotating()],
             ),
             caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
         ):
-            manager._probe_cache_capabilities(lm)
+            await manager._probe_cache_capabilities(lm)
 
         assert "issue #343" in caplog.text
         # #284 is the ArraysCache reason — must not be attributed here.
         assert "issue #284" not in caplog.text
         assert "RotatingKVCache" in caplog.text or "sliding-window" in caplog.text
+        mock_flush.assert_awaited_once()
 
-    def test_non_persistable_layout_logs_284(self, registry, mock_store, caplog):
+    @pytest.mark.asyncio
+    async def test_non_persistable_layout_logs_284(self, registry, mock_store, caplog):
         """A hybrid SSM layout (ArraysCache) is in neither allowlist:
         trim=False, layout-persist=False.  The load-time log must cite
         #284 / ArraysCache — not #343 / RotatingKVCache.  This is the
@@ -901,8 +1065,9 @@ class TestProbeCacheCapabilities:
                 return_value=[_FakeArrays(), _FakeArrays()],
             ),
             caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
         ):
-            manager._probe_cache_capabilities(lm)
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
         assert lm.supports_cache_persistence is False
@@ -911,8 +1076,10 @@ class TestProbeCacheCapabilities:
         # to ArraysCache models.
         assert "issue #343" not in caplog.text
         assert "RotatingKVCache" not in caplog.text
+        mock_flush.assert_awaited_once()
 
-    def test_probe_failure_warns_and_disables_persistence(
+    @pytest.mark.asyncio
+    async def test_probe_failure_warns_and_disables_persistence(
         self, registry, mock_store, caplog
     ):
         """When ``make_prompt_cache`` raises, the probe must log at WARNING,
@@ -930,12 +1097,15 @@ class TestProbeCacheCapabilities:
                 side_effect=RuntimeError("simulated probe failure"),
             ),
             caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
         ):
-            manager._probe_cache_capabilities(lm)
+            await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is True
         assert lm.supports_cache_persistence is False
         assert "Cache probe raised an exception" in caplog.text
+        # probe_cache was never created, so flush should NOT be called
+        mock_flush.assert_not_awaited()
 
 
 class TestLoadModel:
@@ -1666,6 +1836,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(ModelLoadTimeoutError, match="OLMLX_MODEL_LOAD_TIMEOUT"):
                 await manager.ensure_loaded("qwen3")
@@ -1704,6 +1875,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             lm = await manager.ensure_loaded("qwen3")
 
@@ -1743,6 +1915,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             lm = await manager.ensure_loaded("qwen3")
 
@@ -1772,6 +1945,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             with pytest.raises(TimeoutError):
                 await manager.ensure_loaded("qwen3")
@@ -1779,6 +1953,7 @@ class TestModelLoadTimeout:
         # Only pre-load flush — the BaseException handler skips gc/clear
         # when a deferred cleanup is pending (background thread still running).
         assert mock_gc.call_count == 1
+        assert mock_sync.call_count == 1
         assert mock_clear.call_count == 1
         assert "qwen3:latest" not in manager._loaded
 
@@ -1808,12 +1983,14 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             with pytest.raises(TimeoutError):
                 await manager.ensure_loaded("qwen3")
 
             # Only pre-load flush (BaseException handler skips when deferred)
             assert mock_gc.call_count == 1
+            assert mock_sync.call_count == 1
             assert mock_clear.call_count == 1
 
             # Await the cleanup task directly (deterministic, no sleep needed)
@@ -1823,6 +2000,7 @@ class TestModelLoadTimeout:
 
             # Deferred cleanup adds one more call each
             assert mock_gc.call_count == 2
+            assert mock_sync.call_count == 2
             assert mock_clear.call_count == 2
 
     @pytest.mark.asyncio
@@ -1862,6 +2040,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             # First call times out
             with pytest.raises(TimeoutError):
@@ -1927,6 +2106,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             # Timeout on qwen3 — orphaned thread runs for ~0.5s
             with pytest.raises(TimeoutError):
@@ -1993,6 +2173,7 @@ class TestModelLoadTimeout:
                 side_effect=gc_collect_that_fails_second_time,
             ),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(ModelLoadTimeoutError):
                 await manager.ensure_loaded("qwen3")
@@ -2033,6 +2214,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(ModelLoadTimeoutError):
                 await manager.ensure_loaded("qwen3")
@@ -2071,6 +2253,7 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(ModelLoadTimeoutError):
                 await manager.ensure_loaded("qwen3")
@@ -2118,12 +2301,14 @@ class TestModelLoadTimeout:
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             with pytest.raises(MemoryError):
                 await manager.ensure_loaded("qwen3")
 
             # gc/clear should have been called for cleanup
             assert mock_gc.call_count >= 1
+            assert mock_sync.call_count >= 1
             assert mock_clear.call_count >= 1
             assert "qwen3:latest" not in manager._loaded
 
@@ -2789,6 +2974,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(MemoryError, match="memory limit"):
                 await manager.ensure_loaded("qwen3")
@@ -2831,6 +3017,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             lm = await manager.ensure_loaded("qwen3")
 
@@ -2876,6 +3063,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             lm = await manager.ensure_loaded("qwen3")
 
@@ -2914,6 +3102,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(MemoryError) as exc_info:
                 await manager.ensure_loaded("qwen3")
@@ -2924,7 +3113,8 @@ class TestMemoryCheck:
 
     @pytest.mark.asyncio
     async def test_cleanup_called_on_rejection(self, registry, mock_store):
-        """gc.collect() and mx.clear_cache() are called when a model is rejected."""
+        """_flush_metal is called twice when a model is rejected:
+        once pre-load and once post-rejection cleanup."""
         manager = ModelManager(registry, mock_store)
 
         mock_model = MagicMock()
@@ -2953,15 +3143,13 @@ class TestMemoryCheck:
                 "olmlx.utils.memory.is_memory_pressure_high",
                 return_value=False,
             ),
-            patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
-            patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock) as mock_flush,
         ):
             with pytest.raises(MemoryError):
                 await manager.ensure_loaded("qwen3")
 
         # Called twice: once for pre-load cache flush, once for post-rejection cleanup
-        assert mock_gc.call_count == 2
-        assert mock_clear.call_count == 2
+        assert mock_flush.await_count == 2
 
     @pytest.mark.asyncio
     async def test_cache_flushed_after_eviction(
@@ -2997,6 +3185,9 @@ class TestMemoryCheck:
         def track_clear():
             call_order.append("mx.clear_cache")
 
+        def track_sync():
+            call_order.append("mx.synchronize")
+
         def track_get_metal(*args):
             call_order.append("get_metal")
             return (
@@ -3025,16 +3216,21 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect", side_effect=track_gc),
             patch("olmlx.engine.model_manager.mx.clear_cache", side_effect=track_clear),
+            patch("olmlx.engine.model_manager.mx.synchronize", side_effect=track_sync),
         ):
             lm = await manager.ensure_loaded("qwen3")
 
         assert lm.name == "qwen3:latest"
         # Cache flush must happen before the first memory measurement
         gc_idx = call_order.index("gc.collect")
+        sync_idx = call_order.index("mx.synchronize")
         clear_idx = call_order.index("mx.clear_cache")
         first_metal_idx = call_order.index("get_metal")
         assert gc_idx < first_metal_idx
+        assert sync_idx < first_metal_idx
         assert clear_idx < first_metal_idx
+        # Internal ordering: gc → synchronize → clear
+        assert gc_idx < sync_idx < clear_idx
 
     @pytest.mark.asyncio
     async def test_model_mb_not_negative_in_error(self, registry, mock_store):
@@ -3070,6 +3266,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect"),
             patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
         ):
             with pytest.raises(MemoryError) as exc_info:
                 await manager.ensure_loaded("qwen3")
@@ -3109,6 +3306,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             with pytest.raises(OSError, match="Metal query failed"):
                 await manager.ensure_loaded("qwen3")
@@ -3116,6 +3314,7 @@ class TestMemoryCheck:
         # Cleanup must have been called: once pre-load flush + once post-failure
         assert mock_gc.call_count == 2
         assert mock_clear.call_count == 2
+        assert mock_sync.call_count == 2
         # Model must NOT be in _loaded
         assert "qwen3:latest" not in manager._loaded
 
@@ -3172,6 +3371,7 @@ class TestMemoryCheck:
             ),
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             with pytest.raises(RuntimeError, match="Metal OOM"):
                 await manager.ensure_loaded("qwen3")
@@ -3179,6 +3379,7 @@ class TestMemoryCheck:
         # Pre-load flush + post-failure flush = 2 calls each
         assert mock_gc.call_count == 2
         assert mock_clear.call_count == 2
+        assert mock_sync.call_count == 2
         assert "qwen3:latest" not in manager._loaded
 
 
@@ -3598,9 +3799,11 @@ class TestEvictLruIfNeeded:
         with (
             patch("olmlx.engine.model_manager.gc.collect") as mock_gc,
             patch("olmlx.engine.model_manager.mx.clear_cache") as mock_clear,
+            patch("olmlx.engine.model_manager.mx.synchronize") as mock_sync,
         ):
             await manager._close_evictees([old])
             mock_gc.assert_not_called()
+            mock_sync.assert_not_called()
             mock_clear.assert_not_called()
 
     @pytest.mark.asyncio
