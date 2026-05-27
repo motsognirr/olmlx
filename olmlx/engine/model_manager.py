@@ -1047,8 +1047,12 @@ class ModelManager:
         GPU command queue drains, which can take seconds for large models.
 
         Callers on the event loop use :meth:`_flush_metal` which wraps this
-        in ``asyncio.to_thread``.  Sync callers already inside a thread pool
-        (e.g. ``_load_model_and_shard``) call this directly.
+        in ``asyncio.to_thread`` and serialises via ``_flush_lock``.
+        Sync callers already inside a thread pool (e.g.
+        ``_load_model_and_shard``) call this directly — these callers are
+        not serialised by ``_flush_lock`` (that is an ``asyncio.Lock``),
+        but model loading is serialised by ``_inference_lock`` so the
+        practical risk of a thread-pool + event-loop race is low.
         """
         gc.collect()
         mx.synchronize()
@@ -2217,7 +2221,13 @@ class ModelManager:
                 # that concurrent ensure_loaded callers, which may observe
                 # the registered LoadedModel during this yield, see
                 # fully-configured flags.
-                await self._flush_metal()
+                #
+                # Guarded on _pending_cleanups (matching all other
+                # _flush_metal sites): if a deferred cleanup is still
+                # running, its own _flush_metal will drain the released
+                # probe memory when it completes.
+                if not self._pending_cleanups:
+                    await self._flush_metal()
 
         # Single load-time log site for "cross-request reuse disabled."
         # Distinguishes the two disable reasons by inspecting the raw
