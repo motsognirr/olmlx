@@ -205,6 +205,20 @@ class TestModelManager:
                 task.cancel()
 
     @pytest.mark.asyncio
+    async def test_unload_returns_true_even_when_flush_raises(self, mock_manager):
+        """If _flush_metal() raises, unload() still returns True — the model
+        is already popped from _loaded and resources are closed.
+        Metal memory will be reclaimed by the next flush."""
+        mock_manager._close_loaded_model = MagicMock()  # type: ignore[method-assign]
+        with patch.object(
+            mock_manager, "_flush_metal", side_effect=RuntimeError("flush boom")
+        ):
+            result = await mock_manager.unload("qwen3")
+        assert result is True
+        assert "qwen3:latest" not in mock_manager._loaded
+        mock_manager._close_loaded_model.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_ensure_loaded_cached(self, mock_manager):
         lm = await mock_manager.ensure_loaded("qwen3")
         assert lm.name == "qwen3:latest"

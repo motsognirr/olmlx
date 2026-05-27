@@ -1040,13 +1040,13 @@ class ModelManager:
             raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
 
     @staticmethod
-    def _flush_metal_sync() -> None:
+    def _flush_metal_impl() -> None:
         gc.collect()
         mx.synchronize()
         mx.clear_cache()
 
-    def _flush_metal_sync_thread_safe(self) -> None:
-        """Thread-safe wrapper for :meth:`_flush_metal_sync`.
+    def _flush_metal_sync(self) -> None:
+        """Thread-safe wrapper for :meth:`_flush_metal_impl`.
 
         Acquires ``_flush_thread_lock`` so that a thread-pool caller
         (``_load_model_and_shard``) and an event-loop caller
@@ -1055,16 +1055,19 @@ class ModelManager:
         safe under concurrent clear from separate threads."""
 
         with self._flush_thread_lock:
-            self._flush_metal_sync()
+            self._flush_metal_impl()
 
     async def _flush_metal(self) -> None:
         """Async wrapper for :meth:`_flush_metal_sync`.
 
-        Offloads the Metal drain to a worker thread so the event loop stays
+        Serialises via ``_flush_lock`` so that concurrent callers from the
+        event loop (e.g. eviction flush + deferred cleanup flush arriving
+        together) do not all drain the Metal queue in parallel.  Offloads
+        the actual drain to a worker thread so the event loop stays
         responsive while the GPU command queue drains.
         """
         async with self._flush_lock:
-            await asyncio.to_thread(self._flush_metal_sync_thread_safe)
+            await asyncio.to_thread(self._flush_metal_sync)
 
     def _pop_lru_evictees(self) -> list[LoadedModel]:
         """Pop LRU evictees from ``_loaded`` until below max_loaded_models.
@@ -1713,7 +1716,14 @@ class ModelManager:
         # is still allocating Metal memory (even for a different model),
         # the concurrent clear is unsafe.
         if not self._pending_cleanups:
-            await self._flush_metal()
+            try:
+                await self._flush_metal()
+            except Exception:
+                logger.exception(
+                    "Metal flush failed for unload of '%s'; model already "
+                    "unloaded, Metal memory will be reclaimed on next flush.",
+                    normalized,
+                )
         else:
             logger.debug(
                 "Skipping Metal flush for unload of '%s': deferred cleanup "
@@ -3641,7 +3651,7 @@ class ModelManager:
         if self._distributed_group is not None:
             if is_vlm:
                 del model, tokenizer
-                self._flush_metal_sync_thread_safe()
+                self._flush_metal_sync()
                 raise ValueError(
                     f"VLM models are not supported in distributed mode. "
                     f"Model {hf_path} is a vision-language model which cannot "
@@ -3659,7 +3669,7 @@ class ModelManager:
                     )
                 except ValueError:
                     del model, tokenizer
-                    self._flush_metal_sync_thread_safe()
+                    self._flush_metal_sync()
                     raise
                 # Materialize parameters — pipeline nullified unowned layers
                 # so only owned weights are evaluated (no cross-rank ops).
@@ -3671,7 +3681,7 @@ class ModelManager:
             elif self._distributed_strategy == "tensor":
                 if not hasattr(model, "shard"):
                     del model, tokenizer
-                    self._flush_metal_sync_thread_safe()
+                    self._flush_metal_sync()
                     raise ValueError(
                         f"Model {hf_path} does not support distributed inference "
                         f"(no shard() method). Supported architectures include: "
@@ -3688,7 +3698,7 @@ class ModelManager:
                 logger.info("Model %s sharded for distributed inference", hf_path)
             else:
                 del model, tokenizer
-                self._flush_metal_sync_thread_safe()
+                self._flush_metal_sync()
                 raise AssertionError(
                     "unreachable: distributed_strategy is Literal['tensor']; "
                     "pydantic rejects any other value at config parse"
