@@ -604,6 +604,7 @@ def _apply_serve_overrides(args) -> None:
     spec_strategy = getattr(args, "speculative_strategy", None)
     spec_draft = getattr(args, "speculative_draft_model", None)
     spec_tokens = getattr(args, "speculative_tokens", None)
+    spec_layers_skip = getattr(args, "speculative_layers_skip", None)
     if spec is not None:
         _settings.speculative = spec
     if spec_strategy is not None:
@@ -612,6 +613,8 @@ def _apply_serve_overrides(args) -> None:
         _settings.speculative_draft_model = spec_draft
     if spec_tokens is not None:
         _settings.speculative_tokens = spec_tokens
+    if spec_layers_skip is not None:
+        _settings.speculative_layers_skip = spec_layers_skip
 
     kvq = getattr(args, "kv_cache_quant", None)
     if kvq is not None:
@@ -745,8 +748,8 @@ def _apply_serve_overrides(args) -> None:
             "with Flash-MoE. Once Flash-MoE is prepared and loads, this "
             "will raise a ValueError at load time (dflash requires "
             "hidden-state capture that does not generalize to MoE "
-            "routing): %s. Use speculative_strategy='classic' or set "
-            "speculative=false.",
+            "routing): %s. Use speculative_strategy='classic', "
+            "'self_speculative', or set speculative=false.",
             ", ".join(dflash_moe_actionable),
         )
     if bad:
@@ -1021,7 +1024,7 @@ def _audit_speculative_config(
                 exc_info=True,
             )
             continue
-        if enabled and not draft:
+        if enabled and not draft and strategy != "self_speculative":
             bad.append(name)
         elif not enabled and mc.speculative_draft_model:
             # Use the raw per-model field rather than the resolved
@@ -1038,6 +1041,18 @@ def _audit_speculative_config(
             # per-model override, so the global setting is still
             # logically unused for that model.
             global_draft_used = True
+        if enabled and draft and strategy == "self_speculative":
+            # ``self_speculative`` uses the target's own layers as
+            # draft — an external draft model set in the config is
+            # silently ignored by ``_load_self_speculative_decoder``.
+            # Warn so the operator knows the draft model setting has
+            # no effect while this strategy is active.
+            logger.warning(
+                "speculative_draft_model is set for %r but "
+                "strategy='self_speculative' uses the target's own "
+                "layers — the draft model will be ignored.",
+                name,
+            )
         if enabled:
             # Resolve the full experimental config (global defaults
             # merged with per-model overrides) for ``flash`` and via
@@ -1434,6 +1449,24 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
                 )
         if _resolved_kvq:
             env["OLMLX_KV_CACHE_QUANT"] = _resolved_kvq
+        _resolved_wq = settings.weight_quant
+        if model:
+            try:
+                from olmlx.engine.registry import ModelRegistry
+
+                reg = ModelRegistry()
+                reg.load()
+                mc = reg.resolve(model)
+                if mc is not None:
+                    _resolved_wq = mc.resolved_weight_quant()
+            except Exception as exc:
+                logger.debug(
+                    "Skipping per-model weight_quant resolution for distributed "
+                    "worker: %s",
+                    exc,
+                )
+        if _resolved_wq:
+            env["OLMLX_WEIGHT_QUANT"] = _resolved_wq
         if settings.flash:
             env["OLMLX_FLASH"] = "true"
             # Forward the *resolved* primary knobs (from ``settings``)
@@ -2800,15 +2833,17 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument(
         "--speculative-strategy",
         dest="speculative_strategy",
-        choices=("classic", "dflash", "eagle", "pld"),
+        choices=("classic", "dflash", "eagle", "pld", "self_speculative"),
         default=None,
         help=(
             "Speculative decoding strategy: 'classic' (standalone draft LM), "
             "'dflash' (block-diffusion draft conditioned on target hidden "
             "states), 'eagle' (autoregressive draft head conditioned on "
-            "target last-layer hidden, arxiv 2401.15077), or 'pld' "
+            "target last-layer hidden, arxiv 2401.15077), 'pld' "
             "(prompt-lookup decoding — n-gram lookup in the prompt+generated "
-            "history, no draft model required). Default: classic."
+            "history, no draft model required), or 'self_speculative' "
+            "(LayerSkip-style — uses target's own early layers as draft; "
+            "no external draft model required). Default: classic."
         ),
     )
     serve_p.add_argument(
@@ -2828,6 +2863,17 @@ def build_parser() -> argparse.ArgumentParser:
             "for classic, 10 for PLD). For DFlash this is the block size "
             "(excluding the pending token); for PLD it's the max draft "
             "length (actual draft is bounded by the longest n-gram match)."
+        ),
+    )
+    serve_p.add_argument(
+        "--speculative-layers-skip",
+        dest="speculative_layers_skip",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Number of layers skipped during self_speculative draft "
+            "(default: L//4, where L is the total number of layers). "
+            "Only applies to strategy='self_speculative'."
         ),
     )
     serve_p.add_argument(

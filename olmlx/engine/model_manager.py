@@ -757,6 +757,9 @@ class LoadedModel:
     )
     prompt_cache_store: PromptCacheStore = field(default=None)  # type: ignore[assignment]
     kv_cache_quant: str | None = None
+    #: Weight quantization string (e.g. "hqq:4") applied at load time.
+    #: ``None`` means no weight quantization was applied.
+    weight_quant: str | None = None
     # False for hybrid sliding-window models (RotatingKVCache layers).
     # Set by the loader; default True covers direct construction in tests.
     supports_cache_trim: bool = True
@@ -1222,6 +1225,7 @@ class ModelManager:
                 # ``model_exp``.
                 flash_config = model_config.resolved_flash()
                 kv_cache_quant = model_config.resolved_kv_cache_quant()
+                weight_quant_str = model_config.resolved_weight_quant()
                 flash_moe_config = model_config.resolved_flash_moe()
 
                 # Pop LRU evictees under the lock; close them outside the lock
@@ -1347,6 +1351,7 @@ class ModelManager:
                         spec_config,
                         flash_config,
                         flash_moe_config,
+                        weight_quant_str,
                     )
                     timeout = settings.model_load_timeout
                     is_distributed = False
@@ -1514,6 +1519,7 @@ class ModelManager:
                         expires_at=expires,
                         size_bytes=_model_size,
                         kv_cache_quant=kv_cache_quant,
+                        weight_quant=weight_quant_str,
                         spectral_calibration_dir=_spectral_dir,
                         default_options=dict(model_config.options),
                         inference_queue_timeout=model_config.inference_queue_timeout,
@@ -2865,6 +2871,8 @@ class ModelManager:
             draft_model=draft_model,
             target_model=spec_target,
             num_speculative_tokens=num_tokens,
+            tree_width=settings.tree_width if settings.tree_speculative else 1,
+            tree_max_nodes=settings.tree_max_nodes,
         )
 
     def _load_pld_decoder(
@@ -2949,6 +2957,46 @@ class ModelManager:
             max_ngram_size=spec_config.pld_max_ngram,
             min_ngram_size=spec_config.pld_min_ngram,
             lookup_window=spec_config.pld_lookup_window,
+        )
+
+    def _load_self_speculative_decoder(
+        self,
+        target_model: Any,
+        spec_config: SpeculativeConfig,
+    ) -> Any:
+        """Create a SelfSpeculativeDecoder using the target's own early layers.
+
+        No external draft model is loaded. ``spec_config.layers_skip``
+        determines how many layers the draft skips (defaulting to
+        ``L // 4`` when ``None``).
+        """
+        from olmlx.engine.gdn_rollback import get_model_layers
+        from olmlx.engine.self_speculative import SelfSpeculativeDecoder
+
+        num_tokens = spec_config.num_tokens if spec_config.num_tokens is not None else 4
+
+        total_layers = len(get_model_layers(target_model))
+        if spec_config.layers_skip is not None:
+            layers_skip = spec_config.layers_skip
+        else:
+            layers_skip = max(total_layers // 4, 1)
+        num_early_layers = total_layers - layers_skip
+        if num_early_layers < 1:
+            num_early_layers = 1
+            layers_skip = total_layers - 1
+
+        logger.info(
+            "Self-speculative: draft uses %d/%d layers (skip=%d, λ=%d)",
+            num_early_layers,
+            total_layers,
+            layers_skip,
+            num_tokens,
+        )
+
+        return SelfSpeculativeDecoder(
+            target_model=target_model,
+            num_early_layers=num_early_layers,
+            num_speculative_tokens=num_tokens,
         )
 
     def _is_flash_enabled(self, flash_config: ResolvedFlashConfig) -> bool:
@@ -3168,6 +3216,7 @@ class ModelManager:
         spec_config: SpeculativeConfig | None = None,
         flash_config: ResolvedFlashConfig | None = None,
         flash_moe_config: FlashMoeConfig | None = None,
+        weight_quant_str: str | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
 
@@ -3185,6 +3234,9 @@ class ModelManager:
         *flash_moe_config* is the resolved ``FlashMoeConfig`` (per-model
         overrides applied). Falls back to a fresh resolution from
         global ``Settings`` values when ``None``.
+
+        *weight_quant_str* is the resolved weight quantization string
+        (e.g. ``"hqq:4"``). ``None`` means no weight quantization.
 
         Returns (model, tokenizer, is_vlm, caps, speculative_decoder).
         """
@@ -3253,8 +3305,9 @@ class ModelManager:
                     raise ValueError(
                         f"speculative_strategy={spec_config.strategy!r} is "
                         "not supported on Flash-MoE targets. Use "
-                        "speculative_strategy='classic' or remove the "
-                        "speculative settings."
+                        "speculative_strategy='classic' or "
+                        "'self_speculative', or remove the speculative "
+                        "settings."
                     )
                 if flash_config.flash_speculative:
                     raise ValueError(
@@ -3263,6 +3316,14 @@ class ModelManager:
                         "(or unset OLMLX_FLASH_SPECULATIVE) and "
                         "use speculative instead."
                     )
+                if weight_quant_str:
+                    logger.warning(
+                        "weight_quant=%s is set but %s is loaded via "
+                        "Flash-MoE; weight quantization is not applied on "
+                        "the Flash-MoE code path.",
+                        weight_quant_str,
+                        hf_path,
+                    )
                 model, tokenizer, is_vlm, caps = self._load_flash_moe_model(
                     hf_path, load_path, flash_moe_dir, flash_moe_config=flash_moe_config
                 )
@@ -3270,6 +3331,10 @@ class ModelManager:
                     if spec_config.strategy == "pld":
                         decoder = self._load_pld_decoder(
                             model, spec_config, is_vlm=is_vlm
+                        )
+                    elif spec_config.strategy == "self_speculative":
+                        decoder = self._load_self_speculative_decoder(
+                            model, spec_config
                         )
                     else:
                         decoder = self._load_speculative_decoder(
@@ -3309,6 +3374,14 @@ class ModelManager:
                         "speculative_strategy='pld' on the same model. "
                         "Pick one."
                     )
+                if weight_quant_str:
+                    logger.warning(
+                        "weight_quant=%s is set but %s is loaded via "
+                        "Flash; weight quantization is not applied on "
+                        "the Flash code path.",
+                        weight_quant_str,
+                        hf_path,
+                    )
                 model, tokenizer, is_vlm, caps, decoder = self._load_flash_model(
                     hf_path,
                     load_path,
@@ -3336,12 +3409,17 @@ class ModelManager:
                 )
                 self._load_chat_template(tok, load_path, hf_path)
                 caps = detect_caps(tok)
+
+                # Apply HQQ weight quantization if configured
+                self._maybe_quantize_model(model, True, weight_quant_str, hf_path)
+
                 if spec_enabled and spec_config.strategy in ("dflash", "eagle"):
                     raise ValueError(
                         f"speculative_strategy={spec_config.strategy!r} is not "
                         "supported on VLM targets. Use "
-                        "speculative_strategy='classic' or remove the "
-                        "speculative settings."
+                        "speculative_strategy='classic' or "
+                        "'self_speculative', or remove the speculative "
+                        "settings."
                     )
                 if flash_config.flash_speculative:
                     raise ValueError(
@@ -3354,6 +3432,11 @@ class ModelManager:
                     if spec_config.strategy == "pld":
                         decoder = self._load_pld_decoder(
                             model, spec_config, is_vlm=True
+                        )
+                    elif spec_config.strategy == "self_speculative":
+                        spec_target = getattr(model, "language_model", model)
+                        decoder = self._load_self_speculative_decoder(
+                            spec_target, spec_config
                         )
                     else:
                         decoder = self._load_speculative_decoder(
@@ -3371,6 +3454,12 @@ class ModelManager:
         # Text or unknown — try mlx-lm first, fall back to mlx-vlm
         model, tokenizer, is_vlm, caps = self._try_lm_then_vlm(load_path, hf_path)
 
+        # Apply HQQ weight quantization if configured.
+        # The text path (including hybrid VLMs routed through mlx-lm)
+        # loads a plain text model — pass is_vlm=False so we quantize
+        # the model directly without looking for .language_model.
+        self._maybe_quantize_model(model, False, weight_quant_str, hf_path)
+
         if spec_enabled and flash_config.flash_speculative:
             raise ValueError(
                 "Only one speculative decoder can be active at a time; "
@@ -3384,11 +3473,56 @@ class ModelManager:
                 decoder = self._load_eagle_decoder(model, spec_config)
             elif spec_config.strategy == "pld":
                 decoder = self._load_pld_decoder(model, spec_config)
+            elif spec_config.strategy == "self_speculative":
+                decoder = self._load_self_speculative_decoder(model, spec_config)
             else:
                 decoder = self._load_speculative_decoder(model, hf_path, spec_config)
             return model, tokenizer, is_vlm, caps, decoder
 
         return model, tokenizer, is_vlm, caps, None
+
+    @staticmethod
+    def _maybe_quantize_model(
+        model: Any,
+        is_vlm: bool,
+        weight_quant_str: str | None,
+        hf_path: str,
+    ) -> None:
+        """Apply HQQ weight quantization to the model if configured.
+
+        For VLM models, quantizes the language model portion only.
+        The vision component is left untouched.
+        """
+        if not weight_quant_str:
+            return
+        from olmlx.engine.hqq.quantize import HQQConfig, quantize_model
+
+        cfg = HQQConfig.from_string(weight_quant_str)
+        if cfg is None:
+            return
+
+        if is_vlm:
+            if hasattr(model, "language_model"):
+                target = model.language_model
+            else:
+                logger.warning(
+                    "weight_quant=%s configured for VLM %s but model has no "
+                    "language_model attribute; quantizing the full model",
+                    weight_quant_str,
+                    hf_path,
+                )
+                target = model
+        else:
+            target = model
+
+        logger.info(
+            "Applying HQQ weight quantization (%d-bit, group_size=%d) to %s",
+            cfg.bits,
+            cfg.group_size,
+            hf_path,
+        )
+        quantize_model(target, cfg)
+        mx.eval(target.parameters())
 
     def _load_model_and_shard(
         self,
@@ -3397,6 +3531,7 @@ class ModelManager:
         spec_config: SpeculativeConfig | None = None,
         flash_config: ResolvedFlashConfig | None = None,
         flash_moe_config: FlashMoeConfig | None = None,
+        weight_quant_str: str | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 
@@ -3408,6 +3543,9 @@ class ModelManager:
 
         *flash_config* is the resolved Flash primary-knob config.
 
+        *weight_quant_str* is the resolved weight quantization string
+        (e.g. ``"hqq:4"``). ``None`` means no weight quantization.
+
         Returns (model, tokenizer, is_vlm, caps, is_distributed, speculative_decoder).
         """
         model, tokenizer, is_vlm, caps, speculative_decoder = self._load_model(
@@ -3416,6 +3554,7 @@ class ModelManager:
             spec_config=spec_config,
             flash_config=flash_config,
             flash_moe_config=flash_moe_config,
+            weight_quant_str=weight_quant_str,
         )
         is_distributed = False
 

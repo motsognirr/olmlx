@@ -1443,6 +1443,44 @@ class TestLoadModel:
 
         assert model is mock_model
 
+    def test_load_text_model_with_weight_quant(self, registry, mock_store):
+        """When weight_quant is configured, quantize_model is called."""
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/path")
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        with patch.object(manager, "_detect_model_kind", return_value="text"):
+            mock_mlx_lm = MagicMock()
+            mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch.object(manager, "_maybe_quantize_model") as mock_quant:
+                    model, tokenizer, is_vlm, caps, _ = manager._load_model(
+                        "test/path", weight_quant_str="hqq:4"
+                    )
+
+        mock_quant.assert_called_once_with(mock_model, False, "hqq:4", "test/path")
+
+    def test_load_text_model_without_weight_quant(self, registry, mock_store):
+        """When weight_quant is None, quantize_model is not called."""
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/path")
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        with patch.object(manager, "_detect_model_kind", return_value="text"):
+            mock_mlx_lm = MagicMock()
+            mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch.object(manager, "_maybe_quantize_model") as mock_quant:
+                    model, tokenizer, is_vlm, caps, _ = manager._load_model(
+                        "test/path", weight_quant_str=None
+                    )
+
+        mock_quant.assert_called_once_with(mock_model, False, None, "test/path")
+
 
 class TestFlashMoeVlmFallback:
     """Flash-MoE loading should fall back to mlx-vlm for unsupported model types."""

@@ -233,6 +233,27 @@ SCENARIOS: list[Scenario] = [
         should_skip=_requires_speculative_draft,
     ),
     Scenario(
+        name="self-speculative",
+        description=(
+            "Self-speculative decoding (LayerSkip — no external draft "
+            "model; uses the target's own early layers as draft)"
+        ),
+        env_overrides={
+            "OLMLX_SPECULATIVE": "true",
+            "OLMLX_SPECULATIVE_STRATEGY": "self_speculative",
+        },
+    ),
+    Scenario(
+        name="flash+self-speculative",
+        description="Flash inference + self-speculative decoding",
+        env_overrides={
+            "OLMLX_FLASH": "true",
+            "OLMLX_SPECULATIVE": "true",
+            "OLMLX_SPECULATIVE_STRATEGY": "self_speculative",
+        },
+        should_skip=_requires_flash,
+    ),
+    Scenario(
         name="flash+prefetch",
         description="Flash inference + speculative neuron prefetch",
         env_overrides={"OLMLX_FLASH": "true", "OLMLX_FLASH_PREFETCH": "true"},

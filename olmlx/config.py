@@ -15,6 +15,41 @@ logger = logging.getLogger(__name__)
 SyncMode = Literal["full", "minimal", "none"]
 
 
+def validate_weight_quant_format(v: str | None) -> str | None:
+    """Validate that *v* is a valid ``weight_quant`` value.
+
+    Called by both the Pydantic field validator and the per-model config
+    path (``ModelConfig.from_entry``).
+    """
+    if v is None:
+        return v
+    parts = v.split(":")
+    if len(parts) < 2 or len(parts) > 3:
+        raise ValueError(
+            f"Invalid weight_quant={v!r}. "
+            f"Expected '<method>:<bits>' or '<method>:<bits>:<group_size>'."
+        )
+    method, bits = parts[0], parts[1]
+    if method != "hqq":
+        raise ValueError(f"Invalid weight_quant method={method!r}. Expected 'hqq'.")
+    if bits not in ("4", "8"):
+        raise ValueError(f"Invalid weight_quant bits={bits!r}. Expected '4' or '8'.")
+    if len(parts) == 3:
+        try:
+            gs = int(parts[2])
+        except ValueError:
+            raise ValueError(
+                f"Invalid weight_quant group_size={parts[2]!r}. "
+                f"Expected a positive integer."
+            )
+        if gs < 32 or gs % 32 != 0:
+            raise ValueError(
+                f"Invalid weight_quant group_size={gs}. "
+                f"Expected a multiple of 32 (e.g. 32, 64, 128)."
+            )
+    return v
+
+
 def validate_kv_cache_quant_format(v: str | None) -> str | None:
     """Validate that *v* is a valid ``kv_cache_quant`` value.
 
@@ -85,6 +120,13 @@ class Settings(BaseSettings):
     # prepare <model>`` on first load.
     kv_cache_auto_calibrate: bool = False
 
+    # Weight quantization (HQQ).
+    # Format: "hqq:<bits>" or "hqq:<bits>:<group_size>" where bits ∈ {4, 8}
+    # and group_size is a positive integer (default 64 for 4-bit, 128 for
+    # 8-bit). Per-model overrides live on ``ModelConfig`` in
+    # ``olmlx.engine.registry``.
+    weight_quant: str | None = None
+
     # Distributed inference — split models across Apple Silicon machines.
     # Configured via hostfile (``distributed_hostfile``), launched by
     # ``olmlx serve``.
@@ -125,14 +167,22 @@ class Settings(BaseSettings):
     #   carries an ``eagle_config`` block.
     # - ``pld``: prompt-lookup decoding. No draft model — the "draft" comes
     #   from n-gram lookup in the prompt+generated history. Free acceptance
-    #   on code edits, repeated context, and JSON/structured replies. Only
-    #   speculative strategy that composes with Flash-MoE.
+    #   on code edits, repeated context, and JSON/structured replies.
+    # - ``self_speculative``: LayerSkip-style decoding — uses the target's
+    #   own early layers (0..L-skip-1) as an autoregressive draft, then
+    #   verifies with all L layers in one forward pass. No external draft
+    #   model required. Works under Flash and Flash-MoE.
+    #   Configured with ``speculative_layers_skip`` (default: L//4).
+    # Both ``pld`` and ``self_speculative`` compose with Flash-MoE.
     # ``speculative_tokens`` is reused as DFlash's ``block_size``, EAGLE's
-    # per-verify draft-token count, and PLD's max draft length. ``None``
-    # means "use the strategy default": 4 for classic, 10 for PLD, the
-    # draft model's pre-trained ``block_size`` for DFlash and EAGLE.
+    # per-verify draft-token count, PLD's max draft length, and
+    # self_speculative's draft token count. ``None`` means "use the
+    # strategy default": 4 for classic and self_speculative, 10 for PLD,
+    # the draft model's pre-trained ``block_size`` for DFlash and EAGLE.
     speculative: bool = False
-    speculative_strategy: Literal["classic", "dflash", "eagle", "pld"] = "classic"
+    speculative_strategy: Literal[
+        "classic", "dflash", "eagle", "pld", "self_speculative"
+    ] = "classic"
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] | None = None
     #: PLD-only knobs (ignored by other strategies). N-gram sizes for the
@@ -148,6 +198,26 @@ class Settings(BaseSettings):
     #: max_ngram=3); raise it if you need matches against an older
     #: prefix, lower it if you're seeing scan-time regressions.
     speculative_pld_lookup_window: Annotated[int, Field(gt=0)] = 8192
+    #: Self-speculative knob — number of layers skipped during the draft
+    #: pass. ``None`` defaults to L//4 at load time.
+    speculative_layers_skip: Annotated[int, Field(ge=1)] | None = None
+
+    # Tree-structured speculative verification (#358).  When enabled,
+    # the classic speculative strategy produces a tree of draft alternatives
+    # (top-K candidates per step) and verifies them against the target in
+    # one forward pass using a sparse attention mask.
+    #
+    # ``tree_width`` controls how many candidates are kept per draft step
+    # (1 = linear, ≥2 = tree).  ``tree_max_nodes`` is a hard cap on the
+    # total number of tree nodes (including the root).  The tree automatically
+    # stops growing when it hits either the draft length (``speculative_tokens``)
+    # or ``tree_max_nodes``.
+    #
+    # Setting ``tree_width`` to 1 or ``tree_speculative`` to False falls
+    # back to the existing linear verification path.
+    tree_speculative: bool = False
+    tree_width: Annotated[int, Field(ge=1)] = 2
+    tree_max_nodes: Annotated[int, Field(ge=3)] = 8
 
     # Flash inference (LLM in a Flash). Primary, user-facing knobs.
     # Advanced tuning (window size, IO threads, cache budget, predictor
@@ -220,6 +290,28 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_tree_speculative(self) -> "Settings":
+        if self.tree_speculative and self.flash_speculative:
+            raise ValueError(
+                "OLMLX_TREE_SPECULATIVE=true and OLMLX_FLASH_SPECULATIVE=true "
+                "are incompatible. Tree verification is only supported with "
+                "OLMLX_SPECULATIVE=true (classic strategy). Flash speculative "
+                "decoding uses a separate code path that does not support tree "
+                "drafts (see #358)."
+            )
+        if self.tree_speculative and not self.speculative:
+            raise ValueError(
+                "OLMLX_TREE_SPECULATIVE=true requires OLMLX_SPECULATIVE=true"
+            )
+        if self.tree_speculative and self.speculative_strategy != "classic":
+            raise ValueError(
+                "OLMLX_TREE_SPECULATIVE=true is only supported with "
+                "OLMLX_SPECULATIVE_STRATEGY=classic "
+                f"(got {self.speculative_strategy!r})"
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_flash_neuron_range(self) -> "Settings":
         # Cross-field check: an inverted min/max would produce a silently
         # broken ``FlashConfig`` at runtime (FlashMLP clamps each token's
@@ -240,6 +332,11 @@ class Settings(BaseSettings):
     @classmethod
     def validate_kv_cache_quant(cls, v: str | None) -> str | None:
         return validate_kv_cache_quant_format(v)
+
+    @field_validator("weight_quant")
+    @classmethod
+    def validate_weight_quant(cls, v: str | None) -> str | None:
+        return validate_weight_quant_format(v)
 
     @field_validator("speculative_draft_model")
     @classmethod

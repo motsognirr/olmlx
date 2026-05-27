@@ -57,6 +57,13 @@ async def ps(request: Request):
                 except Exception:
                     pass
 
+        # Override with HQQ weight quantization if applied at load time.
+        if lm.weight_quant:
+            q_str = lm.weight_quant
+            parts = q_str.split(":")
+            bits = parts[1] if len(parts) > 1 else ""
+            meta["quantization_level"] = f"HQQ-{bits}bit"
+
         models.append(
             RunningModel(
                 name=lm.name,

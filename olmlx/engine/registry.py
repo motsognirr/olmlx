@@ -14,9 +14,9 @@ import logging
 
 from olmlx.config import FlashMoeConfig, SyncMode, settings
 
-SpeculativeStrategy = Literal["classic", "dflash", "eagle", "pld"]
+SpeculativeStrategy = Literal["classic", "dflash", "eagle", "pld", "self_speculative"]
 _VALID_SPECULATIVE_STRATEGIES: frozenset[str] = frozenset(
-    ("classic", "dflash", "eagle", "pld")
+    ("classic", "dflash", "eagle", "pld", "self_speculative")
 )
 
 logger = logging.getLogger(__name__)
@@ -262,8 +262,9 @@ class SpeculativeConfig(NamedTuple):
 
     enabled: bool
     draft_model: str | None
-    #: ``None`` means "use the strategy default" — 4 for classic speculative
-    #: decoding, the draft model's pre-trained ``block_size`` for DFlash.
+    #: ``None`` means "use the strategy default" — 4 for classic and
+    #: self_speculative, the draft model's pre-trained ``block_size``
+    #: for DFlash and EAGLE.
     num_tokens: int | None
     strategy: SpeculativeStrategy = "classic"
     #: PLD-only n-gram tuning. ``None`` means "use the global
@@ -273,6 +274,9 @@ class SpeculativeConfig(NamedTuple):
     pld_max_ngram: int | None = None
     pld_min_ngram: int | None = None
     pld_lookup_window: int | None = None
+    #: Number of layers to skip during self_speculative draft. ``None``
+    #: means "use the strategy default" — L//4 at load time.
+    layers_skip: int | None = None
 
 
 @dataclass
@@ -303,9 +307,14 @@ class ModelConfig:
     speculative_pld_max_ngram: int | None = None
     speculative_pld_min_ngram: int | None = None
     speculative_pld_lookup_window: int | None = None
+    speculative_layers_skip: int | None = None
     #: KV cache quantization method and bits (e.g. "turboquant:4").
     #: ``None`` means inherit the global ``Settings.kv_cache_quant`` value.
     kv_cache_quant: str | None = None
+    #: Weight quantization method, bits, and optional group size
+    #: (e.g. "hqq:4", "hqq:8:128").
+    #: ``None`` means inherit the global ``Settings.weight_quant`` value.
+    weight_quant: str | None = None
     #: Per-model Flash overrides for the promoted primary knobs.
     #: ``None`` means inherit from the global ``Settings.flash*`` value.
     #: Advanced/tuning knobs still go under the ``experimental`` block.
@@ -396,6 +405,15 @@ class ModelConfig:
                 f"({self.speculative_pld_lookup_window}) must be >= "
                 f"'speculative_pld_max_ngram' "
                 f"({self.speculative_pld_max_ngram})"
+            )
+        if self.speculative_layers_skip is not None and (
+            isinstance(self.speculative_layers_skip, bool)
+            or not isinstance(self.speculative_layers_skip, int)
+            or self.speculative_layers_skip < 1
+        ):
+            raise ValueError(
+                f"'speculative_layers_skip' must be a positive integer or "
+                f"None, got {self.speculative_layers_skip!r}"
             )
         # Flash primary-knob bounds match the Settings field constraints.
         # Kept here so direct ModelConfig() construction (tests,
@@ -493,13 +511,14 @@ class ModelConfig:
         """Resolve speculative config: per-model overrides global settings.
 
         Returns a ``SpeculativeConfig(enabled, draft_model, num_tokens,
-        strategy, pld_max_ngram, pld_min_ngram, pld_lookup_window)``.
+        strategy, pld_max_ngram, pld_min_ngram, pld_lookup_window,
+        layers_skip)``.
         When ``enabled`` is ``False`` the draft slot is forced to
         ``None`` even if a global ``speculative_draft_model`` is
         configured — callers should never see a non-None draft for a
-        disabled model. The token count and PLD knobs are always
-        returned so callers that flip ``enabled`` at runtime keep a
-        sensible default.
+        disabled model. The token count, PLD knobs, and layers_skip are
+        always returned so callers that flip ``enabled`` at runtime keep
+        a sensible default.
         """
         from olmlx.config import settings
 
@@ -531,6 +550,11 @@ class ModelConfig:
             if self.speculative_pld_lookup_window is not None
             else settings.speculative_pld_lookup_window
         )
+        layers_skip = (
+            self.speculative_layers_skip
+            if self.speculative_layers_skip is not None
+            else settings.speculative_layers_skip
+        )
         # Cross-field checks: per-model overrides combined with global
         # values may produce inverted/under-sized pairs that pass each
         # layer's local validation. ``Settings`` and
@@ -558,13 +582,14 @@ class ModelConfig:
                 )
         if not enabled:
             return SpeculativeConfig(
-                False,
-                None,
-                tokens,
-                strategy,
-                pld_max_ngram,
-                pld_min_ngram,
-                pld_lookup_window,
+                enabled=False,
+                draft_model=None,
+                num_tokens=tokens,
+                strategy=strategy,
+                pld_max_ngram=pld_max_ngram,
+                pld_min_ngram=pld_min_ngram,
+                pld_lookup_window=pld_lookup_window,
+                layers_skip=layers_skip,
             )
         draft = (
             self.speculative_draft_model
@@ -572,13 +597,14 @@ class ModelConfig:
             else settings.speculative_draft_model
         )
         return SpeculativeConfig(
-            True,
-            draft,
-            tokens,
-            strategy,
-            pld_max_ngram,
-            pld_min_ngram,
-            pld_lookup_window,
+            enabled=True,
+            draft_model=draft,
+            num_tokens=tokens,
+            strategy=strategy,
+            pld_max_ngram=pld_max_ngram,
+            pld_min_ngram=pld_min_ngram,
+            pld_lookup_window=pld_lookup_window,
+            layers_skip=layers_skip,
         )
 
     def resolved_kv_cache_quant(self) -> str | None:
@@ -586,6 +612,12 @@ class ModelConfig:
         if self.kv_cache_quant is not None:
             return self.kv_cache_quant
         return settings.kv_cache_quant
+
+    def resolved_weight_quant(self) -> str | None:
+        """Resolve weight quant config: per-model overrides global settings."""
+        if self.weight_quant is not None:
+            return self.weight_quant
+        return settings.weight_quant
 
     def resolved_flash(self) -> ResolvedFlashConfig:
         """Resolve Flash primary knobs: per-model overrides global settings.
@@ -776,6 +808,19 @@ class ModelConfig:
             speculative_pld_min_ngram = entry.get("speculative_pld_min_ngram")
             speculative_pld_lookup_window = entry.get("speculative_pld_lookup_window")
 
+            speculative_layers_skip_raw = entry.get("speculative_layers_skip")
+            if speculative_layers_skip_raw is not None:
+                if (
+                    isinstance(speculative_layers_skip_raw, bool)
+                    or not isinstance(speculative_layers_skip_raw, int)
+                    or speculative_layers_skip_raw < 1
+                ):
+                    raise ValueError(
+                        f"'speculative_layers_skip' must be a positive integer, "
+                        f"got {speculative_layers_skip_raw!r}"
+                    )
+            speculative_layers_skip = speculative_layers_skip_raw
+
             # Flash primary-knob fields: type/bounds checks live in
             # ``ModelConfig.__post_init__`` (which fires from the
             # ``cls(...)`` call below). Pull raw values verbatim and let
@@ -810,6 +855,21 @@ class ModelConfig:
 
                 kv_cache_quant_raw = validate_kv_cache_quant_format(kv_cache_quant_raw)
 
+            weight_quant_raw = entry.get("weight_quant")
+            if weight_quant_raw is not None:
+                if not isinstance(weight_quant_raw, str):
+                    raise ValueError(
+                        f"'weight_quant' must be a string, got {weight_quant_raw!r}"
+                    )
+                if not weight_quant_raw.strip():
+                    raise ValueError(
+                        "'weight_quant' must be a non-empty string; "
+                        "use ``null`` to inherit from the global setting."
+                    )
+                from olmlx.config import validate_weight_quant_format
+
+                weight_quant_raw = validate_weight_quant_format(weight_quant_raw)
+
             extra = {k: v for k, v in entry.items() if k not in _KNOWN_CONFIG_KEYS}
             return cls(
                 hf_path=hf_path,
@@ -826,7 +886,9 @@ class ModelConfig:
                 speculative_pld_max_ngram=speculative_pld_max_ngram,
                 speculative_pld_min_ngram=speculative_pld_min_ngram,
                 speculative_pld_lookup_window=speculative_pld_lookup_window,
+                speculative_layers_skip=speculative_layers_skip,
                 kv_cache_quant=kv_cache_quant_raw,
+                weight_quant=weight_quant_raw,
                 flash=flash,
                 flash_sparsity_threshold=flash_sparsity_threshold,
                 flash_min_active_neurons=flash_min_active_neurons,
@@ -861,7 +923,9 @@ class ModelConfig:
             and self.speculative_pld_max_ngram is None
             and self.speculative_pld_min_ngram is None
             and self.speculative_pld_lookup_window is None
+            and self.speculative_layers_skip is None
             and self.kv_cache_quant is None
+            and self.weight_quant is None
             and self.flash is None
             and self.flash_sparsity_threshold is None
             and self.flash_min_active_neurons is None
@@ -905,8 +969,12 @@ class ModelConfig:
             result["speculative_pld_min_ngram"] = self.speculative_pld_min_ngram
         if self.speculative_pld_lookup_window is not None:
             result["speculative_pld_lookup_window"] = self.speculative_pld_lookup_window
+        if self.speculative_layers_skip is not None:
+            result["speculative_layers_skip"] = self.speculative_layers_skip
         if self.kv_cache_quant is not None:
             result["kv_cache_quant"] = self.kv_cache_quant
+        if self.weight_quant is not None:
+            result["weight_quant"] = self.weight_quant
         if self.flash is not None:
             result["flash"] = self.flash
         if self.flash_sparsity_threshold is not None:
