@@ -210,6 +210,83 @@ class TestModelManager:
         assert lm.name == "qwen3:latest"
 
     @pytest.mark.asyncio
+    async def test_concurrent_ensure_loaded_sees_registered_model_during_probe(
+        self, registry, mock_store, monkeypatch
+    ):
+        """A second ensure_loaded during the probe's async flush must return
+        the already-registered model with fully-configured cache flags."""
+        import asyncio
+
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 10)
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.mx.metal.is_available", lambda: True
+        )
+        manager = ModelManager(registry, mock_store)
+
+        probe_in_flight = asyncio.Event()
+        probe_done = asyncio.Event()
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.chat_template = None
+
+        async def _stalling_probe(lm):
+            # Set flags synchronously (matching the real implementation's
+            # contract), then block until the test signals completion.
+            lm.supports_cache_trim = True
+            lm.supports_cache_persistence = True
+            probe_in_flight.set()
+            await probe_done.wait()
+
+        manager._probe_cache_capabilities = _stalling_probe  # type: ignore[method-assign]
+
+        total_ram = 64 * 1024**3
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(model, tokenizer, False, TemplateCaps(), None),
+            ),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                return_value=1 * 1024**3,
+            ),
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
+            patch("olmlx.engine.model_manager.gc.collect"),
+        ):
+            task1 = asyncio.ensure_future(manager.ensure_loaded("qwen3"))
+
+            # Wait for the probe to set flags and signal readiness
+            await asyncio.wait_for(probe_in_flight.wait(), timeout=5.0)
+
+            # Second caller for the same model — must get the cached LM
+            task2 = asyncio.ensure_future(manager.ensure_loaded("qwen3"))
+
+            # Let probe complete
+            probe_done.set()
+
+            lm1 = await asyncio.wait_for(task1, timeout=5.0)
+            lm2 = await asyncio.wait_for(task2, timeout=5.0)
+
+        assert lm1 is lm2
+        # Flags were set synchronously before the probe awaited, so the
+        # second caller sees fully-configured state.
+        assert lm1.supports_cache_trim is True
+        assert lm2.supports_cache_trim is True
+        assert lm1.supports_cache_persistence is True
+        assert lm2.supports_cache_persistence is True
+        assert "qwen3:latest" in manager._loaded
+
+    @pytest.mark.asyncio
     async def test_ensure_loaded_refreshes_expiry(self, mock_manager):
         lm = await mock_manager.ensure_loaded("qwen3", keep_alive="10m")
         assert lm.expires_at is not None

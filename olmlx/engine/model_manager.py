@@ -893,6 +893,7 @@ class ModelManager:
         self._expiry_task: asyncio.Task | None = None
         self._pending_cleanups: dict[str, asyncio.Task] = {}
         self._pending_load_tasks: dict[str, asyncio.Task] = {}
+        self._flush_lock = asyncio.Lock()
 
     def start_expiry_checker(self):
         self._expiry_task = asyncio.create_task(self._check_expiry_loop())
@@ -1059,7 +1060,8 @@ class ModelManager:
         Offloads the Metal drain to a worker thread so the event loop stays
         responsive while the GPU command queue drains.
         """
-        await asyncio.to_thread(self._flush_metal_sync)
+        async with self._flush_lock:
+            await asyncio.to_thread(self._flush_metal_sync)
 
     def _pop_lru_evictees(self) -> list[LoadedModel]:
         """Pop LRU evictees from ``_loaded`` until below max_loaded_models.
@@ -1696,6 +1698,13 @@ class ModelManager:
         # the concurrent clear is unsafe.
         if not self._pending_cleanups:
             await self._flush_metal()
+        else:
+            logger.debug(
+                "Skipping Metal flush for unload of '%s': deferred cleanup "
+                "still in flight (global Metal clear unsafe). The deferred "
+                "cleanup task will flush when it completes.",
+                normalized,
+            )
         return True
 
     # Config keys that indicate a vision-language model
@@ -2093,6 +2102,14 @@ class ModelManager:
     async def _probe_cache_capabilities(self, lm: LoadedModel) -> None:
         """Probe how the model's prompt cache can be safely reused, recording
         the result on ``lm.supports_cache_trim`` and ``lm.supports_cache_persistence``.
+
+        **Caller contract**: the caller must register ``lm`` in ``_loaded``
+        BEFORE calling this method (so concurrent ``ensure_loaded`` callers
+        see the model). This is safe because every ``lm.*`` flag assignment
+        in this method completes synchronously, before the first ``await``
+        (the ``finally`` block's Metal flush).  Do not insert an ``await``
+        before the ``lm.supports_cache_* = ...`` lines without updating the
+        caller-side registration guard accordingly.
 
         Hybrid sliding-window models (Gemma 4, Qwen3-Next) include
         `RotatingKVCache` layers which become non-trimmable once the
