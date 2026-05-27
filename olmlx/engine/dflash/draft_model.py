@@ -350,15 +350,15 @@ class DFlashDraftModel(nn.Module):
             t == "sliding_attention" and not config.attention_causal
             for t in config.layer_types
         ):
-            logger.warning(
-                "DFlash draft (%d layers) contains sliding_attention "
-                "layers with attention_causal=False.  As of gh#317 the "
+            logger.info(
+                "DFlash draft (%d layers): sliding_attention layers "
+                "with attention_causal=False.  As of gh#317 the "
                 "inference path applies a sliding-causal mask whenever "
                 "ctx_len + L > sliding_window regardless of the causal "
-                "flag.  Correctly-trained post-#317 drafts expect this "
-                "mask and can safely ignore this warning.  Older drafts "
-                "trained without the mask may show degraded acceptance "
-                "rates — re-train if acceptance is unexpectedly low.",
+                "flag.  The mask also enforces causal ordering between "
+                "proposal tokens.  Correctly-trained post-#317 drafts "
+                "expect this mask; older drafts trained without the "
+                "mask may show degraded acceptance rates.",
                 config.num_hidden_layers,
             )
 

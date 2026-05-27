@@ -657,6 +657,11 @@ class TestSlidingAttentionMask:
                 attn_causal(x_b, x_ctx_b, rope, cache_causal),
                 attn_non_causal(x_b, x_ctx_b, rope, cache_non_causal),
             )
+            # RotatingKVCache offset is the monotonic write counter; after
+            # two passes of 2 ctx keys each, offset >= max_size means the
+            # ring buffer is full (= window - 1 keys resident).
+            assert cache_causal.offset >= window - 1
+            assert cache_non_causal.offset >= window - 1
             x_ctx = mx.random.normal((1, 1, hidden_size))
             x_prop = mx.random.normal((1, L, hidden_size))
             out_c = attn_causal(x_prop, x_ctx, rope, cache_causal)
@@ -664,8 +669,8 @@ class TestSlidingAttentionMask:
             mx.eval(out_c, out_nc)
             assert mx.allclose(out_c, out_nc, atol=1e-5)
 
-    def test_warns_on_sliding_non_causal_draft(self, caplog):
-        """DFlashDraftModel emits a warning when any layer is sliding
+    def test_logs_info_on_sliding_non_causal_draft(self, caplog):
+        """DFlashDraftModel logs at INFO when any layer is sliding
         with attention_causal=False, informing operators that
         locally-trained non-causal sliding drafts may regress.
         """
@@ -688,12 +693,12 @@ class TestSlidingAttentionMask:
             sliding_window=4,
             attention_causal=False,
         )
-        with caplog.at_level("WARNING", logger="olmlx.engine.dflash.draft_model"):
+        with caplog.at_level("INFO", logger="olmlx.engine.dflash.draft_model"):
             _ = DFlashDraftModel(cfg)
         assert "sliding_attention" in caplog.text
         assert "attention_causal=False" in caplog.text
 
-    def test_no_warning_when_sliding_causal(self, caplog):
+    def test_no_log_when_sliding_causal(self, caplog):
         cfg = DraftConfig(
             hidden_size=16,
             num_hidden_layers=2,
@@ -713,11 +718,11 @@ class TestSlidingAttentionMask:
             sliding_window=4,
             attention_causal=True,
         )
-        with caplog.at_level("WARNING", logger="olmlx.engine.dflash.draft_model"):
+        with caplog.at_level("INFO", logger="olmlx.engine.dflash.draft_model"):
             _ = DFlashDraftModel(cfg)
         assert "sliding_attention" not in caplog.text
 
-    def test_no_warning_when_full_attention(self, caplog):
+    def test_no_log_when_full_attention(self, caplog):
         cfg = DraftConfig(
             hidden_size=16,
             num_hidden_layers=2,
@@ -736,7 +741,7 @@ class TestSlidingAttentionMask:
             layer_types=("full_attention", "full_attention"),
             attention_causal=False,
         )
-        with caplog.at_level("WARNING", logger="olmlx.engine.dflash.draft_model"):
+        with caplog.at_level("INFO", logger="olmlx.engine.dflash.draft_model"):
             _ = DFlashDraftModel(cfg)
         assert "sliding_attention" not in caplog.text
 
