@@ -722,22 +722,30 @@ class TestEagleDecoderGDNPath:
 
         # Stub ``_GDNStateCapture`` so we don't actually need a real
         # ``GatedDeltaNet`` class on the target. Mirrors only the
-        # methods the decoder calls (``__init__``, ``clear``, ``close``,
-        # ``rollback``).
+        # methods the decoder calls: ``for_model`` (returns the
+        # capture/buffer pair), ``use_buffer``, ``close``, and
+        # ``rollback_single``; the buffer side exposes ``clear``.
         captured_calls = {"init": 0, "clear": 0, "close": 0, "rollback": []}
 
-        class _FakeCapture:
-            def __init__(self, model):
-                captured_calls["init"] += 1
-                self._model = model
-
+        class _FakeBuffer:
             def clear(self):
                 captured_calls["clear"] += 1
+
+        class _FakeCapture:
+            @classmethod
+            def for_model(cls, model):
+                captured_calls["init"] += 1
+                inst = cls()
+                inst._model = model
+                return inst, _FakeBuffer()
+
+            def use_buffer(self, _buf):
+                pass
 
             def close(self):
                 captured_calls["close"] += 1
 
-            def rollback(self, cache, accepted, trim):
+            def rollback_single(self, _buffer, _cache, accepted, trim):
                 captured_calls["rollback"].append((accepted, trim))
 
         monkeypatch.setattr(decoder_mod, "_GDNStateCapture", _FakeCapture)
@@ -755,13 +763,14 @@ class TestEagleDecoderGDNPath:
         decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
         assert captured_calls["init"] == 1
         assert decoder._capture is not None
+        assert decoder._capture_buffer is not None
         assert decoder._target_can_trim is False
 
     def test_step_calls_rollback_on_non_trimmable_cache(self, monkeypatch):
         # Same setup as above; verify that ``step()`` invokes
-        # ``capture.clear()`` before the verify forward and
-        # ``capture.rollback(...)`` instead of ``trim_prompt_cache``
-        # for the target cache.
+        # ``buffer.clear()`` before the verify forward and
+        # ``capture.rollback_single(...)`` instead of
+        # ``trim_prompt_cache`` for the target cache.
         from olmlx.engine.eagle import decoder as decoder_mod
 
         monkeypatch.setattr(decoder_mod, "can_trim_prompt_cache", lambda _: False)
@@ -787,17 +796,22 @@ class TestEagleDecoderGDNPath:
 
         captured_calls = {"clear": 0, "close": 0, "rollback": []}
 
-        class _FakeCapture:
-            def __init__(self, model):
-                pass
-
+        class _FakeBuffer:
             def clear(self):
                 captured_calls["clear"] += 1
+
+        class _FakeCapture:
+            @classmethod
+            def for_model(cls, _model):
+                return cls(), _FakeBuffer()
+
+            def use_buffer(self, _buf):
+                pass
 
             def close(self):
                 captured_calls["close"] += 1
 
-            def rollback(self, cache, accepted, trim):
+            def rollback_single(self, _buffer, _cache, accepted, trim):
                 captured_calls["rollback"].append((accepted, trim))
 
         monkeypatch.setattr(decoder_mod, "_GDNStateCapture", _FakeCapture)
@@ -817,7 +831,7 @@ class TestEagleDecoderGDNPath:
         decoder, _, _ = _make_decoder(block_size=2)
         decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
         accepted, _ = decoder.step()
-        # capture.clear must run before verify
+        # buffer.clear must run before verify
         assert captured_calls["clear"] == 1
         # rollback must run after verify. With the
         # ``verify_draft_greedy`` patch above we deterministically
@@ -836,8 +850,8 @@ class TestEagleDecoderGDNPath:
         # draft trim; settle for "no double-trim of target": the
         # number of target_trim_calls equals the number of draft
         # trims (== 1 if any draft trim happened).
-        # Rather than a brittle equality, just confirm capture.rollback
-        # ran — the path is exercised.
+        # Rather than a brittle equality, just confirm
+        # capture.rollback_single ran — the path is exercised.
         decoder.reset()
         # close should fire on reset
         assert captured_calls["close"] == 1
