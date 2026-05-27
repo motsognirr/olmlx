@@ -2856,6 +2856,8 @@ class ModelManager:
             draft_model=draft_model,
             target_model=spec_target,
             num_speculative_tokens=num_tokens,
+            tree_width=settings.tree_width if settings.tree_speculative else 1,
+            tree_max_nodes=settings.tree_max_nodes,
         )
 
     def _load_pld_decoder(
