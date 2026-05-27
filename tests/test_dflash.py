@@ -29,7 +29,13 @@ from olmlx.engine.gdn_rollback import (
     _order_matches,
     find_gdn_class as _find_gdn_class,
 )
-from olmlx.engine.dflash.draft_model import DFlashDraftModel, DraftConfig
+from mlx_lm.models.rope_utils import initialize_rope
+
+from olmlx.engine.dflash.draft_model import (
+    DFlashAttention,
+    DFlashDraftModel,
+    DraftConfig,
+)
 from olmlx.engine.speculative_stream import speculative_stream_generate
 
 
@@ -410,6 +416,362 @@ class TestDraftConfig:
                 target_layer_ids=[0, 1],  # length 2 != num_target_layers 3
                 mask_token_id=0,
             )
+
+
+# ---------------------------------------------------------------------------
+# Sliding attention mask (regression for gh#317 Gap 6)
+# ---------------------------------------------------------------------------
+
+
+class TestSlidingAttentionMask:
+    """When ``ctx_len + L > sliding_window``, the sliding-causal mask is
+    applied regardless of ``attention_causal`` — matching upstream
+    z-lab/dflash behaviour. When within the window, ``attention_causal``
+    still controls mask presence.
+    """
+
+    @staticmethod
+    def _make_attn(
+        attention_causal: bool,
+        *,
+        hidden_size: int = 16,
+        sliding_window: int = 4,
+        layer_types: tuple = ("sliding_attention",),
+        seed: int = 42,
+    ) -> DFlashAttention:
+        cfg = DraftConfig(
+            hidden_size=hidden_size,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=hidden_size // 2,
+            intermediate_size=hidden_size * 2,
+            vocab_size=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            max_position_embeddings=2048,
+            block_size=4,
+            num_target_layers=1,
+            target_layer_ids=[0],
+            mask_token_id=0,
+            layer_types=layer_types,
+            sliding_window=sliding_window,
+            attention_causal=attention_causal,
+        )
+        mx.random.seed(seed)
+        return DFlashAttention(cfg, layer_idx=0)
+
+    def test_sliding_mask_applied_when_window_exceeded(self):
+        """Causal and non-causal sliding layers produce identical output
+        when ctx_len + L > window because both get the same
+        sliding-causal mask.
+        """
+        window = 4
+        hidden_size = 16
+        attn_causal = self._make_attn(
+            attention_causal=True, hidden_size=hidden_size, sliding_window=window
+        )
+        attn_non_causal = self._make_attn(
+            attention_causal=False, hidden_size=hidden_size, sliding_window=window
+        )
+        # Copy weights so both layers have identical parameters.
+        # Use ``nn.Module.update()``, not dict-value mutation —
+        # ``parameters()`` returns a freshly-built dict whose
+        # values are disconnected from the module.
+        attn_non_causal.update(attn_causal.parameters())
+
+        rope = initialize_rope(
+            hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
+        )
+        # Both get the same cache type (KVCache) to isolate mask differences.
+        cache_causal: KVCache | RotatingKVCache = KVCache()
+        cache_non_causal: KVCache | RotatingKVCache = KVCache()
+
+        x_ctx = mx.random.normal((1, 3, hidden_size))  # S=3
+        x = mx.random.normal((1, 2, hidden_size))  # L=2, S+L=5 > 4
+
+        out_causal = attn_causal(x, x_ctx, rope, cache_causal)
+        out_non_causal = attn_non_causal(x, x_ctx, rope, cache_non_causal)
+        mx.eval(out_causal, out_non_causal)
+
+        assert mx.allclose(out_causal, out_non_causal, atol=1e-5)
+
+    def test_no_sliding_mask_when_within_window(self):
+        """When ctx_len + L <= window, attention_causal still controls
+        the mask — non-causal gets None, causal gets "causal".
+        """
+        window = 4
+        hidden_size = 16
+        attn_causal = self._make_attn(
+            attention_causal=True, hidden_size=hidden_size, sliding_window=window
+        )
+        attn_non_causal = self._make_attn(
+            attention_causal=False, hidden_size=hidden_size, sliding_window=window
+        )
+        attn_non_causal.update(attn_causal.parameters())
+
+        rope = initialize_rope(
+            hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
+        )
+        cache_causal: KVCache | RotatingKVCache = KVCache()
+        cache_non_causal: KVCache | RotatingKVCache = KVCache()
+
+        x_ctx = mx.random.normal((1, 1, hidden_size))  # S=1
+        x = mx.random.normal((1, 2, hidden_size))  # L=2, S+L=3 <= 4
+
+        out_causal = attn_causal(x, x_ctx, rope, cache_causal)
+        out_non_causal = attn_non_causal(x, x_ctx, rope, cache_non_causal)
+        mx.eval(out_causal, out_non_causal)
+
+        # Causal mask restricts attention vs no mask — outputs should differ.
+        assert not mx.allclose(out_causal, out_non_causal, atol=1e-5)
+
+    def test_full_attention_layers_unaffected(self):
+        """Full-attention layers are not touched by the sliding-mask
+        change — the ``self.is_sliding`` guard still short-circuits.
+        Causal and non-causal full-attention layers should produce
+        different outputs (causal mask vs no mask) regardless of
+        sequence length.
+        """
+        hidden_size = 16
+        attn_causal = self._make_attn(
+            attention_causal=True,
+            hidden_size=hidden_size,
+            layer_types=("full_attention",),
+        )
+        attn_non_causal = self._make_attn(
+            attention_causal=False,
+            hidden_size=hidden_size,
+            layer_types=("full_attention",),
+        )
+        attn_non_causal.update(attn_causal.parameters())
+
+        rope = initialize_rope(
+            hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
+        )
+        cache_causal: KVCache | RotatingKVCache = KVCache()
+        cache_non_causal: KVCache | RotatingKVCache = KVCache()
+
+        # Long sequence (would trigger sliding mask if this were sliding).
+        x_ctx = mx.random.normal((1, 6, hidden_size))  # S=6
+        x = mx.random.normal((1, 2, hidden_size))  # L=2
+
+        out_causal = attn_causal(x, x_ctx, rope, cache_causal)
+        out_non_causal = attn_non_causal(x, x_ctx, rope, cache_non_causal)
+        mx.eval(out_causal, out_non_causal)
+
+        # Full-attention: causal gets mask, non-causal does not.
+        assert not mx.allclose(out_causal, out_non_causal, atol=1e-5)
+
+    def test_at_window_boundary_no_sliding_mask(self):
+        """ctx_len + L == sliding_window falls on the <= side — no
+        sliding-causal mask is applied.  This test uses a fresh
+        ``KVCache`` (simulating the initial fill-up phase) where the
+        cache has not yet accumulated ``window`` keys, so
+        ``ctx_len + L`` can land exactly at the window boundary.  In
+        steady-state decoding with a full ``RotatingKVCache`` the
+        boundary is unreachable (``ctx_len`` is always ``window - 1``
+        because ``max_size = window - 1``), so
+        the ``>`` threshold only matters during the initial cache
+        fill-up.  Matching upstream z-lab/dflash, the spatial mask is
+        only applied when the combined sequence strictly *exceeds* the
+        window.
+        """
+        window = 4
+        hidden_size = 16
+        attn_causal = self._make_attn(
+            attention_causal=True, hidden_size=hidden_size, sliding_window=window
+        )
+        attn_non_causal = self._make_attn(
+            attention_causal=False, hidden_size=hidden_size, sliding_window=window
+        )
+        attn_non_causal.update(attn_causal.parameters())
+
+        rope = initialize_rope(
+            hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
+        )
+        cache_causal: KVCache | RotatingKVCache = KVCache()
+        cache_non_causal: KVCache | RotatingKVCache = KVCache()
+
+        # S+L == 4 exactly (window), not >.
+        x_ctx = mx.random.normal((1, 2, hidden_size))  # S=2
+        x = mx.random.normal((1, 2, hidden_size))  # L=2, S+L=4 == window
+
+        out_causal = attn_causal(x, x_ctx, rope, cache_causal)
+        out_non_causal = attn_non_causal(x, x_ctx, rope, cache_non_causal)
+        mx.eval(out_causal, out_non_causal)
+
+        # No sliding mask applied — causal gets "causal", non-causal gets None.
+        assert not mx.allclose(out_causal, out_non_causal, atol=1e-5)
+
+    @staticmethod
+    def _new_rotating_caches(window: int):
+        return (
+            RotatingKVCache(max_size=max(window - 1, 1), keep=0),
+            RotatingKVCache(max_size=max(window - 1, 1), keep=0),
+        )
+
+    def test_sliding_mask_with_rotating_cache_steady_state(self):
+        """Production path: with a pre-filled ``RotatingKVCache`` (the
+        cache type ``make_cache()`` creates for sliding layers), verify
+        the sliding-causal mask produces identical outputs for causal
+        and non-causal sliding layers when ``ctx_len + L > window``.
+
+        With ``RotatingKVCache(max_size=window-1)`` the cache holds at
+        most ``window-1`` keys, so ``ctx_len + L > window`` for any
+        ``L >= 2``.  DFlash always processes ``block_size >= 2`` tokens
+        per step, so the mask is effectively unconditional in steady
+        state.  The ``L=1`` edge case where ``ctx_len + L == window``
+        is an academic corner that never occurs in real DFlash
+        inference.
+        """
+        window = 4
+        hidden_size = 16
+        attn_causal = self._make_attn(
+            attention_causal=True, hidden_size=hidden_size, sliding_window=window
+        )
+        attn_non_causal = self._make_attn(
+            attention_causal=False, hidden_size=hidden_size, sliding_window=window
+        )
+        attn_non_causal.update(attn_causal.parameters())
+
+        rope = initialize_rope(
+            hidden_size // 2, 10000.0, traditional=False, max_position_embeddings=2048
+        )
+
+        for L in (2, 4):
+            cc, cnc = self._new_rotating_caches(window)
+            cache_causal: KVCache | RotatingKVCache = cc
+            cache_non_causal: KVCache | RotatingKVCache = cnc
+            # Fill to steady state with shared tensors so both caches
+            # have identical history.
+            x_ctx_a = mx.random.normal((1, 2, hidden_size))
+            x_a = mx.random.normal((1, 1, hidden_size))
+            mx.eval(
+                attn_causal(x_a, x_ctx_a, rope, cache_causal),
+                attn_non_causal(x_a, x_ctx_a, rope, cache_non_causal),
+            )
+            x_ctx_b = mx.random.normal((1, 2, hidden_size))
+            x_b = mx.random.normal((1, 1, hidden_size))
+            mx.eval(
+                attn_causal(x_b, x_ctx_b, rope, cache_causal),
+                attn_non_causal(x_b, x_ctx_b, rope, cache_non_causal),
+            )
+            # RotatingKVCache offset is the monotonic write counter; after
+            # two passes of 2 ctx keys each, offset >= max_size means the
+            # ring buffer is full (= window - 1 keys resident).
+            assert cache_causal.offset >= window - 1
+            assert cache_non_causal.offset >= window - 1
+            x_ctx = mx.random.normal((1, 1, hidden_size))
+            x_prop = mx.random.normal((1, L, hidden_size))
+            out_c = attn_causal(x_prop, x_ctx, rope, cache_causal)
+            out_nc = attn_non_causal(x_prop, x_ctx, rope, cache_non_causal)
+            mx.eval(out_c, out_nc)
+            assert mx.allclose(out_c, out_nc, atol=1e-5)
+
+    def test_warns_on_sliding_non_causal_draft(self, caplog):
+        """DFlashDraftModel warns when any layer is sliding with
+        attention_causal=False, informing operators that
+        locally-trained non-causal sliding drafts may regress.
+        """
+        cfg = DraftConfig(
+            hidden_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            intermediate_size=32,
+            vocab_size=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            max_position_embeddings=2048,
+            block_size=4,
+            num_target_layers=1,
+            target_layer_ids=[0],
+            mask_token_id=0,
+            layer_types=("sliding_attention", "sliding_attention"),
+            sliding_window=4,
+            attention_causal=False,
+        )
+        with caplog.at_level("WARNING", logger="olmlx.engine.dflash.draft_model"):
+            _ = DFlashDraftModel(cfg)
+        assert "sliding_attention" in caplog.text
+        assert "attention_causal=False" in caplog.text
+
+    def test_no_warning_when_sliding_causal(self, caplog):
+        cfg = DraftConfig(
+            hidden_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            intermediate_size=32,
+            vocab_size=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            max_position_embeddings=2048,
+            block_size=4,
+            num_target_layers=1,
+            target_layer_ids=[0],
+            mask_token_id=0,
+            layer_types=("sliding_attention", "sliding_attention"),
+            sliding_window=4,
+            attention_causal=True,
+        )
+        with caplog.at_level("WARNING", logger="olmlx.engine.dflash.draft_model"):
+            _ = DFlashDraftModel(cfg)
+        assert "sliding_attention" not in caplog.text
+
+    def test_sliding_without_window_raises_valueerror(self):
+        """DFlashAttention.__init__ raises ValueError when is_sliding=True
+        but sliding_window is None.  DraftConfig has its own validation,
+        so the only way to reach this guard is by mutating the config
+        after construction — but the guard provides defense-in-depth for
+        direct construction paths."""
+        cfg = DraftConfig(
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            intermediate_size=32,
+            vocab_size=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            max_position_embeddings=2048,
+            block_size=4,
+            num_target_layers=1,
+            target_layer_ids=[0],
+            mask_token_id=0,
+            layer_types=("sliding_attention",),
+            sliding_window=4,
+        )
+        cfg.sliding_window = None
+        with pytest.raises(ValueError, match="sliding-attention layer"):
+            DFlashAttention(cfg, layer_idx=0)
+
+    def test_no_warning_when_full_attention(self, caplog):
+        cfg = DraftConfig(
+            hidden_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            intermediate_size=32,
+            vocab_size=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            max_position_embeddings=2048,
+            block_size=4,
+            num_target_layers=1,
+            target_layer_ids=[0],
+            mask_token_id=0,
+            layer_types=("full_attention", "full_attention"),
+            attention_causal=False,
+        )
+        with caplog.at_level("WARNING", logger="olmlx.engine.dflash.draft_model"):
+            _ = DFlashDraftModel(cfg)
+        assert "sliding_attention" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

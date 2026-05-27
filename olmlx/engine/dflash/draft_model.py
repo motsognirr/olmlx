@@ -19,6 +19,7 @@ not duplicated in memory.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +28,8 @@ import mlx.nn as nn
 from mlx_lm.models.base import create_causal_mask
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.rope_utils import initialize_rope
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -124,10 +127,37 @@ class DFlashAttention(nn.Module):
     context-K (offset by the prior cache offset).
 
     When ``config.attention_causal`` is ``False`` (bidirectional), the
-    mask is ``None`` for both full- and sliding-attention layers.
-    Bidirectional sliding layers rely on ``RotatingKVCache`` eviction
-    (enforced by ``make_cache()`` via ``layer_types``) to limit the
-    effective receptive field — no explicit spatial mask is needed.
+    mask is ``None`` for full-attention layers only. Sliding-attention
+    layers always apply a sliding-causal mask (via
+    ``create_causal_mask``) when the combined context + proposal length
+    exceeds the sliding window — matching upstream z-lab/dflash
+    behaviour regardless of the ``causal`` flag. For sequences shorter
+    than the window the mask remains ``None`` so in-window attention is
+    fully bidirectional. The ``RotatingKVCache`` eviction (enforced by
+    ``make_cache()`` via ``layer_types``) works alongside the explicit
+    spatial mask — the mask bounds the attention dot-product to the
+    window while the cache discards keys outside it.
+
+    .. note::
+
+       ``create_causal_mask`` enforces *both* the spatial window and
+       causal ordering within the proposal stream.  When the window is
+       exceeded, proposal token ``i`` cannot attend to proposal token
+       ``j > i`` even when ``attention_causal`` is ``False``.  This
+       matches upstream z-lab/dflash and avoids a train/inference
+       mismatch, but a custom draft architecture that was trained with
+       full bidirectionality for proposal tokens would silently degrade
+       under this mask.
+
+    .. note::
+
+       With a full ``RotatingKVCache`` (``max_size = window - 1``,
+       the ``make_cache()`` convention for sliding layers),
+       ``ctx_len`` is ``window - 1``, so ``ctx_len + L > window``
+       holds for ``L >= 2`` — the mask kicks in at two or more
+       proposal tokens.  In practice DFlash always processes
+       ``block_size >= 2`` tokens per step, so the mask is
+       effectively unconditional in steady state.
     """
 
     def __init__(self, config: DraftConfig, layer_idx: int):
@@ -139,6 +169,15 @@ class DFlashAttention(nn.Module):
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
         self.causal = config.attention_causal
+
+        if self.is_sliding and self.sliding_window is None:
+            raise ValueError(
+                "DFlashAttention layer has is_sliding=True but no "
+                "sliding_window set — a sliding-attention layer "
+                "requires a window size.  This occurs when "
+                "DFlashAttention is constructed directly without "
+                "DraftConfig validation."
+            )
 
         self.q_proj = nn.Linear(
             config.hidden_size, self.n_heads * self.head_dim, bias=False
@@ -215,7 +254,17 @@ class DFlashAttention(nn.Module):
 
         ctx_len = keys.shape[2] - L
         mask = "causal" if self.causal else None
-        if self.is_sliding and self.causal and ctx_len + L > (self.sliding_window or 0):
+        # The ``or 0`` fallback is dead code after the __init__ guard
+        # (raising ValueError when is_sliding=True without a window),
+        # but kept as belt-and-suspenders in case the guard is ever
+        # bypassed (e.g. direct construction in tests).
+        if self.is_sliding and ctx_len + L > (self.sliding_window or 0):
+            # Upstream z-lab/dflash always applies a sliding-causal mask on
+            # sliding layers regardless of causal mode (see
+            # dflash/model_mlx.py:110-114). The spatial window constrains
+            # which positions a token can interact with independently of the
+            # causal directionality; matching this avoids a train/inference
+            # mismatch for sliding-attention draft architectures.
             mask = create_causal_mask(
                 L, offset=ctx_len, window_size=self.sliding_window
             )
@@ -288,6 +337,30 @@ class DFlashDraftModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = _build_rope(config)
+
+        # The warning fires for every non-causal sliding draft —
+        # including correctly-trained ones that were prepared with the
+        # patched pipeline.  The checkpoint format does not record which
+        # code version trained it, so we cannot distinguish legacy
+        # (mask-free) training from post-#317 (mask-applied) training.
+        # Newly-trained drafts correctly expect the mask at inference
+        # time and can safely ignore this warning; the heuristic "if
+        # acceptance is unexpectedly low, re-train" still holds.
+        if any(
+            t == "sliding_attention" and not config.attention_causal
+            for t in config.layer_types
+        ):
+            logger.warning(
+                "DFlash draft (%d layers): sliding_attention layers "
+                "with attention_causal=False.  As of gh#317 the "
+                "inference path applies a sliding-causal mask whenever "
+                "ctx_len + L > sliding_window regardless of the causal "
+                "flag.  The mask also enforces causal ordering between "
+                "proposal tokens.  Correctly-trained post-#317 drafts "
+                "expect this mask; older drafts trained without the "
+                "mask may show degraded acceptance rates.",
+                config.num_hidden_layers,
+            )
 
         # Populated by ``bind()``. We use ``object.__setattr__`` there to
         # bypass mlx's ``Module.__setattr__`` — assigning an
