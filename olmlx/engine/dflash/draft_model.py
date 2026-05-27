@@ -350,7 +350,7 @@ class DFlashDraftModel(nn.Module):
             t == "sliding_attention" and not config.attention_causal
             for t in config.layer_types
         ):
-            logger.info(
+            logger.warning(
                 "DFlash draft (%d layers): sliding_attention layers "
                 "with attention_causal=False.  As of gh#317 the "
                 "inference path applies a sliding-causal mask whenever "

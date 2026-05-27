@@ -669,9 +669,9 @@ class TestSlidingAttentionMask:
             mx.eval(out_c, out_nc)
             assert mx.allclose(out_c, out_nc, atol=1e-5)
 
-    def test_logs_info_on_sliding_non_causal_draft(self, caplog):
-        """DFlashDraftModel logs at INFO when any layer is sliding
-        with attention_causal=False, informing operators that
+    def test_warns_on_sliding_non_causal_draft(self, caplog):
+        """DFlashDraftModel warns when any layer is sliding with
+        attention_causal=False, informing operators that
         locally-trained non-causal sliding drafts may regress.
         """
         cfg = DraftConfig(
@@ -693,12 +693,12 @@ class TestSlidingAttentionMask:
             sliding_window=4,
             attention_causal=False,
         )
-        with caplog.at_level("INFO", logger="olmlx.engine.dflash.draft_model"):
+        with caplog.at_level("WARNING", logger="olmlx.engine.dflash.draft_model"):
             _ = DFlashDraftModel(cfg)
         assert "sliding_attention" in caplog.text
         assert "attention_causal=False" in caplog.text
 
-    def test_no_log_when_sliding_causal(self, caplog):
+    def test_no_warning_when_sliding_causal(self, caplog):
         cfg = DraftConfig(
             hidden_size=16,
             num_hidden_layers=2,
@@ -718,11 +718,39 @@ class TestSlidingAttentionMask:
             sliding_window=4,
             attention_causal=True,
         )
-        with caplog.at_level("INFO", logger="olmlx.engine.dflash.draft_model"):
+        with caplog.at_level("WARNING", logger="olmlx.engine.dflash.draft_model"):
             _ = DFlashDraftModel(cfg)
         assert "sliding_attention" not in caplog.text
 
-    def test_no_log_when_full_attention(self, caplog):
+    def test_sliding_without_window_raises_valueerror(self):
+        """DFlashAttention.__init__ raises ValueError when is_sliding=True
+        but sliding_window is None.  DraftConfig has its own validation,
+        so the only way to reach this guard is by mutating the config
+        after construction — but the guard provides defense-in-depth for
+        direct construction paths."""
+        cfg = DraftConfig(
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            intermediate_size=32,
+            vocab_size=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            max_position_embeddings=2048,
+            block_size=4,
+            num_target_layers=1,
+            target_layer_ids=[0],
+            mask_token_id=0,
+            layer_types=("sliding_attention",),
+            sliding_window=4,
+        )
+        cfg.sliding_window = None
+        with pytest.raises(ValueError, match="sliding-attention layer"):
+            DFlashAttention(cfg, layer_idx=0)
+
+    def test_no_warning_when_full_attention(self, caplog):
         cfg = DraftConfig(
             hidden_size=16,
             num_hidden_layers=2,
@@ -741,7 +769,7 @@ class TestSlidingAttentionMask:
             layer_types=("full_attention", "full_attention"),
             attention_causal=False,
         )
-        with caplog.at_level("INFO", logger="olmlx.engine.dflash.draft_model"):
+        with caplog.at_level("WARNING", logger="olmlx.engine.dflash.draft_model"):
             _ = DFlashDraftModel(cfg)
         assert "sliding_attention" not in caplog.text
 
