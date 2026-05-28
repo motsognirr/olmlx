@@ -578,10 +578,14 @@ def _select_pivots(
     caller proceeds with the windows it received (no skip).
 
     Slot-and-jitter: divide the valid pivot range into ``num_windows``
-    equal slots and sample one pivot uniformly per slot. The non-overlap
-    invariant holds when each slot is at least ``block_size + 1`` wide;
-    if some slots would be narrower we cap ``num_windows`` to the max
-    that fits.
+    equal-width slots and sample one pivot per slot from the slot's left
+    portion ``[slot_lo, slot_hi - block_size]``, leaving a ``block_size``
+    buffer at the right of each slot. That buffer is what guarantees
+    non-overlap between adjacent windows: each pivot's
+    ``[p, p+block_size]`` span fits inside its slot, so adjacent pivots
+    are at least ``block_size + 1`` apart. Slots narrower than
+    ``block_size + 1`` would make the sampling range empty, so we cap
+    ``num_windows`` to ``max_fit = range_size // (block_size + 1)``.
 
     ``num_windows == 1`` delegates to ``_select_pivot`` so the K=1 path
     is bit-exact with the legacy single-window code under a fixed RNG
@@ -641,9 +645,17 @@ def _select_pivots(
         slot_lo = lo + int(i * slot_width)
         slot_hi_exclusive = lo + int((i + 1) * slot_width)
         slot_hi = slot_hi_exclusive - 1  # inclusive
-        # ``max_fit`` already guarantees slot_width >= block_size + 1,
-        # so slot_hi >= slot_lo always — no degenerate empty-slot case.
-        pivots.append(random.randint(slot_lo, slot_hi))
+        # Sample from ``[slot_lo, slot_hi - block_size]`` so the
+        # pivot's ``[p, p+block_size]`` span fits inside its slot.
+        # That guarantees adjacent pivots are at least
+        # ``block_size + 1`` apart: ``p_i + block_size <= slot_hi_i <
+        # slot_lo_{i+1} <= p_{i+1}``. ``max_fit`` guarantees
+        # ``slot_width >= block_size + 1``, so ``slot_hi - block_size
+        # >= slot_lo`` and the sampling range is non-empty (collapses
+        # to a single point at the lower bound when the slot is
+        # exactly the minimum width).
+        sample_hi = slot_hi - block_size
+        pivots.append(random.randint(slot_lo, sample_hi))
     return pivots
 
 

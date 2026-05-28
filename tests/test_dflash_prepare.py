@@ -1156,7 +1156,13 @@ class TestSelectPivots:
     def test_k4_returns_four_non_overlapping_pivots(self):
         """A long-enough sequence yields exactly K pivots, all within
         the valid range, with adjacent pivots at least block_size+1
-        apart so their [p, p+block_size] spans cannot overlap."""
+        apart so their [p, p+block_size] spans cannot overlap.
+
+        Tested across many seeds — the non-overlap invariant is a hard
+        guarantee, not a probabilistic one. A single seed would let a
+        broken implementation pass by luck (and previously did — see
+        gh#382 review).
+        """
         import random
         from olmlx.engine.dflash.prepare import _select_pivots
 
@@ -1165,28 +1171,30 @@ class TestSelectPivots:
         # min_real = 200 → range_size = 192 → max non-overlap = 192//5 = 38
         ids = mx.full((2, 200), 7, dtype=mx.int32)
 
-        random.seed(0)
-        pivots = _select_pivots(
-            ids, pad_token_id=pad, block_size=block_size, num_windows=4
-        )
-
-        assert pivots is not None
-        assert len(pivots) == 4
-        # All pivots inside the valid range
-        for p in pivots:
-            assert block_size <= p <= 200 - block_size - 1
-        # Sorted + non-overlapping
-        assert pivots == sorted(pivots)
-        for i in range(len(pivots) - 1):
-            assert pivots[i + 1] - pivots[i] >= block_size + 1, (
-                f"pivots {pivots[i]} and {pivots[i + 1]} are within "
-                f"block_size+1={block_size + 1} of each other"
+        for seed in range(200):
+            random.seed(seed)
+            pivots = _select_pivots(
+                ids, pad_token_id=pad, block_size=block_size, num_windows=4
             )
+            assert pivots is not None, f"seed={seed}: got None"
+            assert len(pivots) == 4, f"seed={seed}: got {pivots}"
+            for p in pivots:
+                assert block_size <= p <= 200 - block_size - 1, (
+                    f"seed={seed}: pivot {p} outside valid range"
+                )
+            assert pivots == sorted(pivots), f"seed={seed}: not sorted {pivots}"
+            for i in range(len(pivots) - 1):
+                assert pivots[i + 1] - pivots[i] >= block_size + 1, (
+                    f"seed={seed}: pivots {pivots[i]} and {pivots[i + 1]} are "
+                    f"within block_size+1={block_size + 1} of each other"
+                )
 
     def test_k_caps_to_max_non_overlapping_fit(self):
         """If the operator requests more windows than the valid range
         can accommodate non-overlapping, return the maximum that
-        actually fits — K is a target, not a guarantee."""
+        actually fits — K is a target, not a guarantee. Non-overlap
+        must hold across all seeds."""
+        import random
         from olmlx.engine.dflash.prepare import _select_pivots
 
         pad = 0
@@ -1201,14 +1209,17 @@ class TestSelectPivots:
         )
         ids = mx.broadcast_to(ids, (2, 32))
 
-        pivots = _select_pivots(
-            ids, pad_token_id=pad, block_size=block_size, num_windows=8
-        )
-        assert pivots is not None
-        assert 1 <= len(pivots) <= 2
-        # If multiple, must be non-overlapping
-        for i in range(len(pivots) - 1):
-            assert pivots[i + 1] - pivots[i] >= block_size + 1
+        for seed in range(200):
+            random.seed(seed)
+            pivots = _select_pivots(
+                ids, pad_token_id=pad, block_size=block_size, num_windows=8
+            )
+            assert pivots is not None, f"seed={seed}: got None"
+            assert 1 <= len(pivots) <= 2, f"seed={seed}: got {pivots}"
+            for i in range(len(pivots) - 1):
+                assert pivots[i + 1] - pivots[i] >= block_size + 1, (
+                    f"seed={seed}: gap too small in {pivots}"
+                )
 
     def test_pivots_stay_in_unpadded_prefix(self):
         """With trailing padding, every selected pivot must satisfy
