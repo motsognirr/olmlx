@@ -3733,6 +3733,17 @@ async def generate_transcription(
 
     lm = await manager.ensure_loaded(model_name, keep_alive)
 
+    # Reject non-whisper models with a clear error (issue #366). Without this,
+    # a text/VLM model name would load fine, get injected into mlx_whisper's
+    # ModelHolder, and produce a cryptic failure inside transcribe(). Raising
+    # ValueError surfaces as HTTP 400 via the app-level handler.
+    if not lm.is_whisper:
+        raise ValueError(
+            f"Model '{model_name}' is not a Whisper model. "
+            "/v1/audio/transcriptions requires a whisper-class model "
+            "(e.g. whisper-turbo or an mlx-community/whisper-* repo)."
+        )
+
     # Resolve the on-disk path used as path_or_hf_repo so the ModelHolder
     # cache key matches what we inject.
     if manager.store is not None:

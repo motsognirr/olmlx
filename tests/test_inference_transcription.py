@@ -58,3 +58,17 @@ async def test_generate_transcription_ffmpeg_missing(mock_manager):
     ):
         with pytest.raises(ValueError, match="ffmpeg"):
             await generate_transcription(mock_manager, "whisper-turbo", "/tmp/clip.wav")
+
+
+@pytest.mark.asyncio
+async def test_generate_transcription_rejects_non_whisper_model(mock_manager):
+    lm = mock_manager._loaded["qwen3:latest"]
+    lm.is_whisper = False  # a text LLM, not a whisper model
+    mock_manager.ensure_loaded = AsyncMock(return_value=lm)
+
+    with patch("mlx_whisper.transcribe.transcribe") as mock_tx:
+        with pytest.raises(ValueError, match="not a Whisper model"):
+            await generate_transcription(mock_manager, "qwen3", "/tmp/clip.wav")
+
+    # Must reject before touching mlx_whisper at all.
+    mock_tx.assert_not_called()

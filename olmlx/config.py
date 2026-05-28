@@ -101,11 +101,13 @@ class Settings(BaseSettings):
     prompt_cache_disk: bool = False
     prompt_cache_disk_path: Path = Path.home() / ".olmlx" / "cache" / "kv"
     prompt_cache_disk_max_gb: Annotated[float, Field(gt=0)] = 10.0
-    audio_max_bytes: int = Field(
-        100 * 1024 * 1024,
-        gt=0,
-        description="Max upload size for /v1/audio/transcriptions (OLMLX_AUDIO_MAX_BYTES).",
-    )
+    audio_max_bytes: Annotated[
+        int,
+        Field(
+            gt=0,
+            description="Max upload size for /v1/audio/transcriptions (OLMLX_AUDIO_MAX_BYTES).",
+        ),
+    ] = 100 * 1024 * 1024
     inference_queue_timeout: Annotated[float, Field(gt=0)] | None = 300.0
     inference_timeout: Annotated[float, Field(gt=0)] | None = None
     sync_mode: SyncMode = "full"
