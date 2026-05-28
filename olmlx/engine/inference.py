@@ -3701,3 +3701,71 @@ async def generate_embeddings(
                     exc_info=True,
                 )
             return embeddings
+
+
+async def generate_transcription(
+    manager: ModelManager,
+    model_name: str,
+    audio_path: str,
+    *,
+    language: str | None = None,
+    prompt: str | None = None,
+    temperature: float = 0.0,
+    word_timestamps: bool = False,
+    keep_alive: str | None = None,
+) -> dict:
+    """Transcribe an audio file with a whisper model managed by ModelManager.
+
+    Loads (or reuses) the whisper model via ``ensure_loaded``, injects it into
+    mlx_whisper's module-level ``ModelHolder`` so ``transcribe()`` reuses the
+    managed model instead of loading its own, and runs the (synchronous)
+    transcription in a worker thread. Returns the raw mlx-whisper result dict
+    (``text``, ``segments``, ``language``). Issue #366.
+    """
+    import importlib
+
+    # NOTE: ``import mlx_whisper.transcribe as ...`` binds to the *function*
+    # ``transcribe``, not the submodule — mlx_whisper's __init__ does
+    # ``from .transcribe import transcribe`` which shadows the submodule name on
+    # the package. Fetch the genuine submodule object (the one unittest.mock's
+    # patch() targets) via importlib so ModelHolder injection lands correctly.
+    whisper_transcribe = importlib.import_module("mlx_whisper.transcribe")
+
+    lm = await manager.ensure_loaded(model_name, keep_alive)
+
+    # Resolve the on-disk path used as path_or_hf_repo so the ModelHolder
+    # cache key matches what we inject.
+    if manager.store is not None:
+        load_path = str(manager.store.local_path(lm.hf_path))
+    else:
+        load_path = lm.hf_path
+
+    async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
+        with _inference_ref(lm):
+            # Inject the managed model so transcribe() reuses it. Safe because
+            # _inference_locked serializes inference (no ModelHolder race).
+            whisper_transcribe.ModelHolder.model = lm.model
+            whisper_transcribe.ModelHolder.model_path = load_path
+
+            def _run() -> dict:
+                try:
+                    return whisper_transcribe.transcribe(
+                        audio_path,
+                        path_or_hf_repo=load_path,
+                        language=language,
+                        initial_prompt=prompt,
+                        temperature=temperature,
+                        word_timestamps=word_timestamps,
+                    )
+                except FileNotFoundError as exc:
+                    raise ValueError(
+                        "Audio decoding failed: ffmpeg was not found on PATH. "
+                        "Install ffmpeg (e.g. `brew install ffmpeg`) to use "
+                        "/v1/audio/transcriptions."
+                    ) from exc
+                except RuntimeError as exc:
+                    # mlx_whisper.audio.load_audio raises RuntimeError on a
+                    # failed ffmpeg decode (bad/corrupt/unsupported file).
+                    raise ValueError(f"Audio decoding failed: {exc}") from exc
+
+            return await asyncio.to_thread(_run)
