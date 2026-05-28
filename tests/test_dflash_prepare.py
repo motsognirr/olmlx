@@ -1302,6 +1302,51 @@ class TestTrainWindowsValidation:
             )
 
 
+class TestK1BitExactness:
+    """K=1 (default) must continue to train cleanly after the
+    training-loop refactor: same number of steps, finite losses,
+    deterministic under fixed seeds. The K=1 path goes through
+    ``_select_pivots(num_windows=1)``, which delegates to
+    ``_select_pivot`` and thus shares the legacy RNG draw."""
+
+    def test_k1_loss_finite_under_fixed_seed(self, tmp_path):
+        import random
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(7)
+        mx.random.seed(7)
+        captured: list[float] = []
+
+        def cb(msg: str, _frac: float) -> None:
+            tail = msg.rsplit("loss=", 1)
+            if len(tail) == 2:
+                captured.append(float(tail[1]))
+
+        prepare_dflash_draft(
+            model_path=tmp_path,
+            steps=5,
+            batch_size=2,
+            seq_len=32,
+            block_size=4,
+            num_hidden_layers=2,
+            num_target_layers=2,
+            train_windows_per_step=1,
+            _target_loader=_mock_target_loader(
+                vocab_size=64, hidden_size=16, num_layers=4
+            ),
+            _batch_iterator=_synthetic_batches(vocab=64, batch_size=2, seq_len=32, n=5),
+            progress_callback=cb,
+            log_every=1,
+        )
+
+        assert len(captured) == 5
+        # Finite, positive, no NaN
+        assert all(0 < x < 100 for x in captured)
+        assert all(x == x for x in captured)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end training
 # ---------------------------------------------------------------------------

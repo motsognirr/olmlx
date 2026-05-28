@@ -909,48 +909,39 @@ def prepare_dflash_draft(
     optimizer = optim.AdamW(learning_rate=lr)
     warmup = max(int(steps * DEFAULT_WARMUP_FRAC), 1)
 
-    # Closure that ``nn.value_and_grad`` differentiates wrt ``draft``
-    # parameters only. ``cache`` and the (detached) target tensors are
-    # passed positionally so the optimizer doesn't see them as
-    # parameters.
-    def loss_fn(
+    # Multi-window loss closure. ``windows`` is a list of
+    # (block_input, target_hidden, targets, target_logits_window)
+    # tuples — one per pivot. Each window gets a fresh draft cache;
+    # the closure sums per-window losses and divides by K. At K=1 the
+    # list has one element and ``sum_of_one / 1`` reduces to the
+    # legacy per-window loss exactly.
+    def loss_fn_multi(
         model: DFlashDraftModel,
-        block_input: mx.array,
-        target_hidden: mx.array,
-        targets: mx.array,
-        cache: list[Any],
-        target_logits_window: mx.array | None,
+        windows: list[tuple[mx.array, mx.array, mx.array, mx.array | None]],
     ) -> mx.array:
-        return _draft_loss(
-            model,
-            block_input,
-            target_hidden,
-            targets,
-            cache,
-            target_logits_window=target_logits_window,
-            distill_alpha=distill_alpha if distill else 0.0,
-            distill_temp=distill_temp,
-            pad_token_id=pad_for_loss,
-            position_decay_gamma=position_decay_gamma,
-        )
+        total = mx.array(0.0)
+        for block_input, target_hidden, targets, target_logits_window in windows:
+            cache = model.make_cache()
+            total = total + _draft_loss(
+                model,
+                block_input,
+                target_hidden,
+                targets,
+                cache,
+                target_logits_window=target_logits_window,
+                distill_alpha=distill_alpha if distill else 0.0,
+                distill_temp=distill_temp,
+                pad_token_id=pad_for_loss,
+                position_decay_gamma=position_decay_gamma,
+            )
+        return total / len(windows)
 
-    loss_and_grad = nn.value_and_grad(draft, loss_fn)
+    loss_and_grad_multi = nn.value_and_grad(draft, loss_fn_multi)
 
     def _step(
-        block_input: mx.array,
-        target_hidden: mx.array,
-        targets: mx.array,
-        cache: list[Any],
-        target_logits_window: mx.array | None,
+        windows: list[tuple[mx.array, mx.array, mx.array, mx.array | None]],
     ) -> mx.array:
-        loss, grads = loss_and_grad(
-            draft,
-            block_input,
-            target_hidden,
-            targets,
-            cache,
-            target_logits_window,
-        )
+        loss, grads = loss_and_grad_multi(draft, windows)
         optimizer.update(draft, grads)
         return loss
 
@@ -1119,26 +1110,19 @@ def prepare_dflash_draft(
                 input_ids = batch
                 precomputed_hidden = None
 
-            # Pick a random pivot p. Two regimes:
+            # Pick up to ``train_windows_per_step`` non-overlapping
+            # pivots. Two regimes mirror the legacy single-pivot path:
             #
-            # - When we know the loader's pad token (the common path,
-            #   ``pad_for_pivot is not None``), restrict the pivot to
-            #   the unpadded prefix shared by every batch row. Otherwise
-            #   the pivot can land where ``pending`` and ``targets`` are
-            #   all pad tokens — and with ``mask_token_id ==
-            #   pad_token_id`` the bound lm_head trivially predicts
-            #   pad-after-pad, producing exact-zero CE that
-            #   contaminates the running average without contributing
-            #   gradient. ``_select_pivot`` syncs once per batch
-            #   (``min().item()``) but spares us the per-step waste
-            #   those degenerate windows would impose on a real-data
-            #   run.
-            #
-            # - When ``pad_for_pivot is None`` (test fixtures with
-            #   no-padding tokenizers, custom batch iterators), keep
-            #   the legacy uniform sampler so the unit tests that wire
-            #   in synthetic batches don't suddenly start skipping
-            #   windows.
+            # - When the loader's pad token is known
+            #   (``pad_for_pivot is not None``), restrict every pivot
+            #   to the shared unpadded prefix via ``_select_pivots``.
+            #   At K=1 this delegates to ``_select_pivot`` so the RNG
+            #   draw and the monkey-patch hook surface stay
+            #   bit-exactly equivalent to the legacy path.
+            # - When ``pad_for_pivot is None`` (test fixtures with no
+            #   padding), use an inline slot-and-jitter sampler so the
+            #   no-padding test path does not start syncing through
+            #   the MLX-side trailing-pad detection.
             seq = input_ids.shape[1]
             if pad_for_pivot is None:
                 lo = block_size
@@ -1148,16 +1132,38 @@ def prepare_dflash_draft(
                         f"seq_len={seq} too small for block_size={block_size}; "
                         f"need at least 2*block_size + 1 tokens per sequence"
                     )
-                p = random.randint(lo, hi_inclusive)
+                range_size = hi_inclusive - lo + 1
+                max_fit = max(1, range_size // (block_size + 1))
+                k = min(train_windows_per_step, max_fit)
+                if k == 1:
+                    # K=1 (default) uses the same random.randint call
+                    # the legacy single-window path used — same range,
+                    # same RNG draw under a fixed seed.
+                    pivots = [random.randint(lo, hi_inclusive)]
+                else:
+                    # Slot-and-jitter with a block_size buffer at the
+                    # right of each slot so adjacent pivots are at
+                    # least block_size + 1 apart (see _select_pivots
+                    # docstring for the proof). The max_fit cap above
+                    # ensures slot_width >= block_size + 1, so the
+                    # sampling range [slot_lo, slot_hi - block_size]
+                    # is non-empty.
+                    slot_width = range_size / k
+                    pivots = []
+                    for i in range(k):
+                        slot_lo = lo + int(i * slot_width)
+                        slot_hi = lo + int((i + 1) * slot_width) - 1
+                        pivots.append(random.randint(slot_lo, slot_hi - block_size))
             else:
-                pivot = _select_pivot(input_ids, pad_for_pivot, block_size)
-                if pivot is None:
-                    # Every row in this batch was padded shorter than
-                    # ``2*block_size + 1`` real tokens; no valid window
-                    # exists. Skip rather than train on a degenerate
-                    # all-pad target — the next batch will most likely
-                    # be longer. Skipping happens BEFORE the target
-                    # forward, so this costs almost nothing.
+                pivot_list = _select_pivots(
+                    input_ids,
+                    pad_for_pivot,
+                    block_size,
+                    train_windows_per_step,
+                )
+                if pivot_list is None:
+                    # Every row was shorter than 2*block_size + 1 real
+                    # tokens; no window fits. Skip the batch.
                     logger.debug(
                         "skipping all-padding batch before real step %d "
                         "(no row has %d+ real tokens)",
@@ -1166,14 +1172,22 @@ def prepare_dflash_draft(
                     )
                     consecutive_skips += 1
                     continue
-                p = pivot
-            # Reset the skip counter as soon as we know this batch is
-            # going to do real work, so the infinite-loop guard only
-            # measures *consecutive* skips.
+                pivots = pivot_list
+                if len(pivots) < train_windows_per_step:
+                    # Shared unpadded prefix was too short for the
+                    # full K. Train on what we got — this is NOT a
+                    # skip; a real gradient update still happens.
+                    logger.debug(
+                        "step %d: shared prefix too short for %d windows; using %d",
+                        real_step + 1,
+                        train_windows_per_step,
+                        len(pivots),
+                    )
             consecutive_skips = 0
 
-            # Pivot accepted: now run the target forward (online) or
-            # consume the precomputed hidden state.
+            # Pivots accepted: run the target forward (online) or
+            # consume the precomputed hidden state. One target forward
+            # per batch — its output is shared by all K windows below.
             target_logits_full: mx.array | None = None
             if precomputed_hidden is not None:
                 target_hidden_full = precomputed_hidden
@@ -1186,42 +1200,33 @@ def prepare_dflash_draft(
                     capture_logits=distill,
                 )
 
-            pending = input_ids[:, p : p + 1]  # (B, 1)
-            mask_block = mx.full(
-                (input_ids.shape[0], block_size),
-                int(draft_config.mask_token_id),
-                dtype=input_ids.dtype,
-            )
-            block_input = mx.concatenate([pending, mask_block], axis=1)
-            targets = input_ids[:, p + 1 : p + 1 + block_size]
-            # Slice ctx to positions 0..p-1 so the draft sees the same
-            # hidden-state distribution at training and inference time.
-            # At inference, ctx covers 0..L-1 and pending sits at RoPE
-            # position L (the position pending's content actually
-            # corresponds to). A prior version sliced ``[:, :p+1, :]``,
-            # which (a) gave the draft the target's own hidden for the
-            # pending position — a copy-shortcut that doesn't exist at
-            # inference — and (b) pushed proposal RoPE positions to
-            # p+1..p+block_size+1 instead of p..p+block_size. The pivot
-            # range guarantees ``p >= block_size >= 1`` so the slice is
-            # non-empty. See gh#317 (Gap 1).
-            target_hidden = target_hidden_full[:, :p, :]
+            # Build the per-window list. Each window slices its own
+            # block_input / targets / target_hidden / (optionally)
+            # target_logits_window from the shared target forward.
+            windows: list[tuple[mx.array, mx.array, mx.array, mx.array | None]] = []
+            for p in pivots:
+                pending = input_ids[:, p : p + 1]  # (B, 1)
+                mask_block = mx.full(
+                    (input_ids.shape[0], block_size),
+                    int(draft_config.mask_token_id),
+                    dtype=input_ids.dtype,
+                )
+                block_input = mx.concatenate([pending, mask_block], axis=1)
+                targets = input_ids[:, p + 1 : p + 1 + block_size]
+                # Slice ctx to positions 0..p-1 so the draft sees the
+                # same hidden-state distribution at training and
+                # inference time (gh#317 Gap 1).
+                target_hidden = target_hidden_full[:, :p, :]
 
-            target_logits_window: mx.array | None = None
-            if distill and target_logits_full is not None:
-                # The target's logit at position i is its prediction for
-                # position i+1 (next-token), so the logits we want for
-                # masked positions p+1..p+block_size live at indices
-                # p..p+block_size-1 of the target's output.
-                target_logits_window = target_logits_full[:, p : p + block_size, :]
+                target_logits_window: mx.array | None = None
+                if distill and target_logits_full is not None:
+                    target_logits_window = target_logits_full[:, p : p + block_size, :]
 
-            # Fresh draft cache per step — block-diffusion training does
-            # not cross step boundaries (each window is independent).
-            draft_cache = draft.make_cache()
+                windows.append(
+                    (block_input, target_hidden, targets, target_logits_window)
+                )
 
-            loss = _step(
-                block_input, target_hidden, targets, draft_cache, target_logits_window
-            )
+            loss = _step(windows)
             mx.eval(loss, draft.parameters(), optimizer.state)
             losses.append(float(loss.item()))
             real_step += 1
