@@ -26,7 +26,7 @@ class TestPromptCacheStoreDiskEviction:
             model_name="test-model",
         )
         state_a = _make_state(1)
-        with patch("olmlx.engine.model_manager.save_prompt_cache") as mock_save:
+        with patch("olmlx.engine.prompt_cache.store.save_prompt_cache") as mock_save:
             store.set("a", state_a)
             store.set("b", _make_state(2))  # evicts "a"
             mock_save.assert_called_once()
@@ -43,7 +43,7 @@ class TestPromptCacheStoreDiskEviction:
             model_name="test-model",
         )
         state_a = CachedPromptState(tokens=[10, 20, 30], cache=["kv"])
-        with patch("olmlx.engine.model_manager.save_prompt_cache") as mock_save:
+        with patch("olmlx.engine.prompt_cache.store.save_prompt_cache") as mock_save:
             store.set("a", state_a)
             store.set("b", _make_state(2))  # evicts "a"
             metadata = mock_save.call_args[0][2]
@@ -53,7 +53,7 @@ class TestPromptCacheStoreDiskEviction:
         """Without disk_path, eviction behaves as before (no save)."""
         store = PromptCacheStore(max_slots=1)
         store.set("a", _make_state(1))
-        with patch("olmlx.engine.model_manager.save_prompt_cache") as mock_save:
+        with patch("olmlx.engine.prompt_cache.store.save_prompt_cache") as mock_save:
             store.set("b", _make_state(2))  # evicts "a"
             mock_save.assert_not_called()
 
@@ -68,7 +68,7 @@ class TestPromptCacheStoreDiskEviction:
         )
         store.set("a", _make_state(1))
         with patch(
-            "olmlx.engine.model_manager.save_prompt_cache",
+            "olmlx.engine.prompt_cache.store.save_prompt_cache",
             side_effect=OSError("disk full"),
         ):
             with caplog.at_level(logging.WARNING):
@@ -92,7 +92,7 @@ class TestPromptCacheStoreDiskLoad:
         restored_tokens = [10, 20, 30]
 
         with patch(
-            "olmlx.engine.model_manager.load_prompt_cache",
+            "olmlx.engine.prompt_cache.store.load_prompt_cache",
             return_value=(restored_cache, {"tokens": "[10, 20, 30]"}),
         ) as mock_load:
             # Simulate: file exists on disk
@@ -125,7 +125,7 @@ class TestPromptCacheStoreDiskLoad:
             model_name="test-model",
         )
         with patch(
-            "olmlx.engine.model_manager.load_prompt_cache",
+            "olmlx.engine.prompt_cache.store.load_prompt_cache",
             side_effect=Exception("corrupt file"),
         ):
             disk_file = store._disk_file_path("a")
@@ -152,10 +152,10 @@ class TestPromptCacheStoreDiskLoad:
         # evicts "a" which triggers save_prompt_cache for "a"
         with (
             patch(
-                "olmlx.engine.model_manager.load_prompt_cache",
+                "olmlx.engine.prompt_cache.store.load_prompt_cache",
                 return_value=(["kv_b"], {"tokens": "[2]"}),
             ),
-            patch("olmlx.engine.model_manager.save_prompt_cache") as mock_save,
+            patch("olmlx.engine.prompt_cache.store.save_prompt_cache") as mock_save,
         ):
             disk_file = store._disk_file_path("b")
             disk_file.parent.mkdir(parents=True, exist_ok=True)
@@ -176,7 +176,7 @@ class TestPromptCacheStoreDiskLoad:
             model_name="test-model",
         )
         with patch(
-            "olmlx.engine.model_manager.load_prompt_cache",
+            "olmlx.engine.prompt_cache.store.load_prompt_cache",
             return_value=(["kv"], {"tokens": "[1, 2]"}),
         ):
             disk_file = store._disk_file_path("a")
@@ -326,7 +326,7 @@ class TestPromptCacheStoreEvictAllToDisk:
         store.set("b", _make_state(2))
         assert len(store) == 2
 
-        with patch("olmlx.engine.model_manager.save_prompt_cache") as mock_save:
+        with patch("olmlx.engine.prompt_cache.store.save_prompt_cache") as mock_save:
             store.evict_all_to_disk()
             assert len(store) == 0
             assert mock_save.call_count == 2
@@ -347,7 +347,7 @@ class TestPromptCacheStoreEvictAllToDisk:
         )
         store.set("a", _make_state(1))
 
-        with patch("olmlx.engine.model_manager.save_prompt_cache"):
+        with patch("olmlx.engine.prompt_cache.store.save_prompt_cache"):
             store.evict_all_to_disk()
 
         # Simulate file exists on disk for restoration
@@ -356,7 +356,7 @@ class TestPromptCacheStoreEvictAllToDisk:
         disk_file.touch()
 
         with patch(
-            "olmlx.engine.model_manager.load_prompt_cache",
+            "olmlx.engine.prompt_cache.store.load_prompt_cache",
             return_value=(["restored_kv"], {"tokens": "[1]"}),
         ):
             result = store.get("a")
