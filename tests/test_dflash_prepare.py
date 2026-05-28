@@ -1360,6 +1360,285 @@ class TestK1BitExactness:
             )
 
 
+class TestMultiWindowTraining:
+    """K > 1 behavioural tests: trains successfully on long sequences,
+    downgrades gracefully on short ranges, still skips pad-only batches,
+    works with distillation and precomputed shards."""
+
+    def test_k4_long_sequence_trains(self, tmp_path):
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        captured: list[float] = []
+
+        def cb(msg: str, _frac: float) -> None:
+            tail = msg.rsplit("loss=", 1)
+            if len(tail) == 2:
+                captured.append(float(tail[1]))
+
+        prepare_dflash_draft(
+            model_path=tmp_path,
+            steps=8,
+            batch_size=2,
+            seq_len=128,
+            block_size=4,
+            num_hidden_layers=2,
+            num_target_layers=2,
+            train_windows_per_step=4,
+            _target_loader=_mock_target_loader(
+                vocab_size=64, hidden_size=16, num_layers=4
+            ),
+            _batch_iterator=_synthetic_batches(
+                vocab=64, batch_size=2, seq_len=128, n=8
+            ),
+            progress_callback=cb,
+            log_every=1,
+        )
+
+        # All 8 optimizer steps ran (K windows per step are folded into
+        # one optimizer.update — step count is unchanged from K=1).
+        assert len(captured) == 8
+        # Finite, positive, no NaN.
+        assert all(0 < x < 100 and x == x for x in captured)
+        # Sanity: K=4 with a synthetic learnable-structure dataset
+        # shouldn't make loss diverge wildly relative to early steps.
+        first_avg = sum(captured[:2]) / 2
+        last_avg = sum(captured[-2:]) / 2
+        assert last_avg <= first_avg * 1.5, (
+            f"loss got dramatically worse: first={first_avg} last={last_avg}"
+        )
+
+    def test_k4_downgrades_on_short_range_no_pad(self, tmp_path):
+        """No-pad inline branch: when the valid range can't fit K
+        non-overlapping windows, the inline sampler caps to max_fit
+        and the loop still produces a real gradient update — no
+        exception, no skip increment.
+
+        seq_len=24, block_size=4 → range_size=24-2*4=16 → max_fit=16//5=3.
+        K=4 requested → 3 windows used.
+        """
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        def short_batches():
+            for i in range(3):
+                offsets = mx.arange(24, dtype=mx.int32) + i
+                per_row = mx.arange(2, dtype=mx.int32)[:, None] * 7
+                yield (offsets[None, :] + per_row) % 63 + 1
+
+        captured: list[float] = []
+
+        def cb(msg: str, _frac: float) -> None:
+            tail = msg.rsplit("loss=", 1)
+            if len(tail) == 2:
+                captured.append(float(tail[1]))
+
+        prepare_dflash_draft(
+            model_path=tmp_path,
+            steps=3,
+            batch_size=2,
+            seq_len=24,
+            block_size=4,
+            num_hidden_layers=2,
+            num_target_layers=2,
+            train_windows_per_step=4,
+            _target_loader=_mock_target_loader(
+                vocab_size=64, hidden_size=16, num_layers=4
+            ),
+            _batch_iterator=short_batches(),
+            progress_callback=cb,
+            log_every=1,
+        )
+
+        # All 3 steps completed despite the downgrade.
+        assert len(captured) == 3
+        assert all(0 < x < 100 and x == x for x in captured)
+
+    def test_k4_downgrade_logs_on_pad_aware_path(self, tmp_path, caplog):
+        """Pad-aware downgrade emits a debug log identifying the cap.
+
+        The synthetic test fixture (_MockTokenizer.pad_token_id=0,
+        eos_token_id=1) gives ``pad_for_pivot=0`` and ``pad_for_loss=0``
+        (the two ids are distinct), so the ``_select_pivots`` branch
+        runs. Build batches whose unpadded prefix accommodates fewer
+        than 4 non-overlapping windows. block_size=4, real_len=24 →
+        range_size=16 → max_fit=3.
+        """
+        import logging
+
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        def short_batches_with_pad():
+            for i in range(3):
+                # rows of 24 real tokens (in [2, 63]) followed by 8 pad (0).
+                offsets = mx.arange(24, dtype=mx.int32) + i
+                real = offsets[None, :] % 62 + 2
+                real = mx.broadcast_to(real, (2, 24))
+                pad = mx.zeros((2, 8), dtype=mx.int32)
+                yield mx.concatenate([real, pad], axis=1)
+
+        with caplog.at_level(logging.DEBUG, logger="olmlx.engine.dflash.prepare"):
+            prepare_dflash_draft(
+                model_path=tmp_path,
+                steps=3,
+                batch_size=2,
+                seq_len=32,
+                block_size=4,
+                num_hidden_layers=2,
+                num_target_layers=2,
+                train_windows_per_step=4,
+                _target_loader=_mock_target_loader(
+                    vocab_size=64, hidden_size=16, num_layers=4
+                ),
+                _batch_iterator=short_batches_with_pad(),
+                log_every=1,
+            )
+
+        downgrade_msgs = [
+            r.message for r in caplog.records if "shared prefix too short" in r.message
+        ]
+        assert downgrade_msgs, (
+            "Expected at least one downgrade log message; got: "
+            + str([r.message for r in caplog.records])
+        )
+
+    def test_k4_pad_only_batches_still_skip(self, tmp_path, caplog):
+        """All-pad batches with K > 1 still trigger the consecutive-skip
+        guard and exit cleanly. The infinite-skip ceiling caps total
+        skipped batches at min(steps*2 + 50, 500); the loop logs the
+        error and breaks, then the post-loop under-training warning
+        fires. No exception.
+        """
+        import logging
+
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        def all_pad():
+            for _ in range(200):
+                yield mx.zeros((2, 32), dtype=mx.int32)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.dflash.prepare"):
+            prepare_dflash_draft(
+                model_path=tmp_path,
+                steps=3,
+                batch_size=2,
+                seq_len=32,
+                block_size=4,
+                num_hidden_layers=2,
+                num_target_layers=2,
+                train_windows_per_step=4,
+                _target_loader=_mock_target_loader(
+                    vocab_size=64, hidden_size=16, num_layers=4
+                ),
+                _batch_iterator=all_pad(),
+                log_every=1,
+            )
+
+        # Either the consecutive-skip abort or the no-steps under-training
+        # warning fires — both indicate the skip path triggered, not a
+        # silent training pass on pad-only data.
+        warned = [
+            r.message
+            for r in caplog.records
+            if "consecutive batches" in r.message
+            or "No real gradient steps" in r.message
+        ]
+        assert warned, (
+            "Expected consecutive-skip or no-gradient-steps warning; got: "
+            + str([r.message for r in caplog.records])
+        )
+
+    def test_k4_with_distill(self, tmp_path):
+        """Distillation × K=4: target logits captured once per batch,
+        sliced K times, loss combines CE + KL per window then averages."""
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        captured: list[float] = []
+
+        def cb(msg: str, _frac: float) -> None:
+            tail = msg.rsplit("loss=", 1)
+            if len(tail) == 2:
+                captured.append(float(tail[1]))
+
+        prepare_dflash_draft(
+            model_path=tmp_path,
+            steps=4,
+            batch_size=2,
+            seq_len=128,
+            block_size=4,
+            num_hidden_layers=2,
+            num_target_layers=2,
+            train_windows_per_step=4,
+            distill=True,
+            distill_alpha=0.5,
+            distill_temp=2.0,
+            _target_loader=_mock_target_loader(
+                vocab_size=64, hidden_size=16, num_layers=4
+            ),
+            _batch_iterator=_synthetic_batches(
+                vocab=64, batch_size=2, seq_len=128, n=4
+            ),
+            progress_callback=cb,
+            log_every=1,
+        )
+
+        assert len(captured) == 4
+        assert all(0 < x < 100 and x == x for x in captured)
+
+    def test_k4_with_precomputed_tuples(self, tmp_path):
+        """Precomputed-shard tuple batches × K=4: hidden state passed
+        in directly, K windows slice independently from the same
+        full-length tensor."""
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        def tuple_batches():
+            for i in range(4):
+                offsets = mx.arange(128, dtype=mx.int32) + i
+                per_row = mx.arange(2, dtype=mx.int32)[:, None] * 7
+                input_ids = (offsets[None, :] + per_row) % 62 + 1
+                # Concat hidden size = num_target_layers * target_hidden_size
+                # = 2 * 16 = 32.
+                hidden = mx.random.normal(shape=(2, 128, 32), dtype=mx.float32)
+                yield (input_ids, hidden)
+
+        captured: list[float] = []
+
+        def cb(msg: str, _frac: float) -> None:
+            tail = msg.rsplit("loss=", 1)
+            if len(tail) == 2:
+                captured.append(float(tail[1]))
+
+        prepare_dflash_draft(
+            model_path=tmp_path,
+            steps=4,
+            batch_size=2,
+            seq_len=128,
+            block_size=4,
+            num_hidden_layers=2,
+            num_target_layers=2,
+            train_windows_per_step=4,
+            _target_loader=_mock_target_loader(
+                vocab_size=64, hidden_size=16, num_layers=4
+            ),
+            _batch_iterator=tuple_batches(),
+            progress_callback=cb,
+            log_every=1,
+        )
+
+        assert len(captured) == 4
+        assert all(0 < x < 100 and x == x for x in captured)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end training
 # ---------------------------------------------------------------------------
