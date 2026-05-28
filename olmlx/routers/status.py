@@ -64,6 +64,11 @@ async def ps(request: Request):
             bits = parts[1] if len(parts) > 1 else ""
             meta["quantization_level"] = f"HQQ-{bits}bit"
 
+        cache_metrics: dict[str, int] = {}
+        store = getattr(lm, "prompt_cache_store", None)
+        if store is not None and hasattr(store, "metrics"):
+            cache_metrics = store.metrics.to_dict()
+
         models.append(
             RunningModel(
                 name=lm.name,
@@ -79,6 +84,7 @@ async def ps(request: Request):
                 expires_at=expires,
                 size_vram=size,
                 active_refs=lm.active_refs,
+                cache_metrics=cache_metrics,
             )
         )
     return PsResponse(models=models)

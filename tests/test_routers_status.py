@@ -110,3 +110,25 @@ class TestStatusRouter:
         assert model["size"] == 4096
         assert model["size_vram"] == model["size"]
         assert model["details"]["family"] == "test"
+
+    @pytest.mark.asyncio
+    async def test_api_ps_includes_cache_metrics(self, app_client):
+        """ps includes cache_metrics from the loaded model's prompt_cache_store."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore
+
+        # Set up a model with a PromptCacheStore and some cache activity
+        lm = app_client._transport.app.state.model_manager._loaded["qwen3:latest"]
+        store = PromptCacheStore(max_slots=4)
+        store.set("a", CachedPromptState(tokens=[1, 2, 3], cache=[MagicMock()]))
+        store.get("a")  # bump cache_id_hits
+        lm.prompt_cache_store = store
+
+        resp = await app_client.get("/api/ps")
+        assert resp.status_code == 200
+        data = resp.json()
+        model = data["models"][0]
+        assert "cache_metrics" in model
+        assert model["cache_metrics"]["cache_id_hits"] == 1
+        assert "radix_hits" in model["cache_metrics"]
