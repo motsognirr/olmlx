@@ -18,6 +18,7 @@ dependencies = [
     "mcp>=1.0",
     "rich>=13.0",
     "xgrammar>=0.2.1",
+    "mlx-whisper>=0.4.3",
 ]
 
 [project.scripts]
