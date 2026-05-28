@@ -338,6 +338,24 @@ class TestPromptCacheStoreEvictAllToDisk:
         store.evict_all_to_disk()
         assert len(store) == 0
 
+    def test_cleanup_disk_updates_metrics(self, tmp_path):
+        """_cleanup_disk should increment evictions_disk and report bytes_on_disk."""
+        store = PromptCacheStore(
+            max_slots=4,
+            disk_path=tmp_path,
+            model_name="test-model",
+            disk_max_bytes=100,
+        )
+        disk_dir = tmp_path / "test-model"
+        disk_dir.mkdir(parents=True)
+        # Three files at 80 bytes each = 240 total; budget 100 → 2 evicted
+        for name in ("a", "b", "c"):
+            (disk_dir / f"{name}.safetensors").write_bytes(b"x" * 80)
+        store._cleanup_disk()
+        assert store.metrics.evictions_disk == 2
+        # 80 bytes left under the 100-byte budget after cleanup
+        assert store.metrics.bytes_on_disk == 80
+
     def test_evict_all_to_disk_entries_restorable(self, tmp_path):
         """Entries evicted to disk can be restored on next get()."""
         store = PromptCacheStore(

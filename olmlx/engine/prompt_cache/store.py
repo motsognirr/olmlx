@@ -175,7 +175,9 @@ class PromptCacheStore:
             path, size, _ = file_info.pop(0)
             total -= size
             path.unlink(missing_ok=True)
+            self.metrics.evictions_disk += 1
             logger.info("Disk cache cleanup: removed %s", path)
+        self.metrics.bytes_on_disk = total
 
     def peek(self, cache_id: str) -> CachedPromptState | None:
         """Read-only check for a cache entry without LRU side effects."""
