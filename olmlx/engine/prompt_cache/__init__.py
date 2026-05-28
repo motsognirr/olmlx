@@ -4,5 +4,6 @@ Issue #365.
 """
 
 from olmlx.engine.prompt_cache.state import CachedPromptState
+from olmlx.engine.prompt_cache.store import PromptCacheStore
 
-__all__ = ["CachedPromptState"]
+__all__ = ["CachedPromptState", "PromptCacheStore"]
