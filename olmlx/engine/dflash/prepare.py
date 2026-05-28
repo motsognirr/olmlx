@@ -1202,15 +1202,18 @@ def prepare_dflash_draft(
 
             # Build the per-window list. Each window slices its own
             # block_input / targets / target_hidden / (optionally)
-            # target_logits_window from the shared target forward.
+            # target_logits_window from the shared target forward. The
+            # MASK block is identical across windows (same shape, same
+            # mask_token_id, same dtype), so build it once outside the
+            # loop.
+            mask_block = mx.full(
+                (input_ids.shape[0], block_size),
+                int(draft_config.mask_token_id),
+                dtype=input_ids.dtype,
+            )
             windows: list[tuple[mx.array, mx.array, mx.array, mx.array | None]] = []
             for p in pivots:
                 pending = input_ids[:, p : p + 1]  # (B, 1)
-                mask_block = mx.full(
-                    (input_ids.shape[0], block_size),
-                    int(draft_config.mask_token_id),
-                    dtype=input_ids.dtype,
-                )
                 block_input = mx.concatenate([pending, mask_block], axis=1)
                 targets = input_ids[:, p + 1 : p + 1 + block_size]
                 # Slice ctx to positions 0..p-1 so the draft sees the

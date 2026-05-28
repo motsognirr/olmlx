@@ -1303,13 +1303,20 @@ class TestTrainWindowsValidation:
 
 
 class TestK1BitExactness:
-    """K=1 (default) must continue to train cleanly after the
-    training-loop refactor: same number of steps, finite losses,
-    deterministic under fixed seeds. The K=1 path goes through
-    ``_select_pivots(num_windows=1)``, which delegates to
-    ``_select_pivot`` and thus shares the legacy RNG draw."""
+    """K=1 (default) must continue to train identically after the
+    training-loop refactor: same RNG draws, same per-step loss values.
+    The K=1 path goes through ``_select_pivots(num_windows=1)``, which
+    delegates to ``_select_pivot``, so under a fixed seed every pivot
+    and every loss value should be bit-exact with the legacy
+    single-window code.
 
-    def test_k1_loss_finite_under_fixed_seed(self, tmp_path):
+    Pinned values were captured against the pre-refactor code and
+    verified to match the refactored path. They guard against silent
+    semantic regressions (e.g. an off-by-one slice that still produces
+    a small positive loss) that a pure finiteness check would miss.
+    """
+
+    def test_k1_loss_matches_baseline_under_fixed_seed(self, tmp_path):
         import random
         from olmlx.engine.dflash.prepare import prepare_dflash_draft
 
@@ -1341,10 +1348,16 @@ class TestK1BitExactness:
             log_every=1,
         )
 
-        assert len(captured) == 5
-        # Finite, positive, no NaN
-        assert all(0 < x < 100 for x in captured)
-        assert all(x == x for x in captured)
+        # Baseline captured against the pre-refactor single-window
+        # path; the refactor preserves bit-exactness at K=1. The 1e-3
+        # tolerance allows minor MLX-version-driven float drift while
+        # still catching any meaningful regression.
+        expected = [4.2952, 4.3009, 4.2603, 4.2794, 4.1174]
+        assert len(captured) == len(expected)
+        for got, want in zip(captured, expected, strict=True):
+            assert got == pytest.approx(want, abs=1e-3), (
+                f"K=1 loss regression: captured={captured} expected={expected}"
+            )
 
 
 # ---------------------------------------------------------------------------
