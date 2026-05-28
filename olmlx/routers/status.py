@@ -65,9 +65,9 @@ async def ps(request: Request):
             meta["quantization_level"] = f"HQQ-{bits}bit"
 
         cache_metrics: dict[str, int] = {}
-        store = getattr(lm, "prompt_cache_store", None)
-        if store is not None and hasattr(store, "metrics"):
-            cache_metrics = store.metrics.to_dict()
+        cache_store = getattr(lm, "prompt_cache_store", None)
+        if cache_store is not None and hasattr(cache_store, "metrics"):
+            cache_metrics = cache_store.metrics.to_dict()
 
         models.append(
             RunningModel(
