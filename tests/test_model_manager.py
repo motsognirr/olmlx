@@ -5460,3 +5460,38 @@ class TestSpectralAutoCalibrate:
         manager = ModelManager(registry, mock_store)
         with pytest.raises(AssertionError):
             manager._auto_calibrate_spectral("test/model", "turboquant:4")
+
+
+class TestWhisperLoad:
+    def test_load_model_whisper_branch(self, tmp_path, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
+        fake_whisper = MagicMock()
+        with (
+            patch.object(manager, "_detect_model_kind", return_value="whisper"),
+            patch(
+                "mlx_whisper.load_models.load_model", return_value=fake_whisper
+            ) as mock_load,
+        ):
+            model, tok, is_vlm, caps, spec = manager._load_model("test/whisper")
+        assert model is fake_whisper
+        assert tok is None
+        assert is_vlm is False
+        assert spec is None
+        mock_load.assert_called_once()
+
+    def test_probe_cache_skipped_for_whisper(self, registry, mock_store):
+        from olmlx.engine.model_manager import LoadedModel
+
+        manager = ModelManager(registry, mock_store)
+        lm = LoadedModel(
+            name="whisper:latest",
+            hf_path="test/whisper",
+            model=MagicMock(),
+            tokenizer=None,
+            is_whisper=True,
+        )
+        lm.supports_cache_trim = True
+        lm.supports_cache_persistence = False
+        with patch("mlx_lm.models.cache.make_prompt_cache") as mock_make:
+            manager._probe_cache_capabilities(lm)
+        mock_make.assert_not_called()
