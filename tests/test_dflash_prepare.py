@@ -1255,6 +1255,53 @@ class TestSelectPivots:
             )
 
 
+class TestTrainWindowsValidation:
+    def test_zero_windows_raises(self, tmp_path):
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        with pytest.raises(ValueError, match="train_windows_per_step"):
+            prepare_dflash_draft(
+                model_path=tmp_path,
+                steps=1,
+                batch_size=2,
+                seq_len=32,
+                block_size=4,
+                num_hidden_layers=2,
+                num_target_layers=2,
+                train_windows_per_step=0,
+                _target_loader=_mock_target_loader(
+                    vocab_size=64, hidden_size=16, num_layers=4
+                ),
+                _batch_iterator=_synthetic_batches(
+                    vocab=64, batch_size=2, seq_len=32, n=1
+                ),
+            )
+
+    def test_negative_windows_raises(self, tmp_path):
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+        with pytest.raises(ValueError, match="train_windows_per_step"):
+            prepare_dflash_draft(
+                model_path=tmp_path,
+                steps=1,
+                batch_size=2,
+                seq_len=32,
+                block_size=4,
+                num_hidden_layers=2,
+                num_target_layers=2,
+                train_windows_per_step=-1,
+                _target_loader=_mock_target_loader(
+                    vocab_size=64, hidden_size=16, num_layers=4
+                ),
+                _batch_iterator=_synthetic_batches(
+                    vocab=64, batch_size=2, seq_len=32, n=1
+                ),
+            )
+
+
 # ---------------------------------------------------------------------------
 # End-to-end training
 # ---------------------------------------------------------------------------

@@ -695,6 +695,7 @@ def prepare_dflash_draft(
     distill_alpha: float = 0.5,
     distill_temp: float = 2.0,
     position_decay_gamma: float | None = None,
+    train_windows_per_step: int = 1,
     use_precomputed: str | Path | None = None,
     _target_loader: Callable[[str], tuple[Any, Any]] | None = None,
     _batch_iterator: Any = None,
@@ -715,6 +716,16 @@ def prepare_dflash_draft(
     sweep is ``block_size / 2``; the paper does not publicly pin a
     single value. ``0`` or a negative value also disables the
     weighting. See gh#317 (Gap 2).
+
+    ``train_windows_per_step``: number of non-overlapping masked
+    windows to train on per batch (per optimizer step). Default ``1``
+    reproduces the legacy single-window behaviour bit-for-bit. ``K > 1``
+    amortises the dominant per-step cost (the target forward) across
+    multiple draft-loss windows: the target runs once, then K windows
+    are sliced from its hidden states (and, when ``distill=True``, its
+    logits). When the batch's shared unpadded prefix is too short to
+    fit K non-overlapping windows, fewer are used — K is a target, not
+    a guarantee. See gh#382.
 
     ``use_precomputed``: read precomputed (input_ids, hidden) shards
     from this directory instead of running the target each step. Skips
@@ -745,6 +756,14 @@ def prepare_dflash_draft(
     # simple.
     if position_decay_gamma is not None and position_decay_gamma <= 0:
         position_decay_gamma = None
+    if train_windows_per_step < 1:
+        # train_windows_per_step == 0 would build an empty windows list
+        # once the training loop is multi-window-aware (Task 3), and
+        # the mean-over-K reduction would divide by zero; negative
+        # values are nonsensical.
+        raise ValueError(
+            f"train_windows_per_step must be >= 1, got {train_windows_per_step}"
+        )
     if block_size < 1:
         # ``block_size == 0`` builds zero-length mask/target tensors,
         # ``_draft_loss`` then returns 0 with no gradient, and the
