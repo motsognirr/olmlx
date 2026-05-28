@@ -1782,6 +1782,17 @@ class ModelManager:
                 return "unknown"
 
         model_type = config.get("model_type", "").lower()
+
+        # Whisper STT (issue #366). Check before the empty-model_type return:
+        # mlx-community whisper repos ship a non-HF config.json carrying
+        # mlx_whisper.whisper.ModelDimensions fields, and load_model pops
+        # "model_type", so model_type is often absent. The dims keys are the
+        # robust discriminator; the model_type check covers HF-style configs.
+        if model_type == "whisper" or (
+            "n_mels" in config and "n_audio_state" in config
+        ):
+            return "whisper"
+
         if not model_type:
             return "unknown"
 

@@ -822,6 +822,43 @@ class TestDetectModelKind:
                 kind = manager._detect_model_kind("test/qwen2_vl")
         assert kind == "vlm"
 
+    def test_whisper_by_model_type(self, tmp_path, registry, mock_store):
+        config_path = self._make_config(tmp_path, {"model_type": "whisper"})
+        manager = self._make_manager(registry, mock_store)
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/whisper")
+        assert kind == "whisper"
+
+    def test_whisper_by_dims_without_model_type(self, tmp_path, registry, mock_store):
+        # mlx-community whisper repos ship a non-HF config.json with dims and
+        # no usable model_type (load_model pops it).
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "n_mels": 80,
+                "n_audio_ctx": 1500,
+                "n_audio_state": 384,
+                "n_audio_head": 6,
+                "n_audio_layer": 4,
+                "n_vocab": 51865,
+                "n_text_ctx": 448,
+                "n_text_state": 384,
+                "n_text_head": 6,
+                "n_text_layer": 4,
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/whisper-mlx")
+        assert kind == "whisper"
+
+    def test_llama_not_whisper(self, tmp_path, registry, mock_store):
+        config_path = self._make_config(tmp_path, {"model_type": "llama"})
+        manager = self._make_manager(registry, mock_store)
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/model")
+        assert kind == "text"
+
 
 class TestProbeCacheCapabilities:
     """Exercise _probe_cache_capabilities, including the probe-failure path
