@@ -2,6 +2,7 @@
 
 from olmlx.engine.prompt_cache.radix import PrefixCacheIndex
 from olmlx.engine.prompt_cache.metrics import CacheMetrics
+from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore
 
 
 class TestPrefixCacheIndexInsertLookup:
@@ -108,3 +109,76 @@ class TestCacheMetrics:
             "evictions_ram", "evictions_disk",
             "bytes_in_ram", "bytes_on_disk",
         }
+
+
+def _make_state(tokens: list[int]) -> CachedPromptState:
+    return CachedPromptState(tokens=list(tokens), cache=[object()])
+
+
+class TestPromptCacheStoreRadixIntegration:
+    def test_set_inserts_into_radix(self):
+        store = PromptCacheStore(max_slots=4)
+        store.set("a", _make_state([1, 2, 3]))
+        store_metrics = store.metrics
+        assert store_metrics.bytes_in_ram >= 0  # estimator runs without crashing
+        found = store.find_by_prefix([1, 2, 3, 4], min_prefix_tokens=0)
+        assert found is not None
+        old_cache_id, state, depth = found
+        assert old_cache_id == "a"
+        assert depth == 3
+        assert state.tokens == [1, 2, 3]
+
+    def test_remove_drops_radix_terminal(self):
+        store = PromptCacheStore(max_slots=4)
+        store.set("a", _make_state([1, 2, 3]))
+        store.remove("a")
+        assert store.find_by_prefix([1, 2, 3], min_prefix_tokens=0) is None
+
+    def test_find_by_prefix_threshold_filters(self):
+        store = PromptCacheStore(max_slots=4)
+        store.set("a", _make_state([1, 2, 3]))
+        # min_prefix_tokens=5 rejects the 3-token match
+        assert store.find_by_prefix([1, 2, 3, 9, 9], min_prefix_tokens=5) is None
+        # min_prefix_tokens=3 accepts
+        assert store.find_by_prefix([1, 2, 3, 9, 9], min_prefix_tokens=3) is not None
+
+    def test_takeover_rekeys_entry(self):
+        store = PromptCacheStore(max_slots=4)
+        original = _make_state([1, 2, 3])
+        store.set("a", original)
+        taken = store.takeover("a", "b")
+        assert taken is original
+        # Old key gone
+        assert store.peek("a") is None
+        # New key resolves
+        assert store.peek("b") is original
+        # Radix terminal now points to "b"
+        cache_id, _ = store._radix.find_longest_prefix([1, 2, 3])
+        assert cache_id == "b"
+
+    def test_takeover_unknown_returns_none(self):
+        store = PromptCacheStore(max_slots=4)
+        assert store.takeover("missing", "new") is None
+
+    def test_lru_eviction_removes_radix_terminal(self):
+        store = PromptCacheStore(max_slots=2)
+        store.set("a", _make_state([1, 1, 1]))
+        store.set("b", _make_state([2, 2, 2]))
+        store.set("c", _make_state([3, 3, 3]))  # evicts "a"
+        assert store.peek("a") is None
+        # Radix no longer has the "a" path
+        cache_id, _ = store._radix.find_longest_prefix([1, 1, 1])
+        assert cache_id is None
+        # Metrics recorded the eviction
+        assert store.metrics.evictions_ram == 1
+
+    def test_metrics_tracks_hits_and_misses(self):
+        store = PromptCacheStore(max_slots=4)
+        store.set("a", _make_state([1, 2, 3]))
+        assert store.peek("a") is not None  # peek does not affect metrics
+        # get() records a hit
+        store.get("a")
+        assert store.metrics.cache_id_hits == 1
+        # get() on unknown records a miss
+        store.get("missing")
+        assert store.metrics.cache_id_misses == 1

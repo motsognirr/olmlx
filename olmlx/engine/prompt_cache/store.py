@@ -13,6 +13,8 @@ import shutil
 from collections import OrderedDict
 from pathlib import Path
 
+from olmlx.engine.prompt_cache.metrics import CacheMetrics
+from olmlx.engine.prompt_cache.radix import PrefixCacheIndex
 from olmlx.engine.prompt_cache.state import CachedPromptState
 
 try:
@@ -25,6 +27,22 @@ except ImportError:  # pragma: no cover
     load_prompt_cache = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+def _estimate_state_bytes(state: CachedPromptState) -> int:
+    """Best-effort byte estimate of a cached state.
+
+    Walks the per-layer cache list looking for mlx.core.array-shaped
+    objects exposing `nbytes`. Unknown layer types contribute 0.
+    """
+    total = 0
+    for layer in state.cache or ():
+        for attr in ("keys", "values"):
+            arr = getattr(layer, attr, None)
+            nbytes = getattr(arr, "nbytes", None)
+            if isinstance(nbytes, int):
+                total += nbytes
+    return total
 
 
 class PromptCacheStore:
@@ -48,6 +66,8 @@ class PromptCacheStore:
         self._model_name = model_name.replace("/", "--")
         self._disk_max_bytes = disk_max_bytes
         self._evict_generation = 0  # bumped by async_evict_all_to_disk
+        self._radix = PrefixCacheIndex()
+        self.metrics = CacheMetrics()
 
     @property
     def _disk_enabled(self) -> bool:
@@ -167,9 +187,15 @@ class PromptCacheStore:
         state = self._entries.get(cache_id)
         if state is not None:
             self._entries.move_to_end(cache_id)
+            self.metrics.cache_id_hits += 1
             return state
         # Memory miss — try disk
-        return self._load_from_disk(cache_id)
+        loaded = self._load_from_disk(cache_id)
+        if loaded is not None:
+            self.metrics.cache_id_hits += 1
+        else:
+            self.metrics.cache_id_misses += 1
+        return loaded
 
     def _set_in_memory(
         self, cache_id: str, state: CachedPromptState
@@ -184,14 +210,23 @@ class PromptCacheStore:
         if cache_id in self._entries:
             self._entries.move_to_end(cache_id)
             old = self._entries[cache_id]
+            self.metrics.bytes_in_ram -= _estimate_state_bytes(old)
+            self._radix.remove(old.tokens, cache_id)
             self._entries[cache_id] = state
+            self._radix.insert(state.tokens, cache_id)
+            self.metrics.bytes_in_ram += _estimate_state_bytes(state)
             displaced = old if old.cache is not state.cache else None
             return None, displaced
         evicted: CachedPromptState | None = None
         evicted_id: str | None = None
         if len(self._entries) >= self._max_slots:
             evicted_id, evicted = self._entries.popitem(last=False)
+            self._radix.remove(evicted.tokens, evicted_id)
+            self.metrics.bytes_in_ram -= _estimate_state_bytes(evicted)
+            self.metrics.evictions_ram += 1
         self._entries[cache_id] = state
+        self._radix.insert(state.tokens, cache_id)
+        self.metrics.bytes_in_ram += _estimate_state_bytes(state)
         return evicted_id, evicted
 
     def set(self, cache_id: str, state: CachedPromptState) -> CachedPromptState | None:
@@ -208,7 +243,10 @@ class PromptCacheStore:
 
     def remove(self, cache_id: str) -> None:
         """Remove a specific cache entry from memory and disk."""
-        self._entries.pop(cache_id, None)
+        existing = self._entries.pop(cache_id, None)
+        if existing is not None:
+            self._radix.remove(existing.tokens, cache_id)
+            self.metrics.bytes_in_ram -= _estimate_state_bytes(existing)
         if self._disk_enabled:
             self._disk_file_path(cache_id).unlink(missing_ok=True)
 
@@ -248,6 +286,8 @@ class PromptCacheStore:
             for cache_id, state in list(self._entries.items()):
                 self._save_to_disk(cache_id, state)
         self._entries.clear()
+        self._radix = PrefixCacheIndex()
+        self.metrics.bytes_in_ram = 0
         self._evict_generation += 1
 
     def _save_entries_to_disk(
@@ -300,16 +340,19 @@ class PromptCacheStore:
         state = self._entries.get(cache_id)
         if state is not None:
             self._entries.move_to_end(cache_id)
+            self.metrics.cache_id_hits += 1
             return state
         # Memory miss — read from disk in a thread, then insert on the event loop.
         gen_before = self._evict_generation
         loaded, disk_path = await asyncio.to_thread(self._read_from_disk, cache_id)
         if loaded is None:
+            self.metrics.cache_id_misses += 1
             return None
         # If entries were bulk-evicted during the await (memory pressure),
         # don't re-insert — the eviction was intentional.  Leave the disk
         # file intact so it can be restored later.
         if self._evict_generation != gen_before:
+            self.metrics.cache_id_misses += 1
             return None
         # Another coroutine may have populated this cache_id during the await;
         # if so, keep the fresher in-memory entry and discard the stale disk load.
@@ -319,6 +362,7 @@ class PromptCacheStore:
             existing = self._entries[cache_id]
             if disk_path is not None:
                 await asyncio.to_thread(disk_path.unlink, True)
+            self.metrics.cache_id_hits += 1
             return existing
         evicted_id, evicted = self._set_in_memory(cache_id, loaded)
         # Save evicted entry to disk first to avoid a window where
@@ -328,6 +372,7 @@ class PromptCacheStore:
         # Delete disk file only after successful insertion and eviction save
         if disk_path is not None:
             await asyncio.to_thread(disk_path.unlink, True)
+        self.metrics.cache_id_hits += 1
         return loaded
 
     async def async_set(
@@ -355,6 +400,8 @@ class PromptCacheStore:
         else:
             snapshot = []
         self._entries.clear()
+        self._radix = PrefixCacheIndex()
+        self.metrics.bytes_in_ram = 0
         self._evict_generation += 1
         if snapshot:
             await asyncio.to_thread(self._save_entries_to_disk, snapshot)
@@ -362,10 +409,62 @@ class PromptCacheStore:
     def clear(self) -> None:
         """Remove all cache entries and disk cache files."""
         self._entries.clear()
+        self._radix = PrefixCacheIndex()
+        self.metrics.bytes_in_ram = 0
         if self._disk_path is not None and self._model_name:
             disk_dir = self._disk_dir()
             if disk_dir.exists():
                 shutil.rmtree(disk_dir, ignore_errors=True)
+
+    def find_by_prefix(
+        self,
+        tokens: list[int],
+        min_prefix_tokens: int,
+    ) -> tuple[str, CachedPromptState, int] | None:
+        """Longest-prefix lookup against in-memory entries.
+
+        Returns (old_cache_id, state, prefix_len) or None if no terminal
+        on the descent path meets `min_prefix_tokens`.
+        """
+        cache_id, depth = self._radix.find_longest_prefix(tokens)
+        if cache_id is None or depth < min_prefix_tokens:
+            self.metrics.radix_misses += 1
+            return None
+        state = self._entries.get(cache_id)
+        if state is None:
+            # Trie out of sync — defensive.
+            self.metrics.radix_misses += 1
+            return None
+        self.metrics.radix_hits += 1
+        return cache_id, state, depth
+
+    def takeover(
+        self,
+        old_cache_id: str,
+        new_cache_id: str,
+    ) -> CachedPromptState | None:
+        """Re-key an existing in-memory entry. No KV copy.
+
+        The trie terminal moves from old_cache_id to new_cache_id; the
+        entry is promoted to MRU under the new key. Returns the state,
+        or None if old_cache_id is no longer present.
+        """
+        state = self._entries.pop(old_cache_id, None)
+        if state is None:
+            return None
+        self._radix.remove(state.tokens, old_cache_id)
+        # Update bytes_in_ram book-keeping: the pop above didn't decrement
+        # since we bypassed remove(); _set_in_memory will increment when it
+        # re-inserts the same state. Decrement here for symmetry so the
+        # two calls cancel out exactly.
+        self.metrics.bytes_in_ram -= _estimate_state_bytes(state)
+        evicted_id, evicted = self._set_in_memory(new_cache_id, state)
+        if evicted_id is not None and evicted is not None:
+            # Caller doesn't expect a side-channel disk save here — it
+            # would mean the takeover destination collided with a third
+            # entry. Mirror set()'s behaviour for symmetry.
+            self._save_to_disk(evicted_id, evicted)
+        return state
 
     def __len__(self) -> int:
         return len(self._entries)
