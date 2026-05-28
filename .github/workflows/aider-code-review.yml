@@ -1,0 +1,25 @@
+name: Aider Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  aider-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Aider Code Review
+        uses: motsognirr/aider-code-review@v1
+        with:
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          model: gpt-5.5
