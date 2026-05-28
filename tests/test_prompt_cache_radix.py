@@ -1,6 +1,7 @@
 """Tests for the cross-request radix prefix cache (issue #365)."""
 
 from olmlx.engine.prompt_cache.radix import PrefixCacheIndex
+from olmlx.engine.prompt_cache.metrics import CacheMetrics
 
 
 class TestPrefixCacheIndexInsertLookup:
@@ -80,3 +81,30 @@ class TestPrefixCacheIndexRemove:
         assert idx.find_longest_prefix([1, 2, 3]) == ("b", 3)
         idx.remove([1, 2, 3], "b")
         assert idx.find_longest_prefix([1, 2, 3]) == (None, 0)
+
+
+class TestCacheMetrics:
+    def test_defaults_are_zero(self):
+        m = CacheMetrics()
+        assert m.cache_id_hits == 0
+        assert m.cache_id_misses == 0
+        assert m.radix_hits == 0
+        assert m.radix_misses == 0
+        assert m.evictions_ram == 0
+        assert m.evictions_disk == 0
+        assert m.bytes_in_ram == 0
+        assert m.bytes_on_disk == 0
+
+    def test_to_dict_round_trip(self):
+        m = CacheMetrics(cache_id_hits=3, radix_hits=1, bytes_in_ram=2048)
+        d = m.to_dict()
+        assert d["cache_id_hits"] == 3
+        assert d["radix_hits"] == 1
+        assert d["bytes_in_ram"] == 2048
+        # All defined keys present
+        assert set(d.keys()) == {
+            "cache_id_hits", "cache_id_misses",
+            "radix_hits", "radix_misses",
+            "evictions_ram", "evictions_disk",
+            "bytes_in_ram", "bytes_on_disk",
+        }
