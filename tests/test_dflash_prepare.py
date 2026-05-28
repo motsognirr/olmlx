@@ -18,6 +18,7 @@ models. Coverage:
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import mlx.core as mx
@@ -1360,22 +1361,40 @@ class TestK1BitExactness:
             )
 
 
+def _capture_losses() -> tuple[list[float], Callable[[str, float], None]]:
+    """Build a (list, progress_callback) pair that pulls per-step loss
+    values out of ``prepare_dflash_draft``'s progress messages.
+
+    The training loop emits messages formatted as
+    ``f"Training step {n}/{N} loss={loss:.4f}"``; this helper does the
+    ``rsplit("loss=", 1)`` parse in one place so a future format change
+    only needs to touch this function.
+    """
+    captured: list[float] = []
+
+    def cb(msg: str, _frac: float) -> None:
+        tail = msg.rsplit("loss=", 1)
+        if len(tail) == 2:
+            captured.append(float(tail[1]))
+
+    return captured, cb
+
+
 class TestMultiWindowTraining:
     """K > 1 behavioural tests: trains successfully on long sequences,
     downgrades gracefully on short ranges, still skips pad-only batches,
     works with distillation and precomputed shards."""
 
     def test_k4_long_sequence_trains(self, tmp_path):
+        import random
+
         from olmlx.engine.dflash.prepare import prepare_dflash_draft
 
         _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
 
-        captured: list[float] = []
-
-        def cb(msg: str, _frac: float) -> None:
-            tail = msg.rsplit("loss=", 1)
-            if len(tail) == 2:
-                captured.append(float(tail[1]))
+        random.seed(11)
+        mx.random.seed(11)
+        captured, cb = _capture_losses()
 
         prepare_dflash_draft(
             model_path=tmp_path,
@@ -1421,9 +1440,14 @@ class TestMultiWindowTraining:
         actual padding present; a separate test exercises the
         explicit pad-aware downgrade log on data that does carry pad.
         """
+        import random
+
         from olmlx.engine.dflash.prepare import prepare_dflash_draft
 
         _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(11)
+        mx.random.seed(11)
 
         def short_batches():
             for i in range(3):
@@ -1431,12 +1455,7 @@ class TestMultiWindowTraining:
                 per_row = mx.arange(2, dtype=mx.int32)[:, None] * 7
                 yield (offsets[None, :] + per_row) % 63 + 1
 
-        captured: list[float] = []
-
-        def cb(msg: str, _frac: float) -> None:
-            tail = msg.rsplit("loss=", 1)
-            if len(tail) == 2:
-                captured.append(float(tail[1]))
+        captured, cb = _capture_losses()
 
         prepare_dflash_draft(
             model_path=tmp_path,
@@ -1470,10 +1489,14 @@ class TestMultiWindowTraining:
         range_size=16 → max_fit=3.
         """
         import logging
+        import random
 
         from olmlx.engine.dflash.prepare import prepare_dflash_draft
 
         _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(11)
+        mx.random.seed(11)
 
         def short_batches_with_pad():
             for i in range(3):
@@ -1511,16 +1534,23 @@ class TestMultiWindowTraining:
 
     def test_k4_pad_only_batches_still_skip(self, tmp_path, caplog):
         """All-pad batches with K > 1 still trigger the consecutive-skip
-        guard and exit cleanly. The infinite-skip ceiling caps total
-        skipped batches at min(steps*2 + 50, 500); the loop logs the
-        error and breaks, then the post-loop under-training warning
-        fires. No exception.
+        guard. With steps=3 the skip ceiling is min(3*2+50, 500) = 56,
+        and the iterator yields 200 all-pad batches — so the
+        consecutive-skip abort path is what fires (the alternate
+        "stream exhausted before steps" path can't happen with this
+        configuration). Asserting that specific message catches
+        regressions where the skip counter stops incrementing but the
+        loop still falls through to the no-gradient-steps warning.
         """
         import logging
+        import random
 
         from olmlx.engine.dflash.prepare import prepare_dflash_draft
 
         _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(11)
+        mx.random.seed(11)
 
         def all_pad():
             for _ in range(200):
@@ -1543,33 +1573,25 @@ class TestMultiWindowTraining:
                 log_every=1,
             )
 
-        # Either the consecutive-skip abort or the no-steps under-training
-        # warning fires — both indicate the skip path triggered, not a
-        # silent training pass on pad-only data.
-        warned = [
-            r.message
-            for r in caplog.records
-            if "consecutive batches" in r.message
-            or "No real gradient steps" in r.message
+        skip_aborts = [
+            r.message for r in caplog.records if "consecutive batches" in r.message
         ]
-        assert warned, (
-            "Expected consecutive-skip or no-gradient-steps warning; got: "
-            + str([r.message for r in caplog.records])
+        assert skip_aborts, "Expected consecutive-skip abort warning; got: " + str(
+            [r.message for r in caplog.records]
         )
 
     def test_k4_with_distill(self, tmp_path):
         """Distillation × K=4: target logits captured once per batch,
         sliced K times, loss combines CE + KL per window then averages."""
+        import random
+
         from olmlx.engine.dflash.prepare import prepare_dflash_draft
 
         _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
 
-        captured: list[float] = []
-
-        def cb(msg: str, _frac: float) -> None:
-            tail = msg.rsplit("loss=", 1)
-            if len(tail) == 2:
-                captured.append(float(tail[1]))
+        random.seed(11)
+        mx.random.seed(11)
+        captured, cb = _capture_losses()
 
         prepare_dflash_draft(
             model_path=tmp_path,
@@ -1596,13 +1618,36 @@ class TestMultiWindowTraining:
         assert len(captured) == 4
         assert all(0 < x < 100 and x == x for x in captured)
 
-    def test_k4_with_precomputed_tuples(self, tmp_path):
+    def test_k4_with_precomputed_tuples(self, tmp_path, monkeypatch):
         """Precomputed-shard tuple batches × K=4: hidden state passed
         in directly, K windows slice independently from the same
-        full-length tensor."""
+        full-length tensor. Monkey-patches ``_capture_target_outputs``
+        to assert the online target forward is NOT called on the
+        precomputed path — a regression that silently re-ran the
+        target while still consuming the tuple would otherwise pass
+        the loose loss-bound check.
+        """
+        import random
+
+        from olmlx.engine.dflash import prepare as prepare_mod
         from olmlx.engine.dflash.prepare import prepare_dflash_draft
 
         _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(11)
+        mx.random.seed(11)
+
+        capture_calls = {"count": 0}
+
+        def _no_target_forward(*_args, **_kwargs):
+            capture_calls["count"] += 1
+            raise AssertionError(
+                "_capture_target_outputs was called on the precomputed path; "
+                "the trainer should have consumed the (input_ids, hidden) tuple "
+                "without running the target forward."
+            )
+
+        monkeypatch.setattr(prepare_mod, "_capture_target_outputs", _no_target_forward)
 
         def tuple_batches():
             for i in range(4):
@@ -1614,12 +1659,7 @@ class TestMultiWindowTraining:
                 hidden = mx.random.normal(shape=(2, 128, 32), dtype=mx.float32)
                 yield (input_ids, hidden)
 
-        captured: list[float] = []
-
-        def cb(msg: str, _frac: float) -> None:
-            tail = msg.rsplit("loss=", 1)
-            if len(tail) == 2:
-                captured.append(float(tail[1]))
+        captured, cb = _capture_losses()
 
         prepare_dflash_draft(
             model_path=tmp_path,
@@ -1638,6 +1678,7 @@ class TestMultiWindowTraining:
             log_every=1,
         )
 
+        assert capture_calls["count"] == 0
         assert len(captured) == 4
         assert all(0 < x < 100 and x == x for x in captured)
 
