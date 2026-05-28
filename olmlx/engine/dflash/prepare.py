@@ -561,6 +561,92 @@ def _select_pivot(
     return random.randint(block_size, min_real - block_size - 1)
 
 
+def _select_pivots(
+    input_ids: mx.array,
+    pad_token_id: int,
+    block_size: int,
+    num_windows: int,
+) -> list[int] | None:
+    """Pick up to ``num_windows`` non-overlapping pivots in the shared
+    unpadded prefix via slot-and-jitter placement.
+
+    Returns ``None`` only when no window fits at all (matching
+    ``_select_pivot``'s ``None`` semantics — the caller treats this as
+    "skip the batch"). Otherwise returns a list of length
+    ``1..num_windows``; a length below ``num_windows`` means the valid
+    range was too small for that many non-overlapping slots, and the
+    caller proceeds with the windows it received (no skip).
+
+    Slot-and-jitter: divide the valid pivot range into ``num_windows``
+    equal slots and sample one pivot uniformly per slot. The non-overlap
+    invariant holds when each slot is at least ``block_size + 1`` wide;
+    if some slots would be narrower we cap ``num_windows`` to the max
+    that fits.
+
+    ``num_windows == 1`` delegates to ``_select_pivot`` so the K=1 path
+    is bit-exact with the legacy single-window code under a fixed RNG
+    seed (same single ``random.randint`` call with the same bounds).
+    This also preserves the monkey-patch behaviour the existing
+    ``test_target_hidden_slice_excludes_pending_position`` test relies
+    on.
+    """
+    if num_windows <= 0:
+        raise ValueError(f"num_windows must be >= 1, got {num_windows}")
+    if num_windows == 1:
+        p = _select_pivot(input_ids, pad_token_id, block_size)
+        return None if p is None else [p]
+
+    # Replicate the trailing-pad detection from _select_pivot. We can't
+    # call _select_pivot directly for K > 1 because we need access to
+    # ``min_real`` to lay out the slots; factoring it out would
+    # complicate the K=1 RNG-equivalence guarantee, so we duplicate the
+    # cheap reversal + argmax instead.
+    seq_len = input_ids.shape[1]
+    reversed_ids = input_ids[:, ::-1]
+    not_pad_rev = reversed_ids != pad_token_id
+    has_real = not_pad_rev.any(axis=1)
+    first_real_rev = not_pad_rev.argmax(axis=1).astype(mx.int32)
+    trailing_pads = mx.where(
+        has_real, first_real_rev, mx.array(seq_len, dtype=mx.int32)
+    )
+    real_lens = mx.array(seq_len, dtype=mx.int32) - trailing_pads
+    min_real = int(real_lens.min().item())
+    if min_real < 2 * block_size + 1:
+        return None
+
+    lo = block_size
+    hi = min_real - block_size - 1  # inclusive
+    range_size = hi - lo + 1
+
+    # Cap num_windows by what actually fits non-overlapping. Each
+    # window's [p, p+block_size] span has length block_size+1, so two
+    # adjacent pivots need to be at least that far apart.
+    max_fit = max(1, range_size // (block_size + 1))
+    k = min(num_windows, max_fit)
+
+    if k == 1:
+        # Range only big enough for one window even though the operator
+        # asked for more. Delegate again so the K=1 RNG path matches the
+        # single-pivot case exactly.
+        return [random.randint(lo, hi)]
+
+    # Equal-width slots over the inclusive range [lo, hi]. Using float
+    # division then int-truncating the per-slot boundaries keeps the
+    # slot edges close to ``range_size / k`` apart for small K — the
+    # alternative ``range_size // k`` integer step would systematically
+    # bias the last slot wider.
+    slot_width = range_size / k
+    pivots: list[int] = []
+    for i in range(k):
+        slot_lo = lo + int(i * slot_width)
+        slot_hi_exclusive = lo + int((i + 1) * slot_width)
+        slot_hi = slot_hi_exclusive - 1  # inclusive
+        # ``max_fit`` already guarantees slot_width >= block_size + 1,
+        # so slot_hi >= slot_lo always — no degenerate empty-slot case.
+        pivots.append(random.randint(slot_lo, slot_hi))
+    return pivots
+
+
 def _cosine_lr(step: int, total: int, peak: float, warmup: int) -> float:
     """Linear warmup followed by cosine decay to 10% of peak."""
     if step < warmup:

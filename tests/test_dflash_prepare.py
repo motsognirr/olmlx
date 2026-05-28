@@ -1110,6 +1110,140 @@ class TestPivotSelection:
             assert block_size <= p <= 10 - block_size - 1
 
 
+class TestSelectPivots:
+    """Multi-window pivot selection via slot-and-jitter."""
+
+    def test_k1_delegates_to_select_pivot(self):
+        """K=1 must be bit-exact with _select_pivot under a fixed seed
+        — the multi-window code path collapses to the legacy single
+        pivot when num_windows=1."""
+        import random
+        from olmlx.engine.dflash.prepare import _select_pivot, _select_pivots
+
+        pad = 0
+        block_size = 4
+        ids = mx.full((2, 32), 7, dtype=mx.int32)
+
+        random.seed(123)
+        legacy = _select_pivot(ids, pad_token_id=pad, block_size=block_size)
+        random.seed(123)
+        multi = _select_pivots(
+            ids, pad_token_id=pad, block_size=block_size, num_windows=1
+        )
+
+        assert legacy is not None
+        assert multi == [legacy]
+
+    def test_returns_none_when_no_window_fits(self):
+        from olmlx.engine.dflash.prepare import _select_pivots
+
+        pad = 0
+        block_size = 4
+        # min_real = 5 < 2*4 + 1 = 9 — no window fits.
+        ids = mx.concatenate(
+            [
+                mx.full((1, 5), 7, dtype=mx.int32),
+                mx.full((1, 27), pad, dtype=mx.int32),
+            ],
+            axis=1,
+        )
+        ids = mx.broadcast_to(ids, (2, 32))
+        assert (
+            _select_pivots(ids, pad_token_id=pad, block_size=block_size, num_windows=4)
+            is None
+        )
+
+    def test_k4_returns_four_non_overlapping_pivots(self):
+        """A long-enough sequence yields exactly K pivots, all within
+        the valid range, with adjacent pivots at least block_size+1
+        apart so their [p, p+block_size] spans cannot overlap."""
+        import random
+        from olmlx.engine.dflash.prepare import _select_pivots
+
+        pad = 0
+        block_size = 4
+        # min_real = 200 → range_size = 192 → max non-overlap = 192//5 = 38
+        ids = mx.full((2, 200), 7, dtype=mx.int32)
+
+        random.seed(0)
+        pivots = _select_pivots(
+            ids, pad_token_id=pad, block_size=block_size, num_windows=4
+        )
+
+        assert pivots is not None
+        assert len(pivots) == 4
+        # All pivots inside the valid range
+        for p in pivots:
+            assert block_size <= p <= 200 - block_size - 1
+        # Sorted + non-overlapping
+        assert pivots == sorted(pivots)
+        for i in range(len(pivots) - 1):
+            assert pivots[i + 1] - pivots[i] >= block_size + 1, (
+                f"pivots {pivots[i]} and {pivots[i + 1]} are within "
+                f"block_size+1={block_size + 1} of each other"
+            )
+
+    def test_k_caps_to_max_non_overlapping_fit(self):
+        """If the operator requests more windows than the valid range
+        can accommodate non-overlapping, return the maximum that
+        actually fits — K is a target, not a guarantee."""
+        from olmlx.engine.dflash.prepare import _select_pivots
+
+        pad = 0
+        block_size = 4
+        # min_real = 20 → range_size = 12 → max non-overlap = 12//5 = 2
+        ids = mx.concatenate(
+            [
+                mx.full((1, 20), 7, dtype=mx.int32),
+                mx.full((1, 12), pad, dtype=mx.int32),
+            ],
+            axis=1,
+        )
+        ids = mx.broadcast_to(ids, (2, 32))
+
+        pivots = _select_pivots(
+            ids, pad_token_id=pad, block_size=block_size, num_windows=8
+        )
+        assert pivots is not None
+        assert 1 <= len(pivots) <= 2
+        # If multiple, must be non-overlapping
+        for i in range(len(pivots) - 1):
+            assert pivots[i + 1] - pivots[i] >= block_size + 1
+
+    def test_pivots_stay_in_unpadded_prefix(self):
+        """With trailing padding, every selected pivot must satisfy
+        p + block_size < min_real so targets land on real tokens."""
+        from olmlx.engine.dflash.prepare import _select_pivots
+
+        pad = 0
+        block_size = 4
+        # Row 0: real_len=60; Row 1: real_len=40; min_real=40.
+        row0 = mx.concatenate(
+            [
+                mx.full((1, 60), 7, dtype=mx.int32),
+                mx.full((1, 4), pad, dtype=mx.int32),
+            ],
+            axis=1,
+        )
+        row1 = mx.concatenate(
+            [
+                mx.full((1, 40), 7, dtype=mx.int32),
+                mx.full((1, 24), pad, dtype=mx.int32),
+            ],
+            axis=1,
+        )
+        ids = mx.concatenate([row0, row1], axis=0)
+
+        pivots = _select_pivots(
+            ids, pad_token_id=pad, block_size=block_size, num_windows=4
+        )
+        assert pivots is not None
+        for p in pivots:
+            assert p + block_size < 40, (
+                f"pivot {p} targets ({p + 1}..{p + block_size}) extend past min_real=40"
+            )
+
+
 # ---------------------------------------------------------------------------
 # End-to-end training
 # ---------------------------------------------------------------------------
