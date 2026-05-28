@@ -1030,13 +1030,39 @@ class ModelManager:
         # for the wrong vocab. Must use ``lm.text_tokenizer`` (the HF
         # tokenizer, post-VLM-unwrap) to match what
         # ``_install_grammar_processor`` keyed the cache on.
-        try:
-            from olmlx.engine import grammar as _grammar
+        #
+        # Whisper models (issue #366) return ``tokenizer=None``; guard the
+        # grammar drop so it doesn't choke on the missing tokenizer.
+        if not lm.is_whisper:
+            try:
+                from olmlx.engine import grammar as _grammar
 
-            _grammar.drop_for_tokenizer(lm.text_tokenizer)
-        except Exception as exc:
-            logger.exception("Error dropping grammar cache for %s", lm.name)
-            errors.append(exc)
+                _grammar.drop_for_tokenizer(lm.text_tokenizer)
+            except Exception as exc:
+                logger.exception("Error dropping grammar cache for %s", lm.name)
+                errors.append(exc)
+        # Whisper models (issue #366) are injected into mlx_whisper's
+        # module-level ModelHolder by generate_transcription so transcribe()
+        # reuses the managed weights. ModelManager owns that lifetime, so on
+        # close we must drop the holder's strong reference — otherwise the
+        # float16 GPU weights survive eviction/expiry until the next
+        # transcription overwrites them. Guard on identity so closing one
+        # whisper model doesn't clear a different one still referenced.
+        if lm.is_whisper:
+            try:
+                import importlib
+
+                # NOTE: import the submodule via importlib — mlx_whisper's
+                # __init__ rebinds the ``transcribe`` attribute to the
+                # function, shadowing the submodule for ``import ... as``.
+                whisper_transcribe = importlib.import_module("mlx_whisper.transcribe")
+                holder = whisper_transcribe.ModelHolder
+                if holder.model is lm.model:
+                    holder.model = None
+                    holder.model_path = None
+            except Exception as exc:
+                logger.exception("Error clearing whisper ModelHolder for %s", lm.name)
+                errors.append(exc)
         if errors:
             raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
 

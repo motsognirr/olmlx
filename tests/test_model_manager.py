@@ -5495,3 +5495,49 @@ class TestWhisperLoad:
         with patch("mlx_lm.models.cache.make_prompt_cache") as mock_make:
             manager._probe_cache_capabilities(lm)
         mock_make.assert_not_called()
+
+    def test_close_clears_whisper_model_holder(self, registry, mock_store):
+        import importlib
+
+        from olmlx.engine.model_manager import LoadedModel, ModelManager
+
+        whisper_transcribe = importlib.import_module("mlx_whisper.transcribe")
+        manager = ModelManager(registry, mock_store)
+        sentinel = MagicMock()
+        lm = LoadedModel(
+            name="whisper:latest",
+            hf_path="test/whisper",
+            model=sentinel,
+            tokenizer=None,
+            is_whisper=True,
+        )
+        whisper_transcribe.ModelHolder.model = sentinel
+        whisper_transcribe.ModelHolder.model_path = "test/whisper"
+
+        manager._close_loaded_model(lm)
+
+        assert whisper_transcribe.ModelHolder.model is None
+        assert whisper_transcribe.ModelHolder.model_path is None
+
+    def test_close_preserves_other_whisper_in_holder(self, registry, mock_store):
+        import importlib
+
+        from olmlx.engine.model_manager import LoadedModel, ModelManager
+
+        whisper_transcribe = importlib.import_module("mlx_whisper.transcribe")
+        manager = ModelManager(registry, mock_store)
+        other = MagicMock()
+        lm = LoadedModel(
+            name="whisper:latest",
+            hf_path="test/whisper",
+            model=MagicMock(),
+            tokenizer=None,
+            is_whisper=True,
+        )
+        # Holder references a DIFFERENT model than the one being closed.
+        whisper_transcribe.ModelHolder.model = other
+        whisper_transcribe.ModelHolder.model_path = "other/whisper"
+
+        manager._close_loaded_model(lm)
+
+        assert whisper_transcribe.ModelHolder.model is other
