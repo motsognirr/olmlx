@@ -32,6 +32,8 @@ DEFAULT_MODELS = {
     "mistral:7b": "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
     "qwen2.5:3b": "mlx-community/Qwen2.5-3B-Instruct-4bit",
     "gemma2:2b": "mlx-community/gemma-2-2b-it-4bit",
+    "whisper-turbo:latest": "mlx-community/whisper-large-v3-turbo",
+    "whisper-large:latest": "mlx-community/whisper-large-v3-mlx",
 }
 
 
