@@ -1,5 +1,8 @@
 """Tests for the cross-request radix prefix cache (issue #365)."""
 
+import pytest
+from unittest.mock import MagicMock, patch
+
 from olmlx.engine.prompt_cache.radix import PrefixCacheIndex
 from olmlx.engine.prompt_cache.metrics import CacheMetrics
 from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore
@@ -104,10 +107,14 @@ class TestCacheMetrics:
         assert d["bytes_in_ram"] == 2048
         # All defined keys present
         assert set(d.keys()) == {
-            "cache_id_hits", "cache_id_misses",
-            "radix_hits", "radix_misses",
-            "evictions_ram", "evictions_disk",
-            "bytes_in_ram", "bytes_on_disk",
+            "cache_id_hits",
+            "cache_id_misses",
+            "radix_hits",
+            "radix_misses",
+            "evictions_ram",
+            "evictions_disk",
+            "bytes_in_ram",
+            "bytes_on_disk",
         }
 
 
@@ -182,3 +189,120 @@ class TestPromptCacheStoreRadixIntegration:
         # get() on unknown records a miss
         store.get("missing")
         assert store.metrics.cache_id_misses == 1
+
+
+@pytest.fixture(autouse=True)
+def _safe_memory_defaults():
+    """Mock memory utils so prompt cache tests aren't affected by real Metal state."""
+    with (
+        patch("olmlx.utils.memory.mx.get_active_memory", return_value=0),
+        patch("olmlx.utils.memory.mx.get_cache_memory", return_value=0),
+    ):
+        yield
+
+
+def _make_lm_for_radix(store: PromptCacheStore) -> MagicMock:
+    """Minimal LoadedModel stand-in for _setup_prompt_cache."""
+    lm = MagicMock()
+    lm.prompt_cache_store = store
+    lm.supports_cache_persistence = True
+    lm.supports_cache_trim = True
+    lm.is_vlm = False
+    lm.kv_cache_quant = None
+    lm.is_distributed = False
+    return lm
+
+
+@pytest.mark.asyncio
+class TestRadixFallbackInSetup:
+    async def test_sibling_prefix_hit_triggers_takeover(self):
+        from olmlx.engine.inference import _setup_prompt_cache
+
+        store = PromptCacheStore(max_slots=4)
+        shared_prompt = list(range(1, 1025))  # 1024 tokens
+        # Seed the store with cache_id="A": shared system prompt + completed turn.
+        # Simulates a previous request that processed a full conversation turn.
+        seeded_tokens = shared_prompt + [42, 43, 44]  # 1027 tokens stored
+        seeded = CachedPromptState(tokens=seeded_tokens, cache=[MagicMock()])
+        store.set("A", seeded)
+
+        # New request "B" extends "A"'s stored tokens with a new user turn.
+        # This is the real Claude Code sibling case — same conversation history,
+        # new cache_id, new user message appended.
+        continuation_tokens = seeded_tokens + [99, 100]  # 1029 tokens total
+
+        lm = _make_lm_for_radix(store)
+        gen_kwargs: dict = {}
+
+        with patch(
+            "olmlx.engine.inference.make_prompt_cache", return_value=[MagicMock()]
+        ):
+            result = await _setup_prompt_cache(
+                lm,
+                prompt=continuation_tokens,
+                gen_kwargs=gen_kwargs,
+                prompt_tokens=continuation_tokens,
+                cache_id="B",
+            )
+
+        # Radix hit: prefix matched 1027 tokens, those tokens are reused.
+        assert result.cache_read_tokens >= 1024
+        # Only the 2-token new user turn needs prefilling.
+        assert result.cache_creation_tokens <= 3
+        # Takeover: "A" gone (taken over then removed for mid-gen safety).
+        assert store.peek("A") is None
+        # KV state wired into gen_kwargs so mlx-lm reuses it.
+        assert "prompt_cache" in gen_kwargs
+
+    async def test_radix_below_threshold_falls_to_fresh(self):
+        from olmlx.engine.inference import _setup_prompt_cache
+
+        store = PromptCacheStore(max_slots=4)
+        store.set("A", CachedPromptState(tokens=[1, 2, 3], cache=[MagicMock()]))
+        lm = _make_lm_for_radix(store)
+
+        with (
+            patch(
+                "olmlx.engine.inference.settings.prompt_cache_radix_min_prefix_tokens",
+                1000,
+            ),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache", return_value=[MagicMock()]
+            ),
+        ):
+            result = await _setup_prompt_cache(
+                lm,
+                prompt=[1, 2, 3, 4, 5],
+                gen_kwargs={},
+                prompt_tokens=[1, 2, 3, 4, 5],
+                cache_id="B",
+            )
+
+        # Threshold not met → fresh cache, A stays in place
+        assert result.cache_read_tokens == 0
+        assert store.peek("A") is not None
+
+    async def test_radix_disabled_skips_lookup(self):
+        from olmlx.engine.inference import _setup_prompt_cache
+
+        store = PromptCacheStore(max_slots=4)
+        store.set("A", CachedPromptState(tokens=list(range(1024)), cache=[MagicMock()]))
+        lm = _make_lm_for_radix(store)
+
+        with (
+            patch("olmlx.engine.inference.settings.prompt_cache_radix", False),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache", return_value=[MagicMock()]
+            ),
+        ):
+            result = await _setup_prompt_cache(
+                lm,
+                prompt=list(range(1024)) + [99],
+                gen_kwargs={},
+                prompt_tokens=list(range(1024)) + [99],
+                cache_id="B",
+            )
+
+        # No fallback → fresh prefill, A still there
+        assert result.cache_read_tokens == 0
+        assert store.peek("A") is not None

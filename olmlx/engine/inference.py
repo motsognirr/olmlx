@@ -2166,6 +2166,24 @@ async def _setup_prompt_cache(
         cached = None
     else:
         cached = await lm.prompt_cache_store.async_get(cache_id)
+        # Issue #365: cache_id miss → look for a sibling that shares a long
+        # token prefix. Takeover semantics — no KV copy. The old cache_id
+        # loses its entry (documented limitation: concurrent two-stream
+        # sibling branching falls back to fresh prefill on the loser).
+        if cached is None and settings.prompt_cache_radix:
+            found = lm.prompt_cache_store.find_by_prefix(
+                prompt_tokens,
+                min_prefix_tokens=settings.prompt_cache_radix_min_prefix_tokens,
+            )
+            if found is not None:
+                old_cache_id, cached, prefix_len_hint = found
+                lm.prompt_cache_store.takeover(old_cache_id, cache_id)
+                logger.info(
+                    "Radix prefix hit: %d tokens reused from cache_id=%s → %s",
+                    prefix_len_hint,
+                    old_cache_id,
+                    cache_id,
+                )
     logger.debug(
         "Cache lookup: cached=%s, new prompt=%d tokens",
         (

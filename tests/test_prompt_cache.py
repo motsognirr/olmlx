@@ -2842,6 +2842,9 @@ class TestMultiCacheBehavior:
             mock_settings.default_keep_alive = "5m"
             mock_settings.inference_timeout = None
             mock_settings.sync_mode = "full"
+            # Disable radix fallback so a miss on agent-b does not steal
+            # agent-a's cache entry — this test verifies isolation semantics.
+            mock_settings.prompt_cache_radix = False
             gen = await generate_chat(
                 mock_manager,
                 "qwen3",
