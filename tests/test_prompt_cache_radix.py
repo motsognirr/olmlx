@@ -101,12 +101,22 @@ class TestPrefixCacheIndexRemove:
         idx.remove([1, 2, 3, 4, 5], "long")
         assert idx.find_longest_prefix([1, 2, 3, 4]) == ("short", 3)
 
-    def test_overwrite_same_path_replaces_terminal(self):
+    def test_duplicate_path_keeps_both_terminals(self):
+        # Two cache_ids with identical token sequences must both stay
+        # reachable; removing one leaves the other findable. Previously
+        # the second insert overwrote the first terminal, breaking the
+        # invariant that every entry in _entries has a trie terminal.
         idx = PrefixCacheIndex()
         idx.insert([1, 2, 3], "a")
         idx.insert([1, 2, 3], "b")
-        assert idx.find_longest_prefix([1, 2, 3]) == ("b", 3)
+        # Either cache_id is acceptable on lookup — both share the prefix.
+        cache_id, depth = idx.find_longest_prefix([1, 2, 3])
+        assert cache_id in {"a", "b"}
+        assert depth == 3
+        # Removing "b" must NOT clear "a"'s terminal.
         idx.remove([1, 2, 3], "b")
+        assert idx.find_longest_prefix([1, 2, 3]) == ("a", 3)
+        idx.remove([1, 2, 3], "a")
         assert idx.find_longest_prefix([1, 2, 3]) == (None, 0)
 
 

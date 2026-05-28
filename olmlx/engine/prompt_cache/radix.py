@@ -8,11 +8,16 @@ from dataclasses import dataclass, field
 @dataclass
 class _TrieNode:
     children: dict[int, "_TrieNode"] = field(default_factory=dict)
-    terminal_cache_id: str | None = None
+    # A path can be claimed by more than one cache_id when distinct
+    # entries in the store happen to land on identical token sequences
+    # (rare in practice but the store doesn't prevent it). Tracking a
+    # set keeps every entry in _entries reachable through the trie.
+    terminal_cache_ids: set[str] = field(default_factory=set)
 
 
 class PrefixCacheIndex:
-    """Trie over token IDs. Each terminal node maps to one cache_id.
+    """Trie over token IDs. Each terminal node tracks the set of
+    cache_ids that claim that exact path.
 
     Lookups walk the query tokens as far as possible, then return any
     reachable terminal in the subtree of the deepest visited node —
@@ -29,10 +34,7 @@ class PrefixCacheIndex:
         self._root = _TrieNode()
 
     def insert(self, tokens: list[int], cache_id: str) -> None:
-        """Mark the path tokens[0..len-1] as a terminal for cache_id.
-
-        Overwrites any existing terminal at the same path.
-        """
+        """Add cache_id to the terminal set at the tokens path."""
         node = self._root
         for tok in tokens:
             child = node.children.get(tok)
@@ -40,7 +42,7 @@ class PrefixCacheIndex:
                 child = _TrieNode()
                 node.children[tok] = child
             node = child
-        node.terminal_cache_id = cache_id
+        node.terminal_cache_ids.add(cache_id)
 
     def find_longest_prefix(self, tokens: list[int]) -> tuple[str | None, int]:
         """Walk the trie matching tokens, return any cache_id reachable
@@ -73,22 +75,21 @@ class PrefixCacheIndex:
         # the query (the descent path), so DFS for one. The remove()
         # pruning invariant guarantees a terminal exists somewhere below
         # any non-leaf node.
-        if deepest_node.terminal_cache_id is not None:
-            return deepest_node.terminal_cache_id, deepest_depth
+        if deepest_node.terminal_cache_ids:
+            return next(iter(deepest_node.terminal_cache_ids)), deepest_depth
         stack = [deepest_node]
         while stack:
             n = stack.pop()
-            if n.terminal_cache_id is not None:
-                return n.terminal_cache_id, deepest_depth
+            if n.terminal_cache_ids:
+                return next(iter(n.terminal_cache_ids)), deepest_depth
             stack.extend(n.children.values())
         return None, 0  # unreachable if pruning invariant holds
 
     def remove(self, tokens: list[int], cache_id: str) -> None:
-        """Clear the terminal at the tokens path if it matches cache_id,
+        """Discard cache_id from the terminal set at the tokens path,
         then prune now-empty branches upward.
 
-        No-op if the path doesn't exist or the terminal belongs to a
-        different cache_id.
+        No-op if the path doesn't exist or cache_id isn't claiming it.
         """
         path: list[tuple[_TrieNode, int]] = []
         node = self._root
@@ -98,12 +99,12 @@ class PrefixCacheIndex:
                 return
             path.append((node, tok))
             node = child
-        if node.terminal_cache_id != cache_id:
+        if cache_id not in node.terminal_cache_ids:
             return
-        node.terminal_cache_id = None
-        # Prune upward while nodes are empty.
+        node.terminal_cache_ids.discard(cache_id)
+        # Prune upward while nodes have no children and no terminals.
         for parent, tok in reversed(path):
             child = parent.children[tok]
-            if child.children or child.terminal_cache_id is not None:
+            if child.children or child.terminal_cache_ids:
                 return
             del parent.children[tok]
