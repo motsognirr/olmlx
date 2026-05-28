@@ -2590,6 +2590,10 @@ def cmd_dflash_prepare(args):
             f"({args.block_size}); need at least 2*block_size + 1 = "
             f"{min_seq_len} tokens per sequence."
         )
+    if args.train_windows_per_step < 1:
+        raise SystemExit(
+            f"--train-windows-per-step must be >= 1, got {args.train_windows_per_step}"
+        )
 
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
@@ -2622,6 +2626,8 @@ def cmd_dflash_prepare(args):
     print(f"  LR: {args.lr}")
     if args.distill:
         print(f"  Distillation: alpha={args.distill_alpha} temp={args.distill_temp}")
+    if args.train_windows_per_step != 1:
+        print(f"  Train windows per step: {args.train_windows_per_step}")
     if args.use_precomputed:
         print(f"  Precomputed shards: {args.use_precomputed}")
     print()
@@ -2646,6 +2652,7 @@ def cmd_dflash_prepare(args):
         distill_alpha=args.distill_alpha,
         distill_temp=args.distill_temp,
         position_decay_gamma=args.position_decay_gamma,
+        train_windows_per_step=args.train_windows_per_step,
         use_precomputed=args.use_precomputed,
         progress_callback=_flash_progress,
     )
@@ -3200,6 +3207,22 @@ def build_parser() -> argparse.ArgumentParser:
             "disable and use the uniform-mean reduction (the default "
             "when this flag is omitted). Suggested starting value: "
             "block_size/2."
+        ),
+    )
+    dflash_prepare_p.add_argument(
+        "--train-windows-per-step",
+        type=int,
+        default=1,
+        help=(
+            "Number of non-overlapping masked windows to train on per "
+            "batch (per optimizer step). Default 1 reproduces the "
+            "legacy single-window behaviour bit-for-bit. K > 1 "
+            "amortises the target forward across K draft-loss windows "
+            "in a single optimizer step; the optimizer-step budget "
+            "(--steps) is unchanged but each step sees K times more "
+            "training signal. When the batch's shared unpadded prefix "
+            "is too short for K non-overlapping windows, fewer are "
+            "used (K is a target, not a guarantee). See gh#382."
         ),
     )
     dflash_prepare_p.add_argument(

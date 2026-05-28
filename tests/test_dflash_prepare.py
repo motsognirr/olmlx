@@ -18,6 +18,7 @@ models. Coverage:
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import mlx.core as mx
@@ -1108,6 +1109,578 @@ class TestPivotSelection:
             assert p is not None
             # Must fit inside the SHORT row's real content.
             assert block_size <= p <= 10 - block_size - 1
+
+
+class TestSelectPivots:
+    """Multi-window pivot selection via slot-and-jitter."""
+
+    def test_k1_delegates_to_select_pivot(self):
+        """K=1 must be bit-exact with _select_pivot under a fixed seed
+        — the multi-window code path collapses to the legacy single
+        pivot when num_windows=1."""
+        import random
+        from olmlx.engine.dflash.prepare import _select_pivot, _select_pivots
+
+        pad = 0
+        block_size = 4
+        ids = mx.full((2, 32), 7, dtype=mx.int32)
+
+        random.seed(123)
+        legacy = _select_pivot(ids, pad_token_id=pad, block_size=block_size)
+        random.seed(123)
+        multi = _select_pivots(
+            ids, pad_token_id=pad, block_size=block_size, num_windows=1
+        )
+
+        assert legacy is not None
+        assert multi == [legacy]
+
+    def test_returns_none_when_no_window_fits(self):
+        from olmlx.engine.dflash.prepare import _select_pivots
+
+        pad = 0
+        block_size = 4
+        # min_real = 5 < 2*4 + 1 = 9 — no window fits.
+        ids = mx.concatenate(
+            [
+                mx.full((1, 5), 7, dtype=mx.int32),
+                mx.full((1, 27), pad, dtype=mx.int32),
+            ],
+            axis=1,
+        )
+        ids = mx.broadcast_to(ids, (2, 32))
+        assert (
+            _select_pivots(ids, pad_token_id=pad, block_size=block_size, num_windows=4)
+            is None
+        )
+
+    def test_k4_returns_four_non_overlapping_pivots(self):
+        """A long-enough sequence yields exactly K pivots, all within
+        the valid range, with adjacent pivots at least block_size+1
+        apart so their [p, p+block_size] spans cannot overlap.
+
+        Tested across many seeds — the non-overlap invariant is a hard
+        guarantee, not a probabilistic one. A single seed would let a
+        broken implementation pass by luck (and previously did — see
+        gh#382 review).
+        """
+        import random
+        from olmlx.engine.dflash.prepare import _select_pivots
+
+        pad = 0
+        block_size = 4
+        # min_real = 200 → range_size = 192 → max non-overlap = 192//5 = 38
+        ids = mx.full((2, 200), 7, dtype=mx.int32)
+
+        for seed in range(200):
+            random.seed(seed)
+            pivots = _select_pivots(
+                ids, pad_token_id=pad, block_size=block_size, num_windows=4
+            )
+            assert pivots is not None, f"seed={seed}: got None"
+            assert len(pivots) == 4, f"seed={seed}: got {pivots}"
+            for p in pivots:
+                assert block_size <= p <= 200 - block_size - 1, (
+                    f"seed={seed}: pivot {p} outside valid range"
+                )
+            assert pivots == sorted(pivots), f"seed={seed}: not sorted {pivots}"
+            for i in range(len(pivots) - 1):
+                assert pivots[i + 1] - pivots[i] >= block_size + 1, (
+                    f"seed={seed}: pivots {pivots[i]} and {pivots[i + 1]} are "
+                    f"within block_size+1={block_size + 1} of each other"
+                )
+
+    def test_k_caps_to_max_non_overlapping_fit(self):
+        """If the operator requests more windows than the valid range
+        can accommodate non-overlapping, return the maximum that
+        actually fits — K is a target, not a guarantee. Non-overlap
+        must hold across all seeds."""
+        import random
+        from olmlx.engine.dflash.prepare import _select_pivots
+
+        pad = 0
+        block_size = 4
+        # min_real = 20 → range_size = 12 → max non-overlap = 12//5 = 2
+        ids = mx.concatenate(
+            [
+                mx.full((1, 20), 7, dtype=mx.int32),
+                mx.full((1, 12), pad, dtype=mx.int32),
+            ],
+            axis=1,
+        )
+        ids = mx.broadcast_to(ids, (2, 32))
+
+        for seed in range(200):
+            random.seed(seed)
+            pivots = _select_pivots(
+                ids, pad_token_id=pad, block_size=block_size, num_windows=8
+            )
+            assert pivots is not None, f"seed={seed}: got None"
+            assert 1 <= len(pivots) <= 2, f"seed={seed}: got {pivots}"
+            for i in range(len(pivots) - 1):
+                assert pivots[i + 1] - pivots[i] >= block_size + 1, (
+                    f"seed={seed}: gap too small in {pivots}"
+                )
+
+    def test_pivots_stay_in_unpadded_prefix(self):
+        """With trailing padding, every selected pivot must satisfy
+        p + block_size < min_real so targets land on real tokens."""
+        from olmlx.engine.dflash.prepare import _select_pivots
+
+        pad = 0
+        block_size = 4
+        # Row 0: real_len=60; Row 1: real_len=40; min_real=40.
+        row0 = mx.concatenate(
+            [
+                mx.full((1, 60), 7, dtype=mx.int32),
+                mx.full((1, 4), pad, dtype=mx.int32),
+            ],
+            axis=1,
+        )
+        row1 = mx.concatenate(
+            [
+                mx.full((1, 40), 7, dtype=mx.int32),
+                mx.full((1, 24), pad, dtype=mx.int32),
+            ],
+            axis=1,
+        )
+        ids = mx.concatenate([row0, row1], axis=0)
+
+        pivots = _select_pivots(
+            ids, pad_token_id=pad, block_size=block_size, num_windows=4
+        )
+        assert pivots is not None
+        for p in pivots:
+            assert p + block_size < 40, (
+                f"pivot {p} targets ({p + 1}..{p + block_size}) extend past min_real=40"
+            )
+
+
+class TestTrainWindowsValidation:
+    def test_zero_windows_raises(self, tmp_path):
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        with pytest.raises(ValueError, match="train_windows_per_step"):
+            prepare_dflash_draft(
+                model_path=tmp_path,
+                steps=1,
+                batch_size=2,
+                seq_len=32,
+                block_size=4,
+                num_hidden_layers=2,
+                num_target_layers=2,
+                train_windows_per_step=0,
+                _target_loader=_mock_target_loader(
+                    vocab_size=64, hidden_size=16, num_layers=4
+                ),
+                _batch_iterator=_synthetic_batches(
+                    vocab=64, batch_size=2, seq_len=32, n=1
+                ),
+            )
+
+    def test_negative_windows_raises(self, tmp_path):
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+        with pytest.raises(ValueError, match="train_windows_per_step"):
+            prepare_dflash_draft(
+                model_path=tmp_path,
+                steps=1,
+                batch_size=2,
+                seq_len=32,
+                block_size=4,
+                num_hidden_layers=2,
+                num_target_layers=2,
+                train_windows_per_step=-1,
+                _target_loader=_mock_target_loader(
+                    vocab_size=64, hidden_size=16, num_layers=4
+                ),
+                _batch_iterator=_synthetic_batches(
+                    vocab=64, batch_size=2, seq_len=32, n=1
+                ),
+            )
+
+
+class TestK1BitExactness:
+    """K=1 (default) must continue to train identically after the
+    training-loop refactor: same RNG draws, same per-step loss values.
+    The K=1 path goes through ``_select_pivots(num_windows=1)``, which
+    delegates to ``_select_pivot``, so under a fixed seed every pivot
+    and every loss value should be bit-exact with the legacy
+    single-window code.
+
+    Pinned values were captured against the pre-refactor code and
+    verified to match the refactored path. They guard against silent
+    semantic regressions (e.g. an off-by-one slice that still produces
+    a small positive loss) that a pure finiteness check would miss.
+    """
+
+    def test_k1_loss_matches_baseline_under_fixed_seed(self, tmp_path):
+        import random
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(7)
+        mx.random.seed(7)
+        captured: list[float] = []
+
+        def cb(msg: str, _frac: float) -> None:
+            tail = msg.rsplit("loss=", 1)
+            if len(tail) == 2:
+                captured.append(float(tail[1]))
+
+        prepare_dflash_draft(
+            model_path=tmp_path,
+            steps=5,
+            batch_size=2,
+            seq_len=32,
+            block_size=4,
+            num_hidden_layers=2,
+            num_target_layers=2,
+            train_windows_per_step=1,
+            _target_loader=_mock_target_loader(
+                vocab_size=64, hidden_size=16, num_layers=4
+            ),
+            _batch_iterator=_synthetic_batches(vocab=64, batch_size=2, seq_len=32, n=5),
+            progress_callback=cb,
+            log_every=1,
+        )
+
+        # Baseline captured against the pre-refactor single-window
+        # path; the refactor preserves bit-exactness at K=1. The 1e-3
+        # tolerance allows minor MLX-version-driven float drift while
+        # still catching any meaningful regression.
+        expected = [4.2952, 4.3009, 4.2603, 4.2794, 4.1174]
+        assert len(captured) == len(expected)
+        for got, want in zip(captured, expected, strict=True):
+            assert got == pytest.approx(want, abs=1e-3), (
+                f"K=1 loss regression: captured={captured} expected={expected}"
+            )
+
+
+def _capture_losses() -> tuple[list[float], Callable[[str, float], None]]:
+    """Build a (list, progress_callback) pair that pulls per-step loss
+    values out of ``prepare_dflash_draft``'s progress messages.
+
+    The training loop emits messages formatted as
+    ``f"Training step {n}/{N} loss={loss:.4f}"``; this helper does the
+    ``rsplit("loss=", 1)`` parse in one place so a future format change
+    only needs to touch this function.
+    """
+    captured: list[float] = []
+
+    def cb(msg: str, _frac: float) -> None:
+        tail = msg.rsplit("loss=", 1)
+        if len(tail) == 2:
+            captured.append(float(tail[1]))
+
+    return captured, cb
+
+
+class TestMultiWindowTraining:
+    """K > 1 behavioural tests: trains successfully on long sequences,
+    downgrades gracefully on short ranges, still skips pad-only batches,
+    works with distillation and precomputed shards."""
+
+    def test_k4_long_sequence_trains(self, tmp_path):
+        import random
+
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(11)
+        mx.random.seed(11)
+        captured, cb = _capture_losses()
+
+        prepare_dflash_draft(
+            model_path=tmp_path,
+            steps=8,
+            batch_size=2,
+            seq_len=128,
+            block_size=4,
+            num_hidden_layers=2,
+            num_target_layers=2,
+            train_windows_per_step=4,
+            _target_loader=_mock_target_loader(
+                vocab_size=64, hidden_size=16, num_layers=4
+            ),
+            _batch_iterator=_synthetic_batches(
+                vocab=64, batch_size=2, seq_len=128, n=8
+            ),
+            progress_callback=cb,
+            log_every=1,
+        )
+
+        # All 8 optimizer steps ran (K windows per step are folded into
+        # one optimizer.update — step count is unchanged from K=1).
+        assert len(captured) == 8
+        # Finite, positive, no NaN.
+        assert all(0 < x < 100 and x == x for x in captured)
+        # Sanity: K=4 with a synthetic learnable-structure dataset
+        # shouldn't make loss diverge wildly relative to early steps.
+        first_avg = sum(captured[:2]) / 2
+        last_avg = sum(captured[-2:]) / 2
+        assert last_avg <= first_avg * 1.5, (
+            f"loss got dramatically worse: first={first_avg} last={last_avg}"
+        )
+
+    def test_k4_downgrades_on_short_range_no_skip(self, tmp_path):
+        """When the valid range can't fit K non-overlapping windows,
+        the sampler caps to max_fit and the loop still produces a
+        real gradient update — no exception, no skip increment.
+
+        seq_len=24, block_size=4 → range_size=24-2*4=16 → max_fit=16//5=3.
+        K=4 requested → 3 windows used. The synthetic tokenizer has
+        pad_token_id=0 and synthetic tokens stay in [1, 63), so this
+        runs through the pad-aware ``_select_pivots`` branch with no
+        actual padding present; a separate test exercises the
+        explicit pad-aware downgrade log on data that does carry pad.
+        """
+        import random
+
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(11)
+        mx.random.seed(11)
+
+        def short_batches():
+            for i in range(3):
+                offsets = mx.arange(24, dtype=mx.int32) + i
+                per_row = mx.arange(2, dtype=mx.int32)[:, None] * 7
+                yield (offsets[None, :] + per_row) % 63 + 1
+
+        captured, cb = _capture_losses()
+
+        prepare_dflash_draft(
+            model_path=tmp_path,
+            steps=3,
+            batch_size=2,
+            seq_len=24,
+            block_size=4,
+            num_hidden_layers=2,
+            num_target_layers=2,
+            train_windows_per_step=4,
+            _target_loader=_mock_target_loader(
+                vocab_size=64, hidden_size=16, num_layers=4
+            ),
+            _batch_iterator=short_batches(),
+            progress_callback=cb,
+            log_every=1,
+        )
+
+        # All 3 steps completed despite the downgrade.
+        assert len(captured) == 3
+        assert all(0 < x < 100 and x == x for x in captured)
+
+    def test_k4_downgrade_logs_on_pad_aware_path(self, tmp_path, caplog):
+        """Pad-aware downgrade emits a debug log identifying the cap.
+
+        The synthetic test fixture (_MockTokenizer.pad_token_id=0,
+        eos_token_id=1) gives ``pad_for_pivot=0`` and ``pad_for_loss=0``
+        (the two ids are distinct), so the ``_select_pivots`` branch
+        runs. Build batches whose unpadded prefix accommodates fewer
+        than 4 non-overlapping windows. block_size=4, real_len=24 →
+        range_size=16 → max_fit=3.
+        """
+        import logging
+        import random
+
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(11)
+        mx.random.seed(11)
+
+        def short_batches_with_pad():
+            for i in range(3):
+                # rows of 24 real tokens (in [2, 63]) followed by 8 pad (0).
+                offsets = mx.arange(24, dtype=mx.int32) + i
+                real = offsets[None, :] % 62 + 2
+                real = mx.broadcast_to(real, (2, 24))
+                pad = mx.zeros((2, 8), dtype=mx.int32)
+                yield mx.concatenate([real, pad], axis=1)
+
+        with caplog.at_level(logging.DEBUG, logger="olmlx.engine.dflash.prepare"):
+            prepare_dflash_draft(
+                model_path=tmp_path,
+                steps=3,
+                batch_size=2,
+                seq_len=32,
+                block_size=4,
+                num_hidden_layers=2,
+                num_target_layers=2,
+                train_windows_per_step=4,
+                _target_loader=_mock_target_loader(
+                    vocab_size=64, hidden_size=16, num_layers=4
+                ),
+                _batch_iterator=short_batches_with_pad(),
+                log_every=1,
+            )
+
+        downgrade_msgs = [
+            r.message for r in caplog.records if "shared prefix too short" in r.message
+        ]
+        assert downgrade_msgs, (
+            "Expected at least one downgrade log message; got: "
+            + str([r.message for r in caplog.records])
+        )
+
+    def test_k4_pad_only_batches_still_skip(self, tmp_path, caplog):
+        """All-pad batches with K > 1 still trigger the consecutive-skip
+        guard. With steps=3 the skip ceiling is min(3*2+50, 500) = 56,
+        and the iterator yields 200 all-pad batches — so the
+        consecutive-skip abort path is what fires (the alternate
+        "stream exhausted before steps" path can't happen with this
+        configuration). Asserting that specific message catches
+        regressions where the skip counter stops incrementing but the
+        loop still falls through to the no-gradient-steps warning.
+        """
+        import logging
+        import random
+
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(11)
+        mx.random.seed(11)
+
+        def all_pad():
+            for _ in range(200):
+                yield mx.zeros((2, 32), dtype=mx.int32)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.dflash.prepare"):
+            prepare_dflash_draft(
+                model_path=tmp_path,
+                steps=3,
+                batch_size=2,
+                seq_len=32,
+                block_size=4,
+                num_hidden_layers=2,
+                num_target_layers=2,
+                train_windows_per_step=4,
+                _target_loader=_mock_target_loader(
+                    vocab_size=64, hidden_size=16, num_layers=4
+                ),
+                _batch_iterator=all_pad(),
+                log_every=1,
+            )
+
+        skip_aborts = [
+            r.message for r in caplog.records if "consecutive batches" in r.message
+        ]
+        assert skip_aborts, "Expected consecutive-skip abort warning; got: " + str(
+            [r.message for r in caplog.records]
+        )
+
+    def test_k4_with_distill(self, tmp_path):
+        """Distillation × K=4: target logits captured once per batch,
+        sliced K times, loss combines CE + KL per window then averages."""
+        import random
+
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(11)
+        mx.random.seed(11)
+        captured, cb = _capture_losses()
+
+        prepare_dflash_draft(
+            model_path=tmp_path,
+            steps=4,
+            batch_size=2,
+            seq_len=128,
+            block_size=4,
+            num_hidden_layers=2,
+            num_target_layers=2,
+            train_windows_per_step=4,
+            distill=True,
+            distill_alpha=0.5,
+            distill_temp=2.0,
+            _target_loader=_mock_target_loader(
+                vocab_size=64, hidden_size=16, num_layers=4
+            ),
+            _batch_iterator=_synthetic_batches(
+                vocab=64, batch_size=2, seq_len=128, n=4
+            ),
+            progress_callback=cb,
+            log_every=1,
+        )
+
+        assert len(captured) == 4
+        assert all(0 < x < 100 and x == x for x in captured)
+
+    def test_k4_with_precomputed_tuples(self, tmp_path, monkeypatch):
+        """Precomputed-shard tuple batches × K=4: hidden state passed
+        in directly, K windows slice independently from the same
+        full-length tensor. Monkey-patches ``_capture_target_outputs``
+        to assert the online target forward is NOT called on the
+        precomputed path — a regression that silently re-ran the
+        target while still consuming the tuple would otherwise pass
+        the loose loss-bound check.
+        """
+        import random
+
+        from olmlx.engine.dflash import prepare as prepare_mod
+        from olmlx.engine.dflash.prepare import prepare_dflash_draft
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        random.seed(11)
+        mx.random.seed(11)
+
+        capture_calls = {"count": 0}
+
+        def _no_target_forward(*_args, **_kwargs):
+            capture_calls["count"] += 1
+            raise AssertionError(
+                "_capture_target_outputs was called on the precomputed path; "
+                "the trainer should have consumed the (input_ids, hidden) tuple "
+                "without running the target forward."
+            )
+
+        monkeypatch.setattr(prepare_mod, "_capture_target_outputs", _no_target_forward)
+
+        def tuple_batches():
+            for i in range(4):
+                offsets = mx.arange(128, dtype=mx.int32) + i
+                per_row = mx.arange(2, dtype=mx.int32)[:, None] * 7
+                input_ids = (offsets[None, :] + per_row) % 62 + 1
+                # Concat hidden size = num_target_layers * target_hidden_size
+                # = 2 * 16 = 32.
+                hidden = mx.random.normal(shape=(2, 128, 32), dtype=mx.float32)
+                yield (input_ids, hidden)
+
+        captured, cb = _capture_losses()
+
+        prepare_dflash_draft(
+            model_path=tmp_path,
+            steps=4,
+            batch_size=2,
+            seq_len=128,
+            block_size=4,
+            num_hidden_layers=2,
+            num_target_layers=2,
+            train_windows_per_step=4,
+            _target_loader=_mock_target_loader(
+                vocab_size=64, hidden_size=16, num_layers=4
+            ),
+            _batch_iterator=tuple_batches(),
+            progress_callback=cb,
+            log_every=1,
+        )
+
+        assert capture_calls["count"] == 0
+        assert len(captured) == 4
+        assert all(0 < x < 100 and x == x for x in captured)
 
 
 # ---------------------------------------------------------------------------
