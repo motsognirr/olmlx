@@ -220,10 +220,11 @@ class PromptCacheStore:
         evicted: CachedPromptState | None = None
         evicted_id: str | None = None
         if len(self._entries) >= self._max_slots:
-            evicted_id, evicted = self._entries.popitem(last=False)
-            self._radix.remove(evicted.tokens, evicted_id)
-            self.metrics.bytes_in_ram -= _estimate_state_bytes(evicted)
+            popped_id, popped_state = self._entries.popitem(last=False)
+            self._radix.remove(popped_state.tokens, popped_id)
+            self.metrics.bytes_in_ram -= _estimate_state_bytes(popped_state)
             self.metrics.evictions_ram += 1
+            evicted_id, evicted = popped_id, popped_state
         self._entries[cache_id] = state
         self._radix.insert(state.tokens, cache_id)
         self.metrics.bytes_in_ram += _estimate_state_bytes(state)
