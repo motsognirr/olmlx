@@ -1409,14 +1409,17 @@ class TestMultiWindowTraining:
             f"loss got dramatically worse: first={first_avg} last={last_avg}"
         )
 
-    def test_k4_downgrades_on_short_range_no_pad(self, tmp_path):
-        """No-pad inline branch: when the valid range can't fit K
-        non-overlapping windows, the inline sampler caps to max_fit
-        and the loop still produces a real gradient update — no
-        exception, no skip increment.
+    def test_k4_downgrades_on_short_range_no_skip(self, tmp_path):
+        """When the valid range can't fit K non-overlapping windows,
+        the sampler caps to max_fit and the loop still produces a
+        real gradient update — no exception, no skip increment.
 
         seq_len=24, block_size=4 → range_size=24-2*4=16 → max_fit=16//5=3.
-        K=4 requested → 3 windows used.
+        K=4 requested → 3 windows used. The synthetic tokenizer has
+        pad_token_id=0 and synthetic tokens stay in [1, 63), so this
+        runs through the pad-aware ``_select_pivots`` branch with no
+        actual padding present; a separate test exercises the
+        explicit pad-aware downgrade log on data that does carry pad.
         """
         from olmlx.engine.dflash.prepare import prepare_dflash_draft
 
