@@ -2,3 +2,7 @@
 
 Issue #365.
 """
+
+from olmlx.engine.prompt_cache.state import CachedPromptState
+
+__all__ = ["CachedPromptState"]

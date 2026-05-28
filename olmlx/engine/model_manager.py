@@ -21,6 +21,7 @@ from olmlx.config import resolve_experimental, settings
 from olmlx.engine.registry import ModelRegistry, ResolvedFlashConfig, SpeculativeConfig
 from olmlx.utils import memory as memory_utils
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
+from olmlx.engine.prompt_cache import CachedPromptState
 
 if TYPE_CHECKING:
     from olmlx.models.store import ModelStore
@@ -384,14 +385,6 @@ class ActiveRequestsError(RuntimeError):
     to exactly this condition. Without it, an unrelated ``RuntimeError``
     from ``_close_loaded_model`` would be misreported as 409.
     """
-
-
-@dataclass
-class CachedPromptState:
-    """KV cache state from a previous generation, for prompt cache reuse."""
-
-    tokens: list[int]  # Full sequence: prompt + generated tokens
-    cache: list[Any]  # Per-layer KV cache objects (mutated in-place by generate_step)
 
 
 class PromptCacheStore:
