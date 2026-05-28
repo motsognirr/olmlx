@@ -59,12 +59,14 @@ class PromptCacheStore:
         disk_path: Path | None = None,
         model_name: str = "",
         disk_max_bytes: int | None = None,
+        ram_budget_bytes: int | None = None,
     ) -> None:
         self._max_slots = max_slots
         self._entries: OrderedDict[str, CachedPromptState] = OrderedDict()
         self._disk_path = disk_path
         self._model_name = model_name.replace("/", "--")
         self._disk_max_bytes = disk_max_bytes
+        self._ram_budget_bytes = ram_budget_bytes
         self._evict_generation = 0  # bumped by async_evict_all_to_disk
         self._radix = PrefixCacheIndex()
         self.metrics = CacheMetrics()
@@ -230,6 +232,23 @@ class PromptCacheStore:
         self.metrics.bytes_in_ram += _estimate_state_bytes(state)
         return evicted_id, evicted
 
+    def _enforce_ram_budget(self) -> list[tuple[str, CachedPromptState]]:
+        """Evict LRU entries until bytes_in_ram <= ram_budget_bytes.
+
+        Returns the list of (cache_id, state) tuples that were evicted,
+        for the caller to spill to disk if applicable.
+        """
+        evicted: list[tuple[str, CachedPromptState]] = []
+        if self._ram_budget_bytes is None:
+            return evicted
+        while self._entries and self.metrics.bytes_in_ram > self._ram_budget_bytes:
+            cache_id, state = self._entries.popitem(last=False)
+            self._radix.remove(state.tokens, cache_id)
+            self.metrics.bytes_in_ram -= _estimate_state_bytes(state)
+            self.metrics.evictions_ram += 1
+            evicted.append((cache_id, state))
+        return evicted
+
     def set(self, cache_id: str, state: CachedPromptState) -> CachedPromptState | None:
         """Set a cache entry, evicting LRU if at capacity.
 
@@ -240,6 +259,9 @@ class PromptCacheStore:
         evicted_id, evicted = self._set_in_memory(cache_id, state)
         if evicted_id is not None and evicted is not None:
             self._save_to_disk(evicted_id, evicted)
+        # Byte-budget overflow → additional evictions
+        for over_id, over_state in self._enforce_ram_budget():
+            self._save_to_disk(over_id, over_state)
         return evicted
 
     def remove(self, cache_id: str) -> None:
@@ -383,6 +405,8 @@ class PromptCacheStore:
         evicted_id, evicted = self._set_in_memory(cache_id, state)
         if evicted_id is not None and evicted is not None:
             await asyncio.to_thread(self._save_to_disk, evicted_id, evicted)
+        for over_id, over_state in self._enforce_ram_budget():
+            await asyncio.to_thread(self._save_to_disk, over_id, over_state)
         return evicted
 
     async def async_evict_all_to_disk(self) -> None:

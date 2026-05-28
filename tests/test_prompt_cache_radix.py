@@ -333,3 +333,32 @@ class TestRadixFallbackInSetup:
         # No fallback → fresh prefill, A still there
         assert result.cache_read_tokens == 0
         assert store.peek("A") is not None
+
+
+class TestRamBudgetEviction:
+    def _state_with_bytes(self, tokens, nbytes):
+        layer = MagicMock()
+        layer.keys = MagicMock()
+        layer.keys.nbytes = nbytes
+        layer.values = MagicMock()
+        layer.values.nbytes = 0
+        return CachedPromptState(tokens=list(tokens), cache=[layer])
+
+    def test_byte_budget_evicts_extra_entries(self):
+        # Slot cap 10, byte budget 2500 bytes; entries are 1000 bytes each
+        store = PromptCacheStore(max_slots=10, ram_budget_bytes=2500)
+        store.set("a", self._state_with_bytes([1, 1, 1], 1000))
+        store.set("b", self._state_with_bytes([2, 2, 2], 1000))
+        store.set("c", self._state_with_bytes([3, 3, 3], 1000))
+        # 3000 bytes > 2500 → LRU (a) evicted
+        assert store.peek("a") is None
+        assert store.peek("b") is not None
+        assert store.peek("c") is not None
+        assert store.metrics.evictions_ram == 1
+
+    def test_no_budget_leaves_entries_alone(self):
+        store = PromptCacheStore(max_slots=10, ram_budget_bytes=None)
+        store.set("a", self._state_with_bytes([1], 10_000))
+        store.set("b", self._state_with_bytes([2], 10_000))
+        assert store.peek("a") is not None
+        assert store.peek("b") is not None

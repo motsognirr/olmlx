@@ -434,11 +434,13 @@ class LoadedModel:
                 if settings.prompt_cache_disk
                 else None
             )
+            ram_budget_bytes = int(settings.prompt_cache_ram_budget_gb * 1024**3)
             self.prompt_cache_store = PromptCacheStore(
                 max_slots=settings.prompt_cache_max_slots,
                 disk_path=disk_path,
                 model_name=self.name,
                 disk_max_bytes=disk_max_bytes,
+                ram_budget_bytes=ram_budget_bytes,
             )
 
     @property
