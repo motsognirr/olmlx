@@ -134,13 +134,18 @@ class PromptCacheStore:
             cache, metadata = load_prompt_cache(str(file_path), return_metadata=True)
             tokens = json.loads(metadata.get("tokens", "[]"))
             state = CachedPromptState(tokens=tokens, cache=cache)
-            # Store in memory via set() to respect max_slots capacity.
-            # Delete the evicted entry to release GPU buffers promptly.
+            # Store in memory via set() — respects max_slots AND
+            # _enforce_ram_budget. Delete the evicted entry to release
+            # GPU buffers promptly.
             evicted = self.set(cache_id, state)
             if evicted is not None:
                 del evicted
-            # Remove disk file only after set() succeeded
-            file_path.unlink(missing_ok=True)
+            # Remove disk file only if the entry is still in RAM. If
+            # the budget evicted it back to disk, the file at the same
+            # path was just rewritten by _save_to_disk inside set() —
+            # removing it here would lose the entry from both tiers.
+            if cache_id in self._entries:
+                file_path.unlink(missing_ok=True)
             logger.info(
                 "Restored cache '%s' from disk (%d tokens)",
                 cache_id,
@@ -394,8 +399,16 @@ class PromptCacheStore:
         # evicted_id is in neither memory nor disk.
         if evicted_id is not None and evicted is not None:
             await asyncio.to_thread(self._save_to_disk, evicted_id, evicted)
-        # Delete disk file only after successful insertion and eviction save
-        if disk_path is not None:
+        # The disk restore counts against the RAM byte budget; enforce
+        # it now so a chain of disk hits can't quietly blow the budget
+        # until the next write.
+        for over_id, over_state in self._enforce_ram_budget():
+            await asyncio.to_thread(self._save_to_disk, over_id, over_state)
+        # Only unlink the original disk file if the restored entry is
+        # still in RAM. If the budget evicted it back to disk, the file
+        # at the same path was just rewritten by _save_to_disk — removing
+        # it here would lose the entry from both tiers.
+        if disk_path is not None and cache_id in self._entries:
             await asyncio.to_thread(disk_path.unlink, True)
         self.metrics.cache_id_hits += 1
         return loaded
