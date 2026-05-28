@@ -14,10 +14,15 @@ class _TrieNode:
 class PrefixCacheIndex:
     """Trie over token IDs. Each terminal node maps to one cache_id.
 
-    Lookups return the deepest terminal that lies on the descent path of
-    the query tokens (longest-prefix match).
+    Lookups walk the query tokens as far as possible, then return any
+    reachable terminal in the subtree of the deepest visited node —
+    so a sibling whose stored sequence diverges past the shared prefix
+    is still found. The returned ``prefix_len`` is the descent depth
+    (the actual shared-prefix length), not the terminal's depth.
 
-    Complexity: insert/remove/find are O(len(tokens)) with O(1) per step.
+    Complexity: insert/remove are O(len(tokens)) with O(1) per step.
+    find_longest_prefix is O(len(tokens)) on the happy path plus a
+    bounded DFS into one subtree on divergence.
     """
 
     def __init__(self) -> None:

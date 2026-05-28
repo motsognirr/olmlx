@@ -424,8 +424,9 @@ class PromptCacheStore:
     ) -> tuple[str, CachedPromptState, int] | None:
         """Longest-prefix lookup against in-memory entries.
 
-        Returns (old_cache_id, state, prefix_len) or None if no terminal
-        on the descent path meets `min_prefix_tokens`.
+        Returns (old_cache_id, state, prefix_len) or None if no reachable
+        terminal meets `min_prefix_tokens`. The trie also surfaces sibling
+        entries whose stored sequence diverges past the shared prefix.
         """
         cache_id, depth = self._radix.find_longest_prefix(tokens)
         if cache_id is None or depth < min_prefix_tokens:

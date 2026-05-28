@@ -258,10 +258,11 @@ class TestRadixFallbackInSetup:
         lm = _make_lm_for_radix(store)
         gen_kwargs: dict = {}
 
-        with patch(
-            "olmlx.engine.inference.trim_prompt_cache", return_value=3
-        ), patch(
-            "olmlx.engine.inference.make_prompt_cache", return_value=[MagicMock()]
+        with (
+            patch("olmlx.engine.inference.trim_prompt_cache", return_value=3),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache", return_value=[MagicMock()]
+            ),
         ):
             result = await _setup_prompt_cache(
                 lm,
