@@ -116,6 +116,17 @@ class Settings(BaseSettings):
             description="Max upload size for /v1/audio/transcriptions (OLMLX_AUDIO_MAX_BYTES).",
         ),
     ] = 100 * 1024 * 1024
+    # Cross-request radix prefix cache (issue #365). When enabled, a
+    # cache_id miss falls back to a token-prefix lookup over the in-memory
+    # store; on hit, the matched entry is re-keyed to the new cache_id
+    # (takeover semantics — no KV copy). The old cache_id loses its entry.
+    prompt_cache_radix: bool = True
+    # Soft RAM byte budget for the in-memory tier. Best-effort estimate;
+    # slot count (prompt_cache_max_slots) is the hard cap.
+    prompt_cache_ram_budget_gb: Annotated[float, Field(gt=0)] = 8.0
+    # Below this token count, a radix-prefix hit falls back to fresh
+    # prefill rather than taking over a near-empty match.
+    prompt_cache_radix_min_prefix_tokens: Annotated[int, Field(ge=0)] = 256
     inference_queue_timeout: Annotated[float, Field(gt=0)] | None = 300.0
     inference_timeout: Annotated[float, Field(gt=0)] | None = None
     sync_mode: SyncMode = "full"
