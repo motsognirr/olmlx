@@ -101,6 +101,48 @@ async def test_transcription_srt(app_client):
 
 
 @pytest.mark.asyncio
+async def test_transcription_vtt(app_client):
+    with patch(
+        "olmlx.routers.audio.generate_transcription",
+        new_callable=AsyncMock,
+        return_value=RESULT,
+    ):
+        resp = await app_client.post(
+            "/v1/audio/transcriptions",
+            files=_file(),
+            data={"model": "whisper-turbo", "response_format": "vtt"},
+        )
+    assert resp.status_code == 200
+    assert "WEBVTT" in resp.text
+    assert "00:00:00.000 --> 00:00:02.500" in resp.text
+    assert "Hello world" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_transcription_param_passthrough(app_client):
+    with patch(
+        "olmlx.routers.audio.generate_transcription",
+        new_callable=AsyncMock,
+        return_value=RESULT,
+    ) as mock_tx:
+        resp = await app_client.post(
+            "/v1/audio/transcriptions",
+            files=_file(),
+            data={
+                "model": "whisper-turbo",
+                "language": "fr",
+                "prompt": "context here",
+                "temperature": "0.5",
+            },
+        )
+    assert resp.status_code == 200
+    _, kwargs = mock_tx.call_args
+    assert kwargs["language"] == "fr"
+    assert kwargs["prompt"] == "context here"
+    assert kwargs["temperature"] == 0.5
+
+
+@pytest.mark.asyncio
 async def test_transcription_unknown_format(app_client):
     resp = await app_client.post(
         "/v1/audio/transcriptions",
