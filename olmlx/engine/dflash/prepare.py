@@ -757,10 +757,8 @@ def prepare_dflash_draft(
     if position_decay_gamma is not None and position_decay_gamma <= 0:
         position_decay_gamma = None
     if train_windows_per_step < 1:
-        # train_windows_per_step == 0 would build an empty windows list
-        # once the training loop is multi-window-aware (Task 3), and
-        # the mean-over-K reduction would divide by zero; negative
-        # values are nonsensical.
+        # An empty windows list would divide by zero in the mean-over-K
+        # reduction; negative values are nonsensical.
         raise ValueError(
             f"train_windows_per_step must be >= 1, got {train_windows_per_step}"
         )
