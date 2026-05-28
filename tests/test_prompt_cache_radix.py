@@ -26,13 +26,34 @@ class TestPrefixCacheIndexInsertLookup:
     def test_single_entry_shorter_query(self):
         idx = PrefixCacheIndex()
         idx.insert([1, 2, 3], "a")
-        # No terminal at depth 2 → no match
-        assert idx.find_longest_prefix([1, 2]) == (None, 0)
+        # Query shares 2 tokens with the stored sequence; reachable
+        # terminal in the subtree wins — caller will trim back.
+        assert idx.find_longest_prefix([1, 2]) == ("a", 2)
 
     def test_no_overlap_returns_no_match(self):
         idx = PrefixCacheIndex()
         idx.insert([1, 2, 3], "a")
         assert idx.find_longest_prefix([9, 8, 7]) == (None, 0)
+
+    def test_sibling_branch_finds_subtree_terminal(self):
+        # Claude-Code-style case: A's terminal is past the divergence
+        # point, but the shared prefix should still be findable.
+        idx = PrefixCacheIndex()
+        idx.insert([1, 2, 3, 42, 43], "a")
+        # Sibling query diverges at depth 4 (42 vs 99); should still
+        # find "a" with prefix_len == 3.
+        assert idx.find_longest_prefix([1, 2, 3, 99, 100]) == ("a", 3)
+
+    def test_sibling_prefers_deeper_descent_terminal(self):
+        # If a shallow terminal lies on the descent path AND a deeper
+        # terminal sits in the subtree past the divergence, the deeper
+        # subtree terminal wins because it shares more tokens.
+        idx = PrefixCacheIndex()
+        idx.insert([1, 2], "shallow")
+        idx.insert([1, 2, 3, 4], "deep")
+        # Query diverges at depth 4; deepest visited node is at depth 3.
+        # Subtree below depth 3 contains "deep" → return ("deep", 3).
+        assert idx.find_longest_prefix([1, 2, 3, 99]) == ("deep", 3)
 
     def test_two_entries_sibling_branches(self):
         idx = PrefixCacheIndex()
@@ -68,7 +89,9 @@ class TestPrefixCacheIndexRemove:
         idx.insert([1, 2, 3, 7], "a")
         idx.insert([1, 2, 3, 8], "b")
         idx.remove([1, 2, 3, 7], "a")
-        assert idx.find_longest_prefix([1, 2, 3, 7, 9]) == (None, 0)
+        # "a"'s branch was pruned; query that diverges at depth 4 still
+        # shares [1,2,3] with "b" so returns ("b", 3).
+        assert idx.find_longest_prefix([1, 2, 3, 7, 9]) == ("b", 3)
         assert idx.find_longest_prefix([1, 2, 3, 8, 9]) == ("b", 4)
 
     def test_remove_deep_keeps_shallow_terminal(self):
@@ -219,37 +242,40 @@ class TestRadixFallbackInSetup:
         from olmlx.engine.inference import _setup_prompt_cache
 
         store = PromptCacheStore(max_slots=4)
-        shared_prompt = list(range(1, 1025))  # 1024 tokens
-        # Seed the store with cache_id="A": shared system prompt + completed turn.
-        # Simulates a previous request that processed a full conversation turn.
+        shared_prompt = list(range(1, 1025))  # 1024-token system prefix
+        # Seed "A": shared system prefix + a completed turn (user msg + reply).
+        # The terminal sits past the divergence point that "B" will create.
         seeded_tokens = shared_prompt + [42, 43, 44]  # 1027 tokens stored
         seeded = CachedPromptState(tokens=seeded_tokens, cache=[MagicMock()])
         store.set("A", seeded)
 
-        # New request "B" extends "A"'s stored tokens with a new user turn.
-        # This is the real Claude Code sibling case — same conversation history,
-        # new cache_id, new user message appended.
-        continuation_tokens = seeded_tokens + [99, 100]  # 1029 tokens total
+        # "B" arrives with the same system prefix but a different user turn.
+        # This is the Claude-Code-style branching case: shared system prompt,
+        # divergent next message. A's KV state should be taken over and
+        # trimmed back to the 1024-token shared prefix.
+        sibling_prompt_tokens = shared_prompt + [99, 100]  # 1026 tokens total
 
         lm = _make_lm_for_radix(store)
         gen_kwargs: dict = {}
 
         with patch(
+            "olmlx.engine.inference.trim_prompt_cache", return_value=3
+        ), patch(
             "olmlx.engine.inference.make_prompt_cache", return_value=[MagicMock()]
         ):
             result = await _setup_prompt_cache(
                 lm,
-                prompt=continuation_tokens,
+                prompt=sibling_prompt_tokens,
                 gen_kwargs=gen_kwargs,
-                prompt_tokens=continuation_tokens,
+                prompt_tokens=sibling_prompt_tokens,
                 cache_id="B",
             )
 
-        # Radix hit: prefix matched 1027 tokens, those tokens are reused.
+        # Radix hit: A's KV state trimmed back to the 1024-token shared prefix.
         assert result.cache_read_tokens >= 1024
-        # Only the 2-token new user turn needs prefilling.
-        assert result.cache_creation_tokens <= 3
-        # Takeover: "A" gone (taken over then removed for mid-gen safety).
+        # Only the 2-token divergent user turn needs prefilling.
+        assert result.cache_creation_tokens <= 2
+        # Takeover: "A" gone (entry transferred to "B").
         assert store.peek("A") is None
         # KV state wired into gen_kwargs so mlx-lm reuses it.
         assert "prompt_cache" in gen_kwargs

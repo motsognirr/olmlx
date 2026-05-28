@@ -38,23 +38,45 @@ class PrefixCacheIndex:
         node.terminal_cache_id = cache_id
 
     def find_longest_prefix(self, tokens: list[int]) -> tuple[str | None, int]:
-        """Walk the trie matching tokens, return the deepest terminal seen.
+        """Walk the trie matching tokens, return any cache_id reachable
+        from the deepest visited node.
 
-        Returns (cache_id, prefix_len) or (None, 0) if no terminal lies on
-        the descent path.
+        The shared prefix length is the depth of the deepest visited
+        node — not the depth of the returned terminal. A stored
+        ``[1, 2, 3, 4, 5]`` (terminal at depth 5) and a query
+        ``[1, 2, 3, 9]`` share three tokens; this returns the stored
+        cache_id with ``prefix_len == 3`` so the caller can take it
+        over and trim its KV cache back to align.
+
+        Returns ``(None, 0)`` only when the query has no token in
+        common with anything stored.
         """
         node = self._root
-        best_id: str | None = None
-        best_depth = 0
+        deepest_node = node
+        deepest_depth = 0
         for depth, tok in enumerate(tokens, start=1):
             child = node.children.get(tok)
             if child is None:
                 break
             node = child
-            if node.terminal_cache_id is not None:
-                best_id = node.terminal_cache_id
-                best_depth = depth
-        return best_id, best_depth
+            deepest_node = node
+            deepest_depth = depth
+        if deepest_depth == 0:
+            return None, 0
+        # Prefer a terminal at the deepest visited node itself; otherwise
+        # any terminal in its subtree shares the same prefix-length with
+        # the query (the descent path), so DFS for one. The remove()
+        # pruning invariant guarantees a terminal exists somewhere below
+        # any non-leaf node.
+        if deepest_node.terminal_cache_id is not None:
+            return deepest_node.terminal_cache_id, deepest_depth
+        stack = [deepest_node]
+        while stack:
+            n = stack.pop()
+            if n.terminal_cache_id is not None:
+                return n.terminal_cache_id, deepest_depth
+            stack.extend(n.children.values())
+        return None, 0  # unreachable if pruning invariant holds
 
     def remove(self, tokens: list[int], cache_id: str) -> None:
         """Clear the terminal at the tokens path if it matches cache_id,
