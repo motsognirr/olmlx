@@ -4488,6 +4488,9 @@ class TestStorePromptCacheAfterGeneration:
         lm = MagicMock()
         lm.prompt_cache_store = MagicMock()
         lm.prompt_cache_store.async_set = AsyncMock(return_value=None)
+        # Ensure the checkpoint-path gate (Task 4.3) is disabled for these
+        # tests, which exercise the normal flat-cache storage path.
+        lm.uses_checkpoint_persistence = False
         return lm
 
     @pytest.mark.asyncio
