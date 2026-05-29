@@ -275,6 +275,18 @@ class Settings(BaseSettings):
             )
         return self
 
+    @property
+    def effective_load_budget_fraction(self) -> float:
+        """Fraction of system RAM a model's weights may occupy at load time.
+
+        Single source of truth shared by the model-load admission check and
+        the pre-load memory-pressure / idle-eviction trigger so the two never
+        drift: ``memory_limit_fraction`` minus the inference headroom reserve.
+        ``max(0.0, ...)`` is defensive — ``validate_inference_headroom``
+        already guarantees headroom < limit, so this is strictly positive.
+        """
+        return max(0.0, self.memory_limit_fraction - self.inference_headroom_fraction)
+
     @model_validator(mode="after")
     def validate_inference_headroom(self) -> "Settings":
         # The load budget is ``memory_limit_fraction - inference_headroom_fraction``.

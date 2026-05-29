@@ -3642,6 +3642,59 @@ class TestPreloadIdleModelEviction:
         assert "llama3:8b" in manager._loaded
         resident.active_refs = 0
 
+    @pytest.mark.asyncio
+    async def test_pressure_check_uses_effective_budget_fraction(
+        self, registry, mock_store, monkeypatch
+    ):
+        """The pre-load pressure/eviction trigger must use the same effective
+        budget (limit - headroom) as the admission check, not the raw limit.
+
+        Otherwise, with headroom configured, an idle model can leave Metal
+        below the raw limit but above the effective budget — the hygiene pass
+        skips eviction and the load is then rejected even though evicting the
+        idle model first would have made it fit.
+        """
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.memory_limit_fraction", 0.75
+        )
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.inference_headroom_fraction", 0.30
+        )
+        manager = ModelManager(registry, mock_store)
+
+        total_ram = 64 * self.GB
+        mem_before = 1 * self.GB
+        mem_after = int(total_ram * 0.40)  # under effective 0.45 budget
+
+        mock_pressure = MagicMock(return_value=False)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(MagicMock(), MagicMock(), False, TemplateCaps(), None),
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                side_effect=[mem_before, mem_after],
+            ),
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+            patch("olmlx.utils.memory.is_memory_pressure_high", mock_pressure),
+            patch("olmlx.engine.model_manager.gc.collect"),
+            patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
+        ):
+            await manager.ensure_loaded("qwen3")
+
+        assert mock_pressure.call_count >= 1
+        # Every pre-load pressure check uses the effective budget (0.45),
+        # not the raw memory_limit_fraction (0.75).
+        for call in mock_pressure.call_args_list:
+            assert call.args[0] == pytest.approx(0.45)
+
 
 class TestEnsureLoadedNotFoundSuggestions:
     @pytest.mark.asyncio

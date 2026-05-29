@@ -1358,7 +1358,14 @@ class ModelManager:
             # GPU allocations from a prior model pushes Metal into swap,
             # causing the sub-token-per-second thrashing documented in
             # issue #223.
-            if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+            # Trigger the pressure / eviction pass against the same effective
+            # budget the admission check uses (limit - headroom), not the raw
+            # limit. Otherwise, with headroom configured, an idle model can
+            # sit below the raw limit but above the effective budget — the
+            # hygiene pass would skip eviction and the load would then be
+            # rejected even though evicting that idle model first would fit.
+            budget = settings.effective_load_budget_fraction
+            if memory_utils.is_memory_pressure_high(budget):
                 logger.warning(
                     "Metal memory under pressure before loading %s; "
                     "flushing prompt caches to free GPU memory",
@@ -1415,9 +1422,7 @@ class ModelManager:
                 # clears or nothing idle remains — the "exclusive load" the
                 # issue asks for.  Models in active use are left alone (they
                 # cannot be freed); the load then proceeds with a warning.
-                pressure = memory_utils.is_memory_pressure_high(
-                    settings.memory_limit_fraction
-                )
+                pressure = memory_utils.is_memory_pressure_high(budget)
                 while pressure:
                     async with self._lock:
                         # Never evict ``normalized`` itself: a concurrent
@@ -1436,9 +1441,7 @@ class ModelManager:
                     await self._close_evictees([idle])
                     if not self._pending_cleanups:
                         await self._flush_metal()
-                    pressure = memory_utils.is_memory_pressure_high(
-                        settings.memory_limit_fraction
-                    )
+                    pressure = memory_utils.is_memory_pressure_high(budget)
 
                 if pressure:
                     logger.warning(
@@ -1542,11 +1545,8 @@ class ModelManager:
                     # decode — a model whose weights land just under the limit
                     # can still swap mid-generation (issue #223).  Default
                     # headroom 0.0 reproduces the legacy weights-only check.
-                    effective_fraction = max(
-                        0.0,
-                        settings.memory_limit_fraction
-                        - settings.inference_headroom_fraction,
-                    )
+                    # Same budget the pre-load eviction trigger uses (above).
+                    effective_fraction = settings.effective_load_budget_fraction
                     if total > 0 and mem_after > int(total * effective_fraction):
                         limit = int(total * effective_fraction)
                         model_mb = max(0, (mem_after - mem_before)) // (1024 * 1024)
