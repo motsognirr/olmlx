@@ -234,6 +234,34 @@ def _is_serializable_cache(cache: list) -> bool:
     )
 
 
+# KV-quant config string prefixes whose backing cache class stores an
+# ``mx.Dtype`` reference that ``copy.deepcopy`` (used by
+# ``snapshot_cache_for_persistence``) can't pickle.  See
+# ``_is_serializable_cache`` for the parallel class-level allowlist used
+# at the disk-save layer.  Centralised so a rename of either prefix is a
+# one-line update.
+_KV_QUANT_PREFIXES_BLOCKING_SNAPSHOT: tuple[str, ...] = (
+    "turboquant:",
+    "spectral:",
+)
+
+
+def _kv_quant_blocks_snapshot(kv_cache_quant: str | None) -> bool:
+    """True iff ``kv_cache_quant`` selects a quantization wrapper whose
+    layer state can't be deep-copied (the checkpoint path requirement).
+
+    Prefix-based because the probe constructs the bare (unquantized) cache
+    by design — see the comment on ``_probe_cache_capabilities`` — so we
+    can't check via ``isinstance`` like ``_is_serializable_cache`` does.
+    """
+    if kv_cache_quant is None:
+        return False
+    return any(
+        kv_cache_quant.startswith(prefix)
+        for prefix in _KV_QUANT_PREFIXES_BLOCKING_SNAPSHOT
+    )
+
+
 # mlx-lm cache classes whose `trim(n)` reliably removes exactly n tokens from
 # any offset (no silent under-delivery).  Class-name allowlist is authoritative
 # because `is_trimmable()` on a fresh (offset==0) cache cannot detect rotate
@@ -2104,15 +2132,11 @@ class ModelManager:
             # by ``snapshot_cache_for_persistence``) can't pickle —
             # mirrors the existing disk-save exclusion in
             # ``_is_serializable_cache``.
-            kv_quant_blocks_snapshot = lm.kv_cache_quant is not None and (
-                lm.kv_cache_quant.startswith("turboquant:")
-                or lm.kv_cache_quant.startswith("spectral:")
-            )
             lm.uses_checkpoint_persistence = (
                 ckpt_ok
                 and not trim_ok
                 and not lm.is_vlm
-                and not kv_quant_blocks_snapshot
+                and not _kv_quant_blocks_snapshot(lm.kv_cache_quant)
             )
             lm.supports_cache_trim = trim_ok
             lm.supports_cache_persistence = persist_ok or lm.uses_checkpoint_persistence
