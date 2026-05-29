@@ -60,8 +60,8 @@ A trie over token IDs. Each node is:
 ```python
 @dataclass
 class _TrieNode:
-    children: dict[int, "_TrieNode"]  # next token → child node
-    terminal_cache_id: str | None     # set on the leaf that owns this exact token-prefix
+    children: dict[int, "_TrieNode"]   # next token → child node
+    terminal_cache_ids: set[str]       # cache_ids that claim this exact token-prefix
 ```
 
 Public API:
@@ -70,15 +70,17 @@ Public API:
 class PrefixCacheIndex:
     def insert(self, tokens: list[int], cache_id: str) -> None: ...
     def remove(self, tokens: list[int], cache_id: str) -> None: ...
-    def find_longest_prefix(self, tokens: list[int]) -> tuple[str | None, int]:
-        """Return (cache_id_of_deepest_match, prefix_length)."""
+    def find_longest_prefix(
+        self, tokens: list[int], min_depth: int = 0
+    ) -> tuple[str | None, int]:
+        """Return (cache_id_of_match, prefix_length)."""
 ```
 
 Behaviour:
 
-- `insert`: walks/creates nodes for each token; sets `terminal_cache_id` on the final node. If a terminal already exists for a different cache_id at the same path (entries with identical token sequences), the new insert overwrites — practically impossible for distinct sessions, but defined for safety.
-- `find_longest_prefix`: descends matching `tokens`. Tracks the deepest node along the descent that has a non-None `terminal_cache_id`. Returns that cache_id and the depth at which it was found. Returns `(None, 0)` if no terminal was seen.
-- `remove`: walks to the leaf, clears its terminal marker, prunes upward until a node has either children or a terminal.
+- `insert`: walks/creates nodes for each token; adds `cache_id` to the terminal set at the final node. Multiple distinct entries with identical token sequences all stay reachable (set semantics, no clobbering).
+- `find_longest_prefix`: descends matching `tokens` to the deepest visited node, then returns any cache_id reachable from that node — either a terminal on the descent path or, if the descent ended on a non-terminal interior node, any terminal found via DFS in the subtree below. This catches the sibling case where a stored entry's terminal sits *past* the query's divergence point (e.g. shared system prompt, different next turn). The returned `prefix_len` is the descent depth, not the terminal's depth, so the caller knows how much of the query is shared and can trim the borrowed KV cache to align. `min_depth` short-circuits the subtree DFS and returns `(None, 0)` immediately when the descent ends below the caller's threshold — relevant for queries that only share a BOS token with a large stored subtree. Returns `(None, 0)` when nothing was matched.
+- `remove`: walks to the leaf, discards `cache_id` from the terminal set, prunes upward until a node has either children or a non-empty terminal set.
 
 Complexity: insert/remove/lookup are O(len(tokens)) with O(1) dict ops per step.
 

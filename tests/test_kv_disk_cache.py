@@ -380,6 +380,37 @@ class TestPromptCacheStoreEvictAllToDisk:
         store.clear_disk()
         assert store.metrics.bytes_on_disk == 0
 
+    def test_clear_disk_recomputes_metric_after_unlink_failure(self, tmp_path):
+        """clear_disk must not zero bytes_on_disk if an unlink failed
+        and a file is still on disk."""
+        store = PromptCacheStore(
+            max_slots=4,
+            disk_path=tmp_path,
+            model_name="test-model",
+        )
+        disk_dir = tmp_path / "test-model"
+        disk_dir.mkdir(parents=True)
+        (disk_dir / "kept.safetensors").write_bytes(b"x" * 100)
+        (disk_dir / "removed.safetensors").write_bytes(b"x" * 100)
+        store._cleanup_disk()
+        assert store.metrics.bytes_on_disk == 200
+
+        # Patch unlink so "kept" fails but "removed" succeeds.
+        real_unlink = Path.unlink
+
+        def fake_unlink(self_path, *args, **kwargs):
+            if self_path.name == "kept.safetensors":
+                raise OSError("simulated")
+            return real_unlink(self_path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", autospec=True, side_effect=fake_unlink):
+            removed = store.clear_disk()
+
+        # One file successfully removed, one survived.
+        assert removed == 1
+        # The metric must reflect the surviving file, not be zero.
+        assert store.metrics.bytes_on_disk == 100
+
     def test_bytes_on_disk_zero_after_clear(self, tmp_path):
         """clear() removes the disk directory; bytes_on_disk → 0."""
         store = PromptCacheStore(

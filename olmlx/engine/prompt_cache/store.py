@@ -326,7 +326,9 @@ class PromptCacheStore:
                 removed += 1
             except OSError:
                 logger.debug("Failed to remove stale disk cache %s", f, exc_info=True)
-        self.metrics.bytes_on_disk = 0
+        # Recompute rather than zero so any files that survived an
+        # unlink failure are still reflected in the metric.
+        self._refresh_disk_bytes()
         return removed
 
     def evict_all_to_disk(self) -> None:
