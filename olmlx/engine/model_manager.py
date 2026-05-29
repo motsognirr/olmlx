@@ -1123,6 +1123,32 @@ class ModelManager:
             evictees.append(self._loaded.pop(oldest_name))
         return evictees
 
+    def _pop_one_idle_lru(self, exclude: str | None = None) -> LoadedModel | None:
+        """Pop the oldest idle (``active_refs == 0``) model, or None if none.
+
+        Unlike :meth:`_pop_lru_evictees`, this is driven by memory pressure
+        rather than the ``max_loaded_models`` count, and never raises when
+        every model is active — it simply returns None so the caller can
+        stop evicting and proceed (a model in active use cannot be freed).
+
+        ``exclude`` names a model that must never be popped — the pressure
+        loop passes the model it is about to load so that a concurrent caller
+        which loaded the same model during the lock-release window (and whose
+        ``active_refs`` is still 0 until inference starts) is not closed out
+        from under it, which would also make this caller load a duplicate.
+
+        Must be called while holding ``self._lock``. The caller closes the
+        returned model via :meth:`_close_evictees` after releasing the lock
+        (same pop / close split as ``_pop_lru_evictees`` — issue #315).
+        """
+        idle = {
+            k: v for k, v in self._loaded.items() if v.active_refs == 0 and k != exclude
+        }
+        if not idle:
+            return None
+        oldest_name = min(idle, key=lambda k: idle[k].loaded_at)
+        return self._loaded.pop(oldest_name)
+
     async def _close_evictees(self, evictees: list[LoadedModel]) -> None:
         """Close popped evictees off the event loop. MUST NOT hold ``self._lock``.
 
@@ -1332,7 +1358,14 @@ class ModelManager:
             # GPU allocations from a prior model pushes Metal into swap,
             # causing the sub-token-per-second thrashing documented in
             # issue #223.
-            if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+            # Trigger the pressure / eviction pass against the same effective
+            # budget the admission check uses (limit - headroom), not the raw
+            # limit. Otherwise, with headroom configured, an idle model can
+            # sit below the raw limit but above the effective budget — the
+            # hygiene pass would skip eviction and the load would then be
+            # rejected even though evicting that idle model first would fit.
+            budget = settings.effective_load_budget_fraction
+            if memory_utils.is_memory_pressure_high(budget):
                 logger.warning(
                     "Metal memory under pressure before loading %s; "
                     "flushing prompt caches to free GPU memory",
@@ -1377,7 +1410,40 @@ class ModelManager:
                 # the matching guard at the _ensure_loaded pre-load path).
                 if not self._pending_cleanups:
                     await self._flush_metal()
-                if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+
+                # Flushing prompt caches frees KV buffers but leaves the
+                # resident models' *weights* in Metal.  When several models
+                # are kept resident (max_loaded_models > 1), those weights are
+                # what push Metal into swap once a new large model loads on
+                # top — the sub-token/sec thrash in issue #223.  Count-based
+                # eviction (_pop_lru_evictees) won't touch them because the
+                # count is still under the limit.  So if pressure persists,
+                # evict idle (active_refs == 0) models LRU-first until it
+                # clears or nothing idle remains — the "exclusive load" the
+                # issue asks for.  Models in active use are left alone (they
+                # cannot be freed); the load then proceeds with a warning.
+                pressure = memory_utils.is_memory_pressure_high(budget)
+                while pressure:
+                    async with self._lock:
+                        # Never evict ``normalized`` itself: a concurrent
+                        # caller may have loaded it during the lock-release
+                        # window (active_refs still 0), and closing it would
+                        # corrupt that caller and force a duplicate load here.
+                        idle = self._pop_one_idle_lru(exclude=normalized)
+                    if idle is None:
+                        break
+                    logger.warning(
+                        "Metal pressure persists; evicting idle model %s to "
+                        "make room for %s",
+                        idle.name,
+                        normalized,
+                    )
+                    await self._close_evictees([idle])
+                    if not self._pending_cleanups:
+                        await self._flush_metal()
+                    pressure = memory_utils.is_memory_pressure_high(budget)
+
+                if pressure:
                     logger.warning(
                         "Metal pressure persists after hygiene flush; "
                         "proceeding to load %s anyway — generation may "
@@ -1474,10 +1540,15 @@ class ModelManager:
                     # during generation that causes the abort.
                     mem_after = memory_utils.get_metal_memory()
                     total = memory_utils.get_system_memory_bytes()
-                    if total > 0 and mem_after > int(
-                        total * settings.memory_limit_fraction
-                    ):
-                        limit = int(total * settings.memory_limit_fraction)
+                    # Reserve headroom below the limit for the KV cache and
+                    # activations that allocate on top of the weights during
+                    # decode — a model whose weights land just under the limit
+                    # can still swap mid-generation (issue #223).  Default
+                    # headroom 0.0 reproduces the legacy weights-only check.
+                    # Same budget the pre-load eviction trigger uses (above).
+                    effective_fraction = settings.effective_load_budget_fraction
+                    if total > 0 and mem_after > int(total * effective_fraction):
+                        limit = int(total * effective_fraction)
                         model_mb = max(0, (mem_after - mem_before)) // (1024 * 1024)
                         total_mb = total // (1024 * 1024)
                         limit_mb = limit // (1024 * 1024)
@@ -1489,15 +1560,22 @@ class ModelManager:
                             model_mb,
                             mem_after // (1024 * 1024),
                             limit_mb,
-                            settings.memory_limit_fraction * 100,
+                            effective_fraction * 100,
                             total_mb,
+                        )
+                        headroom_note = (
+                            f" (includes a {settings.inference_headroom_fraction:.0%} "
+                            f"inference headroom reserve; lower "
+                            f"OLMLX_INFERENCE_HEADROOM_FRACTION to reclaim it)"
+                            if settings.inference_headroom_fraction > 0
+                            else ""
                         )
                         raise MemoryError(
                             f"Model '{normalized}' requires ~{model_mb} MB but the memory limit "
-                            f"is {limit_mb} MB ({settings.memory_limit_fraction:.0%} of "
-                            f"{total_mb} MB system RAM). Use a smaller/more quantized model, "
-                            f"or increase OLMLX_MEMORY_LIMIT_FRACTION (current: "
-                            f"{settings.memory_limit_fraction})."
+                            f"is {limit_mb} MB ({effective_fraction:.0%} of "
+                            f"{total_mb} MB system RAM){headroom_note}. Use a smaller/more "
+                            f"quantized model, or increase OLMLX_MEMORY_LIMIT_FRACTION "
+                            f"(current: {settings.memory_limit_fraction})."
                         )
 
                     # Memory check passed — register the model.

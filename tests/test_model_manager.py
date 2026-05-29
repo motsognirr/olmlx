@@ -3107,6 +3107,111 @@ class TestMemoryCheck:
         assert lm.name == "qwen3:latest"
 
     @pytest.mark.asyncio
+    async def test_inference_headroom_fraction_tightens_admission(
+        self, registry, mock_store, monkeypatch
+    ):
+        """inference_headroom_fraction reserves room below memory_limit_fraction.
+
+        A model whose weights land at 50% of RAM loads fine with no headroom
+        (50% < 75% limit), but must be rejected when 30% is reserved for the
+        KV cache / activations (effective limit 45% < 50%).  Issue #223: a
+        model that passes the static weights-only check can still swap during
+        decode because the KV cache allocates on top of the weights.
+        """
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.memory_limit_fraction", 0.75
+        )
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.inference_headroom_fraction",
+            0.30,
+            raising=False,
+        )
+        manager = ModelManager(registry, mock_store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        total_ram = 64 * self.GB
+        mem_before = 1 * self.GB
+        mem_after = int(total_ram * 0.50)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(mock_model, mock_tokenizer, False, TemplateCaps(), None),
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                side_effect=[mem_before, mem_after],
+            ),
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
+            patch("olmlx.engine.model_manager.gc.collect"),
+            patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
+        ):
+            with pytest.raises(MemoryError, match="memory limit"):
+                await manager.ensure_loaded("qwen3")
+
+        assert "qwen3:latest" not in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_inference_headroom_default_does_not_reject(
+        self, registry, mock_store, monkeypatch
+    ):
+        """With the default headroom (0.0), the admission check is unchanged.
+
+        A model at 50% of RAM loads fine under the 75% limit — the headroom
+        knob is opt-in and must not narrow the limit when left at its default.
+        """
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.memory_limit_fraction", 0.75
+        )
+        manager = ModelManager(registry, mock_store)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+
+        total_ram = 64 * self.GB
+        mem_before = 1 * self.GB
+        mem_after = int(total_ram * 0.50)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(mock_model, mock_tokenizer, False, TemplateCaps(), None),
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                side_effect=[mem_before, mem_after],
+            ),
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
+            patch("olmlx.engine.model_manager.gc.collect"),
+            patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
+        ):
+            lm = await manager.ensure_loaded("qwen3")
+
+        assert lm.name == "qwen3:latest"
+
+    @pytest.mark.asyncio
     async def test_memory_error_message_includes_guidance(self, registry, mock_store):
         """The error message should include actionable guidance."""
         manager = ModelManager(registry, mock_store)
@@ -3418,6 +3523,177 @@ class TestMemoryCheck:
         assert mock_clear.call_count == 2
         assert mock_sync.call_count == 2
         assert "qwen3:latest" not in manager._loaded
+
+
+class TestPreloadIdleModelEviction:
+    """Issue #223: under sustained memory pressure, the pre-load hygiene
+    pass must evict idle (active_refs == 0) resident models — not just their
+    prompt caches — so loading a new model on top of resident weights does
+    not push Metal into swap.  Only relevant when max_loaded_models > 1.
+    """
+
+    GB = 1024 * 1024 * 1024
+
+    @pytest.mark.asyncio
+    async def test_evicts_idle_model_when_pressure_persists(
+        self, registry, mock_store, monkeypatch
+    ):
+        """Prompt-cache flush isn't enough → evict the idle resident model."""
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 2)
+        manager = ModelManager(registry, mock_store)
+
+        # An idle model already resident, loaded earlier (clear LRU victim).
+        resident = LoadedModel(
+            name="llama3:8b",
+            hf_path="mlx-community/Llama-3-8B-Instruct",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["llama3:8b"] = resident
+
+        total_ram = 64 * self.GB
+        mem_before = 1 * self.GB
+        mem_after = int(total_ram * 0.50)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(MagicMock(), MagicMock(), False, TemplateCaps(), None),
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                side_effect=[mem_before, mem_after],
+            ),
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+            # Pressure persists through the prompt-cache flush, then clears
+            # once the idle model is evicted: outer guard, loop entry, then
+            # loop re-check / final check both report cleared.
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                side_effect=[True, True, False, False],
+            ),
+            patch("olmlx.engine.model_manager.gc.collect"),
+            patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
+        ):
+            lm = await manager.ensure_loaded("qwen3")
+
+        assert lm.name == "qwen3:latest"
+        assert "qwen3:latest" in manager._loaded
+        # The idle resident model must have been evicted to free its weights.
+        assert "llama3:8b" not in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_does_not_evict_active_model_under_pressure(
+        self, registry, mock_store, monkeypatch
+    ):
+        """A model serving requests (active_refs > 0) must not be evicted."""
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 2)
+        manager = ModelManager(registry, mock_store)
+
+        resident = LoadedModel(
+            name="llama3:8b",
+            hf_path="mlx-community/Llama-3-8B-Instruct",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            loaded_at=time.time() - 100,
+        )
+        resident.active_refs = 1  # in-flight request
+        manager._loaded["llama3:8b"] = resident
+
+        total_ram = 64 * self.GB
+        mem_before = 1 * self.GB
+        mem_after = int(total_ram * 0.50)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(MagicMock(), MagicMock(), False, TemplateCaps(), None),
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                side_effect=[mem_before, mem_after],
+            ),
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+            # Pressure stays high throughout — but the only resident model is
+            # active, so eviction can't help; the load proceeds anyway.
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=True,
+            ),
+            patch("olmlx.engine.model_manager.gc.collect"),
+            patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
+        ):
+            lm = await manager.ensure_loaded("qwen3")
+
+        assert lm.name == "qwen3:latest"
+        assert "qwen3:latest" in manager._loaded
+        # Active model survived.
+        assert "llama3:8b" in manager._loaded
+        resident.active_refs = 0
+
+    @pytest.mark.asyncio
+    async def test_pressure_check_uses_effective_budget_fraction(
+        self, registry, mock_store, monkeypatch
+    ):
+        """The pre-load pressure/eviction trigger must use the same effective
+        budget (limit - headroom) as the admission check, not the raw limit.
+
+        Otherwise, with headroom configured, an idle model can leave Metal
+        below the raw limit but above the effective budget — the hygiene pass
+        skips eviction and the load is then rejected even though evicting the
+        idle model first would have made it fit.
+        """
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.memory_limit_fraction", 0.75
+        )
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.inference_headroom_fraction", 0.30
+        )
+        manager = ModelManager(registry, mock_store)
+
+        total_ram = 64 * self.GB
+        mem_before = 1 * self.GB
+        mem_after = int(total_ram * 0.40)  # under effective 0.45 budget
+
+        mock_pressure = MagicMock(return_value=False)
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(MagicMock(), MagicMock(), False, TemplateCaps(), None),
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                side_effect=[mem_before, mem_after],
+            ),
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+            patch("olmlx.utils.memory.is_memory_pressure_high", mock_pressure),
+            patch("olmlx.engine.model_manager.gc.collect"),
+            patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
+        ):
+            await manager.ensure_loaded("qwen3")
+
+        assert mock_pressure.call_count >= 1
+        # Every pre-load pressure check uses the effective budget (0.45),
+        # not the raw memory_limit_fraction (0.75).
+        for call in mock_pressure.call_args_list:
+            assert call.args[0] == pytest.approx(0.45)
 
 
 class TestEnsureLoadedNotFoundSuggestions:
@@ -3812,6 +4088,48 @@ class TestEvictLruIfNeeded:
         manager._loaded["active"] = active
         with pytest.raises(RuntimeError, match="All loaded models are in use"):
             manager._pop_lru_evictees()
+
+    def test_pop_one_idle_lru_excludes_named_model(self, registry, mock_store):
+        """Pressure eviction must never pop the model we're about to load.
+
+        If a concurrent caller loads ``normalized`` during the lock-release
+        window it is idle (active_refs == 0) and could be the LRU victim;
+        evicting it would close a model the other caller just received and
+        cause this caller to load a duplicate.  ``exclude`` guards against it.
+        """
+        manager = ModelManager(registry, mock_store)
+        older = LoadedModel(
+            name="older",
+            hf_path="o/o",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            loaded_at=time.time() - 100,
+        )
+        newer = LoadedModel(
+            name="newer",
+            hf_path="n/n",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            loaded_at=time.time(),
+        )
+        manager._loaded["older"] = older
+        manager._loaded["newer"] = newer
+        # "older" is the LRU victim, but excluded → next idle model returned.
+        popped = manager._pop_one_idle_lru(exclude="older")
+        assert popped is newer
+        assert "newer" not in manager._loaded
+        assert "older" in manager._loaded
+
+    def test_pop_one_idle_lru_returns_none_when_only_excluded(
+        self, registry, mock_store
+    ):
+        manager = ModelManager(registry, mock_store)
+        only = LoadedModel(
+            name="only", hf_path="o/o", model=MagicMock(), tokenizer=MagicMock()
+        )
+        manager._loaded["only"] = only
+        assert manager._pop_one_idle_lru(exclude="only") is None
+        assert "only" in manager._loaded
 
     @pytest.mark.asyncio
     async def test_close_evictees_does_not_touch_gc_or_metal(

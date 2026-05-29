@@ -51,6 +51,39 @@ class TestSettings:
         with pytest.raises(ValidationError):
             Settings()
 
+    def test_inference_headroom_rejects_when_ge_limit(self, monkeypatch):
+        # headroom >= limit collapses the effective load budget to <= 0,
+        # which would silently fail every model load — reject at startup.
+        monkeypatch.setenv("OLMLX_MEMORY_LIMIT_FRACTION", "0.5")
+        monkeypatch.setenv("OLMLX_INFERENCE_HEADROOM_FRACTION", "0.75")
+        with pytest.raises(ValidationError, match="inference_headroom_fraction"):
+            Settings()
+
+    def test_inference_headroom_rejects_when_equal_limit(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_MEMORY_LIMIT_FRACTION", "0.5")
+        monkeypatch.setenv("OLMLX_INFERENCE_HEADROOM_FRACTION", "0.5")
+        with pytest.raises(ValidationError):
+            Settings()
+
+    def test_inference_headroom_below_limit_ok(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_MEMORY_LIMIT_FRACTION", "0.75")
+        monkeypatch.setenv("OLMLX_INFERENCE_HEADROOM_FRACTION", "0.1")
+        s = Settings()
+        assert s.inference_headroom_fraction == 0.1
+
+    def test_effective_load_budget_fraction(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_MEMORY_LIMIT_FRACTION", "0.75")
+        monkeypatch.setenv("OLMLX_INFERENCE_HEADROOM_FRACTION", "0.30")
+        s = Settings()
+        assert s.effective_load_budget_fraction == pytest.approx(0.45)
+
+    def test_effective_load_budget_fraction_default(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_MEMORY_LIMIT_FRACTION", "0.75")
+        monkeypatch.delenv("OLMLX_INFERENCE_HEADROOM_FRACTION", raising=False)
+        s = Settings()
+        # Default headroom 0.0 → effective equals the raw limit.
+        assert s.effective_load_budget_fraction == pytest.approx(0.75)
+
     def test_anthropic_models_default(self, monkeypatch):
         monkeypatch.delenv("OLMLX_ANTHROPIC_MODELS", raising=False)
         s = Settings()
