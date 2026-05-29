@@ -681,6 +681,36 @@ class TestModelConfig:
         mc = ModelConfig(hf_path="org/model", weight_quant="hqq:8")
         assert mc.resolved_weight_quant() == "hqq:8"
 
+    def test_enable_thinking_default_none(self):
+        """``enable_thinking`` defaults to None (engine default applies)."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model"})
+        assert mc.enable_thinking is None
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_enable_thinking_parsed(self, value):
+        """``enable_thinking`` parses bool from a dict entry."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model", "enable_thinking": value})
+        assert mc.enable_thinking is value
+
+    def test_enable_thinking_non_bool_rejected(self):
+        """Non-bool enable_thinking raises ValueError."""
+        with pytest.raises(ValueError, match="enable_thinking"):
+            ModelConfig.from_entry({"hf_path": "org/model", "enable_thinking": "yes"})
+
+    def test_enable_thinking_round_trip(self):
+        """``enable_thinking`` survives to_entry → from_entry."""
+        mc = ModelConfig(hf_path="org/model", enable_thinking=False)
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["enable_thinking"] is False
+        round_trip = ModelConfig.from_entry(entry)
+        assert round_trip.enable_thinking is False
+
+    def test_enable_thinking_compacts_when_none(self):
+        """A plain model with no overrides still serializes to a string."""
+        mc = ModelConfig(hf_path="org/model")
+        assert mc.to_entry() == "org/model"
+
 
 class TestRegistryModelConfig:
     def test_load_mixed_format(self, tmp_path, monkeypatch):

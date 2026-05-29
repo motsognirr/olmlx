@@ -513,6 +513,10 @@ class LoadedModel:
     inference_queue_timeout: float | None = None
     inference_timeout: float | None = None
     sync_mode: SyncMode | None = None
+    # Per-model default for the chat-template ``enable_thinking`` kwarg.
+    # ``generate_chat`` consults this when the request didn't set the
+    # flag.  None means defer to the engine default.
+    enable_thinking: bool | None = None
 
     def __post_init__(self):
         if self.prompt_cache_store is None:
@@ -1430,6 +1434,7 @@ class ModelManager:
                         inference_queue_timeout=model_config.inference_queue_timeout,
                         inference_timeout=model_config.inference_timeout,
                         sync_mode=model_config.sync_mode,
+                        enable_thinking=model_config.enable_thinking,
                     )
                     # Register before probe so concurrent callers see the
                     # model while the probe's async Metal flush releases the
