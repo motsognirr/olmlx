@@ -109,6 +109,50 @@ def test_drive_skips_segments_below_already_covered():
     assert suffix == [5]
 
 
+def test_tokenize_segmented_chat_accepts_extra_eom_boundaries():
+    """For templates like gpt-oss Harmony that inject a baseline
+    system/developer message, the EOM-boundary count exceeds the input
+    message count by 1+. The function must accept extras and treat them
+    as preamble segments rather than falling back to a single segment."""
+
+    class _HarmonyLikeTokenizer:
+        eos_token_id = 9
+        unk_token_id = None
+
+        def convert_tokens_to_ids(self, tok_str):
+            return None
+
+        def apply_chat_template(self, messages, **kwargs):
+            # Template emits: <PREAMBLE_ROLE 7> ... <EOM 9>, then the
+            # caller's messages each as <ROLE_TAG> ... <EOM 9>.
+            ROLE = {"system": 1, "user": 2, "assistant": 3}
+            out = [7, 100, 101, 9]  # preamble emitted by the template
+            for m in messages:
+                out.append(ROLE[m["role"]])
+                out.extend(ord(c) for c in m["content"])
+                out.append(9)
+            return out
+
+    tok = _HarmonyLikeTokenizer()
+    messages = [
+        {"role": "system", "content": "AB"},
+        {"role": "user", "content": "CD"},
+    ]
+    full = tok.apply_chat_template(messages)
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=list(full))
+    # 3 EOMs in `full`: one for the template-injected preamble plus one
+    # per caller message. Result: 3 segments.
+    assert len(sp.segments) == 3, (
+        f"expected 3 segments (1 preamble + 2 caller), got {len(sp.segments)}"
+    )
+    # The flatten() must still equal the input.
+    assert sp.flatten() == list(full)
+    # Preamble role takes the first caller-supplied role.
+    assert sp.segments[0].role == "system"
+    assert sp.segments[1].role == "system"  # caller's first message
+    assert sp.segments[2].role == "user"  # caller's second message
+
+
 def test_tokenize_segmented_chat_returns_one_segment_per_message():
     tok = _FakeTokenizer()
     messages = [
@@ -261,6 +305,45 @@ def test_message_boundary_token_ids_returns_empty_when_none():
         eos_token_id = None
 
     assert _message_boundary_token_ids(_NoEos()) == set()
+
+
+def test_message_boundary_token_ids_picks_up_harmony_end_token():
+    """For gpt-oss / Harmony format, eos_token_id is <|return|> (end of
+    generation, never in input prompts). The actual per-message marker
+    is <|end|>. The helper must include any known per-template marker
+    that the tokenizer can resolve to a real (non-UNK) token id."""
+
+    class _HarmonyTokenizer:
+        eos_token_id = 200002  # <|return|>
+        unk_token_id = None
+
+        def convert_tokens_to_ids(self, tok_str):
+            mapping = {
+                "<|end|>": 200007,
+                "<end_of_turn>": None,  # not present in this template
+            }
+            return mapping.get(tok_str)
+
+    ids = _message_boundary_token_ids(_HarmonyTokenizer())
+    assert ids == {200002, 200007}, (
+        f"expected eos + <|end|>, got {ids} — Harmony-format models won't "
+        f"see message boundaries without the extra lookup"
+    )
+
+
+def test_message_boundary_token_ids_skips_unk_lookups():
+    """Tokenizers return unk_token_id for unknown strings — these must
+    NOT pollute the boundary set."""
+
+    class _UnkReturningTokenizer:
+        eos_token_id = 9
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, _):
+            return self.unk_token_id
+
+    ids = _message_boundary_token_ids(_UnkReturningTokenizer())
+    assert ids == {9}, f"unk leaked into boundary set: {ids}"
 
 
 def test_tokenize_segmented_chat_falls_back_when_no_eos():
