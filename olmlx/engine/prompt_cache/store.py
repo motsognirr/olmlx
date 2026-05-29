@@ -164,6 +164,16 @@ class PromptCacheStore:
             self._refresh_disk_bytes()
             return None
 
+    def _unlink_and_refresh(self, file_path: Path) -> None:
+        """Unlink a disk cache file and refresh ``bytes_on_disk``.
+
+        Convenience helper for the async paths so both the unlink and
+        the directory-scan refresh happen in a single thread offload —
+        avoids blocking the event loop with the sync ``_refresh_disk_bytes``.
+        """
+        file_path.unlink(missing_ok=True)
+        self._refresh_disk_bytes()
+
     def _refresh_disk_bytes(self) -> None:
         """Recompute ``bytes_on_disk`` from a directory scan.
 
@@ -422,8 +432,7 @@ class PromptCacheStore:
             # Capture before any await — entries could be cleared during unlink
             existing = self._entries[cache_id]
             if disk_path is not None:
-                await asyncio.to_thread(disk_path.unlink, True)
-                self._refresh_disk_bytes()
+                await asyncio.to_thread(self._unlink_and_refresh, disk_path)
             self.metrics.cache_id_hits += 1
             return existing
         evicted_id, evicted = self._set_in_memory(cache_id, loaded)
@@ -441,8 +450,7 @@ class PromptCacheStore:
         # at the same path was just rewritten by _save_to_disk — removing
         # it here would lose the entry from both tiers.
         if disk_path is not None and cache_id in self._entries:
-            await asyncio.to_thread(disk_path.unlink, True)
-            self._refresh_disk_bytes()
+            await asyncio.to_thread(self._unlink_and_refresh, disk_path)
         self.metrics.cache_id_hits += 1
         return loaded
 

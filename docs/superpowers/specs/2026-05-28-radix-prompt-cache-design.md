@@ -94,18 +94,20 @@ New internal field: `_radix: PrefixCacheIndex`.
 
 Mutations stay in sync: every `_entries[cache_id] = state` is paired with `self._radix.insert(state.tokens, cache_id)`; every `_entries.pop(cache_id)` is paired with `self._radix.remove(state.tokens, cache_id)`. Disk-tier moves don't touch the radix — the radix indexes RAM only.
 
-New public method:
+New public methods:
 
 ```python
-async def async_find_by_prefix(
+def find_by_prefix(
     self,
     tokens: list[int],
     min_prefix_tokens: int,
 ) -> tuple[str, CachedPromptState, int] | None:
     """Longest-prefix lookup. Returns (old_cache_id, state, prefix_len) or None.
 
-    Caller is responsible for re-keying via takeover() if it intends
-    to use the result under a different cache_id.
+    Sync because the lookup is pure in-memory work (radix walk + dict
+    get); no disk I/O is involved, so wrapping it in async_* would only
+    add overhead. Caller is responsible for re-keying via takeover()
+    if it intends to use the result under a different cache_id.
     """
 ```
 
@@ -157,7 +159,7 @@ Current logic (`olmlx/engine/inference.py:2108`) unchanged through the cache_id 
 
 ```python
 if cached is None and settings.prompt_cache_radix and lm.supports_cache_persistence:
-    found = await lm.prompt_cache_store.async_find_by_prefix(
+    found = lm.prompt_cache_store.find_by_prefix(
         prompt_tokens,
         min_prefix_tokens=settings.prompt_cache_radix_min_prefix_tokens,
     )
@@ -202,7 +204,7 @@ New file `tests/test_prompt_cache_radix.py`:
 
 **Unit (store):**
 - `takeover`: state survives, new cache_id resolves, old cache_id is `None`.
-- `async_find_by_prefix`: returns the deepest-matching entry; respects `min_prefix_tokens`; returns `None` on empty store or under-threshold match.
+- `find_by_prefix`: returns the deepest-matching entry; respects `min_prefix_tokens`; returns `None` on empty store or under-threshold match.
 - Byte budget evicts LRU entry across the budget boundary; metrics increment.
 - Index invariant: after any sequence of set/remove/takeover, the trie's terminals exactly match the keys of `_entries`.
 
