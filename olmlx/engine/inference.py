@@ -2295,6 +2295,97 @@ def _drive_segmented_prefill(
     return [flat[-1]]
 
 
+def _cache_list_contains_lazy_state(cache: list[Any]) -> bool:
+    """True iff the cache contains layer types known to produce lazy
+    metal_kernel outputs that need eager mx.eval before cross-thread reuse.
+
+    Currently flags ArraysCache (used by hybrid SSM models like Qwen3.5).
+    Pure KVCache/QuantizedKVCache/RotatingKVCache layouts return False
+    because their .state arrays are produced by stock matmul/concat ops.
+    """
+    LAZY_STATE_CLASSES = {"ArraysCache"}
+    return any(type(layer).__name__ in LAZY_STATE_CLASSES for layer in cache)
+
+
+async def _setup_via_checkpoint_path(
+    lm: LoadedModel,
+    prompt: str | list[int],
+    gen_kwargs: dict,
+    *,
+    messages: list[dict],
+    tokenizer: Any,
+    prompt_tokens: list[int],
+) -> _CacheSetupResult:
+    """Checkpoint-mechanism path for non-trimmable cache layouts.
+
+    Tokenizes per-message, looks up a strict-prefix match in the prompt
+    cache store, drives prefill for the uncovered segments, and stores a
+    checkpoint at each boundary. Returns a _CacheSetupResult with prompt
+    reduced to the single token that mlx-lm's stream_generate needs to
+    seed its first decode step.
+    """
+    from olmlx.engine.prompt_cache.checkpoint import snapshot_cache_for_persistence
+
+    segmented = tokenize_segmented_chat(tokenizer, messages)
+    # Sanity: the per-message tokenization must reconstruct the same
+    # token sequence the caller already produced via the full template
+    # application. If not, the chat template is non-monotonic and the
+    # segmentation fallback in tokenize_segmented_chat collapsed to a
+    # single segment — fall through to a fresh cache via the flat path.
+    if segmented.flatten() != prompt_tokens:
+        logger.debug(
+            "Checkpoint path: per-message tokens do not match full template "
+            "(non-monotonic template); falling back to fresh cache"
+        )
+        new_cache = _make_prompt_cache_for_lm(lm)
+        gen_kwargs["prompt_cache"] = new_cache
+        return _CacheSetupResult(
+            prompt=prompt,
+            full_prompt_tokens=prompt_tokens,
+            cache_creation_tokens=len(prompt_tokens),
+            cache_setup_done=True,
+        )
+
+    # Look up the longest stored prefix that is a STRICT prefix of our tokens.
+    hit = lm.prompt_cache_store.fetch_nearest(prompt_tokens)
+    if hit is None:
+        # Cold start: build a fresh cache, drive ALL segments.
+        cache = _make_prompt_cache_for_lm(lm)
+        already_covered = 0
+    else:
+        # Warm start: deepcopy the stored snapshot (so subsequent
+        # mutation during drive doesn't corrupt the stored entry).
+        cached_state, _ = hit
+        cache = snapshot_cache_for_persistence(
+            cached_state.cache,
+            eager_eval=False,  # already materialized when stored
+        )
+        already_covered = len(cached_state.tokens)
+
+    # ArraysCache layers carry lazy metal_kernel graphs — pass
+    # eager_eval=True to the snapshot helper so the stored entry is
+    # thread-safe for the next request (#284).
+    needs_eager_eval = _cache_list_contains_lazy_state(cache)
+
+    suffix = _drive_segmented_prefill(
+        model=lm.model,
+        segmented=segmented,
+        cache=cache,
+        store=lm.prompt_cache_store,
+        eager_eval=needs_eager_eval,
+        already_covered_tokens=already_covered,
+    )
+
+    gen_kwargs["prompt_cache"] = cache
+    return _CacheSetupResult(
+        prompt=suffix,
+        full_prompt_tokens=prompt_tokens,
+        cache_read_tokens=already_covered,
+        cache_creation_tokens=max(0, len(prompt_tokens) - already_covered),
+        cache_setup_done=True,
+    )
+
+
 async def _setup_prompt_cache(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -2302,6 +2393,8 @@ async def _setup_prompt_cache(
     *,
     prompt_tokens: list[int] | None,
     cache_id: str,
+    messages: list[dict] | None = None,
+    tokenizer: Any = None,
 ) -> _CacheSetupResult:
     """Set up prompt cache for a streaming or non-streaming completion.
 
@@ -2331,6 +2424,25 @@ async def _setup_prompt_cache(
 
     if memory_too_high or prompt_tokens is None or make_prompt_cache is None:
         return result
+
+    # Checkpoint path — non-trimmable cache layouts (set by probe in
+    # Task 5.2). Drives prefill per message-segment and stores snapshots
+    # at each boundary into the prompt cache store. Closes #284 (ArraysCache
+    # via eager mx.eval) and #343 (RotatingKVCache via shorter-match lookup).
+    if (
+        lm.uses_checkpoint_persistence
+        and messages is not None
+        and tokenizer is not None
+        and not memory_too_high
+    ):
+        return await _setup_via_checkpoint_path(
+            lm,
+            prompt,
+            gen_kwargs,
+            messages=messages,
+            tokenizer=tokenizer,
+            prompt_tokens=prompt_tokens,
+        )
 
     # Cross-request prompt cache reuse is disabled for this model.  Two
     # families land here, both folded into supports_cache_persistence=False
@@ -2659,6 +2771,14 @@ async def _store_prompt_cache_after_generation(
     path handles their eventual discard when alignment requires a trim;
     this storage just keeps them alive for strict-extension cache hits.
     """
+    if lm.uses_checkpoint_persistence:
+        # Checkpoints already taken at boundaries during prefill by
+        # _drive_segmented_prefill. Storing the post-generation state
+        # would duplicate a longer entry that the next request's
+        # fetch_nearest can't realign without trim — exactly what the
+        # checkpoint path is designed to avoid.
+        return
+
     prompt_cache = gen_kwargs.get("prompt_cache")
     if prompt_cache is None or full_prompt_tokens is None:
         return
@@ -2843,6 +2963,8 @@ async def _stream_completion(
     keep_alive: str | None = None,
     grammar_active: bool = False,
     adopt_pin: bool = False,
+    messages: list[dict] | None = None,
+    tokenizer: Any = None,
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
@@ -2901,6 +3023,8 @@ async def _stream_completion(
                 gen_kwargs,
                 prompt_tokens=prompt_tokens,
                 cache_id=cache_id,
+                messages=messages,
+                tokenizer=tokenizer,
             )
         else:
             cs = _CacheSetupResult(prompt=prompt)
@@ -3227,6 +3351,8 @@ async def _full_completion(
     keep_alive: str | None = None,
     grammar_active: bool = False,
     adopt_pin: bool = False,
+    messages: list[dict] | None = None,
+    tokenizer: Any = None,
 ) -> dict:
     # inference_timeout is not enforced for non-streaming: the GPU thread
     # cannot be safely cancelled (releasing the lock while Metal is still
@@ -3260,6 +3386,8 @@ async def _full_completion(
                         gen_kwargs,
                         prompt_tokens=prompt_tokens,
                         cache_id=cache_id,
+                        messages=messages,
+                        tokenizer=tokenizer,
                     )
                     prompt = cs.prompt
                     cache_read_tokens = cs.cache_read_tokens
@@ -3779,6 +3907,8 @@ async def generate_chat(
                 keep_alive=keep_alive,
                 grammar_active=grammar_active,
                 adopt_pin=True,
+                messages=messages,
+                tokenizer=lm.tokenizer,
             )
             # Ownership of the pin transfers to the wrapper; its finally
             # releases on any generator exit. Mark the flag for the outer
@@ -3804,6 +3934,8 @@ async def generate_chat(
                     keep_alive=keep_alive,
                     grammar_active=grammar_active,
                     adopt_pin=True,
+                    messages=messages,
+                    tokenizer=lm.tokenizer,
                 )
                 # Mirror the streaming meta chunk so non-streaming routers
                 # can gate orphan `</think>` handling on the same signal

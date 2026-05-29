@@ -1,9 +1,16 @@
 """Tests for segment-aware tokenization and the segmented-prefill drive."""
 
+import asyncio
+
 import mlx.core as mx
 from mlx_lm.models.cache import KVCache
 
-from olmlx.engine.inference import _drive_segmented_prefill, tokenize_segmented_chat
+from olmlx.engine.inference import (
+    _drive_segmented_prefill,
+    _store_prompt_cache_after_generation,
+    tokenize_segmented_chat,
+)
+from olmlx.engine.model_manager import LoadedModel
 from olmlx.engine.prompt_cache.checkpoint import Segment, SegmentedPrompt
 from olmlx.engine.prompt_cache.store import PromptCacheStore
 
@@ -126,3 +133,80 @@ def test_tokenize_segmented_chat_flatten_matches_full_apply():
     sp = tokenize_segmented_chat(tok, messages)
     full = tok.apply_chat_template(messages)
     assert sp.flatten() == full
+
+
+def test_setup_prompt_cache_drives_segments_when_lm_uses_checkpoint_path(monkeypatch):
+    """When lm.uses_checkpoint_persistence is True and messages+tokenizer
+    are provided, _setup_prompt_cache routes through the checkpoint path
+    and the returned suffix is the one-token tail."""
+    from olmlx.engine import inference as inference_mod
+    from olmlx.engine.inference import _setup_prompt_cache
+
+    tok = _FakeTokenizer()
+    messages = [
+        {"role": "system", "content": "AB"},
+        {"role": "user", "content": "CD"},
+    ]
+    full_tokens = tok.apply_chat_template(messages)
+    model = _DummyModel()
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=model,
+        tokenizer=tok,
+        prompt_cache_store=PromptCacheStore(max_slots=4),
+        uses_checkpoint_persistence=True,
+        supports_cache_persistence=True,
+    )
+    # Patch _make_prompt_cache_for_lm to return a plain [KVCache()] for the
+    # dummy model (avoids needing a real mlx-lm model object).
+    monkeypatch.setattr(
+        inference_mod, "_make_prompt_cache_for_lm", lambda m: [KVCache()]
+    )
+    gen_kwargs: dict = {}
+    cs = asyncio.run(
+        _setup_prompt_cache(
+            lm,
+            "ignored",
+            gen_kwargs,
+            prompt_tokens=full_tokens,
+            cache_id="test",
+            messages=messages,
+            tokenizer=tok,
+        )
+    )
+    # Cold start: drive ran both segments, returned single-token suffix.
+    assert cs.cache_setup_done is True
+    assert isinstance(cs.prompt, list) and len(cs.prompt) == 1
+    assert cs.prompt[0] == full_tokens[-1]
+    assert gen_kwargs["prompt_cache"] is not None
+    assert cs.cache_read_tokens == 0
+    assert cs.cache_creation_tokens == len(full_tokens)
+
+
+def test_store_prompt_cache_after_generation_is_noop_for_checkpoint_path():
+    """With uses_checkpoint_persistence=True, the post-generation store
+    must not write to the cache store."""
+    store = PromptCacheStore(max_slots=4)
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=None,
+        tokenizer=None,
+        prompt_cache_store=store,
+        uses_checkpoint_persistence=True,
+    )
+    # Build a minimal call — only the early-return path is exercised, so
+    # most args can be no-ops.  The real signature uses gen_kwargs (not
+    # prompt_cache directly).
+    asyncio.run(
+        _store_prompt_cache_after_generation(
+            lm=lm,
+            gen_kwargs={"prompt_cache": [KVCache()]},
+            full_prompt_tokens=[1, 2, 3],
+            generated_tokens=[4],
+            eval_count=1,
+            cache_id="test",
+        )
+    )
+    assert len(store) == 0
