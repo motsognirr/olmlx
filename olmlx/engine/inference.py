@@ -11,7 +11,7 @@ import threading
 import time
 import weakref
 from collections.abc import AsyncGenerator
-from typing import Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import mlx.core as mx
 
@@ -23,6 +23,9 @@ from olmlx.engine.model_manager import (
 )
 from olmlx.config import SyncMode, settings
 from olmlx.utils import memory as memory_utils
+
+if TYPE_CHECKING:
+    from olmlx.engine.prompt_cache.checkpoint import SegmentedPrompt
 
 try:
     from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
@@ -1684,6 +1687,68 @@ def apply_chat_template_text(
         tokenize=False,
         enable_thinking=enable_thinking,
     )
+
+
+def tokenize_segmented_chat(
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    **template_kwargs: Any,
+) -> "SegmentedPrompt":
+    """Tokenize ``messages`` one-at-a-time so the resulting prompt is
+    split into per-message segments suitable for checkpoint snapshotting.
+
+    The token boundaries returned here MUST match what
+    ``tokenizer.apply_chat_template(messages)`` would produce if called
+    on the full list — otherwise downstream checkpoint snapshots would
+    be misaligned with the request's actual prefill. The implementation
+    enforces this by calling ``apply_chat_template`` on each successive
+    prefix of ``messages`` and taking the delta against the prior
+    prefix. This pays len(messages)+1 template applications, but the
+    cost is bounded (a few microseconds each) and is the only way to
+    correctly handle chat templates that insert role-dependent markers
+    or that emit different tokens depending on the trailing message.
+
+    Falls back to a single-segment prompt for templates that fail
+    cleanly under the empty-messages prefix (some templates require a
+    final user message).
+    """
+    from olmlx.engine.prompt_cache.checkpoint import Segment, SegmentedPrompt
+
+    if not messages:
+        return SegmentedPrompt(segments=[])
+
+    # Compute the full tokenization once — this is the ground truth.
+    full = tokenizer.apply_chat_template(messages, **template_kwargs)
+    # Then for each k in [1..len-1], tokenize the first-k prefix to find
+    # where the (k+1)-th segment starts. The first segment is everything
+    # up to the first split.
+    boundaries: list[int] = []
+    for k in range(1, len(messages)):
+        try:
+            prefix_tokens = tokenizer.apply_chat_template(
+                messages[:k], **template_kwargs
+            )
+        except Exception:
+            # Template rejected the partial prefix (e.g. needs a final user
+            # message). Bail out to a single segment covering everything.
+            return SegmentedPrompt(
+                segments=[Segment(tokens=list(full), role=messages[-1]["role"])]
+            )
+        # Sanity: the prefix tokens must be an actual prefix of the full
+        # tokenization. If not, the template is non-monotonic — fall back.
+        if list(full[: len(prefix_tokens)]) != list(prefix_tokens):
+            return SegmentedPrompt(
+                segments=[Segment(tokens=list(full), role=messages[-1]["role"])]
+            )
+        boundaries.append(len(prefix_tokens))
+    boundaries.append(len(full))
+
+    segments: list[Segment] = []
+    start = 0
+    for k, end in enumerate(boundaries):
+        segments.append(Segment(tokens=list(full[start:end]), role=messages[k]["role"]))
+        start = end
+    return SegmentedPrompt(segments=segments)
 
 
 def _normalize_tool_calls_in_messages(messages: list[dict]) -> list[dict]:
