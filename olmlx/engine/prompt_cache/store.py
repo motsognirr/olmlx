@@ -163,8 +163,10 @@ class PromptCacheStore:
             return None
 
     def _cleanup_disk(self) -> None:
-        """Remove oldest disk cache files if total size exceeds the limit."""
-        if self._disk_max_bytes is None or self._disk_path is None:
+        """Update the bytes_on_disk metric and, if a size cap is set,
+        remove oldest disk cache files until the total fits.
+        """
+        if self._disk_path is None:
             return
         disk_dir = self._disk_dir()
         if not disk_dir.exists():
@@ -176,12 +178,15 @@ class PromptCacheStore:
             file_info.append((f, st.st_size, st.st_mtime))
         file_info.sort(key=lambda x: x[2])  # sort by mtime
         total = sum(size for _, size, _ in file_info)
-        while total > self._disk_max_bytes and file_info:
-            path, size, _ = file_info.pop(0)
-            total -= size
-            path.unlink(missing_ok=True)
-            self.metrics.evictions_disk += 1
-            logger.info("Disk cache cleanup: removed %s", path)
+        if self._disk_max_bytes is not None:
+            while total > self._disk_max_bytes and file_info:
+                path, size, _ = file_info.pop(0)
+                total -= size
+                path.unlink(missing_ok=True)
+                self.metrics.evictions_disk += 1
+                logger.info("Disk cache cleanup: removed %s", path)
+        # Always record the post-cleanup total so /api/ps surfaces an
+        # accurate disk footprint even when no size cap is configured.
         self.metrics.bytes_on_disk = total
 
     def peek(self, cache_id: str) -> CachedPromptState | None:
@@ -472,7 +477,9 @@ class PromptCacheStore:
         cache_id, depth = self._radix.find_longest_prefix(
             tokens, min_depth=min_prefix_tokens
         )
-        if cache_id is None or depth < min_prefix_tokens:
+        # find_longest_prefix already returns (None, 0) for below-threshold
+        # descents, so a non-None cache_id always satisfies the threshold.
+        if cache_id is None:
             self.metrics.radix_misses += 1
             return None
         state = self._entries.get(cache_id)
@@ -504,11 +511,14 @@ class PromptCacheStore:
         # two calls cancel out exactly.
         self.metrics.bytes_in_ram -= _estimate_state_bytes(state)
         evicted_id, evicted = self._set_in_memory(new_cache_id, state)
-        if evicted_id is not None and evicted is not None:
-            # Caller doesn't expect a side-channel disk save here — it
-            # would mean the takeover destination collided with a third
-            # entry. Mirror set()'s behaviour for symmetry.
-            self._save_to_disk(evicted_id, evicted)
+        # The pop above freed a slot, so the subsequent insert cannot
+        # trigger an LRU eviction. A non-None evicted_id here would mean
+        # blocking disk I/O on the event loop — assert it can't happen
+        # rather than silently stalling.
+        assert evicted_id is None, (
+            "takeover triggered an unexpected LRU eviction; this would "
+            "block the event loop with sync disk I/O"
+        )
         return state
 
     def __len__(self) -> int:

@@ -356,6 +356,24 @@ class TestPromptCacheStoreEvictAllToDisk:
         # 80 bytes left under the 100-byte budget after cleanup
         assert store.metrics.bytes_on_disk == 80
 
+    def test_cleanup_disk_updates_bytes_without_size_cap(self, tmp_path):
+        """Regression for aider PR #391 follow-up: bytes_on_disk must
+        be reported even when no disk_max_bytes cap is configured."""
+        store = PromptCacheStore(
+            max_slots=4,
+            disk_path=tmp_path,
+            model_name="test-model",
+            disk_max_bytes=None,  # disk offload enabled, no cap
+        )
+        disk_dir = tmp_path / "test-model"
+        disk_dir.mkdir(parents=True)
+        for name in ("a", "b"):
+            (disk_dir / f"{name}.safetensors").write_bytes(b"x" * 80)
+        store._cleanup_disk()
+        # No eviction loop runs without a cap, but the metric must reflect reality.
+        assert store.metrics.evictions_disk == 0
+        assert store.metrics.bytes_on_disk == 160
+
     def test_evict_all_to_disk_entries_restorable(self, tmp_path):
         """Entries evicted to disk can be restored on next get()."""
         store = PromptCacheStore(
