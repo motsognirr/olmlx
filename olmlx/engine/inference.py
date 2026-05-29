@@ -2282,15 +2282,22 @@ def _drive_segmented_prefill(
         else:
             cursor = chunk_end
         # Snapshot the cache state at this boundary into the store.
-        snap = snapshot_cache_for_persistence(cache, eager_eval=eager_eval)
-        store.insert_checkpoint(
-            CachedPromptState(
-                tokens=flat[:boundary],
-                cache=snap,
-                cache_type=seg.role,
-                is_checkpoint=True,
+        # Skip the last boundary: the final segment withholds the trailing
+        # token for stream_generate (prefill_end == chunk_end - 1), so the
+        # KV depth here is len(flat)-1 but boundary == len(flat).  A snapshot
+        # with tokens=flat[:len(flat)] would claim N tokens but have KV state
+        # for only N-1, causing warm-start misalignment on any future request
+        # that is a strict extension of the full token sequence.
+        if boundary < len(flat):
+            snap = snapshot_cache_for_persistence(cache, eager_eval=eager_eval)
+            store.insert_checkpoint(
+                CachedPromptState(
+                    tokens=flat[:boundary],
+                    cache=snap,
+                    cache_type=seg.role,
+                    is_checkpoint=True,
+                )
             )
-        )
     # Return the last token as the suffix.
     return [flat[-1]]
 
@@ -2433,7 +2440,6 @@ async def _setup_prompt_cache(
         lm.uses_checkpoint_persistence
         and messages is not None
         and tokenizer is not None
-        and not memory_too_high
     ):
         return await _setup_via_checkpoint_path(
             lm,
@@ -2444,24 +2450,22 @@ async def _setup_prompt_cache(
             prompt_tokens=prompt_tokens,
         )
 
-    # Cross-request prompt cache reuse is disabled for this model.  Two
-    # families land here, both folded into supports_cache_persistence=False
-    # by _probe_cache_capabilities:
-    #   - Issue #284: hybrid SSM-style ArraysCache (Qwen3.5, Qwen3-Next
-    #     gated-delta layers) — loading the stored entry and feeding it to
-    #     mlx-lm would crash the next prefill with a Metal stream error.
-    #   - Issue #343: non-trimmable hybrid sliding-window layouts
-    #     (RotatingKVCache for Gemma 4, ChunkedKVCache for gpt-oss) — any
-    #     stored entry can't realign with the next request's retokenized
-    #     prompt, so the lookup always discards it; storing was pure waste.
-    # We never store for either family post-PR, so the only path to a stale
-    # entry is pre-PR data.  Skip the disk lookup entirely and clear any
-    # in-memory entry.  Gated on peek() so we don't pay a blocking
-    # unlink(ENOENT) syscall on every request.  Pre-PR on-disk files for
-    # non-persistable models can persist indefinitely — that's harmless
-    # because nothing reads from disk for these models — but they're
-    # cleaned up by the disk cache size eviction in PromptCacheStore
-    # eventually.
+    # Cross-request prompt cache reuse is disabled for this model.  The
+    # checkpoint path above handles the main non-trimmable families (#284
+    # ArraysCache, #343 RotatingKVCache).  What actually reaches here today:
+    #   - Issue #396: mixed RotatingKVCache + ArraysCache layouts (Qwen3-Next)
+    #     excluded by _EXCLUDED_MIXED_LAYER_PAIRS — pending upstream
+    #     composition work.
+    #   - Probe-failure models: _probe_cache_capabilities caught an exception
+    #     and set supports_cache_persistence=False as the safe fallback.
+    #   - Cache types not yet allowlisted by the probe.
+    # We never store for these models, so the only path to a stale entry is
+    # pre-PR data.  Skip the disk lookup entirely and clear any in-memory
+    # entry.  Gated on peek() so we don't pay a blocking unlink(ENOENT)
+    # syscall on every request.  Pre-PR on-disk files can persist
+    # indefinitely — that's harmless because nothing reads from disk for
+    # these models — but they're cleaned up by disk cache size eviction
+    # in PromptCacheStore eventually.
     if not lm.supports_cache_persistence:
         if lm.prompt_cache_store.peek(cache_id) is not None:
             lm.prompt_cache_store.remove(cache_id)
@@ -2765,11 +2769,19 @@ async def _store_prompt_cache_after_generation(
     Handles trimming to max_cache_tokens, eviction pressure cleanup,
     and cache invalidation on trim failure.
 
-    Non-trimmable hybrid caches (e.g. Gemma 4, Qwen3-Next with
-    RotatingKVCache layers) skip the trim path and are stored as-is
-    even when they exceed max_cache_tokens.  The pre-generation setup
-    path handles their eventual discard when alignment requires a trim;
-    this storage just keeps them alive for strict-extension cache hits.
+    Models routed through the checkpoint path (uses_checkpoint_persistence)
+    return immediately — boundary snapshots were already taken during prefill
+    by _drive_segmented_prefill.
+
+    What actually reaches the body here:
+      - Trimmable models (standard KVCache / QuantizedKVCache): the normal
+        trim-and-store path.
+      - Issue #396: mixed RotatingKVCache + ArraysCache layouts (Qwen3-Next)
+        excluded from the checkpoint path by _EXCLUDED_MIXED_LAYER_PAIRS.
+      - Probe-failure models (supports_cache_persistence=False): caught by
+        the early-return below, no storage occurs.
+      - Other non-trimmable layouts (supports_cache_trim=False) that are
+        persistable: stored as-is; strict-extension lookups reuse them.
     """
     if lm.uses_checkpoint_persistence:
         # Checkpoints already taken at boundaries during prefill by
@@ -2783,20 +2795,13 @@ async def _store_prompt_cache_after_generation(
     if prompt_cache is None or full_prompt_tokens is None:
         return
 
-    # Skip cross-request storage for any non-persistable model.  Two families
-    # land here, both folded into supports_cache_persistence=False by
-    # _probe_cache_capabilities:
-    #   - Issue #284: hybrid SSM-style models (Qwen3.5, Qwen3-Next gated-delta
-    #     layers using ArraysCache) — the next prefill would crash mlx-lm with
-    #     a Metal stream error.
-    #   - Issue #343: non-trimmable hybrid sliding-window layouts
-    #     (RotatingKVCache for Gemma 4, ChunkedKVCache for gpt-oss) — the
-    #     stored prompt+generated state can never realign with the next
-    #     request's retokenized prompt, so storage was pure waste.
-    # The next request will run a fresh prefill.  No remove() call here:
-    # _setup_prompt_cache already removed any stale entry at request setup
-    # time, and we never stored anything between then and now, so a second
-    # remove() would be a guaranteed no-op disk stat on the event loop.
+    # Skip cross-request storage for non-persistable models.  After the
+    # checkpoint-path port, the main #284 (ArraysCache) and #343
+    # (RotatingKVCache) families are handled via uses_checkpoint_persistence
+    # and return above.  What reaches here are probe-failure models and the
+    # #396 Qwen3-Next mixed layout (excluded from checkpoint path) whose
+    # _setup_prompt_cache already cleared any stale entry.  No remove() call
+    # needed: nothing was stored between setup and now.
     if not lm.supports_cache_persistence:
         logger.debug(
             "Cache not persistable (hybrid SSM/ArraysCache or non-trimmable "

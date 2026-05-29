@@ -184,6 +184,37 @@ def test_setup_prompt_cache_drives_segments_when_lm_uses_checkpoint_path(monkeyp
     assert cs.cache_creation_tokens == len(full_tokens)
 
 
+def test_drive_does_not_snapshot_last_segment_boundary():
+    """The last segment's KV depth is N-1 (the trailing token is reserved
+    for stream_generate); storing a checkpoint with tokens length N would
+    misalign future warm-starts (KV state would lag the claimed depth by 1)."""
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+    sp = SegmentedPrompt(
+        segments=[
+            Segment(tokens=[1, 2, 3], role="system"),
+            Segment(tokens=[4, 5], role="user"),
+        ]
+    )
+    cache = [KVCache()]
+    _drive_segmented_prefill(
+        model=model, segmented=sp, cache=cache, store=store, eager_eval=False
+    )
+    # System boundary (3 tokens) is snapshotted; last boundary (5 tokens) is not.
+    assert store.fetch_nearest([1, 2, 3, 99]) is not None, (
+        "system-boundary checkpoint must be present"
+    )
+    # A query whose prefix exactly matches the full flat tokens must NOT
+    # find a 5-token checkpoint — that would mean the bug is back.
+    hit = store.fetch_nearest([1, 2, 3, 4, 5, 99])
+    assert hit is not None
+    state, _ = hit
+    assert len(state.tokens) == 3, (
+        f"expected 3-token (system) checkpoint as deepest hit, got "
+        f"{len(state.tokens)}-token checkpoint — last-segment snapshot bug"
+    )
+
+
 def test_store_prompt_cache_after_generation_is_noop_for_checkpoint_path():
     """With uses_checkpoint_persistence=True, the post-generation store
     must not write to the cache store."""
