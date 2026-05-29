@@ -47,6 +47,15 @@ class TestEnsureConfig:
         assert data == existing
 
 
+def test_default_models_include_whisper():
+    from olmlx.cli import DEFAULT_MODELS
+
+    assert DEFAULT_MODELS["whisper-turbo:latest"] == (
+        "mlx-community/whisper-large-v3-turbo"
+    )
+    assert "whisper-large:latest" in DEFAULT_MODELS
+
+
 class TestBuildPlist:
     def test_plist_structure(self, monkeypatch):
         monkeypatch.setattr("olmlx.cli.shutil.which", lambda _: "/usr/local/bin/olmlx")

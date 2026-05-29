@@ -496,3 +496,18 @@ class TestDistributedTensorOnly:
 
     def test_tensor_strategy_accepted(self):
         assert Settings(distributed_strategy="tensor").distributed_strategy == "tensor"
+
+
+def test_audio_max_bytes_default():
+    from olmlx.config import Settings
+
+    s = Settings()
+    assert s.audio_max_bytes == 100 * 1024 * 1024
+
+
+def test_audio_max_bytes_env_override(monkeypatch):
+    monkeypatch.setenv("OLMLX_AUDIO_MAX_BYTES", "1048576")
+    from olmlx.config import Settings
+
+    s = Settings()
+    assert s.audio_max_bytes == 1048576

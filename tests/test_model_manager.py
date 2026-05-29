@@ -822,6 +822,43 @@ class TestDetectModelKind:
                 kind = manager._detect_model_kind("test/qwen2_vl")
         assert kind == "vlm"
 
+    def test_whisper_by_model_type(self, tmp_path, registry, mock_store):
+        config_path = self._make_config(tmp_path, {"model_type": "whisper"})
+        manager = self._make_manager(registry, mock_store)
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/whisper")
+        assert kind == "whisper"
+
+    def test_whisper_by_dims_without_model_type(self, tmp_path, registry, mock_store):
+        # mlx-community whisper repos ship a non-HF config.json with dims and
+        # no usable model_type (load_model pops it).
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "n_mels": 80,
+                "n_audio_ctx": 1500,
+                "n_audio_state": 384,
+                "n_audio_head": 6,
+                "n_audio_layer": 4,
+                "n_vocab": 51865,
+                "n_text_ctx": 448,
+                "n_text_state": 384,
+                "n_text_head": 6,
+                "n_text_layer": 4,
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/whisper-mlx")
+        assert kind == "whisper"
+
+    def test_llama_not_whisper(self, tmp_path, registry, mock_store):
+        config_path = self._make_config(tmp_path, {"model_type": "llama"})
+        manager = self._make_manager(registry, mock_store)
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/model")
+        assert kind == "text"
+
 
 class TestProbeCacheCapabilities:
     """Exercise _probe_cache_capabilities, including the probe-failure path
@@ -5423,3 +5460,84 @@ class TestSpectralAutoCalibrate:
         manager = ModelManager(registry, mock_store)
         with pytest.raises(AssertionError):
             manager._auto_calibrate_spectral("test/model", "turboquant:4")
+
+
+class TestWhisperLoad:
+    def test_load_model_whisper_branch(self, tmp_path, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
+        fake_whisper = MagicMock()
+        with (
+            patch.object(manager, "_detect_model_kind", return_value="whisper"),
+            patch(
+                "mlx_whisper.load_models.load_model", return_value=fake_whisper
+            ) as mock_load,
+        ):
+            model, tok, is_vlm, caps, spec = manager._load_model("test/whisper")
+        assert model is fake_whisper
+        assert tok is None
+        assert is_vlm is False
+        assert spec is None
+        mock_load.assert_called_once()
+
+    def test_probe_cache_skipped_for_whisper(self, registry, mock_store):
+        from olmlx.engine.model_manager import LoadedModel
+
+        manager = ModelManager(registry, mock_store)
+        lm = LoadedModel(
+            name="whisper:latest",
+            hf_path="test/whisper",
+            model=MagicMock(),
+            tokenizer=None,
+            is_whisper=True,
+        )
+        lm.supports_cache_trim = True
+        lm.supports_cache_persistence = False
+        with patch("mlx_lm.models.cache.make_prompt_cache") as mock_make:
+            manager._probe_cache_capabilities(lm)
+        mock_make.assert_not_called()
+
+    def test_close_clears_whisper_model_holder(self, registry, mock_store):
+        import importlib
+
+        from olmlx.engine.model_manager import LoadedModel, ModelManager
+
+        whisper_transcribe = importlib.import_module("mlx_whisper.transcribe")
+        manager = ModelManager(registry, mock_store)
+        sentinel = MagicMock()
+        lm = LoadedModel(
+            name="whisper:latest",
+            hf_path="test/whisper",
+            model=sentinel,
+            tokenizer=None,
+            is_whisper=True,
+        )
+        whisper_transcribe.ModelHolder.model = sentinel
+        whisper_transcribe.ModelHolder.model_path = "test/whisper"
+
+        manager._close_loaded_model(lm)
+
+        assert whisper_transcribe.ModelHolder.model is None
+        assert whisper_transcribe.ModelHolder.model_path is None
+
+    def test_close_preserves_other_whisper_in_holder(self, registry, mock_store):
+        import importlib
+
+        from olmlx.engine.model_manager import LoadedModel, ModelManager
+
+        whisper_transcribe = importlib.import_module("mlx_whisper.transcribe")
+        manager = ModelManager(registry, mock_store)
+        other = MagicMock()
+        lm = LoadedModel(
+            name="whisper:latest",
+            hf_path="test/whisper",
+            model=MagicMock(),
+            tokenizer=None,
+            is_whisper=True,
+        )
+        # Holder references a DIFFERENT model than the one being closed.
+        whisper_transcribe.ModelHolder.model = other
+        whisper_transcribe.ModelHolder.model_path = "other/whisper"
+
+        manager._close_loaded_model(lm)
+
+        assert whisper_transcribe.ModelHolder.model is other

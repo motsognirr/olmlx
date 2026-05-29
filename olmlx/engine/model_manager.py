@@ -745,6 +745,7 @@ class LoadedModel:
     is_distributed: bool = False
     is_flash: bool = False
     is_flash_moe: bool = False
+    is_whisper: bool = False
     speculative_decoder: Any = None
     weight_store: Any = None
     template_caps: TemplateCaps = field(default_factory=TemplateCaps)
@@ -1029,13 +1030,39 @@ class ModelManager:
         # for the wrong vocab. Must use ``lm.text_tokenizer`` (the HF
         # tokenizer, post-VLM-unwrap) to match what
         # ``_install_grammar_processor`` keyed the cache on.
-        try:
-            from olmlx.engine import grammar as _grammar
+        #
+        # Whisper models (issue #366) return ``tokenizer=None``; guard the
+        # grammar drop so it doesn't choke on the missing tokenizer.
+        if not lm.is_whisper:
+            try:
+                from olmlx.engine import grammar as _grammar
 
-            _grammar.drop_for_tokenizer(lm.text_tokenizer)
-        except Exception as exc:
-            logger.exception("Error dropping grammar cache for %s", lm.name)
-            errors.append(exc)
+                _grammar.drop_for_tokenizer(lm.text_tokenizer)
+            except Exception as exc:
+                logger.exception("Error dropping grammar cache for %s", lm.name)
+                errors.append(exc)
+        # Whisper models (issue #366) are injected into mlx_whisper's
+        # module-level ModelHolder by generate_transcription so transcribe()
+        # reuses the managed weights. ModelManager owns that lifetime, so on
+        # close we must drop the holder's strong reference — otherwise the
+        # float16 GPU weights survive eviction/expiry until the next
+        # transcription overwrites them. Guard on identity so closing one
+        # whisper model doesn't clear a different one still referenced.
+        if lm.is_whisper:
+            try:
+                import importlib
+
+                # NOTE: import the submodule via importlib — mlx_whisper's
+                # __init__ rebinds the ``transcribe`` attribute to the
+                # function, shadowing the submodule for ``import ... as``.
+                whisper_transcribe = importlib.import_module("mlx_whisper.transcribe")
+                holder = whisper_transcribe.ModelHolder
+                if holder.model is lm.model:
+                    holder.model = None
+                    holder.model_path = None
+            except Exception as exc:
+                logger.exception("Error clearing whisper ModelHolder for %s", lm.name)
+                errors.append(exc)
         if errors:
             raise ExceptionGroup(f"Errors closing resources for {lm.name}", errors)
 
@@ -1257,6 +1284,11 @@ class ModelManager:
                 flash_config = model_config.resolved_flash()
                 kv_cache_quant = model_config.resolved_kv_cache_quant()
                 weight_quant_str = model_config.resolved_weight_quant()
+                # Whisper models (issue #366) have no LLM KV cache — never
+                # apply KV-cache quantization / spectral calibration to them.
+                _model_kind = self._detect_model_kind(hf_path)
+                if _model_kind == "whisper":
+                    kv_cache_quant = None
                 flash_moe_config = model_config.resolved_flash_moe()
 
                 # Pop LRU evictees under the lock; close them outside the lock
@@ -1548,6 +1580,7 @@ class ModelManager:
                         is_distributed=is_distributed,
                         is_flash=is_flash,
                         is_flash_moe=is_flash_moe,
+                        is_whisper=(_model_kind == "whisper"),
                         speculative_decoder=_spec_decoder,
                         weight_store=_weight_store,
                         template_caps=caps,
@@ -1782,6 +1815,17 @@ class ModelManager:
                 return "unknown"
 
         model_type = config.get("model_type", "").lower()
+
+        # Whisper STT (issue #366). Check before the empty-model_type return:
+        # mlx-community whisper repos ship a non-HF config.json carrying
+        # mlx_whisper.whisper.ModelDimensions fields, and load_model pops
+        # "model_type", so model_type is often absent. The dims keys are the
+        # robust discriminator; the model_type check covers HF-style configs.
+        if model_type == "whisper" or (
+            "n_mels" in config and "n_audio_state" in config
+        ):
+            return "whisper"
+
         if not model_type:
             return "unknown"
 
@@ -2164,6 +2208,9 @@ class ModelManager:
         TurboQuant/Spectral factories would otherwise pull calibration data
         off disk on every model load only to throw the result away.
         """
+        if lm.is_whisper:
+            # Whisper has no LLM-style prompt cache; nothing to probe.
+            return
         try:
             from mlx_lm.models.cache import make_prompt_cache
         except ImportError:
@@ -3495,6 +3542,16 @@ class ModelManager:
 
         kind = self._detect_model_kind(hf_path)
         logger.info("Detected model kind for %s: %s", hf_path, kind)
+
+        if kind == "whisper":
+            # Whisper STT (issue #366). Load via mlx-whisper's loader and
+            # return no tokenizer/caps/speculative — the transcription path
+            # drives mlx_whisper.transcribe() directly.
+            import mlx.core as mx
+            import mlx_whisper.load_models as whisper_loader
+
+            model = whisper_loader.load_model(load_path, dtype=mx.float16)
+            return model, None, False, TemplateCaps(), None
 
         if kind == "vlm":
             # VLM detected — load with mlx-vlm directly

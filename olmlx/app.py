@@ -20,6 +20,7 @@ from olmlx.engine.registry import ModelRegistry
 from olmlx.models.store import ModelStore
 from olmlx.routers import (
     anthropic,
+    audio,
     blobs,
     chat,
     embed,
@@ -136,7 +137,7 @@ class ForceJSONMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method in ("POST", "PUT", "PATCH"):
             content_type = request.headers.get("content-type", "")
-            if "json" not in content_type:
+            if "json" not in content_type and "multipart/form-data" not in content_type:
                 scope = request.scope
                 headers = dict(scope["headers"])
                 headers[b"content-type"] = b"application/json"
@@ -309,6 +310,7 @@ def create_app() -> FastAPI:
     app.include_router(embed.router)
     app.include_router(blobs.router)
     app.include_router(openai.router)
+    app.include_router(audio.router)
     app.include_router(anthropic.router)
 
     return app

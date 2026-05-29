@@ -74,6 +74,7 @@ olmlx/
 ├── routers/
 │   ├── anthropic.py    # /v1/messages — Anthropic Messages API (Claude Code)
 │   ├── openai.py       # /v1/chat/completions, /v1/completions, /v1/models, /v1/embeddings
+│   ├── audio.py        # /v1/audio/transcriptions — OpenAI Whisper STT (mlx-whisper)
 │   ├── chat.py         # /api/chat (Ollama)
 │   ├── generate.py     # /api/generate (Ollama)
 │   ├── models.py       # /api/tags, /api/show, /api/ps (Ollama)
@@ -84,6 +85,7 @@ olmlx/
 ├── schemas/
 │   ├── anthropic.py    # Anthropic API request/response models
 │   ├── openai.py       # OpenAI API request/response models
+│   ├── audio.py        # Audio transcription response models
 │   ├── common.py       # Shared schema types
 │   ├── chat.py         # Ollama chat schemas
 │   ├── generate.py     # Ollama generate schemas
@@ -143,6 +145,7 @@ olmlx/
   - **Path B — Draft-informed**: During speculative decoding, captures the draft model's hidden states (pre-lm_head, via `draft.model()` + `draft.lm_head()`) and submits bulk prefetch for all target layers before verification. Maps draft positions to target layers by depth ratio so early/deep layers get appropriate signals. Deduplicates predictor calls when multiple layers share the same draft position.
   - **Prefetcher** (`prefetch.py`): Owns a dedicated `ThreadPoolExecutor` (default 16 threads) separate from the weight store's I/O pool. Prediction runs synchronously on the calling thread (MLX `mx.eval` deadlocks under concurrent multi-thread use); only I/O is async. `PrefetchStats` tracks submitted/hits/misses/failures. Lifecycle: prefetcher must be closed before weight store on model unload (prefetcher tasks submit into the weight store's pool).
   - Config: `OLMLX_FLASH_PREFETCH=true`. Tuning: `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_CONFIDENCE_THRESHOLD` (default 0.3), `_MIN_NEURONS` (64), `_MAX_NEURONS`, `_IO_THREADS` (16).
+- **Audio transcription** (`routers/audio.py`): OpenAI-compatible `POST /v1/audio/transcriptions` backed by `mlx-whisper`. Multipart upload (`file` + `model`, optional `language`/`prompt`/`response_format`/`temperature`/`timestamp_granularities[]`) is streamed to a temp file under `OLMLX_AUDIO_MAX_BYTES` (default 100 MB; 413 on overflow). Whisper models are a first-class `ModelManager` kind: `_detect_model_kind` returns `"whisper"` (via `model_type == "whisper"` or the presence of mlx whisper dims `n_mels`/`n_audio_state` — mlx-community repos ship a non-HF `config.json`), `_load_model` loads them with `mlx_whisper.load_models.load_model`, and `LoadedModel.is_whisper` guards the LLM-only prompt-cache probe and KV-quant/spectral paths. `engine/inference.py::generate_transcription` acquires the inference lock + active-ref, injects the managed model into `mlx_whisper.transcribe.ModelHolder` (the module-level singleton — race-free under the serialized lock; obtained via `importlib.import_module` because the package shadows the submodule name) so `transcribe()` reuses it instead of loading its own, and runs the synchronous transcribe in a worker thread. Response formats: `json` (`{text}`), `verbose_json` (`{task, language, duration, text, segments[]}`), `text`, `srt`, `vtt` (srt/vtt rendered from segments by helpers in `routers/audio.py`). The `ForceJSONMiddleware` (which rewrites non-JSON bodies to `application/json` for Ollama `curl -d` compatibility) explicitly skips `multipart/form-data` so the upload's content-type/boundary survives. **Requires ffmpeg on PATH** (mlx-whisper decodes via ffmpeg); a missing/failed decode surfaces as HTTP 400. Convenience names `whisper-turbo`/`whisper-large` are seeded into `DEFAULT_MODELS`; direct HF paths auto-register as usual. Streaming transcription and diarization are out of scope.
 
 ## Development
 
