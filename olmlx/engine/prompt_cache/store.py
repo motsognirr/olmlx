@@ -6,6 +6,7 @@ Issue #365.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -525,6 +526,58 @@ class PromptCacheStore:
             return None
         self.metrics.radix_hits += 1
         return cache_id, state, depth
+
+    # -- Multi-checkpoint API ----------------------------------------------
+    #
+    # Companion to the cache_id-keyed `get`/`set`/`takeover` API. Used by the
+    # message-boundary checkpoint path: many checkpoint entries can coexist,
+    # keyed by their token sequences (the cache_id is derived from the tokens).
+    # Lookup returns the deepest STRICT-PREFIX match — no trim required, so
+    # this path is safe for non-trimmable caches (RotatingKVCache after wrap,
+    # ArraysCache via eager-eval; see snapshot_cache_for_persistence).
+
+    @staticmethod
+    def _checkpoint_cache_id(tokens: list[int]) -> str:
+        """Stable cache_id derived from token list. Two checkpoints over
+        identical tokens collide here intentionally — re-insertion replaces.
+        """
+        # Hash-based keying; collisions across distinct sequences would only
+        # cause a false "displaced" eviction which the store handles.
+        h = hashlib.sha1(
+            b"".join(t.to_bytes(4, "little", signed=False) for t in tokens),
+            usedforsecurity=False,
+        ).hexdigest()
+        return f"ckpt:{h}"
+
+    def insert_checkpoint(self, state: CachedPromptState) -> None:
+        """Add a checkpoint state, keyed by its tokens.
+
+        Re-inserting with the same tokens replaces the prior entry.
+        """
+        cid = self._checkpoint_cache_id(state.tokens)
+        evicted = self.set(cid, state)
+        if evicted is not None:
+            del evicted
+
+    def fetch_nearest(
+        self, tokens: list[int]
+    ) -> tuple[CachedPromptState, list[int]] | None:
+        """Find the deepest stored entry whose tokens are a strict prefix
+        of ``tokens``; return (state, suffix) where ``suffix`` is the
+        portion of ``tokens`` not covered by ``state.tokens``.
+
+        Returns None when no terminal in the index is a strict prefix.
+        """
+        cid, depth = self._radix.find_strict_prefix(tokens, min_depth=1)
+        if cid is None or depth == 0:
+            return None
+        state = self._entries.get(cid)
+        if state is None:
+            return None
+        self._entries.move_to_end(cid)
+        self.metrics.radix_hits += 1
+        suffix = tokens[depth:]
+        return state, suffix
 
     def takeover(
         self,
