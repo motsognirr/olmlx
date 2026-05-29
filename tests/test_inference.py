@@ -4111,6 +4111,10 @@ class TestSetupPromptCache:
         lm.prompt_cache_store.async_get = AsyncMock(return_value=None)
         lm.prompt_cache_store.async_set = AsyncMock(return_value=None)
         lm.prompt_cache_store.async_evict_all_to_disk = AsyncMock()
+        # Radix lookup must return None (no sibling found) for generic cache-miss
+        # tests — the full MagicMock store would otherwise return a truthy
+        # MagicMock that fails the 3-tuple unpack in _setup_prompt_cache.
+        lm.prompt_cache_store.find_by_prefix = MagicMock(return_value=None)
         return lm
 
     @pytest.mark.asyncio

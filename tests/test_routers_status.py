@@ -110,3 +110,60 @@ class TestStatusRouter:
         assert model["size"] == 4096
         assert model["size_vram"] == model["size"]
         assert model["details"]["family"] == "test"
+
+    @pytest.mark.asyncio
+    async def test_api_ps_includes_cache_metrics(self, app_client):
+        """ps includes cache_metrics from the loaded model's prompt_cache_store."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore
+
+        # Set up a model with a PromptCacheStore and some cache activity
+        lm = app_client._transport.app.state.model_manager._loaded["qwen3:latest"]
+        store = PromptCacheStore(max_slots=4)
+        store.set("a", CachedPromptState(tokens=[1, 2, 3], cache=[MagicMock()]))
+        store.get("a")  # bump cache_id_hits
+        lm.prompt_cache_store = store
+
+        resp = await app_client.get("/api/ps")
+        assert resp.status_code == 200
+        data = resp.json()
+        model = data["models"][0]
+        assert "cache_metrics" in model
+        assert model["cache_metrics"]["cache_id_hits"] == 1
+        assert "radix_hits" in model["cache_metrics"]
+
+    @pytest.mark.asyncio
+    async def test_api_ps_multi_model_preserves_model_store(self, app_client):
+        """Regression: per-lm cache_store lookup must not shadow the outer
+        model_store used for manifest reads on subsequent iterations."""
+        from copy import copy
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore
+
+        manager = app_client._transport.app.state.model_manager
+        first = manager._loaded["qwen3:latest"]
+        # Shallow-clone the first model under a new key so both rows hit the
+        # manifest-reading branch (which depends on app.state.model_store).
+        second = copy(first)
+        second.name = "qwen3:second"
+        second.hf_path = first.hf_path  # share manifest dir
+        second.prompt_cache_store = PromptCacheStore(max_slots=4)
+        second.prompt_cache_store.set(
+            "x", CachedPromptState(tokens=[7, 8], cache=[MagicMock()])
+        )
+        manager._loaded["qwen3:second"] = second
+
+        try:
+            resp = await app_client.get("/api/ps")
+            assert resp.status_code == 200
+            data = resp.json()
+            names = {m["name"] for m in data["models"]}
+            assert names == {"qwen3:latest", "qwen3:second"}
+            # Both rows must carry the cache_metrics field.
+            for model in data["models"]:
+                assert "cache_metrics" in model
+                assert "cache_id_hits" in model["cache_metrics"]
+        finally:
+            manager._loaded.pop("qwen3:second", None)
