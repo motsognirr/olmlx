@@ -73,7 +73,7 @@ def test_drive_runs_one_model_call_per_uncovered_segment():
     )
     cache = [KVCache()]
     suffix = _drive_segmented_prefill(
-        model=model, segmented=sp, cache=cache, store=store, eager_eval=False
+        model=model, segmented=sp, cache=cache, store=store
     )
     assert len(model.calls) == 2, "one call per segment when starting cold"
     # First call processes the system segment, second processes the user segment.
@@ -102,7 +102,6 @@ def test_drive_skips_segments_below_already_covered():
         segmented=sp,
         cache=cache,
         store=store,
-        eager_eval=False,
         already_covered_tokens=3,
     )
     assert len(model.calls) == 1
@@ -205,9 +204,7 @@ def test_drive_does_not_snapshot_last_segment_boundary():
         ]
     )
     cache = [KVCache()]
-    _drive_segmented_prefill(
-        model=model, segmented=sp, cache=cache, store=store, eager_eval=False
-    )
+    _drive_segmented_prefill(model=model, segmented=sp, cache=cache, store=store)
     # System boundary (3 tokens) is snapshotted; last boundary (5 tokens) is not.
     assert store.fetch_nearest([1, 2, 3, 99]) is not None, (
         "system-boundary checkpoint must be present"

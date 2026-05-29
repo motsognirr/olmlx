@@ -1753,13 +1753,13 @@ def tokenize_segmented_chat(
         token_seq = raw
     else:
         token_seq = None
-    if not isinstance(token_seq, list) or (token_seq and not isinstance(token_seq[0], int)):
+    if not isinstance(token_seq, list) or (
+        token_seq and not isinstance(token_seq[0], int)
+    ):
         # Unrecognised return shape — single-segment fallback. The caller's
         # `segmented.flatten() != prompt_tokens` check will route to the
         # flat path on the next layer if needed.
-        return SegmentedPrompt(
-            segments=[Segment(tokens=[], role=messages[-1]["role"])]
-        )
+        return SegmentedPrompt(segments=[Segment(tokens=[], role=messages[-1]["role"])])
     full: list[int] = list(token_seq)
 
     eom_ids = _message_boundary_token_ids(tokenizer)
@@ -2280,7 +2280,6 @@ def _drive_segmented_prefill(
     segmented: "SegmentedPrompt",
     cache: list[Any],
     store: "PromptCacheStore",
-    eager_eval: bool,
     already_covered_tokens: int = 0,
 ) -> list[int]:
     """Walk the segmented prompt, run prefill per segment, snapshot the
@@ -2333,7 +2332,14 @@ def _drive_segmented_prefill(
         # for only N-1, causing warm-start misalignment on any future request
         # that is a strict extension of the full token sequence.
         if boundary < len(flat):
-            snap = snapshot_cache_for_persistence(cache, eager_eval=eager_eval)
+            # The inner ``mx.eval`` above already materialised cache state
+            # for this segment, so the snapshot only needs to deepcopy —
+            # eager_eval=False skips a redundant mx.eval + Metal sync per
+            # boundary that would otherwise be a no-op on already-evaluated
+            # arrays.  Warm-start loads in ``_setup_via_checkpoint_path``
+            # pass eager_eval=True separately because their inner eval
+            # hasn't run.
+            snap = snapshot_cache_for_persistence(cache, eager_eval=False)
             store.insert_checkpoint(
                 CachedPromptState(
                     tokens=flat[:boundary],
@@ -2421,17 +2427,14 @@ async def _setup_via_checkpoint_path(
         )
         already_covered = len(cached_state.tokens)
 
-    # ArraysCache layers carry lazy metal_kernel graphs — pass
-    # eager_eval=True to the snapshot helper so each boundary
-    # checkpoint is thread-safe for the next request (#284).
-    needs_eager_eval = _cache_list_contains_lazy_state(cache)
-
+    # ArraysCache layers carry lazy metal_kernel graphs — the drive's
+    # per-segment ``mx.eval`` materialises them before each snapshot, so
+    # callers don't need to pass an eager-eval flag here (#284).
     suffix = _drive_segmented_prefill(
         model=lm.model,
         segmented=segmented,
         cache=cache,
         store=lm.prompt_cache_store,
-        eager_eval=needs_eager_eval,
         already_covered_tokens=already_covered,
     )
 
