@@ -22,4 +22,4 @@ jobs:
         with:
           openai_api_key: ${{ secrets.OPENAI_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          model: gpt-5.5
+          model: gpt-5.4-mini
