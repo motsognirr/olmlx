@@ -2098,8 +2098,22 @@ class ModelManager:
             # path's _drive_segmented_prefill calls ``model(arr, cache=cache)``
             # text-only, which crashes (mlx-vlm models require image inputs)
             # or silently produces wrong cache state.  mlx-vlm also doesn't
-            # forward ``prompt_cache`` from gen_kwargs.
-            lm.uses_checkpoint_persistence = ckpt_ok and not trim_ok and not lm.is_vlm
+            # forward ``prompt_cache`` from gen_kwargs.  TurboQuant /
+            # SpectralQuant caches are excluded because their layer state
+            # holds an ``mx.Dtype`` reference that ``copy.deepcopy`` (used
+            # by ``snapshot_cache_for_persistence``) can't pickle —
+            # mirrors the existing disk-save exclusion in
+            # ``_is_serializable_cache``.
+            kv_quant_blocks_snapshot = lm.kv_cache_quant is not None and (
+                lm.kv_cache_quant.startswith("turboquant:")
+                or lm.kv_cache_quant.startswith("spectral:")
+            )
+            lm.uses_checkpoint_persistence = (
+                ckpt_ok
+                and not trim_ok
+                and not lm.is_vlm
+                and not kv_quant_blocks_snapshot
+            )
             lm.supports_cache_trim = trim_ok
             lm.supports_cache_persistence = persist_ok or lm.uses_checkpoint_persistence
             probe_succeeded = True
