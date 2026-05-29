@@ -1690,13 +1690,31 @@ def apply_chat_template_text(
     )
 
 
+_KNOWN_EOM_TOKEN_STRINGS: tuple[str, ...] = (
+    # Harmony format (gpt-oss): ``eos_token_id`` is ``<|return|>``
+    # (end-of-generation, never appears in input), but the actual
+    # end-of-message marker is ``<|end|>``.
+    "<|end|>",
+    # Gemma chat template: ``eos_token_id`` is the base ``<eos>``;
+    # the per-message terminator is ``<end_of_turn>``.
+    "<end_of_turn>",
+)
+
+
 def _message_boundary_token_ids(tokenizer: Any) -> set[int]:
     """Return the set of token IDs that mark end-of-message in chat templates.
 
-    Primary signal: ``tokenizer.eos_token_id``.  For Qwen3 this is
-    ``<|im_end|>``, for Llama 3 ``<|eot_id|>``, for Gemma ``<end_of_turn>``.
-    All three are reliably the end-of-message marker in their respective
-    chat templates.
+    Combines two signals:
+
+    1. ``tokenizer.eos_token_id`` — works for templates where the EOS IS
+       the message-end marker: Qwen3 ``<|im_end|>``, Llama 3 ``<|eot_id|>``,
+       Nemotron-style ``<|im_end|>``.
+
+    2. Known per-template message-end strings looked up via
+       ``convert_tokens_to_ids`` — for templates where the EOS is *not* the
+       message-end marker (gpt-oss Harmony format, where eos is
+       ``<|return|>`` but messages end with ``<|end|>``; Gemma chat where
+       the per-turn marker is ``<end_of_turn>`` not the base ``<eos>``).
 
     For tokenizers like Llama 2's where ``eos_token_id`` (``</s>``) can in
     principle appear inside content, ``tokenize_segmented_chat`` falls back
@@ -1704,13 +1722,25 @@ def _message_boundary_token_ids(tokenizer: Any) -> set[int]:
     guard; ``_setup_via_checkpoint_path`` then skips the checkpoint path
     for the request.
     """
+    out: set[int] = set()
     eos = getattr(tokenizer, "eos_token_id", None)
-    if eos is None:
-        return set()
-    # Some tokenizers wrap the EOS in a list of valid stops.
-    if isinstance(eos, (list, tuple, set)):
-        return {int(x) for x in eos if x is not None}
-    return {int(eos)}
+    if eos is not None:
+        if isinstance(eos, (list, tuple, set)):
+            out.update(int(x) for x in eos if x is not None)
+        else:
+            out.add(int(eos))
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    unk = getattr(tokenizer, "unk_token_id", None)
+    if callable(convert):
+        for tok_str in _KNOWN_EOM_TOKEN_STRINGS:
+            try:
+                tok_id = convert(tok_str)
+            except Exception:
+                continue
+            if tok_id is None or tok_id == unk:
+                continue
+            out.add(int(tok_id))
+    return out
 
 
 def tokenize_segmented_chat(
@@ -1804,11 +1834,14 @@ def tokenize_segmented_chat(
         if tok in eom_ids:
             boundaries.append(i + 1)
 
-    # Most chat templates emit exactly one EOM per message.  When the
-    # count doesn't match, the template either doesn't follow the EOM
-    # convention or emits multiple markers per message (rare).  Fall
-    # back to single segment rather than guess.
-    if len(boundaries) != len(messages):
+    # Most chat templates emit exactly one EOM per message. Some
+    # (Harmony / gpt-oss) emit extras because the template injects a
+    # baseline preamble (system message about output channels) that the
+    # caller didn't supply. Accept extras by treating them as preamble
+    # segments at the start with the first caller-supplied role; reject
+    # only when boundaries < messages (the template emitted FEWER EOMs
+    # than expected, which means we can't safely align roles).
+    if len(boundaries) < len(messages):
         return SegmentedPrompt(
             segments=[Segment(tokens=full, role=messages[-1]["role"])]
         )
@@ -1818,10 +1851,16 @@ def tokenize_segmented_chat(
     if boundaries[-1] < len(full):
         boundaries[-1] = len(full)
 
+    # Build the role list, padding the front with extras using
+    # ``messages[0]["role"]`` so the LRU eviction tier still picks a
+    # sensible (typically "system") priority for the injected preamble.
+    extras = len(boundaries) - len(messages)
+    roles: list[Any] = [messages[0]["role"]] * extras + [m["role"] for m in messages]
+
     segments: list[Segment] = []
     start = 0
     for k, end in enumerate(boundaries):
-        segments.append(Segment(tokens=full[start:end], role=messages[k]["role"]))
+        segments.append(Segment(tokens=full[start:end], role=roles[k]))
         start = end
     return SegmentedPrompt(segments=segments)
 
