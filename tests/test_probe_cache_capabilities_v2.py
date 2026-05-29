@@ -87,3 +87,51 @@ def test_probe_excludes_vlm_from_checkpoint_path_regardless_of_layer_layout(
     # rules — ArraysCache is non-trimmable so the existing #284 fold
     # keeps it non-persistable too.
     assert lm.supports_cache_persistence is False
+
+
+def test_probe_excludes_turboquant_from_checkpoint_path(monkeypatch):
+    """Regression: TurboQuantKVCache holds an mx.Dtype object that
+    copy.deepcopy can't pickle. Without this gate the checkpoint path
+    would crash with TypeError: cannot pickle 'Dtype' object on every
+    request for a TurboQuant-quantized model whose underlying layout
+    would otherwise qualify (e.g. Qwen3-Coder-Next, Qwen3-Next mixed
+    isn't affected because it's already excluded by #396)."""
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=None,
+        tokenizer=None,
+        kv_cache_quant="turboquant:4",
+    )
+    cache = _fake_cache_with(ArraysCache)
+    monkeypatch.setattr(
+        "mlx_lm.models.cache.make_prompt_cache",
+        lambda model: cache,
+    )
+    mgr = ModelManager.__new__(ModelManager)
+    mgr._pending_cleanups = {"skip_metal_flush": True}
+    asyncio.run(mgr._probe_cache_capabilities(lm))
+    assert lm.uses_checkpoint_persistence is False, (
+        "TurboQuant must be excluded from the checkpoint path"
+    )
+
+
+def test_probe_excludes_spectralquant_from_checkpoint_path(monkeypatch):
+    """Same as TurboQuant — SpectralQuant exposes the same Dtype-bearing
+    state that breaks deepcopy."""
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=None,
+        tokenizer=None,
+        kv_cache_quant="spectral:4",
+    )
+    cache = _fake_cache_with(ArraysCache)
+    monkeypatch.setattr(
+        "mlx_lm.models.cache.make_prompt_cache",
+        lambda model: cache,
+    )
+    mgr = ModelManager.__new__(ModelManager)
+    mgr._pending_cleanups = {"skip_metal_flush": True}
+    asyncio.run(mgr._probe_cache_capabilities(lm))
+    assert lm.uses_checkpoint_persistence is False
