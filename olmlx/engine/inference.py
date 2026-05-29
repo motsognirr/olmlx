@@ -2605,10 +2605,8 @@ async def _setup_prompt_cache(
 
     # Cross-request prompt cache reuse is disabled for this model.  The
     # checkpoint path above handles the main non-trimmable families (#284
-    # ArraysCache, #343 RotatingKVCache).  What actually reaches here today:
-    #   - Issue #396: mixed RotatingKVCache + ArraysCache layouts (Qwen3-Next)
-    #     excluded by _EXCLUDED_MIXED_LAYER_PAIRS — pending upstream
-    #     composition work.
+    # ArraysCache, #343 RotatingKVCache, #396 mixed Rotating+Arrays).  What
+    # actually reaches here today:
     #   - Probe-failure models: _probe_cache_capabilities caught an exception
     #     and set supports_cache_persistence=False as the safe fallback.
     #   - Cache types not yet allowlisted by the probe.
@@ -2929,8 +2927,6 @@ async def _store_prompt_cache_after_generation(
     What actually reaches the body here:
       - Trimmable models (standard KVCache / QuantizedKVCache): the normal
         trim-and-store path.
-      - Issue #396: mixed RotatingKVCache + ArraysCache layouts (Qwen3-Next)
-        excluded from the checkpoint path by _EXCLUDED_MIXED_LAYER_PAIRS.
       - Probe-failure models (supports_cache_persistence=False): caught by
         the early-return below, no storage occurs.
       - Other non-trimmable layouts (supports_cache_trim=False) that are
@@ -2949,12 +2945,12 @@ async def _store_prompt_cache_after_generation(
         return
 
     # Skip cross-request storage for non-persistable models.  After the
-    # checkpoint-path port, the main #284 (ArraysCache) and #343
-    # (RotatingKVCache) families are handled via uses_checkpoint_persistence
-    # and return above.  What reaches here are probe-failure models and the
-    # #396 Qwen3-Next mixed layout (excluded from checkpoint path) whose
-    # _setup_prompt_cache already cleared any stale entry.  No remove() call
-    # needed: nothing was stored between setup and now.
+    # checkpoint-path port, the main #284 (ArraysCache), #343
+    # (RotatingKVCache), and #396 (mixed Rotating+Arrays) families are
+    # handled via uses_checkpoint_persistence and return above.  What
+    # reaches here are probe-failure models whose _setup_prompt_cache
+    # already cleared any stale entry.  No remove() call needed: nothing
+    # was stored between setup and now.
     if not lm.supports_cache_persistence:
         logger.debug(
             "Cache not persistable (hybrid SSM/ArraysCache or non-trimmable "

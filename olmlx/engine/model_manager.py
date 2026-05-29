@@ -376,23 +376,19 @@ _PERSISTABLE_CACHE_CLASSES_WITH_CHECKPOINT = frozenset(
 )
 
 # Layer-class compositions that are individually safe via the checkpoint
-# path but combine into a layout we can't currently snapshot consistently
-# (issue #396, Qwen3-Next: mixed RotatingKVCache + ArraysCache).
-_EXCLUDED_MIXED_LAYER_PAIRS: frozenset[frozenset[str]] = frozenset(
-    {
-        frozenset({"RotatingKVCache", "ArraysCache"}),
-    }
-)
+# path but combine into a layout we can't currently snapshot consistently.
+# Empty since #396 was lifted: the Qwen3-Next mix (RotatingKVCache +
+# ArraysCache) is handled by ``snapshot_cache_for_persistence`` — each
+# layer is deepcopied independently and ArraysCache lazy state is
+# materialized via ``mx.eval`` before the deepcopy, so the joint snapshot
+# captures both sub-states at the same logical token offset and survives
+# a continued forward pass after restore.  Kept as the registration point
+# for any future composition that proves unsafe.
+_EXCLUDED_MIXED_LAYER_PAIRS: frozenset[frozenset[str]] = frozenset()
 
 
 def _layer_layout_is_mixed_excluded(cache_list: list) -> bool:
-    """True iff the layer-class set is in the excluded mixed-pair list.
-
-    Conservative composition gate: a layout that combines layer types
-    each of which is independently checkpoint-safe but whose joint
-    snapshot semantics we have not validated.  Currently flags Qwen3-Next
-    (RotatingKVCache + ArraysCache).
-    """
+    """True iff the layer-class set is in the excluded mixed-pair list."""
     if not cache_list:
         return False
     classes = {type(layer).__name__ for layer in cache_list}
@@ -404,7 +400,7 @@ def _layer_layout_is_mixed_excluded(cache_list: list) -> bool:
 
 def _cache_supports_checkpoint_persistence(cache_list: list) -> bool:
     """True iff every layer is checkpoint-persistable AND the layout is
-    not in the excluded mixed-pair list (#396).
+    not in the excluded mixed-pair list.
     """
     if not cache_list:
         return False

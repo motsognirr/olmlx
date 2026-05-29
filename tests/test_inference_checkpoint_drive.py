@@ -3,7 +3,7 @@
 import asyncio
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
 import pytest
 
@@ -627,3 +627,102 @@ def test_setup_prompt_cache_single_segment_request_still_uses_existing_checkpoin
         "drive should process only tokens between hit_depth and the "
         "reserved trailing token"
     )
+
+
+class _MixedRotatingArraysModel:
+    """Dummy model for Qwen3-Next-style mixed RotatingKVCache + ArraysCache
+    layouts (#396).  Advances each layer per its real update API so the
+    checkpoint snapshot captures meaningful state.
+    """
+
+    def __init__(self):
+        self.calls: list[list[int]] = []
+
+    def __call__(self, tokens, cache=None):
+        self.calls.append(list(tokens.flatten().tolist()))
+        S = tokens.shape[-1]
+        for layer in cache:
+            if isinstance(layer, RotatingKVCache):
+                keys = mx.zeros((1, 1, S, 4))
+                values = mx.zeros((1, 1, S, 4))
+                layer.update_and_fetch(keys, values)
+            elif isinstance(layer, ArraysCache):
+                # Simulate SSM state evolution: overwrite each slot with a
+                # tensor whose values encode how many tokens have flowed
+                # through.  The exact values don't matter for the round-trip
+                # check — what matters is that deepcopy + continued mutation
+                # works without crashing.
+                for i in range(len(layer.cache)):
+                    prev = layer.cache[i]
+                    base = mx.ones((1, 4, 8)) * float(S)
+                    layer.cache[i] = base if prev is None else prev + base
+        return mx.zeros((1, S, 32))
+
+
+def test_drive_handles_mixed_rotating_arrays_layout():
+    """Regression for #396 (Qwen3-Next mixed layout).
+
+    The checkpoint path must drive prefill correctly over a layer list
+    that mixes RotatingKVCache (SWA) and ArraysCache (Gated-DeltaNet SSM)
+    in alternating order.  ``snapshot_cache_for_persistence`` deepcopies
+    each layer independently, so the joint snapshot survives a continued
+    forward pass on the snapshot without disturbing the original.
+    """
+    from olmlx.engine.prompt_cache.checkpoint import (
+        snapshot_cache_for_persistence,
+    )
+
+    model = _MixedRotatingArraysModel()
+    store = PromptCacheStore(max_slots=8)
+    sp = SegmentedPrompt(
+        segments=[
+            Segment(tokens=[1, 2, 3, 4], role="system"),
+            Segment(tokens=[5, 6], role="user"),
+        ]
+    )
+    cache = [
+        RotatingKVCache(max_size=32, keep=2),
+        ArraysCache(2),
+        RotatingKVCache(max_size=32, keep=2),
+    ]
+    suffix = _drive_segmented_prefill(
+        model=model, segmented=sp, cache=cache, store=store
+    )
+    # Two segments: one model call per uncovered segment, last token
+    # reserved for stream_generate's decode init.
+    assert model.calls == [[1, 2, 3, 4], [5]]
+    assert suffix == [6]
+    # System-boundary checkpoint should be in the store; final-boundary
+    # snapshot is deliberately skipped (see test above).
+    hit = store.fetch_nearest([1, 2, 3, 4, 5, 6, 99])
+    assert hit is not None
+    state, _ = hit
+    assert len(state.tokens) == 4, "deepest hit should be the system boundary"
+    # Round-trip: warm-start by deepcopying the stored snapshot and feeding
+    # one more token.  This is what _setup_via_checkpoint_path does for a
+    # request whose prompt strictly extends the stored prefix.
+    warm = snapshot_cache_for_persistence(state.cache, eager_eval=True)
+    assert [type(layer).__name__ for layer in warm] == [
+        "RotatingKVCache",
+        "ArraysCache",
+        "RotatingKVCache",
+    ]
+    # Rotating layers carry the snapshot's offset; arrays slots are populated.
+    rotating_layers = [layer for layer in warm if isinstance(layer, RotatingKVCache)]
+    assert all(layer.offset == 4 for layer in rotating_layers)
+    arrays_layer = next(layer for layer in warm if isinstance(layer, ArraysCache))
+    assert all(slot is not None for slot in arrays_layer.cache)
+    # Drive the uncovered tail through the warmed cache.
+    warm_model = _MixedRotatingArraysModel()
+    suffix2 = _drive_segmented_prefill(
+        model=warm_model,
+        segmented=sp,
+        cache=warm,
+        store=PromptCacheStore(max_slots=4),
+        already_covered_tokens=4,
+    )
+    # Only the user segment's prefill tokens get fed; the trailing token
+    # is reserved.
+    assert warm_model.calls == [[5]]
+    assert suffix2 == [6]
+    assert all(layer.offset == 5 for layer in rotating_layers)
