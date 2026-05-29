@@ -416,6 +416,12 @@ class LoadedModel:
     # trim_prompt_cache() call.  Direct LoadedModel construction must
     # explicitly opt in if the model's cache layout is known to be safe.
     supports_cache_persistence: bool = False
+    # True for models whose cache layout is non-trimmable (ArraysCache,
+    # RotatingKVCache) but can still benefit from cross-request reuse via
+    # the checkpoint path: prefill per message-segment, snapshot at each
+    # boundary.  Set by _probe_cache_capabilities (Tasks 5.2/5.3).
+    # Defaults to False until the probe populates it.
+    uses_checkpoint_persistence: bool = False
     spectral_calibration_dir: Any = None  # Path | None, typed as Any to avoid import
     default_options: dict = field(default_factory=dict)
     inference_queue_timeout: float | None = None
