@@ -1,7 +1,11 @@
 """Tests for segment-aware tokenization and the segmented-prefill drive."""
 
-from olmlx.engine.inference import tokenize_segmented_chat
-from olmlx.engine.prompt_cache.checkpoint import SegmentedPrompt
+import mlx.core as mx
+from mlx_lm.models.cache import KVCache
+
+from olmlx.engine.inference import _drive_segmented_prefill, tokenize_segmented_chat
+from olmlx.engine.prompt_cache.checkpoint import Segment, SegmentedPrompt
+from olmlx.engine.prompt_cache.store import PromptCacheStore
 
 
 class _FakeTokenizer:
@@ -21,6 +25,74 @@ class _FakeTokenizer:
             out.extend(ord(c) for c in m["content"])
             out.append(9)
         return out
+
+
+class _DummyModel:
+    """Records call-by-call which tokens were fed in. Cache pretends to grow."""
+
+    def __init__(self):
+        self.calls: list[list[int]] = []
+
+    def __call__(self, tokens, cache=None):
+        # mlx-lm's contract: model(input_tokens_batched[None], cache=cache).
+        # tokens is a 2D mx.array, batch dim first.
+        self.calls.append(list(tokens.flatten().tolist()))
+        # Grow each layer's "state" by len(tokens) — using KVCache primitives.
+        S = tokens.shape[-1]
+        keys = mx.zeros((1, 1, S, 4))
+        values = mx.zeros((1, 1, S, 4))
+        for layer in cache:
+            layer.update_and_fetch(keys, values)
+        # Return a dummy logits tensor of the right shape.
+        return mx.zeros((1, S, 32))
+
+
+def test_drive_runs_one_model_call_per_uncovered_segment():
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+    sp = SegmentedPrompt(
+        segments=[
+            Segment(tokens=[1, 2, 3], role="system"),
+            Segment(tokens=[4, 5], role="user"),
+        ]
+    )
+    cache = [KVCache()]
+    suffix = _drive_segmented_prefill(
+        model=model, segmented=sp, cache=cache, store=store, eager_eval=False
+    )
+    assert len(model.calls) == 2, "one call per segment when starting cold"
+    # First call processes the system segment, second processes the user segment.
+    assert model.calls[0] == [1, 2, 3]
+    assert model.calls[1] == [4]  # [4,5] minus the trailing token reserved for decode
+    # Both boundaries should have been snapshotted into the store.
+    assert store.fetch_nearest([1, 2, 3, 4, 5, 99]) is not None
+    # The drive returns the suffix to be fed to stream_generate: the last token only.
+    assert suffix == [5]
+
+
+def test_drive_skips_segments_below_already_covered():
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+    sp = SegmentedPrompt(
+        segments=[
+            Segment(tokens=[1, 2, 3], role="system"),
+            Segment(tokens=[4, 5], role="user"),
+        ]
+    )
+    cache = [KVCache()]
+    # Pretend the cache is already warmed to position 3 (end of system).
+    # Drive should NOT re-process [1,2,3]; only [4,5].
+    suffix = _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=cache,
+        store=store,
+        eager_eval=False,
+        already_covered_tokens=3,
+    )
+    assert len(model.calls) == 1
+    assert model.calls[0] == [4]  # [4,5] minus the trailing token reserved for decode
+    assert suffix == [5]
 
 
 def test_tokenize_segmented_chat_returns_one_segment_per_message():

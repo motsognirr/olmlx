@@ -26,6 +26,7 @@ from olmlx.utils import memory as memory_utils
 
 if TYPE_CHECKING:
     from olmlx.engine.prompt_cache.checkpoint import SegmentedPrompt
+    from olmlx.engine.prompt_cache.store import PromptCacheStore
 
 try:
     from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
@@ -2227,6 +2228,71 @@ class _CacheSetupResult:
     full_prompt_tokens: list[int] | None = None
     prompt: str | list[int] = ""
     cache_setup_done: bool = False
+
+
+def _drive_segmented_prefill(
+    *,
+    model: Any,
+    segmented: "SegmentedPrompt",
+    cache: list[Any],
+    store: "PromptCacheStore",
+    eager_eval: bool,
+    already_covered_tokens: int = 0,
+) -> list[int]:
+    """Walk the segmented prompt, run prefill per segment, snapshot the
+    cache at each boundary, return the suffix to hand off to stream_generate.
+
+    ``already_covered_tokens`` is the depth at which ``cache`` is already
+    populated (from a checkpoint hit). Segments wholly inside that depth
+    are skipped; a partially covered segment has only its uncovered tail
+    fed to ``model``.
+
+    The returned suffix is ``[full_flat_tokens[-1]]`` — one token —
+    because ``mlx_lm.stream_generate`` requires at least one prompt
+    token to seed the decode step, and feeding the same token back into
+    the prefilled cache is a no-op for the cache but produces the
+    correct first-token logits.
+    """
+    from olmlx.engine.prompt_cache.checkpoint import snapshot_cache_for_persistence
+
+    flat = segmented.flatten()
+    if not flat:
+        return []
+    boundaries = segmented.boundary_offsets()
+
+    cursor = already_covered_tokens
+    for boundary, seg in zip(boundaries, segmented.segments, strict=True):
+        if boundary <= cursor:
+            continue
+        # Feed only the uncovered tail of this segment.
+        chunk_start = cursor
+        chunk_end = boundary
+        # Last token is consumed by stream_generate's decode init —
+        # don't include it in the prefill if it's the absolute final token.
+        prefill_end = chunk_end
+        if chunk_end == len(flat):
+            prefill_end = chunk_end - 1  # leave one token for stream_generate
+        if prefill_end > chunk_start:
+            chunk = flat[chunk_start:prefill_end]
+            arr = mx.array(chunk, dtype=mx.int32)[None, :]
+            with mx.stream(mx.default_stream(mx.default_device())):
+                model(arr, cache=cache)
+                mx.eval([c.state for c in cache])
+            cursor = prefill_end
+        else:
+            cursor = chunk_end
+        # Snapshot the cache state at this boundary into the store.
+        snap = snapshot_cache_for_persistence(cache, eager_eval=eager_eval)
+        store.insert_checkpoint(
+            CachedPromptState(
+                tokens=flat[:boundary],
+                cache=snap,
+                cache_type=seg.role,
+                is_checkpoint=True,
+            )
+        )
+    # Return the last token as the suffix.
+    return [flat[-1]]
 
 
 async def _setup_prompt_cache(
