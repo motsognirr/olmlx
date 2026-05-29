@@ -410,3 +410,28 @@ class TestRamBudgetEviction:
         store.set("b", self._state_with_bytes([2], 10_000))
         assert store.peek("a") is not None
         assert store.peek("b") is not None
+
+
+class TestStrictPrefix:
+    def test_find_strict_prefix_returns_deepest_stored_prefix(self):
+        """Walks query tokens; returns the deepest terminal at or before query end."""
+        idx = PrefixCacheIndex()
+        idx.insert([1, 2], "shorter")
+        idx.insert([1, 2, 3, 4], "deeper")
+        cid, depth = idx.find_strict_prefix([1, 2, 3, 4, 5], min_depth=1)
+        assert cid == "deeper"
+        assert depth == 4
+
+    def test_find_strict_prefix_returns_none_when_no_terminal_is_a_prefix(self):
+        """A stored entry that diverges past the shared prefix is NOT a strict prefix."""
+        idx = PrefixCacheIndex()
+        idx.insert([1, 2, 9, 9], "diverges")
+        cid, depth = idx.find_strict_prefix([1, 2, 3, 4], min_depth=1)
+        assert cid is None
+        assert depth == 0
+
+    def test_find_strict_prefix_respects_min_depth(self):
+        idx = PrefixCacheIndex()
+        idx.insert([1], "tiny")
+        assert idx.find_strict_prefix([1, 2, 3], min_depth=2) == (None, 0)
+        assert idx.find_strict_prefix([1, 2, 3], min_depth=1) == ("tiny", 1)
