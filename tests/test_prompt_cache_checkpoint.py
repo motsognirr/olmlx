@@ -80,3 +80,23 @@ def test_snapshot_cache_eager_eval_materializes_state():
     t.start()
     t.join()
     assert not err, f"cross-thread eval failed: {err}"
+
+
+def test_cached_prompt_state_defaults_match_pre_checkpoint_behavior():
+    """Existing call sites that pass only tokens+cache get assistant terminal."""
+    from olmlx.engine.prompt_cache.state import CachedPromptState
+
+    state = CachedPromptState(tokens=[1, 2, 3], cache=[])
+    assert state.cache_type == "assistant"
+    assert state.is_checkpoint is False
+
+
+def test_cached_prompt_state_can_be_marked_as_checkpoint():
+    """New fields allow marking a state as a checkpoint with explicit role."""
+    from olmlx.engine.prompt_cache.state import CachedPromptState
+
+    state = CachedPromptState(
+        tokens=[1, 2, 3], cache=[], cache_type="system", is_checkpoint=True
+    )
+    assert state.cache_type == "system"
+    assert state.is_checkpoint is True
