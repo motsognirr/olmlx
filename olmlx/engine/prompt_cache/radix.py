@@ -93,6 +93,37 @@ class PrefixCacheIndex:
             stack.extend(n.children.values())
         return None, 0  # unreachable if pruning invariant holds
 
+    def find_strict_prefix(
+        self, tokens: list[int], min_depth: int = 0
+    ) -> tuple[str | None, int]:
+        """Return the deepest terminal whose stored token sequence is a strict
+        prefix of ``tokens`` (terminal depth <= len(tokens) and every token
+        along the path matches).
+
+        Distinct from ``find_longest_prefix`` which also surfaces siblings
+        that diverge past the shared prefix. Strict-prefix is the lookup
+        the non-trimmable checkpoint path needs: only safe to reuse a stored
+        cache when its tokens fully match a prefix of the new request — no
+        trim required, no divergence to discard.
+
+        ``min_depth`` short-circuits below-threshold matches with
+        ``(None, 0)`` (consistent with ``find_longest_prefix``).
+        """
+        node = self._root
+        best_cid: str | None = None
+        best_depth = 0
+        for depth, tok in enumerate(tokens, start=1):
+            child = node.children.get(tok)
+            if child is None:
+                break
+            node = child
+            if node.terminal_cache_ids:
+                best_cid = next(iter(node.terminal_cache_ids))
+                best_depth = depth
+        if best_depth < min_depth:
+            return None, 0
+        return best_cid, best_depth
+
     def remove(self, tokens: list[int], cache_id: str) -> None:
         """Discard cache_id from the terminal set at the tokens path,
         then prune now-empty branches upward.

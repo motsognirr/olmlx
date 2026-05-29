@@ -1,14 +1,24 @@
-"""KV cache state stored cross-request."""
+"""Cached prompt state dataclass."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+CacheType = Literal["system", "user", "assistant", "tool", "developer"]
 
 
 @dataclass
 class CachedPromptState:
-    """KV cache state from a previous generation, for prompt cache reuse."""
+    """A snapshot of a prompt cache and the tokens it represents.
 
-    tokens: list[int]  # Full sequence: prompt + generated tokens
-    cache: list[Any]  # Per-layer KV cache objects (mutated in-place by generate_step)
+    ``cache_type`` records which message-role boundary this state ends at;
+    used by the multi-checkpoint store for tier-aware LRU. ``is_checkpoint``
+    distinguishes a mid-prompt boundary snapshot from a terminal (end-of-
+    generation) entry; the two participate in different lookup paths.
+    """
+
+    tokens: list[int]
+    cache: list[Any]
+    cache_type: CacheType = "assistant"
+    is_checkpoint: bool = False

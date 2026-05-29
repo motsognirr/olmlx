@@ -11,7 +11,7 @@ import threading
 import time
 import weakref
 from collections.abc import AsyncGenerator
-from typing import Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import mlx.core as mx
 
@@ -23,6 +23,10 @@ from olmlx.engine.model_manager import (
 )
 from olmlx.config import SyncMode, settings
 from olmlx.utils import memory as memory_utils
+
+if TYPE_CHECKING:
+    from olmlx.engine.prompt_cache.checkpoint import SegmentedPrompt
+    from olmlx.engine.prompt_cache.store import PromptCacheStore
 
 try:
     from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
@@ -1686,6 +1690,142 @@ def apply_chat_template_text(
     )
 
 
+def _message_boundary_token_ids(tokenizer: Any) -> set[int]:
+    """Return the set of token IDs that mark end-of-message in chat templates.
+
+    Primary signal: ``tokenizer.eos_token_id``.  For Qwen3 this is
+    ``<|im_end|>``, for Llama 3 ``<|eot_id|>``, for Gemma ``<end_of_turn>``.
+    All three are reliably the end-of-message marker in their respective
+    chat templates.
+
+    For tokenizers like Llama 2's where ``eos_token_id`` (``</s>``) can in
+    principle appear inside content, ``tokenize_segmented_chat`` falls back
+    to a single-segment prompt via the ``len(boundaries) != len(messages)``
+    guard; ``_setup_via_checkpoint_path`` then skips the checkpoint path
+    for the request.
+    """
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is None:
+        return set()
+    # Some tokenizers wrap the EOS in a list of valid stops.
+    if isinstance(eos, (list, tuple, set)):
+        return {int(x) for x in eos if x is not None}
+    return {int(eos)}
+
+
+def tokenize_segmented_chat(
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    *,
+    full_tokens: list[int] | None = None,
+    **template_kwargs: Any,
+) -> "SegmentedPrompt":
+    """Split a tokenized chat into per-message segments by scanning for
+    end-of-message marker tokens.
+
+    Two call modes:
+
+    1. ``full_tokens`` provided — the caller already has the authoritative
+       tokenization (typically from ``tokenize_for_cache`` which replicates
+       ``stream_generate``'s BOS heuristic). The function uses these tokens
+       directly. This is the path that ``_setup_via_checkpoint_path`` takes
+       so that ``segmented.flatten() == prompt_tokens`` holds by
+       construction — without it, a re-tokenization via
+       ``apply_chat_template(tokenize=True)`` and the caller's
+       ``tokenize_for_cache(apply_chat_template_text(...))`` can differ by
+       a leading BOS token on tokenizers like Llama 3's, silently
+       disabling the checkpoint path for every request on those models.
+
+    2. ``full_tokens`` omitted — the function calls
+       ``apply_chat_template(messages, **template_kwargs)`` itself. Used by
+       unit tests with synthetic tokenizers; not exercised on the production
+       request path.
+
+    EOM detection: scan ``full`` for ``tokenizer.eos_token_id`` — for Qwen3
+    this is ``<|im_end|>``, for Llama 3 ``<|eot_id|>``, for Gemma
+    ``<end_of_turn>``. Each EOM occurrence ends one message. The position
+    *after* each EOM is a segment boundary; the last segment absorbs the
+    chat template's trailing assistant-prompt suffix so
+    ``segmented.flatten()`` equals ``full``.
+
+    Falls back to a single-segment prompt (logged at debug) when the
+    tokenizer exposes no EOM token or the detected EOM count differs from
+    ``len(messages)``. Callers detect this via ``len(segmented.segments)
+    <= 1`` and skip the checkpoint path for the request, since a
+    single-segment prompt has no usable mid-prompt checkpoint boundary.
+    """
+    from olmlx.engine.prompt_cache.checkpoint import Segment, SegmentedPrompt
+
+    if not messages:
+        return SegmentedPrompt(segments=[])
+
+    if full_tokens is not None:
+        full = list(full_tokens)
+    else:
+        # Normalise apply_chat_template's varied return types — see
+        # _apply_chat_template_text. Possible shapes: flat list[int],
+        # batch-of-1 list[list[int]], BatchEncoding mapping with
+        # ``input_ids``, or array-like sequences (numpy ndarray, torch
+        # tensor, mlx array) whose elements are ints.
+        raw = tokenizer.apply_chat_template(messages, **template_kwargs)
+        if isinstance(raw, collections.abc.Mapping):
+            token_seq: Any = raw.get("input_ids")
+        else:
+            token_seq = raw
+        # Unwrap a batch-of-1 nested sequence.
+        if (
+            token_seq is not None
+            and not isinstance(token_seq, (str, bytes))
+            and len(token_seq) > 0
+            and isinstance(token_seq[0], (list, tuple))
+        ):
+            token_seq = token_seq[0]
+        try:
+            full = [int(t) for t in token_seq]
+        except (TypeError, ValueError):
+            logger.debug(
+                "tokenize_segmented_chat: cannot coerce apply_chat_template "
+                "result (%s) to list[int]; falling back to empty segment",
+                type(raw).__name__,
+            )
+            return SegmentedPrompt(
+                segments=[Segment(tokens=[], role=messages[-1]["role"])]
+            )
+
+    eom_ids = _message_boundary_token_ids(tokenizer)
+    if not eom_ids:
+        return SegmentedPrompt(
+            segments=[Segment(tokens=full, role=messages[-1]["role"])]
+        )
+
+    # Find positions immediately after each EOM marker.
+    boundaries: list[int] = []
+    for i, tok in enumerate(full):
+        if tok in eom_ids:
+            boundaries.append(i + 1)
+
+    # Most chat templates emit exactly one EOM per message.  When the
+    # count doesn't match, the template either doesn't follow the EOM
+    # convention or emits multiple markers per message (rare).  Fall
+    # back to single segment rather than guess.
+    if len(boundaries) != len(messages):
+        return SegmentedPrompt(
+            segments=[Segment(tokens=full, role=messages[-1]["role"])]
+        )
+
+    # Extend the last boundary to include any trailing template tokens
+    # (e.g. ``\n<|im_start|>assistant\n``) so flatten() == full.
+    if boundaries[-1] < len(full):
+        boundaries[-1] = len(full)
+
+    segments: list[Segment] = []
+    start = 0
+    for k, end in enumerate(boundaries):
+        segments.append(Segment(tokens=full[start:end], role=messages[k]["role"]))
+        start = end
+    return SegmentedPrompt(segments=segments)
+
+
 def _normalize_tool_calls_in_messages(messages: list[dict]) -> list[dict]:
     """Normalise tool_calls in assistant messages for chat templates.
 
@@ -2164,6 +2304,207 @@ class _CacheSetupResult:
     cache_setup_done: bool = False
 
 
+def _drive_segmented_prefill(
+    *,
+    model: Any,
+    segmented: "SegmentedPrompt",
+    cache: list[Any],
+    store: "PromptCacheStore",
+    already_covered_tokens: int = 0,
+) -> list[int]:
+    """Walk the segmented prompt, run prefill per segment, snapshot the
+    cache at each boundary, return the suffix to hand off to stream_generate.
+
+    ``already_covered_tokens`` is the depth at which ``cache`` is already
+    populated (from a checkpoint hit). Segments wholly inside that depth
+    are skipped; a partially covered segment has only its uncovered tail
+    fed to ``model``.
+
+    The returned suffix is ``[full_flat_tokens[-1]]`` — one token —
+    because ``mlx_lm.stream_generate`` requires at least one prompt
+    token to seed the decode step, and feeding the same token back into
+    the prefilled cache is a no-op for the cache but produces the
+    correct first-token logits.
+    """
+    from olmlx.engine.prompt_cache.checkpoint import (
+        flatten_cache_state,
+        snapshot_cache_for_persistence,
+    )
+
+    flat = segmented.flatten()
+    if not flat:
+        return []
+    boundaries = segmented.boundary_offsets()
+
+    cursor = already_covered_tokens
+    for boundary, seg in zip(boundaries, segmented.segments, strict=True):
+        if boundary <= cursor:
+            continue
+        # Feed only the uncovered tail of this segment.
+        chunk_start = cursor
+        chunk_end = boundary
+        # Last token is consumed by stream_generate's decode init —
+        # don't include it in the prefill if it's the absolute final token.
+        prefill_end = chunk_end
+        if chunk_end == len(flat):
+            prefill_end = chunk_end - 1  # leave one token for stream_generate
+        if prefill_end > chunk_start:
+            chunk = flat[chunk_start:prefill_end]
+            arr = mx.array(chunk, dtype=mx.int32)[None, :]
+            with mx.stream(mx.default_stream(mx.default_device())):
+                model(arr, cache=cache)
+                mx.eval(flatten_cache_state(cache))
+            cursor = prefill_end
+        else:
+            cursor = chunk_end
+        # Snapshot the cache state at this boundary into the store.
+        # Skip the last boundary: the final segment withholds the trailing
+        # token for stream_generate (prefill_end == chunk_end - 1), so the
+        # KV depth here is len(flat)-1 but boundary == len(flat).  A snapshot
+        # with tokens=flat[:len(flat)] would claim N tokens but have KV state
+        # for only N-1, causing warm-start misalignment on any future request
+        # that is a strict extension of the full token sequence.
+        if boundary < len(flat):
+            # eager_eval=False — by the time we get here the cache state
+            # is already materialised, either by the inner ``mx.eval`` a
+            # few lines above (cold-start segments, just-processed) or by
+            # the warm-start load in ``_setup_via_checkpoint_path`` which
+            # passes eager_eval=True to its own ``snapshot_cache_for_persistence``
+            # call for lazy-state layouts. Either way the snapshot here
+            # only needs to deepcopy; running ``mx.eval`` again would be a
+            # no-op Metal sync per boundary.
+            snap = snapshot_cache_for_persistence(cache, eager_eval=False)
+            store.insert_checkpoint(
+                CachedPromptState(
+                    tokens=flat[:boundary],
+                    cache=snap,
+                    cache_type=seg.role,
+                    is_checkpoint=True,
+                )
+            )
+    # Return the last token as the suffix.
+    return [flat[-1]]
+
+
+def _cache_list_contains_lazy_state(cache: list[Any]) -> bool:
+    """True iff the cache contains layer types known to produce lazy
+    metal_kernel outputs that need eager mx.eval before cross-thread reuse.
+
+    Currently flags ArraysCache (used by hybrid SSM models like Qwen3.5).
+    Pure KVCache/QuantizedKVCache/RotatingKVCache layouts return False
+    because their .state arrays are produced by stock matmul/concat ops.
+    """
+    LAZY_STATE_CLASSES = {"ArraysCache"}
+    return any(type(layer).__name__ in LAZY_STATE_CLASSES for layer in cache)
+
+
+async def _setup_via_checkpoint_path(
+    lm: LoadedModel,
+    prompt: str | list[int],
+    gen_kwargs: dict,
+    *,
+    messages: list[dict],
+    tokenizer: Any,
+    prompt_tokens: list[int],
+    template_kwargs: dict | None = None,
+) -> _CacheSetupResult:
+    """Checkpoint-mechanism path for non-trimmable cache layouts.
+
+    Tokenizes per-message, looks up a strict-prefix match in the prompt
+    cache store, drives prefill for the uncovered segments, and stores a
+    checkpoint at each boundary. Returns a _CacheSetupResult with prompt
+    reduced to the single token that mlx-lm's stream_generate needs to
+    seed its first decode step.
+    """
+    from olmlx.engine.prompt_cache.checkpoint import snapshot_cache_for_persistence
+
+    # Pass the caller's authoritative tokenization (prompt_tokens) directly
+    # so segmentation never re-tokenizes — this avoids a BOS-handling
+    # mismatch between apply_chat_template(tokenize=True) and
+    # tokenize_for_cache that would silently disable the checkpoint path
+    # on tokenizers like Llama 3's. template_kwargs is still threaded
+    # through for the non-production no-prompt_tokens path used by tests.
+    segmented = tokenize_segmented_chat(
+        tokenizer,
+        messages,
+        full_tokens=prompt_tokens,
+        **(template_kwargs or {}),
+    )
+    # Look up the longest stored prefix that is a STRICT prefix of our
+    # tokens BEFORE the single-segment guard — a single-message request
+    # that happens to be a strict extension of an existing checkpoint
+    # should still warm-start, even though it can't itself contribute a
+    # new mid-prompt checkpoint.
+    hit = lm.prompt_cache_store.fetch_nearest(prompt_tokens)
+
+    # No usable message boundaries AND no warm-start to inherit: a
+    # single-segment prompt has only one boundary at len(prompt_tokens),
+    # which the drive deliberately skips (the KV depth there is
+    # len(prompt_tokens)-1 because the trailing token is reserved for
+    # stream_generate). With nothing to gain on either side, skip the
+    # checkpoint path entirely — cheaper than driving a no-op snapshot.
+    if hit is None and len(segmented.segments) <= 1:
+        logger.debug(
+            "Checkpoint path: no usable message boundaries detected "
+            "and no warm-start hit (segments=%d); falling back to fresh cache",
+            len(segmented.segments),
+        )
+        new_cache = _make_prompt_cache_for_lm(lm)
+        gen_kwargs["prompt_cache"] = new_cache
+        # Return prompt_tokens (list[int]) to stay consistent with the
+        # cold-start and warm-start branches below — handing the
+        # original string back would let downstream code re-tokenize
+        # via a different BOS path than prompt_tokens used.
+        return _CacheSetupResult(
+            prompt=list(prompt_tokens),
+            full_prompt_tokens=prompt_tokens,
+            cache_creation_tokens=len(prompt_tokens),
+            cache_setup_done=True,
+        )
+
+    if hit is None:
+        # Cold start with usable boundaries: build a fresh cache, drive
+        # ALL segments and store checkpoints at each interior boundary.
+        cache = _make_prompt_cache_for_lm(lm)
+        already_covered = 0
+    else:
+        # Warm start: deepcopy the stored snapshot (so subsequent
+        # mutation during drive doesn't corrupt the stored entry).
+        # eager_eval is necessary when the loaded entry contains
+        # lazy-state layer types (ArraysCache) — otherwise re-evaluating
+        # the lazy graph on this worker thread re-introduces the #284
+        # Metal stream crash. Don't rely on "already materialised when
+        # stored" — pre-PR disk entries from the old flat path were
+        # stored before snapshot_cache_for_persistence existed.
+        cached_state, _ = hit
+        needs_eager_load = _cache_list_contains_lazy_state(cached_state.cache)
+        cache = snapshot_cache_for_persistence(
+            cached_state.cache,
+            eager_eval=needs_eager_load,
+        )
+        already_covered = len(cached_state.tokens)
+
+    # ArraysCache layers carry lazy metal_kernel graphs — the drive's
+    # per-segment ``mx.eval`` materialises them before each snapshot, so
+    # callers don't need to pass an eager-eval flag here (#284).
+    suffix = _drive_segmented_prefill(
+        model=lm.model,
+        segmented=segmented,
+        cache=cache,
+        store=lm.prompt_cache_store,
+        already_covered_tokens=already_covered,
+    )
+
+    gen_kwargs["prompt_cache"] = cache
+    return _CacheSetupResult(
+        prompt=suffix,
+        full_prompt_tokens=prompt_tokens,
+        cache_read_tokens=already_covered,
+        cache_creation_tokens=max(0, len(prompt_tokens) - already_covered),
+        cache_setup_done=True,
+    )
+
+
 async def _setup_prompt_cache(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -2171,6 +2512,9 @@ async def _setup_prompt_cache(
     *,
     prompt_tokens: list[int] | None,
     cache_id: str,
+    messages: list[dict] | None = None,
+    tokenizer: Any = None,
+    template_kwargs: dict | None = None,
 ) -> _CacheSetupResult:
     """Set up prompt cache for a streaming or non-streaming completion.
 
@@ -2201,24 +2545,41 @@ async def _setup_prompt_cache(
     if memory_too_high or prompt_tokens is None or make_prompt_cache is None:
         return result
 
-    # Cross-request prompt cache reuse is disabled for this model.  Two
-    # families land here, both folded into supports_cache_persistence=False
-    # by _probe_cache_capabilities:
-    #   - Issue #284: hybrid SSM-style ArraysCache (Qwen3.5, Qwen3-Next
-    #     gated-delta layers) — loading the stored entry and feeding it to
-    #     mlx-lm would crash the next prefill with a Metal stream error.
-    #   - Issue #343: non-trimmable hybrid sliding-window layouts
-    #     (RotatingKVCache for Gemma 4, ChunkedKVCache for gpt-oss) — any
-    #     stored entry can't realign with the next request's retokenized
-    #     prompt, so the lookup always discards it; storing was pure waste.
-    # We never store for either family post-PR, so the only path to a stale
-    # entry is pre-PR data.  Skip the disk lookup entirely and clear any
-    # in-memory entry.  Gated on peek() so we don't pay a blocking
-    # unlink(ENOENT) syscall on every request.  Pre-PR on-disk files for
-    # non-persistable models can persist indefinitely — that's harmless
-    # because nothing reads from disk for these models — but they're
-    # cleaned up by the disk cache size eviction in PromptCacheStore
-    # eventually.
+    # Checkpoint path — non-trimmable cache layouts (set by probe in
+    # Task 5.2). Drives prefill per message-segment and stores snapshots
+    # at each boundary into the prompt cache store. Closes #284 (ArraysCache
+    # via eager mx.eval) and #343 (RotatingKVCache via shorter-match lookup).
+    if (
+        lm.uses_checkpoint_persistence
+        and messages is not None
+        and tokenizer is not None
+    ):
+        return await _setup_via_checkpoint_path(
+            lm,
+            prompt,
+            gen_kwargs,
+            messages=messages,
+            tokenizer=tokenizer,
+            prompt_tokens=prompt_tokens,
+            template_kwargs=template_kwargs,
+        )
+
+    # Cross-request prompt cache reuse is disabled for this model.  The
+    # checkpoint path above handles the main non-trimmable families (#284
+    # ArraysCache, #343 RotatingKVCache).  What actually reaches here today:
+    #   - Issue #396: mixed RotatingKVCache + ArraysCache layouts (Qwen3-Next)
+    #     excluded by _EXCLUDED_MIXED_LAYER_PAIRS — pending upstream
+    #     composition work.
+    #   - Probe-failure models: _probe_cache_capabilities caught an exception
+    #     and set supports_cache_persistence=False as the safe fallback.
+    #   - Cache types not yet allowlisted by the probe.
+    # We never store for these models, so the only path to a stale entry is
+    # pre-PR data.  Skip the disk lookup entirely and clear any in-memory
+    # entry.  Gated on peek() so we don't pay a blocking unlink(ENOENT)
+    # syscall on every request.  Pre-PR on-disk files can persist
+    # indefinitely — that's harmless because nothing reads from disk for
+    # these models — but they're cleaned up by disk cache size eviction
+    # in PromptCacheStore eventually.
     if not lm.supports_cache_persistence:
         if lm.prompt_cache_store.peek(cache_id) is not None:
             lm.prompt_cache_store.remove(cache_id)
@@ -2522,30 +2883,39 @@ async def _store_prompt_cache_after_generation(
     Handles trimming to max_cache_tokens, eviction pressure cleanup,
     and cache invalidation on trim failure.
 
-    Non-trimmable hybrid caches (e.g. Gemma 4, Qwen3-Next with
-    RotatingKVCache layers) skip the trim path and are stored as-is
-    even when they exceed max_cache_tokens.  The pre-generation setup
-    path handles their eventual discard when alignment requires a trim;
-    this storage just keeps them alive for strict-extension cache hits.
+    Models routed through the checkpoint path (uses_checkpoint_persistence)
+    return immediately — boundary snapshots were already taken during prefill
+    by _drive_segmented_prefill.
+
+    What actually reaches the body here:
+      - Trimmable models (standard KVCache / QuantizedKVCache): the normal
+        trim-and-store path.
+      - Issue #396: mixed RotatingKVCache + ArraysCache layouts (Qwen3-Next)
+        excluded from the checkpoint path by _EXCLUDED_MIXED_LAYER_PAIRS.
+      - Probe-failure models (supports_cache_persistence=False): caught by
+        the early-return below, no storage occurs.
+      - Other non-trimmable layouts (supports_cache_trim=False) that are
+        persistable: stored as-is; strict-extension lookups reuse them.
     """
+    if lm.uses_checkpoint_persistence:
+        # Checkpoints already taken at boundaries during prefill by
+        # _drive_segmented_prefill. Storing the post-generation state
+        # would duplicate a longer entry that the next request's
+        # fetch_nearest can't realign without trim — exactly what the
+        # checkpoint path is designed to avoid.
+        return
+
     prompt_cache = gen_kwargs.get("prompt_cache")
     if prompt_cache is None or full_prompt_tokens is None:
         return
 
-    # Skip cross-request storage for any non-persistable model.  Two families
-    # land here, both folded into supports_cache_persistence=False by
-    # _probe_cache_capabilities:
-    #   - Issue #284: hybrid SSM-style models (Qwen3.5, Qwen3-Next gated-delta
-    #     layers using ArraysCache) — the next prefill would crash mlx-lm with
-    #     a Metal stream error.
-    #   - Issue #343: non-trimmable hybrid sliding-window layouts
-    #     (RotatingKVCache for Gemma 4, ChunkedKVCache for gpt-oss) — the
-    #     stored prompt+generated state can never realign with the next
-    #     request's retokenized prompt, so storage was pure waste.
-    # The next request will run a fresh prefill.  No remove() call here:
-    # _setup_prompt_cache already removed any stale entry at request setup
-    # time, and we never stored anything between then and now, so a second
-    # remove() would be a guaranteed no-op disk stat on the event loop.
+    # Skip cross-request storage for non-persistable models.  After the
+    # checkpoint-path port, the main #284 (ArraysCache) and #343
+    # (RotatingKVCache) families are handled via uses_checkpoint_persistence
+    # and return above.  What reaches here are probe-failure models and the
+    # #396 Qwen3-Next mixed layout (excluded from checkpoint path) whose
+    # _setup_prompt_cache already cleared any stale entry.  No remove() call
+    # needed: nothing was stored between setup and now.
     if not lm.supports_cache_persistence:
         logger.debug(
             "Cache not persistable (hybrid SSM/ArraysCache or non-trimmable "
@@ -2712,6 +3082,9 @@ async def _stream_completion(
     keep_alive: str | None = None,
     grammar_active: bool = False,
     adopt_pin: bool = False,
+    messages: list[dict] | None = None,
+    tokenizer: Any = None,
+    template_kwargs: dict | None = None,
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
@@ -2770,6 +3143,9 @@ async def _stream_completion(
                 gen_kwargs,
                 prompt_tokens=prompt_tokens,
                 cache_id=cache_id,
+                messages=messages,
+                tokenizer=tokenizer,
+                template_kwargs=template_kwargs,
             )
         else:
             cs = _CacheSetupResult(prompt=prompt)
@@ -2904,7 +3280,15 @@ async def _stream_completion(
                 async for token in stream:
                     # Always accumulate for prompt cache (raw stream, not filtered)
                     stats.eval_count = token.generation_tokens
-                    stats.prompt_eval_count = token.prompt_tokens
+                    # Report the full prompt size to the caller — when the
+                    # cache path (flat or checkpoint) hands a suffix to
+                    # mlx-lm, `token.prompt_tokens` only counts what
+                    # mlx-lm actually re-prefilled, not the full request.
+                    stats.prompt_eval_count = (
+                        len(full_prompt_tokens)
+                        if full_prompt_tokens is not None
+                        else token.prompt_tokens
+                    )
                     if token.token is not None:
                         generated_tokens.append(token.token)
                     else:
@@ -3096,6 +3480,9 @@ async def _full_completion(
     keep_alive: str | None = None,
     grammar_active: bool = False,
     adopt_pin: bool = False,
+    messages: list[dict] | None = None,
+    tokenizer: Any = None,
+    template_kwargs: dict | None = None,
 ) -> dict:
     # inference_timeout is not enforced for non-streaming: the GPU thread
     # cannot be safely cancelled (releasing the lock while Metal is still
@@ -3129,6 +3516,9 @@ async def _full_completion(
                         gen_kwargs,
                         prompt_tokens=prompt_tokens,
                         cache_id=cache_id,
+                        messages=messages,
+                        tokenizer=tokenizer,
+                        template_kwargs=template_kwargs,
                     )
                     prompt = cs.prompt
                     cache_read_tokens = cs.cache_read_tokens
@@ -3160,6 +3550,14 @@ async def _full_completion(
                     grammar_active=grammar_active,
                 )
                 generation_complete = True
+
+                # Report the full prompt size to the caller — when the
+                # cache path (flat or checkpoint) hands a suffix to mlx-lm,
+                # `result.prompt_tokens` (captured into stats inside
+                # _full_completion_inner) only counts what mlx-lm actually
+                # re-prefilled, not the full request.
+                if full_prompt_tokens is not None:
+                    stats.prompt_eval_count = len(full_prompt_tokens)
 
                 if cache_setup_done:
                     result_dict["cache_read_tokens"] = cache_read_tokens
@@ -3634,6 +4032,23 @@ async def generate_chat(
         # #307) `</think>` token — shares the rules with `_apply_chat_template`.
         thinking_expected = _resolve_thinking_active(caps, tools, enable_thinking)
 
+        # Build the chat template kwargs used for segmented tokenization in the
+        # checkpoint cache path.  These must match the kwargs that produced
+        # ``prompt_tokens`` so that ``tokenize_segmented_chat`` produces the
+        # same full token sequence and the EOM-boundary split is correctly
+        # aligned.  Only applies to text (non-VLM) models; the checkpoint path
+        # is never reached for VLMs.
+        chat_template_kwargs: dict | None = None
+        if not lm.is_vlm:
+            chat_template_kwargs = {
+                "tokenize": True,
+                "add_generation_prompt": True,
+            }
+            if caps.supports_enable_thinking:
+                chat_template_kwargs["enable_thinking"] = _resolve_thinking_active(
+                    caps, tools, enable_thinking
+                )
+
         if stream:
             gen = _stream_completion(
                 lm,
@@ -3648,6 +4063,9 @@ async def generate_chat(
                 keep_alive=keep_alive,
                 grammar_active=grammar_active,
                 adopt_pin=True,
+                messages=messages,
+                tokenizer=lm.tokenizer,
+                template_kwargs=chat_template_kwargs,
             )
             # Ownership of the pin transfers to the wrapper; its finally
             # releases on any generator exit. Mark the flag for the outer
@@ -3673,6 +4091,9 @@ async def generate_chat(
                     keep_alive=keep_alive,
                     grammar_active=grammar_active,
                     adopt_pin=True,
+                    messages=messages,
+                    tokenizer=lm.tokenizer,
+                    template_kwargs=chat_template_kwargs,
                 )
                 # Mirror the streaming meta chunk so non-streaming routers
                 # can gate orphan `</think>` handling on the same signal
