@@ -2094,8 +2094,12 @@ class ModelManager:
             ckpt_ok = _cache_supports_checkpoint_persistence(probe_cache)
             # Checkpoint path is preferred for non-trimmable layouts; for
             # trimmable layouts the existing flat path is simpler and
-            # equivalent — keep flat.
-            lm.uses_checkpoint_persistence = ckpt_ok and not trim_ok
+            # equivalent — keep flat.  VLMs are explicitly excluded: the
+            # path's _drive_segmented_prefill calls ``model(arr, cache=cache)``
+            # text-only, which crashes (mlx-vlm models require image inputs)
+            # or silently produces wrong cache state.  mlx-vlm also doesn't
+            # forward ``prompt_cache`` from gen_kwargs.
+            lm.uses_checkpoint_persistence = ckpt_ok and not trim_ok and not lm.is_vlm
             lm.supports_cache_trim = trim_ok
             lm.supports_cache_persistence = persist_ok or lm.uses_checkpoint_persistence
             probe_succeeded = True

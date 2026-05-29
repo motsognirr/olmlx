@@ -54,3 +54,36 @@ def test_probe_sets_uses_checkpoint_for_non_trimmable_only(
         f"layers={[t.__name__ for t in layers]}: "
         f"want supports_persist={expected_persist}, got {lm.supports_cache_persistence}"
     )
+
+
+def test_probe_excludes_vlm_from_checkpoint_path_regardless_of_layer_layout(
+    monkeypatch,
+):
+    """Regression for aider Finding (9befefb): VLM models must NOT enter
+    the checkpoint path. The path's _drive_segmented_prefill calls
+    ``model(arr, cache=cache)`` text-only, which crashes mlx-vlm models
+    that require image inputs. The probe must gate on lm.is_vlm even
+    when the cache-layer composition would otherwise qualify."""
+    lm = LoadedModel(
+        name="vlm",
+        hf_path="y",
+        model=None,
+        tokenizer=None,
+        is_vlm=True,
+    )
+    # ArraysCache layout would normally enable the checkpoint path.
+    cache = _fake_cache_with(ArraysCache)
+    monkeypatch.setattr(
+        "mlx_lm.models.cache.make_prompt_cache",
+        lambda model: cache,
+    )
+    mgr = ModelManager.__new__(ModelManager)
+    mgr._pending_cleanups = {"skip_metal_flush": True}
+    asyncio.run(mgr._probe_cache_capabilities(lm))
+    assert lm.uses_checkpoint_persistence is False, (
+        "VLM must be excluded from the checkpoint path"
+    )
+    # supports_cache_persistence falls through to the regular flat-path
+    # rules — ArraysCache is non-trimmable so the existing #284 fold
+    # keeps it non-persistable too.
+    assert lm.supports_cache_persistence is False
