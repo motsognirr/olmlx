@@ -44,7 +44,9 @@ class PrefixCacheIndex:
             node = child
         node.terminal_cache_ids.add(cache_id)
 
-    def find_longest_prefix(self, tokens: list[int]) -> tuple[str | None, int]:
+    def find_longest_prefix(
+        self, tokens: list[int], min_depth: int = 0
+    ) -> tuple[str | None, int]:
         """Walk the trie matching tokens, return any cache_id reachable
         from the deepest visited node.
 
@@ -55,8 +57,14 @@ class PrefixCacheIndex:
         cache_id with ``prefix_len == 3`` so the caller can take it
         over and trim its KV cache back to align.
 
-        Returns ``(None, 0)`` only when the query has no token in
-        common with anything stored.
+        ``min_depth`` short-circuits the subtree DFS when the descent
+        depth is already below the caller's acceptance threshold —
+        cheap reject for queries that only share a BOS token with a
+        fat subtree of stored entries.
+
+        Returns ``(None, 0)`` when the query has no token in common
+        with anything stored, or when the descent depth is below
+        ``min_depth``.
         """
         node = self._root
         deepest_node = node
@@ -68,7 +76,7 @@ class PrefixCacheIndex:
             node = child
             deepest_node = node
             deepest_depth = depth
-        if deepest_depth == 0:
+        if deepest_depth == 0 or deepest_depth < min_depth:
             return None, 0
         # Prefer a terminal at the deepest visited node itself; otherwise
         # any terminal in its subtree shares the same prefix-length with

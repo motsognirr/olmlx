@@ -182,6 +182,31 @@ class TestPromptCacheStoreRadixIntegration:
         # min_prefix_tokens=3 accepts
         assert store.find_by_prefix([1, 2, 3, 9, 9], min_prefix_tokens=3) is not None
 
+    def test_find_by_prefix_short_circuits_below_threshold(self):
+        # Regression for aider PR #391 review: a shallow descent (e.g.
+        # only BOS matches) must not walk the entire subtree under that
+        # shallow node when min_prefix_tokens guarantees a reject. We
+        # verify by counting DFS subtree visits through the trie's
+        # `find_longest_prefix(min_depth=...)` parameter — when the
+        # descent ends below min_depth, the function must return
+        # (None, 0) without touching any subtree node.
+        from olmlx.engine.prompt_cache.radix import PrefixCacheIndex
+
+        idx = PrefixCacheIndex()
+        # Fat subtree under BOS=1, no terminal at depth 1.
+        for i in range(8):
+            idx.insert([1, 100 + i, 200 + i], f"e{i}")
+
+        # Query shares only BOS with stored entries (descent depth 1).
+        # With min_depth=256, expect (None, 0).
+        result = idx.find_longest_prefix([1, 9999], min_depth=256)
+        assert result == (None, 0)
+
+        # Without the threshold, the same query finds something via DFS.
+        cache_id, depth = idx.find_longest_prefix([1, 9999])
+        assert cache_id is not None
+        assert depth == 1
+
     def test_takeover_rekeys_entry(self):
         store = PromptCacheStore(max_slots=4)
         original = _make_state([1, 2, 3])

@@ -467,7 +467,9 @@ class PromptCacheStore:
         terminal meets `min_prefix_tokens`. The trie also surfaces sibling
         entries whose stored sequence diverges past the shared prefix.
         """
-        cache_id, depth = self._radix.find_longest_prefix(tokens)
+        cache_id, depth = self._radix.find_longest_prefix(
+            tokens, min_depth=min_prefix_tokens
+        )
         if cache_id is None or depth < min_prefix_tokens:
             self.metrics.radix_misses += 1
             return None
