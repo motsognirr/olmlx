@@ -1738,29 +1738,36 @@ def tokenize_segmented_chat(
         return SegmentedPrompt(segments=[])
 
     # Normalise apply_chat_template's varied return types — see
-    # _apply_chat_template_text. A BatchEncoding dict or nested list is
-    # possible depending on tokenizer/version. Anything we can't unpack
-    # falls back to single-segment so the caller's prompt_tokens check
-    # later detects the mismatch.
+    # _apply_chat_template_text. Possible shapes: flat list[int],
+    # batch-of-1 list[list[int]], BatchEncoding mapping with
+    # ``input_ids``, or array-like sequences (numpy ndarray, torch
+    # tensor, mlx array) whose elements are ints. Anything we can't
+    # coerce to list[int] logs at debug and falls back to an empty
+    # segment so the caller's ``segmented.flatten() != prompt_tokens``
+    # check routes to the flat path.
     raw = tokenizer.apply_chat_template(messages, **template_kwargs)
     if isinstance(raw, collections.abc.Mapping):
-        token_seq = raw.get("input_ids")
-        if isinstance(token_seq, list) and token_seq and isinstance(token_seq[0], list):
-            token_seq = token_seq[0]
-    elif isinstance(raw, list) and raw and isinstance(raw[0], list):
-        token_seq = raw[0]
-    elif isinstance(raw, list):
-        token_seq = raw
+        token_seq: Any = raw.get("input_ids")
     else:
-        token_seq = None
-    if not isinstance(token_seq, list) or (
-        token_seq and not isinstance(token_seq[0], int)
+        token_seq = raw
+    # Unwrap a batch-of-1 nested sequence.
+    if (
+        token_seq is not None
+        and not isinstance(token_seq, (str, bytes))
+        and len(token_seq) > 0
+        and isinstance(token_seq[0], (list, tuple))
     ):
-        # Unrecognised return shape — single-segment fallback. The caller's
-        # `segmented.flatten() != prompt_tokens` check will route to the
-        # flat path on the next layer if needed.
+        token_seq = token_seq[0]
+    try:
+        full: list[int] = [int(t) for t in token_seq]
+    except (TypeError, ValueError):
+        logger.debug(
+            "tokenize_segmented_chat: cannot coerce apply_chat_template "
+            "result (%s) to list[int]; checkpoint path will fall back to "
+            "the flat path for this request",
+            type(raw).__name__,
+        )
         return SegmentedPrompt(segments=[Segment(tokens=[], role=messages[-1]["role"])])
-    full: list[int] = list(token_seq)
 
     eom_ids = _message_boundary_token_ids(tokenizer)
     if not eom_ids:
@@ -2332,13 +2339,14 @@ def _drive_segmented_prefill(
         # for only N-1, causing warm-start misalignment on any future request
         # that is a strict extension of the full token sequence.
         if boundary < len(flat):
-            # The inner ``mx.eval`` above already materialised cache state
-            # for this segment, so the snapshot only needs to deepcopy —
-            # eager_eval=False skips a redundant mx.eval + Metal sync per
-            # boundary that would otherwise be a no-op on already-evaluated
-            # arrays.  Warm-start loads in ``_setup_via_checkpoint_path``
-            # pass eager_eval=True separately because their inner eval
-            # hasn't run.
+            # eager_eval=False — by the time we get here the cache state
+            # is already materialised, either by the inner ``mx.eval`` a
+            # few lines above (cold-start segments, just-processed) or by
+            # the warm-start load in ``_setup_via_checkpoint_path`` which
+            # passes eager_eval=True to its own ``snapshot_cache_for_persistence``
+            # call for lazy-state layouts. Either way the snapshot here
+            # only needs to deepcopy; running ``mx.eval`` again would be a
+            # no-op Metal sync per boundary.
             snap = snapshot_cache_for_persistence(cache, eager_eval=False)
             store.insert_checkpoint(
                 CachedPromptState(

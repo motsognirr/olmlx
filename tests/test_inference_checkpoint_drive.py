@@ -336,6 +336,46 @@ def test_tokenize_segmented_chat_handles_nested_list_return():
     assert sp.flatten() == [1, ord("X"), 9, 2, ord("Y"), 9]
 
 
+def test_tokenize_segmented_chat_coerces_arraylike_to_list_of_int():
+    """Tokenizers that return numpy-style array-likes (anything with
+    int elements) must NOT silently fall back to an empty segment."""
+
+    class _IntArray:
+        """Minimal array-like: iterable + indexable + len, returns ints."""
+
+        def __init__(self, data):
+            self._data = data
+
+        def __iter__(self):
+            return iter(self._data)
+
+        def __len__(self):
+            return len(self._data)
+
+        def __getitem__(self, i):
+            return self._data[i]
+
+    class _ArrayLikeTok:
+        eos_token_id = 9
+
+        def apply_chat_template(self, messages, **kwargs):
+            ROLE = {"system": 1, "user": 2}
+            out = []
+            for m in messages:
+                out.append(ROLE[m["role"]])
+                out.extend(ord(c) for c in m["content"])
+                out.append(9)
+            return _IntArray(out)
+
+    tok = _ArrayLikeTok()
+    messages = [{"role": "system", "content": "AB"}, {"role": "user", "content": "CD"}]
+    sp = tokenize_segmented_chat(tok, messages)
+    assert len(sp.segments) == 2, (
+        "array-like tokenizer output must be coerced, not dropped"
+    )
+    assert sp.flatten() == [1, 65, 66, 9, 2, 67, 68, 9]
+
+
 def test_tokenize_segmented_chat_returns_empty_segment_for_unrecognised_shape():
     """Anything we can't unpack to list[int] becomes an empty single
     segment so the caller's prompt_tokens != segmented.flatten() check
