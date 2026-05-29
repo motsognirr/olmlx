@@ -813,29 +813,32 @@ async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request
     )
     resolved_model = _resolve_anthropic_model(req.model)
     manager = request.app.state.model_manager
-    lm = await manager.ensure_loaded(resolved_model)
+    lm = await manager.ensure_loaded(resolved_model, pin=True)
 
-    messages = _convert_messages(req)
-    tools = _convert_tools(req)
+    try:
+        messages = _convert_messages(req)
+        tools = _convert_tools(req)
 
-    enable_thinking: bool | None = None
-    if req.thinking is not None:
-        enable_thinking = _THINKING_TYPE_MAP.get(req.thinking.type)
+        enable_thinking: bool | None = None
+        if req.thinking is not None:
+            enable_thinking = _THINKING_TYPE_MAP.get(req.thinking.type)
 
-    with _inference_ref(lm):
-        loop = asyncio.get_running_loop()
-        token_count = await loop.run_in_executor(
-            None,
-            partial(
-                count_chat_tokens,
-                lm.text_tokenizer,
-                messages,
-                tools,
-                lm.template_caps,
-                enable_thinking=enable_thinking,
-            ),
-        )
-    return AnthropicTokenCountResponse(input_tokens=token_count)
+        with _inference_ref(lm, adopt=True):
+            loop = asyncio.get_running_loop()
+            token_count = await loop.run_in_executor(
+                None,
+                partial(
+                    count_chat_tokens,
+                    lm.text_tokenizer,
+                    messages,
+                    tools,
+                    lm.template_caps,
+                    enable_thinking=enable_thinking,
+                ),
+            )
+        return AnthropicTokenCountResponse(input_tokens=token_count)
+    finally:
+        lm.release_ref()
 
 
 @router.post(

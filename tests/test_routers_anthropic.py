@@ -1999,7 +1999,7 @@ class TestAnthropicModelResolution:
             )
 
         assert resp.status_code == 200
-        mock_ensure.assert_called_with("qwen3-8b:latest")
+        mock_ensure.assert_called_with("qwen3-8b:latest", pin=True)
 
 
 class TestXCacheIDHeader:

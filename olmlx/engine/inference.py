@@ -1284,18 +1284,16 @@ def _inference_ref(
 
     When *adopt* is True the caller obtained ``lm`` via
     ``ensure_loaded(..., pin=True)``, which already incremented ``active_refs``
-    under the lock — so this context manager does NOT increment again; it
-    merely *adopts* that existing pin and releases it on exit. This closes the
-    handoff window: the model is pinned continuously from inside
-    ``ensure_loaded`` (under the lock) through the awaits that precede this
-    block (inference-lock acquisition, async prompt-cache setup) until exit.
-    The caller is responsible for releasing the pin (via ``lm.release_ref()``)
-    on any error path that bypasses this context manager.
+    under the lock. This context manager does NOT increment on entry and does
+    NOT release on exit; the caller's outer try/finally owns the single pin
+    release. This avoids races where an exception path here and the caller's
+    cleanup could double-release. Expiry refresh still runs on exit so the
+    model's deadline reflects the inference that just happened.
 
-    With *adopt* False (the legacy path) this increments on entry as before;
-    a small unprotected window then exists between ``ensure_loaded`` and here,
-    but that path is only used where the caller does not hold the model across
-    awaits.
+    With *adopt* False (the legacy path) this increments on entry and releases
+    on exit as before; a small unprotected window then exists between
+    ``ensure_loaded`` and here, but that path is only used where the caller
+    does not hold the model across awaits.
 
     Bug #118: Python ``+=`` on int is not atomic. Concurrent async tasks can
     race on ``active_refs``. Use the model's ``_active_refs_lock`` to protect
@@ -1310,7 +1308,8 @@ def _inference_ref(
     try:
         yield
     finally:
-        lm.release_ref()
+        if not adopt:
+            lm.release_ref()
         # Refresh expiry so the model doesn't expire immediately after inference.
         # Honour per-request keep_alive when available (fix #338).
         # Falls back to settings.default_keep_alive when no per-request value
@@ -1326,6 +1325,31 @@ def _inference_ref(
             lm.expires_at = time.time() + ka
         else:
             lm.expires_at = None
+
+
+async def _release_pin_after_gen(
+    gen: AsyncGenerator[dict, None], lm: LoadedModel
+) -> AsyncGenerator[dict, None]:
+    """Forward ``gen`` and release ``lm``'s pin on any generator exit.
+
+    Used by the streaming entry points to release the pin acquired by
+    ``ensure_loaded(pin=True)`` once the underlying generator finishes
+    (normally, via exception, or via aclose on client disconnect). The
+    inner generator's ``_inference_ref(adopt=True)`` does NOT release —
+    only this wrapper does — so the pin is released exactly once.
+
+    The finally explicitly closes ``gen`` so the wrapped generator's own
+    finally blocks (e.g. the inference-lock release in
+    ``_stream_completion``) fire when the client disconnects mid-stream.
+    """
+    try:
+        async for chunk in gen:
+            yield chunk
+    finally:
+        try:
+            await gen.aclose()
+        finally:
+            lm.release_ref()
 
 
 def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
@@ -1976,7 +2000,7 @@ async def generate_completion(
     stats = TimingStats()
 
     with Timer() as load_timer:
-        lm = await manager.ensure_loaded(model_name, keep_alive)
+        lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     stats.load_duration = load_timer.duration_ns
 
     # /api/generate defaults thinking OFF when unspecified (None), unlike the
@@ -2073,9 +2097,14 @@ async def generate_completion(
         else False
     )
 
-    if stream:
-        return _prepend_meta(
-            _stream_completion(
+    # The pin acquired by ``ensure_loaded(pin=True)`` is released exactly
+    # once: by the stream wrapper after the generator exits, by the
+    # non-stream finally below, or by the except below if anything raises
+    # before delegation.
+    delegated = False
+    try:
+        if stream:
+            gen = _stream_completion(
                 lm,
                 prompt,
                 mt,
@@ -2084,22 +2113,39 @@ async def generate_completion(
                 images,
                 keep_alive=keep_alive,
                 grammar_active=grammar_active,
-            ),
-            {"thinking_expected": thinking_expected},
-        )
-    else:
-        result = await _full_completion(
-            lm,
-            prompt,
-            mt,
-            gen_kwargs,
-            stats,
-            images,
-            keep_alive=keep_alive,
-            grammar_active=grammar_active,
-        )
-        result["thinking_expected"] = thinking_expected
-        return result
+                adopt_pin=True,
+            )
+            delegated = True
+            return _prepend_meta(
+                _release_pin_after_gen(gen, lm),
+                {"thinking_expected": thinking_expected},
+            )
+        else:
+            try:
+                result = await _full_completion(
+                    lm,
+                    prompt,
+                    mt,
+                    gen_kwargs,
+                    stats,
+                    images,
+                    keep_alive=keep_alive,
+                    grammar_active=grammar_active,
+                    adopt_pin=True,
+                )
+                result["thinking_expected"] = thinking_expected
+                return result
+            finally:
+                # Release exactly once on every exit path — success or
+                # exception. Set ``delegated`` so the outer except doesn't
+                # try to release again.
+                if not delegated:
+                    lm.release_ref()
+                    delegated = True
+    except BaseException:
+        if not delegated:
+            lm.release_ref()
+        raise
 
 
 @dataclasses.dataclass
@@ -2660,6 +2706,7 @@ async def _stream_completion(
     cache_id: str = "",
     keep_alive: str | None = None,
     grammar_active: bool = False,
+    adopt_pin: bool = False,
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
@@ -3043,6 +3090,7 @@ async def _full_completion(
     cache_id: str = "",
     keep_alive: str | None = None,
     grammar_active: bool = False,
+    adopt_pin: bool = False,
 ) -> dict:
     # inference_timeout is not enforced for non-streaming: the GPU thread
     # cannot be safely cancelled (releasing the lock while Metal is still
@@ -3050,8 +3098,13 @@ async def _full_completion(
     # this via CancellableStream.cancel() + drain_and_join().
     # Pop stop sequences before passing gen_kwargs to mlx-lm (unsupported).
     stop_sequences: list[str] | None = gen_kwargs.pop("stop", None)
+    # When adopt_pin is True the caller passed an ``lm`` already pinned via
+    # ``ensure_loaded(pin=True)``. ``_inference_ref(adopt=True)`` does NOT
+    # release the pin — the caller's outer finally is responsible for the
+    # single release. This avoids races between an early exception path
+    # here and the caller's cleanup.
     async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
-        with _inference_ref(lm, keep_alive=keep_alive):
+        with _inference_ref(lm, keep_alive=keep_alive, adopt=adopt_pin):
             # Cache setup must happen under the inference lock so two
             # concurrent requests can't race to read/mutate the same store
             # entry.  The gate at the call site has already excluded VLM
@@ -3424,7 +3477,7 @@ async def generate_chat(
     stats = TimingStats()
 
     with Timer() as load_timer:
-        lm = await manager.ensure_loaded(model_name, keep_alive)
+        lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     stats.load_duration = load_timer.duration_ns
 
     images = _extract_images(messages)
@@ -3566,9 +3619,14 @@ async def generate_chat(
     # #307) `</think>` token — shares the rules with `_apply_chat_template`.
     thinking_expected = _resolve_thinking_active(caps, tools, enable_thinking)
 
-    if stream:
-        return _prepend_meta(
-            _stream_completion(
+    # The pin acquired by ``ensure_loaded(pin=True)`` is released exactly
+    # once: by the stream wrapper after the generator exits, by the
+    # non-stream finally below, or by the except below if anything raises
+    # before delegation.
+    delegated = False
+    try:
+        if stream:
+            gen = _stream_completion(
                 lm,
                 prompt,
                 mt,
@@ -3580,28 +3638,43 @@ async def generate_chat(
                 cache_id=cache_id,
                 keep_alive=keep_alive,
                 grammar_active=grammar_active,
-            ),
-            {"thinking_expected": thinking_expected},
-        )
-    else:
-        result = await _full_completion(
-            lm,
-            prompt,
-            mt,
-            gen_kwargs,
-            stats,
-            images,
-            has_tools=bool(tools),
-            use_prompt_cache=use_prompt_cache,
-            prompt_tokens=prompt_tokens,
-            cache_id=cache_id,
-            keep_alive=keep_alive,
-            grammar_active=grammar_active,
-        )
-        # Mirror the streaming meta chunk so non-streaming routers can gate
-        # orphan `</think>` handling on the same signal (issue #307).
-        result["thinking_expected"] = thinking_expected
-        return result
+                adopt_pin=True,
+            )
+            delegated = True
+            return _prepend_meta(
+                _release_pin_after_gen(gen, lm),
+                {"thinking_expected": thinking_expected},
+            )
+        else:
+            try:
+                result = await _full_completion(
+                    lm,
+                    prompt,
+                    mt,
+                    gen_kwargs,
+                    stats,
+                    images,
+                    has_tools=bool(tools),
+                    use_prompt_cache=use_prompt_cache,
+                    prompt_tokens=prompt_tokens,
+                    cache_id=cache_id,
+                    keep_alive=keep_alive,
+                    grammar_active=grammar_active,
+                    adopt_pin=True,
+                )
+                # Mirror the streaming meta chunk so non-streaming routers
+                # can gate orphan `</think>` handling on the same signal
+                # (issue #307).
+                result["thinking_expected"] = thinking_expected
+                return result
+            finally:
+                if not delegated:
+                    lm.release_ref()
+                    delegated = True
+    except BaseException:
+        if not delegated:
+            lm.release_ref()
+        raise
 
 
 # Streaming routers consult this when the engine signals
@@ -3661,72 +3734,77 @@ async def generate_embeddings(
     keep_alive: int | str | None = None,
 ) -> list[list[float]]:
     """Generate embeddings using the model's hidden states or embed_tokens layer."""
-    lm = await manager.ensure_loaded(model_name, keep_alive)
+    lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
 
-    async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
-        with _inference_ref(lm, keep_alive=keep_alive):
-            embeddings = []
+    try:
+        async with _inference_locked(
+            lm.inference_queue_timeout, sync_mode=lm.sync_mode
+        ):
+            with _inference_ref(lm, keep_alive=keep_alive, adopt=True):
+                embeddings = []
 
-            tokenizer = lm.text_tokenizer
+                tokenizer = lm.text_tokenizer
 
-            # Check if model has a static embedding layer we can use directly
-            embed_layer = None
-            model_inner = getattr(lm.model, "model", lm.model)
-            if hasattr(model_inner, "embed_tokens"):
-                embed_layer = model_inner.embed_tokens
+                # Check if model has a static embedding layer we can use directly
+                embed_layer = None
+                model_inner = getattr(lm.model, "model", lm.model)
+                if hasattr(model_inner, "embed_tokens"):
+                    embed_layer = model_inner.embed_tokens
 
-            for text in texts:
-                tokens = tokenizer.encode(text)
-                input_ids = mx.array([tokens])
+                for text in texts:
+                    tokens = tokenizer.encode(text)
+                    input_ids = mx.array([tokens])
 
-                if embed_layer is not None:
-                    # Use static token embeddings — no forward pass needed
-                    hidden = embed_layer(input_ids)
-                else:
-                    outputs = lm.model(input_ids)
-                    if hasattr(outputs, "hidden_states") and outputs.hidden_states:
-                        hidden = outputs.hidden_states[-1]
-                    elif hasattr(outputs, "last_hidden_state"):
-                        hidden = outputs.last_hidden_state
+                    if embed_layer is not None:
+                        # Use static token embeddings — no forward pass needed
+                        hidden = embed_layer(input_ids)
                     else:
-                        hidden = outputs
+                        outputs = lm.model(input_ids)
+                        if hasattr(outputs, "hidden_states") and outputs.hidden_states:
+                            hidden = outputs.hidden_states[-1]
+                        elif hasattr(outputs, "last_hidden_state"):
+                            hidden = outputs.last_hidden_state
+                        else:
+                            hidden = outputs
 
-                # Robust shape handling
-                if hidden.ndim == 3:
-                    # (batch, seq, dim) — mean-pool over sequence
-                    embedding = mx.mean(hidden[0], axis=0)
-                elif hidden.ndim == 2:
-                    # (seq, dim) — mean-pool over sequence
-                    embedding = mx.mean(hidden, axis=0)
-                elif hidden.ndim == 1:
-                    embedding = hidden
-                else:
-                    raise ValueError(
-                        f"Unexpected embedding tensor shape: {hidden.shape}"
+                    # Robust shape handling
+                    if hidden.ndim == 3:
+                        # (batch, seq, dim) — mean-pool over sequence
+                        embedding = mx.mean(hidden[0], axis=0)
+                    elif hidden.ndim == 2:
+                        # (seq, dim) — mean-pool over sequence
+                        embedding = mx.mean(hidden, axis=0)
+                    elif hidden.ndim == 1:
+                        embedding = hidden
+                    else:
+                        raise ValueError(
+                            f"Unexpected embedding tensor shape: {hidden.shape}"
+                        )
+
+                    embeddings.append(embedding.tolist())
+
+                # Load-bearing when sync_mode="none": this function runs
+                # synchronously under _inference_locked with no worker thread,
+                # so the lock-boundary exit sync may be skipped. This sync is
+                # then the only Metal barrier before the lock is released —
+                # do not remove without providing an equivalent barrier.
+                # Suppress+log rather than raise: the embeddings have already
+                # been .tolist()'d so the caller should still get the result;
+                # a Metal error here will surface on the next request.
+                try:
+                    mx.synchronize()
+                except Exception:
+                    # WARNING, not DEBUG: under sync_mode="none" this is the
+                    # only Metal barrier in the path; a silent failure here
+                    # typically surfaces as an uncatchable Metal crash on the
+                    # next inference. Operators need to see it now, not after.
+                    logger.warning(
+                        "embeddings post-compute sync failed — next inference will crash",
+                        exc_info=True,
                     )
-
-                embeddings.append(embedding.tolist())
-
-            # Load-bearing when sync_mode="none": this function runs
-            # synchronously under _inference_locked with no worker thread,
-            # so the lock-boundary exit sync may be skipped. This sync is
-            # then the only Metal barrier before the lock is released —
-            # do not remove without providing an equivalent barrier.
-            # Suppress+log rather than raise: the embeddings have already
-            # been .tolist()'d so the caller should still get the result;
-            # a Metal error here will surface on the next request.
-            try:
-                mx.synchronize()
-            except Exception:
-                # WARNING, not DEBUG: under sync_mode="none" this is the
-                # only Metal barrier in the path; a silent failure here
-                # typically surfaces as an uncatchable Metal crash on the
-                # next inference. Operators need to see it now, not after.
-                logger.warning(
-                    "embeddings post-compute sync failed — next inference will crash",
-                    exc_info=True,
-                )
-            return embeddings
+                return embeddings
+    finally:
+        lm.release_ref()
 
 
 async def generate_transcription(
@@ -3757,52 +3835,57 @@ async def generate_transcription(
     # patch() targets) via importlib so ModelHolder injection lands correctly.
     whisper_transcribe = importlib.import_module("mlx_whisper.transcribe")
 
-    lm = await manager.ensure_loaded(model_name, keep_alive)
+    lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
 
-    # Reject non-whisper models with a clear error (issue #366). Without this,
-    # a text/VLM model name would load fine, get injected into mlx_whisper's
-    # ModelHolder, and produce a cryptic failure inside transcribe(). Raising
-    # ValueError surfaces as HTTP 400 via the app-level handler.
-    if not lm.is_whisper:
-        raise ValueError(
-            f"Model '{model_name}' is not a Whisper model. "
-            "/v1/audio/transcriptions requires a whisper-class model "
-            "(e.g. whisper-turbo or an mlx-community/whisper-* repo)."
-        )
+    try:
+        # Reject non-whisper models with a clear error (issue #366). Without this,
+        # a text/VLM model name would load fine, get injected into mlx_whisper's
+        # ModelHolder, and produce a cryptic failure inside transcribe(). Raising
+        # ValueError surfaces as HTTP 400 via the app-level handler.
+        if not lm.is_whisper:
+            raise ValueError(
+                f"Model '{model_name}' is not a Whisper model. "
+                "/v1/audio/transcriptions requires a whisper-class model "
+                "(e.g. whisper-turbo or an mlx-community/whisper-* repo)."
+            )
 
-    # Resolve the on-disk path used as path_or_hf_repo so the ModelHolder
-    # cache key matches what we inject.
-    if manager.store is not None:
-        load_path = str(manager.store.local_path(lm.hf_path))
-    else:
-        load_path = lm.hf_path
+        # Resolve the on-disk path used as path_or_hf_repo so the ModelHolder
+        # cache key matches what we inject.
+        if manager.store is not None:
+            load_path = str(manager.store.local_path(lm.hf_path))
+        else:
+            load_path = lm.hf_path
 
-    async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
-        with _inference_ref(lm):
-            # Inject the managed model so transcribe() reuses it. Safe because
-            # _inference_locked serializes inference (no ModelHolder race).
-            whisper_transcribe.ModelHolder.model = lm.model
-            whisper_transcribe.ModelHolder.model_path = load_path
+        async with _inference_locked(
+            lm.inference_queue_timeout, sync_mode=lm.sync_mode
+        ):
+            with _inference_ref(lm, adopt=True):
+                # Inject the managed model so transcribe() reuses it. Safe because
+                # _inference_locked serializes inference (no ModelHolder race).
+                whisper_transcribe.ModelHolder.model = lm.model
+                whisper_transcribe.ModelHolder.model_path = load_path
 
-            def _run() -> dict:
-                try:
-                    return whisper_transcribe.transcribe(
-                        audio_path,
-                        path_or_hf_repo=load_path,
-                        language=language,
-                        initial_prompt=prompt,
-                        temperature=temperature,
-                        word_timestamps=word_timestamps,
-                    )
-                except FileNotFoundError as exc:
-                    raise ValueError(
-                        "Audio decoding failed: ffmpeg was not found on PATH. "
-                        "Install ffmpeg (e.g. `brew install ffmpeg`) to use "
-                        "/v1/audio/transcriptions."
-                    ) from exc
-                except RuntimeError as exc:
-                    # mlx_whisper.audio.load_audio raises RuntimeError on a
-                    # failed ffmpeg decode (bad/corrupt/unsupported file).
-                    raise ValueError(f"Audio decoding failed: {exc}") from exc
+                def _run() -> dict:
+                    try:
+                        return whisper_transcribe.transcribe(
+                            audio_path,
+                            path_or_hf_repo=load_path,
+                            language=language,
+                            initial_prompt=prompt,
+                            temperature=temperature,
+                            word_timestamps=word_timestamps,
+                        )
+                    except FileNotFoundError as exc:
+                        raise ValueError(
+                            "Audio decoding failed: ffmpeg was not found on PATH. "
+                            "Install ffmpeg (e.g. `brew install ffmpeg`) to use "
+                            "/v1/audio/transcriptions."
+                        ) from exc
+                    except RuntimeError as exc:
+                        # mlx_whisper.audio.load_audio raises RuntimeError on a
+                        # failed ffmpeg decode (bad/corrupt/unsupported file).
+                        raise ValueError(f"Audio decoding failed: {exc}") from exc
 
-            return await asyncio.to_thread(_run)
+                return await asyncio.to_thread(_run)
+    finally:
+        lm.release_ref()

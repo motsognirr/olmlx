@@ -58,10 +58,12 @@ class TestDeriveTimingStats:
         assert stats.prompt_eval_duration == 1_000_000_000
         assert stats.eval_duration == 0
 
-    def test_inference_ref_adopt_does_not_double_count(self):
-        """adopt=True must NOT increment on entry (the pin already did), and
-        must release exactly once on exit — net 0 change while a pre-pinned
-        model stays pinned (refs==1) for the duration."""
+    def test_inference_ref_adopt_does_not_touch_ref_count(self):
+        """adopt=True must NOT increment on entry (the pin already did) and
+        must NOT release on exit — the caller's outer try/finally owns the
+        single pin release. Splitting acquire/release like this avoids
+        races where _inference_ref's finally and the caller's cleanup
+        could both try to release. Net 0 change across the with block."""
         lm = LoadedModel(
             name="a", hf_path="a/a", model=MagicMock(), tokenizer=MagicMock()
         )
@@ -69,7 +71,9 @@ class TestDeriveTimingStats:
         assert lm.active_refs == 1
         with _inference_ref(lm, adopt=True):
             assert lm.active_refs == 1  # adopted, not double-counted
-        assert lm.active_refs == 0  # released exactly once on exit
+        assert lm.active_refs == 1  # still pinned; caller releases
+        lm.release_ref()
+        assert lm.active_refs == 0
 
     def test_inference_ref_legacy_increments(self):
         """adopt=False (legacy) increments on entry, releases on exit."""
