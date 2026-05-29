@@ -1710,64 +1710,81 @@ def _message_boundary_token_ids(tokenizer: Any) -> set[int]:
 def tokenize_segmented_chat(
     tokenizer: Any,
     messages: list[dict[str, Any]],
+    *,
+    full_tokens: list[int] | None = None,
     **template_kwargs: Any,
 ) -> "SegmentedPrompt":
-    """Tokenize ``messages`` and split into per-message segments by
-    scanning the full tokenization for end-of-message marker tokens.
+    """Split a tokenized chat into per-message segments by scanning for
+    end-of-message marker tokens.
 
-    Strategy: tokenize with the full chat template once (so all
-    template_kwargs are honoured), then scan for EOM markers (typically
-    ``tokenizer.eos_token_id`` — for Qwen3 this is ``<|im_end|>``, for
-    Llama 3 ``<|eot_id|>``, for Gemma ``<end_of_turn>``). Each EOM
-    occurrence ends one message. The position *after* each EOM is a
-    segment boundary.
+    Two call modes:
 
-    The last segment absorbs everything after the final EOM (i.e., the
-    chat template's trailing assistant-prompt suffix like
-    ``\\n<|im_start|>assistant\\n``) so that ``segmented.flatten()``
-    exactly equals the full tokenization.
+    1. ``full_tokens`` provided — the caller already has the authoritative
+       tokenization (typically from ``tokenize_for_cache`` which replicates
+       ``stream_generate``'s BOS heuristic). The function uses these tokens
+       directly. This is the path that ``_setup_via_checkpoint_path`` takes
+       so that ``segmented.flatten() == prompt_tokens`` holds by
+       construction — without it, a re-tokenization via
+       ``apply_chat_template(tokenize=True)`` and the caller's
+       ``tokenize_for_cache(apply_chat_template_text(...))`` can differ by
+       a leading BOS token on tokenizers like Llama 3's, silently
+       disabling the checkpoint path for every request on those models.
 
-    Falls back to a single-segment prompt when:
-    - The tokenizer exposes no EOM token (no ``eos_token_id``).
-    - The number of detected EOM markers is inconsistent with
-      ``len(messages)`` (template format we don't recognise).
+    2. ``full_tokens`` omitted — the function calls
+       ``apply_chat_template(messages, **template_kwargs)`` itself. Used by
+       unit tests with synthetic tokenizers; not exercised on the production
+       request path.
+
+    EOM detection: scan ``full`` for ``tokenizer.eos_token_id`` — for Qwen3
+    this is ``<|im_end|>``, for Llama 3 ``<|eot_id|>``, for Gemma
+    ``<end_of_turn>``. Each EOM occurrence ends one message. The position
+    *after* each EOM is a segment boundary; the last segment absorbs the
+    chat template's trailing assistant-prompt suffix so
+    ``segmented.flatten()`` equals ``full``.
+
+    Falls back to a single-segment prompt (logged at debug) when the
+    tokenizer exposes no EOM token or the detected EOM count differs from
+    ``len(messages)``. Callers detect this via ``len(segmented.segments)
+    <= 1`` and skip the checkpoint path for the request, since a
+    single-segment prompt has no usable mid-prompt checkpoint boundary.
     """
     from olmlx.engine.prompt_cache.checkpoint import Segment, SegmentedPrompt
 
     if not messages:
         return SegmentedPrompt(segments=[])
 
-    # Normalise apply_chat_template's varied return types — see
-    # _apply_chat_template_text. Possible shapes: flat list[int],
-    # batch-of-1 list[list[int]], BatchEncoding mapping with
-    # ``input_ids``, or array-like sequences (numpy ndarray, torch
-    # tensor, mlx array) whose elements are ints. Anything we can't
-    # coerce to list[int] logs at debug and falls back to an empty
-    # segment so the caller's ``segmented.flatten() != prompt_tokens``
-    # check routes to the flat path.
-    raw = tokenizer.apply_chat_template(messages, **template_kwargs)
-    if isinstance(raw, collections.abc.Mapping):
-        token_seq: Any = raw.get("input_ids")
+    if full_tokens is not None:
+        full = list(full_tokens)
     else:
-        token_seq = raw
-    # Unwrap a batch-of-1 nested sequence.
-    if (
-        token_seq is not None
-        and not isinstance(token_seq, (str, bytes))
-        and len(token_seq) > 0
-        and isinstance(token_seq[0], (list, tuple))
-    ):
-        token_seq = token_seq[0]
-    try:
-        full: list[int] = [int(t) for t in token_seq]
-    except (TypeError, ValueError):
-        logger.debug(
-            "tokenize_segmented_chat: cannot coerce apply_chat_template "
-            "result (%s) to list[int]; checkpoint path will fall back to "
-            "the flat path for this request",
-            type(raw).__name__,
-        )
-        return SegmentedPrompt(segments=[Segment(tokens=[], role=messages[-1]["role"])])
+        # Normalise apply_chat_template's varied return types — see
+        # _apply_chat_template_text. Possible shapes: flat list[int],
+        # batch-of-1 list[list[int]], BatchEncoding mapping with
+        # ``input_ids``, or array-like sequences (numpy ndarray, torch
+        # tensor, mlx array) whose elements are ints.
+        raw = tokenizer.apply_chat_template(messages, **template_kwargs)
+        if isinstance(raw, collections.abc.Mapping):
+            token_seq: Any = raw.get("input_ids")
+        else:
+            token_seq = raw
+        # Unwrap a batch-of-1 nested sequence.
+        if (
+            token_seq is not None
+            and not isinstance(token_seq, (str, bytes))
+            and len(token_seq) > 0
+            and isinstance(token_seq[0], (list, tuple))
+        ):
+            token_seq = token_seq[0]
+        try:
+            full = [int(t) for t in token_seq]
+        except (TypeError, ValueError):
+            logger.debug(
+                "tokenize_segmented_chat: cannot coerce apply_chat_template "
+                "result (%s) to list[int]; falling back to empty segment",
+                type(raw).__name__,
+            )
+            return SegmentedPrompt(
+                segments=[Segment(tokens=[], role=messages[-1]["role"])]
+            )
 
     eom_ids = _message_boundary_token_ids(tokenizer)
     if not eom_ids:
@@ -2392,16 +2409,29 @@ async def _setup_via_checkpoint_path(
     """
     from olmlx.engine.prompt_cache.checkpoint import snapshot_cache_for_persistence
 
-    segmented = tokenize_segmented_chat(tokenizer, messages, **(template_kwargs or {}))
-    # Sanity: the per-message tokenization must reconstruct the same
-    # token sequence the caller already produced via the full template
-    # application. If not, the chat template is non-monotonic and the
-    # segmentation fallback in tokenize_segmented_chat collapsed to a
-    # single segment — fall through to a fresh cache via the flat path.
-    if segmented.flatten() != prompt_tokens:
+    # Pass the caller's authoritative tokenization (prompt_tokens) directly
+    # so segmentation never re-tokenizes — this avoids a BOS-handling
+    # mismatch between apply_chat_template(tokenize=True) and
+    # tokenize_for_cache that would silently disable the checkpoint path
+    # on tokenizers like Llama 3's. template_kwargs is still threaded
+    # through for the non-production no-prompt_tokens path used by tests.
+    segmented = tokenize_segmented_chat(
+        tokenizer,
+        messages,
+        full_tokens=prompt_tokens,
+        **(template_kwargs or {}),
+    )
+    # No usable message boundaries (no EOM token, mismatched EOM count,
+    # or empty messages). A single-segment prompt has only one boundary
+    # at len(prompt_tokens), which the drive deliberately skips because
+    # the KV depth at that boundary is len(prompt_tokens)-1 (the trailing
+    # token is reserved for stream_generate). Skipping the checkpoint
+    # path entirely is cheaper than driving a no-op snapshot.
+    if len(segmented.segments) <= 1:
         logger.debug(
-            "Checkpoint path: per-message tokens do not match full template "
-            "(non-monotonic template); falling back to fresh cache"
+            "Checkpoint path: no usable message boundaries detected "
+            "(segments=%d); falling back to fresh cache",
+            len(segmented.segments),
         )
         new_cache = _make_prompt_cache_for_lm(lm)
         gen_kwargs["prompt_cache"] = new_cache

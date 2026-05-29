@@ -336,6 +336,52 @@ def test_tokenize_segmented_chat_handles_nested_list_return():
     assert sp.flatten() == [1, ord("X"), 9, 2, ord("Y"), 9]
 
 
+def test_tokenize_segmented_chat_full_tokens_bypasses_apply_chat_template():
+    """When full_tokens is provided, the function MUST use those tokens
+    directly and not call apply_chat_template — the caller's tokenization
+    is authoritative.
+
+    This regression test guards against the BOS-handling mismatch where
+    apply_chat_template(tokenize=True) and tokenize_for_cache produce
+    different leading-token sequences on tokenizers like Llama 3's,
+    which would silently disable the checkpoint path for every request.
+    """
+
+    class _BosMismatchTok:
+        """Returns a token list with one extra leading token when called
+        directly — simulates the apply_chat_template-vs-tokenize_for_cache
+        BOS mismatch."""
+
+        eos_token_id = 9
+        applied = False
+
+        def apply_chat_template(self, messages, **kwargs):
+            type(self).applied = True
+            ROLE = {"system": 1, "user": 2}
+            out = [999]  # leading BOS that the caller's tokenization lacks
+            for m in messages:
+                out.append(ROLE[m["role"]])
+                out.extend(ord(c) for c in m["content"])
+                out.append(9)
+            return out
+
+    tok = _BosMismatchTok()
+    messages = [
+        {"role": "system", "content": "AB"},
+        {"role": "user", "content": "CD"},
+    ]
+    # Caller passes its own tokenization WITHOUT the leading 999.
+    caller_tokens = [1, 65, 66, 9, 2, 67, 68, 9]
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=caller_tokens)
+    assert tok.applied is False, (
+        "apply_chat_template must not be called when full_tokens is provided"
+    )
+    assert sp.flatten() == caller_tokens, (
+        "segments must reconstruct exactly the caller's tokens"
+    )
+    assert len(sp.segments) == 2
+
+
 def test_tokenize_segmented_chat_coerces_arraylike_to_list_of_int():
     """Tokenizers that return numpy-style array-likes (anything with
     int elements) must NOT silently fall back to an empty segment."""
