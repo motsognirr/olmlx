@@ -93,6 +93,14 @@ class Settings(BaseSettings):
     default_keep_alive: str = "5m"
     max_loaded_models: int = 1
     memory_limit_fraction: Annotated[float, Field(gt=0, le=1.0)] = 0.75
+    # Fraction of system RAM reserved below ``memory_limit_fraction`` for the
+    # KV cache and activations that allocate on top of model weights during
+    # decode.  The model-load admission check uses an effective weight budget
+    # of ``memory_limit_fraction - inference_headroom_fraction``.  Default 0.0
+    # preserves the legacy weights-only check; raise it (e.g. 0.1) on machines
+    # where a model that loads near the limit then swaps mid-generation
+    # (issue #223).
+    inference_headroom_fraction: Annotated[float, Field(ge=0, lt=1.0)] = 0.0
     model_load_timeout: Annotated[float, Field(gt=0)] | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     prompt_cache: bool = True
