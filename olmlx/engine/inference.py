@@ -2003,106 +2003,108 @@ async def generate_completion(
         lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     stats.load_duration = load_timer.duration_ns
 
-    # /api/generate defaults thinking OFF when unspecified (None), unlike the
-    # chat route's "think unless tools".  Coerce once so the template
-    # instruction and the downstream thinking_expected signal stay consistent
-    # (otherwise the splitter would arm the orphan-</think> buffer for thinking
-    # the model was told not to produce).
-    effective_thinking = enable_thinking if enable_thinking is not None else False
-
-    if apply_chat_template and not lm.is_vlm:
-        messages: list[dict] = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        try:
-            prompt = apply_chat_template_text(
-                lm.text_tokenizer,
-                messages,
-                caps=lm.template_caps,
-                enable_thinking=effective_thinking,
-            )
-            logger.info(
-                "Applied chat template for /api/generate (prompt length: %d chars)",
-                len(prompt),
-            )
-            logger.debug("Templated prompt: %s", prompt[:500])
-        except RuntimeError as exc:
-            logger.warning(
-                "Chat template failed for %s, falling back to raw prompt: %s",
-                model_name,
-                exc,
-                exc_info=True,
-            )
-            if system:
-                prompt = f"{system}\n\n{prompt}"
-    elif apply_chat_template and lm.is_vlm:
-        messages: list[dict] = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        try:
-            # Forward the *coerced* effective_thinking (not raw enable_thinking)
-            # so VLM /api/generate is off-by-default like the text path, and so
-            # the explicit instruction matches the thinking_expected signal
-            # computed below.  We deliberately don't defer to the VLM template's
-            # own default: we can't introspect it, so passing an explicit bool
-            # is the only way to keep the thinking-splitter consistent.  This
-            # differs intentionally from generate_chat's no-tools VLM path,
-            # which passes None and lets _apply_chat_template_vlm's guard skip
-            # the kwarg (preserving the template default).  Consequence: every
-            # /api/generate VLM request passes enable_thinking (incl. False) to
-            # the template even for non-thinking VLMs — harmless because HF
-            # templates ignore unknown kwargs.
-            prompt = _apply_chat_template_vlm(
-                lm.tokenizer, lm.model, messages, enable_thinking=effective_thinking
-            )
-            logger.info(
-                "Applied VLM chat template for /api/generate (prompt length: %d chars)",
-                len(prompt),
-            )
-            logger.debug("VLM templated prompt: %s", prompt[:500])
-        except Exception as exc:
-            logger.warning(
-                "VLM chat template failed for %s, falling back to raw prompt: %s",
-                model_name,
-                exc,
-                exc_info=True,
-            )
-            if system:
-                prompt = f"{system}\n\n{prompt}"
-
-    # Merge per-model defaults with request options.  options=None means
-    # "use defaults"; options={} means "override all defaults" (empty).
-    merged_options = (
-        {**lm.default_options, **(options or {})}
-        if lm.default_options and options is None
-        else options
-    )
-    gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
-    mt = gen_kwargs.pop("max_tokens", max_tokens)
-
-    grammar_active = _install_grammar_processor(lm, gen_kwargs, grammar_spec)
-
-    # Tell routers whether to wait for a (possibly orphaned) `</think>` when
-    # splitting thinking from the response (issue #307) — shares the rules
-    # with `generate_chat`.  Completions never carry tools.  In raw mode no
-    # chat template is applied, so no thinking instruction reached the model:
-    # leave thinking_expected False so the router doesn't arm the orphan-close
-    # heuristic on un-templated output (a literal `</think>` in code/prose).
-    caps = lm.template_caps or TemplateCaps()
-    thinking_expected = (
-        _resolve_thinking_active(caps, None, effective_thinking)
-        if apply_chat_template
-        else False
-    )
-
     # The pin acquired by ``ensure_loaded(pin=True)`` is released exactly
     # once: by the stream wrapper after the generator exits, by the
-    # non-stream finally below, or by the except below if anything raises
-    # before delegation.
-    delegated = False
+    # non-stream finally below, or by the outer except below if anything
+    # raises before delegation. The outer try must scope from RIGHT AFTER
+    # ensure_loaded (PR #394 aider review) so an exception in the chat
+    # template / kwargs setup doesn't leak the pin.
+    pin_released_or_transferred = False
     try:
+        # /api/generate defaults thinking OFF when unspecified (None), unlike the
+        # chat route's "think unless tools".  Coerce once so the template
+        # instruction and the downstream thinking_expected signal stay consistent
+        # (otherwise the splitter would arm the orphan-</think> buffer for thinking
+        # the model was told not to produce).
+        effective_thinking = enable_thinking if enable_thinking is not None else False
+
+        if apply_chat_template and not lm.is_vlm:
+            messages: list[dict] = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            try:
+                prompt = apply_chat_template_text(
+                    lm.text_tokenizer,
+                    messages,
+                    caps=lm.template_caps,
+                    enable_thinking=effective_thinking,
+                )
+                logger.info(
+                    "Applied chat template for /api/generate (prompt length: %d chars)",
+                    len(prompt),
+                )
+                logger.debug("Templated prompt: %s", prompt[:500])
+            except RuntimeError as exc:
+                logger.warning(
+                    "Chat template failed for %s, falling back to raw prompt: %s",
+                    model_name,
+                    exc,
+                    exc_info=True,
+                )
+                if system:
+                    prompt = f"{system}\n\n{prompt}"
+        elif apply_chat_template and lm.is_vlm:
+            messages: list[dict] = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            try:
+                # Forward the *coerced* effective_thinking (not raw enable_thinking)
+                # so VLM /api/generate is off-by-default like the text path, and so
+                # the explicit instruction matches the thinking_expected signal
+                # computed below.  We deliberately don't defer to the VLM template's
+                # own default: we can't introspect it, so passing an explicit bool
+                # is the only way to keep the thinking-splitter consistent.  This
+                # differs intentionally from generate_chat's no-tools VLM path,
+                # which passes None and lets _apply_chat_template_vlm's guard skip
+                # the kwarg (preserving the template default).  Consequence: every
+                # /api/generate VLM request passes enable_thinking (incl. False) to
+                # the template even for non-thinking VLMs — harmless because HF
+                # templates ignore unknown kwargs.
+                prompt = _apply_chat_template_vlm(
+                    lm.tokenizer, lm.model, messages, enable_thinking=effective_thinking
+                )
+                logger.info(
+                    "Applied VLM chat template for /api/generate (prompt length: %d chars)",
+                    len(prompt),
+                )
+                logger.debug("VLM templated prompt: %s", prompt[:500])
+            except Exception as exc:
+                logger.warning(
+                    "VLM chat template failed for %s, falling back to raw prompt: %s",
+                    model_name,
+                    exc,
+                    exc_info=True,
+                )
+                if system:
+                    prompt = f"{system}\n\n{prompt}"
+
+        # Merge per-model defaults with request options.  options=None means
+        # "use defaults"; options={} means "override all defaults" (empty).
+        merged_options = (
+            {**lm.default_options, **(options or {})}
+            if lm.default_options and options is None
+            else options
+        )
+        gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
+        mt = gen_kwargs.pop("max_tokens", max_tokens)
+
+        grammar_active = _install_grammar_processor(lm, gen_kwargs, grammar_spec)
+
+        # Tell routers whether to wait for a (possibly orphaned) `</think>` when
+        # splitting thinking from the response (issue #307) — shares the rules
+        # with `generate_chat`.  Completions never carry tools.  In raw mode no
+        # chat template is applied, so no thinking instruction reached the model:
+        # leave thinking_expected False so the router doesn't arm the orphan-close
+        # heuristic on un-templated output (a literal `</think>` in code/prose).
+        caps = lm.template_caps or TemplateCaps()
+        thinking_expected = (
+            _resolve_thinking_active(caps, None, effective_thinking)
+            if apply_chat_template
+            else False
+        )
+
         if stream:
             gen = _stream_completion(
                 lm,
@@ -2115,7 +2117,10 @@ async def generate_completion(
                 grammar_active=grammar_active,
                 adopt_pin=True,
             )
-            delegated = True
+            # Ownership of the pin transfers to the wrapper; its finally
+            # releases on any generator exit. Mark the flag for the outer
+            # except so it doesn't double-release.
+            pin_released_or_transferred = True
             return _prepend_meta(
                 _release_pin_after_gen(gen, lm),
                 {"thinking_expected": thinking_expected},
@@ -2137,13 +2142,13 @@ async def generate_completion(
                 return result
             finally:
                 # Release exactly once on every exit path — success or
-                # exception. Set ``delegated`` so the outer except doesn't
-                # try to release again.
-                if not delegated:
+                # exception. Set the flag so the outer except doesn't try
+                # to release again.
+                if not pin_released_or_transferred:
                     lm.release_ref()
-                    delegated = True
+                    pin_released_or_transferred = True
     except BaseException:
-        if not delegated:
+        if not pin_released_or_transferred:
             lm.release_ref()
         raise
 
@@ -3480,151 +3485,155 @@ async def generate_chat(
         lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     stats.load_duration = load_timer.duration_ns
 
-    images = _extract_images(messages)
-
-    # Normalise OpenAI-format tool_calls ({function: {name, arguments: "json"}})
-    # to the flat format chat templates expect ({name, arguments: {...}}).
-    messages = _normalize_tool_calls_in_messages(messages)
-
-    # When native tools are used, clients (e.g. opencode, Claude Code) may
-    # include their own tool-format instructions in the system message that
-    # conflict with the model's native tool call format.  With long prompts,
-    # models like Gemma 4 follow the client's text instructions instead of
-    # generating native tool call tokens.  Appending a short override to the
-    # system message steers the model back to the native format.  We pass
-    # the model's own chat template so the helper can suppress patterns the
-    # template uses natively (e.g. Mistral's `[TOOL_CALLS]`).
-    caps = lm.template_caps or TemplateCaps()
-    if tools and caps.supports_tools:
-        template_text = _get_chat_template_text(lm.tokenizer)
-        messages = _add_native_tool_hint(messages, template_text)
-
-    if lm.is_vlm:
-        # VLM models must use the VLM generation path for tokenization.
-        # Pass tools natively through the template when supported — this
-        # produces model-native formatting (e.g. <|tool> tags for Gemma 4)
-        # which is far more effective than injecting JSON into the system
-        # message.  Fall back to system-message injection for models whose
-        # template lacks tool support.
-        # Resolve enable_thinking for templates that support it.
-        vlm_thinking = enable_thinking if caps.supports_enable_thinking else None
-        # Convert role="tool" messages to tool_responses format for models
-        # that don't support OpenAI-style tool messages (e.g. Gemma 4).
-        if caps.uses_tool_responses:
-            messages = _convert_tool_messages_to_responses(messages)
-        if tools and caps.supports_tools:
-            prompt = _apply_chat_template_vlm(
-                lm.tokenizer,
-                lm.model,
-                messages,
-                images,
-                tools=tools,
-                enable_thinking=vlm_thinking,
-            )
-            logger.info("VLM chat prompt with %d tools (native template)", len(tools))
-        elif tools:
-            vlm_messages = _inject_tools_into_system(list(messages), tools)
-            prompt = _apply_chat_template_vlm(
-                lm.tokenizer,
-                lm.model,
-                vlm_messages,
-                images,
-                enable_thinking=vlm_thinking,
-            )
-            logger.info(
-                "VLM chat prompt with %d tools (injected into system)", len(tools)
-            )
-        else:
-            prompt = _apply_chat_template_vlm(
-                lm.tokenizer,
-                lm.model,
-                messages,
-                images,
-                enable_thinking=vlm_thinking,
-            )
-        logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
-        logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
-        if enable_thinking is not None and vlm_thinking is None:
-            logger.debug(
-                "enable_thinking=%s ignored for VLM model (template does not support it)",
-                enable_thinking,
-            )
-    else:
-        prompt = apply_chat_template_text(
-            lm.text_tokenizer,
-            messages,
-            tools,
-            caps=lm.template_caps,
-            enable_thinking=enable_thinking,
-        )
-        if tools:
-            logger.info("Chat prompt with %d tools", len(tools))
-        logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
-        logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
-
-    # Merge per-model defaults with request options.  options=None means
-    # "use defaults"; options={} means "override all defaults" (empty).
-    merged_options = (
-        {**lm.default_options, **(options or {})}
-        if lm.default_options and options is None
-        else options
-    )
-    gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
-    mt = gen_kwargs.pop("max_tokens", max_tokens)
-
-    grammar_active = _install_grammar_processor(
-        lm, gen_kwargs, grammar_spec, has_tools=bool(tools)
-    )
-
-    # Prompt caching applies to both streaming and non-streaming requests
-    # (issue #342).  Disabled in distributed mode because rank 0 processes
-    # only suffix tokens on cache hits while workers process the full
-    # prompt, causing all_sum call count mismatch and deadlock.  Disabled
-    # for speculative regardless of stream mode (issue #346): the
-    # speculative decoder owns its own internal target/draft caches and
-    # would receive a misaligned suffix-only prompt on a cache hit —
-    # ``async_speculative_stream`` does not consume ``gen_kwargs['prompt_cache']``.
-    # Also disabled for VLMs on the non-streaming path because
-    # ``mlx_vlm.generate`` accepts neither ``prompt_cache`` nor ``input_ids``.
-    use_prompt_cache = (
-        settings.prompt_cache
-        and make_prompt_cache is not None
-        and not lm.is_distributed
-        and not lm.is_speculative
-        and (stream or not lm.is_vlm)
-    )
-    prompt_tokens = None
-    if use_prompt_cache:
-        prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
-        # Memory-only peek for debug logging; the authoritative lookup happens
-        # inside _stream_completion/_full_completion under the inference lock.
-        cached_state = lm.prompt_cache_store.peek(cache_id)
-        logger.debug(
-            "Prompt cache enabled: %d prompt tokens, existing cache=%s",
-            len(prompt_tokens),
-            f"{len(cached_state.tokens)} tokens" if cached_state else "none",
-        )
-    else:
-        logger.debug(
-            "Prompt cache disabled: setting=%s stream=%s vlm=%s speculative=%s "
-            "make_prompt_cache=%s",
-            settings.prompt_cache,
-            stream,
-            lm.is_vlm,
-            lm.is_speculative,
-            make_prompt_cache is not None,
-        )
-
-    # Tell streaming routers whether to wait for a (possibly orphaned, see
-    # #307) `</think>` token — shares the rules with `_apply_chat_template`.
-    thinking_expected = _resolve_thinking_active(caps, tools, enable_thinking)
-
     # The pin acquired by ``ensure_loaded(pin=True)`` is released exactly
     # once: by the stream wrapper after the generator exits, by the
-    # non-stream finally below, or by the except below if anything raises
-    # before delegation.
-    delegated = False
+    # non-stream finally below, or by the outer except below if anything
+    # raises before delegation. The outer try must scope from RIGHT AFTER
+    # ensure_loaded (PR #394 aider review) so an exception in the chat
+    # template / kwargs setup doesn't leak the pin.
+    pin_released_or_transferred = False
     try:
+        images = _extract_images(messages)
+
+        # Normalise OpenAI-format tool_calls ({function: {name, arguments: "json"}})
+        # to the flat format chat templates expect ({name, arguments: {...}}).
+        messages = _normalize_tool_calls_in_messages(messages)
+
+        # When native tools are used, clients (e.g. opencode, Claude Code) may
+        # include their own tool-format instructions in the system message that
+        # conflict with the model's native tool call format.  With long prompts,
+        # models like Gemma 4 follow the client's text instructions instead of
+        # generating native tool call tokens.  Appending a short override to the
+        # system message steers the model back to the native format.  We pass
+        # the model's own chat template so the helper can suppress patterns the
+        # template uses natively (e.g. Mistral's `[TOOL_CALLS]`).
+        caps = lm.template_caps or TemplateCaps()
+        if tools and caps.supports_tools:
+            template_text = _get_chat_template_text(lm.tokenizer)
+            messages = _add_native_tool_hint(messages, template_text)
+
+        if lm.is_vlm:
+            # VLM models must use the VLM generation path for tokenization.
+            # Pass tools natively through the template when supported — this
+            # produces model-native formatting (e.g. <|tool> tags for Gemma 4)
+            # which is far more effective than injecting JSON into the system
+            # message.  Fall back to system-message injection for models whose
+            # template lacks tool support.
+            # Resolve enable_thinking for templates that support it.
+            vlm_thinking = enable_thinking if caps.supports_enable_thinking else None
+            # Convert role="tool" messages to tool_responses format for models
+            # that don't support OpenAI-style tool messages (e.g. Gemma 4).
+            if caps.uses_tool_responses:
+                messages = _convert_tool_messages_to_responses(messages)
+            if tools and caps.supports_tools:
+                prompt = _apply_chat_template_vlm(
+                    lm.tokenizer,
+                    lm.model,
+                    messages,
+                    images,
+                    tools=tools,
+                    enable_thinking=vlm_thinking,
+                )
+                logger.info(
+                    "VLM chat prompt with %d tools (native template)", len(tools)
+                )
+            elif tools:
+                vlm_messages = _inject_tools_into_system(list(messages), tools)
+                prompt = _apply_chat_template_vlm(
+                    lm.tokenizer,
+                    lm.model,
+                    vlm_messages,
+                    images,
+                    enable_thinking=vlm_thinking,
+                )
+                logger.info(
+                    "VLM chat prompt with %d tools (injected into system)", len(tools)
+                )
+            else:
+                prompt = _apply_chat_template_vlm(
+                    lm.tokenizer,
+                    lm.model,
+                    messages,
+                    images,
+                    enable_thinking=vlm_thinking,
+                )
+            logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
+            logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
+            if enable_thinking is not None and vlm_thinking is None:
+                logger.debug(
+                    "enable_thinking=%s ignored for VLM model (template does not support it)",
+                    enable_thinking,
+                )
+        else:
+            prompt = apply_chat_template_text(
+                lm.text_tokenizer,
+                messages,
+                tools,
+                caps=lm.template_caps,
+                enable_thinking=enable_thinking,
+            )
+            if tools:
+                logger.info("Chat prompt with %d tools", len(tools))
+            logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
+            logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
+
+        # Merge per-model defaults with request options.  options=None means
+        # "use defaults"; options={} means "override all defaults" (empty).
+        merged_options = (
+            {**lm.default_options, **(options or {})}
+            if lm.default_options and options is None
+            else options
+        )
+        gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
+        mt = gen_kwargs.pop("max_tokens", max_tokens)
+
+        grammar_active = _install_grammar_processor(
+            lm, gen_kwargs, grammar_spec, has_tools=bool(tools)
+        )
+
+        # Prompt caching applies to both streaming and non-streaming requests
+        # (issue #342).  Disabled in distributed mode because rank 0 processes
+        # only suffix tokens on cache hits while workers process the full
+        # prompt, causing all_sum call count mismatch and deadlock.  Disabled
+        # for speculative regardless of stream mode (issue #346): the
+        # speculative decoder owns its own internal target/draft caches and
+        # would receive a misaligned suffix-only prompt on a cache hit —
+        # ``async_speculative_stream`` does not consume ``gen_kwargs['prompt_cache']``.
+        # Also disabled for VLMs on the non-streaming path because
+        # ``mlx_vlm.generate`` accepts neither ``prompt_cache`` nor ``input_ids``.
+        use_prompt_cache = (
+            settings.prompt_cache
+            and make_prompt_cache is not None
+            and not lm.is_distributed
+            and not lm.is_speculative
+            and (stream or not lm.is_vlm)
+        )
+        prompt_tokens = None
+        if use_prompt_cache:
+            prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
+            # Memory-only peek for debug logging; the authoritative lookup happens
+            # inside _stream_completion/_full_completion under the inference lock.
+            cached_state = lm.prompt_cache_store.peek(cache_id)
+            logger.debug(
+                "Prompt cache enabled: %d prompt tokens, existing cache=%s",
+                len(prompt_tokens),
+                f"{len(cached_state.tokens)} tokens" if cached_state else "none",
+            )
+        else:
+            logger.debug(
+                "Prompt cache disabled: setting=%s stream=%s vlm=%s speculative=%s "
+                "make_prompt_cache=%s",
+                settings.prompt_cache,
+                stream,
+                lm.is_vlm,
+                lm.is_speculative,
+                make_prompt_cache is not None,
+            )
+
+        # Tell streaming routers whether to wait for a (possibly orphaned, see
+        # #307) `</think>` token — shares the rules with `_apply_chat_template`.
+        thinking_expected = _resolve_thinking_active(caps, tools, enable_thinking)
+
         if stream:
             gen = _stream_completion(
                 lm,
@@ -3640,7 +3649,10 @@ async def generate_chat(
                 grammar_active=grammar_active,
                 adopt_pin=True,
             )
-            delegated = True
+            # Ownership of the pin transfers to the wrapper; its finally
+            # releases on any generator exit. Mark the flag for the outer
+            # except so it doesn't double-release.
+            pin_released_or_transferred = True
             return _prepend_meta(
                 _release_pin_after_gen(gen, lm),
                 {"thinking_expected": thinking_expected},
@@ -3668,11 +3680,11 @@ async def generate_chat(
                 result["thinking_expected"] = thinking_expected
                 return result
             finally:
-                if not delegated:
+                if not pin_released_or_transferred:
                     lm.release_ref()
-                    delegated = True
+                    pin_released_or_transferred = True
     except BaseException:
-        if not delegated:
+        if not pin_released_or_transferred:
             lm.release_ref()
         raise
 

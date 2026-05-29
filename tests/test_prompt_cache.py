@@ -1692,6 +1692,33 @@ class TestPinReleasedAcrossStreamingHandoff:
     case where the wrapper's aclose propagates to the inner generator."""
 
     @pytest.mark.asyncio
+    async def test_pin_released_when_setup_raises_before_dispatch(self, mock_manager):
+        """Regression for PR #394 aider review: an exception in the
+        chat-template / kwargs setup code (between ensure_loaded(pin=True)
+        and the dispatch try block) must release the pin so the model
+        doesn't stay permanently pinned."""
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        # Apply chat template blows up before dispatch.
+        lm.tokenizer.apply_chat_template = MagicMock(
+            side_effect=RuntimeError("synthetic template failure")
+        )
+        assert lm.active_refs == 0
+
+        with pytest.raises(RuntimeError, match="synthetic template failure"):
+            await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=False,
+            )
+
+        # The pin must be released — not stuck at 1 — even though the
+        # exception fired before the dispatch try block.
+        assert lm.active_refs == 0
+
+    @pytest.mark.asyncio
     async def test_pin_released_on_aclose_mid_stream(self, mock_manager):
         from olmlx.engine.inference import generate_chat
 
