@@ -2092,6 +2092,61 @@ class TestGenerateChatEnableThinking:
         ].tokenizer.apply_chat_template.call_args[1]
         assert call_kwargs["enable_thinking"] is False
 
+    @pytest.mark.asyncio
+    async def test_per_model_default_applied_when_request_omits_flag(
+        self, mock_manager
+    ):
+        """LoadedModel.enable_thinking is consulted when the request omits the flag (issue #400)."""
+        mock_mx = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.enable_thinking = False
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings.prompt_cache", False),
+        ):
+            with patch(
+                "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_thread:
+                mock_thread.return_value = "response"
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                )
+
+        call_kwargs = lm.tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["enable_thinking"] is False
+
+    @pytest.mark.asyncio
+    async def test_request_flag_overrides_per_model_default(self, mock_manager):
+        """Explicit request enable_thinking wins over the per-model default."""
+        mock_mx = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.enable_thinking = False  # per-model default: off
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings.prompt_cache", False),
+        ):
+            with patch(
+                "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_thread:
+                mock_thread.return_value = "response"
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                    enable_thinking=True,  # request wins
+                )
+
+        call_kwargs = lm.tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["enable_thinking"] is True
+
 
 class TestFullCompletionInner:
     @pytest.mark.asyncio

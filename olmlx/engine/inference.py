@@ -3930,6 +3930,12 @@ async def generate_chat(
     # template / kwargs setup doesn't leak the pin.
     pin_released_or_transferred = False
     try:
+        # Per-model default for enable_thinking applies when the request
+        # didn't set the flag. Request value, when present, still wins.
+        # See issue #400.
+        if enable_thinking is None and lm.enable_thinking is not None:
+            enable_thinking = lm.enable_thinking
+
         images = _extract_images(messages)
 
         # Normalise OpenAI-format tool_calls ({function: {name, arguments: "json"}})

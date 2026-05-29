@@ -345,6 +345,10 @@ class ModelConfig:
     flash_speculative: bool | None = None
     flash_speculative_draft_model: str | None = None
     flash_speculative_tokens: int | None = None
+    #: Per-model default for the chat-template ``enable_thinking`` kwarg.
+    #: Applied by ``generate_chat`` when the request didn't set the flag.
+    #: ``None`` means fall back to the engine default (think unless tools).
+    enable_thinking: bool | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -516,6 +520,12 @@ class ModelConfig:
             raise ValueError(
                 f"'flash_speculative_tokens' must be a positive integer or None, "
                 f"got {self.flash_speculative_tokens!r}"
+            )
+        if self.enable_thinking is not None and not isinstance(
+            self.enable_thinking, bool
+        ):
+            raise ValueError(
+                f"'enable_thinking' must be a bool or None, got {self.enable_thinking!r}"
             )
 
     def resolved_speculative(self) -> SpeculativeConfig:
@@ -848,6 +858,13 @@ class ModelConfig:
             flash_speculative = entry.get("flash_speculative")
             flash_speculative_draft_model = entry.get("flash_speculative_draft_model")
             flash_speculative_tokens = entry.get("flash_speculative_tokens")
+            enable_thinking_raw = entry.get("enable_thinking")
+            if enable_thinking_raw is not None and not isinstance(
+                enable_thinking_raw, bool
+            ):
+                raise ValueError(
+                    f"'enable_thinking' must be a bool, got {enable_thinking_raw!r}"
+                )
 
             kv_cache_quant_raw = entry.get("kv_cache_quant")
             if kv_cache_quant_raw is not None:
@@ -912,6 +929,7 @@ class ModelConfig:
                 flash_speculative=flash_speculative,
                 flash_speculative_draft_model=flash_speculative_draft_model,
                 flash_speculative_tokens=flash_speculative_tokens,
+                enable_thinking=enable_thinking_raw,
                 _extra=extra,
             )
         raise TypeError(
@@ -949,6 +967,7 @@ class ModelConfig:
             and self.flash_speculative is None
             and self.flash_speculative_draft_model is None
             and self.flash_speculative_tokens is None
+            and self.enable_thinking is None
             and not self._extra
         ):
             return self.hf_path
@@ -1012,6 +1031,8 @@ class ModelConfig:
             result["flash_speculative_draft_model"] = self.flash_speculative_draft_model
         if self.flash_speculative_tokens is not None:
             result["flash_speculative_tokens"] = self.flash_speculative_tokens
+        if self.enable_thinking is not None:
+            result["enable_thinking"] = self.enable_thinking
         # Filter known keys defensively — from_entry() already excludes them,
         # but _extra can be set directly via ModelConfig construction.
         result.update(
