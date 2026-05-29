@@ -859,12 +859,6 @@ class ModelConfig:
             flash_speculative_draft_model = entry.get("flash_speculative_draft_model")
             flash_speculative_tokens = entry.get("flash_speculative_tokens")
             enable_thinking_raw = entry.get("enable_thinking")
-            if enable_thinking_raw is not None and not isinstance(
-                enable_thinking_raw, bool
-            ):
-                raise ValueError(
-                    f"'enable_thinking' must be a bool, got {enable_thinking_raw!r}"
-                )
 
             kv_cache_quant_raw = entry.get("kv_cache_quant")
             if kv_cache_quant_raw is not None:

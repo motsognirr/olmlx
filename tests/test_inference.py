@@ -2093,13 +2093,14 @@ class TestGenerateChatEnableThinking:
         assert call_kwargs["enable_thinking"] is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("default_value", [True, False])
     async def test_per_model_default_applied_when_request_omits_flag(
-        self, mock_manager
+        self, mock_manager, default_value
     ):
         """LoadedModel.enable_thinking is consulted when the request omits the flag (issue #400)."""
         mock_mx = MagicMock()
         lm = mock_manager._loaded["qwen3:latest"]
-        lm.enable_thinking = False
+        lm.enable_thinking = default_value
         lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
 
         with (
@@ -2118,7 +2119,7 @@ class TestGenerateChatEnableThinking:
                 )
 
         call_kwargs = lm.tokenizer.apply_chat_template.call_args[1]
-        assert call_kwargs["enable_thinking"] is False
+        assert call_kwargs["enable_thinking"] is default_value
 
     @pytest.mark.asyncio
     async def test_request_flag_overrides_per_model_default(self, mock_manager):
