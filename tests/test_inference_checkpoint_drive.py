@@ -464,3 +464,83 @@ def test_tokenize_segmented_chat_real_qwen3_5_template():
         tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
     )
     assert sp.flatten() == full
+
+
+def test_setup_prompt_cache_single_segment_request_still_uses_existing_checkpoint(
+    monkeypatch,
+):
+    """Regression for aider Finding on aabc3aa: a single-message request
+    that is a strict extension of a previously-stored checkpoint must
+    still warm-start. The previous code short-circuited on the
+    single-segment guard before consulting fetch_nearest, so
+    single-message requests got zero benefit from existing checkpoints.
+    """
+    from olmlx.engine.inference import _setup_prompt_cache
+    from olmlx.engine.model_manager import LoadedModel
+    from olmlx.engine.prompt_cache.checkpoint import (
+        snapshot_cache_for_persistence,
+    )
+    from olmlx.engine.prompt_cache.state import CachedPromptState
+    from olmlx.engine.prompt_cache.store import PromptCacheStore
+
+    tok = _FakeTokenizer()
+    # Single-message request: just one user turn — yields 1 segment under
+    # the EOM split.
+    messages = [{"role": "user", "content": "EXTRA"}]
+    full_tokens = tok.apply_chat_template(messages)
+    # Pre-populate the store with a checkpoint that is a strict prefix
+    # of `full_tokens`. (In real usage this came from an earlier multi-
+    # segment request that shared the prefix.)
+    store = PromptCacheStore(max_slots=4)
+    prefix_len = 3
+    stored_cache = [KVCache()]
+    stored_cache[0].update_and_fetch(
+        mx.zeros((1, 1, prefix_len, 4)), mx.zeros((1, 1, prefix_len, 4))
+    )
+    store.insert_checkpoint(
+        CachedPromptState(
+            tokens=full_tokens[:prefix_len],
+            cache=snapshot_cache_for_persistence(stored_cache, eager_eval=False),
+            cache_type="system",
+            is_checkpoint=True,
+        )
+    )
+
+    model = _DummyModel()
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=model,
+        tokenizer=tok,
+        prompt_cache_store=store,
+        uses_checkpoint_persistence=True,
+        supports_cache_persistence=True,
+    )
+    monkeypatch.setattr(
+        "olmlx.engine.inference._make_prompt_cache_for_lm",
+        lambda lm: [KVCache()],
+    )
+    gen_kwargs: dict = {}
+    cs = asyncio.run(
+        _setup_prompt_cache(
+            lm,
+            "ignored",
+            gen_kwargs,
+            prompt_tokens=full_tokens,
+            cache_id="test",
+            messages=messages,
+            tokenizer=tok,
+        )
+    )
+    assert cs.cache_setup_done is True
+    assert cs.cache_read_tokens == prefix_len, (
+        f"expected cache_read={prefix_len} (warm-start), got "
+        f"{cs.cache_read_tokens} — single-segment request didn't take "
+        f"the hit"
+    )
+    # Drive should have run on the un-covered tokens only.
+    assert len(model.calls) == 1
+    assert model.calls[0] == full_tokens[prefix_len : len(full_tokens) - 1], (
+        "drive should process only tokens between hit_depth and the "
+        "reserved trailing token"
+    )

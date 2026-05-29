@@ -2430,16 +2430,23 @@ async def _setup_via_checkpoint_path(
         full_tokens=prompt_tokens,
         **(template_kwargs or {}),
     )
-    # No usable message boundaries (no EOM token, mismatched EOM count,
-    # or empty messages). A single-segment prompt has only one boundary
-    # at len(prompt_tokens), which the drive deliberately skips because
-    # the KV depth at that boundary is len(prompt_tokens)-1 (the trailing
-    # token is reserved for stream_generate). Skipping the checkpoint
-    # path entirely is cheaper than driving a no-op snapshot.
-    if len(segmented.segments) <= 1:
+    # Look up the longest stored prefix that is a STRICT prefix of our
+    # tokens BEFORE the single-segment guard — a single-message request
+    # that happens to be a strict extension of an existing checkpoint
+    # should still warm-start, even though it can't itself contribute a
+    # new mid-prompt checkpoint.
+    hit = lm.prompt_cache_store.fetch_nearest(prompt_tokens)
+
+    # No usable message boundaries AND no warm-start to inherit: a
+    # single-segment prompt has only one boundary at len(prompt_tokens),
+    # which the drive deliberately skips (the KV depth there is
+    # len(prompt_tokens)-1 because the trailing token is reserved for
+    # stream_generate). With nothing to gain on either side, skip the
+    # checkpoint path entirely — cheaper than driving a no-op snapshot.
+    if hit is None and len(segmented.segments) <= 1:
         logger.debug(
             "Checkpoint path: no usable message boundaries detected "
-            "(segments=%d); falling back to fresh cache",
+            "and no warm-start hit (segments=%d); falling back to fresh cache",
             len(segmented.segments),
         )
         new_cache = _make_prompt_cache_for_lm(lm)
@@ -2455,10 +2462,9 @@ async def _setup_via_checkpoint_path(
             cache_setup_done=True,
         )
 
-    # Look up the longest stored prefix that is a STRICT prefix of our tokens.
-    hit = lm.prompt_cache_store.fetch_nearest(prompt_tokens)
     if hit is None:
-        # Cold start: build a fresh cache, drive ALL segments.
+        # Cold start with usable boundaries: build a fresh cache, drive
+        # ALL segments and store checkpoints at each interior boundary.
         cache = _make_prompt_cache_for_lm(lm)
         already_covered = 0
     else:
