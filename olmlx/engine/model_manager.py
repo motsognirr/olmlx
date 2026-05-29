@@ -330,6 +330,64 @@ _PERSISTABLE_CACHE_CLASSES = frozenset(
 )
 
 
+# Layer classes that are safe to persist via the message-boundary
+# CHECKPOINT path (not the flat path).  Strict superset of
+# _PERSISTABLE_CACHE_CLASSES: RotatingKVCache is safe because the
+# checkpoint mechanism avoids trim entirely (#343); ArraysCache is
+# safe when the snapshot helper materialises the lazy gated_delta_kernel
+# graph via mx.eval before storage (#284).
+_PERSISTABLE_CACHE_CLASSES_WITH_CHECKPOINT = frozenset(
+    {
+        "KVCache",
+        "QuantizedKVCache",
+        "ConcatenateKVCache",
+        "RotatingKVCache",
+        "ChunkedKVCache",
+        "ArraysCache",
+    }
+)
+
+# Layer-class compositions that are individually safe via the checkpoint
+# path but combine into a layout we can't currently snapshot consistently
+# (issue #396, Qwen3-Next: mixed RotatingKVCache + ArraysCache).
+_EXCLUDED_MIXED_LAYER_PAIRS: frozenset[frozenset[str]] = frozenset(
+    {
+        frozenset({"RotatingKVCache", "ArraysCache"}),
+    }
+)
+
+
+def _layer_layout_is_mixed_excluded(cache_list: list) -> bool:
+    """True iff the layer-class set is in the excluded mixed-pair list.
+
+    Conservative composition gate: a layout that combines layer types
+    each of which is independently checkpoint-safe but whose joint
+    snapshot semantics we have not validated.  Currently flags Qwen3-Next
+    (RotatingKVCache + ArraysCache).
+    """
+    if not cache_list:
+        return False
+    classes = {type(layer).__name__ for layer in cache_list}
+    for excluded in _EXCLUDED_MIXED_LAYER_PAIRS:
+        if excluded.issubset(classes):
+            return True
+    return False
+
+
+def _cache_supports_checkpoint_persistence(cache_list: list) -> bool:
+    """True iff every layer is checkpoint-persistable AND the layout is
+    not in the excluded mixed-pair list (#396).
+    """
+    if not cache_list:
+        return False
+    if _layer_layout_is_mixed_excluded(cache_list):
+        return False
+    return all(
+        type(layer).__name__ in _PERSISTABLE_CACHE_CLASSES_WITH_CHECKPOINT
+        for layer in cache_list
+    )
+
+
 def _cache_supports_persistence(cache_list: list) -> bool:
     """True iff every layer is a cache type known to be safe for
     cross-request persistence.
@@ -2033,8 +2091,13 @@ class ModelManager:
             # trim_ok``: that would silently over-persist any such class
             # at the next mlx-lm release.
             persist_ok = persist_layout_ok and trim_ok
+            ckpt_ok = _cache_supports_checkpoint_persistence(probe_cache)
+            # Checkpoint path is preferred for non-trimmable layouts; for
+            # trimmable layouts the existing flat path is simpler and
+            # equivalent — keep flat.
+            lm.uses_checkpoint_persistence = ckpt_ok and not trim_ok
             lm.supports_cache_trim = trim_ok
-            lm.supports_cache_persistence = persist_ok
+            lm.supports_cache_persistence = persist_ok or lm.uses_checkpoint_persistence
             probe_succeeded = True
         except Exception:
             # Best-effort probe; on failure assume trim works so the
@@ -2055,6 +2118,7 @@ class ModelManager:
             )
             lm.supports_cache_trim = True
             lm.supports_cache_persistence = False
+            lm.uses_checkpoint_persistence = False
         finally:
             if probe_cache is not None:
                 del probe_cache

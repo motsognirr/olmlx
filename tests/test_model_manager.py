@@ -991,18 +991,14 @@ class TestProbeCacheCapabilities:
         mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_non_trimmable_layout_disables_persistence(
+    async def test_non_trimmable_layout_uses_checkpoint_persistence(
         self, registry, mock_store
     ):
-        """Issue #343: a layout containing a ``RotatingKVCache`` layer makes
-        the cache non-trimmable.  In real chat flow the stored prompt +
-        generated tokens can never be aligned with the next request's
-        client-supplied assistant message (which retokenizes differently
-        from the model's actual generation), so every cache lookup fails
-        the trim check and is discarded.  The bug is upstream: storing
-        any cross-request state for these models is wasted disk + Metal
-        I/O.  Treat them like ``ArraysCache`` (#284) — disable persistence
-        at probe time and short-circuit the store/load path entirely."""
+        """Issue #343 / Task 5.2-5.3: a layout containing a ``RotatingKVCache``
+        layer makes the cache non-trimmable, but the checkpoint path can still
+        reuse it safely (#343 — trim is avoided entirely).  The probe must set
+        ``uses_checkpoint_persistence=True`` and ``supports_cache_persistence=True``
+        for these layouts."""
 
         class _FakeRotating:
             pass
@@ -1011,9 +1007,6 @@ class TestProbeCacheCapabilities:
 
         manager = ModelManager(registry, mock_store)
         lm = self._make_lm()
-        # Start with persistence True to make the test failure mode
-        # unambiguous: the probe must actively flip it back to False.
-        lm.supports_cache_persistence = True
 
         probe_cache = [_FakeRotating(), _FakeRotating()]
         with (
@@ -1023,23 +1016,20 @@ class TestProbeCacheCapabilities:
             await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
-        assert lm.supports_cache_persistence is False
+        assert lm.uses_checkpoint_persistence is True
+        assert lm.supports_cache_persistence is True
         mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_chunked_kv_cache_layout_disables_persistence(
+    async def test_chunked_kv_cache_layout_uses_checkpoint_persistence(
         self, registry, mock_store
     ):
         """``ChunkedKVCache`` is the other non-trimmable layout cited by
         #343 and CLAUDE.md (mlx-lm's chunk-based cache; affects newer
         Apple-published checkpoints).  Like ``RotatingKVCache`` it sits
-        in the persist allowlist but not the trim allowlist, so the
-        #343 fold must force the effective persist flag to False.
-        Companion to ``test_non_trimmable_layout_disables_persistence``
-        — guards against a future contributor accidentally promoting
-        ``ChunkedKVCache`` into ``_TRIMMABLE_CACHE_CLASSES`` when
-        adding support for a new model family and silently re-enabling
-        the wasted store-then-discard cycle this PR removes."""
+        in the checkpoint-persist allowlist — so after Tasks 5.2/5.3 the
+        probe must set ``uses_checkpoint_persistence=True`` and keep
+        ``supports_cache_persistence=True``."""
 
         class _FakeChunked:
             pass
@@ -1048,7 +1038,6 @@ class TestProbeCacheCapabilities:
 
         manager = ModelManager(registry, mock_store)
         lm = self._make_lm()
-        lm.supports_cache_persistence = True
 
         probe_cache = [_FakeChunked(), _FakeChunked()]
         with (
@@ -1058,24 +1047,21 @@ class TestProbeCacheCapabilities:
             await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
-        assert lm.supports_cache_persistence is False
+        assert lm.uses_checkpoint_persistence is True
+        assert lm.supports_cache_persistence is True
         mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_mixed_layout_kv_plus_rotating_disables_persistence(
+    async def test_mixed_layout_kv_plus_rotating_uses_checkpoint_persistence(
         self, registry, mock_store
     ):
         """Real Gemma 4 layout: full-attention layers produce ``KVCache``
         (trimmable + persistable), sliding-window layers produce
-        ``RotatingKVCache`` (non-trimmable, layout-persistable).  With
-        ``all(...)`` semantics in both allowlist checks, the mixed list
-        reports trim=False (RotatingKVCache breaks the universal
-        quantifier) and layout-persist=True (both classes are in the
-        persist allowlist) — so the #343 fold takes effect and forces
-        the effective persist flag to False.  This guards against a
-        future allowlist change silently breaking the universal
-        quantifier on the heterogeneous layout that the affected models
-        actually use."""
+        ``RotatingKVCache`` (non-trimmable, layout-persistable).
+        After Tasks 5.2/5.3: the checkpoint path supports this layout
+        (KVCache+RotatingKVCache is not in the excluded-pairs set), so
+        the probe must set ``uses_checkpoint_persistence=True`` and
+        ``supports_cache_persistence=True``."""
 
         class _FakeKV:
             pass
@@ -1088,7 +1074,6 @@ class TestProbeCacheCapabilities:
 
         manager = ModelManager(registry, mock_store)
         lm = self._make_lm()
-        lm.supports_cache_persistence = True
 
         probe_cache = [_FakeKV(), _FakeRotating(), _FakeKV(), _FakeRotating()]
         with (
@@ -1098,7 +1083,8 @@ class TestProbeCacheCapabilities:
             await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
-        assert lm.supports_cache_persistence is False
+        assert lm.uses_checkpoint_persistence is True
+        assert lm.supports_cache_persistence is True
         mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1128,14 +1114,14 @@ class TestProbeCacheCapabilities:
         mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_non_trimmable_persistable_layout_logs_343(
+    async def test_non_trimmable_persistable_layout_no_disabled_log(
         self, registry, mock_store, caplog
     ):
-        """A hybrid sliding-window layout (RotatingKVCache) is in the
-        persist allowlist but not the trim allowlist.  After #343 the
-        probe forces persistence False; the load-time log must cite
-        #343 and reference the RotatingKVCache family — not #284 or
-        ArraysCache."""
+        """After Tasks 5.2/5.3: a pure RotatingKVCache layout now sets
+        ``uses_checkpoint_persistence=True`` and ``supports_cache_persistence=True``,
+        so the "cross-request reuse disabled" log gate
+        (``not lm.supports_cache_persistence``) is False and neither the
+        #343 nor the #284 attribution is emitted."""
         import logging
 
         class _FakeRotating:
@@ -1156,21 +1142,24 @@ class TestProbeCacheCapabilities:
         ):
             await manager._probe_cache_capabilities(lm)
 
-        assert "issue #343" in caplog.text
-        # #284 is the ArraysCache reason — must not be attributed here.
+        assert lm.supports_cache_persistence is True
+        assert lm.uses_checkpoint_persistence is True
+        # The "disabled" log branches are gated on not supports_cache_persistence;
+        # since persistence is now True for this layout, neither fires.
+        assert "issue #343" not in caplog.text
         assert "issue #284" not in caplog.text
-        assert "RotatingKVCache" in caplog.text or "sliding-window" in caplog.text
         mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_non_persistable_layout_logs_284(self, registry, mock_store, caplog):
-        """A hybrid SSM layout (ArraysCache) is in neither allowlist:
-        trim=False, layout-persist=False.  The load-time log must cite
-        #284 / ArraysCache — not #343 / RotatingKVCache.  This is the
-        regression the first PR cut of #343 introduced: gating the
-        secondary log on ``supports_cache_trim`` made it unreachable for
-        ArraysCache models, and the non-trimmable log misattributed them
-        as RotatingKVCache + #343."""
+    async def test_arrays_cache_layout_uses_checkpoint_persistence(
+        self, registry, mock_store, caplog
+    ):
+        """After Tasks 5.2/5.3: a pure ArraysCache layout (hybrid SSM,
+        e.g. Qwen3.5) now sets ``uses_checkpoint_persistence=True`` and
+        ``supports_cache_persistence=True`` — the checkpoint path can
+        reuse the cache safely via mx.eval before snapshot (#284).
+        The "cross-request reuse disabled" logs must NOT fire because
+        persistence is enabled."""
         import logging
 
         class _FakeArrays:
@@ -1192,12 +1181,12 @@ class TestProbeCacheCapabilities:
             await manager._probe_cache_capabilities(lm)
 
         assert lm.supports_cache_trim is False
-        assert lm.supports_cache_persistence is False
-        assert "issue #284" in caplog.text
-        # #343 is the RotatingKVCache reason — must not be attributed
-        # to ArraysCache models.
+        assert lm.uses_checkpoint_persistence is True
+        assert lm.supports_cache_persistence is True
+        # The "disabled" log branches are gated on not supports_cache_persistence;
+        # since persistence is now True for this layout, neither fires.
+        assert "issue #284" not in caplog.text
         assert "issue #343" not in caplog.text
-        assert "RotatingKVCache" not in caplog.text
         mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
