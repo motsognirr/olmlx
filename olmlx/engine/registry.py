@@ -21,6 +21,17 @@ _VALID_SPECULATIVE_STRATEGIES: frozenset[str] = frozenset(
 
 logger = logging.getLogger(__name__)
 
+
+class ModelsConfigError(Exception):
+    """Raised when ``models.json`` exists but cannot be read as a JSON object.
+
+    We refuse to silently substitute an empty registry and continue, because
+    a subsequent save would overwrite the on-disk file and lose the user's
+    config. Callers (CLI entry points, app lifespan) surface this as a
+    startup failure so the operator can repair or remove the file.
+    """
+
+
 # Experimental keys that can be overridden per-model.
 # Distributed settings are excluded — they affect process startup, not per-model behavior.
 PER_MODEL_EXPERIMENTAL_KEYS: frozenset[str] = frozenset(
@@ -1091,18 +1102,33 @@ class ModelRegistry:
         self._aliases_path = settings.models_config.parent / "aliases.json"
 
     def load(self):
-        """Load model mappings from config file and aliases."""
+        """Load model mappings from config file and aliases.
+
+        Raises ``ModelsConfigError`` when ``models.json`` exists but cannot
+        be parsed as a JSON object — refusing to load prevents a later save
+        from clobbering an unreadable file with empty in-memory state.
+        """
         if settings.models_config.exists():
             try:
                 with open(settings.models_config) as f:
                     raw = json.load(f)
             except json.JSONDecodeError as exc:
-                logger.warning(
-                    "Corrupted %s, starting with empty config: %s",
-                    settings.models_config,
-                    exc,
+                raise ModelsConfigError(
+                    f"Could not parse {settings.models_config}: {exc}. "
+                    f"Refusing to start so the file is not overwritten — "
+                    f"fix the JSON or remove the file and retry."
+                ) from exc
+            except OSError as exc:
+                raise ModelsConfigError(
+                    f"Could not read {settings.models_config}: {exc}. "
+                    f"Refusing to start — check file permissions and retry."
+                ) from exc
+            if not isinstance(raw, dict):
+                raise ModelsConfigError(
+                    f"{settings.models_config} must contain a JSON object, "
+                    f"got {type(raw).__name__}. Refusing to start so the "
+                    f"file is not overwritten."
                 )
-                raw = {}
             self._mappings = {}
             self._raw_unrecognized = {}
             self._dirty_keys = set()
@@ -1281,20 +1307,30 @@ class ModelRegistry:
             try:
                 with open(settings.models_config) as f:
                     loaded = json.load(f)
-                if not isinstance(loaded, dict):
-                    raise ValueError(f"Expected dict, got {type(loaded).__name__}")
-                disk_data = loaded
-                disk_read_ok = True
-            except (json.JSONDecodeError, ValueError, OSError):
-                pass  # corrupt, wrong type, or unreadable
+            except (json.JSONDecodeError, OSError) as exc:
+                # Refuse to overwrite an unreadable on-disk file — silently
+                # rewriting it from in-memory state would clobber the
+                # user's config. Surface the error to the caller (a model
+                # load, pull, or auto-register).
+                raise ModelsConfigError(
+                    f"Refusing to overwrite {settings.models_config}: "
+                    f"existing file is unreadable ({exc}). Fix or remove "
+                    f"the file and retry."
+                ) from exc
+            if not isinstance(loaded, dict):
+                raise ModelsConfigError(
+                    f"Refusing to overwrite {settings.models_config}: "
+                    f"existing file is not a JSON object (got "
+                    f"{type(loaded).__name__})."
+                )
+            disk_data = loaded
+            disk_read_ok = True
 
         if not disk_read_ok and self._mappings:
-            # File was missing or corrupt — write full in-memory state to
-            # avoid silently dropping live entries. Removed keys are already
+            # File was missing — write full in-memory state to avoid
+            # silently dropping live entries. Removed keys are already
             # absent from _mappings (remove() pops them), so they won't
             # reappear. dirty/removed snapshots are not needed here.
-            if file_exists:
-                logger.warning("models.json corrupt; writing full in-memory state")
             disk_data = {k: v.to_entry() for k, v in self._mappings.items()}
         else:
             # Remove explicitly deleted keys

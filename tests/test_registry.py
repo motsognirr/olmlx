@@ -7,7 +7,12 @@ from unittest.mock import patch
 
 import pytest
 
-from olmlx.engine.registry import ModelConfig, ModelRegistry, _atomic_write_json
+from olmlx.engine.registry import (
+    ModelConfig,
+    ModelRegistry,
+    ModelsConfigError,
+    _atomic_write_json,
+)
 
 
 class TestModelRegistry:
@@ -1173,17 +1178,33 @@ class TestRegistryModelConfig:
 
 
 class TestCorruptedJsonFiles:
-    """Regression tests for #180: corrupted JSON config files should not crash."""
+    """Regression tests for corrupted JSON config files.
 
-    def test_load_corrupted_models_json(self, tmp_path, monkeypatch):
-        """Corrupted models.json should log a warning, not crash."""
+    ``models.json`` is treated as authoritative user state: a corrupt file
+    is a startup-blocking error (refusing to silently clobber it later),
+    while ``aliases.json`` is rebuildable and tolerates a warn-and-skip.
+    """
+
+    def test_load_corrupted_models_json_raises(self, tmp_path, monkeypatch):
+        """Corrupted models.json must raise — never silently clear the file."""
         config_path = tmp_path / "models.json"
         config_path.write_text("{invalid json content!!!")
         monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
         reg = ModelRegistry()
-        reg.load()
-        # Should fall back to empty mappings
-        assert reg._mappings == {}
+        with pytest.raises(ModelsConfigError, match="Could not parse"):
+            reg.load()
+        # On-disk contents must be untouched.
+        assert config_path.read_text() == "{invalid json content!!!"
+
+    def test_load_non_object_models_json_raises(self, tmp_path, monkeypatch):
+        """models.json that isn't a JSON object must raise without clobbering."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text("[1, 2, 3]")
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        with pytest.raises(ModelsConfigError, match="JSON object"):
+            reg.load()
+        assert config_path.read_text() == "[1, 2, 3]"
 
     def test_load_corrupted_aliases_json(self, tmp_path, monkeypatch):
         """Corrupted aliases.json should log a warning, not crash."""
@@ -1444,8 +1465,8 @@ class TestDiskMergeOnSave:
         # prevent silent data loss.
         assert saved["modelA:latest"] == "org/model-a"
 
-    def test_save_with_corrupt_file(self, tmp_path, monkeypatch):
-        """If models.json is corrupted while running, full in-memory state is restored."""
+    def test_save_with_corrupt_file_refuses_to_clobber(self, tmp_path, monkeypatch):
+        """If models.json is corrupted mid-run, the save must refuse to clobber."""
         config = {"modelA:latest": "org/model-a"}
         config_path = tmp_path / "models.json"
         config_path.write_text(json.dumps(config))
@@ -1453,15 +1474,15 @@ class TestDiskMergeOnSave:
         reg = ModelRegistry()
         reg.load()
 
-        # Corrupt the file
-        config_path.write_text("{broken json!!!")
+        # External corruption after load — e.g. user editing the file.
+        corrupt = "{broken json!!!"
+        config_path.write_text(corrupt)
 
-        # Add a new mapping — should restore all entries
-        reg.add_mapping("modelB", "org/model-b")
+        with pytest.raises(ModelsConfigError, match="unreadable"):
+            reg.add_mapping("modelB", "org/model-b")
 
-        saved = json.loads(config_path.read_text())
-        assert saved["modelB:latest"] == "org/model-b"
-        assert saved["modelA:latest"] == "org/model-a"
+        # File contents must be untouched.
+        assert config_path.read_text() == corrupt
 
     def test_save_with_externally_emptied_file(self, tmp_path, monkeypatch):
         """An intentionally emptied {} file should not restore in-memory entries."""

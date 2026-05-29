@@ -2046,17 +2046,19 @@ class TestCreateStore:
         data = json.loads(config_path.read_text())
         assert data == DEFAULT_MODELS
 
-    def test_malformed_config_logs_warning(self, tmp_path, monkeypatch, caplog):
-        """Malformed models.json should log a warning and start with empty config."""
-        config_path = tmp_path / "models.json"
-        config_path.write_text("{bad json")
-        monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
-        import logging
+    def test_malformed_config_raises_without_clobbering(self, tmp_path, monkeypatch):
+        """Malformed models.json must raise rather than silently clearing the file."""
+        from olmlx.engine.registry import ModelsConfigError
 
-        with caplog.at_level(logging.WARNING):
-            store = _create_store()
-        assert store is not None
-        assert "Corrupted" in caplog.text
+        config_path = tmp_path / "models.json"
+        original = "{bad json"
+        config_path.write_text(original)
+        monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
+        with pytest.raises(ModelsConfigError):
+            _create_store()
+        # File contents must be untouched — losing the user's config to a
+        # parse error is exactly what we're guarding against.
+        assert config_path.read_text() == original
 
     def test_ensure_config_permission_error_raises(self, tmp_path, monkeypatch):
         """Permission error in ensure_config should propagate."""

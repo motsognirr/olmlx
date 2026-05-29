@@ -930,6 +930,14 @@ def _load_registry_for_audit() -> "Any":
     (asymmetric output → multiple restart cycles to surface every
     problem). Standalone callers of the audit helpers (e.g. tests)
     still get the helper's own retry-and-skip fallback.
+
+    Note: ``ModelsConfigError`` (raised by ``ModelRegistry.load`` when
+    ``models.json`` is corrupt/unreadable) is intentionally NOT caught
+    here. Returning ``None`` for that case would silently skip startup
+    and let a later save clobber the file — exactly the behaviour the
+    strict load was added to prevent. The exception propagates to
+    ``cli_main``, which prints it and exits cleanly. Do not add a
+    ``ModelsConfigError`` branch here.
     """
     from olmlx.engine.registry import ModelRegistry
 
@@ -3597,7 +3605,17 @@ def cli_main():
 
     handler = _resolve_handler(cmd, sub_name)
     if handler:
-        return handler(args)
+        # ``ModelsConfigError`` surfaces from ``registry.load()`` /
+        # ``_save_mappings_locked()`` when ``models.json`` is unreadable
+        # or corrupt — refusing to clobber the file. Convert to a clean
+        # exit with the error text instead of dumping a traceback.
+        from olmlx.engine.registry import ModelsConfigError
+
+        try:
+            return handler(args)
+        except ModelsConfigError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     # Unknown subcommand — print help for the parent command
     parser.parse_args([cmd, "--help"])
