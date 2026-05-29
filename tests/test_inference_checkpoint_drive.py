@@ -289,6 +289,73 @@ def test_tokenize_segmented_chat_falls_back_when_no_eos():
     assert sp.flatten() == tok.apply_chat_template(messages)
 
 
+def test_tokenize_segmented_chat_handles_batchencoding_dict_return():
+    """Some tokenizers return a BatchEncoding mapping with input_ids,
+    not a flat list. The helper must extract input_ids transparently."""
+
+    class _DictReturnTok:
+        eos_token_id = 9
+
+        def apply_chat_template(self, messages, **kwargs):
+            # Encode the same way as _FakeTokenizer but wrap in a dict
+            # to mimic a BatchEncoding-like return.
+            ROLE = {"system": 1, "user": 2, "assistant": 3}
+            out = []
+            for m in messages:
+                out.append(ROLE[m["role"]])
+                out.extend(ord(c) for c in m["content"])
+                out.append(9)
+            return {"input_ids": out, "attention_mask": [1] * len(out)}
+
+    tok = _DictReturnTok()
+    messages = [
+        {"role": "system", "content": "AB"},
+        {"role": "user", "content": "CD"},
+    ]
+    sp = tokenize_segmented_chat(tok, messages)
+    assert len(sp.segments) == 2
+    assert sp.flatten() == [1, 65, 66, 9, 2, 67, 68, 9]
+
+
+def test_tokenize_segmented_chat_handles_nested_list_return():
+    """Some tokenizers return a batch-of-1 nested list. Unwrap it."""
+
+    class _NestedListTok:
+        eos_token_id = 9
+
+        def apply_chat_template(self, messages, **kwargs):
+            ROLE = {"system": 1, "user": 2}
+            out = []
+            for m in messages:
+                out.append(ROLE[m["role"]])
+                out.extend(ord(c) for c in m["content"])
+                out.append(9)
+            return [out]  # batch dim of 1
+
+    tok = _NestedListTok()
+    messages = [{"role": "system", "content": "X"}, {"role": "user", "content": "Y"}]
+    sp = tokenize_segmented_chat(tok, messages)
+    assert len(sp.segments) == 2
+    assert sp.flatten() == [1, ord("X"), 9, 2, ord("Y"), 9]
+
+
+def test_tokenize_segmented_chat_returns_empty_segment_for_unrecognised_shape():
+    """Anything we can't unpack to list[int] becomes an empty single
+    segment so the caller's prompt_tokens != segmented.flatten() check
+    catches it cleanly."""
+
+    class _StringReturnTok:
+        eos_token_id = 9
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "not a token list"
+
+    tok = _StringReturnTok()
+    sp = tokenize_segmented_chat(tok, [{"role": "user", "content": "hi"}])
+    assert len(sp.segments) == 1
+    assert sp.segments[0].tokens == []
+
+
 @pytest.mark.slow
 def test_tokenize_segmented_chat_real_qwen3_5_template():
     """Real-template test: Qwen3.5 chat template should produce one

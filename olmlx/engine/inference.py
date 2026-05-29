@@ -1737,7 +1737,30 @@ def tokenize_segmented_chat(
     if not messages:
         return SegmentedPrompt(segments=[])
 
-    full = list(tokenizer.apply_chat_template(messages, **template_kwargs))
+    # Normalise apply_chat_template's varied return types — see
+    # _apply_chat_template_text. A BatchEncoding dict or nested list is
+    # possible depending on tokenizer/version. Anything we can't unpack
+    # falls back to single-segment so the caller's prompt_tokens check
+    # later detects the mismatch.
+    raw = tokenizer.apply_chat_template(messages, **template_kwargs)
+    if isinstance(raw, collections.abc.Mapping):
+        token_seq = raw.get("input_ids")
+        if isinstance(token_seq, list) and token_seq and isinstance(token_seq[0], list):
+            token_seq = token_seq[0]
+    elif isinstance(raw, list) and raw and isinstance(raw[0], list):
+        token_seq = raw[0]
+    elif isinstance(raw, list):
+        token_seq = raw
+    else:
+        token_seq = None
+    if not isinstance(token_seq, list) or (token_seq and not isinstance(token_seq[0], int)):
+        # Unrecognised return shape — single-segment fallback. The caller's
+        # `segmented.flatten() != prompt_tokens` check will route to the
+        # flat path on the next layer if needed.
+        return SegmentedPrompt(
+            segments=[Segment(tokens=[], role=messages[-1]["role"])]
+        )
+    full: list[int] = list(token_seq)
 
     eom_ids = _message_boundary_token_ids(tokenizer)
     if not eom_ids:
@@ -2384,16 +2407,23 @@ async def _setup_via_checkpoint_path(
     else:
         # Warm start: deepcopy the stored snapshot (so subsequent
         # mutation during drive doesn't corrupt the stored entry).
+        # eager_eval is necessary when the loaded entry contains
+        # lazy-state layer types (ArraysCache) — otherwise re-evaluating
+        # the lazy graph on this worker thread re-introduces the #284
+        # Metal stream crash. Don't rely on "already materialised when
+        # stored" — pre-PR disk entries from the old flat path were
+        # stored before snapshot_cache_for_persistence existed.
         cached_state, _ = hit
+        needs_eager_load = _cache_list_contains_lazy_state(cached_state.cache)
         cache = snapshot_cache_for_persistence(
             cached_state.cache,
-            eager_eval=False,  # already materialized when stored
+            eager_eval=needs_eager_load,
         )
         already_covered = len(cached_state.tokens)
 
     # ArraysCache layers carry lazy metal_kernel graphs — pass
-    # eager_eval=True to the snapshot helper so the stored entry is
-    # thread-safe for the next request (#284).
+    # eager_eval=True to the snapshot helper so each boundary
+    # checkpoint is thread-safe for the next request (#284).
     needs_eager_eval = _cache_list_contains_lazy_state(cache)
 
     suffix = _drive_segmented_prefill(
