@@ -3190,7 +3190,15 @@ async def _stream_completion(
                 async for token in stream:
                     # Always accumulate for prompt cache (raw stream, not filtered)
                     stats.eval_count = token.generation_tokens
-                    stats.prompt_eval_count = token.prompt_tokens
+                    # Report the full prompt size to the caller — when the
+                    # cache path (flat or checkpoint) hands a suffix to
+                    # mlx-lm, `token.prompt_tokens` only counts what
+                    # mlx-lm actually re-prefilled, not the full request.
+                    stats.prompt_eval_count = (
+                        len(full_prompt_tokens)
+                        if full_prompt_tokens is not None
+                        else token.prompt_tokens
+                    )
                     if token.token is not None:
                         generated_tokens.append(token.token)
                     else:
@@ -3452,6 +3460,14 @@ async def _full_completion(
                     grammar_active=grammar_active,
                 )
                 generation_complete = True
+
+                # Report the full prompt size to the caller — when the
+                # cache path (flat or checkpoint) hands a suffix to mlx-lm,
+                # `result.prompt_tokens` (captured into stats inside
+                # _full_completion_inner) only counts what mlx-lm actually
+                # re-prefilled, not the full request.
+                if full_prompt_tokens is not None:
+                    stats.prompt_eval_count = len(full_prompt_tokens)
 
                 if cache_setup_done:
                     result_dict["cache_read_tokens"] = cache_read_tokens
