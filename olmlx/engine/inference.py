@@ -1697,6 +1697,12 @@ def _message_boundary_token_ids(tokenizer: Any) -> set[int]:
     ``<|im_end|>``, for Llama 3 ``<|eot_id|>``, for Gemma ``<end_of_turn>``.
     All three are reliably the end-of-message marker in their respective
     chat templates.
+
+    For tokenizers like Llama 2's where ``eos_token_id`` (``</s>``) can in
+    principle appear inside content, ``tokenize_segmented_chat`` falls back
+    to a single-segment prompt via the ``len(boundaries) != len(messages)``
+    guard; ``_setup_via_checkpoint_path`` then skips the checkpoint path
+    for the request.
     """
     eos = getattr(tokenizer, "eos_token_id", None)
     if eos is None:

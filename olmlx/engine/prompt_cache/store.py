@@ -13,6 +13,7 @@ import re
 import shutil
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 from olmlx.engine.prompt_cache.metrics import CacheMetrics
 from olmlx.engine.prompt_cache.radix import PrefixCacheIndex
@@ -33,14 +34,39 @@ logger = logging.getLogger(__name__)
 def _estimate_state_bytes(state: CachedPromptState) -> int:
     """Best-effort byte estimate of a cached state.
 
-    Walks the per-layer cache list looking for mlx.core.array-shaped
-    objects exposing `nbytes`. Unknown layer types contribute 0.
+    Walks the per-layer cache list and sums ``nbytes`` of any mlx array
+    encountered. Falls back to ``layer.state`` for layer types that don't
+    expose ``.keys`` / ``.values`` directly — most importantly
+    ``ArraysCache`` (used by Qwen3.5 / Nemotron-H / Jamba hybrid layers),
+    which would otherwise report 0 bytes and let the RAM budget overrun
+    silently for the model families the checkpoint path primarily targets.
+    Unknown layer types still contribute 0.
     """
     total = 0
     for layer in state.cache or ():
+        # Fast path: KVCache-style layers with .keys / .values attributes.
+        seen_attr = False
         for attr in ("keys", "values"):
             arr = getattr(layer, attr, None)
             nbytes = getattr(arr, "nbytes", None)
+            if isinstance(nbytes, int):
+                total += nbytes
+                seen_attr = True
+        if seen_attr:
+            continue
+        # Fallback path: layers (e.g. ArraysCache) that expose state via
+        # ``.state``, a tuple or list of arrays. Walk arbitrarily nested
+        # tuples/lists so future cache layouts that group arrays in
+        # sub-containers still get counted.
+        stack: list[Any] = [getattr(layer, "state", None)]
+        while stack:
+            item = stack.pop()
+            if item is None:
+                continue
+            if isinstance(item, (tuple, list)):
+                stack.extend(item)
+                continue
+            nbytes = getattr(item, "nbytes", None)
             if isinstance(nbytes, int):
                 total += nbytes
     return total
@@ -109,7 +135,11 @@ class PromptCacheStore:
             disk_dir = self._disk_dir()
             disk_dir.mkdir(parents=True, exist_ok=True)
             file_path = self._disk_file_path(cache_id)
-            metadata = {"tokens": json.dumps(state.tokens)}
+            metadata = {
+                "tokens": json.dumps(state.tokens),
+                "cache_type": state.cache_type,
+                "is_checkpoint": "1" if state.is_checkpoint else "0",
+            }
             save_prompt_cache(str(file_path), state.cache, metadata)
             logger.info(
                 "Saved evicted cache '%s' to disk (%s)",
@@ -134,7 +164,17 @@ class PromptCacheStore:
         try:
             cache, metadata = load_prompt_cache(str(file_path), return_metadata=True)
             tokens = json.loads(metadata.get("tokens", "[]"))
-            state = CachedPromptState(tokens=tokens, cache=cache)
+            # Pre-PR entries lack cache_type / is_checkpoint metadata;
+            # fall through to the CachedPromptState defaults in that
+            # case so old disk caches still round-trip correctly.
+            cache_type = metadata.get("cache_type", "assistant")
+            is_checkpoint = metadata.get("is_checkpoint", "0") == "1"
+            state = CachedPromptState(
+                tokens=tokens,
+                cache=cache,
+                cache_type=cache_type,  # type: ignore[arg-type]
+                is_checkpoint=is_checkpoint,
+            )
             # Store in memory via set() — respects max_slots AND
             # _enforce_ram_budget. Delete the evicted entry to release
             # GPU buffers promptly.
@@ -385,7 +425,14 @@ class PromptCacheStore:
         try:
             cache, metadata = load_prompt_cache(str(file_path), return_metadata=True)
             tokens = json.loads(metadata.get("tokens", "[]"))
-            state = CachedPromptState(tokens=tokens, cache=cache)
+            cache_type = metadata.get("cache_type", "assistant")
+            is_checkpoint = metadata.get("is_checkpoint", "0") == "1"
+            state = CachedPromptState(
+                tokens=tokens,
+                cache=cache,
+                cache_type=cache_type,  # type: ignore[arg-type]
+                is_checkpoint=is_checkpoint,
+            )
             logger.info(
                 "Restored cache '%s' from disk (%d tokens)",
                 cache_id,
@@ -567,6 +614,13 @@ class PromptCacheStore:
         portion of ``tokens`` not covered by ``state.tokens``.
 
         Returns None when no terminal in the index is a strict prefix.
+
+        Note: in-memory only. After ``async_evict_all_to_disk`` clears
+        ``self._radix`` under memory pressure, checkpoint entries that
+        spilled to disk are unreachable through this method until a
+        warm-start writes a fresh entry whose path overlaps. Adding a
+        disk-tier prefix index is tracked separately — see the issue
+        thread on PR #397.
         """
         cid, depth = self._radix.find_strict_prefix(tokens, min_depth=1)
         if cid is None or depth == 0:
@@ -575,6 +629,9 @@ class PromptCacheStore:
         state = self._entries.get(cid)
         if state is None:
             # Trie out of sync — defensive (matches find_by_prefix).
+            # The stale terminal stays in the trie because we don't carry
+            # the token path; a full re-build on the next
+            # ``async_evict_all_to_disk`` clears it.
             self.metrics.radix_misses += 1
             return None
         self._entries.move_to_end(cid)
