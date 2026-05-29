@@ -237,6 +237,19 @@ class TestPromptCacheStoreRadixIntegration:
         # Metrics recorded the eviction
         assert store.metrics.evictions_ram == 1
 
+    def test_bulk_eviction_counts_toward_evictions_ram(self):
+        # Regression for aider PR #391 follow-up: memory-pressure
+        # bulk evictions via evict_all_to_disk() must be reflected in
+        # evictions_ram, not silently zeroed out alongside _entries.
+        store = PromptCacheStore(max_slots=8)
+        store.set("a", _make_state([1, 2]))
+        store.set("b", _make_state([3, 4]))
+        store.set("c", _make_state([5, 6]))
+        before = store.metrics.evictions_ram
+        store.evict_all_to_disk()
+        # All three entries were dropped from RAM.
+        assert store.metrics.evictions_ram == before + 3
+
     def test_metrics_tracks_hits_and_misses(self):
         store = PromptCacheStore(max_slots=4)
         store.set("a", _make_state([1, 2, 3]))

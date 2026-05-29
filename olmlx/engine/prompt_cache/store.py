@@ -315,6 +315,7 @@ class PromptCacheStore:
         if self._disk_enabled:
             for cache_id, state in list(self._entries.items()):
                 self._save_to_disk(cache_id, state)
+        self.metrics.evictions_ram += len(self._entries)
         self._entries.clear()
         self._radix = PrefixCacheIndex()
         self.metrics.bytes_in_ram = 0
@@ -439,6 +440,7 @@ class PromptCacheStore:
             snapshot = list(self._entries.items())
         else:
             snapshot = []
+        self.metrics.evictions_ram += len(self._entries)
         self._entries.clear()
         self._radix = PrefixCacheIndex()
         self.metrics.bytes_in_ram = 0
