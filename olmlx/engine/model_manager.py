@@ -1346,9 +1346,21 @@ class ModelManager:
                     # Metal flush), so no coroutine can observe an incomplete
                     # probe state between registration and the yield point.
                     self._loaded[normalized] = lm
-                    await self._probe_cache_capabilities(lm)
+                    # Acquire the pin BEFORE the probe's await. unload() does
+                    # not take self._lock; it only checks active_refs > 0.
+                    # If we left active_refs at 0 across the probe's Metal
+                    # flush yield, a concurrent unload could pop and close
+                    # the model before this call returns. Release the pin
+                    # if the probe fails so the outer except's cleanup can
+                    # pop the model normally.
                     if pin:
                         lm.acquire_ref()
+                    try:
+                        await self._probe_cache_capabilities(lm)
+                    except BaseException:
+                        if pin:
+                            lm.release_ref()
+                        raise
                     return lm
                 except BaseException:
                     # Drop references and flush Metal allocator so the memory
