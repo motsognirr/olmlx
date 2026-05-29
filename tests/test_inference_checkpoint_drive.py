@@ -5,8 +5,11 @@ import asyncio
 import mlx.core as mx
 from mlx_lm.models.cache import KVCache
 
+import pytest
+
 from olmlx.engine.inference import (
     _drive_segmented_prefill,
+    _message_boundary_token_ids,
     _store_prompt_cache_after_generation,
     tokenize_segmented_chat,
 )
@@ -17,10 +20,15 @@ from olmlx.engine.prompt_cache.store import PromptCacheStore
 
 class _FakeTokenizer:
     """Minimal tokenizer stub: tokens are 1 per character, role-tagged via
-    the chat template adding a fixed-length wrapper per message."""
+    the chat template adding a fixed-length wrapper per message.
+
+    Token 9 is the end-of-message marker (``eos_token_id``), so
+    ``_message_boundary_token_ids`` returns ``{9}`` and the EOM-boundary
+    segmentation strategy correctly detects one boundary per message.
+    """
 
     bos_token_id = None
-    eos_token_id = None
+    eos_token_id = 9
 
     def apply_chat_template(self, messages, **kwargs):
         # Each message expands to [role_marker, *content_chars, end_marker].
@@ -241,3 +249,68 @@ def test_store_prompt_cache_after_generation_is_noop_for_checkpoint_path():
         )
     )
     assert len(store) == 0
+
+
+def test_message_boundary_token_ids_returns_eos_token_id():
+    """_message_boundary_token_ids should return {eos_token_id} when set."""
+    tok = _FakeTokenizer()
+    assert _message_boundary_token_ids(tok) == {9}
+
+
+def test_message_boundary_token_ids_returns_empty_when_none():
+    """_message_boundary_token_ids should return empty set when eos_token_id is None."""
+
+    class _NoEos:
+        eos_token_id = None
+
+    assert _message_boundary_token_ids(_NoEos()) == set()
+
+
+def test_tokenize_segmented_chat_falls_back_when_no_eos():
+    """Without eos_token_id, falls back to a single segment."""
+
+    class _NoEosTok:
+        eos_token_id = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            out = []
+            for m in messages:
+                out.extend(ord(c) for c in m["content"])
+            return out
+
+    tok = _NoEosTok()
+    messages = [
+        {"role": "system", "content": "Hi"},
+        {"role": "user", "content": "Bye"},
+    ]
+    sp = tokenize_segmented_chat(tok, messages)
+    assert len(sp.segments) == 1
+    assert sp.segments[0].role == "user"
+    assert sp.flatten() == tok.apply_chat_template(messages)
+
+
+@pytest.mark.slow
+def test_tokenize_segmented_chat_real_qwen3_5_template():
+    """Real-template test: Qwen3.5 chat template should produce one
+    segment per message, with token boundaries at <|im_end|> positions."""
+    try:
+        from mlx_lm import load
+
+        _, tok = load("mlx-community/Qwen3.5-0.8B-MLX-4bit")
+    except Exception as e:
+        pytest.skip(f"model not available: {e}")
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hello."},
+    ]
+    sp = tokenize_segmented_chat(
+        tok, messages, tokenize=True, add_generation_prompt=True
+    )
+    assert len(sp.segments) == 2
+    assert sp.segments[0].role == "system"
+    assert sp.segments[1].role == "user"
+    # Flatten must match full tokenization.
+    full = list(
+        tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+    )
+    assert sp.flatten() == full

@@ -1690,64 +1690,85 @@ def apply_chat_template_text(
     )
 
 
+def _message_boundary_token_ids(tokenizer: Any) -> set[int]:
+    """Return the set of token IDs that mark end-of-message in chat templates.
+
+    Primary signal: ``tokenizer.eos_token_id``.  For Qwen3 this is
+    ``<|im_end|>``, for Llama 3 ``<|eot_id|>``, for Gemma ``<end_of_turn>``.
+    All three are reliably the end-of-message marker in their respective
+    chat templates.
+    """
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is None:
+        return set()
+    # Some tokenizers wrap the EOS in a list of valid stops.
+    if isinstance(eos, (list, tuple, set)):
+        return {int(x) for x in eos if x is not None}
+    return {int(eos)}
+
+
 def tokenize_segmented_chat(
     tokenizer: Any,
     messages: list[dict[str, Any]],
     **template_kwargs: Any,
 ) -> "SegmentedPrompt":
-    """Tokenize ``messages`` one-at-a-time so the resulting prompt is
-    split into per-message segments suitable for checkpoint snapshotting.
+    """Tokenize ``messages`` and split into per-message segments by
+    scanning the full tokenization for end-of-message marker tokens.
 
-    The token boundaries returned here MUST match what
-    ``tokenizer.apply_chat_template(messages)`` would produce if called
-    on the full list — otherwise downstream checkpoint snapshots would
-    be misaligned with the request's actual prefill. The implementation
-    enforces this by calling ``apply_chat_template`` on each successive
-    prefix of ``messages`` and taking the delta against the prior
-    prefix. This pays len(messages)+1 template applications, but the
-    cost is bounded (a few microseconds each) and is the only way to
-    correctly handle chat templates that insert role-dependent markers
-    or that emit different tokens depending on the trailing message.
+    Strategy: tokenize with the full chat template once (so all
+    template_kwargs are honoured), then scan for EOM markers (typically
+    ``tokenizer.eos_token_id`` — for Qwen3 this is ``<|im_end|>``, for
+    Llama 3 ``<|eot_id|>``, for Gemma ``<end_of_turn>``). Each EOM
+    occurrence ends one message. The position *after* each EOM is a
+    segment boundary.
 
-    Falls back to a single-segment prompt for templates that fail
-    cleanly under the empty-messages prefix (some templates require a
-    final user message).
+    The last segment absorbs everything after the final EOM (i.e., the
+    chat template's trailing assistant-prompt suffix like
+    ``\\n<|im_start|>assistant\\n``) so that ``segmented.flatten()``
+    exactly equals the full tokenization.
+
+    Falls back to a single-segment prompt when:
+    - The tokenizer exposes no EOM token (no ``eos_token_id``).
+    - The number of detected EOM markers is inconsistent with
+      ``len(messages)`` (template format we don't recognise).
     """
     from olmlx.engine.prompt_cache.checkpoint import Segment, SegmentedPrompt
 
     if not messages:
         return SegmentedPrompt(segments=[])
 
-    # Compute the full tokenization once — this is the ground truth.
-    full = tokenizer.apply_chat_template(messages, **template_kwargs)
-    # Then for each k in [1..len-1], tokenize the first-k prefix to find
-    # where the (k+1)-th segment starts. The first segment is everything
-    # up to the first split.
+    full = list(tokenizer.apply_chat_template(messages, **template_kwargs))
+
+    eom_ids = _message_boundary_token_ids(tokenizer)
+    if not eom_ids:
+        return SegmentedPrompt(
+            segments=[Segment(tokens=full, role=messages[-1]["role"])]
+        )
+
+    # Find positions immediately after each EOM marker.
     boundaries: list[int] = []
-    for k in range(1, len(messages)):
-        try:
-            prefix_tokens = tokenizer.apply_chat_template(
-                messages[:k], **template_kwargs
-            )
-        except Exception:
-            # Template rejected the partial prefix (e.g. needs a final user
-            # message). Bail out to a single segment covering everything.
-            return SegmentedPrompt(
-                segments=[Segment(tokens=list(full), role=messages[-1]["role"])]
-            )
-        # Sanity: the prefix tokens must be an actual prefix of the full
-        # tokenization. If not, the template is non-monotonic — fall back.
-        if list(full[: len(prefix_tokens)]) != list(prefix_tokens):
-            return SegmentedPrompt(
-                segments=[Segment(tokens=list(full), role=messages[-1]["role"])]
-            )
-        boundaries.append(len(prefix_tokens))
-    boundaries.append(len(full))
+    for i, tok in enumerate(full):
+        if tok in eom_ids:
+            boundaries.append(i + 1)
+
+    # Most chat templates emit exactly one EOM per message.  When the
+    # count doesn't match, the template either doesn't follow the EOM
+    # convention or emits multiple markers per message (rare).  Fall
+    # back to single segment rather than guess.
+    if len(boundaries) != len(messages):
+        return SegmentedPrompt(
+            segments=[Segment(tokens=full, role=messages[-1]["role"])]
+        )
+
+    # Extend the last boundary to include any trailing template tokens
+    # (e.g. ``\n<|im_start|>assistant\n``) so flatten() == full.
+    if boundaries[-1] < len(full):
+        boundaries[-1] = len(full)
 
     segments: list[Segment] = []
     start = 0
     for k, end in enumerate(boundaries):
-        segments.append(Segment(tokens=list(full[start:end]), role=messages[k]["role"]))
+        segments.append(Segment(tokens=full[start:end], role=messages[k]["role"]))
         start = end
     return SegmentedPrompt(segments=segments)
 
@@ -2322,6 +2343,7 @@ async def _setup_via_checkpoint_path(
     messages: list[dict],
     tokenizer: Any,
     prompt_tokens: list[int],
+    template_kwargs: dict | None = None,
 ) -> _CacheSetupResult:
     """Checkpoint-mechanism path for non-trimmable cache layouts.
 
@@ -2333,7 +2355,7 @@ async def _setup_via_checkpoint_path(
     """
     from olmlx.engine.prompt_cache.checkpoint import snapshot_cache_for_persistence
 
-    segmented = tokenize_segmented_chat(tokenizer, messages)
+    segmented = tokenize_segmented_chat(tokenizer, messages, **(template_kwargs or {}))
     # Sanity: the per-message tokenization must reconstruct the same
     # token sequence the caller already produced via the full template
     # application. If not, the chat template is non-monotonic and the
@@ -2402,6 +2424,7 @@ async def _setup_prompt_cache(
     cache_id: str,
     messages: list[dict] | None = None,
     tokenizer: Any = None,
+    template_kwargs: dict | None = None,
 ) -> _CacheSetupResult:
     """Set up prompt cache for a streaming or non-streaming completion.
 
@@ -2448,6 +2471,7 @@ async def _setup_prompt_cache(
             messages=messages,
             tokenizer=tokenizer,
             prompt_tokens=prompt_tokens,
+            template_kwargs=template_kwargs,
         )
 
     # Cross-request prompt cache reuse is disabled for this model.  The
@@ -2970,6 +2994,7 @@ async def _stream_completion(
     adopt_pin: bool = False,
     messages: list[dict] | None = None,
     tokenizer: Any = None,
+    template_kwargs: dict | None = None,
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
@@ -3030,6 +3055,7 @@ async def _stream_completion(
                 cache_id=cache_id,
                 messages=messages,
                 tokenizer=tokenizer,
+                template_kwargs=template_kwargs,
             )
         else:
             cs = _CacheSetupResult(prompt=prompt)
@@ -3358,6 +3384,7 @@ async def _full_completion(
     adopt_pin: bool = False,
     messages: list[dict] | None = None,
     tokenizer: Any = None,
+    template_kwargs: dict | None = None,
 ) -> dict:
     # inference_timeout is not enforced for non-streaming: the GPU thread
     # cannot be safely cancelled (releasing the lock while Metal is still
@@ -3393,6 +3420,7 @@ async def _full_completion(
                         cache_id=cache_id,
                         messages=messages,
                         tokenizer=tokenizer,
+                        template_kwargs=template_kwargs,
                     )
                     prompt = cs.prompt
                     cache_read_tokens = cs.cache_read_tokens
@@ -3898,6 +3926,23 @@ async def generate_chat(
         # #307) `</think>` token — shares the rules with `_apply_chat_template`.
         thinking_expected = _resolve_thinking_active(caps, tools, enable_thinking)
 
+        # Build the chat template kwargs used for segmented tokenization in the
+        # checkpoint cache path.  These must match the kwargs that produced
+        # ``prompt_tokens`` so that ``tokenize_segmented_chat`` produces the
+        # same full token sequence and the EOM-boundary split is correctly
+        # aligned.  Only applies to text (non-VLM) models; the checkpoint path
+        # is never reached for VLMs.
+        chat_template_kwargs: dict | None = None
+        if not lm.is_vlm:
+            chat_template_kwargs = {
+                "tokenize": True,
+                "add_generation_prompt": True,
+            }
+            if caps.supports_enable_thinking:
+                chat_template_kwargs["enable_thinking"] = _resolve_thinking_active(
+                    caps, tools, enable_thinking
+                )
+
         if stream:
             gen = _stream_completion(
                 lm,
@@ -3914,6 +3959,7 @@ async def generate_chat(
                 adopt_pin=True,
                 messages=messages,
                 tokenizer=lm.tokenizer,
+                template_kwargs=chat_template_kwargs,
             )
             # Ownership of the pin transfers to the wrapper; its finally
             # releases on any generator exit. Mark the flag for the outer
@@ -3941,6 +3987,7 @@ async def generate_chat(
                     adopt_pin=True,
                     messages=messages,
                     tokenizer=lm.tokenizer,
+                    template_kwargs=chat_template_kwargs,
                 )
                 # Mirror the streaming meta chunk so non-streaming routers
                 # can gate orphan `</think>` handling on the same signal
