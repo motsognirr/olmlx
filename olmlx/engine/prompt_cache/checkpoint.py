@@ -49,6 +49,29 @@ class SegmentedPrompt:
         return out
 
 
+def flatten_cache_state(cache: list[Any]) -> list[Any]:
+    """Return the flat list of state arrays across all cache layers.
+
+    Most mlx-lm cache classes expose ``.state`` as a tuple ``(keys, values)``;
+    ``ArraysCache`` exposes it as a list. Flattening is needed because
+    ``mx.eval`` on a list-of-tuples-of-arrays would walk the PyTree as a
+    generic container — fine in current MLX but brittle if a layer ever
+    exposes a non-list/tuple container (dict, dataclass) whose internal
+    arrays mx.eval would silently skip.
+
+    Used by ``snapshot_cache_for_persistence`` and by callers that need
+    to ``mx.eval`` the cache state in-place (e.g. mid-prefill flushes).
+    """
+    states: list[Any] = []
+    for layer in cache:
+        state = layer.state
+        if isinstance(state, tuple):
+            states.extend(state)
+        else:
+            states.append(state)
+    return states
+
+
 def snapshot_cache_for_persistence(
     cache: list[Any],
     *,
@@ -72,13 +95,7 @@ def snapshot_cache_for_persistence(
             alone is sufficient and ``eager_eval=False`` saves the eval cost.
     """
     if eager_eval:
-        states: list[Any] = []
-        for layer in cache:
-            state = layer.state
-            if isinstance(state, tuple):
-                states.extend(state)
-            else:
-                states.append(state)
+        states = flatten_cache_state(cache)
         if states:
             mx.eval(states)
     return copy.deepcopy(cache)

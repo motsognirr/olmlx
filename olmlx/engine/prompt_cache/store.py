@@ -570,9 +570,12 @@ class PromptCacheStore:
         """
         cid, depth = self._radix.find_strict_prefix(tokens, min_depth=1)
         if cid is None or depth == 0:
+            self.metrics.radix_misses += 1
             return None
         state = self._entries.get(cid)
         if state is None:
+            # Trie out of sync — defensive (matches find_by_prefix).
+            self.metrics.radix_misses += 1
             return None
         self._entries.move_to_end(cid)
         self.metrics.radix_hits += 1

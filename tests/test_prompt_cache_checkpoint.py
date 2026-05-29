@@ -39,6 +39,24 @@ def test_segmented_prompt_empty_is_valid():
     assert sp.flatten() == []
 
 
+def test_flatten_cache_state_unpacks_tuple_state():
+    """flatten_cache_state must extend tuple state (keys, values) flatly,
+    not nest the tuple inside the result. Callers pass the result to
+    mx.eval, which would silently skip nested containers it doesn't know."""
+    from olmlx.engine.prompt_cache.checkpoint import flatten_cache_state
+
+    cache = [KVCache()]
+    keys = mx.zeros((1, 4, 8, 16))
+    values = mx.ones((1, 4, 8, 16))
+    cache[0].update_and_fetch(keys, values)
+    states = flatten_cache_state(cache)
+    # KVCache.state is (keys, values); flattened result must be two
+    # arrays, not one tuple.
+    assert len(states) == 2
+    for s in states:
+        assert hasattr(s, "shape"), f"expected mlx array, got {type(s).__name__}"
+
+
 def test_snapshot_cache_returns_deepcopy_of_arrays():
     cache = [KVCache()]
     keys = mx.zeros((1, 4, 8, 16))

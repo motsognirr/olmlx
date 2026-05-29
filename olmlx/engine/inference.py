@@ -2320,7 +2320,10 @@ def _drive_segmented_prefill(
     the prefilled cache is a no-op for the cache but produces the
     correct first-token logits.
     """
-    from olmlx.engine.prompt_cache.checkpoint import snapshot_cache_for_persistence
+    from olmlx.engine.prompt_cache.checkpoint import (
+        flatten_cache_state,
+        snapshot_cache_for_persistence,
+    )
 
     flat = segmented.flatten()
     if not flat:
@@ -2344,7 +2347,7 @@ def _drive_segmented_prefill(
             arr = mx.array(chunk, dtype=mx.int32)[None, :]
             with mx.stream(mx.default_stream(mx.default_device())):
                 model(arr, cache=cache)
-                mx.eval([c.state for c in cache])
+                mx.eval(flatten_cache_state(cache))
             cursor = prefill_end
         else:
             cursor = chunk_end
@@ -2435,8 +2438,12 @@ async def _setup_via_checkpoint_path(
         )
         new_cache = _make_prompt_cache_for_lm(lm)
         gen_kwargs["prompt_cache"] = new_cache
+        # Return prompt_tokens (list[int]) to stay consistent with the
+        # cold-start and warm-start branches below — handing the
+        # original string back would let downstream code re-tokenize
+        # via a different BOS path than prompt_tokens used.
         return _CacheSetupResult(
-            prompt=prompt,
+            prompt=list(prompt_tokens),
             full_prompt_tokens=prompt_tokens,
             cache_creation_tokens=len(prompt_tokens),
             cache_setup_done=True,
