@@ -4036,6 +4036,48 @@ class TestEvictLruIfNeeded:
         with pytest.raises(RuntimeError, match="All loaded models are in use"):
             manager._pop_lru_evictees()
 
+    def test_pop_one_idle_lru_excludes_named_model(self, registry, mock_store):
+        """Pressure eviction must never pop the model we're about to load.
+
+        If a concurrent caller loads ``normalized`` during the lock-release
+        window it is idle (active_refs == 0) and could be the LRU victim;
+        evicting it would close a model the other caller just received and
+        cause this caller to load a duplicate.  ``exclude`` guards against it.
+        """
+        manager = ModelManager(registry, mock_store)
+        older = LoadedModel(
+            name="older",
+            hf_path="o/o",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            loaded_at=time.time() - 100,
+        )
+        newer = LoadedModel(
+            name="newer",
+            hf_path="n/n",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            loaded_at=time.time(),
+        )
+        manager._loaded["older"] = older
+        manager._loaded["newer"] = newer
+        # "older" is the LRU victim, but excluded → next idle model returned.
+        popped = manager._pop_one_idle_lru(exclude="older")
+        assert popped is newer
+        assert "newer" not in manager._loaded
+        assert "older" in manager._loaded
+
+    def test_pop_one_idle_lru_returns_none_when_only_excluded(
+        self, registry, mock_store
+    ):
+        manager = ModelManager(registry, mock_store)
+        only = LoadedModel(
+            name="only", hf_path="o/o", model=MagicMock(), tokenizer=MagicMock()
+        )
+        manager._loaded["only"] = only
+        assert manager._pop_one_idle_lru(exclude="only") is None
+        assert "only" in manager._loaded
+
     @pytest.mark.asyncio
     async def test_close_evictees_does_not_touch_gc_or_metal(
         self, registry, mock_store

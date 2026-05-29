@@ -276,6 +276,22 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_inference_headroom(self) -> "Settings":
+        # The load budget is ``memory_limit_fraction - inference_headroom_fraction``.
+        # If headroom >= limit the effective budget is <= 0, which would
+        # silently reject every model load at request time. Fail fast at
+        # startup with an actionable message instead.
+        if self.inference_headroom_fraction >= self.memory_limit_fraction:
+            raise ValueError(
+                f"inference_headroom_fraction ({self.inference_headroom_fraction}) "
+                f"must be < memory_limit_fraction ({self.memory_limit_fraction}); "
+                f"otherwise the effective load budget is zero and every model "
+                f"load fails. Lower OLMLX_INFERENCE_HEADROOM_FRACTION or raise "
+                f"OLMLX_MEMORY_LIMIT_FRACTION."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_pld_ngram_range(self) -> "Settings":
         # Scope to ``strategy=pld`` so a stray inverted env var
         # (e.g. ``PLD_MIN=5, PLD_MAX=3``) doesn't reject an otherwise

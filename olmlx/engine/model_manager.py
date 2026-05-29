@@ -1123,7 +1123,7 @@ class ModelManager:
             evictees.append(self._loaded.pop(oldest_name))
         return evictees
 
-    def _pop_one_idle_lru(self) -> LoadedModel | None:
+    def _pop_one_idle_lru(self, exclude: str | None = None) -> LoadedModel | None:
         """Pop the oldest idle (``active_refs == 0``) model, or None if none.
 
         Unlike :meth:`_pop_lru_evictees`, this is driven by memory pressure
@@ -1131,11 +1131,19 @@ class ModelManager:
         every model is active — it simply returns None so the caller can
         stop evicting and proceed (a model in active use cannot be freed).
 
+        ``exclude`` names a model that must never be popped — the pressure
+        loop passes the model it is about to load so that a concurrent caller
+        which loaded the same model during the lock-release window (and whose
+        ``active_refs`` is still 0 until inference starts) is not closed out
+        from under it, which would also make this caller load a duplicate.
+
         Must be called while holding ``self._lock``. The caller closes the
         returned model via :meth:`_close_evictees` after releasing the lock
         (same pop / close split as ``_pop_lru_evictees`` — issue #315).
         """
-        idle = {k: v for k, v in self._loaded.items() if v.active_refs == 0}
+        idle = {
+            k: v for k, v in self._loaded.items() if v.active_refs == 0 and k != exclude
+        }
         if not idle:
             return None
         oldest_name = min(idle, key=lambda k: idle[k].loaded_at)
@@ -1412,7 +1420,11 @@ class ModelManager:
                 )
                 while pressure:
                     async with self._lock:
-                        idle = self._pop_one_idle_lru()
+                        # Never evict ``normalized`` itself: a concurrent
+                        # caller may have loaded it during the lock-release
+                        # window (active_refs still 0), and closing it would
+                        # corrupt that caller and force a duplicate load here.
+                        idle = self._pop_one_idle_lru(exclude=normalized)
                     if idle is None:
                         break
                     logger.warning(
