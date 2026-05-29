@@ -13,6 +13,7 @@ from olmlx.engine.inference import (
     _apply_seed,
     _build_generate_kwargs,
     _full_completion,
+    _inference_ref,
     _make_frequency_penalty_processor,
     _make_presence_penalty_processor,
     estimate_kv_cache_bytes,
@@ -31,6 +32,7 @@ from olmlx.engine.inference import (
     ServerBusyError,
 )
 from olmlx.engine.template_caps import TemplateCaps
+from olmlx.engine.model_manager import LoadedModel
 from olmlx.engine.inference import _derive_timing_stats
 from olmlx.utils.streaming import CancellableStream, StreamToken
 from olmlx.utils.timing import TimingStats
@@ -55,6 +57,29 @@ class TestDeriveTimingStats:
         _derive_timing_stats(stats, 0.0, 0.0, eval_timer_ns=1_000_000_000)
         assert stats.prompt_eval_duration == 1_000_000_000
         assert stats.eval_duration == 0
+
+    def test_inference_ref_adopt_does_not_double_count(self):
+        """adopt=True must NOT increment on entry (the pin already did), and
+        must release exactly once on exit — net 0 change while a pre-pinned
+        model stays pinned (refs==1) for the duration."""
+        lm = LoadedModel(
+            name="a", hf_path="a/a", model=MagicMock(), tokenizer=MagicMock()
+        )
+        lm.acquire_ref()  # simulate ensure_loaded(pin=True)
+        assert lm.active_refs == 1
+        with _inference_ref(lm, adopt=True):
+            assert lm.active_refs == 1  # adopted, not double-counted
+        assert lm.active_refs == 0  # released exactly once on exit
+
+    def test_inference_ref_legacy_increments(self):
+        """adopt=False (legacy) increments on entry, releases on exit."""
+        lm = LoadedModel(
+            name="a", hf_path="a/a", model=MagicMock(), tokenizer=MagicMock()
+        )
+        assert lm.active_refs == 0
+        with _inference_ref(lm):
+            assert lm.active_refs == 1
+        assert lm.active_refs == 0
 
     def test_decode_subtracts_prefill_from_wall_clock(self):
         """When gen_tps is missing but prompt_tps is known, decode-only time

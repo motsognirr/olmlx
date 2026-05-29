@@ -443,6 +443,16 @@ class LoadedModel:
                 ram_budget_bytes=ram_budget_bytes,
             )
 
+    def acquire_ref(self) -> None:
+        """Pin the model so eviction/expiry skip it (active_refs += 1)."""
+        with self._active_refs_lock:
+            self.active_refs += 1
+
+    def release_ref(self) -> None:
+        """Release a pin taken by :meth:`acquire_ref` (active_refs -= 1)."""
+        with self._active_refs_lock:
+            self.active_refs -= 1
+
     @property
     def is_speculative(self) -> bool:
         return self.speculative_decoder is not None
@@ -869,9 +879,19 @@ class ModelManager:
                 del lm
 
     async def ensure_loaded(
-        self, name: str, keep_alive: int | str | None = None
+        self, name: str, keep_alive: int | str | None = None, *, pin: bool = False
     ) -> LoadedModel:
-        """Ensure a model is loaded and return it."""
+        """Ensure a model is loaded and return it.
+
+        When *pin* is True the returned model has ``active_refs`` incremented
+        by one **under the lock**, before it is handed back. This closes the
+        handoff window between ``ensure_loaded`` returning and the caller's
+        ``_inference_ref`` taking its reference: during that window (which spans
+        awaits — inference-lock acquisition, async prompt-cache setup) a
+        concurrent load's eviction could otherwise close a model this caller is
+        about to use. The caller MUST release the pin exactly once (the
+        inference paths adopt it via ``_inference_ref(..., adopt=True)``).
+        """
         normalized = self.registry.normalize_name(name)
         if normalized != name:
             logger.info("Normalized model name '%s' -> '%s'", name, normalized)
@@ -912,6 +932,8 @@ class ModelManager:
                         lm.expires_at = time.time() + ka
                     else:
                         lm.expires_at = None
+                    if pin:
+                        lm.acquire_ref()
                     return lm
 
                 # Resolve before eviction — reject unknown models without
@@ -1105,6 +1127,8 @@ class ModelManager:
                     lm = self._loaded[normalized]
                     ka = self._resolve_keep_alive(keep_alive)
                     lm.expires_at = (time.time() + ka) if ka is not None else None
+                    if pin:
+                        lm.acquire_ref()
                     return lm
 
                 if len(self._loaded) >= settings.max_loaded_models:
@@ -1323,6 +1347,8 @@ class ModelManager:
                     # probe state between registration and the yield point.
                     self._loaded[normalized] = lm
                     await self._probe_cache_capabilities(lm)
+                    if pin:
+                        lm.acquire_ref()
                     return lm
                 except BaseException:
                     # Drop references and flush Metal allocator so the memory

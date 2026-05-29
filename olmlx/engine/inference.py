@@ -1277,16 +1277,25 @@ async def _inference_locked(
 
 
 @contextlib.contextmanager
-def _inference_ref(lm: LoadedModel, keep_alive: int | str | None = None):
+def _inference_ref(
+    lm: LoadedModel, keep_alive: int | str | None = None, *, adopt: bool = False
+):
     """Track active inference on a model to prevent expiry during use.
 
-    Note: there is a small window between ``ensure_loaded()`` (which returns
-    the LoadedModel) and the point where ``_inference_ref`` increments
-    ``active_refs``.  During that window the expiry checker could remove the
-    model from ``_loaded``.  This is **safe**: the caller already holds a
-    Python reference to the LoadedModel object, so the model and tokenizer
-    remain alive in memory.  The only side-effect is that the next request
-    would re-load the model into ``_loaded``.
+    When *adopt* is True the caller obtained ``lm`` via
+    ``ensure_loaded(..., pin=True)``, which already incremented ``active_refs``
+    under the lock — so this context manager does NOT increment again; it
+    merely *adopts* that existing pin and releases it on exit. This closes the
+    handoff window: the model is pinned continuously from inside
+    ``ensure_loaded`` (under the lock) through the awaits that precede this
+    block (inference-lock acquisition, async prompt-cache setup) until exit.
+    The caller is responsible for releasing the pin (via ``lm.release_ref()``)
+    on any error path that bypasses this context manager.
+
+    With *adopt* False (the legacy path) this increments on entry as before;
+    a small unprotected window then exists between ``ensure_loaded`` and here,
+    but that path is only used where the caller does not hold the model across
+    awaits.
 
     Bug #118: Python ``+=`` on int is not atomic. Concurrent async tasks can
     race on ``active_refs``. Use the model's ``_active_refs_lock`` to protect
@@ -1296,13 +1305,12 @@ def _inference_ref(lm: LoadedModel, keep_alive: int | str | None = None):
     When a request passes a specific keep_alive, that value is honoured after
     inference instead of being silently replaced with the global default.
     """
-    with lm._active_refs_lock:
-        lm.active_refs += 1
+    if not adopt:
+        lm.acquire_ref()
     try:
         yield
     finally:
-        with lm._active_refs_lock:
-            lm.active_refs -= 1
+        lm.release_ref()
         # Refresh expiry so the model doesn't expire immediately after inference.
         # Honour per-request keep_alive when available (fix #338).
         # Falls back to settings.default_keep_alive when no per-request value
