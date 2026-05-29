@@ -68,12 +68,14 @@ def test_snapshot_cache_eager_eval_materializes_state():
     snap = snapshot_cache_for_persistence(cache, eager_eval=True)
     snap_keys, snap_values = snap[0].state
     err: list[Exception] = []
+
     def read_in_thread() -> None:
         try:
             mx.eval(snap_keys)
             mx.eval(snap_values)
         except Exception as e:  # pragma: no cover
             err.append(e)
+
     t = threading.Thread(target=read_in_thread)
     t.start()
     t.join()
