@@ -1686,6 +1686,88 @@ class TestCacheExactMatchTrimAlignment:
         assert cache_info["cache_creation_tokens"] == 1
 
 
+class TestPinReleasedAcrossStreamingHandoff:
+    """The pin acquired by ensure_loaded(pin=True) must be released when the
+    streaming generator exits, including the mid-stream client-disconnect
+    case where the wrapper's aclose propagates to the inner generator."""
+
+    @pytest.mark.asyncio
+    async def test_pin_released_when_setup_raises_before_dispatch(self, mock_manager):
+        """Regression for PR #394 aider review: an exception in the
+        chat-template / kwargs setup code (between ensure_loaded(pin=True)
+        and the dispatch try block) must release the pin so the model
+        doesn't stay permanently pinned."""
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        # Apply chat template blows up before dispatch.
+        lm.tokenizer.apply_chat_template = MagicMock(
+            side_effect=RuntimeError("synthetic template failure")
+        )
+        assert lm.active_refs == 0
+
+        with pytest.raises(RuntimeError, match="synthetic template failure"):
+            await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=False,
+            )
+
+        # The pin must be released — not stuck at 1 — even though the
+        # exception fired before the dispatch try block.
+        assert lm.active_refs == 0
+
+    @pytest.mark.asyncio
+    async def test_pin_released_on_aclose_mid_stream(self, mock_manager):
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30])
+        assert lm.active_refs == 0
+
+        mock_make_cache = MagicMock(return_value=[MagicMock()])
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream",
+                return_value=_make_mock_stream(
+                    _make_stream_tokens("hi", prompt_tokens=3)
+                ),
+            ),
+            patch("olmlx.engine.inference.make_prompt_cache", mock_make_cache),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+            # Iterate to first cache_info, then close (mid-stream disconnect).
+            while True:
+                chunk = await gen.__anext__()
+                if chunk.get("cache_info") is True:
+                    break
+            # The pin is held during streaming.
+            assert lm.active_refs == 1, "pin must be held while the stream is in flight"
+            await gen.aclose()
+
+        # After aclose, the pin is released — even though _inference_ref's
+        # finally and the lock/cache cleanup ran via GeneratorExit, the
+        # _release_pin_after_gen wrapper's aclose-in-finally propagated and
+        # its finally released exactly once.
+        assert lm.active_refs == 0
+
+
 class TestLockReleasedOnCacheInfoDisconnect:
     @pytest.mark.asyncio
     async def test_lock_released_when_generator_closed_at_cache_info(

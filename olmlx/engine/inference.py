@@ -1277,16 +1277,23 @@ async def _inference_locked(
 
 
 @contextlib.contextmanager
-def _inference_ref(lm: LoadedModel, keep_alive: int | str | None = None):
+def _inference_ref(
+    lm: LoadedModel, keep_alive: int | str | None = None, *, adopt: bool = False
+):
     """Track active inference on a model to prevent expiry during use.
 
-    Note: there is a small window between ``ensure_loaded()`` (which returns
-    the LoadedModel) and the point where ``_inference_ref`` increments
-    ``active_refs``.  During that window the expiry checker could remove the
-    model from ``_loaded``.  This is **safe**: the caller already holds a
-    Python reference to the LoadedModel object, so the model and tokenizer
-    remain alive in memory.  The only side-effect is that the next request
-    would re-load the model into ``_loaded``.
+    When *adopt* is True the caller obtained ``lm`` via
+    ``ensure_loaded(..., pin=True)``, which already incremented ``active_refs``
+    under the lock. This context manager does NOT increment on entry and does
+    NOT release on exit; the caller's outer try/finally owns the single pin
+    release. This avoids races where an exception path here and the caller's
+    cleanup could double-release. Expiry refresh still runs on exit so the
+    model's deadline reflects the inference that just happened.
+
+    With *adopt* False (the legacy path) this increments on entry and releases
+    on exit as before; a small unprotected window then exists between
+    ``ensure_loaded`` and here, but that path is only used where the caller
+    does not hold the model across awaits.
 
     Bug #118: Python ``+=`` on int is not atomic. Concurrent async tasks can
     race on ``active_refs``. Use the model's ``_active_refs_lock`` to protect
@@ -1296,13 +1303,13 @@ def _inference_ref(lm: LoadedModel, keep_alive: int | str | None = None):
     When a request passes a specific keep_alive, that value is honoured after
     inference instead of being silently replaced with the global default.
     """
-    with lm._active_refs_lock:
-        lm.active_refs += 1
+    if not adopt:
+        lm.acquire_ref()
     try:
         yield
     finally:
-        with lm._active_refs_lock:
-            lm.active_refs -= 1
+        if not adopt:
+            lm.release_ref()
         # Refresh expiry so the model doesn't expire immediately after inference.
         # Honour per-request keep_alive when available (fix #338).
         # Falls back to settings.default_keep_alive when no per-request value
@@ -1318,6 +1325,31 @@ def _inference_ref(lm: LoadedModel, keep_alive: int | str | None = None):
             lm.expires_at = time.time() + ka
         else:
             lm.expires_at = None
+
+
+async def _release_pin_after_gen(
+    gen: AsyncGenerator[dict, None], lm: LoadedModel
+) -> AsyncGenerator[dict, None]:
+    """Forward ``gen`` and release ``lm``'s pin on any generator exit.
+
+    Used by the streaming entry points to release the pin acquired by
+    ``ensure_loaded(pin=True)`` once the underlying generator finishes
+    (normally, via exception, or via aclose on client disconnect). The
+    inner generator's ``_inference_ref(adopt=True)`` does NOT release —
+    only this wrapper does — so the pin is released exactly once.
+
+    The finally explicitly closes ``gen`` so the wrapped generator's own
+    finally blocks (e.g. the inference-lock release in
+    ``_stream_completion``) fire when the client disconnects mid-stream.
+    """
+    try:
+        async for chunk in gen:
+            yield chunk
+    finally:
+        try:
+            await gen.aclose()
+        finally:
+            lm.release_ref()
 
 
 def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
@@ -1968,106 +2000,113 @@ async def generate_completion(
     stats = TimingStats()
 
     with Timer() as load_timer:
-        lm = await manager.ensure_loaded(model_name, keep_alive)
+        lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     stats.load_duration = load_timer.duration_ns
 
-    # /api/generate defaults thinking OFF when unspecified (None), unlike the
-    # chat route's "think unless tools".  Coerce once so the template
-    # instruction and the downstream thinking_expected signal stay consistent
-    # (otherwise the splitter would arm the orphan-</think> buffer for thinking
-    # the model was told not to produce).
-    effective_thinking = enable_thinking if enable_thinking is not None else False
+    # The pin acquired by ``ensure_loaded(pin=True)`` is released exactly
+    # once: by the stream wrapper after the generator exits, by the
+    # non-stream finally below, or by the outer except below if anything
+    # raises before delegation. The outer try must scope from RIGHT AFTER
+    # ensure_loaded (PR #394 aider review) so an exception in the chat
+    # template / kwargs setup doesn't leak the pin.
+    pin_released_or_transferred = False
+    try:
+        # /api/generate defaults thinking OFF when unspecified (None), unlike the
+        # chat route's "think unless tools".  Coerce once so the template
+        # instruction and the downstream thinking_expected signal stay consistent
+        # (otherwise the splitter would arm the orphan-</think> buffer for thinking
+        # the model was told not to produce).
+        effective_thinking = enable_thinking if enable_thinking is not None else False
 
-    if apply_chat_template and not lm.is_vlm:
-        messages: list[dict] = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        try:
-            prompt = apply_chat_template_text(
-                lm.text_tokenizer,
-                messages,
-                caps=lm.template_caps,
-                enable_thinking=effective_thinking,
-            )
-            logger.info(
-                "Applied chat template for /api/generate (prompt length: %d chars)",
-                len(prompt),
-            )
-            logger.debug("Templated prompt: %s", prompt[:500])
-        except RuntimeError as exc:
-            logger.warning(
-                "Chat template failed for %s, falling back to raw prompt: %s",
-                model_name,
-                exc,
-                exc_info=True,
-            )
+        if apply_chat_template and not lm.is_vlm:
+            messages: list[dict] = []
             if system:
-                prompt = f"{system}\n\n{prompt}"
-    elif apply_chat_template and lm.is_vlm:
-        messages: list[dict] = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        try:
-            # Forward the *coerced* effective_thinking (not raw enable_thinking)
-            # so VLM /api/generate is off-by-default like the text path, and so
-            # the explicit instruction matches the thinking_expected signal
-            # computed below.  We deliberately don't defer to the VLM template's
-            # own default: we can't introspect it, so passing an explicit bool
-            # is the only way to keep the thinking-splitter consistent.  This
-            # differs intentionally from generate_chat's no-tools VLM path,
-            # which passes None and lets _apply_chat_template_vlm's guard skip
-            # the kwarg (preserving the template default).  Consequence: every
-            # /api/generate VLM request passes enable_thinking (incl. False) to
-            # the template even for non-thinking VLMs — harmless because HF
-            # templates ignore unknown kwargs.
-            prompt = _apply_chat_template_vlm(
-                lm.tokenizer, lm.model, messages, enable_thinking=effective_thinking
-            )
-            logger.info(
-                "Applied VLM chat template for /api/generate (prompt length: %d chars)",
-                len(prompt),
-            )
-            logger.debug("VLM templated prompt: %s", prompt[:500])
-        except Exception as exc:
-            logger.warning(
-                "VLM chat template failed for %s, falling back to raw prompt: %s",
-                model_name,
-                exc,
-                exc_info=True,
-            )
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            try:
+                prompt = apply_chat_template_text(
+                    lm.text_tokenizer,
+                    messages,
+                    caps=lm.template_caps,
+                    enable_thinking=effective_thinking,
+                )
+                logger.info(
+                    "Applied chat template for /api/generate (prompt length: %d chars)",
+                    len(prompt),
+                )
+                logger.debug("Templated prompt: %s", prompt[:500])
+            except RuntimeError as exc:
+                logger.warning(
+                    "Chat template failed for %s, falling back to raw prompt: %s",
+                    model_name,
+                    exc,
+                    exc_info=True,
+                )
+                if system:
+                    prompt = f"{system}\n\n{prompt}"
+        elif apply_chat_template and lm.is_vlm:
+            messages: list[dict] = []
             if system:
-                prompt = f"{system}\n\n{prompt}"
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            try:
+                # Forward the *coerced* effective_thinking (not raw enable_thinking)
+                # so VLM /api/generate is off-by-default like the text path, and so
+                # the explicit instruction matches the thinking_expected signal
+                # computed below.  We deliberately don't defer to the VLM template's
+                # own default: we can't introspect it, so passing an explicit bool
+                # is the only way to keep the thinking-splitter consistent.  This
+                # differs intentionally from generate_chat's no-tools VLM path,
+                # which passes None and lets _apply_chat_template_vlm's guard skip
+                # the kwarg (preserving the template default).  Consequence: every
+                # /api/generate VLM request passes enable_thinking (incl. False) to
+                # the template even for non-thinking VLMs — harmless because HF
+                # templates ignore unknown kwargs.
+                prompt = _apply_chat_template_vlm(
+                    lm.tokenizer, lm.model, messages, enable_thinking=effective_thinking
+                )
+                logger.info(
+                    "Applied VLM chat template for /api/generate (prompt length: %d chars)",
+                    len(prompt),
+                )
+                logger.debug("VLM templated prompt: %s", prompt[:500])
+            except Exception as exc:
+                logger.warning(
+                    "VLM chat template failed for %s, falling back to raw prompt: %s",
+                    model_name,
+                    exc,
+                    exc_info=True,
+                )
+                if system:
+                    prompt = f"{system}\n\n{prompt}"
 
-    # Merge per-model defaults with request options.  options=None means
-    # "use defaults"; options={} means "override all defaults" (empty).
-    merged_options = (
-        {**lm.default_options, **(options or {})}
-        if lm.default_options and options is None
-        else options
-    )
-    gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
-    mt = gen_kwargs.pop("max_tokens", max_tokens)
+        # Merge per-model defaults with request options.  options=None means
+        # "use defaults"; options={} means "override all defaults" (empty).
+        merged_options = (
+            {**lm.default_options, **(options or {})}
+            if lm.default_options and options is None
+            else options
+        )
+        gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
+        mt = gen_kwargs.pop("max_tokens", max_tokens)
 
-    grammar_active = _install_grammar_processor(lm, gen_kwargs, grammar_spec)
+        grammar_active = _install_grammar_processor(lm, gen_kwargs, grammar_spec)
 
-    # Tell routers whether to wait for a (possibly orphaned) `</think>` when
-    # splitting thinking from the response (issue #307) — shares the rules
-    # with `generate_chat`.  Completions never carry tools.  In raw mode no
-    # chat template is applied, so no thinking instruction reached the model:
-    # leave thinking_expected False so the router doesn't arm the orphan-close
-    # heuristic on un-templated output (a literal `</think>` in code/prose).
-    caps = lm.template_caps or TemplateCaps()
-    thinking_expected = (
-        _resolve_thinking_active(caps, None, effective_thinking)
-        if apply_chat_template
-        else False
-    )
+        # Tell routers whether to wait for a (possibly orphaned) `</think>` when
+        # splitting thinking from the response (issue #307) — shares the rules
+        # with `generate_chat`.  Completions never carry tools.  In raw mode no
+        # chat template is applied, so no thinking instruction reached the model:
+        # leave thinking_expected False so the router doesn't arm the orphan-close
+        # heuristic on un-templated output (a literal `</think>` in code/prose).
+        caps = lm.template_caps or TemplateCaps()
+        thinking_expected = (
+            _resolve_thinking_active(caps, None, effective_thinking)
+            if apply_chat_template
+            else False
+        )
 
-    if stream:
-        return _prepend_meta(
-            _stream_completion(
+        if stream:
+            gen = _stream_completion(
                 lm,
                 prompt,
                 mt,
@@ -2076,22 +2115,42 @@ async def generate_completion(
                 images,
                 keep_alive=keep_alive,
                 grammar_active=grammar_active,
-            ),
-            {"thinking_expected": thinking_expected},
-        )
-    else:
-        result = await _full_completion(
-            lm,
-            prompt,
-            mt,
-            gen_kwargs,
-            stats,
-            images,
-            keep_alive=keep_alive,
-            grammar_active=grammar_active,
-        )
-        result["thinking_expected"] = thinking_expected
-        return result
+                adopt_pin=True,
+            )
+            # Ownership of the pin transfers to the wrapper; its finally
+            # releases on any generator exit. Mark the flag for the outer
+            # except so it doesn't double-release.
+            pin_released_or_transferred = True
+            return _prepend_meta(
+                _release_pin_after_gen(gen, lm),
+                {"thinking_expected": thinking_expected},
+            )
+        else:
+            try:
+                result = await _full_completion(
+                    lm,
+                    prompt,
+                    mt,
+                    gen_kwargs,
+                    stats,
+                    images,
+                    keep_alive=keep_alive,
+                    grammar_active=grammar_active,
+                    adopt_pin=True,
+                )
+                result["thinking_expected"] = thinking_expected
+                return result
+            finally:
+                # Release exactly once on every exit path — success or
+                # exception. Set the flag so the outer except doesn't try
+                # to release again.
+                if not pin_released_or_transferred:
+                    lm.release_ref()
+                    pin_released_or_transferred = True
+    except BaseException:
+        if not pin_released_or_transferred:
+            lm.release_ref()
+        raise
 
 
 @dataclasses.dataclass
@@ -2652,6 +2711,7 @@ async def _stream_completion(
     cache_id: str = "",
     keep_alive: str | None = None,
     grammar_active: bool = False,
+    adopt_pin: bool = False,
 ) -> AsyncGenerator[dict, None]:
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
@@ -3035,6 +3095,7 @@ async def _full_completion(
     cache_id: str = "",
     keep_alive: str | None = None,
     grammar_active: bool = False,
+    adopt_pin: bool = False,
 ) -> dict:
     # inference_timeout is not enforced for non-streaming: the GPU thread
     # cannot be safely cancelled (releasing the lock while Metal is still
@@ -3042,8 +3103,13 @@ async def _full_completion(
     # this via CancellableStream.cancel() + drain_and_join().
     # Pop stop sequences before passing gen_kwargs to mlx-lm (unsupported).
     stop_sequences: list[str] | None = gen_kwargs.pop("stop", None)
+    # When adopt_pin is True the caller passed an ``lm`` already pinned via
+    # ``ensure_loaded(pin=True)``. ``_inference_ref(adopt=True)`` does NOT
+    # release the pin — the caller's outer finally is responsible for the
+    # single release. This avoids races between an early exception path
+    # here and the caller's cleanup.
     async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
-        with _inference_ref(lm, keep_alive=keep_alive):
+        with _inference_ref(lm, keep_alive=keep_alive, adopt=adopt_pin):
             # Cache setup must happen under the inference lock so two
             # concurrent requests can't race to read/mutate the same store
             # entry.  The gate at the call site has already excluded VLM
@@ -3416,151 +3482,160 @@ async def generate_chat(
     stats = TimingStats()
 
     with Timer() as load_timer:
-        lm = await manager.ensure_loaded(model_name, keep_alive)
+        lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     stats.load_duration = load_timer.duration_ns
 
-    images = _extract_images(messages)
+    # The pin acquired by ``ensure_loaded(pin=True)`` is released exactly
+    # once: by the stream wrapper after the generator exits, by the
+    # non-stream finally below, or by the outer except below if anything
+    # raises before delegation. The outer try must scope from RIGHT AFTER
+    # ensure_loaded (PR #394 aider review) so an exception in the chat
+    # template / kwargs setup doesn't leak the pin.
+    pin_released_or_transferred = False
+    try:
+        images = _extract_images(messages)
 
-    # Normalise OpenAI-format tool_calls ({function: {name, arguments: "json"}})
-    # to the flat format chat templates expect ({name, arguments: {...}}).
-    messages = _normalize_tool_calls_in_messages(messages)
+        # Normalise OpenAI-format tool_calls ({function: {name, arguments: "json"}})
+        # to the flat format chat templates expect ({name, arguments: {...}}).
+        messages = _normalize_tool_calls_in_messages(messages)
 
-    # When native tools are used, clients (e.g. opencode, Claude Code) may
-    # include their own tool-format instructions in the system message that
-    # conflict with the model's native tool call format.  With long prompts,
-    # models like Gemma 4 follow the client's text instructions instead of
-    # generating native tool call tokens.  Appending a short override to the
-    # system message steers the model back to the native format.  We pass
-    # the model's own chat template so the helper can suppress patterns the
-    # template uses natively (e.g. Mistral's `[TOOL_CALLS]`).
-    caps = lm.template_caps or TemplateCaps()
-    if tools and caps.supports_tools:
-        template_text = _get_chat_template_text(lm.tokenizer)
-        messages = _add_native_tool_hint(messages, template_text)
-
-    if lm.is_vlm:
-        # VLM models must use the VLM generation path for tokenization.
-        # Pass tools natively through the template when supported — this
-        # produces model-native formatting (e.g. <|tool> tags for Gemma 4)
-        # which is far more effective than injecting JSON into the system
-        # message.  Fall back to system-message injection for models whose
-        # template lacks tool support.
-        # Resolve enable_thinking for templates that support it.
-        vlm_thinking = enable_thinking if caps.supports_enable_thinking else None
-        # Convert role="tool" messages to tool_responses format for models
-        # that don't support OpenAI-style tool messages (e.g. Gemma 4).
-        if caps.uses_tool_responses:
-            messages = _convert_tool_messages_to_responses(messages)
+        # When native tools are used, clients (e.g. opencode, Claude Code) may
+        # include their own tool-format instructions in the system message that
+        # conflict with the model's native tool call format.  With long prompts,
+        # models like Gemma 4 follow the client's text instructions instead of
+        # generating native tool call tokens.  Appending a short override to the
+        # system message steers the model back to the native format.  We pass
+        # the model's own chat template so the helper can suppress patterns the
+        # template uses natively (e.g. Mistral's `[TOOL_CALLS]`).
+        caps = lm.template_caps or TemplateCaps()
         if tools and caps.supports_tools:
-            prompt = _apply_chat_template_vlm(
-                lm.tokenizer,
-                lm.model,
+            template_text = _get_chat_template_text(lm.tokenizer)
+            messages = _add_native_tool_hint(messages, template_text)
+
+        if lm.is_vlm:
+            # VLM models must use the VLM generation path for tokenization.
+            # Pass tools natively through the template when supported — this
+            # produces model-native formatting (e.g. <|tool> tags for Gemma 4)
+            # which is far more effective than injecting JSON into the system
+            # message.  Fall back to system-message injection for models whose
+            # template lacks tool support.
+            # Resolve enable_thinking for templates that support it.
+            vlm_thinking = enable_thinking if caps.supports_enable_thinking else None
+            # Convert role="tool" messages to tool_responses format for models
+            # that don't support OpenAI-style tool messages (e.g. Gemma 4).
+            if caps.uses_tool_responses:
+                messages = _convert_tool_messages_to_responses(messages)
+            if tools and caps.supports_tools:
+                prompt = _apply_chat_template_vlm(
+                    lm.tokenizer,
+                    lm.model,
+                    messages,
+                    images,
+                    tools=tools,
+                    enable_thinking=vlm_thinking,
+                )
+                logger.info(
+                    "VLM chat prompt with %d tools (native template)", len(tools)
+                )
+            elif tools:
+                vlm_messages = _inject_tools_into_system(list(messages), tools)
+                prompt = _apply_chat_template_vlm(
+                    lm.tokenizer,
+                    lm.model,
+                    vlm_messages,
+                    images,
+                    enable_thinking=vlm_thinking,
+                )
+                logger.info(
+                    "VLM chat prompt with %d tools (injected into system)", len(tools)
+                )
+            else:
+                prompt = _apply_chat_template_vlm(
+                    lm.tokenizer,
+                    lm.model,
+                    messages,
+                    images,
+                    enable_thinking=vlm_thinking,
+                )
+            logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
+            logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
+            if enable_thinking is not None and vlm_thinking is None:
+                logger.debug(
+                    "enable_thinking=%s ignored for VLM model (template does not support it)",
+                    enable_thinking,
+                )
+        else:
+            prompt = apply_chat_template_text(
+                lm.text_tokenizer,
                 messages,
-                images,
-                tools=tools,
-                enable_thinking=vlm_thinking,
+                tools,
+                caps=lm.template_caps,
+                enable_thinking=enable_thinking,
             )
-            logger.info("VLM chat prompt with %d tools (native template)", len(tools))
-        elif tools:
-            vlm_messages = _inject_tools_into_system(list(messages), tools)
-            prompt = _apply_chat_template_vlm(
-                lm.tokenizer,
-                lm.model,
-                vlm_messages,
-                images,
-                enable_thinking=vlm_thinking,
-            )
-            logger.info(
-                "VLM chat prompt with %d tools (injected into system)", len(tools)
+            if tools:
+                logger.info("Chat prompt with %d tools", len(tools))
+            logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
+            logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
+
+        # Merge per-model defaults with request options.  options=None means
+        # "use defaults"; options={} means "override all defaults" (empty).
+        merged_options = (
+            {**lm.default_options, **(options or {})}
+            if lm.default_options and options is None
+            else options
+        )
+        gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
+        mt = gen_kwargs.pop("max_tokens", max_tokens)
+
+        grammar_active = _install_grammar_processor(
+            lm, gen_kwargs, grammar_spec, has_tools=bool(tools)
+        )
+
+        # Prompt caching applies to both streaming and non-streaming requests
+        # (issue #342).  Disabled in distributed mode because rank 0 processes
+        # only suffix tokens on cache hits while workers process the full
+        # prompt, causing all_sum call count mismatch and deadlock.  Disabled
+        # for speculative regardless of stream mode (issue #346): the
+        # speculative decoder owns its own internal target/draft caches and
+        # would receive a misaligned suffix-only prompt on a cache hit —
+        # ``async_speculative_stream`` does not consume ``gen_kwargs['prompt_cache']``.
+        # Also disabled for VLMs on the non-streaming path because
+        # ``mlx_vlm.generate`` accepts neither ``prompt_cache`` nor ``input_ids``.
+        use_prompt_cache = (
+            settings.prompt_cache
+            and make_prompt_cache is not None
+            and not lm.is_distributed
+            and not lm.is_speculative
+            and (stream or not lm.is_vlm)
+        )
+        prompt_tokens = None
+        if use_prompt_cache:
+            prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
+            # Memory-only peek for debug logging; the authoritative lookup happens
+            # inside _stream_completion/_full_completion under the inference lock.
+            cached_state = lm.prompt_cache_store.peek(cache_id)
+            logger.debug(
+                "Prompt cache enabled: %d prompt tokens, existing cache=%s",
+                len(prompt_tokens),
+                f"{len(cached_state.tokens)} tokens" if cached_state else "none",
             )
         else:
-            prompt = _apply_chat_template_vlm(
-                lm.tokenizer,
-                lm.model,
-                messages,
-                images,
-                enable_thinking=vlm_thinking,
-            )
-        logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
-        logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
-        if enable_thinking is not None and vlm_thinking is None:
             logger.debug(
-                "enable_thinking=%s ignored for VLM model (template does not support it)",
-                enable_thinking,
+                "Prompt cache disabled: setting=%s stream=%s vlm=%s speculative=%s "
+                "make_prompt_cache=%s",
+                settings.prompt_cache,
+                stream,
+                lm.is_vlm,
+                lm.is_speculative,
+                make_prompt_cache is not None,
             )
-    else:
-        prompt = apply_chat_template_text(
-            lm.text_tokenizer,
-            messages,
-            tools,
-            caps=lm.template_caps,
-            enable_thinking=enable_thinking,
-        )
-        if tools:
-            logger.info("Chat prompt with %d tools", len(tools))
-        logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
-        logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
 
-    # Merge per-model defaults with request options.  options=None means
-    # "use defaults"; options={} means "override all defaults" (empty).
-    merged_options = (
-        {**lm.default_options, **(options or {})}
-        if lm.default_options and options is None
-        else options
-    )
-    gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
-    mt = gen_kwargs.pop("max_tokens", max_tokens)
+        # Tell streaming routers whether to wait for a (possibly orphaned, see
+        # #307) `</think>` token — shares the rules with `_apply_chat_template`.
+        thinking_expected = _resolve_thinking_active(caps, tools, enable_thinking)
 
-    grammar_active = _install_grammar_processor(
-        lm, gen_kwargs, grammar_spec, has_tools=bool(tools)
-    )
-
-    # Prompt caching applies to both streaming and non-streaming requests
-    # (issue #342).  Disabled in distributed mode because rank 0 processes
-    # only suffix tokens on cache hits while workers process the full
-    # prompt, causing all_sum call count mismatch and deadlock.  Disabled
-    # for speculative regardless of stream mode (issue #346): the
-    # speculative decoder owns its own internal target/draft caches and
-    # would receive a misaligned suffix-only prompt on a cache hit —
-    # ``async_speculative_stream`` does not consume ``gen_kwargs['prompt_cache']``.
-    # Also disabled for VLMs on the non-streaming path because
-    # ``mlx_vlm.generate`` accepts neither ``prompt_cache`` nor ``input_ids``.
-    use_prompt_cache = (
-        settings.prompt_cache
-        and make_prompt_cache is not None
-        and not lm.is_distributed
-        and not lm.is_speculative
-        and (stream or not lm.is_vlm)
-    )
-    prompt_tokens = None
-    if use_prompt_cache:
-        prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
-        # Memory-only peek for debug logging; the authoritative lookup happens
-        # inside _stream_completion/_full_completion under the inference lock.
-        cached_state = lm.prompt_cache_store.peek(cache_id)
-        logger.debug(
-            "Prompt cache enabled: %d prompt tokens, existing cache=%s",
-            len(prompt_tokens),
-            f"{len(cached_state.tokens)} tokens" if cached_state else "none",
-        )
-    else:
-        logger.debug(
-            "Prompt cache disabled: setting=%s stream=%s vlm=%s speculative=%s "
-            "make_prompt_cache=%s",
-            settings.prompt_cache,
-            stream,
-            lm.is_vlm,
-            lm.is_speculative,
-            make_prompt_cache is not None,
-        )
-
-    # Tell streaming routers whether to wait for a (possibly orphaned, see
-    # #307) `</think>` token — shares the rules with `_apply_chat_template`.
-    thinking_expected = _resolve_thinking_active(caps, tools, enable_thinking)
-
-    if stream:
-        return _prepend_meta(
-            _stream_completion(
+        if stream:
+            gen = _stream_completion(
                 lm,
                 prompt,
                 mt,
@@ -3572,28 +3647,46 @@ async def generate_chat(
                 cache_id=cache_id,
                 keep_alive=keep_alive,
                 grammar_active=grammar_active,
-            ),
-            {"thinking_expected": thinking_expected},
-        )
-    else:
-        result = await _full_completion(
-            lm,
-            prompt,
-            mt,
-            gen_kwargs,
-            stats,
-            images,
-            has_tools=bool(tools),
-            use_prompt_cache=use_prompt_cache,
-            prompt_tokens=prompt_tokens,
-            cache_id=cache_id,
-            keep_alive=keep_alive,
-            grammar_active=grammar_active,
-        )
-        # Mirror the streaming meta chunk so non-streaming routers can gate
-        # orphan `</think>` handling on the same signal (issue #307).
-        result["thinking_expected"] = thinking_expected
-        return result
+                adopt_pin=True,
+            )
+            # Ownership of the pin transfers to the wrapper; its finally
+            # releases on any generator exit. Mark the flag for the outer
+            # except so it doesn't double-release.
+            pin_released_or_transferred = True
+            return _prepend_meta(
+                _release_pin_after_gen(gen, lm),
+                {"thinking_expected": thinking_expected},
+            )
+        else:
+            try:
+                result = await _full_completion(
+                    lm,
+                    prompt,
+                    mt,
+                    gen_kwargs,
+                    stats,
+                    images,
+                    has_tools=bool(tools),
+                    use_prompt_cache=use_prompt_cache,
+                    prompt_tokens=prompt_tokens,
+                    cache_id=cache_id,
+                    keep_alive=keep_alive,
+                    grammar_active=grammar_active,
+                    adopt_pin=True,
+                )
+                # Mirror the streaming meta chunk so non-streaming routers
+                # can gate orphan `</think>` handling on the same signal
+                # (issue #307).
+                result["thinking_expected"] = thinking_expected
+                return result
+            finally:
+                if not pin_released_or_transferred:
+                    lm.release_ref()
+                    pin_released_or_transferred = True
+    except BaseException:
+        if not pin_released_or_transferred:
+            lm.release_ref()
+        raise
 
 
 # Streaming routers consult this when the engine signals
@@ -3653,72 +3746,77 @@ async def generate_embeddings(
     keep_alive: int | str | None = None,
 ) -> list[list[float]]:
     """Generate embeddings using the model's hidden states or embed_tokens layer."""
-    lm = await manager.ensure_loaded(model_name, keep_alive)
+    lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
 
-    async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
-        with _inference_ref(lm, keep_alive=keep_alive):
-            embeddings = []
+    try:
+        async with _inference_locked(
+            lm.inference_queue_timeout, sync_mode=lm.sync_mode
+        ):
+            with _inference_ref(lm, keep_alive=keep_alive, adopt=True):
+                embeddings = []
 
-            tokenizer = lm.text_tokenizer
+                tokenizer = lm.text_tokenizer
 
-            # Check if model has a static embedding layer we can use directly
-            embed_layer = None
-            model_inner = getattr(lm.model, "model", lm.model)
-            if hasattr(model_inner, "embed_tokens"):
-                embed_layer = model_inner.embed_tokens
+                # Check if model has a static embedding layer we can use directly
+                embed_layer = None
+                model_inner = getattr(lm.model, "model", lm.model)
+                if hasattr(model_inner, "embed_tokens"):
+                    embed_layer = model_inner.embed_tokens
 
-            for text in texts:
-                tokens = tokenizer.encode(text)
-                input_ids = mx.array([tokens])
+                for text in texts:
+                    tokens = tokenizer.encode(text)
+                    input_ids = mx.array([tokens])
 
-                if embed_layer is not None:
-                    # Use static token embeddings — no forward pass needed
-                    hidden = embed_layer(input_ids)
-                else:
-                    outputs = lm.model(input_ids)
-                    if hasattr(outputs, "hidden_states") and outputs.hidden_states:
-                        hidden = outputs.hidden_states[-1]
-                    elif hasattr(outputs, "last_hidden_state"):
-                        hidden = outputs.last_hidden_state
+                    if embed_layer is not None:
+                        # Use static token embeddings — no forward pass needed
+                        hidden = embed_layer(input_ids)
                     else:
-                        hidden = outputs
+                        outputs = lm.model(input_ids)
+                        if hasattr(outputs, "hidden_states") and outputs.hidden_states:
+                            hidden = outputs.hidden_states[-1]
+                        elif hasattr(outputs, "last_hidden_state"):
+                            hidden = outputs.last_hidden_state
+                        else:
+                            hidden = outputs
 
-                # Robust shape handling
-                if hidden.ndim == 3:
-                    # (batch, seq, dim) — mean-pool over sequence
-                    embedding = mx.mean(hidden[0], axis=0)
-                elif hidden.ndim == 2:
-                    # (seq, dim) — mean-pool over sequence
-                    embedding = mx.mean(hidden, axis=0)
-                elif hidden.ndim == 1:
-                    embedding = hidden
-                else:
-                    raise ValueError(
-                        f"Unexpected embedding tensor shape: {hidden.shape}"
+                    # Robust shape handling
+                    if hidden.ndim == 3:
+                        # (batch, seq, dim) — mean-pool over sequence
+                        embedding = mx.mean(hidden[0], axis=0)
+                    elif hidden.ndim == 2:
+                        # (seq, dim) — mean-pool over sequence
+                        embedding = mx.mean(hidden, axis=0)
+                    elif hidden.ndim == 1:
+                        embedding = hidden
+                    else:
+                        raise ValueError(
+                            f"Unexpected embedding tensor shape: {hidden.shape}"
+                        )
+
+                    embeddings.append(embedding.tolist())
+
+                # Load-bearing when sync_mode="none": this function runs
+                # synchronously under _inference_locked with no worker thread,
+                # so the lock-boundary exit sync may be skipped. This sync is
+                # then the only Metal barrier before the lock is released —
+                # do not remove without providing an equivalent barrier.
+                # Suppress+log rather than raise: the embeddings have already
+                # been .tolist()'d so the caller should still get the result;
+                # a Metal error here will surface on the next request.
+                try:
+                    mx.synchronize()
+                except Exception:
+                    # WARNING, not DEBUG: under sync_mode="none" this is the
+                    # only Metal barrier in the path; a silent failure here
+                    # typically surfaces as an uncatchable Metal crash on the
+                    # next inference. Operators need to see it now, not after.
+                    logger.warning(
+                        "embeddings post-compute sync failed — next inference will crash",
+                        exc_info=True,
                     )
-
-                embeddings.append(embedding.tolist())
-
-            # Load-bearing when sync_mode="none": this function runs
-            # synchronously under _inference_locked with no worker thread,
-            # so the lock-boundary exit sync may be skipped. This sync is
-            # then the only Metal barrier before the lock is released —
-            # do not remove without providing an equivalent barrier.
-            # Suppress+log rather than raise: the embeddings have already
-            # been .tolist()'d so the caller should still get the result;
-            # a Metal error here will surface on the next request.
-            try:
-                mx.synchronize()
-            except Exception:
-                # WARNING, not DEBUG: under sync_mode="none" this is the
-                # only Metal barrier in the path; a silent failure here
-                # typically surfaces as an uncatchable Metal crash on the
-                # next inference. Operators need to see it now, not after.
-                logger.warning(
-                    "embeddings post-compute sync failed — next inference will crash",
-                    exc_info=True,
-                )
-            return embeddings
+                return embeddings
+    finally:
+        lm.release_ref()
 
 
 async def generate_transcription(
@@ -3749,52 +3847,57 @@ async def generate_transcription(
     # patch() targets) via importlib so ModelHolder injection lands correctly.
     whisper_transcribe = importlib.import_module("mlx_whisper.transcribe")
 
-    lm = await manager.ensure_loaded(model_name, keep_alive)
+    lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
 
-    # Reject non-whisper models with a clear error (issue #366). Without this,
-    # a text/VLM model name would load fine, get injected into mlx_whisper's
-    # ModelHolder, and produce a cryptic failure inside transcribe(). Raising
-    # ValueError surfaces as HTTP 400 via the app-level handler.
-    if not lm.is_whisper:
-        raise ValueError(
-            f"Model '{model_name}' is not a Whisper model. "
-            "/v1/audio/transcriptions requires a whisper-class model "
-            "(e.g. whisper-turbo or an mlx-community/whisper-* repo)."
-        )
+    try:
+        # Reject non-whisper models with a clear error (issue #366). Without this,
+        # a text/VLM model name would load fine, get injected into mlx_whisper's
+        # ModelHolder, and produce a cryptic failure inside transcribe(). Raising
+        # ValueError surfaces as HTTP 400 via the app-level handler.
+        if not lm.is_whisper:
+            raise ValueError(
+                f"Model '{model_name}' is not a Whisper model. "
+                "/v1/audio/transcriptions requires a whisper-class model "
+                "(e.g. whisper-turbo or an mlx-community/whisper-* repo)."
+            )
 
-    # Resolve the on-disk path used as path_or_hf_repo so the ModelHolder
-    # cache key matches what we inject.
-    if manager.store is not None:
-        load_path = str(manager.store.local_path(lm.hf_path))
-    else:
-        load_path = lm.hf_path
+        # Resolve the on-disk path used as path_or_hf_repo so the ModelHolder
+        # cache key matches what we inject.
+        if manager.store is not None:
+            load_path = str(manager.store.local_path(lm.hf_path))
+        else:
+            load_path = lm.hf_path
 
-    async with _inference_locked(lm.inference_queue_timeout, sync_mode=lm.sync_mode):
-        with _inference_ref(lm):
-            # Inject the managed model so transcribe() reuses it. Safe because
-            # _inference_locked serializes inference (no ModelHolder race).
-            whisper_transcribe.ModelHolder.model = lm.model
-            whisper_transcribe.ModelHolder.model_path = load_path
+        async with _inference_locked(
+            lm.inference_queue_timeout, sync_mode=lm.sync_mode
+        ):
+            with _inference_ref(lm, adopt=True):
+                # Inject the managed model so transcribe() reuses it. Safe because
+                # _inference_locked serializes inference (no ModelHolder race).
+                whisper_transcribe.ModelHolder.model = lm.model
+                whisper_transcribe.ModelHolder.model_path = load_path
 
-            def _run() -> dict:
-                try:
-                    return whisper_transcribe.transcribe(
-                        audio_path,
-                        path_or_hf_repo=load_path,
-                        language=language,
-                        initial_prompt=prompt,
-                        temperature=temperature,
-                        word_timestamps=word_timestamps,
-                    )
-                except FileNotFoundError as exc:
-                    raise ValueError(
-                        "Audio decoding failed: ffmpeg was not found on PATH. "
-                        "Install ffmpeg (e.g. `brew install ffmpeg`) to use "
-                        "/v1/audio/transcriptions."
-                    ) from exc
-                except RuntimeError as exc:
-                    # mlx_whisper.audio.load_audio raises RuntimeError on a
-                    # failed ffmpeg decode (bad/corrupt/unsupported file).
-                    raise ValueError(f"Audio decoding failed: {exc}") from exc
+                def _run() -> dict:
+                    try:
+                        return whisper_transcribe.transcribe(
+                            audio_path,
+                            path_or_hf_repo=load_path,
+                            language=language,
+                            initial_prompt=prompt,
+                            temperature=temperature,
+                            word_timestamps=word_timestamps,
+                        )
+                    except FileNotFoundError as exc:
+                        raise ValueError(
+                            "Audio decoding failed: ffmpeg was not found on PATH. "
+                            "Install ffmpeg (e.g. `brew install ffmpeg`) to use "
+                            "/v1/audio/transcriptions."
+                        ) from exc
+                    except RuntimeError as exc:
+                        # mlx_whisper.audio.load_audio raises RuntimeError on a
+                        # failed ffmpeg decode (bad/corrupt/unsupported file).
+                        raise ValueError(f"Audio decoding failed: {exc}") from exc
 
-            return await asyncio.to_thread(_run)
+                return await asyncio.to_thread(_run)
+    finally:
+        lm.release_ref()

@@ -304,6 +304,91 @@ class TestModelManager:
         assert "qwen3:latest" in manager._loaded
 
     @pytest.mark.asyncio
+    async def test_ensure_loaded_pin_survives_unload_during_probe(
+        self, registry, mock_store, monkeypatch
+    ):
+        """Regression for PR #394 review: unload() runs without the manager
+        lock, so during a freshly-loaded model's _probe_cache_capabilities
+        await it can pop the model out from under a caller that asked for
+        a pin. The pin must be acquired BEFORE the probe await so the
+        active_refs == 0 check in unload() rejects the close."""
+        import asyncio
+
+        from olmlx.engine.model_manager import ActiveRequestsError
+
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 10)
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.mx.metal.is_available", lambda: True
+        )
+        manager = ModelManager(registry, mock_store)
+
+        probe_in_flight = asyncio.Event()
+        probe_done = asyncio.Event()
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.chat_template = None
+
+        async def _stalling_probe(lm):
+            lm.supports_cache_trim = True
+            lm.supports_cache_persistence = True
+            probe_in_flight.set()
+            await probe_done.wait()
+
+        manager._probe_cache_capabilities = _stalling_probe  # type: ignore[method-assign]
+
+        total_ram = 64 * 1024**3
+
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(model, tokenizer, False, TemplateCaps(), None),
+            ),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock),
+            patch.object(manager, "_close_loaded_model"),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                return_value=1 * 1024**3,
+            ),
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=total_ram,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
+            patch("olmlx.engine.model_manager.gc.collect"),
+        ):
+            # Caller asks for a pin.
+            load_task = asyncio.ensure_future(manager.ensure_loaded("qwen3", pin=True))
+
+            # Wait until the probe has started (model is registered in _loaded).
+            await asyncio.wait_for(probe_in_flight.wait(), timeout=5.0)
+
+            # Concurrent unload while the probe is still awaiting. With the
+            # bug, active_refs is still 0 here and unload pops the model.
+            # With the fix, the pin was already acquired and unload raises.
+            unload_raised = False
+            try:
+                await manager.unload("qwen3")
+            except ActiveRequestsError:
+                unload_raised = True
+
+            # Let the probe finish.
+            probe_done.set()
+            lm = await asyncio.wait_for(load_task, timeout=5.0)
+
+        assert unload_raised, (
+            "unload() should have raised ActiveRequestsError; the pin was "
+            "not acquired before the probe await."
+        )
+        assert "qwen3:latest" in manager._loaded
+        assert manager._loaded["qwen3:latest"] is lm
+        assert lm.active_refs == 1  # caller still holds the pin
+
+    @pytest.mark.asyncio
     async def test_ensure_loaded_refreshes_expiry(self, mock_manager):
         lm = await mock_manager.ensure_loaded("qwen3", keep_alive="10m")
         assert lm.expires_at is not None
@@ -3164,6 +3249,59 @@ class TestMemoryCheck:
         assert "qwen3:latest" not in manager._loaded
 
     @pytest.mark.asyncio
+    async def test_ensure_loaded_pin_increments_active_refs(self, registry, mock_store):
+        """ensure_loaded(pin=True) returns the model already pinned (refs==1)."""
+        manager = ModelManager(registry, mock_store)
+        total_ram = 64 * self.GB
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(MagicMock(), MagicMock(), False, TemplateCaps(), None),
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                side_effect=[1 * self.GB, int(total_ram * 0.40)],
+            ),
+            patch("olmlx.utils.memory.get_system_memory_bytes", return_value=total_ram),
+            patch("olmlx.utils.memory.is_memory_pressure_high", return_value=False),
+            patch("olmlx.engine.model_manager.gc.collect"),
+            patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
+        ):
+            lm = await manager.ensure_loaded("qwen3", pin=True)
+        assert lm.active_refs == 1
+        # Re-ensuring the already-loaded model with pin=True pins again.
+        with patch("olmlx.utils.memory.is_memory_pressure_high", return_value=False):
+            lm2 = await manager.ensure_loaded("qwen3", pin=True)
+        assert lm2 is lm
+        assert lm.active_refs == 2
+
+    @pytest.mark.asyncio
+    async def test_ensure_loaded_default_does_not_pin(self, registry, mock_store):
+        """Default ensure_loaded (pin=False) leaves active_refs at 0."""
+        manager = ModelManager(registry, mock_store)
+        total_ram = 64 * self.GB
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(MagicMock(), MagicMock(), False, TemplateCaps(), None),
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                side_effect=[1 * self.GB, int(total_ram * 0.40)],
+            ),
+            patch("olmlx.utils.memory.get_system_memory_bytes", return_value=total_ram),
+            patch("olmlx.utils.memory.is_memory_pressure_high", return_value=False),
+            patch("olmlx.engine.model_manager.gc.collect"),
+            patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
+        ):
+            lm = await manager.ensure_loaded("qwen3")
+        assert lm.active_refs == 0
+
+    @pytest.mark.asyncio
     async def test_inference_headroom_default_does_not_reject(
         self, registry, mock_store, monkeypatch
     ):
@@ -4130,6 +4268,25 @@ class TestEvictLruIfNeeded:
         manager._loaded["only"] = only
         assert manager._pop_one_idle_lru(exclude="only") is None
         assert "only" in manager._loaded
+
+    def test_pinned_model_not_evicted(self, registry, mock_store):
+        """A pinned model (acquire_ref) is not idle, so eviction skips it.
+
+        This is the protection ensure_loaded(pin=True) buys: a model pinned
+        under the lock cannot be popped by the pressure-eviction loop in the
+        handoff window before the caller's _inference_ref adopts the pin.
+        """
+        manager = ModelManager(registry, mock_store)
+        lm = LoadedModel(
+            name="a", hf_path="a/a", model=MagicMock(), tokenizer=MagicMock()
+        )
+        manager._loaded["a"] = lm
+        lm.acquire_ref()
+        assert lm.active_refs == 1
+        assert manager._pop_one_idle_lru() is None  # pinned → protected
+        lm.release_ref()
+        assert lm.active_refs == 0
+        assert manager._pop_one_idle_lru() is lm  # released → evictable
 
     @pytest.mark.asyncio
     async def test_close_evictees_does_not_touch_gc_or_metal(
