@@ -146,6 +146,7 @@ class PromptCacheStore:
             # removing it here would lose the entry from both tiers.
             if cache_id in self._entries:
                 file_path.unlink(missing_ok=True)
+                self._refresh_disk_bytes()
             logger.info(
                 "Restored cache '%s' from disk (%d tokens)",
                 cache_id,
@@ -160,16 +161,35 @@ class PromptCacheStore:
             )
             # Remove corrupt file
             file_path.unlink(missing_ok=True)
+            self._refresh_disk_bytes()
             return None
 
-    def _cleanup_disk(self) -> None:
-        """Update the bytes_on_disk metric and, if a size cap is set,
-        remove oldest disk cache files until the total fits.
+    def _refresh_disk_bytes(self) -> None:
+        """Recompute ``bytes_on_disk`` from a directory scan.
+
+        Cheap for the per-model cache count (typically slot-cap-sized).
+        Called from every disk-state-changing path so the metric stays
+        consistent across saves, removes, and restores.
         """
         if self._disk_path is None:
             return
         disk_dir = self._disk_dir()
         if not disk_dir.exists():
+            self.metrics.bytes_on_disk = 0
+            return
+        self.metrics.bytes_on_disk = sum(
+            f.stat().st_size for f in disk_dir.glob("*.safetensors")
+        )
+
+    def _cleanup_disk(self) -> None:
+        """Refresh bytes_on_disk and, if a size cap is set, remove
+        oldest disk cache files until the total fits.
+        """
+        if self._disk_path is None:
+            return
+        disk_dir = self._disk_dir()
+        if not disk_dir.exists():
+            self.metrics.bytes_on_disk = 0
             return
         # Single stat pass: collect (path, size, mtime) to avoid double-stat
         file_info = []
@@ -284,6 +304,7 @@ class PromptCacheStore:
             self.metrics.bytes_in_ram -= _estimate_state_bytes(existing)
         if self._disk_enabled:
             self._disk_file_path(cache_id).unlink(missing_ok=True)
+            self._refresh_disk_bytes()
 
     def clear_disk(self) -> int:
         """Remove all on-disk entries for this store's model namespace.
@@ -305,6 +326,7 @@ class PromptCacheStore:
                 removed += 1
             except OSError:
                 logger.debug("Failed to remove stale disk cache %s", f, exc_info=True)
+        self.metrics.bytes_on_disk = 0
         return removed
 
     def evict_all_to_disk(self) -> None:
@@ -364,6 +386,7 @@ class PromptCacheStore:
                 exc_info=True,
             )
             file_path.unlink(missing_ok=True)
+            self._refresh_disk_bytes()
             return None, None
 
     # -- Async wrappers that offload disk I/O to threads ----------------
@@ -398,6 +421,7 @@ class PromptCacheStore:
             existing = self._entries[cache_id]
             if disk_path is not None:
                 await asyncio.to_thread(disk_path.unlink, True)
+                self._refresh_disk_bytes()
             self.metrics.cache_id_hits += 1
             return existing
         evicted_id, evicted = self._set_in_memory(cache_id, loaded)
@@ -416,6 +440,7 @@ class PromptCacheStore:
         # it here would lose the entry from both tiers.
         if disk_path is not None and cache_id in self._entries:
             await asyncio.to_thread(disk_path.unlink, True)
+            self._refresh_disk_bytes()
         self.metrics.cache_id_hits += 1
         return loaded
 
@@ -462,6 +487,7 @@ class PromptCacheStore:
             disk_dir = self._disk_dir()
             if disk_dir.exists():
                 shutil.rmtree(disk_dir, ignore_errors=True)
+        self.metrics.bytes_on_disk = 0
 
     def find_by_prefix(
         self,

@@ -356,6 +356,45 @@ class TestPromptCacheStoreEvictAllToDisk:
         # 80 bytes left under the 100-byte budget after cleanup
         assert store.metrics.bytes_on_disk == 80
 
+    def test_bytes_on_disk_decrements_on_remove(self, tmp_path):
+        """Regression for aider PR #391 follow-up: bytes_on_disk must
+        stay consistent when files are unlinked outside _cleanup_disk."""
+        store = PromptCacheStore(
+            max_slots=4,
+            disk_path=tmp_path,
+            model_name="test-model",
+        )
+        disk_dir = tmp_path / "test-model"
+        disk_dir.mkdir(parents=True)
+        (disk_dir / "a.safetensors").write_bytes(b"x" * 80)
+        (disk_dir / "b.safetensors").write_bytes(b"x" * 80)
+        # Prime the metric by running cleanup.
+        store._cleanup_disk()
+        assert store.metrics.bytes_on_disk == 160
+
+        # remove() unlinks the disk file and must refresh the metric.
+        store.remove("a")
+        assert store.metrics.bytes_on_disk == 80
+
+        # clear_disk() wipes everything; metric must drop to zero.
+        store.clear_disk()
+        assert store.metrics.bytes_on_disk == 0
+
+    def test_bytes_on_disk_zero_after_clear(self, tmp_path):
+        """clear() removes the disk directory; bytes_on_disk → 0."""
+        store = PromptCacheStore(
+            max_slots=4,
+            disk_path=tmp_path,
+            model_name="test-model",
+        )
+        disk_dir = tmp_path / "test-model"
+        disk_dir.mkdir(parents=True)
+        (disk_dir / "x.safetensors").write_bytes(b"x" * 1024)
+        store._cleanup_disk()
+        assert store.metrics.bytes_on_disk == 1024
+        store.clear()
+        assert store.metrics.bytes_on_disk == 0
+
     def test_cleanup_disk_updates_bytes_without_size_cap(self, tmp_path):
         """Regression for aider PR #391 follow-up: bytes_on_disk must
         be reported even when no disk_max_bytes cap is configured."""
