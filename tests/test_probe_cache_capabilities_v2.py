@@ -89,13 +89,16 @@ def test_probe_excludes_vlm_from_checkpoint_path_regardless_of_layer_layout(
     assert lm.supports_cache_persistence is False
 
 
-def test_probe_excludes_turboquant_from_checkpoint_path(monkeypatch):
-    """Regression: TurboQuantKVCache holds an mx.Dtype object that
-    copy.deepcopy can't pickle. Without this gate the checkpoint path
-    would crash with TypeError: cannot pickle 'Dtype' object on every
-    request for a TurboQuant-quantized model whose underlying layout
-    would otherwise qualify (e.g. Qwen3-Coder-Next, Qwen3-Next mixed
-    isn't affected because it's already excluded by #396)."""
+def test_probe_does_not_exclude_turboquant_from_checkpoint_path(monkeypatch):
+    """``TurboQuantKVCache._dequant_dtype`` carries an ``mx.Dtype`` singleton
+    that the default ``copy.deepcopy`` walk can't pickle. The cache class
+    now overrides ``__deepcopy__`` to share that singleton by reference
+    (and eager-eval the private dequant side buffers that ``.state``
+    doesn't expose), so the checkpoint path is once again available for
+    TurboQuant-quantized models on otherwise-qualifying layouts (e.g.
+    Qwen3-Coder-Next with `kv_cache_quant="turboquant:4"`). Pre-fix this
+    asserted False to pin the defensive exclusion; the exclusion has been
+    removed."""
     lm = LoadedModel(
         name="x",
         hf_path="y",
@@ -111,14 +114,17 @@ def test_probe_excludes_turboquant_from_checkpoint_path(monkeypatch):
     mgr = ModelManager.__new__(ModelManager)
     mgr._pending_cleanups = {"skip_metal_flush": True}
     asyncio.run(mgr._probe_cache_capabilities(lm))
-    assert lm.uses_checkpoint_persistence is False, (
-        "TurboQuant must be excluded from the checkpoint path"
+    assert lm.uses_checkpoint_persistence is True, (
+        "TurboQuant no longer blocks the checkpoint path"
     )
+    assert lm.supports_cache_persistence is True
 
 
-def test_probe_excludes_spectralquant_from_checkpoint_path(monkeypatch):
-    """Same as TurboQuant — SpectralQuant exposes the same Dtype-bearing
-    state that breaks deepcopy."""
+def test_probe_does_not_exclude_spectralquant_from_checkpoint_path(monkeypatch):
+    """``SpectralQuantKVCache`` deepcopies cleanly via the default walk
+    (no ``mx.Dtype`` attribute, no out-of-``state`` side buffers); it was
+    excluded by analogy with the (unrelated) disk-save block in
+    ``_is_serializable_cache``. That defensive exclusion is gone."""
     lm = LoadedModel(
         name="x",
         hf_path="y",
@@ -134,4 +140,5 @@ def test_probe_excludes_spectralquant_from_checkpoint_path(monkeypatch):
     mgr = ModelManager.__new__(ModelManager)
     mgr._pending_cleanups = {"skip_metal_flush": True}
     asyncio.run(mgr._probe_cache_capabilities(lm))
-    assert lm.uses_checkpoint_persistence is False
+    assert lm.uses_checkpoint_persistence is True
+    assert lm.supports_cache_persistence is True
