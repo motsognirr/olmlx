@@ -62,7 +62,11 @@ class _DummyModel:
         return mx.zeros((1, S, 32))
 
 
-def test_drive_runs_one_model_call_per_uncovered_segment():
+def test_drive_two_segment_cold_start():
+    """Two segments, cold start: one chunk per side of the single interior
+    boundary, one snapshot at that boundary. With only one interior
+    boundary this case is identical under both the per-segment and the
+    deepest-only chunking strategies."""
     model = _DummyModel()
     store = PromptCacheStore(max_slots=8)
     sp = SegmentedPrompt(
@@ -75,12 +79,18 @@ def test_drive_runs_one_model_call_per_uncovered_segment():
     suffix = _drive_segmented_prefill(
         model=model, segmented=sp, cache=cache, store=store
     )
-    assert len(model.calls) == 2, "one call per segment when starting cold"
-    # First call processes the system segment, second processes the user segment.
-    assert model.calls[0] == [1, 2, 3]
-    assert model.calls[1] == [4]  # [4,5] minus the trailing token reserved for decode
-    # Both boundaries should have been snapshotted into the store.
-    assert store.fetch_nearest([1, 2, 3, 4, 5, 99]) is not None
+    # Two chunks split at the single interior boundary (depth 3): the
+    # system tokens, then the user segment minus its reserved trailing
+    # token.
+    assert model.calls == [[1, 2, 3], [4]]
+    # System boundary (depth 3) is snapshotted; the final boundary
+    # (depth 5 = len(flat)) is always skipped — KV depth there is 4
+    # because the trailing token is reserved for stream_generate.
+    assert len(store) == 1
+    hit = store.fetch_nearest([1, 2, 3, 4, 5, 99])
+    assert hit is not None
+    state, _ = hit
+    assert len(state.tokens) == 3
     # The drive returns the suffix to be fed to stream_generate: the last token only.
     assert suffix == [5]
 
@@ -726,3 +736,91 @@ def test_drive_handles_mixed_rotating_arrays_layout():
     assert warm_model.calls == [[5]]
     assert suffix2 == [6]
     assert all(layer.offset == 5 for layer in rotating_layers)
+
+
+def test_drive_uses_two_chunks_and_one_snapshot_for_multi_segment_request():
+    """Regression for chunking-induced GDN drift (issue: Qwen3.6 MoE
+    repetition on 2nd request).
+
+    For a multi-turn prompt the drive must:
+      - feed the uncovered prefix up to the deepest interior message
+        boundary in ONE model call,
+      - take ONE snapshot there,
+      - feed the rest (up to the reserved trailing token) in ONE more
+        model call.
+
+    Per-segment chunking is what was causing the bug: mlx-lm's
+    ``gated_delta_kernel`` is not exactly chunking-invariant, and the
+    error compounded with conversation depth until MoE routing
+    thresholds were crossed.
+    """
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+    # 4 segments — sys (covered by an earlier hit), user1, asst1, user2.
+    sp = SegmentedPrompt(
+        segments=[
+            Segment(tokens=[1, 2, 3], role="system"),
+            Segment(tokens=[4, 5, 6], role="user"),
+            Segment(tokens=[7, 8, 9, 10], role="assistant"),
+            Segment(tokens=[11, 12, 13], role="user"),
+        ]
+    )
+    cache = [KVCache()]
+    cache[0].update_and_fetch(mx.zeros((1, 1, 3, 4)), mx.zeros((1, 1, 3, 4)))
+    suffix = _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=cache,
+        store=store,
+        already_covered_tokens=3,
+    )
+    # Deepest interior boundary > 3 and < 13 is the assistant boundary (10).
+    # Chunk 1: tokens [4..10) = [4,5,6,7,8,9,10].
+    # Chunk 2: tokens [10..12) = [11,12]  (13 reserved for stream_generate).
+    assert model.calls == [[4, 5, 6, 7, 8, 9, 10], [11, 12]], (
+        "drive must chunk the uncovered tail at the deepest interior "
+        "boundary only, not per segment"
+    )
+    assert suffix == [13]
+    # Only ONE snapshot, taken at the assistant boundary (depth 10).
+    assert len(store) == 1, (
+        f"expected exactly one snapshot at the deepest interior boundary, "
+        f"got {len(store)}"
+    )
+    hit = store.fetch_nearest([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 99])
+    assert hit is not None
+    state, _ = hit
+    assert len(state.tokens) == 10, (
+        f"snapshot should be at the assistant boundary (depth 10), "
+        f"got {len(state.tokens)}"
+    )
+    assert state.cache_type == "assistant"
+
+
+def test_drive_no_snapshot_when_only_final_segment_remains():
+    """Warm-start where everything but the final segment is already covered
+    yields a single chunk and zero snapshots — there is no usable interior
+    boundary strictly less than ``len(flat)``."""
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+    sp = SegmentedPrompt(
+        segments=[
+            Segment(tokens=[1, 2, 3], role="system"),
+            Segment(tokens=[4, 5, 6], role="user"),
+            Segment(tokens=[7, 8, 9], role="assistant"),
+            Segment(tokens=[10, 11, 12], role="user"),
+        ]
+    )
+    cache = [KVCache()]
+    cache[0].update_and_fetch(mx.zeros((1, 1, 9, 4)), mx.zeros((1, 1, 9, 4)))
+    suffix = _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=cache,
+        store=store,
+        already_covered_tokens=9,  # end of assistant
+    )
+    # Single chunk = [10, 11] (12 reserved). No snapshot.
+    assert model.calls == [[10, 11]]
+    assert suffix == [12]
+    assert len(store) == 0

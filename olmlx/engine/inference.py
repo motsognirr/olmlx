@@ -2351,19 +2351,50 @@ def _drive_segmented_prefill(
     store: "PromptCacheStore",
     already_covered_tokens: int = 0,
 ) -> list[int]:
-    """Walk the segmented prompt, run prefill per segment, snapshot the
-    cache at each boundary, return the suffix to hand off to stream_generate.
+    """Run prefill in at most two ``model(...)`` calls and snapshot the
+    cache at the deepest interior message boundary; return the suffix to
+    hand off to stream_generate.
 
     ``already_covered_tokens`` is the depth at which ``cache`` is already
     populated (from a checkpoint hit). Segments wholly inside that depth
-    are skipped; a partially covered segment has only its uncovered tail
-    fed to ``model``.
+    are skipped automatically — the first chunk's start is
+    ``already_covered_tokens``.
 
     The returned suffix is ``[full_flat_tokens[-1]]`` — one token —
     because ``mlx_lm.stream_generate`` requires at least one prompt
     token to seed the decode step, and feeding the same token back into
     the prefilled cache is a no-op for the cache but produces the
     correct first-token logits.
+
+    **Why two chunks, not one-per-segment.** mlx-lm's ``gated_delta_kernel``
+    (GatedDeltaNet linear attention in Qwen3.5 / Qwen3-Next text towers)
+    is not exactly chunking-invariant: feeding ``[A, B]`` and then ``[C]``
+    yields a slightly different recurrent state than feeding ``[A, B, C]``
+    in one call.  On dense full-precision targets the drift is invisible,
+    but on MoE-quantized targets (e.g. Qwen3.6-35B-A3B-6bit) it crosses
+    expert-routing thresholds and the model derails into verbatim
+    paragraph repetition by the second turn.  The pre-fix per-segment
+    drive made this scale linearly with conversation depth — every
+    extra turn added another chunk boundary.  This implementation keeps
+    drift bounded by driving the uncovered tail as a single
+    ``[already_covered_tokens .. deepest_interior_boundary]`` chunk
+    (snapshot point for future requests) followed by a single
+    ``[deepest_interior_boundary .. len(flat)-1]`` chunk (the final
+    message minus the reserved trailing token).  If there is no usable
+    interior boundary the whole tail goes in one chunk and no snapshot
+    is taken.  Trade-off: only the deepest interior boundary is
+    snapshotted per request, not every boundary — for the
+    sequentially-extending chat workload this is the only snapshot
+    future requests actually use (earlier ones in the same request
+    would be shadowed by the deeper hit anyway), and earlier requests'
+    boundary snapshots remain in the store and still serve shallower
+    branched lookups.
+
+    The last boundary (``boundary == len(flat)``) is never a snapshot
+    point: the final segment's trailing token is reserved for
+    stream_generate, so KV depth is ``len(flat) - 1`` while the
+    boundary claims ``len(flat)`` — that mismatch would silently
+    misalign every future strict-extension lookup.
     """
     from olmlx.engine.prompt_cache.checkpoint import (
         flatten_cache_state,
@@ -2375,53 +2406,47 @@ def _drive_segmented_prefill(
         return []
     boundaries = segmented.boundary_offsets()
 
-    cursor = already_covered_tokens
+    # Find the deepest interior boundary strictly greater than what's
+    # already covered and strictly less than len(flat).  This is both the
+    # snapshot point and the split between the two prefill chunks.
+    deepest_boundary: int | None = None
+    deepest_role: Any = None
     for boundary, seg in zip(boundaries, segmented.segments, strict=True):
-        if boundary <= cursor:
-            continue
-        # Feed only the uncovered tail of this segment.
-        chunk_start = cursor
-        chunk_end = boundary
-        # Last token is consumed by stream_generate's decode init —
-        # don't include it in the prefill if it's the absolute final token.
-        prefill_end = chunk_end
-        if chunk_end == len(flat):
-            prefill_end = chunk_end - 1  # leave one token for stream_generate
-        if prefill_end > chunk_start:
-            chunk = flat[chunk_start:prefill_end]
-            arr = mx.array(chunk, dtype=mx.int32)[None, :]
-            with mx.stream(mx.default_stream(mx.default_device())):
-                model(arr, cache=cache)
-                mx.eval(flatten_cache_state(cache))
-            cursor = prefill_end
-        else:
-            cursor = chunk_end
-        # Snapshot the cache state at this boundary into the store.
-        # Skip the last boundary: the final segment withholds the trailing
-        # token for stream_generate (prefill_end == chunk_end - 1), so the
-        # KV depth here is len(flat)-1 but boundary == len(flat).  A snapshot
-        # with tokens=flat[:len(flat)] would claim N tokens but have KV state
-        # for only N-1, causing warm-start misalignment on any future request
-        # that is a strict extension of the full token sequence.
-        if boundary < len(flat):
-            # eager_eval=False — by the time we get here the cache state
-            # is already materialised, either by the inner ``mx.eval`` a
-            # few lines above (cold-start segments, just-processed) or by
-            # the warm-start load in ``_setup_via_checkpoint_path`` which
-            # passes eager_eval=True to its own ``snapshot_cache_for_persistence``
-            # call for lazy-state layouts. Either way the snapshot here
-            # only needs to deepcopy; running ``mx.eval`` again would be a
-            # no-op Metal sync per boundary.
-            snap = snapshot_cache_for_persistence(cache, eager_eval=False)
-            store.insert_checkpoint(
-                CachedPromptState(
-                    tokens=flat[:boundary],
-                    cache=snap,
-                    cache_type=seg.role,
-                    is_checkpoint=True,
-                )
+        if already_covered_tokens < boundary < len(flat):
+            deepest_boundary = boundary
+            deepest_role = seg.role
+
+    final_prefill_end = len(flat) - 1  # reserve trailing token for stream_generate
+
+    def _run(start: int, end: int) -> None:
+        if end <= start:
+            return
+        arr = mx.array(flat[start:end], dtype=mx.int32)[None, :]
+        with mx.stream(mx.default_stream(mx.default_device())):
+            model(arr, cache=cache)
+            mx.eval(flatten_cache_state(cache))
+
+    if deepest_boundary is None:
+        # No usable interior boundary — single chunk, no snapshot.
+        _run(already_covered_tokens, final_prefill_end)
+    else:
+        # Chunk 1: uncovered prefix up to the deepest interior boundary.
+        _run(already_covered_tokens, deepest_boundary)
+        # Snapshot at the boundary.  eager_eval=False because ``_run``'s
+        # inner ``mx.eval(flatten_cache_state(cache))`` just materialised
+        # the state on the default stream; deepcopy alone is sufficient.
+        snap = snapshot_cache_for_persistence(cache, eager_eval=False)
+        store.insert_checkpoint(
+            CachedPromptState(
+                tokens=flat[:deepest_boundary],
+                cache=snap,
+                cache_type=deepest_role,
+                is_checkpoint=True,
             )
-    # Return the last token as the suffix.
+        )
+        # Chunk 2: boundary to the reserved trailing token.
+        _run(deepest_boundary, final_prefill_end)
+
     return [flat[-1]]
 
 
@@ -2502,8 +2527,11 @@ async def _setup_via_checkpoint_path(
         )
 
     if hit is None:
-        # Cold start with usable boundaries: build a fresh cache, drive
-        # ALL segments and store checkpoints at each interior boundary.
+        # Cold start with usable boundaries: build a fresh cache.  The
+        # drive will then run at most two ``model(...)`` calls and store
+        # one checkpoint at the deepest interior boundary (see
+        # ``_drive_segmented_prefill``'s docstring for why per-segment
+        # chunking was abandoned).
         cache = _make_prompt_cache_for_lm(lm)
         already_covered = 0
     else:
