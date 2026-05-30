@@ -2527,8 +2527,11 @@ async def _setup_via_checkpoint_path(
         )
 
     if hit is None:
-        # Cold start with usable boundaries: build a fresh cache, drive
-        # ALL segments and store checkpoints at each interior boundary.
+        # Cold start with usable boundaries: build a fresh cache.  The
+        # drive will then run at most two ``model(...)`` calls and store
+        # one checkpoint at the deepest interior boundary (see
+        # ``_drive_segmented_prefill``'s docstring for why per-segment
+        # chunking was abandoned).
         cache = _make_prompt_cache_for_lm(lm)
         already_covered = 0
     else:

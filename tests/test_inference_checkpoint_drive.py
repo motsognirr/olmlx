@@ -62,7 +62,11 @@ class _DummyModel:
         return mx.zeros((1, S, 32))
 
 
-def test_drive_runs_one_model_call_per_uncovered_segment():
+def test_drive_two_segment_cold_start():
+    """Two segments, cold start: one chunk per side of the single interior
+    boundary, one snapshot at that boundary. With only one interior
+    boundary this case is identical under both the per-segment and the
+    deepest-only chunking strategies."""
     model = _DummyModel()
     store = PromptCacheStore(max_slots=8)
     sp = SegmentedPrompt(
@@ -75,12 +79,18 @@ def test_drive_runs_one_model_call_per_uncovered_segment():
     suffix = _drive_segmented_prefill(
         model=model, segmented=sp, cache=cache, store=store
     )
-    assert len(model.calls) == 2, "one call per segment when starting cold"
-    # First call processes the system segment, second processes the user segment.
-    assert model.calls[0] == [1, 2, 3]
-    assert model.calls[1] == [4]  # [4,5] minus the trailing token reserved for decode
-    # Both boundaries should have been snapshotted into the store.
-    assert store.fetch_nearest([1, 2, 3, 4, 5, 99]) is not None
+    # Two chunks split at the single interior boundary (depth 3): the
+    # system tokens, then the user segment minus its reserved trailing
+    # token.
+    assert model.calls == [[1, 2, 3], [4]]
+    # System boundary (depth 3) is snapshotted; the final boundary
+    # (depth 5 = len(flat)) is always skipped — KV depth there is 4
+    # because the trailing token is reserved for stream_generate.
+    assert len(store) == 1
+    hit = store.fetch_nearest([1, 2, 3, 4, 5, 99])
+    assert hit is not None
+    state, _ = hit
+    assert len(state.tokens) == 3
     # The drive returns the suffix to be fed to stream_generate: the last token only.
     assert suffix == [5]
 
