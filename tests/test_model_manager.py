@@ -1190,6 +1190,68 @@ class TestProbeCacheCapabilities:
         mock_flush.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_turboquant_kv_quant_does_not_block_checkpoint_persistence(
+        self, registry, mock_store
+    ):
+        """With ``TurboQuantKVCache.__deepcopy__`` overriding the
+        ``mx.Dtype`` pickle hazard, ``turboquant:4`` no longer blocks the
+        checkpoint path. Verifies the gate at ``_probe_cache_capabilities``
+        wires through ``lm.kv_cache_quant`` correctly: an ArraysCache
+        layout with TurboQuant configured must still set
+        ``uses_checkpoint_persistence=True`` (otherwise hybrid SSM models
+        on TurboQuant get zero cross-request reuse — the bug this PR
+        targets)."""
+
+        class _FakeArrays:
+            pass
+
+        _FakeArrays.__name__ = "ArraysCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+        lm.kv_cache_quant = "turboquant:4"
+
+        with (
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[_FakeArrays(), _FakeArrays()],
+            ),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock),
+        ):
+            await manager._probe_cache_capabilities(lm)
+
+        assert lm.uses_checkpoint_persistence is True
+        assert lm.supports_cache_persistence is True
+
+    @pytest.mark.asyncio
+    async def test_spectralquant_kv_quant_does_not_block_checkpoint_persistence(
+        self, registry, mock_store
+    ):
+        """``SpectralQuantKVCache`` deepcopies cleanly already; the
+        defensive block by analogy with the disk-save path is dropped."""
+
+        class _FakeArrays:
+            pass
+
+        _FakeArrays.__name__ = "ArraysCache"
+
+        manager = ModelManager(registry, mock_store)
+        lm = self._make_lm()
+        lm.kv_cache_quant = "spectral:4"
+
+        with (
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[_FakeArrays(), _FakeArrays()],
+            ),
+            patch.object(manager, "_flush_metal", new_callable=AsyncMock),
+        ):
+            await manager._probe_cache_capabilities(lm)
+
+        assert lm.uses_checkpoint_persistence is True
+        assert lm.supports_cache_persistence is True
+
+    @pytest.mark.asyncio
     async def test_probe_failure_warns_and_disables_persistence(
         self, registry, mock_store, caplog
     ):

@@ -234,16 +234,19 @@ def _is_serializable_cache(cache: list) -> bool:
     )
 
 
-# KV-quant config string prefixes whose backing cache class stores an
-# ``mx.Dtype`` reference that ``copy.deepcopy`` (used by
-# ``snapshot_cache_for_persistence``) can't pickle.  See
-# ``_is_serializable_cache`` for the parallel class-level allowlist used
-# at the disk-save layer.  Centralised so a rename of either prefix is a
-# one-line update.
-_KV_QUANT_PREFIXES_BLOCKING_SNAPSHOT: tuple[str, ...] = (
-    "turboquant:",
-    "spectral:",
-)
+# KV-quant config string prefixes whose backing cache class cannot be
+# deep-copied by ``snapshot_cache_for_persistence``.  Currently empty:
+# - ``turboquant:`` is handled by ``TurboQuantKVCache.__deepcopy__`` which
+#   shares the ``mx.Dtype`` singleton by reference and eager-evals the
+#   private dequant side buffers that ``flatten_cache_state`` doesn't see.
+# - ``spectral:`` deepcopies cleanly via the default walk (no ``mx.Dtype``
+#   attribute, no out-of-state side buffers).
+# Kept as the registration point for any future kv-quant cache class
+# that proves unsafe — mirrors ``_EXCLUDED_MIXED_LAYER_PAIRS``.  Disk-save
+# remains gated separately by ``_is_serializable_cache`` because that path
+# uses safetensors and the packed indices/codebook layout has no
+# upstream-compatible serialisation.
+_KV_QUANT_PREFIXES_BLOCKING_SNAPSHOT: tuple[str, ...] = ()
 
 
 def _kv_quant_blocks_snapshot(kv_cache_quant: str | None) -> bool:
@@ -2127,12 +2130,14 @@ class ModelManager:
             # path's _drive_segmented_prefill calls ``model(arr, cache=cache)``
             # text-only, which crashes (mlx-vlm models require image inputs)
             # or silently produces wrong cache state.  mlx-vlm also doesn't
-            # forward ``prompt_cache`` from gen_kwargs.  TurboQuant /
-            # SpectralQuant caches are excluded because their layer state
-            # holds an ``mx.Dtype`` reference that ``copy.deepcopy`` (used
-            # by ``snapshot_cache_for_persistence``) can't pickle —
-            # mirrors the existing disk-save exclusion in
-            # ``_is_serializable_cache``.
+            # forward ``prompt_cache`` from gen_kwargs.  KV-quant wrappers
+            # (TurboQuant / SpectralQuant) are no longer excluded:
+            # ``TurboQuantKVCache.__deepcopy__`` handles the ``mx.Dtype``
+            # pickle hazard and eager-evals the private dequant side buffers
+            # that ``flatten_cache_state`` doesn't see; ``SpectralQuantKVCache``
+            # deepcopies cleanly via the default walk.  The
+            # ``_kv_quant_blocks_snapshot`` hook is retained as a registration
+            # point for any future kv-quant cache class that proves unsafe.
             lm.uses_checkpoint_persistence = (
                 ckpt_ok
                 and not trim_ok
