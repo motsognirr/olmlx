@@ -185,6 +185,31 @@ def test_snapshot_turboquant_cache_preserves_state_independently():
     )
 
 
+def test_turboquant_deepcopy_walks_dict_for_array_attributes():
+    """``__deepcopy__`` walks ``self.__dict__`` for ``mx.array`` attributes
+    rather than hard-coding the buffer names, so a hypothetical future
+    array attribute on the cache is covered by the eager-eval pass
+    automatically. Regression guard against re-introducing a hard-coded
+    list that silently misses new attributes — the #284 hazard would
+    return for any buffer the list forgot."""
+    import copy
+
+    cache = _make_turboquant_cache()
+    _drive_turboquant_update(cache)
+    # Simulate a future buffer added by a refactor.  Use a real mx.array
+    # so the dynamic ``isinstance`` filter must pick it up.
+    extra = mx.zeros((4, 8), dtype=mx.float16)
+    cache._future_extra_buffer = extra  # type: ignore[attr-defined]
+    snap = copy.deepcopy(cache)
+    assert hasattr(snap, "_future_extra_buffer")
+    assert isinstance(snap._future_extra_buffer, mx.array)
+    assert snap._future_extra_buffer is not extra, (
+        "the dynamic walk must produce an independent copy of the new "
+        "attribute, not share the reference"
+    )
+    assert snap._future_extra_buffer.shape == extra.shape
+
+
 def test_snapshot_turboquant_cache_safe_in_other_thread():
     """A snapshot taken on this thread must be readable from a worker
     thread without re-evaluating any lazy graph bound to the originating
