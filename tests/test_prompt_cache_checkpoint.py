@@ -118,3 +118,125 @@ def test_cached_prompt_state_can_be_marked_as_checkpoint():
     )
     assert state.cache_type == "system"
     assert state.is_checkpoint is True
+
+
+# ---------------------------------------------------------------------------
+# TurboQuant / SpectralQuant snapshot path (gh #284/#343 + KV-quant unblock)
+# ---------------------------------------------------------------------------
+
+
+def _make_turboquant_cache(head_dim: int = 128, bits: int = 4):
+    from olmlx.engine.turboquant import TurboQuantRotation
+    from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+    rot_k = TurboQuantRotation(head_dim=head_dim, seed=0)
+    rot_v = TurboQuantRotation(head_dim=head_dim, seed=1)
+    return TurboQuantKVCache(bits=bits, rotation_key=rot_k, rotation_value=rot_v)
+
+
+def _drive_turboquant_update(cache, *, B=1, H=2, T=8, head_dim=128, dtype=mx.float16):
+    keys = mx.random.normal((B, H, T, head_dim)).astype(dtype)
+    values = mx.random.normal((B, H, T, head_dim)).astype(dtype)
+    mx.eval(keys, values)
+    return cache.update_and_fetch(keys, values)
+
+
+def test_turboquant_cache_deepcopies_after_first_update():
+    """After ``update_and_fetch`` locks ``_dequant_dtype`` to an ``mx.Dtype``,
+    ``copy.deepcopy`` must still succeed. Pre-fix this raises
+    ``TypeError: cannot pickle 'Dtype' object`` because the default deepcopy
+    walks ``__dict__`` and ``mx.Dtype`` has no ``__reduce__``."""
+    import copy
+
+    cache = _make_turboquant_cache()
+    _drive_turboquant_update(cache)
+    snap = copy.deepcopy(cache)
+    assert snap is not cache
+    assert snap._dequant_dtype is cache._dequant_dtype, (
+        "mx.Dtype is an immutable singleton; the copy should share the "
+        "reference rather than attempt to deep-copy (which fails)."
+    )
+    assert snap.offset == cache.offset
+
+
+def test_snapshot_turboquant_cache_preserves_state_independently():
+    """``snapshot_cache_for_persistence`` on a TurboQuant-only cache list
+    must produce a deepcopy whose subsequent updates do not bleed into the
+    original. Covers the typical mixed Rotating+TQ layout's TQ layers."""
+    cache = [_make_turboquant_cache()]
+    _drive_turboquant_update(cache[0])
+    pre_keys, pre_values = cache[0].update_and_fetch(
+        mx.zeros((1, 2, 1, 128), dtype=mx.float16),
+        mx.zeros((1, 2, 1, 128), dtype=mx.float16),
+    )
+    mx.eval(pre_keys, pre_values)
+    pre_offset = cache[0].offset
+
+    snap = snapshot_cache_for_persistence(cache, eager_eval=False)
+    assert snap is not cache
+    assert snap[0] is not cache[0]
+    assert snap[0].offset == pre_offset
+
+    # Mutate the original; snapshot must not see it.
+    _drive_turboquant_update(cache[0], T=4)
+    assert cache[0].offset == pre_offset + 4
+    assert snap[0].offset == pre_offset, (
+        "snapshot must not see post-snapshot updates on the original"
+    )
+
+
+def test_snapshot_turboquant_cache_safe_in_other_thread():
+    """A snapshot taken on this thread must be readable from a worker
+    thread without re-evaluating any lazy graph bound to the originating
+    Metal stream — the #284 hazard generalised to TQ's side buffers."""
+    cache = [_make_turboquant_cache()]
+    keys_out, values_out = _drive_turboquant_update(cache[0])
+    mx.eval(keys_out, values_out)
+
+    snap = snapshot_cache_for_persistence(cache, eager_eval=True)
+    state = snap[0].state
+    err: list[Exception] = []
+
+    def _read() -> None:
+        try:
+            for arr in state:
+                mx.eval(arr)
+        except Exception as e:  # pragma: no cover
+            err.append(e)
+
+    t = threading.Thread(target=_read)
+    t.start()
+    t.join()
+    assert not err, f"cross-thread eval failed: {err}"
+
+
+def test_snapshot_spectralquant_cache_deepcopies():
+    """Regression guard: ``SpectralQuantKVCache`` has no ``mx.Dtype`` attr
+    and already deepcopies cleanly. It was excluded from the checkpoint
+    path defensively by analogy with the (unrelated) disk-save block."""
+    import copy
+
+    from olmlx.engine.spectralquant import SpectralRotation
+    from olmlx.engine.spectralquant_cache import SpectralQuantKVCache
+
+    head_dim = 64
+    V = mx.eye(head_dim)
+    sem = mx.zeros((16,), dtype=mx.float32)
+    tail = mx.zeros((4,), dtype=mx.float32)
+    mx.eval(V, sem, tail)
+
+    sq = SpectralQuantKVCache(
+        rotation_key=SpectralRotation(V),
+        rotation_value=SpectralRotation(V),
+        codebook_sem_key=sem,
+        codebook_tail_key=tail,
+        codebook_sem_value=sem,
+        codebook_tail_value=tail,
+        d_eff=head_dim // 2,
+        bits_high=8,
+        bits_low=2,
+    )
+    snap = copy.deepcopy(sq)
+    assert snap is not sq
+    snap_via_path = snapshot_cache_for_persistence([sq], eager_eval=False)
+    assert snap_via_path[0] is not sq

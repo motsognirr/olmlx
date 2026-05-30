@@ -6,6 +6,7 @@ dequantizes on fetch, providing transparent memory compression.
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 
@@ -252,6 +253,60 @@ class TurboQuantKVCache(_BaseCache):
 
     def empty(self):
         return self._key_indices is None or self.offset == 0
+
+    def __deepcopy__(self, memo):
+        """Deep-copy hook for the checkpoint snapshot path.
+
+        Two reasons the default ``copy.deepcopy`` walk fails or under-evaluates
+        this cache:
+
+        1. ``_dequant_dtype`` holds an ``mx.Dtype`` once the side buffer is
+           locked. ``mx.Dtype`` is an immutable singleton (e.g.
+           ``mx.float16 is mx.float16``) with no ``__reduce__`` /
+           ``__deepcopy__``, so the default reductor falls back to pickle
+           and raises ``TypeError: cannot pickle 'Dtype' object``. Re-using
+           the singleton reference is semantically identical and safe.
+
+        2. ``_key_dequant`` / ``_value_dequant`` are not exposed via
+           ``state`` (they are recoverable from indices + norms), so the
+           ``flatten_cache_state`` + ``mx.eval`` pass that
+           ``snapshot_cache_for_persistence`` runs before deepcopy does not
+           touch them. The side buffer is written in place via
+           ``_key_dequant[..., prev:offset, :] = k_new``; that graph is
+           bound to the worker thread's Metal stream at write time, so
+           re-evaluating it from a different thread later is the #284
+           hazard. Eager-eval the side buffer here so the snapshot is
+           thread-safe regardless of where it is later consumed.
+
+        Mirrors the rationale documented at the ``uses_checkpoint_persistence``
+        gate in ``model_manager.py``.
+        """
+        owned = [
+            arr
+            for arr in (
+                self._key_indices,
+                self._key_norms,
+                self._value_indices,
+                self._value_norms,
+                self._key_dequant,
+                self._value_dequant,
+            )
+            if arr is not None
+        ]
+        if owned:
+            mx.eval(owned)
+
+        cls = type(self)
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+        for k, v in self.__dict__.items():
+            if k == "_dequant_dtype":
+                # mx.Dtype is an immutable singleton; share by reference
+                # because the default pickle-based deepcopy would fail.
+                new.__dict__[k] = v
+            else:
+                new.__dict__[k] = copy.deepcopy(v, memo)
+        return new
 
 
 def _detect_head_dim(model: Any, layers_hint: Any = None) -> int:
