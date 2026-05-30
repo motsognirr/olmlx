@@ -54,6 +54,15 @@ class TurboQuantKVCache(_BaseCache):
         rotation_key: TurboQuantRotation,
         rotation_value: TurboQuantRotation,
     ):
+        # Invariant for ``__deepcopy__``: this constructor must stay
+        # side-effect-free (only attribute assignment — no validation that
+        # mutates external state, no file handles, no Metal allocations).
+        # ``__deepcopy__`` builds the copy via ``cls.__new__(cls)`` and
+        # populates ``__dict__`` directly, deliberately bypassing
+        # ``__init__``.  If you add validation or resource acquisition here,
+        # update ``__deepcopy__`` so snapshots stay correct (either teach it
+        # to invoke the new logic with reconstructed args, or move the side
+        # effect to a separate factory).
         self._bits = bits
         self.rotation_key = rotation_key
         self.rotation_value = rotation_value
@@ -278,21 +287,21 @@ class TurboQuantKVCache(_BaseCache):
            hazard. Eager-eval the side buffer here so the snapshot is
            thread-safe regardless of where it is later consumed.
 
+        The eager-eval pass walks ``self.__dict__`` for any ``mx.array``
+        attribute rather than hard-coding the list, so a future addition
+        (e.g. a different dequantisation strategy that introduces a new
+        buffer) is covered automatically — keeping the only line that
+        would otherwise need updating in lockstep with ``__init__`` out
+        of the way of the next refactor.
+
+        ``__init__`` is bypassed via ``cls.__new__(cls)`` — see the
+        invariant note at the top of ``__init__`` before adding validation
+        or resource acquisition there.
+
         Mirrors the rationale documented at the ``uses_checkpoint_persistence``
         gate in ``model_manager.py``.
         """
-        owned = [
-            arr
-            for arr in (
-                self._key_indices,
-                self._key_norms,
-                self._value_indices,
-                self._value_norms,
-                self._key_dequant,
-                self._value_dequant,
-            )
-            if arr is not None
-        ]
+        owned = [v for v in self.__dict__.values() if isinstance(v, mx.array)]
         if owned:
             mx.eval(owned)
 
