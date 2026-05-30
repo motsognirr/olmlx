@@ -26,7 +26,7 @@ def _fake_cache_with(*layer_types) -> list:
         ([ArraysCache], True, True),  # SSM: ckpt
         ([KVCache, ArraysCache], True, True),  # Qwen3.5 mix: ckpt
         ([KVCache, RotatingKVCache], True, True),  # Gemma 3 mix: ckpt
-        ([RotatingKVCache, ArraysCache], False, False),  # Qwen3-Next: excluded
+        ([RotatingKVCache, ArraysCache], True, True),  # Qwen3-Next mix: ckpt (#396)
     ],
 )
 def test_probe_sets_uses_checkpoint_for_non_trimmable_only(
