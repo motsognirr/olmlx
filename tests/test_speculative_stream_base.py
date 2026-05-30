@@ -67,3 +67,115 @@ class TestSpeculativeStreamBase:
         )
 
         assert base is flash
+
+
+class TestSpecialTokenTextStripping:
+    """Stop tokens (e.g. Qwen ``<|im_end|>``) must not leak into streamed text.
+
+    Pre-fix, ``tokenizer.decode(generated)`` was called without
+    ``skip_special_tokens=True``, so the chunk that carried the EOS token also
+    carried its literal string form. Clients (opencode, anthropic SDK, raw
+    SSE consumers) then rendered ``<|im_end|>`` as plain text right before the
+    ``finish_reason=stop`` signal.
+
+    The non-speculative path used by every other model went through mlx-lm's
+    ``stream_generate`` which sets ``skip_special_tokens=True`` by default,
+    hiding the bug to non-speculative configurations.
+    """
+
+    class _StubDecoder:
+        """Emits a fixed token sequence including a final EOS-special token."""
+
+        def __init__(self, tokens: list[int]) -> None:
+            self._tokens = tokens
+            self._idx = 0
+
+        def prefill(self, prompt):  # noqa: ARG002 - protocol compliance
+            self._idx = 1
+            return self._tokens[0]
+
+        def step(self) -> tuple[list[int], int]:
+            if self._idx >= len(self._tokens):
+                # Decoder exhausted — caller should have stopped on EOS earlier.
+                return ([], 0)
+            tok = self._tokens[self._idx]
+            self._idx += 1
+            return ([tok], 1)
+
+        def reset(self) -> None:
+            self._idx = 0
+
+    class _MockTokenizer:
+        """Models a Qwen-style tokenizer where token 99 is a special EOS marker.
+
+        Honours ``skip_special_tokens`` like real HuggingFace tokenizers do —
+        without it, token 99 renders as the literal string ``<|im_end|>``.
+        """
+
+        eos_token_id = 99
+
+        def decode(self, tokens: list[int], skip_special_tokens: bool = False) -> str:
+            parts: list[str] = []
+            for t in tokens:
+                if t == 99:
+                    if not skip_special_tokens:
+                        parts.append("<|im_end|>")
+                else:
+                    parts.append(f"w{t}")
+            return "".join(parts)
+
+    def test_streamed_text_omits_eos_special_token(self):
+        from olmlx.engine.speculative_stream import speculative_stream_generate
+
+        decoder = self._StubDecoder([1, 2, 3, 99])
+        tok = self._MockTokenizer()
+        cancel = threading.Event()
+
+        responses = list(
+            speculative_stream_generate(
+                decoder,
+                [10, 11],
+                max_tokens=8,
+                cancel_event=cancel,
+                eos_token_id=tok.eos_token_id,
+                tokenizer=tok,
+            )
+        )
+
+        full_streamed = "".join(r.text for r in responses)
+        assert "<|im_end|>" not in full_streamed, (
+            f"special token leaked into streamed text: {full_streamed!r}"
+        )
+        # And the substantive content tokens did make it through.
+        for marker in ("w1", "w2", "w3"):
+            assert marker in full_streamed, (
+                f"expected content token {marker!r} missing from {full_streamed!r}"
+            )
+        # The final chunk should carry finish_reason=stop on the EOS token.
+        assert responses[-1].token == 99
+        assert responses[-1].finish_reason == "stop"
+
+    def test_streamed_text_omits_eos_when_first_token_is_eos(self):
+        """Edge case: prefill returns EOS as the very first token."""
+        from olmlx.engine.speculative_stream import speculative_stream_generate
+
+        decoder = self._StubDecoder([99])
+        tok = self._MockTokenizer()
+        cancel = threading.Event()
+
+        responses = list(
+            speculative_stream_generate(
+                decoder,
+                [10, 11],
+                max_tokens=8,
+                cancel_event=cancel,
+                eos_token_id=tok.eos_token_id,
+                tokenizer=tok,
+            )
+        )
+
+        assert len(responses) == 1
+        assert responses[0].token == 99
+        assert "<|im_end|>" not in responses[0].text, (
+            f"prefill EOS leaked: {responses[0].text!r}"
+        )

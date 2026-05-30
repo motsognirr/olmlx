@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class TokenizerProtocol(Protocol):
     """Protocol for tokenizer with decode method."""
 
-    def decode(self, token_ids: list[int]) -> str: ...
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = ...) -> str: ...
 
 
 class SpeculativeDecoderProtocol(Protocol):
@@ -63,9 +63,14 @@ def speculative_stream_generate(
     gen_count = 1
 
     # Incremental text decoding: decode full sequence and diff against previous length.
+    # ``skip_special_tokens=True`` matches mlx-lm's ``stream_generate`` default and
+    # prevents EOS / chat-template markers (e.g. Qwen ``<|im_end|>``) from leaking
+    # into the streamed text — without it the final chunk that carries the EOS
+    # token contains the literal string for that token, which clients render as
+    # plain text (issue surfaced via opencode + speculative-enabled Qwen3.5-27B).
     prev_text_len = 0
     if tokenizer is not None:
-        full_text = tokenizer.decode(generated)
+        full_text = tokenizer.decode(generated, skip_special_tokens=True)
         new_text = full_text
         prev_text_len = len(full_text)
     else:
@@ -117,7 +122,7 @@ def speculative_stream_generate(
             gen_elapsed = time.perf_counter() - t0
 
             if tokenizer is not None:
-                full_text = tokenizer.decode(generated)
+                full_text = tokenizer.decode(generated, skip_special_tokens=True)
                 new_text = full_text[prev_text_len:]
                 prev_text_len = len(full_text)
             else:
