@@ -328,16 +328,53 @@ class TestTurboQuantKVCache:
         assert v_out.shape == (1, 4, 17, 64)
         assert cache.offset == 17
 
-    def test_trim(self):
-        """Trim should reduce offset."""
+    def test_trim_capacity_cap(self):
+        """Trim should shrink buffers when offset drops below 50% of capacity."""
         cache = self._make_cache(bits=4, head_dim=64)
-        keys = mx.random.normal((1, 4, 32, 64))
-        values = mx.random.normal((1, 4, 32, 64))
+        # 1. Fill cache: 1 token * 256 step = 256 capacity
+        keys = mx.random.normal((1, 4, 1, 64))
+        values = mx.random.normal((1, 4, 1, 64))
         cache.update_and_fetch(keys, values)
+        initial_capacity = cache._key_indices.shape[2]
+        assert initial_capacity == 256
 
-        trimmed = cache.trim(10)
-        assert trimmed == 10
-        assert cache.offset == 22
+        # 2. Trim to 100 tokens: 100 < 256 // 2 is True
+        cache.trim(156) # offset = 1 - 156 = -155 -> clamped to 0
+        # Full trim resets to None
+        assert cache._key_indices is None
+
+        # 3. Refill to 300 tokens
+        keys = mx.random.normal((1, 4, 300, 64))
+        values = mx.random.normal((1, 4, 300, 64))
+        cache.update_and_fetch(keys, values)
+        # Capacity should be 512 (300 rounded up to 256 step)
+        current_capacity = cache._key_indices.shape[2]
+        assert current_capacity == 512
+
+        # 4. Trim to 100 tokens: 100 < 512 // 2 is True
+        # Offset is currently 300, trim 200 -> offset = 100
+        cache.trim(200)
+        assert cache.offset == 100
+        # Should shrink to new_capacity = (100 + 256 - 1) // 256 * 256 = 256
+        shrunk_capacity = cache._key_indices.shape[2]
+        assert shrunk_capacity == 256
+        assert shrunk_capacity < current_capacity
+
+    def test_trim_no_capacity_cap_above_threshold(self):
+        """Buffers should not shrink if offset is above 50% of capacity."""
+        cache = self._make_cache(bits=4, head_dim=64)
+        keys = mx.random.normal((1, 4, 300, 64))
+        values = mx.random.normal((1, 4, 300, 64))
+        cache.update_and_fetch(keys, values)
+        # Capacity is 512
+        capacity = cache._key_indices.shape[2]
+        assert capacity == 512
+
+        # Trim to 300: 300 < 512 // 2 is False
+        cache.trim(10) # offset = 290
+        assert cache.offset == 290
+        # Capacity should remain 512
+        assert cache._key_indices.shape[2] == 512
 
     def test_trim_clamps_to_offset(self):
         """Trim more than offset should clamp."""
