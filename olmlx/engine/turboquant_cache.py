@@ -245,15 +245,18 @@ class TurboQuantKVCache(_BaseCache):
             self._key_dequant = None
             self._value_dequant = None
             self._dequant_dtype = None
-        # For partial trims (offset > 0) the side buffer retains stale dequant
-        # values at ``[..., self.offset:, :]``.  That's safe: ``update_and_fetch``
-        # always overwrites ``[prev:new_offset]`` before returning
-        # ``[..., :new_offset, :]``, so no stale position is ever exposed.
-        # TODO(perf/capacity-cap): after a large partial trim the side buffer
-        # stays at peak capacity for the session (~input_dtype bytes per token
-        # per layer). A capacity cap that shrinks the buffer when offset drops
-        # well below capacity would bound memory for long sessions with heavy
-        # trimming (tool-call reshape, speculative rejection).
+        elif self._key_indices is not None:
+            # Shrink buffers if offset drops below 50% of current capacity
+            # to bound memory for long sessions with heavy trimming.
+            capacity = self._key_indices.shape[2]
+            if self.offset < capacity // 2:
+                new_capacity = (self.offset + self.step - 1) // self.step * self.step
+                self._key_indices = self._key_indices[..., :new_capacity, :]
+                self._key_norms = self._key_norms[..., :new_capacity, :]
+                self._value_indices = self._value_indices[..., :new_capacity, :]
+                self._value_norms = self._value_norms[..., :new_capacity, :]
+                self._key_dequant = self._key_dequant[..., :new_capacity, :]
+                self._value_dequant = self._value_dequant[..., :new_capacity, :]
         return n
 
     def make_mask(self, *args, **kwargs):
