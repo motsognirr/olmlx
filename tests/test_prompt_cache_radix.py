@@ -435,3 +435,24 @@ class TestStrictPrefix:
         idx.insert([1], "tiny")
         assert idx.find_strict_prefix([1, 2, 3], min_depth=2) == (None, 0)
         assert idx.find_strict_prefix([1, 2, 3], min_depth=1) == ("tiny", 1)
+
+    def test_find_strict_prefix_excludes_exact_length_match(self):
+        """A stored entry whose tokens equal the query is NOT a proper
+        prefix. Returning it would cause the checkpoint-path driver to
+        no-op while still seeding stream_generate with the prompt's last
+        token — re-feeding that token at an extra position past the cache
+        depth produces wrong output (the model sees the last token twice).
+        """
+        idx = PrefixCacheIndex()
+        idx.insert([1, 2, 3], "exact")
+        assert idx.find_strict_prefix([1, 2, 3], min_depth=1) == (None, 0)
+
+    def test_find_strict_prefix_falls_back_to_proper_prefix_when_exact_excluded(
+        self,
+    ):
+        """When a stored entry exactly matches the query, the lookup
+        must fall back to a strictly-shorter terminal."""
+        idx = PrefixCacheIndex()
+        idx.insert([1, 2], "shorter")
+        idx.insert([1, 2, 3], "exact-match")
+        assert idx.find_strict_prefix([1, 2, 3], min_depth=1) == ("shorter", 2)

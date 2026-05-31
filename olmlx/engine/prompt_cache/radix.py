@@ -96,15 +96,21 @@ class PrefixCacheIndex:
     def find_strict_prefix(
         self, tokens: list[int], min_depth: int = 0
     ) -> tuple[str | None, int]:
-        """Return the deepest terminal whose stored token sequence is a strict
-        prefix of ``tokens`` (terminal depth <= len(tokens) and every token
-        along the path matches).
+        """Return the deepest terminal whose stored token sequence is a
+        *proper* prefix of ``tokens`` (terminal depth < len(tokens) and
+        every token along the path matches).
 
         Distinct from ``find_longest_prefix`` which also surfaces siblings
         that diverge past the shared prefix. Strict-prefix is the lookup
         the non-trimmable checkpoint path needs: only safe to reuse a stored
-        cache when its tokens fully match a prefix of the new request — no
-        trim required, no divergence to discard.
+        cache when its tokens are a proper prefix of the new request — no
+        trim required, no divergence to discard, and *no exact-length
+        match* either. An exact-length match would leave the checkpoint
+        driver with no prefill work to do (``already_covered == len(flat)``)
+        while still handing the last prompt token back to stream_generate as
+        the decode seed — re-feeding that token at an extra position
+        relative to the cache yields wrong output (the model sees the
+        prompt's last token twice).
 
         ``min_depth`` short-circuits below-threshold matches with
         ``(None, 0)`` (consistent with ``find_longest_prefix``).
@@ -112,7 +118,12 @@ class PrefixCacheIndex:
         node = self._root
         best_cid: str | None = None
         best_depth = 0
+        # Walk at most len(tokens) - 1 tokens: a proper prefix of ``tokens``
+        # has length strictly less than len(tokens).
+        max_depth = len(tokens) - 1
         for depth, tok in enumerate(tokens, start=1):
+            if depth > max_depth:
+                break
             child = node.children.get(tok)
             if child is None:
                 break
