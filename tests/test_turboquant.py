@@ -339,7 +339,7 @@ class TestTurboQuantKVCache:
         assert initial_capacity == 256
 
         # 2. Trim to 100 tokens: 100 < 256 // 2 is True
-        cache.trim(156) # offset = 1 - 156 = -155 -> clamped to 0
+        cache.trim(156)  # offset = 1 - 156 = -155 -> clamped to 0
         # Full trim resets to None
         assert cache._key_indices is None
 
@@ -371,7 +371,7 @@ class TestTurboQuantKVCache:
         assert capacity == 512
 
         # Trim to 300: 300 < 512 // 2 is False
-        cache.trim(10) # offset = 290
+        cache.trim(10)  # offset = 290
         assert cache.offset == 290
         # Capacity should remain 512
         assert cache._key_indices.shape[2] == 512
