@@ -35,12 +35,19 @@ def _estimate_state_bytes(state: CachedPromptState) -> int:
     """Best-effort byte estimate of a cached state.
 
     Walks the per-layer cache list and sums ``nbytes`` of any mlx array
-    encountered. Falls back to ``layer.state`` for layer types that don't
-    expose ``.keys`` / ``.values`` directly — most importantly
-    ``ArraysCache`` (used by Qwen3.5 / Nemotron-H / Jamba hybrid layers),
-    which would otherwise report 0 bytes and let the RAM budget overrun
-    silently for the model families the checkpoint path primarily targets.
-    Unknown layer types still contribute 0.
+    encountered. Falls back to ``layer.__dict__`` plus ``layer.state`` for
+    layer types that don't expose ``.keys`` / ``.values`` directly — most
+    importantly ``ArraysCache`` (used by Qwen3.5 / Nemotron-H / Jamba
+    hybrid layers), which would otherwise report 0 bytes and let the RAM
+    budget overrun silently for the model families the checkpoint path
+    primarily targets, and ``TurboQuantKVCache`` / ``SpectralQuantKVCache``,
+    which hold full-precision dequantisation side buffers
+    (``_key_dequant`` / ``_value_dequant``) that ``.state`` deliberately
+    excludes (they are recoverable from the packed indices + norms) — a
+    state-only walk would undercount their snapshot RAM by ~8x at 4-bit
+    and ~16x at 2-bit, defeating the ``ram_budget_bytes`` soft-eviction
+    guard. Walking ``__dict__`` plus the ``.state`` view (deduped by
+    ``id``) covers both surfaces. Unknown layer types still contribute 0.
     """
     total = 0
     for layer in state.cache or ():
@@ -54,11 +61,19 @@ def _estimate_state_bytes(state: CachedPromptState) -> int:
                 seen_attr = True
         if seen_attr:
             continue
-        # Fallback path: layers (e.g. ArraysCache) that expose state via
-        # ``.state``, a tuple or list of arrays. Walk arbitrarily nested
-        # tuples/lists so future cache layouts that group arrays in
-        # sub-containers still get counted.
-        stack: list[Any] = [getattr(layer, "state", None)]
+        # Fallback path: walk every mlx array owned by the layer. Walking
+        # ``__dict__`` catches side buffers (e.g. TurboQuant's
+        # ``_key_dequant``) that aren't surfaced through ``.state``;
+        # walking ``.state`` covers layer types whose backing storage
+        # lives in a sub-container exposed only via the property
+        # (``ArraysCache``). Container types (tuple / list / dict) are
+        # traversed; ``id()`` dedup prevents double-counting the same
+        # underlying array when it appears in both views.
+        seen_ids: set[int] = set()
+        stack: list[Any] = []
+        if hasattr(layer, "__dict__"):
+            stack.extend(vars(layer).values())
+        stack.append(getattr(layer, "state", None))
         while stack:
             item = stack.pop()
             if item is None:
@@ -66,8 +81,20 @@ def _estimate_state_bytes(state: CachedPromptState) -> int:
             if isinstance(item, (tuple, list)):
                 stack.extend(item)
                 continue
+            if isinstance(item, dict):
+                stack.extend(item.values())
+                continue
             nbytes = getattr(item, "nbytes", None)
-            if isinstance(nbytes, int):
+            # Guard against non-array objects that happen to have an
+            # ``nbytes`` attribute by additionally requiring ``ndim``
+            # (which mx.array has, but ints / Dtype singletons / etc. do
+            # not).
+            ndim = getattr(item, "ndim", None)
+            if isinstance(nbytes, int) and ndim is not None:
+                key = id(item)
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
                 total += nbytes
     return total
 
@@ -628,10 +655,14 @@ class PromptCacheStore:
             return None
         state = self._entries.get(cid)
         if state is None:
-            # Trie out of sync — defensive (matches find_by_prefix).
-            # The stale terminal stays in the trie because we don't carry
-            # the token path; a full re-build on the next
-            # ``async_evict_all_to_disk`` clears it.
+            # Trie out of sync — defensive. Strict-prefix's descent path
+            # is exactly ``tokens[:depth]`` (the stored entry's tokens are
+            # a proper prefix of the query), so we can drop the stale
+            # terminal here. Otherwise every future query that hits the
+            # same subtree would short-circuit on the same stale cid and
+            # produce indefinite radix misses for an otherwise-recoverable
+            # prefix.
+            self._radix.remove(tokens[:depth], cid)
             self.metrics.radix_misses += 1
             return None
         self._entries.move_to_end(cid)
