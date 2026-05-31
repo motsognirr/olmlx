@@ -349,6 +349,12 @@ class ModelConfig:
     #: Applied by ``generate_chat`` when the request didn't set the flag.
     #: ``None`` means fall back to the engine default (think unless tools).
     enable_thinking: bool | None = None
+    #: Per-model override for the cross-request prompt cache toggle. When set,
+    #: fully overrides ``OLMLX_PROMPT_CACHE`` for this model — useful when a
+    #: specific architecture surfaces a checkpoint-path bug while the rest of
+    #: the registry continues to benefit from caching. ``None`` means defer to
+    #: the global ``settings.prompt_cache`` (default behaviour).
+    prompt_cache: bool | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -526,6 +532,10 @@ class ModelConfig:
         ):
             raise ValueError(
                 f"'enable_thinking' must be a bool or None, got {self.enable_thinking!r}"
+            )
+        if self.prompt_cache is not None and not isinstance(self.prompt_cache, bool):
+            raise ValueError(
+                f"'prompt_cache' must be a bool or None, got {self.prompt_cache!r}"
             )
 
     def resolved_speculative(self) -> SpeculativeConfig:
@@ -859,6 +869,7 @@ class ModelConfig:
             flash_speculative_draft_model = entry.get("flash_speculative_draft_model")
             flash_speculative_tokens = entry.get("flash_speculative_tokens")
             enable_thinking_raw = entry.get("enable_thinking")
+            prompt_cache_raw = entry.get("prompt_cache")
 
             kv_cache_quant_raw = entry.get("kv_cache_quant")
             if kv_cache_quant_raw is not None:
@@ -924,6 +935,7 @@ class ModelConfig:
                 flash_speculative_draft_model=flash_speculative_draft_model,
                 flash_speculative_tokens=flash_speculative_tokens,
                 enable_thinking=enable_thinking_raw,
+                prompt_cache=prompt_cache_raw,
                 _extra=extra,
             )
         raise TypeError(
@@ -962,6 +974,7 @@ class ModelConfig:
             and self.flash_speculative_draft_model is None
             and self.flash_speculative_tokens is None
             and self.enable_thinking is None
+            and self.prompt_cache is None
             and not self._extra
         ):
             return self.hf_path
@@ -1027,6 +1040,8 @@ class ModelConfig:
             result["flash_speculative_tokens"] = self.flash_speculative_tokens
         if self.enable_thinking is not None:
             result["enable_thinking"] = self.enable_thinking
+        if self.prompt_cache is not None:
+            result["prompt_cache"] = self.prompt_cache
         # Filter known keys defensively — from_entry() already excludes them,
         # but _extra can be set directly via ModelConfig construction.
         result.update(

@@ -516,6 +516,14 @@ class LoadedModel:
     # ``generate_chat`` consults this when the request didn't set the
     # flag.  None means defer to the engine default.
     enable_thinking: bool | None = None
+    # Per-model override for the cross-request prompt cache toggle.
+    # ``generate_chat`` honours this in place of ``settings.prompt_cache``
+    # when set. None means defer to the global setting. Surfaced for
+    # architectures that crash or degrade on the checkpoint path while
+    # other models continue to benefit from caching (e.g. Qwen3-Coder-Next
+    # MoE-quantized targets where chunked prefill triggers GatedDeltaNet
+    # numerical drift across expert-routing thresholds).
+    prompt_cache: bool | None = None
 
     def __post_init__(self):
         if self.prompt_cache_store is None:
@@ -1434,6 +1442,7 @@ class ModelManager:
                         inference_timeout=model_config.inference_timeout,
                         sync_mode=model_config.sync_mode,
                         enable_thinking=model_config.enable_thinking,
+                        prompt_cache=model_config.prompt_cache,
                     )
                     # Register before probe so concurrent callers see the
                     # model while the probe's async Metal flush releases the

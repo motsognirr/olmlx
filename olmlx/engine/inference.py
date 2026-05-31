@@ -4077,8 +4077,16 @@ async def generate_chat(
         # ``async_speculative_stream`` does not consume ``gen_kwargs['prompt_cache']``.
         # Also disabled for VLMs on the non-streaming path because
         # ``mlx_vlm.generate`` accepts neither ``prompt_cache`` nor ``input_ids``.
+        # Per-model ``prompt_cache`` (set in models.json) overrides the global
+        # ``OLMLX_PROMPT_CACHE`` toggle. Surfaced for architectures that hit
+        # checkpoint-path bugs (e.g. Qwen3-Coder-Next MoE-quantized GatedDeltaNet
+        # targets where chunked prefill crosses expert-routing thresholds) while
+        # other models on the same server keep caching enabled.
+        effective_prompt_cache = (
+            lm.prompt_cache if lm.prompt_cache is not None else settings.prompt_cache
+        )
         use_prompt_cache = (
-            settings.prompt_cache
+            effective_prompt_cache
             and make_prompt_cache is not None
             and not lm.is_distributed
             and not lm.is_speculative
@@ -4097,9 +4105,10 @@ async def generate_chat(
             )
         else:
             logger.debug(
-                "Prompt cache disabled: setting=%s stream=%s vlm=%s speculative=%s "
-                "make_prompt_cache=%s",
+                "Prompt cache disabled: setting=%s per_model=%s stream=%s vlm=%s "
+                "speculative=%s make_prompt_cache=%s",
                 settings.prompt_cache,
+                lm.prompt_cache,
                 stream,
                 lm.is_vlm,
                 lm.is_speculative,

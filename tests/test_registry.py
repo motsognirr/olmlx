@@ -711,6 +711,31 @@ class TestModelConfig:
         mc = ModelConfig(hf_path="org/model")
         assert mc.to_entry() == "org/model"
 
+    def test_prompt_cache_default_none(self):
+        """``prompt_cache`` defaults to None (global setting applies)."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model"})
+        assert mc.prompt_cache is None
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_prompt_cache_parsed(self, value):
+        """``prompt_cache`` parses bool from a dict entry."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model", "prompt_cache": value})
+        assert mc.prompt_cache is value
+
+    def test_prompt_cache_non_bool_rejected(self):
+        """Non-bool prompt_cache raises ValueError."""
+        with pytest.raises(ValueError, match="prompt_cache"):
+            ModelConfig.from_entry({"hf_path": "org/model", "prompt_cache": "no"})
+
+    def test_prompt_cache_round_trip(self):
+        """``prompt_cache`` survives to_entry → from_entry."""
+        mc = ModelConfig(hf_path="org/model", prompt_cache=False)
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["prompt_cache"] is False
+        round_trip = ModelConfig.from_entry(entry)
+        assert round_trip.prompt_cache is False
+
 
 class TestRegistryModelConfig:
     def test_load_mixed_format(self, tmp_path, monkeypatch):
