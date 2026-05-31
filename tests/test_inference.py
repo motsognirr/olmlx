@@ -2216,6 +2216,121 @@ class TestGenerateChatEnableThinking:
         assert call_kwargs["enable_thinking"] is True
 
 
+class TestGenerateChatPerModelPromptCache:
+    """Per-model ``prompt_cache`` override (set in models.json) takes
+    precedence over the global ``OLMLX_PROMPT_CACHE`` setting.
+
+    Surfaced for architectures where the checkpoint cache path mis-prefills
+    (e.g. Qwen3-Coder-Next-4bit, where chunked prefill drifts the
+    GatedDeltaNet recurrent state across MoE expert-routing thresholds).
+    Per-model opt-out keeps caching enabled for healthy models on the same
+    server while disabling it for the broken ones.
+
+    The resolution is asserted via ``lm.prompt_cache_store.peek``: it is
+    called only when ``use_prompt_cache`` resolves true. This keeps the
+    test surface narrow and avoids depending on log message formatting.
+    """
+
+    @pytest.mark.asyncio
+    async def test_per_model_false_overrides_global_true(self, mock_manager):
+        """lm.prompt_cache=False suppresses caching even when settings.prompt_cache=True."""
+        mock_mx = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.prompt_cache = False  # per-model opt-out
+        lm.prompt_cache_store.peek = MagicMock(return_value=None)
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings.prompt_cache", True),
+        ):
+            with patch(
+                "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_thread:
+                mock_thread.return_value = "response"
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                )
+
+        lm.prompt_cache_store.peek.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_per_model_true_overrides_global_false(self, mock_manager):
+        """lm.prompt_cache=True engages caching even when settings.prompt_cache=False."""
+        mock_mx = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.prompt_cache = True  # per-model opt-in
+        # Replace the store wholesale so downstream cache machinery is inert.
+        peek_mock = MagicMock(return_value=None)
+        lm.prompt_cache_store = MagicMock()
+        lm.prompt_cache_store.peek = peek_mock
+        lm.prompt_cache_store.async_get = AsyncMock(return_value=None)
+        lm.prompt_cache_store.async_set = AsyncMock(return_value=None)
+        lm.prompt_cache_store.async_evict_all_to_disk = AsyncMock(return_value=None)
+        lm.prompt_cache_store.find_by_prefix = MagicMock(return_value=None)
+        lm.prompt_cache_store.fetch_nearest = MagicMock(return_value=None)
+        lm.prompt_cache_store.remove = MagicMock(return_value=None)
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings.prompt_cache", False),
+        ):
+            with patch(
+                "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_thread:
+                mock_thread.return_value = "response"
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                )
+
+        peek_mock.assert_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("global_value", [True, False])
+    async def test_per_model_none_defers_to_global(self, mock_manager, global_value):
+        """lm.prompt_cache=None (default) honours settings.prompt_cache."""
+        mock_mx = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.prompt_cache = None  # explicit default
+        peek_mock = MagicMock(return_value=None)
+        lm.prompt_cache_store = MagicMock()
+        lm.prompt_cache_store.peek = peek_mock
+        lm.prompt_cache_store.async_get = AsyncMock(return_value=None)
+        lm.prompt_cache_store.async_set = AsyncMock(return_value=None)
+        lm.prompt_cache_store.async_evict_all_to_disk = AsyncMock(return_value=None)
+        lm.prompt_cache_store.find_by_prefix = MagicMock(return_value=None)
+        lm.prompt_cache_store.fetch_nearest = MagicMock(return_value=None)
+        lm.prompt_cache_store.remove = MagicMock(return_value=None)
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference.settings.prompt_cache", global_value),
+        ):
+            with patch(
+                "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_thread:
+                mock_thread.return_value = "response"
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                )
+
+        if global_value:
+            peek_mock.assert_called()
+        else:
+            peek_mock.assert_not_called()
+
+
 class TestFullCompletionInner:
     @pytest.mark.asyncio
     async def test_result_with_text_attr(self, mock_manager):
