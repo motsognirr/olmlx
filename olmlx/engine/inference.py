@@ -1356,12 +1356,15 @@ async def _release_pin_after_gen(
             lm.release_ref()
 
 
-def _merge_default_options(defaults: dict, request: dict | None) -> dict:
+def _merge_default_options(defaults: dict | None, request: dict | None) -> dict:
     """Merge per-model default options with per-request options.
 
     Request values win per-key; keys absent from the request fall back to
     model defaults.  ``request=None`` and ``request={}`` both mean "use
     defaults"; any non-None ``request`` is layered on top of ``defaults``.
+    ``defaults=None`` is accepted symmetrically with ``request`` and treated
+    as an empty dict so callers that haven't normalised the field can still
+    use this helper without a guard.
 
     History: prior versions dropped *all* defaults whenever the request
     supplied *any* options — so a request that sent ``top_k`` without
@@ -1371,7 +1374,7 @@ def _merge_default_options(defaults: dict, request: dict | None) -> dict:
     ``"temperature": 0.7`` was discarded.  The current always-merge form
     matches Ollama's per-model options semantics.
     """
-    return {**defaults, **(request or {})}
+    return {**(defaults or {}), **(request or {})}
 
 
 def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:

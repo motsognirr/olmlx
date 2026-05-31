@@ -235,6 +235,14 @@ class TestMergeDefaultOptions:
         assert _merge_default_options({}, None) == {}
         assert _merge_default_options({}, {}) == {}
 
+    def test_none_defaults_accepted_symmetrically(self):
+        """Defensive: helper accepts ``None`` for defaults the same way it does
+        for request, so callers that haven't normalised the field don't crash."""
+        assert _merge_default_options(None, {"temperature": 0.5}) == {
+            "temperature": 0.5
+        }
+        assert _merge_default_options(None, None) == {}
+
     def test_does_not_mutate_inputs(self):
         defaults = {"temperature": 0.7}
         request = {"top_k": 20}
