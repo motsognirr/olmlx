@@ -12,6 +12,7 @@ from olmlx.engine.inference import (
     _acquire_inference_lock,
     _apply_seed,
     _build_generate_kwargs,
+    _merge_default_options,
     _full_completion,
     _inference_ref,
     _make_frequency_penalty_processor,
@@ -182,6 +183,64 @@ class TestDeriveTimingStats:
         _derive_timing_stats(stats, 0.0, 0.0, eval_timer_ns=200_000_000)
         assert stats.prompt_eval_duration == 0
         assert stats.eval_duration == 0
+
+
+class TestMergeDefaultOptions:
+    """Per-model defaults from ``models.json`` must layer under request options.
+
+    Request-key wins per-key; keys absent from the request fall back to the
+    model default.  Pre-fix, supplying *any* key in the request dropped *all*
+    defaults — so a request that sent ``top_k`` without ``temperature``
+    silently lost the model's default temperature and ran greedy (no sampler
+    built).  Surfaced via opencode + ``mlx-community/Qwen3-Coder-Next-4bit``
+    where opencode sent ``{top_k, top_p, min_p}`` and ``models.json``'s
+    ``"temperature": 0.7`` vanished from the merge.
+    """
+
+    def test_none_request_yields_defaults(self):
+        assert _merge_default_options({"temperature": 0.7}, None) == {
+            "temperature": 0.7
+        }
+
+    def test_empty_request_yields_defaults(self):
+        """``{}`` from ``build_inference_options`` (request supplied no params)
+        must still apply model defaults."""
+        assert _merge_default_options({"temperature": 0.7}, {}) == {"temperature": 0.7}
+
+    def test_partial_request_layers_under_defaults(self):
+        """Regression for the opencode case: top_k in request, temperature in
+        defaults — both must end up in the merged dict."""
+        merged = _merge_default_options(
+            {"temperature": 0.7, "top_p": 0.8},
+            {"top_k": 20, "min_p": 0.0},
+        )
+        assert merged == {
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "min_p": 0.0,
+        }
+
+    def test_request_overrides_default_per_key(self):
+        merged = _merge_default_options(
+            {"temperature": 0.7, "top_p": 0.8},
+            {"temperature": 0.2},
+        )
+        assert merged == {"temperature": 0.2, "top_p": 0.8}
+
+    def test_empty_defaults_passes_request_through(self):
+        assert _merge_default_options({}, {"temperature": 0.5}) == {"temperature": 0.5}
+
+    def test_both_empty_yields_empty(self):
+        assert _merge_default_options({}, None) == {}
+        assert _merge_default_options({}, {}) == {}
+
+    def test_does_not_mutate_inputs(self):
+        defaults = {"temperature": 0.7}
+        request = {"top_k": 20}
+        _merge_default_options(defaults, request)
+        assert defaults == {"temperature": 0.7}
+        assert request == {"top_k": 20}
 
 
 class TestBuildGenerateKwargs:

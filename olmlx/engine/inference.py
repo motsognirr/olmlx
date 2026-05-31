@@ -1356,6 +1356,24 @@ async def _release_pin_after_gen(
             lm.release_ref()
 
 
+def _merge_default_options(defaults: dict, request: dict | None) -> dict:
+    """Merge per-model default options with per-request options.
+
+    Request values win per-key; keys absent from the request fall back to
+    model defaults.  ``request=None`` and ``request={}`` both mean "use
+    defaults"; any non-None ``request`` is layered on top of ``defaults``.
+
+    History: prior versions dropped *all* defaults whenever the request
+    supplied *any* options — so a request that sent ``top_k`` without
+    ``temperature`` silently lost the model's default temperature and ran
+    greedy (no sampler built).  Surfaced via opencode + Qwen3-Coder-Next-4bit
+    where opencode sent ``{top_k, top_p, min_p}`` and ``models.json``'s
+    ``"temperature": 0.7`` was discarded.  The current always-merge form
+    matches Ollama's per-model options semantics.
+    """
+    return {**defaults, **(request or {})}
+
+
 def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
     """Convert Ollama options dict to mlx_lm/mlx_vlm generate kwargs.
 
@@ -2259,13 +2277,7 @@ async def generate_completion(
                 if system:
                     prompt = f"{system}\n\n{prompt}"
 
-        # Merge per-model defaults with request options.  options=None means
-        # "use defaults"; options={} means "override all defaults" (empty).
-        merged_options = (
-            {**lm.default_options, **(options or {})}
-            if lm.default_options and options is None
-            else options
-        )
+        merged_options = _merge_default_options(lm.default_options, options)
         gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
         mt = gen_kwargs.pop("max_tokens", max_tokens)
 
@@ -4044,13 +4056,7 @@ async def generate_chat(
             logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
             logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
 
-        # Merge per-model defaults with request options.  options=None means
-        # "use defaults"; options={} means "override all defaults" (empty).
-        merged_options = (
-            {**lm.default_options, **(options or {})}
-            if lm.default_options and options is None
-            else options
-        )
+        merged_options = _merge_default_options(lm.default_options, options)
         gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
         mt = gen_kwargs.pop("max_tokens", max_tokens)
 
