@@ -14,6 +14,11 @@ class TemplateCaps:
     has_thinking_tags: bool = False
     has_channel_format: bool = False
     uses_tool_responses: bool = False
+    # Whether the template can render tool turns at all — via a ``tool`` role,
+    # ``tool_calls`` iteration, ``[TOOL_RESULTS]`` markers, or ``tool_responses``.
+    # Minimal templates (e.g. Devstral/Mistral) only allow user/system/assistant
+    # and raise on anything else; for those we fold tool turns into user text.
+    handles_tool_role: bool = False
 
 
 def _find_template_variables(tpl: str) -> set[str] | None:
@@ -68,10 +73,25 @@ def detect_caps(tokenizer: Any) -> TemplateCaps:
         or '["tool_responses"]' in tpl
     )
 
+    # The template can natively render a tool-result turn only if it branches on
+    # the tool role itself — a quoted ``'tool'``/``"tool"`` role literal, Mistral's
+    # ``[TOOL_RESULTS]`` block, or Gemma's ``tool_responses``.  A bare
+    # ``tool_calls`` reference is NOT sufficient: templates iterate assistant
+    # ``tool_calls`` while still rejecting a separate ``role: "tool"`` message, so
+    # keying on it would skip the rewrite and reintroduce the crash.  Absent all
+    # of these (e.g. the minimal Devstral template), ``role: "tool"`` raises.
+    handles_tool_role = (
+        uses_tool_responses
+        or "'tool'" in tpl
+        or '"tool"' in tpl
+        or "[TOOL_RESULTS]" in tpl
+    )
+
     return TemplateCaps(
         supports_tools=supports_tools,
         supports_enable_thinking=supports_enable_thinking,
         has_thinking_tags=has_thinking_tags,
         has_channel_format=has_channel_format,
         uses_tool_responses=uses_tool_responses,
+        handles_tool_role=handles_tool_role,
     )

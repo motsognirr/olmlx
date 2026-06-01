@@ -2012,6 +2012,76 @@ def _convert_tool_messages_to_responses(messages: list[dict]) -> list[dict]:
     return result
 
 
+def _convert_tool_messages_to_user_text(messages: list[dict]) -> list[dict]:
+    """Fold tool turns into plain text for templates that only support the
+    user/system/assistant roles.
+
+    The minimal Devstral/Mistral template has no native tool support and
+    ``raise_exception``\\ s on any other role, so an OpenAI-style
+    ``role: "tool"`` result message crashes ``apply_chat_template`` with
+    "Only user, system and assistant roles are supported!".  For such templates
+    we rewrite the conversation using only the accepted roles:
+
+    * An assistant message carrying ``tool_calls`` gets a readable rendering of
+      those calls appended to its content, so the model still sees what it
+      called and the turn isn't empty.
+    * Each ``role: "tool"`` message becomes ``user`` text.  Consecutive tool
+      results are merged into one user message to avoid back-to-back user
+      turns.
+    """
+    if not any(m.get("role") == "tool" for m in messages):
+        return messages
+
+    # tool_call_id -> function name, for labelling results.
+    id_to_name: dict[str, str] = {}
+    for m in messages:
+        for tc in m.get("tool_calls", []):
+            fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+            name = fn.get("name", tc.get("name", "")) if isinstance(fn, dict) else ""
+            tc_id = tc.get("id", "") if isinstance(tc, dict) else ""
+            if tc_id and name:
+                id_to_name[tc_id] = name
+
+    result: list[dict] = []
+    pending: list[str] = []  # buffered tool-result lines, flushed as one user msg
+
+    def flush() -> None:
+        if pending:
+            result.append({"role": "user", "content": "\n".join(pending)})
+            pending.clear()
+
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            name = id_to_name.get(m.get("tool_call_id", ""), "tool")
+            pending.append(f"[tool_result] {name}: {m.get('content', '')}")
+            continue
+
+        flush()
+        if role == "assistant" and m.get("tool_calls"):
+            m = dict(m)
+            lines = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function", tc)
+                name = fn.get("name", tc.get("name", ""))
+                args = fn.get("arguments", tc.get("arguments", {}))
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                lines.append(f"[tool_call] {name}({json.dumps(args, default=str)})")
+            existing = (m.get("content") or "").strip()
+            m["content"] = (existing + "\n" if existing else "") + "\n".join(lines)
+            m.pop("tool_calls", None)  # rendered into content; template ignores it
+            result.append(m)
+        else:
+            result.append(dict(m))
+
+    flush()
+    return result
+
+
 def _apply_chat_template_vlm(
     processor: Any,
     model: Any,
@@ -2441,7 +2511,34 @@ def _drive_segmented_prefill(
             model(arr, cache=cache)
             mx.eval(flatten_cache_state(cache))
 
-    if deepest_boundary is None:
+    if _is_pure_rotating_cache(cache):
+        # Sliding-window models (gpt-oss, Step-3.5, Gemma 3) must be prefilled
+        # in ONE call — splitting at an interior boundary corrupts their
+        # windowed attention (coherent-but-unrelated output, no tool calls).
+        # The two-chunk split only exists to bound GatedDeltaNet drift, which
+        # these don't have.  Snapshot at the end (KV depth == len(flat)-1, so
+        # tokens stored are flat[:final_prefill_end] — consistent, no trailing-
+        # token mismatch) so a strict-extension follow-up can still warm-start.
+        logger.debug(
+            "Pure-rotating cache: single-chunk prefill [%d..%d] (no interior split)",
+            already_covered_tokens,
+            final_prefill_end,
+        )
+        _run(already_covered_tokens, final_prefill_end)
+        if final_prefill_end > already_covered_tokens and segmented.segments:
+            snap = snapshot_cache_for_persistence(cache, eager_eval=False)
+            store.insert_checkpoint(
+                CachedPromptState(
+                    tokens=flat[:final_prefill_end],
+                    cache=snap,
+                    # Snapshot spans the whole prompt (not an interior
+                    # boundary), so tier it by the leading role — matching how
+                    # tokenize_segmented_chat tiers injected preamble segments.
+                    cache_type=segmented.segments[0].role,
+                    is_checkpoint=True,
+                )
+            )
+    elif deepest_boundary is None:
         # No usable interior boundary — single chunk, no snapshot.
         _run(already_covered_tokens, final_prefill_end)
     else:
@@ -2475,6 +2572,22 @@ def _cache_list_contains_lazy_state(cache: list[Any]) -> bool:
     """
     LAZY_STATE_CLASSES = {"ArraysCache"}
     return any(type(layer).__name__ in LAZY_STATE_CLASSES for layer in cache)
+
+
+def _is_pure_rotating_cache(cache: list[Any]) -> bool:
+    """True iff the cache is a sliding-window layout (has ``RotatingKVCache``)
+    with no ``ArraysCache`` (GatedDeltaNet/SSM) layers.
+
+    These models — gpt-oss, Step-3.5, Gemma 3 — must be prefilled in a SINGLE
+    ``model(...)`` call.  The two-chunk checkpoint drive (which exists only to
+    bound GatedDeltaNet recurrent-state drift on ``ArraysCache`` models)
+    corrupts sliding-window attention here: splitting the prefill at an
+    interior message boundary makes the model generate coherent-but-unrelated
+    output and skip tool calls.  Mixed Rotating+Arrays layouts (Qwen3-Next)
+    return False — they keep the two-chunk drive for the SSM part.
+    """
+    names = {type(layer).__name__ for layer in cache}
+    return "RotatingKVCache" in names and "ArraysCache" not in names
 
 
 async def _setup_via_checkpoint_path(
@@ -3994,6 +4107,16 @@ async def generate_chat(
             template_text = _get_chat_template_text(lm.tokenizer)
             messages = _add_native_tool_hint(messages, template_text)
 
+        # Rewrite OpenAI-style role="tool" turns for templates that can't render
+        # them natively: Gemma-style templates take a tool_responses array;
+        # minimal templates (Devstral/Mistral) only accept user/system/assistant
+        # and raise otherwise, so tool turns are folded into user-message text.
+        if any(m.get("role") == "tool" for m in messages):
+            if caps.uses_tool_responses:
+                messages = _convert_tool_messages_to_responses(messages)
+            elif not caps.handles_tool_role:
+                messages = _convert_tool_messages_to_user_text(messages)
+
         if lm.is_vlm:
             # VLM models must use the VLM generation path for tokenization.
             # Pass tools natively through the template when supported — this
@@ -4003,10 +4126,6 @@ async def generate_chat(
             # template lacks tool support.
             # Resolve enable_thinking for templates that support it.
             vlm_thinking = enable_thinking if caps.supports_enable_thinking else None
-            # Convert role="tool" messages to tool_responses format for models
-            # that don't support OpenAI-style tool messages (e.g. Gemma 4).
-            if caps.uses_tool_responses:
-                messages = _convert_tool_messages_to_responses(messages)
             if tools and caps.supports_tools:
                 prompt = _apply_chat_template_vlm(
                     lm.tokenizer,
