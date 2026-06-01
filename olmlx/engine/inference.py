@@ -2428,6 +2428,14 @@ class _CacheSetupResult:
     cache_setup_done: bool = False
 
 
+# Sub-chunk size for the segmented-prefill drive's per-chunk ``model()`` calls
+# on non-pure-rotating (GatedDeltaNet/ArraysCache) caches. Matches mlx-lm's
+# ``generate_step`` ``prefill_step_size`` default so the checkpoint path bounds
+# activation memory the same way mlx-lm's native prefill does (avoids the
+# 70k-token single-forward OOM).
+_PREFILL_CHUNK = 2048
+
+
 def _drive_segmented_prefill(
     *,
     model: Any,
@@ -2503,15 +2511,52 @@ def _drive_segmented_prefill(
 
     final_prefill_end = len(flat) - 1  # reserve trailing token for stream_generate
 
+    # Prefill MUST run on the same stream ``stream_generate`` decodes on
+    # (mlx-lm's ``generation_stream``).  Prefilling on ``mx.default_stream``
+    # and then decoding on ``generation_stream`` leaves the GatedDeltaNet
+    # recurrent state as a cross-stream lazy graph whose materialization
+    # corrupts MoE expert routing on Qwen3-Next-family targets once the
+    # prompt is large enough (~16k+ tokens) — the model emits coherent but
+    # off-prompt pretraining-data dumps instead of answering (Qwen3-Coder-Next,
+    # Qwen3.6-35B-A3B; same Metal-stream hazard family as #284).  Single-message
+    # requests never hit this because they skip the drive entirely and let
+    # ``stream_generate`` prefill on ``generation_stream``.  ``mx.clear_cache()``
+    # per chunk mirrors mlx-lm's prefill loop.
+    prefill_stream = (
+        _generation_streams[0]
+        if _generation_streams
+        else mx.default_stream(mx.default_device())
+    )
+    pure_rotating = _is_pure_rotating_cache(cache)
+
     def _run(start: int, end: int) -> None:
         if end <= start:
             return
-        arr = mx.array(flat[start:end], dtype=mx.int32)[None, :]
-        with mx.stream(mx.default_stream(mx.default_device())):
-            model(arr, cache=cache)
-            mx.eval(flatten_cache_state(cache))
+        with mx.stream(prefill_stream):
+            if pure_rotating:
+                # Sliding-window models (gpt-oss, Step-3.5, Gemma 3): feed the
+                # span in ONE call, preserving the validated single-call
+                # behavior their windowed attention depends on.
+                model(mx.array(flat[start:end], dtype=mx.int32)[None, :], cache=cache)
+                mx.eval(flatten_cache_state(cache))
+                mx.clear_cache()
+            else:
+                # GatedDeltaNet/ArraysCache family: sub-chunk at _PREFILL_CHUNK
+                # to bound activation memory — a ~70k-token chunk-1 prefill fed
+                # as a single forward OOM'd Metal at 123 GB (Qwen3.6-35B-A3B-6bit).
+                # Mirrors mlx-lm's prefill loop; eval + clear per sub-chunk caps
+                # peak memory at roughly one sub-chunk's worth of activations.
+                pos = start
+                while pos < end:
+                    stop = min(pos + _PREFILL_CHUNK, end)
+                    model(
+                        mx.array(flat[pos:stop], dtype=mx.int32)[None, :], cache=cache
+                    )
+                    mx.eval(flatten_cache_state(cache))
+                    mx.clear_cache()
+                    pos = stop
 
-    if _is_pure_rotating_cache(cache):
+    if pure_rotating:
         # Sliding-window models (gpt-oss, Step-3.5, Gemma 3) must be prefilled
         # in ONE call — splitting at an interior boundary corrupts their
         # windowed attention (coherent-but-unrelated output, no tool calls).
@@ -2546,7 +2591,7 @@ def _drive_segmented_prefill(
         _run(already_covered_tokens, deepest_boundary)
         # Snapshot at the boundary.  eager_eval=False because ``_run``'s
         # inner ``mx.eval(flatten_cache_state(cache))`` just materialised
-        # the state on the default stream; deepcopy alone is sufficient.
+        # the state on the prefill stream; deepcopy alone is sufficient.
         snap = snapshot_cache_for_persistence(cache, eager_eval=False)
         store.insert_checkpoint(
             CachedPromptState(

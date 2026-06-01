@@ -119,6 +119,79 @@ def test_drive_skips_segments_below_already_covered():
     assert suffix == [5]
 
 
+def test_drive_prefill_runs_on_generation_stream(monkeypatch):
+    """Prefill must run on mlx-lm's ``generation_stream`` — the same stream
+    ``stream_generate`` decodes on.
+
+    Regression for Qwen3-Coder-Next (and the Qwen3-Next MoE-quant family):
+    prefilling the cache on ``mx.default_stream`` and then decoding on
+    ``generation_stream`` leaves the GatedDeltaNet recurrent state as a
+    cross-stream lazy graph whose materialization corrupts MoE expert routing
+    at scale (~16k+ prompt tokens), making the model emit pretraining-data
+    dumps instead of answering. Same Metal-stream hazard family as #284.
+    """
+    import olmlx.engine.inference as inf
+
+    if not inf._generation_streams:
+        pytest.skip("mlx_lm generation_stream not available in this environment")
+
+    recorded: list = []
+    real_stream = mx.stream
+
+    def spy_stream(s):
+        recorded.append(s)
+        return real_stream(s)
+
+    monkeypatch.setattr(inf.mx, "stream", spy_stream)
+
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+    sp = SegmentedPrompt(
+        segments=[
+            Segment(tokens=[1, 2, 3], role="system"),
+            Segment(tokens=[4, 5], role="user"),
+        ]
+    )
+    cache = [KVCache()]
+    _drive_segmented_prefill(model=model, segmented=sp, cache=cache, store=store)
+
+    gen_stream = inf._generation_streams[0]
+    default_stream = mx.default_stream(mx.default_device())
+    assert gen_stream in recorded, "prefill did not run on mlx-lm's generation_stream"
+    assert default_stream not in recorded, (
+        "prefill ran on the default stream; it must use generation_stream so the "
+        "cache it builds is materialized on the same stream stream_generate decodes on"
+    )
+
+
+def test_drive_subchunks_long_prefill(monkeypatch):
+    """A long uncovered span is fed to the model in sub-chunks bounded by
+    ``_PREFILL_CHUNK`` (matching mlx-lm's prefill loop), not one giant
+    ``model()`` call.
+
+    Regression for the ~70k-token chunk-1 prefill that OOM'd Metal (123 GB) in
+    ``_run`` on Qwen3.6-35B-A3B-6bit: feeding the whole span in one forward
+    materializes activations for every token at once. Sub-chunking bounds that.
+    Only applies to the GatedDeltaNet/ArraysCache family (non-pure-rotating);
+    pure sliding-window models keep their single-call behavior.
+    """
+    import olmlx.engine.inference as inf
+
+    monkeypatch.setattr(inf, "_PREFILL_CHUNK", 2)
+
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+    # Single user segment of 7 tokens. No interior boundary -> one _run(0, 6)
+    # (token 7 reserved for decode). With chunk size 2: [1,2], [3,4], [5,6].
+    sp = SegmentedPrompt(segments=[Segment(tokens=[1, 2, 3, 4, 5, 6, 7], role="user")])
+    cache = [KVCache()]  # not pure-rotating -> sub-chunked
+    suffix = _drive_segmented_prefill(
+        model=model, segmented=sp, cache=cache, store=store
+    )
+    assert model.calls == [[1, 2], [3, 4], [5, 6]]
+    assert suffix == [7]
+
+
 def test_tokenize_segmented_chat_accepts_extra_eom_boundaries():
     """For templates like gpt-oss Harmony that inject a baseline
     system/developer message, the EOM-boundary count exceeds the input
