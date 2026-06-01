@@ -602,6 +602,7 @@ def _derive_timing_stats(
     prompt_tps: float,
     gen_tps: float,
     eval_timer_ns: int,
+    prefilled_count: int | None = None,
 ) -> tuple[float, float]:
     """Populate ``stats.prompt_eval_duration`` and ``stats.eval_duration`` from
     mlx-lm's measured prefill/decode rates, with conservative fallbacks for
@@ -622,7 +623,22 @@ def _derive_timing_stats(
     tok/s). The sum invariant still holds; the split is just heuristic.
     mlx-lm reports both rates in practice, so this path is essentially
     unreached.
+
+    ``prefilled_count`` is the number of tokens mlx-lm actually prefilled —
+    which differs from ``stats.prompt_eval_count`` on a prompt-cache hit, where
+    the caller reports the *full* prompt size but mlx-lm only re-prefilled the
+    uncached suffix (and measured ``prompt_tps`` over that suffix). The prefill
+    *duration* must be derived from the count the rate was measured over, else
+    ``full_count / suffix_rate`` inflates ``raw_prompt_ns`` enough to crowd
+    decode down to a sliver in the proportional clamp — producing an impossible
+    decode tok/s. Defaults to ``stats.prompt_eval_count`` (no cache hit, or the
+    non-streaming path where the reported count already matches the rate).
     """
+    prefill_count = (
+        prefilled_count
+        if prefilled_count is not None and prefilled_count > 0
+        else stats.prompt_eval_count
+    )
     # Explicit zero of the fields this helper owns — several branches below
     # write only one of the two, so initialize both up front to make the
     # mutation contract independent of the caller's TimingStats state.
@@ -645,8 +661,8 @@ def _derive_timing_stats(
         gen_tps = float(gen_tps)
 
     raw_prompt_ns = (
-        int(stats.prompt_eval_count / prompt_tps * 1e9)
-        if prompt_tps > 0 and stats.prompt_eval_count > 0
+        int(prefill_count / prompt_tps * 1e9)
+        if prompt_tps > 0 and prefill_count > 0
         else 0
     )
     raw_decode_ns = (
@@ -715,8 +731,12 @@ def _derive_timing_stats(
     # duration than the one we actually report.
     if stats.eval_duration > 0 and stats.eval_count > 0:
         gen_tps = stats.eval_count / (stats.eval_duration / 1e9)
-    if stats.prompt_eval_duration > 0 and stats.prompt_eval_count > 0:
-        prompt_tps = stats.prompt_eval_count / (stats.prompt_eval_duration / 1e9)
+    if stats.prompt_eval_duration > 0 and prefill_count > 0:
+        # Use prefill_count (what was actually prefilled), not the reported
+        # prompt_eval_count, so the logged rate matches the work the duration
+        # measures — otherwise a cache hit shows full_count / suffix_time, a
+        # fictitious "rate" far above the hardware's real prefill throughput.
+        prompt_tps = prefill_count / (stats.prompt_eval_duration / 1e9)
 
     return prompt_tps, gen_tps
 
@@ -3599,6 +3619,12 @@ async def _stream_completion(
                 getattr(token, "prompt_tps", 0) or 0,
                 getattr(token, "generation_tps", 0) or 0,
                 eval_timer.duration_ns,
+                # On a cache hit stats.prompt_eval_count is the full prompt but
+                # token.prompt_tokens (and prompt_tps) cover only the re-prefilled
+                # suffix — apportion the prefill duration against the suffix.
+                prefilled_count=(
+                    getattr(token, "prompt_tokens", None) if token is not None else None
+                ),
             )
 
         stats.total_duration = total_timer.duration_ns
@@ -4002,6 +4028,10 @@ async def _full_completion_inner(
         getattr(result, "prompt_tps", 0) or 0,
         getattr(result, "generation_tps", 0) or 0,
         eval_timer.duration_ns,
+        # Non-streaming reports the mlx-lm-prefilled count as prompt_eval_count
+        # already, so this matches — passed explicitly for parity with the
+        # streaming path's cache-hit handling.
+        prefilled_count=getattr(result, "prompt_tokens", None),
     )
     total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
     logger.info(

@@ -154,6 +154,33 @@ class TestDeriveTimingStats:
         # prompt_eval_duration is 100 ms, prompt_eval_count is 5 → 50 tok/s.
         assert p == pytest.approx(50.0)
 
+    def test_cache_hit_uses_prefilled_count_not_full_prompt(self):
+        """Streaming cache-hit regression: stats.prompt_eval_count is the FULL
+        prompt (reported to the caller), but mlx-lm's prompt_tps was measured
+        over only the re-prefilled suffix. Dividing the full count by the
+        suffix rate inflates raw prefill duration, which the proportional
+        clamp then lets crowd decode down to a ~1ms sliver — producing an
+        impossible decode tok/s. Passing the actually-prefilled count keeps
+        the prefill duration honest so decode keeps mlx-lm's measured rate."""
+        stats = TimingStats(prompt_eval_count=40_000, eval_count=100)
+        # mlx-lm prefilled a 50-token suffix at 5000 tok/s (10ms) and decoded
+        # 100 tokens at 50 tok/s (2.0s). Wall-clock ~2.01s.
+        p, g = _derive_timing_stats(
+            stats,
+            5000.0,
+            50.0,
+            eval_timer_ns=2_010_000_000,
+            prefilled_count=50,
+        )
+        # Prefill duration reflects the suffix (10ms), not the full prompt.
+        assert stats.prompt_eval_duration == 10_000_000
+        # Decode keeps essentially all of wall-clock → mlx-lm's real 50 tok/s,
+        # NOT the bogus ~250 tok/s the inflated-prefill clamp would produce.
+        assert stats.eval_duration == 2_000_000_000
+        assert g == pytest.approx(50.0)
+        # Prompt rate is the genuine suffix prefill rate (count matches rate).
+        assert p == pytest.approx(5000.0)
+
     def test_non_numeric_rate_treated_as_missing(self):
         """Defensive boundary: a non-Python-numeric scalar (e.g. MagicMock
         from a sloppy test, numpy/mlx scalar from mlx-lm) must not be trusted
