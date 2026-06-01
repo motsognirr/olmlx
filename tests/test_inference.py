@@ -5272,3 +5272,118 @@ class TestStreamCompletionLockLeakOnSyncFailure:
                 pass
         assert not _inference_lock.locked()
         assert mock_mx.synchronize.call_count == 0
+
+
+class TestConvertToolMessagesToUserText:
+    """Folding tool turns into plain text for templates that only support
+    user/system/assistant roles (e.g. the minimal Devstral/Mistral template)."""
+
+    def test_no_tool_messages_unchanged(self):
+        from olmlx.engine.inference import _convert_tool_messages_to_user_text
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        assert _convert_tool_messages_to_user_text(messages) == messages
+
+    def test_tool_result_folded_into_user_message(self):
+        from olmlx.engine.inference import _convert_tool_messages_to_user_text
+
+        messages = [
+            {"role": "user", "content": "weather where I am?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "get_user_location", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": '{"city": "Paris"}'},
+        ]
+        result = _convert_tool_messages_to_user_text(messages)
+        # No tool role survives — only roles the basic template accepts.
+        assert all(m["role"] in ("user", "system", "assistant") for m in result)
+        # The tool result content surfaces in a user message.
+        assert any(m["role"] == "user" and "Paris" in m["content"] for m in result)
+        # The assistant turn names the call it made (so the turn isn't empty).
+        assert any(
+            m["role"] == "assistant" and "get_user_location" in (m.get("content") or "")
+            for m in result
+        )
+
+    def test_consecutive_tool_results_merged_into_one_user_message(self):
+        from olmlx.engine.inference import _convert_tool_messages_to_user_text
+
+        messages = [
+            {"role": "user", "content": "do things"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "a",
+                        "type": "function",
+                        "function": {"name": "f1", "arguments": {}},
+                    },
+                    {
+                        "id": "b",
+                        "type": "function",
+                        "function": {"name": "f2", "arguments": {}},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "r1"},
+            {"role": "tool", "tool_call_id": "b", "content": "r2"},
+        ]
+        result = _convert_tool_messages_to_user_text(messages)
+        assert not any(m["role"] == "tool" for m in result)
+        user_msgs = [m for m in result if m["role"] == "user"]
+        assert any("r1" in m["content"] and "r2" in m["content"] for m in user_msgs)
+
+
+class TestIsPureRotatingCache:
+    """Detection that drives single-chunk prefill for sliding-window models."""
+
+    @staticmethod
+    def _layer(name):
+        # An object whose type().__name__ == name (matches the detector).
+        return type(name, (), {})()
+
+    def test_gpt_oss_like_kv_plus_rotating_is_pure_rotating(self):
+        from olmlx.engine.inference import _is_pure_rotating_cache
+
+        cache = [
+            self._layer(n)
+            for n in ["KVCache", "RotatingKVCache", "KVCache", "RotatingKVCache"]
+        ]
+        assert _is_pure_rotating_cache(cache) is True
+
+    def test_pure_full_attention_is_not(self):
+        from olmlx.engine.inference import _is_pure_rotating_cache
+
+        assert _is_pure_rotating_cache([self._layer("KVCache")] * 3) is False
+
+    def test_arrays_cache_present_is_not(self):
+        # Hybrid SSM (Qwen3.5) — needs the two-chunk drive for GatedDeltaNet.
+        from olmlx.engine.inference import _is_pure_rotating_cache
+
+        cache = [self._layer("ArraysCache"), self._layer("KVCache")]
+        assert _is_pure_rotating_cache(cache) is False
+
+    def test_mixed_rotating_and_arrays_is_not(self):
+        # Qwen3-Next: has rotating AND arrays — keep two-chunk for the SSM part.
+        from olmlx.engine.inference import _is_pure_rotating_cache
+
+        cache = [self._layer("RotatingKVCache"), self._layer("ArraysCache")]
+        assert _is_pure_rotating_cache(cache) is False
+
+    def test_empty_is_not(self):
+        from olmlx.engine.inference import _is_pure_rotating_cache
+
+        assert _is_pure_rotating_cache([]) is False

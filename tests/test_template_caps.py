@@ -195,3 +195,28 @@ class TestDetectCaps:
         )
         caps = detect_caps(tok)
         assert caps.uses_tool_responses is True
+
+
+class TestHandlesToolRole:
+    def test_default_false(self):
+        assert TemplateCaps().handles_tool_role is False
+
+    def test_false_for_basic_template(self):
+        tok = MagicMock()
+        tok.chat_template = (
+            "{% for m in messages %}{% if m['role'] == 'user' %}{{ m['content'] }}"
+            "{% else %}{{ raise_exception('only user') }}{% endif %}{% endfor %}"
+        )
+        assert detect_caps(tok).handles_tool_role is False
+
+    def test_true_when_tool_role_referenced(self):
+        tok = MagicMock()
+        tok.chat_template = (
+            "{% if message['role'] == 'tool' %}{{ message['content'] }}{% endif %}"
+        )
+        assert detect_caps(tok).handles_tool_role is True
+
+    def test_true_for_tool_responses_template(self):
+        tok = MagicMock()
+        tok.chat_template = "{{ message['tool_responses'] }}"
+        assert detect_caps(tok).handles_tool_role is True
