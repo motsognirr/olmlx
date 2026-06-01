@@ -73,15 +73,17 @@ def detect_caps(tokenizer: Any) -> TemplateCaps:
         or '["tool_responses"]' in tpl
     )
 
-    # The template can natively place a tool turn if it references the tool role
-    # ('tool' literal in a role comparison), iterates tool_calls, uses Mistral's
-    # [TOOL_RESULTS] markers, or uses Gemma's tool_responses.  Absent all of
-    # these (e.g. the minimal Devstral template), role="tool" messages raise.
+    # The template can natively render a tool-result turn only if it branches on
+    # the tool role itself — a quoted ``'tool'``/``"tool"`` role literal, Mistral's
+    # ``[TOOL_RESULTS]`` block, or Gemma's ``tool_responses``.  A bare
+    # ``tool_calls`` reference is NOT sufficient: templates iterate assistant
+    # ``tool_calls`` while still rejecting a separate ``role: "tool"`` message, so
+    # keying on it would skip the rewrite and reintroduce the crash.  Absent all
+    # of these (e.g. the minimal Devstral template), ``role: "tool"`` raises.
     handles_tool_role = (
         uses_tool_responses
         or "'tool'" in tpl
         or '"tool"' in tpl
-        or "tool_calls" in tpl
         or "[TOOL_RESULTS]" in tpl
     )
 

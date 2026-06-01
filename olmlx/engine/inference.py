@@ -2070,7 +2070,7 @@ def _convert_tool_messages_to_user_text(messages: list[dict]) -> list[dict]:
                         args = json.loads(args)
                     except (json.JSONDecodeError, TypeError):
                         args = {}
-                lines.append(f"[tool_call] {name}({json.dumps(args)})")
+                lines.append(f"[tool_call] {name}({json.dumps(args, default=str)})")
             existing = (m.get("content") or "").strip()
             m["content"] = (existing + "\n" if existing else "") + "\n".join(lines)
             m.pop("tool_calls", None)  # rendered into content; template ignores it
@@ -2531,7 +2531,10 @@ def _drive_segmented_prefill(
                 CachedPromptState(
                     tokens=flat[:final_prefill_end],
                     cache=snap,
-                    cache_type=segmented.segments[-1].role,
+                    # Snapshot spans the whole prompt (not an interior
+                    # boundary), so tier it by the leading role — matching how
+                    # tokenize_segmented_chat tiers injected preamble segments.
+                    cache_type=segmented.segments[0].role,
                     is_checkpoint=True,
                 )
             )
