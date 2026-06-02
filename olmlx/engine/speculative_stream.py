@@ -14,9 +14,26 @@ from typing import Any, Protocol
 
 import mlx.core as mx
 
+from olmlx.utils import metrics as _metrics
 from olmlx.utils.streaming import StreamToken
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_speculative_metrics(decoder: object) -> None:
+    """Record proposed/accepted speculative counts for a finished stream."""
+    stats_fn = getattr(decoder, "stats_summary", None)
+    if stats_fn is None:
+        return
+    try:
+        s = stats_fn()
+        _metrics.record_speculative(
+            decoder,
+            proposed=int(s.get("proposed", 0)),
+            accepted=int(s.get("accepted_draft", 0)),
+        )
+    except Exception:
+        logger.debug("metrics: record_speculative failed", exc_info=True)
 
 
 class TokenizerProtocol(Protocol):
@@ -106,6 +123,7 @@ def speculative_stream_generate(
             s.get("ema_acceptance_rate", 0.0),
             s.get("lambda", 0),
         )
+        _emit_speculative_metrics(decoder)
 
     while gen_count < max_tokens:
         if cancel_event.is_set():
