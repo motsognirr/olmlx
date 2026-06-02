@@ -3870,6 +3870,24 @@ async def _full_completion(
                         "Cache invalidated: non-streaming generation did not complete"
                     )
                     lm.prompt_cache_store.remove(cache_id)
+                # Symmetric with the streaming path: record a failed generation
+                # for any in-flight real exception. ``_full_completion_inner``
+                # records *success* on its normal return, so this fires only when
+                # it (or cache setup) raised. Client cancellations are excluded.
+                if not generation_complete:
+                    exc_type = sys.exc_info()[0]
+                    if exc_type is not None and not issubclass(
+                        exc_type, (GeneratorExit, asyncio.CancelledError)
+                    ):
+                        try:
+                            _metrics.observe_inference(
+                                lm.name, surface_var.get(), stats, error=True
+                            )
+                        except Exception:
+                            logger.debug(
+                                "metrics: error observe failed (non-stream)",
+                                exc_info=True,
+                            )
     if stop_sequences and result_dict:
         text = result_dict.get("text", "")
         earliest = -1

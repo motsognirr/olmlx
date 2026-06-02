@@ -138,7 +138,7 @@ class _FakeLoadedModel:
         self.size_bytes = 7_000_000
         self.active_refs = 1
         self.prompt_cache_store: object = _FakeStore()
-        self.weight_store = None
+        self.weight_store: object = None
         self.model = object()  # no prefetcher attribute
 
 
@@ -164,6 +164,32 @@ def test_collector_emits_gauges_and_folded_counters():
         'olmlx_prompt_cache_lookups_total{kind="radix",model="m1",result="hit"} 5.0'
         in body
     )
+
+
+class _SnapshotlessExpertStats:
+    # Has the counter attributes but no snapshot() method.
+    cache_hits = 11
+    cache_misses = 4
+    load_failures = 1
+    load_calls = 6
+
+
+class _FakeWeightStore:
+    def __init__(self):
+        self.stats = _SnapshotlessExpertStats()
+
+
+def test_collector_reads_expert_stats_without_snapshot_method():
+    reg = CollectorRegistry()
+    lm = _FakeLoadedModel("moe")
+    lm.weight_store = _FakeWeightStore()
+    reg.register(metrics.OlmlxStatsCollector(_FakeManager([lm])))
+    body = generate_latest(reg).decode()
+    # Live values must be reported, not silently zeroed by the {} fallback.
+    assert (
+        'olmlx_flash_expert_cache_events_total{model="moe",result="hit"} 11.0' in body
+    )
+    assert 'olmlx_flash_expert_load_calls_total{model="moe"} 6.0' in body
 
 
 def test_collector_safe_when_no_stores():

@@ -20,7 +20,8 @@ def test_inference_uses_live_metrics_module():
 
 def test_seams_call_observe_inference():
     src = inspect.getsource(inference)
-    # Two success seams + one error seam.
-    assert src.count("_metrics.observe_inference(") == 3
+    # Two success seams (stream done-chunk, non-stream return) + two error seams
+    # (stream finally, non-stream finally).
+    assert src.count("_metrics.observe_inference(") == 4
     assert "surface_var.get()" in src
-    assert "error=True" in src
+    assert src.count("error=True") == 2

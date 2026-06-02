@@ -347,7 +347,18 @@ class OlmlxStatsCollector:
             ws = getattr(lm, "weight_store", None)
             es = getattr(ws, "stats", None) if ws is not None else None
             if es is not None and hasattr(es, "cache_hits"):
-                snap = es.snapshot() if hasattr(es, "snapshot") else {}
+                # Fall back to direct attribute reads (not an empty dict) when a
+                # stats object lacks snapshot(), so live values aren't discarded.
+                snap = (
+                    es.snapshot()
+                    if hasattr(es, "snapshot")
+                    else {
+                        "cache_hits": getattr(es, "cache_hits", 0),
+                        "cache_misses": getattr(es, "cache_misses", 0),
+                        "load_failures": getattr(es, "load_failures", 0),
+                        "load_calls": getattr(es, "load_calls", 0),
+                    }
+                )
                 expert_c.add_metric(
                     [name, "hit"],
                     self._acc.total(f"{name}|ex_hit", snap.get("cache_hits", 0)),
