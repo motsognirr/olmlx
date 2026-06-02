@@ -15,13 +15,25 @@ Three layers:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 if TYPE_CHECKING:
     from olmlx.utils.timing import TimingStats
+
+
+class _ManagerProtocol(Protocol):
+    """Minimal structural type the collector needs from the model manager.
+
+    Typed as a Protocol (not the concrete ModelManager) to avoid a heavy/circular
+    import; the loaded-model objects are themselves duck-typed via getattr in
+    ``collect`` so the cache/flash stores are optional.
+    """
+
+    def get_loaded(self) -> list: ...
+
 
 # Private registry — see module docstring.
 REGISTRY = CollectorRegistry()
@@ -203,6 +215,12 @@ class CounterAccumulator:
     seen per key and add only the positive delta. When the live value drops below
     the last-seen value (a reset), we treat the new value as a fresh delta from
     zero so the exported total still only increases.
+
+    Approximation across a reset: this folds at most the new store's full live
+    value, so it never over-counts. The only inaccuracy is a slight *under*-count
+    when a reloaded store accumulates past the previous total before the first
+    scrape observes the reset — those interim events are missed. Acceptable for a
+    single-box monitoring tool where the source has no stable per-instance id.
     """
 
     def __init__(self) -> None:
@@ -231,7 +249,7 @@ class OlmlxStatsCollector:
     reload.
     """
 
-    def __init__(self, manager: Any) -> None:
+    def __init__(self, manager: _ManagerProtocol) -> None:
         self._manager = manager
         self._acc = CounterAccumulator()
 
