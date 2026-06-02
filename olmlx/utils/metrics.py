@@ -130,9 +130,9 @@ def observe_inference(
         return
     INFERENCE_REQUESTS.labels(model=model, surface=surface).inc()
     if stats.prompt_eval_count:
-        INFERENCE_TOKENS.labels(
-            model=model, surface=surface, direction="prompt"
-        ).inc(stats.prompt_eval_count)
+        INFERENCE_TOKENS.labels(model=model, surface=surface, direction="prompt").inc(
+            stats.prompt_eval_count
+        )
     if stats.eval_count:
         INFERENCE_TOKENS.labels(
             model=model, surface=surface, direction="completion"
