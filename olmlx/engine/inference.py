@@ -52,7 +52,9 @@ from olmlx.engine.grammar import (
     make_processor as _make_grammar_processor,
     unwrap_mlx_tokenizer as _unwrap_mlx_tokenizer,
 )
+from olmlx.context import surface_var
 from olmlx.engine.template_caps import TemplateCaps
+from olmlx.utils import metrics as _metrics
 from olmlx.utils.streaming import async_mlx_stream
 from olmlx.utils.timing import Timer, TimingStats
 
@@ -3659,6 +3661,10 @@ async def _stream_completion(
             done_chunk["done_reason"] = "timeout"
         if stop_hit:
             done_chunk["done_reason"] = "stop"
+        try:
+            _metrics.observe_inference(lm.name, surface_var.get(), stats)
+        except Exception:
+            logger.debug("metrics: observe_inference failed (stream)", exc_info=True)
         yield done_chunk
     finally:
         # Release GPU-backed references from gen_kwargs so they can be
@@ -3671,6 +3677,12 @@ async def _stream_completion(
         if not generation_complete and full_prompt_tokens is not None:
             logger.debug("Cache invalidated: generation did not complete")
             lm.prompt_cache_store.remove(cache_id)
+            try:
+                _metrics.observe_inference(
+                    lm.name, surface_var.get(), stats, error=True
+                )
+            except Exception:
+                logger.debug("metrics: error observe failed", exc_info=True)
         # We MUST wait for the Metal thread to finish before releasing
         # _inference_lock, otherwise the next inference will hit concurrent
         # Metal command buffer access.
@@ -4076,6 +4088,10 @@ async def _full_completion_inner(
         result_dict["tool_uses"] = tool_uses
     if thinking:
         result_dict["thinking"] = thinking
+    try:
+        _metrics.observe_inference(lm.name, surface_var.get(), stats)
+    except Exception:
+        logger.debug("metrics: observe_inference failed (non-stream)", exc_info=True)
     return result_dict
 
 
