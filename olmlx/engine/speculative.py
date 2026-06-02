@@ -30,6 +30,16 @@ from olmlx.engine.gdn_rollback import (
 
 logger = logging.getLogger(__name__)
 
+# Sub-chunk size for prefill forward passes. Matches mlx-lm's
+# ``generate_step`` ``prefill_step_size`` default so the speculative decoder
+# bounds activation memory the same way mlx-lm's native prefill does. A single
+# forward over a long prompt OOMs Metal — the attention-score intermediate for
+# a ~38k-token prefill exceeds the ~41 GB single-buffer limit (observed on
+# Qwen3.6-35B-A3B-6bit). Speculative decoders own their own prefill (prompt
+# caching is gated off for them), so they don't inherit the prompt-cache path's
+# segmented-prefill chunking — this is the equivalent bound for that path.
+_PREFILL_CHUNK = 2048
+
 
 def _logits(out: Any) -> mx.array:
     # mlx-vlm's language_model returns LanguageModelOutput(logits=...);
@@ -92,6 +102,28 @@ def _eval_cache(cache: list) -> None:
         )
 
 
+def _chunked_prefill(model: Any, tokens: mx.array, cache: list) -> None:
+    """Run ``model`` over ``tokens`` (shape (1, T)) to populate ``cache``,
+    in sub-chunks of at most ``_PREFILL_CHUNK`` tokens.
+
+    Logits are discarded; cache state is materialised (and the Metal buffer
+    cache cleared) after every sub-chunk so peak activation memory stays at
+    roughly one sub-chunk's worth instead of the whole prompt's. Mirrors
+    mlx-lm's prefill loop — without this, a single forward over a long prompt
+    OOMs Metal (the attention-score intermediate exceeds the ~41 GB
+    single-buffer limit). Standard KV-cached attention is chunking-invariant,
+    so the resulting cache state is identical to a single forward.
+    """
+    n = tokens.shape[1]
+    pos = 0
+    while pos < n:
+        stop = min(pos + _PREFILL_CHUNK, n)
+        model(tokens[:, pos:stop], cache=cache)
+        _eval_cache(cache)
+        mx.clear_cache()
+        pos = stop
+
+
 def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
     """Return the logit for the last prompt position without materialising
     the full [batch, seq_len, vocab] tensor.
@@ -111,8 +143,10 @@ def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
     if prompt.shape[1] <= 1:
         return _logits(model(prompt, cache=cache))[0, -1, :]
     prefix, last = prompt[:, :-1], prompt[:, -1:]
-    model(prefix, cache=cache)  # output discarded; lm_head never materialised
-    _eval_cache(cache)  # materialise KV state before the single-token pass
+    # Pass 1: fill the KV cache from the prefix in bounded sub-chunks. Output
+    # is discarded (lm_head never materialised over seq_len-1 positions) and
+    # cache state is materialised between passes for OOM avoidance.
+    _chunked_prefill(model, prefix, cache)
     return _logits(model(last, cache=cache))[0, 0, :]
 
 
@@ -372,9 +406,9 @@ class SpeculativeDecoder:
         )
         mx.eval(self._last_target_logit)
 
-        # Populate draft cache; logits not needed.
-        self._draft(prompt, cache=self._draft_cache)
-        _eval_cache(self._draft_cache)
+        # Populate draft cache; logits not needed. Sub-chunked like the target
+        # prefill above so a long prompt doesn't OOM Metal in one forward.
+        _chunked_prefill(self._draft, prompt, self._draft_cache)
 
         self._cache_seq_len = prompt.shape[1]
 

@@ -262,6 +262,94 @@ class TestPrefillLastLogit:
         assert cache[0].offset == prompt.shape[1]
 
 
+class _RecordingModel:
+    """Wraps a model and records the seq_len of every ``__call__``.
+
+    Used to assert that prefill bounds each forward pass to at most
+    ``_PREFILL_CHUNK`` tokens, the way mlx-lm's native prefill loop does —
+    a single forward over a very long prompt OOMs Metal (the
+    attention-score intermediate for a ~38k-token prefill exceeds the
+    ~41 GB single-buffer limit).
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.layers = inner.layers
+        self.calls: list[int] = []
+
+    def __call__(self, input_ids, cache=None):
+        self.calls.append(int(input_ids.shape[1]))
+        return self._inner(input_ids, cache=cache)
+
+    def __getattr__(self, name):
+        # Delegate anything not set on the wrapper (e.g. named_modules, used
+        # by find_gdn_class during SpeculativeDecoder construction) to inner.
+        if name == "_inner":
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
+class TestChunkedPrefill:
+    """Prefill must sub-chunk long prompts so no single ``model()`` forward
+    materialises an activation graph large enough to OOM Metal."""
+
+    def test_prefix_forward_bounded_to_chunk_size(self):
+        from mlx_lm.models.cache import make_prompt_cache
+
+        from olmlx.engine.speculative import _PREFILL_CHUNK, _prefill_last_logit
+
+        inner = MockModel(32, 16)
+        model = _RecordingModel(inner)
+        cache = make_prompt_cache(inner)
+        n = _PREFILL_CHUNK * 2 + 10
+        prompt = mx.zeros((1, n), dtype=mx.int32)
+
+        result = _prefill_last_logit(model, prompt, cache)
+        mx.eval(result)
+
+        # No single forward may exceed the chunk size (pass 2 is 1 token).
+        assert max(model.calls) <= _PREFILL_CHUNK
+        # Cache must still be fully populated to the prompt length.
+        assert cache[0].offset == n
+
+    def test_chunked_prefill_matches_naive_causal(self, monkeypatch):
+        """Sub-chunking must not change the last-position logit: standard
+        KV-cached attention is mathematically chunking-invariant."""
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine import speculative
+        from olmlx.engine.speculative import _prefill_last_logit
+
+        # Force several sub-chunks over a short prompt.
+        monkeypatch.setattr(speculative, "_PREFILL_CHUNK", 2)
+
+        model = _CausalMockModel(vocab_size=32, hidden_size=16)
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7]])
+
+        naive = model(prompt, cache=[KVCache()])[0, -1, :]
+        mx.eval(naive)
+
+        result = _prefill_last_logit(model, prompt, [KVCache()])
+        mx.eval(result)
+
+        assert mx.allclose(result, naive, atol=1e-4)
+
+    def test_draft_prefill_chunks_long_prompt(self):
+        """SpeculativeDecoder.prefill must also chunk the draft forward."""
+        from olmlx.engine.speculative import _PREFILL_CHUNK, SpeculativeDecoder
+
+        draft = _RecordingModel(MockModel(32, 16))
+        target = _RecordingModel(MockModel(32, 16))
+        decoder = SpeculativeDecoder(
+            draft_model=draft, target_model=target, num_speculative_tokens=2
+        )
+        n = _PREFILL_CHUNK * 2 + 5
+        decoder.prefill(mx.zeros((1, n), dtype=mx.int32))
+
+        assert max(draft.calls) <= _PREFILL_CHUNK
+        assert max(target.calls) <= _PREFILL_CHUNK
+
+
 class _CausalAttention:
     """Minimal scaled-dot-product attention over a real KV cache.
 
