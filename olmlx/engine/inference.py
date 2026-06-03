@@ -56,8 +56,19 @@ from olmlx.engine.grammar import (
 from olmlx.context import surface_var
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils import metrics as _metrics
+from olmlx.utils import tracing as _tracing
 from olmlx.utils.streaming import async_mlx_stream
 from olmlx.utils.timing import Timer, TimingStats
+
+
+def _strategy_label(lm: "LoadedModel") -> str:
+    """Tracing strategy attribute for a loaded model: ``"none"`` when not
+    speculative, else the decoder's metrics strategy label (classic/pld/…)."""
+    decoder = getattr(lm, "speculative_decoder", None)
+    if decoder is None:
+        return "none"
+    return _metrics._STRATEGY_BY_CLASS.get(type(decoder).__name__, "unknown")
+
 
 logger = logging.getLogger(__name__)
 
@@ -1379,6 +1390,25 @@ async def _release_pin_after_gen(
             lm.release_ref()
 
 
+async def _trace_inference_gen(
+    gen: AsyncGenerator[dict, None], lm: LoadedModel
+) -> AsyncGenerator[dict, None]:
+    """Hold a streaming-request ``inference`` span open for the generator's
+    whole lifetime so the seam's ``prefill``/``decode`` spans (opened while the
+    wrapped generator is being iterated) nest under it. Only wired in when
+    tracing is enabled, so the off path keeps its exact generator topology.
+    """
+    with _tracing.span(
+        "inference",
+        model=lm.name,
+        surface=surface_var.get(),
+        strategy=_strategy_label(lm),
+        **{"gen.stream": True},
+    ):
+        async for chunk in gen:
+            yield chunk
+
+
 def _merge_default_options(defaults: dict | None, request: dict | None) -> dict:
     """Merge per-model default options with per-request options.
 
@@ -2408,23 +2438,33 @@ async def generate_completion(
             # releases on any generator exit. Mark the flag for the outer
             # except so it doesn't double-release.
             pin_released_or_transferred = True
+            streamed = _release_pin_after_gen(gen, lm)
+            if _tracing.enabled():
+                streamed = _trace_inference_gen(streamed, lm)
             return _prepend_meta(
-                _release_pin_after_gen(gen, lm),
+                streamed,
                 {"thinking_expected": thinking_expected},
             )
         else:
             try:
-                result = await _full_completion(
-                    lm,
-                    prompt,
-                    mt,
-                    gen_kwargs,
-                    stats,
-                    images,
-                    keep_alive=keep_alive,
-                    grammar_active=grammar_active,
-                    adopt_pin=True,
-                )
+                with _tracing.span(
+                    "inference",
+                    model=lm.name,
+                    surface=surface_var.get(),
+                    strategy=_strategy_label(lm),
+                    **{"gen.stream": False},
+                ):
+                    result = await _full_completion(
+                        lm,
+                        prompt,
+                        mt,
+                        gen_kwargs,
+                        stats,
+                        images,
+                        keep_alive=keep_alive,
+                        grammar_active=grammar_active,
+                        adopt_pin=True,
+                    )
                 result["thinking_expected"] = thinking_expected
                 return result
             finally:
@@ -3473,50 +3513,64 @@ async def _stream_completion(
         else:
             use_speculative = lm.is_speculative and not images
 
-        if use_speculative:
-            from olmlx.engine.speculative_stream import async_speculative_stream
+        # prompt is a str or a token-id list; only the latter gives a count here.
+        _prefill_prompt_tokens = len(prompt) if isinstance(prompt, list) else None
+        with _tracing.span(
+            "prefill",
+            prompt_tokens=_prefill_prompt_tokens,
+            **{"gen.stream": True},
+        ):
+            if use_speculative:
+                from olmlx.engine.speculative_stream import async_speculative_stream
 
-            # Speculative decoding uses greedy argmax; sampling params are not supported.
-            _sampling_keys = {
-                "temperature",
-                "top_p",
-                "top_k",
-                "repetition_penalty",
-                "seed",
-            }
-            # Greedy-compatible defaults: temperature=0, top_p=1.0, top_k=0
-            _greedy_defaults = {"temperature": 0, "top_p": 1.0, "top_k": 0}
-            _dropped = {
-                k
-                for k in gen_kwargs
-                if k in _sampling_keys
-                and gen_kwargs[k] is not None
-                and gen_kwargs[k] != _greedy_defaults.get(k)
-            }
-            if _dropped:
-                logger.warning(
-                    "Speculative decoding uses greedy argmax; ignoring sampling parameters: %s",
-                    ", ".join(sorted(_dropped)),
+                # Speculative decoding uses greedy argmax; sampling params are not supported.
+                _sampling_keys = {
+                    "temperature",
+                    "top_p",
+                    "top_k",
+                    "repetition_penalty",
+                    "seed",
+                }
+                # Greedy-compatible defaults: temperature=0, top_p=1.0, top_k=0
+                _greedy_defaults = {"temperature": 0, "top_p": 1.0, "top_k": 0}
+                _dropped = {
+                    k
+                    for k in gen_kwargs
+                    if k in _sampling_keys
+                    and gen_kwargs[k] is not None
+                    and gen_kwargs[k] != _greedy_defaults.get(k)
+                }
+                if _dropped:
+                    logger.warning(
+                        "Speculative decoding uses greedy argmax; ignoring sampling parameters: %s",
+                        ", ".join(sorted(_dropped)),
+                    )
+                stream = async_speculative_stream(
+                    lm.speculative_decoder,
+                    lm.text_tokenizer,
+                    prompt,
+                    max_tokens=max_tokens,
                 )
-            stream = async_speculative_stream(
-                lm.speculative_decoder,
-                lm.text_tokenizer,
-                prompt,
-                max_tokens=max_tokens,
-            )
-        else:
-            if lm.is_speculative:
-                logger.debug("speculative decoding skipped: request includes images")
-            stream = async_mlx_stream(
-                lm.model,
-                lm.tokenizer,
-                prompt,
-                max_tokens=max_tokens,
-                is_vlm=lm.is_vlm,
-                images=images,
-                memory_limit=memory_limit,
-                **gen_kwargs,
-            )
+            else:
+                if lm.is_speculative:
+                    logger.debug(
+                        "speculative decoding skipped: request includes images"
+                    )
+                # The decode loop runs in the CancellableStream worker thread;
+                # OTel context does not cross threads, so hand the current context
+                # (under the request's inference span) to the stream for the worker
+                # to re-attach — otherwise worker-thread spans (e.g. flash) orphan.
+                stream = async_mlx_stream(
+                    lm.model,
+                    lm.tokenizer,
+                    prompt,
+                    max_tokens=max_tokens,
+                    is_vlm=lm.is_vlm,
+                    images=images,
+                    memory_limit=memory_limit,
+                    trace_context=_tracing.current_context(),
+                    **gen_kwargs,
+                )
 
         # Channel filter for gpt-oss models (decides which tokens to yield as text)
         channel_filter = (
@@ -3531,7 +3585,11 @@ async def _stream_completion(
         timed_out = False
         stop_hit = False
 
-        with _inference_ref(lm, keep_alive=keep_alive), Timer() as total_timer:
+        with (
+            _tracing.span("decode") as _decode_span,
+            _inference_ref(lm, keep_alive=keep_alive),
+            Timer() as total_timer,
+        ):
             with Timer() as eval_timer:
                 inf_start = time.monotonic()
                 token = None
@@ -3628,6 +3686,12 @@ async def _stream_completion(
                 prefilled_count=(
                     getattr(token, "prompt_tokens", None) if token is not None else None
                 ),
+            )
+            _decode_span.set_attributes(
+                {
+                    "eval_count": stats.eval_count,
+                    "decode_tok_s": _metrics._decode_tps(stats),
+                }
             )
 
         stats.total_duration = total_timer.duration_ns
@@ -4047,34 +4111,50 @@ async def _full_completion_inner(
         mx.synchronize(generation_stream)
         return result
 
-    with Timer() as total_timer:
-        with Timer() as eval_timer:
-            result = await asyncio.to_thread(_generate_sync)
+    # Non-streaming fuses prefill + decode inside the single _generate_sync
+    # thread call, so the two phases can't be time-separated here as they are
+    # in _stream_completion. The prefill span marks prompt readiness; the decode
+    # span wraps the generation work and carries the finalized token counts. Both
+    # nest under the entry-point ``inference`` span via the active OTel context.
+    prompt_token_count = len(prompt) if isinstance(prompt, list) else None
+    with _tracing.span(
+        "prefill", prompt_tokens=prompt_token_count, **{"gen.stream": False}
+    ):
+        pass
+    with _tracing.span("decode") as _decode_span:
+        with Timer() as total_timer:
+            with Timer() as eval_timer:
+                result = await asyncio.to_thread(_generate_sync)
+        stats.total_duration = total_timer.duration_ns
 
-    stats.total_duration = total_timer.duration_ns
+        # Unpack (GenerationResult, full_text) tuple from stream_generate path
+        full_text = None
+        if isinstance(result, tuple):
+            gen_result, full_text = result
+            result = gen_result
 
-    # Unpack (GenerationResult, full_text) tuple from stream_generate path
-    full_text = None
-    if isinstance(result, tuple):
-        gen_result, full_text = result
-        result = gen_result
+        # Extract token counts from GenerationResult (stream_generate) or string
+        if hasattr(result, "prompt_tokens"):
+            stats.prompt_eval_count = result.prompt_tokens
+        if hasattr(result, "generation_tokens"):
+            stats.eval_count = result.generation_tokens
 
-    # Extract token counts from GenerationResult (stream_generate) or string
-    if hasattr(result, "prompt_tokens"):
-        stats.prompt_eval_count = result.prompt_tokens
-    if hasattr(result, "generation_tokens"):
-        stats.eval_count = result.generation_tokens
-
-    prompt_tps, gen_tps = _derive_timing_stats(
-        stats,
-        getattr(result, "prompt_tps", 0) or 0,
-        getattr(result, "generation_tps", 0) or 0,
-        eval_timer.duration_ns,
-        # Non-streaming reports the mlx-lm-prefilled count as prompt_eval_count
-        # already, so this matches — passed explicitly for parity with the
-        # streaming path's cache-hit handling.
-        prefilled_count=getattr(result, "prompt_tokens", None),
-    )
+        prompt_tps, gen_tps = _derive_timing_stats(
+            stats,
+            getattr(result, "prompt_tps", 0) or 0,
+            getattr(result, "generation_tps", 0) or 0,
+            eval_timer.duration_ns,
+            # Non-streaming reports the mlx-lm-prefilled count as prompt_eval_count
+            # already, so this matches — passed explicitly for parity with the
+            # streaming path's cache-hit handling.
+            prefilled_count=getattr(result, "prompt_tokens", None),
+        )
+        _decode_span.set_attributes(
+            {
+                "eval_count": stats.eval_count,
+                "decode_tok_s": _metrics._decode_tps(stats),
+            }
+        )
     total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
     logger.info(
         "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
@@ -4398,30 +4478,40 @@ async def generate_chat(
             # releases on any generator exit. Mark the flag for the outer
             # except so it doesn't double-release.
             pin_released_or_transferred = True
+            streamed = _release_pin_after_gen(gen, lm)
+            if _tracing.enabled():
+                streamed = _trace_inference_gen(streamed, lm)
             return _prepend_meta(
-                _release_pin_after_gen(gen, lm),
+                streamed,
                 {"thinking_expected": thinking_expected},
             )
         else:
             try:
-                result = await _full_completion(
-                    lm,
-                    prompt,
-                    mt,
-                    gen_kwargs,
-                    stats,
-                    images,
-                    has_tools=bool(tools),
-                    use_prompt_cache=use_prompt_cache,
-                    prompt_tokens=prompt_tokens,
-                    cache_id=cache_id,
-                    keep_alive=keep_alive,
-                    grammar_active=grammar_active,
-                    adopt_pin=True,
-                    messages=messages,
-                    tokenizer=lm.tokenizer,
-                    template_kwargs=chat_template_kwargs,
-                )
+                with _tracing.span(
+                    "inference",
+                    model=lm.name,
+                    surface=surface_var.get(),
+                    strategy=_strategy_label(lm),
+                    **{"gen.stream": False},
+                ):
+                    result = await _full_completion(
+                        lm,
+                        prompt,
+                        mt,
+                        gen_kwargs,
+                        stats,
+                        images,
+                        has_tools=bool(tools),
+                        use_prompt_cache=use_prompt_cache,
+                        prompt_tokens=prompt_tokens,
+                        cache_id=cache_id,
+                        keep_alive=keep_alive,
+                        grammar_active=grammar_active,
+                        adopt_pin=True,
+                        messages=messages,
+                        tokenizer=lm.tokenizer,
+                        template_kwargs=chat_template_kwargs,
+                    )
                 # Mirror the streaming meta chunk so non-streaming routers
                 # can gate orphan `</think>` handling on the same signal
                 # (issue #307).
@@ -4500,7 +4590,15 @@ async def generate_embeddings(
         async with _inference_locked(
             lm.inference_queue_timeout, sync_mode=lm.sync_mode
         ):
-            with _inference_ref(lm, keep_alive=keep_alive, adopt=True):
+            with (
+                _tracing.span(
+                    "inference",
+                    model=lm.name,
+                    surface=surface_var.get(),
+                    strategy="none",
+                ),
+                _inference_ref(lm, keep_alive=keep_alive, adopt=True),
+            ):
                 embeddings = []
 
                 tokenizer = lm.text_tokenizer
@@ -4619,7 +4717,15 @@ async def generate_transcription(
         async with _inference_locked(
             lm.inference_queue_timeout, sync_mode=lm.sync_mode
         ):
-            with _inference_ref(lm, adopt=True):
+            with (
+                _tracing.span(
+                    "inference",
+                    model=lm.name,
+                    surface=surface_var.get(),
+                    strategy="none",
+                ),
+                _inference_ref(lm, adopt=True),
+            ):
                 # Inject the managed model so transcribe() reuses it. Safe because
                 # _inference_locked serializes inference (no ModelHolder race).
                 whisper_transcribe.ModelHolder.model = lm.model

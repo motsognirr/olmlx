@@ -77,6 +77,13 @@ def span(name: str, **attrs: Any) -> Any:
     return _LiveSpan(name, attrs)
 
 
+def enabled() -> bool:
+    """Whether tracing is active. Lets hot paths skip building tracing-only
+    wrappers (e.g. an extra streaming generator layer) when disabled, keeping
+    the off path allocation-free."""
+    return _ENABLED
+
+
 def shutdown_tracing() -> None:
     """Tear down the tracer and reset module state.
 
