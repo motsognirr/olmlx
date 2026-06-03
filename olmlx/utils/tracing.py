@@ -14,7 +14,10 @@ and shutdown resets state so repeated ``create_app()`` in tests is clean.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from olmlx.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -99,13 +102,77 @@ def _uninstall_log_filter(f: Any) -> None:  # replaced in Task 5
     return None
 
 
-class _LiveSpan:  # replaced in Task 6
+class _LiveSpan:
+    """Context manager wrapping ``tracer.start_as_current_span``.
+
+    Applies attributes on entry, records exceptions and sets ERROR status on
+    an exception exit. Only constructed when tracing is enabled.
+    """
+
     def __init__(self, name: str, attrs: dict[str, Any]) -> None:
         self._name = name
         self._attrs = attrs
+        self._cm: Any = None
+        self._span: Any = None
 
     def __enter__(self) -> Any:
-        return _NOOP_SPAN
+        self._cm = _TRACER.start_as_current_span(self._name)
+        self._span = self._cm.__enter__()
+        if self._attrs:
+            self._span.set_attributes(self._attrs)
+        return self._span
 
-    def __exit__(self, *a: Any) -> None:
-        return None
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        if exc is not None and self._span is not None:
+            from opentelemetry.trace import Status, StatusCode
+
+            self._span.record_exception(exc)
+            self._span.set_status(Status(StatusCode.ERROR, str(exc)))
+        return self._cm.__exit__(exc_type, exc, tb)
+
+
+def init_tracing(settings: "Settings") -> None:
+    """Initialize the global tracer. Called from lifespan startup only when
+    ``settings.tracing`` is true. Lazily imports opentelemetry. Idempotent.
+
+    Endpoint/protocol/headers/sampling come from the native OTEL_* env vars,
+    which the OTLPSpanExporter and SDK read on construction.
+    """
+    global _ENABLED, _TRACER, _PROVIDER, _LOG_FILTER
+    if _ENABLED:
+        return
+    import os
+
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        OTLPSpanExporter,
+    )
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    service_name = os.environ.get("OTEL_SERVICE_NAME", "olmlx")
+    resource = Resource.create({"service.name": service_name})
+    provider = TracerProvider(resource=resource)
+    # BatchSpanProcessor exports asynchronously off the inference thread; the
+    # SDK swallows export failures so they never surface to a request.
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+
+    _PROVIDER = provider
+    _TRACER = provider.get_tracer("olmlx")
+    _ENABLED = True
+    _LOG_FILTER = _install_log_filter()  # Task 5
+    logger.info("OpenTelemetry tracing enabled (service.name=%s)", service_name)
+
+
+def install_test_provider(provider: Any) -> None:
+    """Test hook: enable tracing against a caller-supplied TracerProvider
+    (e.g. one wired to InMemorySpanExporter) without OTLP or env config."""
+    global _ENABLED, _TRACER, _PROVIDER, _LOG_FILTER
+    _PROVIDER = provider
+    _TRACER = provider.get_tracer("olmlx")
+    _ENABLED = True
+    _LOG_FILTER = _install_log_filter()
+
+
+def _install_log_filter() -> Any:  # replaced in Task 5
+    return None

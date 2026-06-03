@@ -1,5 +1,7 @@
 import sys
 
+import pytest
+
 
 def test_span_disabled_returns_noop_singleton():
     """With tracing off, span() returns the same no-op object every call and
@@ -42,3 +44,47 @@ def test_noop_span_is_a_context_manager_returning_self():
     entered = cm.__enter__()
     assert entered is cm
     assert cm.__exit__(None, None, None) is None
+
+
+@pytest.fixture
+def otel_memory_exporter():
+    """Initialize tracing with an in-memory exporter; tear down after."""
+    pytest.importorskip("opentelemetry")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    import olmlx.utils.tracing as tracing
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracing.install_test_provider(provider)
+    yield tracing, exporter
+    tracing.shutdown_tracing()
+
+
+def test_enabled_span_records_attributes(otel_memory_exporter):
+    tracing, exporter = otel_memory_exporter
+    with tracing.span("prefill", model="m", prompt_tokens=10) as sp:
+        sp.set_attribute("ttft_ns", 123)
+    spans = exporter.get_finished_spans()
+    assert [s.name for s in spans] == ["prefill"]
+    attrs = dict(spans[0].attributes)
+    assert attrs["model"] == "m"
+    assert attrs["prompt_tokens"] == 10
+    assert attrs["ttft_ns"] == 123
+
+
+def test_enabled_span_records_exception_and_error_status(otel_memory_exporter):
+    tracing, exporter = otel_memory_exporter
+    from opentelemetry.trace import StatusCode
+
+    with pytest.raises(ValueError):
+        with tracing.span("boom"):
+            raise ValueError("kaboom")
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code == StatusCode.ERROR
+    assert any(e.name == "exception" for e in span.events)
