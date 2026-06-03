@@ -7,6 +7,7 @@ import importlib
 import itertools
 import json
 import logging
+import sys
 import threading
 import time
 import weakref
@@ -52,7 +53,9 @@ from olmlx.engine.grammar import (
     make_processor as _make_grammar_processor,
     unwrap_mlx_tokenizer as _unwrap_mlx_tokenizer,
 )
+from olmlx.context import surface_var
 from olmlx.engine.template_caps import TemplateCaps
+from olmlx.utils import metrics as _metrics
 from olmlx.utils.streaming import async_mlx_stream
 from olmlx.utils.timing import Timer, TimingStats
 
@@ -3659,6 +3662,10 @@ async def _stream_completion(
             done_chunk["done_reason"] = "timeout"
         if stop_hit:
             done_chunk["done_reason"] = "stop"
+        try:
+            _metrics.observe_inference(lm.name, surface_var.get(), stats)
+        except Exception:
+            logger.debug("metrics: observe_inference failed (stream)", exc_info=True)
         yield done_chunk
     finally:
         # Release GPU-backed references from gen_kwargs so they can be
@@ -3671,6 +3678,23 @@ async def _stream_completion(
         if not generation_complete and full_prompt_tokens is not None:
             logger.debug("Cache invalidated: generation did not complete")
             lm.prompt_cache_store.remove(cache_id)
+        # Record a failed generation for any in-flight real exception —
+        # independent of how far prefill got, so early failures (e.g. prefill
+        # OOM, which leaves full_prompt_tokens=None) are still counted. Client
+        # disconnects (GeneratorExit) and cancellations are not errors, so they
+        # are excluded; a clean early return leaves no exception so is also
+        # excluded.
+        if not generation_complete:
+            exc_type = sys.exc_info()[0]
+            if exc_type is not None and not issubclass(
+                exc_type, (GeneratorExit, asyncio.CancelledError)
+            ):
+                try:
+                    _metrics.observe_inference(
+                        lm.name, surface_var.get(), stats, error=True
+                    )
+                except Exception:
+                    logger.debug("metrics: error observe failed", exc_info=True)
         # We MUST wait for the Metal thread to finish before releasing
         # _inference_lock, otherwise the next inference will hit concurrent
         # Metal command buffer access.
@@ -3846,6 +3870,24 @@ async def _full_completion(
                         "Cache invalidated: non-streaming generation did not complete"
                     )
                     lm.prompt_cache_store.remove(cache_id)
+                # Symmetric with the streaming path: record a failed generation
+                # for any in-flight real exception. ``_full_completion_inner``
+                # records *success* on its normal return, so this fires only when
+                # it (or cache setup) raised. Client cancellations are excluded.
+                if not generation_complete:
+                    exc_type = sys.exc_info()[0]
+                    if exc_type is not None and not issubclass(
+                        exc_type, (GeneratorExit, asyncio.CancelledError)
+                    ):
+                        try:
+                            _metrics.observe_inference(
+                                lm.name, surface_var.get(), stats, error=True
+                            )
+                        except Exception:
+                            logger.debug(
+                                "metrics: error observe failed (non-stream)",
+                                exc_info=True,
+                            )
     if stop_sequences and result_dict:
         text = result_dict.get("text", "")
         earliest = -1
@@ -4076,6 +4118,10 @@ async def _full_completion_inner(
         result_dict["tool_uses"] = tool_uses
     if thinking:
         result_dict["thinking"] = thinking
+    try:
+        _metrics.observe_inference(lm.name, surface_var.get(), stats)
+    except Exception:
+        logger.debug("metrics: observe_inference failed (non-stream)", exc_info=True)
     return result_dict
 
 

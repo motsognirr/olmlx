@@ -19,6 +19,7 @@ dependencies = [
     "rich>=13.0",
     "xgrammar>=0.2.1",
     "mlx-whisper>=0.4.3",
+    "prometheus-client>=0.20",
 ]
 
 [project.scripts]

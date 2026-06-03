@@ -40,10 +40,12 @@ olmlx/
 │   ├── anthropic.py    # /v1/messages — Anthropic Messages API
 │   ├── openai.py       # /v1/chat/completions, /v1/completions, /v1/models, /v1/embeddings
 │   ├── audio.py        # /v1/audio/transcriptions — Whisper STT
+│   ├── metrics.py      # GET /metrics — Prometheus exposition
 │   └── *.py            # /api/{chat,generate,tags,show,ps,pull,copy,create,delete,embed,blobs,version} (Ollama)
 ├── schemas/            # Pydantic request/response models per API surface
 └── utils/
     ├── streaming.py    # async_mlx_stream, safe_ndjson_stream
+    ├── metrics.py      # Prometheus registry, helpers, lazy OlmlxStatsCollector
     └── timing.py       # Timer, TimingStats
 ```
 
@@ -84,6 +86,7 @@ olmlx/
 - **Audio transcription**: OpenAI-compatible `/v1/audio/transcriptions` via mlx-whisper. Whisper is a first-class `ModelManager` kind: `_detect_model_kind` matches `model_type == "whisper"` or mlx-whisper dims (`n_mels`/`n_audio_state`); `LoadedModel.is_whisper` guards LLM-only prompt-cache/KV-quant paths. `generate_transcription` injects the managed model into `mlx_whisper.transcribe.ModelHolder` (the module-level singleton — race-free under the serialized lock) and runs transcribe in a worker thread. Formats: `json`, `verbose_json`, `text`, `srt`, `vtt`. `ForceJSONMiddleware` skips `multipart/form-data` so upload boundary survives. **Requires ffmpeg on PATH**. Streaming and diarization out of scope.
 - **Terminal chat**: `olmlx chat` runs in-process via `ModelManager`/`generate_chat()` — no HTTP. Connects to external MCP servers (stdio/SSE) with a full agent loop. MCP config in Claude Desktop format at `~/.olmlx/mcp.json`.
 - **Model load timeout**: `OLMLX_MODEL_LOAD_TIMEOUT` → `ModelLoadTimeoutError` (HTTP 504).
+- **Prometheus metrics** (`utils/metrics.py`, `routers/metrics.py`): `GET /metrics` exposes operational metrics from a private `CollectorRegistry` (not the global default, so tests stay isolated). Three layers: (1) `MetricsMiddleware` records `olmlx_http_*` request/duration/in-flight and sets `surface_var` (ollama/openai/anthropic/audio, derived from path); (2) engine instrumentation reads the finalized `TimingStats` at the two shared `inference.py` seams (`_stream_completion` done-chunk, `_full_completion_inner` return) plus the error path, emitting `olmlx_inference_*` requests/errors/tokens/ttft/decode-tok-s — values are read from the same `TimingStats` the HTTP responses use, so they match `bench run`; speculative proposed/accepted recorded in `speculative_stream._log_stats`; (3) a lazy `OlmlxStatsCollector` registered in `lifespan` reads `ModelManager` at scrape time for point-in-time gauges (loaded models, KV bytes) and process-global cumulative counters (prompt-cache / flash / prefetch) folded through `CounterAccumulator` so they survive model eviction/reload (counters stay monotonic). Labels bounded (model, surface, strategy, route template); no per-request labels. The collector is unregistered on shutdown so repeated `create_app()` in tests doesn't raise a duplicate-collector error.
 
 ## Development
 

@@ -4,6 +4,10 @@ from contextvars import ContextVar
 
 request_id_var: ContextVar[str] = ContextVar("request_id", default="")
 
+# API surface for the current request: "ollama" | "openai" | "anthropic" |
+# "audio". Set by MetricsMiddleware; read by engine inference instrumentation.
+surface_var: ContextVar[str] = ContextVar("surface", default="unknown")
+
 
 class RequestIDFormatter(logging.Formatter):
     """Formatter that prefixes log messages with request ID from ContextVar."""
