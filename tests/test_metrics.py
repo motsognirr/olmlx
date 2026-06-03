@@ -192,6 +192,22 @@ def test_collector_reads_expert_stats_without_snapshot_method():
     assert 'olmlx_flash_expert_load_calls_total{model="moe"} 6.0' in body
 
 
+def test_collector_scrape_survives_one_malformed_model():
+    class _ExplodingStore:
+        @property
+        def metrics(self):
+            raise RuntimeError("boom")
+
+    bad = _FakeLoadedModel("bad")
+    bad.prompt_cache_store = _ExplodingStore()
+    good = _FakeLoadedModel("good")
+    reg = CollectorRegistry()
+    reg.register(metrics.OlmlxStatsCollector(_FakeManager([bad, good])))
+    body = generate_latest(reg).decode()  # must not raise
+    # The healthy model is still reported despite the bad one blowing up.
+    assert 'olmlx_model_size_bytes{model="good"} 7e+06' in body
+
+
 def test_collector_safe_when_no_stores():
     reg = CollectorRegistry()
     lm = _FakeLoadedModel("bare")

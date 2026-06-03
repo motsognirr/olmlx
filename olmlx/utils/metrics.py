@@ -15,6 +15,7 @@ Three layers:
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Protocol
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
@@ -22,6 +23,8 @@ from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 if TYPE_CHECKING:
     from olmlx.utils.timing import TimingStats
+
+logger = logging.getLogger(__name__)
 
 
 class _ManagerProtocol(Protocol):
@@ -309,7 +312,7 @@ class OlmlxStatsCollector:
             labels=["model"],
         )
 
-        for lm in loaded:
+        def _emit_one(lm: object) -> None:
             name = getattr(lm, "name", "") or ""
             size_g.add_metric([name], float(getattr(lm, "size_bytes", 0) or 0))
             refs_g.add_metric([name], float(getattr(lm, "active_refs", 0) or 0))
@@ -391,6 +394,14 @@ class OlmlxStatsCollector:
                 prefetch_sub_c.add_metric(
                     [name], self._acc.total(f"{name}|pf_sub", ps.submitted)
                 )
+
+        # Guard each model independently: a malformed stats object on one model
+        # must not fail the whole scrape (which would 500 /metrics).
+        for lm in loaded:
+            try:
+                _emit_one(lm)
+            except Exception:
+                logger.debug("metrics: per-model collect failed", exc_info=True)
 
         yield size_g
         yield refs_g
