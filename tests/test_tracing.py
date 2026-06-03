@@ -178,3 +178,29 @@ def test_off_path_never_imports_opentelemetry():
         [sys.executable, "-c", code], capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_install_test_provider_twice_no_duplicate_log_filter(otel_memory_exporter):
+    """Calling install_test_provider again without shutdown must not leave a
+    second correlation filter stamping each record (no accumulation)."""
+    import logging
+
+    tracing, _ = otel_memory_exporter  # fixture already installed once
+
+    root = logging.getLogger()
+    handler = root.handlers[0] if root.handlers else None
+    if handler is None:
+        handler = logging.NullHandler()
+        root.addHandler(handler)
+
+    def _filter_count():
+        return sum(
+            isinstance(f, tracing._TraceCorrelationFilter) for f in handler.filters
+        )
+
+    before = _filter_count()
+    # Re-install against a fresh provider without an intervening shutdown.
+    from opentelemetry.sdk.trace import TracerProvider
+
+    tracing.install_test_provider(TracerProvider())
+    assert _filter_count() == before  # old filter removed, not accumulated

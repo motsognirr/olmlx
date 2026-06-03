@@ -179,6 +179,10 @@ def install_test_provider(provider: Any) -> None:
     """Test hook: enable tracing against a caller-supplied TracerProvider
     (e.g. one wired to InMemorySpanExporter) without OTLP or env config."""
     global _ENABLED, _TRACER, _PROVIDER, _LOG_FILTER
+    # Remove a prior filter first so repeated calls without an intervening
+    # shutdown_tracing() don't leave duplicate filters stamping each record.
+    if _LOG_FILTER is not None:
+        _uninstall_log_filter(_LOG_FILTER)
     _PROVIDER = provider
     _TRACER = provider.get_tracer("olmlx")
     _ENABLED = True

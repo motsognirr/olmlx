@@ -139,6 +139,11 @@ async def test_streaming_trace_has_inference_prefill_decode(
     assert dict(by_name["inference"].attributes)["gen.stream"] is True
     assert by_name["prefill"].parent.span_id == by_name["inference"].context.span_id
     assert by_name["decode"].parent.span_id == by_name["inference"].context.span_id
+    # ttft_ns / cache_hit are surfaced on the decode span (the prefill forward
+    # happens lazily in the worker thread, so the prefill span can't time it).
+    decode_attrs = dict(by_name["decode"].attributes)
+    assert "ttft_ns" in decode_attrs
+    assert decode_attrs["cache_hit"] is False  # completions path, no prompt cache
 
 
 def test_speculative_step_and_verify_spans(memory_exporter):

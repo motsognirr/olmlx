@@ -3687,10 +3687,19 @@ async def _stream_completion(
                     getattr(token, "prompt_tokens", None) if token is not None else None
                 ),
             )
+            # ttft_ns: the prefill forward runs lazily inside the stream's
+            # first iteration (worker thread), so the prefill *span* can't time
+            # it; surface the measured prefill duration here instead. cache_hit:
+            # mlx re-prefilled fewer tokens than the full prompt → a prefix was
+            # served from the prompt cache.
             _decode_span.set_attributes(
                 {
                     "eval_count": stats.eval_count,
                     "decode_tok_s": _metrics._decode_tps(stats),
+                    "ttft_ns": stats.prompt_eval_duration,
+                    "cache_hit": bool(full_prompt_tokens)
+                    and token is not None
+                    and (token.prompt_tokens or 0) < len(full_prompt_tokens),
                 }
             )
 
@@ -4149,10 +4158,14 @@ async def _full_completion_inner(
             # streaming path's cache-hit handling.
             prefilled_count=getattr(result, "prompt_tokens", None),
         )
+        # ttft_ns: prefill + decode are fused in the single _generate_sync
+        # thread call here, so surface the measured prefill duration as the
+        # time-to-first-token attribute (the prefill span only marks readiness).
         _decode_span.set_attributes(
             {
                 "eval_count": stats.eval_count,
                 "decode_tok_s": _metrics._decode_tps(stats),
+                "ttft_ns": stats.prompt_eval_duration,
             }
         )
     total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
