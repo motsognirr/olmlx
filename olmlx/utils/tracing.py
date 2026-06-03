@@ -174,5 +174,40 @@ def install_test_provider(provider: Any) -> None:
     _LOG_FILTER = _install_log_filter()
 
 
+def current_context() -> Any:
+    """Capture the current OTel context for re-attachment in another thread.
+
+    Returns ``None`` when tracing is disabled; ``attach_context(None)`` is a
+    no-op, so call sites stay branch-free.
+    """
+    if not _ENABLED:
+        return None
+    from opentelemetry import context as otel_context
+
+    return otel_context.get_current()
+
+
+def attach_context(ctx: Any) -> Any:
+    """Attach a context captured by ``current_context`` inside a worker thread.
+
+    Returns a token to pass to ``detach_context``. No-op (returns ``None``)
+    when disabled or when ``ctx`` is ``None``.
+    """
+    if not _ENABLED or ctx is None:
+        return None
+    from opentelemetry import context as otel_context
+
+    return otel_context.attach(ctx)
+
+
+def detach_context(token: Any) -> None:
+    """Detach a context attached by ``attach_context``. No-op on ``None``."""
+    if token is None:
+        return None
+    from opentelemetry import context as otel_context
+
+    otel_context.detach(token)
+
+
 def _install_log_filter() -> Any:  # replaced in Task 5
     return None

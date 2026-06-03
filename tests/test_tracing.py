@@ -88,3 +88,38 @@ def test_enabled_span_records_exception_and_error_status(otel_memory_exporter):
     span = exporter.get_finished_spans()[0]
     assert span.status.status_code == StatusCode.ERROR
     assert any(e.name == "exception" for e in span.events)
+
+
+def test_cross_thread_child_nests_under_parent(otel_memory_exporter):
+    """A child span opened in a worker thread that re-attaches the captured
+    context is a child of the event-loop parent, not a new root."""
+    import concurrent.futures
+
+    tracing, exporter = otel_memory_exporter
+
+    with tracing.span("parent"):
+        ctx = tracing.current_context()
+
+        def worker():
+            token = tracing.attach_context(ctx)
+            try:
+                with tracing.span("child"):
+                    pass
+            finally:
+                tracing.detach_context(token)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(worker).result()
+
+    by_name = {s.name: s for s in exporter.get_finished_spans()}
+    assert by_name["child"].parent is not None
+    assert by_name["child"].parent.span_id == by_name["parent"].context.span_id
+
+
+def test_context_helpers_are_noops_when_disabled():
+    import olmlx.utils.tracing as tracing
+
+    tracing.shutdown_tracing()
+    ctx = tracing.current_context()
+    token = tracing.attach_context(ctx)
+    tracing.detach_context(token)  # must not raise
