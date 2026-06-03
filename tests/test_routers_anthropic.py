@@ -172,6 +172,48 @@ class TestConvertMessages:
         assert "Part 1" in messages[0]["content"]
         assert "Part 2" in messages[0]["content"]
 
+    def test_system_role_message_folded_into_leading_system(self):
+        """A ``system``-role message inside ``messages`` is folded into the
+        leading system block instead of appended at a non-zero index.
+
+        The Anthropic API carries system content in a dedicated top-level
+        field, but some clients (e.g. Claude Code) also place a ``system``
+        turn inside ``messages``.  Appending it verbatim produced a second
+        system message at index >= 1, which strict chat templates (Qwen3.6)
+        reject with "System message must be at the beginning." — a 500 on
+        every ``/v1/messages`` request.  Regression for that failure.
+        """
+        req = AnthropicMessagesRequest(
+            model="test",
+            system=[AnthropicContentBlock(type="text", text="Top-level system.")],
+            messages=[
+                AnthropicMessage(role="system", content="Inline system."),
+                AnthropicMessage(role="user", content="hello"),
+            ],
+        )
+        messages = _convert_messages(req)
+        # Exactly one system message, and it is first.
+        system_indices = [i for i, m in enumerate(messages) if m["role"] == "system"]
+        assert system_indices == [0]
+        assert "Top-level system." in messages[0]["content"]
+        assert "Inline system." in messages[0]["content"]
+        assert [m["role"] for m in messages] == ["system", "user"]
+
+    def test_system_role_message_without_top_level_system(self):
+        """A ``system``-role message in ``messages`` with no top-level system
+        still becomes the single leading system message."""
+        req = AnthropicMessagesRequest(
+            model="test",
+            messages=[
+                AnthropicMessage(role="system", content="Inline only."),
+                AnthropicMessage(role="user", content="hi"),
+            ],
+        )
+        messages = _convert_messages(req)
+        assert messages[0]["role"] == "system"
+        assert messages[0]["content"] == "Inline only."
+        assert [m["role"] for m in messages] == ["system", "user"]
+
     def test_assistant_with_tool_use(self):
         req = AnthropicMessagesRequest(
             model="test",

@@ -153,16 +153,36 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
     """
     messages = []
 
-    # System message (strip billing headers to preserve KV cache)
+    # System content is collected into a single leading message. The Anthropic
+    # API carries it in a dedicated top-level field, but some clients (e.g.
+    # Claude Code) also place a ``system`` turn inside ``messages``. Appending
+    # such a turn verbatim leaves a second system message at a non-zero index,
+    # which strict chat templates (Qwen3.6) reject with "System message must be
+    # at the beginning." — a 500 on every request. Fold all system content to
+    # the front instead.
+    system_parts: list[str] = []
+
+    # Top-level system (strip billing headers to preserve KV cache)
     system = _strip_billing_headers(req.system)
     if system:
         if isinstance(system, str):
-            messages.append({"role": "system", "content": system})
+            system_parts.append(system)
         else:
             text = " ".join(b.text for b in system if b.text)
-            messages.append({"role": "system", "content": text})
+            if text:
+                system_parts.append(text)
 
     for msg in req.messages:
+        if msg.role == "system":
+            if isinstance(msg.content, str):
+                if msg.content:
+                    system_parts.append(msg.content)
+            else:
+                text = " ".join(b.text for b in msg.content if b.text)
+                if text:
+                    system_parts.append(text)
+            continue
+
         if isinstance(msg.content, str):
             messages.append({"role": msg.role, "content": msg.content})
             continue
@@ -219,6 +239,9 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
                     )
             if text_parts:
                 messages.append({"role": "user", "content": " ".join(text_parts)})
+
+    if system_parts:
+        messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
 
     return messages
 
