@@ -236,6 +236,15 @@ class Settings(BaseSettings):
     #: pass. ``None`` defaults to L//4 at load time.
     speculative_layers_skip: Annotated[int, Field(ge=1)] | None = None
 
+    #: Cross-request KV-cache reuse for speculative decoding (issue #421).
+    #: Max persisted speculative cache lineages held on the per-model
+    #: decoder. Each slot is a full target (+draft) KV snapshot — multi-GB
+    #: for a 27B target — so the default is deliberately small. ``0``
+    #: disables reuse entirely (fresh prefill every turn — the pre-#421
+    #: behavior, useful as a kill switch). Only the ``classic`` and ``pld``
+    #: strategies honor this; ``dflash``/``eagle`` always fresh-prefill.
+    speculative_cache_slots: Annotated[int, Field(ge=0)] = 2
+
     # Tree-structured speculative verification (#358).  When enabled,
     # the classic speculative strategy produces a tree of draft alternatives
     # (top-K candidates per step) and verifies them against the target in

@@ -2906,6 +2906,7 @@ class ModelManager:
             num_speculative_tokens=num_tokens,
             tree_width=settings.tree_width if settings.tree_speculative else 1,
             tree_max_nodes=settings.tree_max_nodes,
+            cache_slots=settings.speculative_cache_slots,
         )
 
     def _load_pld_decoder(
@@ -2990,6 +2991,7 @@ class ModelManager:
             max_ngram_size=spec_config.pld_max_ngram,
             min_ngram_size=spec_config.pld_min_ngram,
             lookup_window=spec_config.pld_lookup_window,
+            cache_slots=settings.speculative_cache_slots,
         )
 
     def _load_self_speculative_decoder(

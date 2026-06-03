@@ -3545,11 +3545,41 @@ async def _stream_completion(
                         "Speculative decoding uses greedy argmax; ignoring sampling parameters: %s",
                         ", ".join(sorted(_dropped)),
                     )
+                # Cross-request KV reuse (#421): when the decoder owns an
+                # enabled snapshot store (classic / pld with
+                # OLMLX_SPECULATIVE_CACHE_SLOTS > 0), build a SegmentedPrompt so
+                # prefill reuses a stored prefix instead of re-prefilling the
+                # whole growing conversation each turn. Pass the *token list*
+                # (not the str) as the prompt and segment from those exact
+                # tokens so segmented.flatten() == the tokens prefill sees —
+                # the alignment the reuse path's boundary guard requires.
+                spec_prompt: str | list[int] = prompt
+                spec_segmented = None
+                _spec_store = getattr(lm.speculative_decoder, "_cache_store", None)
+                if (
+                    _spec_store is not None
+                    and _spec_store.enabled()
+                    and messages is not None
+                    and not lm.is_vlm
+                ):
+                    spec_tokens = (
+                        lm.text_tokenizer.encode(prompt)
+                        if isinstance(prompt, str)
+                        else list(prompt)
+                    )
+                    spec_segmented = tokenize_segmented_chat(
+                        lm.text_tokenizer,
+                        messages,
+                        full_tokens=spec_tokens,
+                        **(template_kwargs or {}),
+                    )
+                    spec_prompt = spec_tokens
                 stream = async_speculative_stream(
                     lm.speculative_decoder,
                     lm.text_tokenizer,
-                    prompt,
+                    spec_prompt,
                     max_tokens=max_tokens,
+                    segmented=spec_segmented,
                 )
             else:
                 if lm.is_speculative:
@@ -4408,6 +4438,10 @@ async def generate_chat(
         # speculative decoder owns its own internal target/draft caches and
         # would receive a misaligned suffix-only prompt on a cache hit —
         # ``async_speculative_stream`` does not consume ``gen_kwargs['prompt_cache']``.
+        # Cross-request reuse for speculative is instead self-managed by the
+        # decoder via its own ``_SpecCacheStore`` (issue #421), driven by the
+        # ``SegmentedPrompt`` built on the speculative branch above — so the
+        # ``not lm.is_speculative`` gate here stays correct.
         # Also disabled for VLMs on the non-streaming path because
         # ``mlx_vlm.generate`` accepts neither ``prompt_cache`` nor ``input_ids``.
         # Per-model ``prompt_cache`` (set in models.json) overrides the global
