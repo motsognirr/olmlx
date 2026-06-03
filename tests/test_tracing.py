@@ -158,3 +158,23 @@ def test_log_filter_not_installed_when_disabled():
     record = logging.LogRecord("olmlx", logging.INFO, __file__, 1, "msg", None, None)
     # No filter installed → attribute absent.
     assert not hasattr(record, "trace_id")
+
+
+def test_off_path_never_imports_opentelemetry():
+    """AC #2: with tracing disabled, exercising the span call site must not
+    pull opentelemetry into sys.modules."""
+    import subprocess
+
+    code = (
+        "import sys; import olmlx.utils.tracing as t; "
+        "t.shutdown_tracing(); "
+        "[t.span('s', a=1).__enter__() or t.span('s').__exit__(None,None,None) "
+        "for _ in range(3)]; "
+        "assert 'opentelemetry' not in sys.modules, sorted(sys.modules)"
+    )
+    # Subprocess so a prior test that imported opentelemetry can't pollute the
+    # assertion via the shared interpreter's module cache.
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
