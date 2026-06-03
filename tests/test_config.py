@@ -544,3 +544,17 @@ def test_audio_max_bytes_env_override(monkeypatch):
 
     s = Settings()
     assert s.audio_max_bytes == 1048576
+
+
+def test_tracing_defaults_off(monkeypatch):
+    monkeypatch.delenv("OLMLX_TRACING", raising=False)
+    from olmlx.config import Settings
+
+    assert Settings().tracing is False
+
+
+def test_tracing_env_toggle(monkeypatch):
+    monkeypatch.setenv("OLMLX_TRACING", "true")
+    from olmlx.config import Settings
+
+    assert Settings().tracing is True

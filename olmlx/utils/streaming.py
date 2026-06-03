@@ -384,16 +384,24 @@ class CancellableStream:
     """
 
     def __init__(
-        self, gen_factory: Callable[[threading.Event], Generator], is_vlm: bool = False
+        self,
+        gen_factory: Callable[[threading.Event], Generator],
+        is_vlm: bool = False,
+        trace_context: Any = None,
     ):
         """
         Args:
             gen_factory: Called with a cancel_event; should return a generator
                          that yields response objects with text/token/etc attrs.
             is_vlm: Whether the model is a VLM (affects which generation_stream to sync).
+            trace_context: Optional captured OTel context to re-attach inside the
+                worker thread so spans opened there (e.g. flash weight loads) nest
+                under the request trace. ``None`` (the default / tracing-off) is a
+                no-op.
         """
         self._gen_factory = gen_factory
         self._is_vlm = is_vlm
+        self._trace_context = trace_context
         self._cancel_event = threading.Event()
         self._stream_done = threading.Event()
         # Queue items are one of: a StreamToken, an error dict, or _SENTINEL.
@@ -411,6 +419,12 @@ class CancellableStream:
         self._cancel_event.set()
 
     def _run(self):
+        from olmlx.utils import tracing as _tracing
+
+        # Re-attach the request's OTel context (captured on the calling
+        # coroutine) so any spans opened in this worker thread nest under the
+        # request trace. No-op when tracing is off or no context was passed.
+        _trace_token = _tracing.attach_context(self._trace_context)
         gen = None
         try:
             gen = self._gen_factory(self._cancel_event)
@@ -494,6 +508,9 @@ class CancellableStream:
                 ).result(timeout=_QUEUE_PUT_TIMEOUT)
             except Exception:
                 pass
+
+            # Detach the OTel context last, after all worker-thread work.
+            _tracing.detach_context(_trace_token)
 
     async def drain_and_join(self, timeout: float = 60.0):
         """Drain remaining items from the queue and wait for the thread to finish.
@@ -648,6 +665,7 @@ def async_mlx_stream(
     is_vlm: bool = False,
     images: list[str] | None = None,
     memory_limit: int = 0,
+    trace_context: Any = None,
     **kwargs: Any,
 ) -> CancellableStream:
     """Bridge sync mlx_lm/mlx_vlm stream_generate into an async iterable.
@@ -701,6 +719,6 @@ def async_mlx_stream(
 
             return mlx_lm.stream_generate(model, tokenizer, **gen_kwargs)
 
-    stream = CancellableStream(gen_factory, is_vlm=is_vlm)
+    stream = CancellableStream(gen_factory, is_vlm=is_vlm, trace_context=trace_context)
     stream.start()
     return stream

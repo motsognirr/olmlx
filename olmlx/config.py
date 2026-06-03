@@ -103,6 +103,14 @@ class Settings(BaseSettings):
     inference_headroom_fraction: Annotated[float, Field(ge=0, lt=1.0)] = 0.0
     model_load_timeout: Annotated[float, Field(gt=0)] | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    # OpenTelemetry tracing master switch (OLMLX_TRACING). Default off.
+    # When off, nothing under olmlx.utils.tracing imports opentelemetry, so
+    # there is no import-time or per-request cost. All endpoint/protocol/
+    # headers/sampling/service-name configuration comes from the native
+    # OTEL_* env vars the OTLP exporter and SDK already honor
+    # (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL,
+    # OTEL_TRACES_SAMPLER, OTEL_SERVICE_NAME, OTEL_TRACES_EXPORTER=console, …).
+    tracing: bool = False
     prompt_cache: bool = True
     prompt_cache_max_tokens: Annotated[int, Field(gt=0)] | None = 32768
     prompt_cache_max_slots: Annotated[int, Field(gt=0)] = 4

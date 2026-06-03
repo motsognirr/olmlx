@@ -672,6 +672,61 @@ throughput/latency values are read from the same timings reported by
 `/metrics` series for per-model counters persist across model eviction/reload
 (they are folded into process-lifetime totals).
 
+#### Distributed Tracing (OpenTelemetry)
+
+olmlx can emit per-phase OpenTelemetry spans for each request, exportable to any
+OTLP collector (Jaeger, Tempo, Honeycomb, …). Tracing is **off by default** and
+adds **zero cost when disabled** — nothing under `olmlx.utils.tracing` even
+imports `opentelemetry` on the off path.
+
+**Install** the optional dependencies and **enable** the toggle:
+
+```bash
+uv sync --extra otel          # installs the OTel SDK + OTLP HTTP exporter
+OLMLX_TRACING=true uv run olmlx
+```
+
+All endpoint/protocol/sampling/service-name configuration uses the **native
+`OTEL_*` environment variables** the SDK already honors — olmlx adds no settings
+of its own beyond the `OLMLX_TRACING` switch:
+
+| Env var | Purpose | Example |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector URL | `http://localhost:4318` |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` (default) or `grpc` | `http/protobuf` |
+| `OTEL_TRACES_SAMPLER` | Sampling strategy (bound span volume) | `parentbased_traceidratio` |
+| `OTEL_TRACES_SAMPLER_ARG` | Sampler argument | `0.1` (sample 10%) |
+| `OTEL_SERVICE_NAME` | Service name in the trace UI | `olmlx` |
+| `OTEL_TRACES_EXPORTER=console` | Print spans to stderr (no collector needed) | for local debugging |
+
+**Span inventory** (one trace per HTTP request):
+
+```
+http.request                       (root: http.method, http.route, surface, status, request_id)
+└─ inference                       (model, surface, strategy, gen.stream)
+   ├─ prefill                      (prompt_tokens)
+   ├─ decode                       (eval_count, decode_tok_s)
+   ├─ spec.prefill / spec.step / spec.verify   (strategy, proposed, accepted)
+   ├─ flash.prefetch / flash.weight_load        (layer_idx, active_neurons/experts)
+   └─ cache.disk_read / cache.disk_write        (cache_id, hit, bytes)
+mcp.tool_call                      (terminal chat: tool.name, mcp.server)
+```
+
+Per-step speculative spans are intentionally high-volume — bound them with
+`OTEL_TRACES_SAMPLER`. Log lines emitted while a span is active are stamped with
+`trace_id`/`span_id` so a log can be pivoted to its trace.
+
+**Quick start with Jaeger** (collector-free local viewing):
+
+```bash
+docker run --rm -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one
+OLMLX_TRACING=true OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 uv run olmlx
+# send a request, then open the Jaeger UI at http://localhost:16686
+```
+
+For a quick check without any collector, set `OTEL_TRACES_EXPORTER=console` to
+print spans to stderr.
+
 #### POST /api/chat — Chat Completion
 
 ```bash
@@ -1177,6 +1232,7 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_MEMORY_LIMIT_FRACTION` | float | `0.75` | Max fraction of system RAM for Metal GPU memory (0-1]. Models exceeding this are rejected with HTTP 503 |
 | `OLMLX_MODEL_LOAD_TIMEOUT` | float/None | `None` | Timeout in seconds for model loading. `None` = no timeout |
 | `OLMLX_LOG_LEVEL` | string | `INFO` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+| `OLMLX_TRACING` | bool | `false` | Enable OpenTelemetry tracing (requires `uv sync --extra otel`). Endpoint/sampler/etc. configured via native `OTEL_*` env vars. See "Distributed Tracing" above |
 | `OLMLX_INFERENCE_QUEUE_TIMEOUT` | float/None | `300.0` | Max seconds to wait for inference lock (5 min). `None` = no timeout |
 | `OLMLX_MAX_TOKENS_LIMIT` | int | `131072` | Maximum tokens allowed per request |
 | `OLMLX_CORS_ORIGINS` | list | `["http://localhost:*", "http://127.0.0.1:*"]` | Allowed CORS origins |

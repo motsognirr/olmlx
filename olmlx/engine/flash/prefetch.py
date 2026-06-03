@@ -26,6 +26,7 @@ import mlx.core as mx
 
 from olmlx.engine.flash.predictor import LookaheadBank, PredictorBank
 from olmlx.engine.flash.weight_store import FlashWeightStore
+from olmlx.utils import tracing as _tracing
 
 logger = logging.getLogger(__name__)
 
@@ -313,12 +314,17 @@ class Prefetcher:
         if not neuron_indices:
             return
 
-        state = _LayerPrefetchState()
-        with self._lock:
-            if layer_idx in self._pending:
-                return  # already in flight
-            self._pending[layer_idx] = state
-        self._enqueue_io(layer_idx, neuron_indices, state)
+        # Span covers the synchronous register+submit on the calling thread; the
+        # actual SSD reads run async in the I/O pool (not timed by this span).
+        with _tracing.span(
+            "flash.prefetch", layer_idx=layer_idx, neurons=len(neuron_indices)
+        ):
+            state = _LayerPrefetchState()
+            with self._lock:
+                if layer_idx in self._pending:
+                    return  # already in flight
+                self._pending[layer_idx] = state
+            self._enqueue_io(layer_idx, neuron_indices, state)
 
     def close(self) -> None:
         """Shut down both the prediction and I/O thread pools.
