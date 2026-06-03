@@ -186,3 +186,41 @@ class TestStreamPrefillCancellation:
             tokenizer=None,
         )
         assert list(gen) == []
+
+    def test_stream_resets_decoder_on_prefill_cancel(self):
+        """Cancelling prefill must release the decoder's partial KV caches
+        eagerly via reset(), not leave them on the long-lived decoder instance
+        until the next request's prefill()."""
+        from olmlx.engine.speculative import PrefillCancelled
+        from olmlx.engine.speculative_stream import speculative_stream_generate
+
+        cancel = threading.Event()
+
+        class _FakeDecoder:
+            def __init__(self):
+                self.reset_calls = 0
+                self.cache = None
+
+            def prefill(self, prompt, cancel_event=None):
+                self.cache = ["partial-kv"]  # simulate populated caches
+                raise PrefillCancelled()
+
+            def step(self):  # pragma: no cover - never reached
+                raise AssertionError("step() must not run after prefill cancel")
+
+            def reset(self):
+                self.reset_calls += 1
+                self.cache = None
+
+        decoder = _FakeDecoder()
+        gen = speculative_stream_generate(
+            decoder,
+            [1, 2, 3],
+            max_tokens=10,
+            cancel_event=cancel,
+            eos_token_id=None,
+            tokenizer=None,
+        )
+        assert list(gen) == []
+        assert decoder.reset_calls == 1
+        assert decoder.cache is None

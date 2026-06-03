@@ -82,6 +82,9 @@ def speculative_stream_generate(
         # Client disconnected mid-prefill. Exit cleanly with no tokens so the
         # caller's drain_and_join() completes and the inference lock is released
         # promptly — no deferred GPU cleanup, no 503 for the next request.
+        # reset() frees any partial KV caches eagerly rather than leaving them
+        # on the long-lived per-model decoder until the next prefill().
+        decoder.reset()
         return
     prefill_elapsed = time.perf_counter() - t0
     prompt_tps_val = prompt_len / max(prefill_elapsed, 1e-9)
