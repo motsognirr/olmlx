@@ -7,6 +7,7 @@ No external draft model required. Works under Flash and Flash-MoE.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, cast
 
 import mlx.core as mx
@@ -19,7 +20,7 @@ except ImportError:  # pragma: no cover — mlx-lm is always available at runtim
     trim_prompt_cache = None
 
 from olmlx.engine.gdn_rollback import find_gdn_class, get_model_layers
-from olmlx.engine.speculative import verify_draft_greedy
+from olmlx.engine.speculative import PrefillCancelled, verify_draft_greedy
 
 logger = logging.getLogger(__name__)
 
@@ -89,17 +90,34 @@ def _eval_cache(cache: list) -> None:
         mx.eval(*arrs)
 
 
-def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
+def _prefill_last_logit(
+    model: Any,
+    prompt: mx.array,
+    cache: list,
+    cancel_event: threading.Event | None = None,
+) -> mx.array:
     """Return the logit for the last prompt position (mirrors speculative.py).
 
     Two-pass split: prefix fills cache (logits discarded), last token
     produces a [1, 1, vocab] logit.
+
+    If ``cancel_event`` is set, raises :class:`PrefillCancelled` before each
+    forward so a client disconnect interrupts at a pass boundary rather than
+    pinning the GPU. The prefix pass is one ``model()`` call (no
+    ``_PREFILL_CHUNK`` sub-chunk loop, unlike the classic decoder), so the
+    granularity is "before prefix" / "before last token" — coarser than the
+    classic decoder but enough to skip the second large forward once the
+    request is gone.
     """
+    if cancel_event is not None and cancel_event.is_set():
+        raise PrefillCancelled()
     if prompt.shape[1] <= 1:
         return _logits(model(prompt, cache=cache))[0, -1, :]
     prefix, last = prompt[:, :-1], prompt[:, -1:]
     model(prefix, cache=cache)
     _eval_cache(cache)
+    if cancel_event is not None and cancel_event.is_set():
+        raise PrefillCancelled()
     return _logits(model(last, cache=cache))[0, 0, :]
 
 
@@ -268,10 +286,18 @@ class SelfSpeculativeDecoder:
     # Protocol: prefill / step
     # ------------------------------------------------------------------
 
-    def prefill(self, prompt: mx.array) -> int:
+    def prefill(
+        self, prompt: mx.array, cancel_event: threading.Event | None = None
+    ) -> int:
         """Process the prompt through the full model, populating KV cache.
 
         Returns the first generated token.
+
+        ``cancel_event`` is required by ``SpeculativeDecoderProtocol`` (which
+        ``speculative_stream_generate`` calls with the kwarg). Self-speculative
+        prefills in a single forward, so it is honored only at the two
+        ``_prefill_last_logit`` pass boundaries — enough to interrupt a
+        disconnected request before the second large forward.
         """
         self.reset()
 
@@ -282,7 +308,9 @@ class SelfSpeculativeDecoder:
             if hasattr(self._target, attr):
                 setattr(self._target, attr, None)
 
-        self._last_logit = _prefill_last_logit(self._target, prompt, self._cache)
+        self._last_logit = _prefill_last_logit(
+            self._target, prompt, self._cache, cancel_event=cancel_event
+        )
         mx.eval(self._last_logit)
 
         self._prompt_len = prompt.shape[1]
