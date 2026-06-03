@@ -188,6 +188,10 @@ def _prefill_last_logit(
     # is discarded (lm_head never materialised over seq_len-1 positions) and
     # cache state is materialised between passes for OOM avoidance.
     _chunked_prefill(model, prefix, cache, cancel_event=cancel_event)
+    # Cancel may have fired on the final prefix sub-chunk; skip the trailing
+    # forward too so post-cancel work stays bounded to one sub-chunk.
+    if cancel_event is not None and cancel_event.is_set():
+        raise PrefillCancelled()
     return _logits(model(last, cache=cache))[0, 0, :]
 
 

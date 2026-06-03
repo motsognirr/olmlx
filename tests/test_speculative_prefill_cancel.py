@@ -49,10 +49,10 @@ class TestChunkedPrefillCancellation:
         import pytest
 
         inner = MockModel(32, 16)
-        model = _CancelOnNthCall(inner, threading.Event())
-        cache = make_prompt_cache(inner)
         cancel = threading.Event()
         cancel.set()  # already cancelled before any work
+        model = _CancelOnNthCall(inner, cancel)
+        cache = make_prompt_cache(inner)
         prompt = mx.zeros((1, 100), dtype=mx.int32)
 
         with pytest.raises(PrefillCancelled):
@@ -116,6 +116,28 @@ class TestChunkedPrefillCancellation:
 
         with pytest.raises(PrefillCancelled):
             _prefill_last_logit(inner, prompt, cache, cancel_event=cancel)
+
+    def test_prefill_last_logit_skips_final_forward_when_cancelled_after_prefix(self):
+        """Cancel set during the prefix loop must skip the final-token forward,
+        not just stop the prefix — bound post-cancel work to one sub-chunk."""
+        from mlx_lm.models.cache import make_prompt_cache
+
+        import pytest
+
+        from olmlx.engine.speculative import PrefillCancelled, _prefill_last_logit
+
+        cancel = threading.Event()
+        inner = MockModel(32, 16)
+        # Sets cancel after the first (prefix) forward; the final 1-token
+        # forward must then be skipped rather than run unchecked.
+        model = _CancelOnNthCall(inner, cancel, n=1)
+        cache = make_prompt_cache(inner)
+        prompt = mx.zeros((1, 3), dtype=mx.int32)  # prefix=2 (one chunk), last=1
+
+        with pytest.raises(PrefillCancelled):
+            _prefill_last_logit(model, prompt, cache, cancel_event=cancel)
+
+        assert model.calls == [2]  # only the prefix forward; final token skipped
 
 
 class TestDecoderPrefillCancellation:
