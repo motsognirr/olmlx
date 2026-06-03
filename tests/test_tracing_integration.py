@@ -155,3 +155,36 @@ async def test_streaming_trace_has_inference_prefill_decode(
     assert dict(by_name["inference"].attributes)["gen.stream"] is True
     assert by_name["prefill"].parent.span_id == by_name["inference"].context.span_id
     assert by_name["decode"].parent.span_id == by_name["inference"].context.span_id
+
+
+def test_speculative_step_and_verify_spans(memory_exporter):
+    """A classic speculative decode emits spec.prefill, per-step spec.step, and
+    a spec.verify sub-span with proposed/accepted attributes."""
+    import mlx.core as mx
+
+    from olmlx.engine.speculative import SpeculativeDecoder
+    from tests.test_flash_speculative import MockModel
+
+    vocab_size, hidden_size = 32, 16
+    draft = MockModel(vocab_size, hidden_size)
+    target = MockModel(vocab_size, hidden_size)
+    decoder = SpeculativeDecoder(
+        draft_model=draft,
+        target_model=target,
+        num_speculative_tokens=3,
+    )
+
+    decoder.prefill(mx.array([[1, 2, 3, 4, 5]]))
+    for _ in range(3):
+        decoder.step()
+
+    spans = memory_exporter.get_finished_spans()
+    names = [s.name for s in spans]
+    assert "spec.prefill" in names
+    assert names.count("spec.step") == 3
+    assert "spec.verify" in names
+
+    step = next(s for s in spans if s.name == "spec.step")
+    attrs = dict(step.attributes)
+    assert "proposed" in attrs and "accepted" in attrs
+    assert attrs["strategy"] in {"classic", "pld", "dflash", "eagle", "self"}

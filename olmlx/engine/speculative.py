@@ -27,8 +27,18 @@ from olmlx.engine.gdn_rollback import (
     GDNStateCapture,
     find_gdn_class,
 )
+from olmlx.utils import tracing as _tracing
 
 logger = logging.getLogger(__name__)
+
+
+def _spec_strategy(decoder: object) -> str:
+    """Tracing ``strategy`` attribute for a decoder, reusing the metrics
+    class→label map (classic/pld/dflash/eagle/self)."""
+    from olmlx.utils import metrics as _metrics
+
+    return _metrics._STRATEGY_BY_CLASS.get(type(decoder).__name__, "unknown")
+
 
 # Sub-chunk size for prefill forward passes. Matches mlx-lm's
 # ``generate_step`` ``prefill_step_size`` default so the speculative decoder
@@ -375,46 +385,51 @@ class SpeculativeDecoder:
         Returns:
             The first generated token (from target model's greedy argmax).
         """
-        self.reset()
+        with _tracing.span(
+            "spec.prefill",
+            strategy=_spec_strategy(self),
+            prompt_tokens=int(prompt.shape[-1]),
+        ):
+            self.reset()
 
-        if make_prompt_cache is None or trim_prompt_cache is None:
-            raise RuntimeError(
-                "mlx_lm.models.cache not available; cannot use cached speculative decoding"
+            if make_prompt_cache is None or trim_prompt_cache is None:
+                raise RuntimeError(
+                    "mlx_lm.models.cache not available; cannot use cached speculative decoding"
+                )
+
+            self._target_cache = make_prompt_cache(self._target)
+            self._draft_cache = make_prompt_cache(self._draft)
+
+            # Observed on mlx-vlm 0.4.4 with Qwen3_5: the language model caches
+            # `_position_ids` and `_rope_deltas` on the module instance across
+            # calls.  Left over from a prior request they produce broadcast
+            # mismatches when a new prompt has a different length.  Reset them
+            # at the start of each prefill.  If a future VLM caches analogous
+            # state under a different attribute name, add it here.
+            for attr in ("_position_ids", "_rope_deltas"):
+                if hasattr(self._target, attr):
+                    setattr(self._target, attr, None)
+
+            # Suppress GDN capture during prefill: no rollback is needed
+            # for the prompt forward, and recording it would just bloat the
+            # buffers (which are sized for one step's worth of captures).
+            if self._gdn_capture is not None:
+                self._gdn_capture.use_buffer(None)
+
+            self._last_target_logit = _prefill_last_logit(
+                self._target, prompt, self._target_cache
             )
+            mx.eval(self._last_target_logit)
 
-        self._target_cache = make_prompt_cache(self._target)
-        self._draft_cache = make_prompt_cache(self._draft)
+            # Populate draft cache; logits not needed. Sub-chunked like the target
+            # prefill above so a long prompt doesn't OOM Metal in one forward.
+            _chunked_prefill(self._draft, prompt, self._draft_cache)
 
-        # Observed on mlx-vlm 0.4.4 with Qwen3_5: the language model caches
-        # `_position_ids` and `_rope_deltas` on the module instance across
-        # calls.  Left over from a prior request they produce broadcast
-        # mismatches when a new prompt has a different length.  Reset them
-        # at the start of each prefill.  If a future VLM caches analogous
-        # state under a different attribute name, add it here.
-        for attr in ("_position_ids", "_rope_deltas"):
-            if hasattr(self._target, attr):
-                setattr(self._target, attr, None)
+            self._cache_seq_len = prompt.shape[1]
 
-        # Suppress GDN capture during prefill: no rollback is needed
-        # for the prompt forward, and recording it would just bloat the
-        # buffers (which are sized for one step's worth of captures).
-        if self._gdn_capture is not None:
-            self._gdn_capture.use_buffer(None)
-
-        self._last_target_logit = _prefill_last_logit(
-            self._target, prompt, self._target_cache
-        )
-        mx.eval(self._last_target_logit)
-
-        # Populate draft cache; logits not needed. Sub-chunked like the target
-        # prefill above so a long prompt doesn't OOM Metal in one forward.
-        _chunked_prefill(self._draft, prompt, self._draft_cache)
-
-        self._cache_seq_len = prompt.shape[1]
-
-        first_token = int(mx.argmax(self._last_target_logit).item())
-        self._pending_token = first_token
-        return first_token
+            first_token = int(mx.argmax(self._last_target_logit).item())
+            self._pending_token = first_token
+            return first_token
 
     def step(self) -> tuple[list[int], int]:
         """One speculative decoding step using persistent KV caches.
@@ -434,9 +449,14 @@ class SpeculativeDecoder:
 
         pending_token = self._pending_token
 
-        if self._use_tree:
-            return self._step_tree(pending_token)
-        return self._step_linear(pending_token)
+        with _tracing.span("spec.step", strategy=_spec_strategy(self)) as _sp:
+            if self._use_tree:
+                result = self._step_tree(pending_token)
+            else:
+                result = self._step_linear(pending_token)
+            accepted, num_proposed = result
+            _sp.set_attributes({"proposed": num_proposed, "accepted": len(accepted)})
+            return result
 
     def _step_linear(self, pending_token: int) -> tuple[list[int], int]:
         """Linear speculative decoding (the existing algorithm)."""
@@ -469,7 +489,8 @@ class SpeculativeDecoder:
         verification_logits = target_out[0]  # (lambda+1, vocab)
 
         # 3. Verify
-        accepted = self._verify(draft_tokens, verification_logits)
+        with _tracing.span("spec.verify", strategy=_spec_strategy(self)):
+            accepted = self._verify(draft_tokens, verification_logits)
         num_accepted = len(accepted)
 
         self._after_verify(num_accepted)
@@ -1123,7 +1144,8 @@ class PromptLookupDecoder:
         verification_logits = target_out[0]  # (num_drafted+1, vocab)
 
         # 3. Greedy verification — identical to SpeculativeDecoder.
-        accepted = verify_draft_greedy(draft_tokens, verification_logits)
+        with _tracing.span("spec.verify", strategy=_spec_strategy(self)):
+            accepted = verify_draft_greedy(draft_tokens, verification_logits)
         num_accepted = len(accepted)
 
         # 4. Trim target cache to keep only the accepted prefix.
