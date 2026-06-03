@@ -103,10 +103,11 @@ def _prefill_last_logit(
 
     If ``cancel_event`` is set, raises :class:`PrefillCancelled` before each
     forward so a client disconnect interrupts at a pass boundary rather than
-    pinning the GPU. Self-speculative prefills the prefix in a single forward
-    (no sub-chunk loop), so the granularity is "before prefix" / "before last
-    token" — coarser than the classic decoder but enough to avoid running a
-    second large forward once the request is gone.
+    pinning the GPU. The prefix pass is one ``model()`` call (no
+    ``_PREFILL_CHUNK`` sub-chunk loop, unlike the classic decoder), so the
+    granularity is "before prefix" / "before last token" — coarser than the
+    classic decoder but enough to skip the second large forward once the
+    request is gone.
     """
     if cancel_event is not None and cancel_event.is_set():
         raise PrefillCancelled()

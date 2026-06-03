@@ -83,3 +83,42 @@ class TestSelfSpeculativePrefillCancelConformance:
 
         with pytest.raises(PrefillCancelled):
             decoder.prefill(prompt, cancel_event=cancel)
+
+    def test_prefill_skips_last_token_forward_when_cancelled_after_prefix(self):
+        """A cancel that fires during the prefix forward must skip the
+        second (last-token) forward — verifying the stated guarantee end-to-end
+        through ``SelfSpeculativeDecoder.prefill``, not just the helper."""
+        import pytest
+
+        from olmlx.engine.speculative import PrefillCancelled
+
+        decoder = _make_decoder()
+        prompt = mx.zeros((1, 8), dtype=mx.int32)
+        cancel = threading.Event()
+
+        # Wrap the target to count forwards and set the event after the first
+        # (prefix) pass — the last-token forward must never run. Plain proxy
+        # (mirrors _CancelOnNthCall in test_speculative_prefill_cancel.py):
+        # exposes ``.layers`` for make_prompt_cache and delegates the rest.
+        inner = decoder._target
+        calls: list[int] = []
+
+        class _CancelAfterPrefix:
+            def __init__(self):
+                self.layers = inner.layers
+
+            def __call__(self, input_ids, cache=None):
+                calls.append(int(input_ids.shape[1]))
+                out = inner(input_ids, cache=cache)
+                cancel.set()
+                return out
+
+            def __getattr__(self, name):
+                return getattr(inner, name)
+
+        decoder._target = _CancelAfterPrefix()
+
+        with pytest.raises(PrefillCancelled):
+            decoder.prefill(prompt, cancel_event=cancel)
+
+        assert calls == [7]  # prefix forward only (8 - 1 reserved last token)
