@@ -226,3 +226,45 @@ def test_flash_weight_load_span(memory_exporter, tmp_path):
     attrs = dict(span.attributes)
     assert attrs["layer_idx"] == 1
     assert attrs["active_neurons"] == 3
+
+
+def test_disk_cache_spans(memory_exporter, tmp_path):
+    """_save_to_disk and _load_from_disk emit cache.disk_write / cache.disk_read
+    spans with cache_id, bytes, and hit attributes."""
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from olmlx.engine.model_manager import CachedPromptState, PromptCacheStore
+
+    store = PromptCacheStore(max_slots=4, disk_path=tmp_path, model_name="test-model")
+    state = CachedPromptState(tokens=[1, 2, 3], cache=["kv"])
+    cid = "abc123"
+
+    def fake_save(path, cache, metadata):
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x" * 128)
+
+    def fake_load(path, return_metadata=False):
+        return ["kv"], {
+            "tokens": "[1, 2, 3]",
+            "cache_type": "assistant",
+            "is_checkpoint": "0",
+        }
+
+    with patch(
+        "olmlx.engine.prompt_cache.store.save_prompt_cache", side_effect=fake_save
+    ):
+        store._save_to_disk(cid, state)
+    with patch(
+        "olmlx.engine.prompt_cache.store.load_prompt_cache", side_effect=fake_load
+    ):
+        loaded = store._load_from_disk(cid)
+    assert loaded is not None
+
+    by_name = {s.name: s for s in memory_exporter.get_finished_spans()}
+    assert "cache.disk_write" in by_name
+    assert "cache.disk_read" in by_name
+    assert dict(by_name["cache.disk_write"].attributes)["cache_id"] == cid
+    assert "bytes" in dict(by_name["cache.disk_write"].attributes)
+    assert dict(by_name["cache.disk_read"].attributes)["hit"] is True

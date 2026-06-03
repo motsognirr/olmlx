@@ -18,6 +18,7 @@ from typing import Any
 from olmlx.engine.prompt_cache.metrics import CacheMetrics
 from olmlx.engine.prompt_cache.radix import PrefixCacheIndex
 from olmlx.engine.prompt_cache.state import CachedPromptState
+from olmlx.utils import tracing as _tracing
 
 try:
     from mlx_lm.models.cache import (
@@ -146,91 +147,99 @@ class PromptCacheStore:
 
     def _save_to_disk(self, cache_id: str, state: CachedPromptState) -> None:
         """Save a cache entry to disk."""
-        if not self._disk_enabled:
-            return
-        # TurboQuant caches use a custom format incompatible with safetensors
-        if state.cache:
-            from olmlx.engine.model_manager import _is_serializable_cache
-
-            if not _is_serializable_cache(state.cache):
-                logger.debug(
-                    "Skipping disk save for '%s': cache uses non-serializable format (TurboQuant)",
-                    cache_id,
-                )
+        with _tracing.span("cache.disk_write", cache_id=cache_id) as _sp:
+            if not self._disk_enabled:
                 return
-        try:
-            disk_dir = self._disk_dir()
-            disk_dir.mkdir(parents=True, exist_ok=True)
-            file_path = self._disk_file_path(cache_id)
-            metadata = {
-                "tokens": json.dumps(state.tokens),
-                "cache_type": state.cache_type,
-                "is_checkpoint": "1" if state.is_checkpoint else "0",
-            }
-            save_prompt_cache(str(file_path), state.cache, metadata)
-            logger.info(
-                "Saved evicted cache '%s' to disk (%s)",
-                cache_id,
-                file_path,
-            )
-            self._cleanup_disk()
-        except Exception:
-            logger.warning(
-                "Failed to save cache '%s' to disk",
-                cache_id,
-                exc_info=True,
-            )
+            # TurboQuant caches use a custom format incompatible with safetensors
+            if state.cache:
+                from olmlx.engine.model_manager import _is_serializable_cache
+
+                if not _is_serializable_cache(state.cache):
+                    logger.debug(
+                        "Skipping disk save for '%s': cache uses non-serializable format (TurboQuant)",
+                        cache_id,
+                    )
+                    return
+            try:
+                disk_dir = self._disk_dir()
+                disk_dir.mkdir(parents=True, exist_ok=True)
+                file_path = self._disk_file_path(cache_id)
+                metadata = {
+                    "tokens": json.dumps(state.tokens),
+                    "cache_type": state.cache_type,
+                    "is_checkpoint": "1" if state.is_checkpoint else "0",
+                }
+                save_prompt_cache(str(file_path), state.cache, metadata)
+                if file_path.exists():
+                    _sp.set_attribute("bytes", file_path.stat().st_size)
+                logger.info(
+                    "Saved evicted cache '%s' to disk (%s)",
+                    cache_id,
+                    file_path,
+                )
+                self._cleanup_disk()
+            except Exception:
+                logger.warning(
+                    "Failed to save cache '%s' to disk",
+                    cache_id,
+                    exc_info=True,
+                )
 
     def _load_from_disk(self, cache_id: str) -> CachedPromptState | None:
         """Try to load a cache entry from disk. Returns None if not found."""
-        if not self._disk_enabled:
-            return None
-        file_path = self._disk_file_path(cache_id)
-        if not file_path.exists():
-            return None
-        try:
-            cache, metadata = load_prompt_cache(str(file_path), return_metadata=True)
-            tokens = json.loads(metadata.get("tokens", "[]"))
-            # Pre-PR entries lack cache_type / is_checkpoint metadata;
-            # fall through to the CachedPromptState defaults in that
-            # case so old disk caches still round-trip correctly.
-            cache_type = metadata.get("cache_type", "assistant")
-            is_checkpoint = metadata.get("is_checkpoint", "0") == "1"
-            state = CachedPromptState(
-                tokens=tokens,
-                cache=cache,
-                cache_type=cache_type,  # type: ignore[arg-type]
-                is_checkpoint=is_checkpoint,
-            )
-            # Store in memory via set() — respects max_slots AND
-            # _enforce_ram_budget. Delete the evicted entry to release
-            # GPU buffers promptly.
-            evicted = self.set(cache_id, state)
-            if evicted is not None:
-                del evicted
-            # Remove disk file only if the entry is still in RAM. If
-            # the budget evicted it back to disk, the file at the same
-            # path was just rewritten by _save_to_disk inside set() —
-            # removing it here would lose the entry from both tiers.
-            if cache_id in self._entries:
+        with _tracing.span("cache.disk_read", cache_id=cache_id) as _sp:
+            _sp.set_attribute("hit", False)
+            if not self._disk_enabled:
+                return None
+            file_path = self._disk_file_path(cache_id)
+            if not file_path.exists():
+                return None
+            try:
+                cache, metadata = load_prompt_cache(
+                    str(file_path), return_metadata=True
+                )
+                tokens = json.loads(metadata.get("tokens", "[]"))
+                # Pre-PR entries lack cache_type / is_checkpoint metadata;
+                # fall through to the CachedPromptState defaults in that
+                # case so old disk caches still round-trip correctly.
+                cache_type = metadata.get("cache_type", "assistant")
+                is_checkpoint = metadata.get("is_checkpoint", "0") == "1"
+                state = CachedPromptState(
+                    tokens=tokens,
+                    cache=cache,
+                    cache_type=cache_type,  # type: ignore[arg-type]
+                    is_checkpoint=is_checkpoint,
+                )
+                # Store in memory via set() — respects max_slots AND
+                # _enforce_ram_budget. Delete the evicted entry to release
+                # GPU buffers promptly.
+                evicted = self.set(cache_id, state)
+                if evicted is not None:
+                    del evicted
+                # Remove disk file only if the entry is still in RAM. If
+                # the budget evicted it back to disk, the file at the same
+                # path was just rewritten by _save_to_disk inside set() —
+                # removing it here would lose the entry from both tiers.
+                if cache_id in self._entries:
+                    file_path.unlink(missing_ok=True)
+                    self._refresh_disk_bytes()
+                logger.info(
+                    "Restored cache '%s' from disk (%d tokens)",
+                    cache_id,
+                    len(tokens),
+                )
+                _sp.set_attribute("hit", True)
+                return state
+            except Exception:
+                logger.warning(
+                    "Failed to load cache '%s' from disk",
+                    cache_id,
+                    exc_info=True,
+                )
+                # Remove corrupt file
                 file_path.unlink(missing_ok=True)
                 self._refresh_disk_bytes()
-            logger.info(
-                "Restored cache '%s' from disk (%d tokens)",
-                cache_id,
-                len(tokens),
-            )
-            return state
-        except Exception:
-            logger.warning(
-                "Failed to load cache '%s' from disk",
-                cache_id,
-                exc_info=True,
-            )
-            # Remove corrupt file
-            file_path.unlink(missing_ok=True)
-            self._refresh_disk_bytes()
-            return None
+                return None
 
     def _unlink_and_refresh(self, file_path: Path) -> None:
         """Unlink a disk cache file and refresh ``bytes_on_disk``.
@@ -444,42 +453,68 @@ class PromptCacheStore:
         a successful insertion into _entries.  Returns (None, None) on miss
         or failure.
         """
-        if not self._disk_enabled:
-            return None, None
-        file_path = self._disk_file_path(cache_id)
-        if not file_path.exists():
-            return None, None
-        try:
-            cache, metadata = load_prompt_cache(str(file_path), return_metadata=True)
-            tokens = json.loads(metadata.get("tokens", "[]"))
-            cache_type = metadata.get("cache_type", "assistant")
-            is_checkpoint = metadata.get("is_checkpoint", "0") == "1"
-            state = CachedPromptState(
-                tokens=tokens,
-                cache=cache,
-                cache_type=cache_type,  # type: ignore[arg-type]
-                is_checkpoint=is_checkpoint,
-            )
-            logger.info(
-                "Restored cache '%s' from disk (%d tokens)",
-                cache_id,
-                len(tokens),
-            )
-            return state, file_path
-        except Exception:
-            logger.warning(
-                "Failed to load cache '%s' from disk",
-                cache_id,
-                exc_info=True,
-            )
-            file_path.unlink(missing_ok=True)
-            self._refresh_disk_bytes()
-            return None, None
+        with _tracing.span("cache.disk_read", cache_id=cache_id) as _sp:
+            _sp.set_attribute("hit", False)
+            if not self._disk_enabled:
+                return None, None
+            file_path = self._disk_file_path(cache_id)
+            if not file_path.exists():
+                return None, None
+            try:
+                cache, metadata = load_prompt_cache(
+                    str(file_path), return_metadata=True
+                )
+                tokens = json.loads(metadata.get("tokens", "[]"))
+                cache_type = metadata.get("cache_type", "assistant")
+                is_checkpoint = metadata.get("is_checkpoint", "0") == "1"
+                state = CachedPromptState(
+                    tokens=tokens,
+                    cache=cache,
+                    cache_type=cache_type,  # type: ignore[arg-type]
+                    is_checkpoint=is_checkpoint,
+                )
+                logger.info(
+                    "Restored cache '%s' from disk (%d tokens)",
+                    cache_id,
+                    len(tokens),
+                )
+                _sp.set_attribute("hit", True)
+                return state, file_path
+            except Exception:
+                logger.warning(
+                    "Failed to load cache '%s' from disk",
+                    cache_id,
+                    exc_info=True,
+                )
+                file_path.unlink(missing_ok=True)
+                self._refresh_disk_bytes()
+                return None, None
 
     # -- Async wrappers that offload disk I/O to threads ----------------
     #
     # All _entries mutations happen on the event loop.  Only pure disk I/O
     # (read/write safetensors, unlink, stat) is dispatched to a worker thread.
+
+    async def _to_thread_traced(self, fn: Any, *fn_args: Any) -> Any:
+        """Run ``fn`` in a worker thread with the request's OTel context
+        re-attached, so the disk span ``fn`` opens nests under the request
+        trace.
+
+        When tracing is off ``current_context()`` is ``None`` and we offload
+        ``fn`` directly — identical call shape and zero extra allocation versus
+        a bare ``asyncio.to_thread``."""
+        ctx = _tracing.current_context()
+        if ctx is None:
+            return await asyncio.to_thread(fn, *fn_args)
+
+        def _runner() -> Any:
+            token = _tracing.attach_context(ctx)
+            try:
+                return fn(*fn_args)
+            finally:
+                _tracing.detach_context(token)
+
+        return await asyncio.to_thread(_runner)
 
     async def async_get(self, cache_id: str) -> CachedPromptState | None:
         """Async version of get(). Memory lookup is sync; disk fallback runs in a thread."""
@@ -490,7 +525,7 @@ class PromptCacheStore:
             return state
         # Memory miss — read from disk in a thread, then insert on the event loop.
         gen_before = self._evict_generation
-        loaded, disk_path = await asyncio.to_thread(self._read_from_disk, cache_id)
+        loaded, disk_path = await self._to_thread_traced(self._read_from_disk, cache_id)
         if loaded is None:
             self.metrics.cache_id_misses += 1
             return None
@@ -514,12 +549,12 @@ class PromptCacheStore:
         # Save evicted entry to disk first to avoid a window where
         # evicted_id is in neither memory nor disk.
         if evicted_id is not None and evicted is not None:
-            await asyncio.to_thread(self._save_to_disk, evicted_id, evicted)
+            await self._to_thread_traced(self._save_to_disk, evicted_id, evicted)
         # The disk restore counts against the RAM byte budget; enforce
         # it now so a chain of disk hits can't quietly blow the budget
         # until the next write.
         for over_id, over_state in self._enforce_ram_budget():
-            await asyncio.to_thread(self._save_to_disk, over_id, over_state)
+            await self._to_thread_traced(self._save_to_disk, over_id, over_state)
         # Only unlink the original disk file if the restored entry is
         # still in RAM. If the budget evicted it back to disk, the file
         # at the same path was just rewritten by _save_to_disk — removing
@@ -535,9 +570,9 @@ class PromptCacheStore:
         """Async version of set(). Memory ops are sync; disk save runs in a thread."""
         evicted_id, evicted = self._set_in_memory(cache_id, state)
         if evicted_id is not None and evicted is not None:
-            await asyncio.to_thread(self._save_to_disk, evicted_id, evicted)
+            await self._to_thread_traced(self._save_to_disk, evicted_id, evicted)
         for over_id, over_state in self._enforce_ram_budget():
-            await asyncio.to_thread(self._save_to_disk, over_id, over_state)
+            await self._to_thread_traced(self._save_to_disk, over_id, over_state)
         return evicted
 
     async def async_evict_all_to_disk(self) -> None:
