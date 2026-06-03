@@ -33,6 +33,7 @@ from olmlx.routers import (
 )
 from olmlx.routers import metrics as metrics_router
 from olmlx.utils import metrics as metrics_mod
+from olmlx.utils import tracing as tracing_mod
 
 logger = logging.getLogger("olmlx")
 
@@ -54,6 +55,9 @@ async def lifespan(app: FastAPI):
 
     # -- Distributed inference --
     from olmlx.config import settings
+
+    if settings.tracing:
+        tracing_mod.init_tracing(settings)
 
     distributed_group = None
     coordinator = None
@@ -126,6 +130,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown — drain in-flight requests before tearing down coordinator
     await manager.stop()
+    tracing_mod.shutdown_tracing()
     # Unregister so a subsequent create_app() (e.g. in tests) does not raise a
     # duplicate-collector error against the module-level REGISTRY.
     try:
@@ -213,6 +218,40 @@ class MetricsMiddleware(BaseHTTPMiddleware):
             surface_var.reset(surface_token)
 
 
+class RootSpanMiddleware(BaseHTTPMiddleware):
+    """Open the per-request root span.
+
+    Added last in ``create_app`` so it runs *outermost* of the tracing-relevant
+    middlewares (Starlette executes middleware in reverse of add order), giving
+    every downstream engine span a single root → one coherent trace per request.
+    Because it runs before RequestIDMiddleware, ``request.state.request_id`` is
+    not yet set when the span opens, so request_id / route / status are all
+    stamped *after* ``call_next`` returns (request_id survives via
+    ``request.state``, an object attribute, not a ContextVar). Surface is derived
+    directly from the path the same way MetricsMiddleware does, rather than read
+    from ``surface_var``: BaseHTTPMiddleware copies the context into the inner
+    sub-task, so a ContextVar set by an inner middleware is not visible to this
+    outer one after ``call_next``. When tracing is disabled, span() returns the
+    no-op context manager and this path costs one function call.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        with tracing_mod.span("http.request", **{"http.method": request.method}) as sp:
+            response = await call_next(request)
+            # Resolve the route template (bounded cardinality) after routing,
+            # mirroring MetricsMiddleware's label_path.
+            route = request.scope.get("route")
+            sp.set_attributes(
+                {
+                    "http.route": getattr(route, "path", None) or "<unmatched>",
+                    "surface": metrics_mod.surface_for_path(request.url.path),
+                    "request_id": getattr(request.state, "request_id", ""),
+                    "http.status_code": response.status_code,
+                }
+            )
+            return response
+
+
 def _make_error_response(
     path: str,
     status_code: int,
@@ -245,6 +284,9 @@ def create_app() -> FastAPI:
     app.add_middleware(ForceJSONMiddleware)
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(MetricsMiddleware)
+    # Added last → runs outermost, so the per-request root span wraps every
+    # other middleware and all downstream engine spans nest under it.
+    app.add_middleware(RootSpanMiddleware)
 
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError):
