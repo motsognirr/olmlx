@@ -618,6 +618,7 @@ Full compatibility with the [Ollama API](https://github.com/ollama/ollama/blob/m
 | `/` | GET, HEAD | Health check — returns `"Ollama is running"` |
 | `/api/version` | GET | Server version |
 | `/api/ps` | GET | List currently loaded models with expiry info |
+| `/metrics` | GET | Prometheus metrics exposition |
 
 **GET /api/ps response:**
 
@@ -633,6 +634,43 @@ Full compatibility with the [Ollama API](https://github.com/ollama/ollama/blob/m
   }]
 }
 ```
+
+**GET /metrics**
+
+Prometheus-format exposition of operational metrics, scrapable by any Prometheus
+server (point a scrape job at `http://localhost:11434/metrics`). No extra
+configuration is required — the endpoint is always available.
+
+```bash
+curl http://localhost:11434/metrics
+```
+
+Exposed metrics (labels in parentheses):
+
+| Metric | Type | Description |
+|---|---|---|
+| `olmlx_http_requests_total` (`path`, `method`, `status`) | counter | HTTP requests handled |
+| `olmlx_http_request_duration_seconds` (`path`, `method`) | histogram | HTTP request latency |
+| `olmlx_http_requests_in_flight` | gauge | Requests currently being handled |
+| `olmlx_inference_requests_total` (`model`, `surface`) | counter | Completed generations |
+| `olmlx_inference_errors_total` (`model`, `surface`) | counter | Generations that failed mid-flight |
+| `olmlx_inference_tokens_total` (`model`, `surface`, `direction`) | counter | Prompt/completion tokens processed |
+| `olmlx_inference_ttft_seconds` (`model`, `surface`) | histogram | Time to first token (prefill) |
+| `olmlx_inference_decode_tokens_per_second` (`model`, `surface`) | histogram | Decode throughput per generation |
+| `olmlx_inference_request_duration_seconds` (`model`, `surface`) | histogram | Total generation wall-clock |
+| `olmlx_speculative_proposed_total` / `_accepted_total` (`strategy`) | counter | Speculative draft tokens proposed / accepted |
+| `olmlx_loaded_models` | gauge | Models currently resident |
+| `olmlx_model_size_bytes` / `olmlx_model_active_refs` (`model`) | gauge | Per-model weight size / active refs |
+| `olmlx_kv_cache_bytes` (`model`, `location`) | gauge | Prompt-cache KV bytes (ram/disk) |
+| `olmlx_prompt_cache_lookups_total` (`model`, `kind`, `result`) | counter | Prompt-cache hits/misses (cache_id/radix) |
+| `olmlx_prompt_cache_evictions_total` (`model`, `location`) | counter | Prompt-cache evictions |
+| `olmlx_flash_expert_cache_events_total` / `olmlx_flash_prefetch_events_total` (`model`, `result`) | counter | Flash-MoE expert / prefetch hits, misses, failures |
+
+`surface` is one of `ollama`, `openai`, `anthropic`, `audio`. Inference
+throughput/latency values are read from the same timings reported by
+`olmlx bench run`, so scraped numbers match a bench on the same workload. The
+`/metrics` series for per-model counters persist across model eviction/reload
+(they are folded into process-lifetime totals).
 
 #### POST /api/chat — Chat Completion
 
