@@ -34,6 +34,7 @@ target-layer-output capture pattern.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 import mlx.core as mx
@@ -240,12 +241,19 @@ class EagleDecoder:
 
     # ----- prefill ---------------------------------------------------------
 
-    def prefill(self, prompt: mx.array) -> int:
+    def prefill(
+        self, prompt: mx.array, cancel_event: threading.Event | None = None
+    ) -> int:
         """Run the target on the prompt; return the first sampled token.
 
         ``prompt`` shape: ``(1, seq_len)`` int tokens. After prefill the
         decoder holds the target's last-layer hidden at position
         ``seq_len - 1`` and the greedily-sampled first token.
+
+        ``cancel_event`` is accepted for ``SpeculativeDecoderProtocol``
+        conformance but not honored: EAGLE prefills the target in a single
+        forward (no sub-chunk loop to check between), and it is an
+        experimental strategy off the default path.
         """
         self.reset()
 

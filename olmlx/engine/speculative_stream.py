@@ -45,7 +45,9 @@ class TokenizerProtocol(Protocol):
 class SpeculativeDecoderProtocol(Protocol):
     """Structural protocol for any speculative decoder (SpeculativeDecoder, DFlashDecoder)."""
 
-    def prefill(self, prompt: mx.array) -> int: ...
+    def prefill(
+        self, prompt: mx.array, cancel_event: threading.Event | None = ...
+    ) -> int: ...
     def step(self) -> tuple[list[int], int]: ...
     def reset(self) -> None: ...
 
@@ -68,11 +70,19 @@ def speculative_stream_generate(
         eos_token_id: Stop generation when this token is produced.
         tokenizer: Tokenizer for incremental text decoding. If None, text is empty.
     """
+    from olmlx.engine.speculative import PrefillCancelled
+
     prompt_arr = mx.array([prompt_tokens])
     prompt_len = len(prompt_tokens)
 
     t0 = time.perf_counter()
-    first_token = decoder.prefill(prompt_arr)
+    try:
+        first_token = decoder.prefill(prompt_arr, cancel_event=cancel_event)
+    except PrefillCancelled:
+        # Client disconnected mid-prefill. Exit cleanly with no tokens so the
+        # caller's drain_and_join() completes and the inference lock is released
+        # promptly — no deferred GPU cleanup, no 503 for the next request.
+        return
     prefill_elapsed = time.perf_counter() - t0
     prompt_tps_val = prompt_len / max(prefill_elapsed, 1e-9)
 

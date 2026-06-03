@@ -21,6 +21,7 @@ prefix to restore the correct state on rejection.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 import mlx.core as mx
@@ -324,10 +325,17 @@ class DFlashDecoder:
     # Main API
     # ------------------------------------------------------------------
 
-    def prefill(self, prompt: mx.array) -> int:
+    def prefill(
+        self, prompt: mx.array, cancel_event: threading.Event | None = None
+    ) -> int:
         """Process the prompt through the target, capturing hidden states.
 
         Returns the first generated token (target greedy argmax).
+
+        ``cancel_event`` is accepted for ``SpeculativeDecoderProtocol``
+        conformance but not honored: DFlash prefills the target in a single
+        forward (no sub-chunk loop to check between), and it is an
+        experimental strategy off the default path.
         """
         self.reset()
 
