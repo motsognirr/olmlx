@@ -2,23 +2,7 @@ import pytest
 
 pytest.importorskip("opentelemetry")
 
-
-@pytest.fixture
-def memory_exporter():
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-        InMemorySpanExporter,
-    )
-
-    import olmlx.utils.tracing as tracing
-
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    tracing.install_test_provider(provider)
-    yield exporter
-    tracing.shutdown_tracing()
+# memory_exporter fixture is provided by the root conftest.py.
 
 
 def test_root_span_emitted_for_request(memory_exporter):
