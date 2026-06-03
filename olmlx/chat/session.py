@@ -23,6 +23,7 @@ from olmlx.engine.inference import (
 from olmlx.engine.model_manager import LoadedModel, ModelManager
 from olmlx.engine.tool_parser import parse_model_output
 from olmlx.utils import memory as memory_utils
+from olmlx.utils import tracing as _tracing
 
 logger = logging.getLogger(__name__)
 
@@ -507,20 +508,22 @@ class ChatSession:
         tool_input = tu["input"]
         tool_id = tu["id"]
         try:
-            if tool_name == "use_skill" and self.skills:
-                result = self.skills.handle_use_skill(tool_input)
-            elif self.builtin and tool_name in self.builtin.tool_names:
-                result = await self.builtin.call_tool(tool_name, tool_input)
-            elif self.mcp is not None:
-                result = await self.mcp.call_tool(
-                    tool_name, tool_input, timeout=self.config.tool_timeout
-                )
-            else:
-                result = ToolError(
-                    message=f"No handler for tool: {tool_name!r}",
-                    tool_name=tool_name,
-                    is_user_error=True,
-                )
+            with _tracing.span("mcp.tool_call", **{"tool.name": tool_name}) as _sp:
+                if tool_name == "use_skill" and self.skills:
+                    result = self.skills.handle_use_skill(tool_input)
+                elif self.builtin and tool_name in self.builtin.tool_names:
+                    result = await self.builtin.call_tool(tool_name, tool_input)
+                elif self.mcp is not None:
+                    _sp.set_attribute("mcp.server", getattr(self.mcp, "name", "mcp"))
+                    result = await self.mcp.call_tool(
+                        tool_name, tool_input, timeout=self.config.tool_timeout
+                    )
+                else:
+                    result = ToolError(
+                        message=f"No handler for tool: {tool_name!r}",
+                        tool_name=tool_name,
+                        is_user_error=True,
+                    )
 
             if isinstance(result, ToolError):
                 return {

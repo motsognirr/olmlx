@@ -268,3 +268,29 @@ def test_disk_cache_spans(memory_exporter, tmp_path):
     assert dict(by_name["cache.disk_write"].attributes)["cache_id"] == cid
     assert "bytes" in dict(by_name["cache.disk_write"].attributes)
     assert dict(by_name["cache.disk_read"].attributes)["hit"] is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_call_span(memory_exporter):
+    """_exec_tool emits an mcp.tool_call span with tool.name (and mcp.server
+    when the call is dispatched through MCP)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from olmlx.chat.config import ChatConfig
+    from olmlx.chat.session import ChatSession
+
+    config = ChatConfig(model_name="test:latest")
+    manager = MagicMock()
+    mcp = MagicMock()
+    mcp.name = "myserver"
+    mcp.call_tool = AsyncMock(return_value="ok")
+    session = ChatSession(config=config, manager=manager, mcp=mcp)
+
+    await session._exec_tool({"name": "echo", "input": {"x": 1}, "id": "t1"})
+
+    span = next(
+        s for s in memory_exporter.get_finished_spans() if s.name == "mcp.tool_call"
+    )
+    attrs = dict(span.attributes)
+    assert attrs["tool.name"] == "echo"
+    assert attrs["mcp.server"] == "myserver"
