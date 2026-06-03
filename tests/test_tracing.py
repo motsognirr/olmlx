@@ -123,3 +123,38 @@ def test_context_helpers_are_noops_when_disabled():
     ctx = tracing.current_context()
     token = tracing.attach_context(ctx)
     tracing.detach_context(token)  # must not raise
+
+
+def test_log_record_gets_trace_ids_when_span_active(otel_memory_exporter):
+    import logging
+
+    tracing, _ = otel_memory_exporter
+    captured = {}
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            captured["trace_id"] = getattr(record, "trace_id", None)
+            captured["span_id"] = getattr(record, "span_id", None)
+
+    handler = _Capture()
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        with tracing.span("work"):
+            logging.getLogger("olmlx").warning("inside span")
+    finally:
+        root.removeHandler(handler)
+
+    assert captured["trace_id"] and captured["trace_id"] != "0" * 32
+    assert captured["span_id"] and captured["span_id"] != "0" * 16
+
+
+def test_log_filter_not_installed_when_disabled():
+    import logging
+
+    import olmlx.utils.tracing as tracing
+
+    tracing.shutdown_tracing()
+    record = logging.LogRecord("olmlx", logging.INFO, __file__, 1, "msg", None, None)
+    # No filter installed → attribute absent.
+    assert not hasattr(record, "trace_id")

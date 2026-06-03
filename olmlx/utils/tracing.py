@@ -98,8 +98,12 @@ def shutdown_tracing() -> None:
             logger.debug("tracing: provider shutdown failed", exc_info=True)
 
 
-def _uninstall_log_filter(f: Any) -> None:  # replaced in Task 5
-    return None
+def _uninstall_log_filter(f: Any) -> None:
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.removeFilter(f)
+        except Exception:
+            pass
 
 
 class _LiveSpan:
@@ -209,5 +213,30 @@ def detach_context(token: Any) -> None:
     otel_context.detach(token)
 
 
-def _install_log_filter() -> Any:  # replaced in Task 5
-    return None
+class _TraceCorrelationFilter(logging.Filter):
+    """Stamp hex trace_id/span_id onto each record when a span is recording.
+
+    Installed on the root logger's handlers by ``init_tracing``; removed by
+    ``shutdown_tracing``. Reads the active span; when none is recording the
+    record is left untouched (request_id from RequestIDMiddleware still
+    applies independently).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        from opentelemetry.trace import get_current_span
+
+        span = get_current_span()
+        ctx = span.get_span_context()
+        if ctx.is_valid:
+            record.trace_id = format(ctx.trace_id, "032x")
+            record.span_id = format(ctx.span_id, "016x")
+        return True
+
+
+def _install_log_filter() -> Any:
+    """Add the correlation filter to every root-logger handler. Returns the
+    filter so ``shutdown_tracing`` can remove it."""
+    f = _TraceCorrelationFilter()
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(f)
+    return f
