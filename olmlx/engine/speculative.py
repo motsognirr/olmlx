@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import mlx.core as mx
@@ -28,6 +29,7 @@ from olmlx.engine.gdn_rollback import (
     GDNStateCapture,
     find_gdn_class,
 )
+from olmlx.engine.prompt_cache.checkpoint import snapshot_cache_for_persistence
 from olmlx.utils import tracing as _tracing
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,174 @@ class PrefillCancelled(Exception):
     request via deferred cleanup). Checking ``cancel_event`` at each sub-chunk
     boundary and raising this lets ``speculative_stream_generate`` exit cleanly.
     """
+
+
+def _common_prefix_len(a: list[int], b: list[int]) -> int:
+    """Length of the longest shared leading run of ``a`` and ``b``.
+
+    Pure-Python (small inputs: a handful of cross-request cache lineages,
+    not the full prompt every step). Mirrors mlx-lm's ``common_prefix_len``
+    semantics without pulling its array-oriented import into this module.
+    """
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+@dataclass
+class _SpecCacheEntry:
+    """One persisted speculative-cache lineage.
+
+    ``tokens`` is the token sequence the snapshot represents (it always ends
+    at a message boundary). ``payload`` is decoder-specific snapshot state —
+    a ``(target_snap, draft_snap)`` pair for :class:`SpeculativeDecoder`, or a
+    single target snapshot for :class:`PromptLookupDecoder`. The store treats
+    it as opaque; only the owning decoder interprets it.
+    """
+
+    tokens: list[int]
+    payload: Any = field(default=None)
+
+
+class _SpecCacheStore:
+    """Tiny LRU of speculative KV snapshots keyed by longest token-prefix.
+
+    Held on a single per-model decoder instance; all inference is serialized
+    under the inference lock, so the store needs no internal locking. Lookup
+    is a longest-common-prefix linear scan over the (capacity-bounded) entry
+    set — no ``cache_id`` dependency, which makes reuse robust to unstable
+    client-supplied ids (the same problem the non-speculative path's radix
+    index solves; at 2–4 slots a trie is unnecessary).
+
+    ``capacity == 0`` disables reuse entirely (``enabled()`` is False and
+    ``insert`` is a no-op) — the ``OLMLX_SPECULATIVE_CACHE_SLOTS=0`` kill
+    switch that restores the previous fresh-prefill-every-turn behavior.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = max(int(capacity), 0)
+        # LRU order: index 0 is the least-recently-used entry (evicted first),
+        # the last index is most-recently-used.
+        self._entries: list[_SpecCacheEntry] = []
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    def enabled(self) -> bool:
+        return self._capacity > 0
+
+    def clear(self) -> None:
+        self._entries = []
+
+    def find(self, tokens: list[int]) -> tuple[_SpecCacheEntry, int] | None:
+        """Return ``(entry, common_prefix_len)`` for the entry whose stored
+        tokens share the longest leading run with ``tokens``, promoting that
+        entry to most-recently-used. ``None`` when the store is empty/disabled
+        or no entry shares any prefix.
+
+        Note: promotion happens on any prefix overlap, even one the caller
+        later rejects (e.g. a non-trimmable partial-prefix hit that falls back
+        to fresh prefill). At the small default slot counts this near-miss
+        promotion is immaterial; revisit if slots are raised substantially.
+        """
+        if not self.enabled() or not self._entries or not tokens:
+            return None
+        best: _SpecCacheEntry | None = None
+        best_common = 0
+        for entry in self._entries:
+            common = _common_prefix_len(entry.tokens, tokens)
+            if common > best_common:
+                best_common = common
+                best = entry
+        if best is None or best_common == 0:
+            return None
+        self._entries.remove(best)
+        self._entries.append(best)
+        return best, best_common
+
+    def insert(self, tokens: list[int], payload: Any) -> None:
+        """Store ``payload`` under ``tokens`` as the most-recently-used entry,
+        replacing any existing entry with identical tokens, and evict the
+        least-recently-used entries past ``capacity``. No-op when disabled.
+        """
+        if not self.enabled():
+            return
+        toks = list(tokens)
+        # Refresh: drop any prior entry for the same lineage so a re-prefill
+        # of the same prompt doesn't consume two slots.
+        self._entries = [e for e in self._entries if e.tokens != toks]
+        self._entries.append(_SpecCacheEntry(tokens=toks, payload=payload))
+        while len(self._entries) > self._capacity:
+            self._entries.pop(0)
+
+
+# Cache-layer class names used to classify a working cache for reuse.
+# Kept local (not imported from model_manager, which imports this module) to
+# avoid a circular import; mirrors model_manager's allowlists.
+_TRIMMABLE_CACHE_NAMES = frozenset(
+    {"KVCache", "QuantizedKVCache", "ConcatenateKVCache"}
+)
+_LAZY_STATE_CACHE_NAMES = frozenset({"ArraysCache"})
+
+
+def _cache_is_trimmable(cache: list) -> bool:
+    """True iff every layer is in the known-trimmable allowlist (so
+    ``trim_prompt_cache`` can realign a reused snapshot to a shorter prefix)."""
+    return bool(cache) and all(
+        type(layer).__name__ in _TRIMMABLE_CACHE_NAMES for layer in cache
+    )
+
+
+def _cache_has_lazy_state(cache: list) -> bool:
+    """True iff any layer carries a lazy ``gated_delta_kernel`` graph
+    (``ArraysCache``) that must be ``mx.eval``-materialized before a snapshot
+    crosses the request/worker-thread boundary (#284 hazard family)."""
+    return any(type(layer).__name__ in _LAZY_STATE_CACHE_NAMES for layer in cache)
+
+
+def _is_pure_rotating_cache(cache: list) -> bool:
+    """True iff the cache is a sliding-window layout (``RotatingKVCache``) with
+    no ``ArraysCache`` layers. These (gpt-oss, Step-3.5, Gemma 3) are fragile
+    under interior-boundary prefill splits, so speculative cache reuse skips
+    them and keeps the legacy fresh-prefill path."""
+    names = {type(layer).__name__ for layer in cache}
+    return "RotatingKVCache" in names and "ArraysCache" not in names
+
+
+def _spec_reuse_decision(
+    is_trimmable: bool,
+    entry_tokens: list[int],
+    common: int,
+    prompt_len: int,
+) -> tuple[bool, int]:
+    """Decide whether a stored snapshot is reusable and to what depth.
+
+    Returns ``(reuse, already_covered)``:
+
+    - **Trimmable** caches can roll back to any shared-prefix depth, so reuse
+      up to ``common`` — backing up one position on an exact full match
+      because the prefill needs at least one trailing token to forward for the
+      seeding logit. A single-token prompt yields nothing reusable.
+    - **Non-trimmable** (hybrid ``ArraysCache``) caches can only *extend* a
+      stored state, never trim it: reuse only when the stored tokens are a
+      strict full prefix of the new prompt (``common == len(entry_tokens)``)
+      and there is at least one new token to forward. An exact full match is
+      discarded (no way to back up one position) — fresh prefill instead.
+    """
+    if is_trimmable:
+        already_covered = min(common, prompt_len - 1)
+        return (already_covered > 0, max(already_covered, 0))
+    # Non-trimmable: strict full-prefix extension only.
+    if common != len(entry_tokens):
+        return (False, 0)
+    already_covered = common
+    if already_covered <= 0 or already_covered >= prompt_len:
+        return (False, 0)
+    return (True, already_covered)
 
 
 def _logits(out: Any) -> mx.array:
@@ -195,6 +365,80 @@ def _prefill_last_logit(
     return _logits(model(last, cache=cache))[0, 0, :]
 
 
+def _drive_spec_prefill(
+    *,
+    flat: list[int],
+    boundaries: list[int],
+    already_covered: int,
+    lanes: list[tuple[Any, list]],
+    cancel_event: threading.Event | None,
+    on_boundary: Any,
+) -> mx.array:
+    """Forward each ``(model, cache)`` lane over ``flat[already_covered:]`` and
+    return ``lanes[0]`` (the target)'s last-position logit (lazy).
+
+    Snapshots happen via ``on_boundary(deepest_boundary)`` — invoked once, after
+    every lane has been filled up to the deepest interior message boundary but
+    before the final span — so the caller can persist all caches at a clean
+    boundary depth for the next turn. When no interior boundary lies in
+    ``(already_covered, len(flat))`` the whole span runs in one pass and
+    ``on_boundary`` is not called.
+
+    Runs on the **default stream** (no ``mx.stream`` wrapper) — the same stream
+    ``step()`` decodes on. ``inference.py``'s ``_drive_segmented_prefill`` is
+    *replicated* rather than reused because it forces ``generation_stream``, and
+    splitting prefill/decode across streams reintroduces the GatedDeltaNet /
+    MoE-routing corruption on Qwen3-Next-family targets (#284 / #396 family).
+    Each sub-chunk is bounded at ``_PREFILL_CHUNK`` and ``cancel_event`` is
+    checked at every boundary so a client disconnect interrupts within one
+    sub-chunk.
+    """
+    n = len(flat)
+    deepest: int | None = None
+    for b in boundaries:
+        if already_covered < b < n:
+            deepest = b
+
+    def _arr(start: int, end: int) -> mx.array:
+        return mx.array(flat[start:end], dtype=mx.int32)[None, :]
+
+    def _fill(model: Any, cache: list, start: int, end: int) -> None:
+        pos = start
+        while pos < end:
+            if cancel_event is not None and cancel_event.is_set():
+                raise PrefillCancelled()
+            stop = min(pos + _PREFILL_CHUNK, end)
+            model(_arr(pos, stop), cache=cache)
+            _eval_cache(cache)
+            mx.clear_cache()
+            pos = stop
+
+    def _target_last_logit(start: int, end: int) -> mx.array:
+        # Fill [start, end-1] (logits discarded — keeps lm_head out of the eval
+        # graph over the prefix), then forward the final token for the seeding
+        # logit (``_prefill_last_logit`` semantics).
+        target_model, target_cache = lanes[0]
+        _fill(target_model, target_cache, start, end - 1)
+        if cancel_event is not None and cancel_event.is_set():
+            raise PrefillCancelled()
+        return _logits(target_model(_arr(end - 1, end), cache=target_cache))[0, -1, :]
+
+    if deepest is None:
+        for model, cache in lanes[1:]:
+            _fill(model, cache, already_covered, n)
+        return _target_last_logit(already_covered, n)
+
+    # Chunk 1: uncovered prefix up to the deepest interior boundary (all lanes).
+    for model, cache in lanes:
+        _fill(model, cache, already_covered, deepest)
+    on_boundary(deepest)
+    # Chunk 2: boundary to the end. Non-target lanes fill KV; the target
+    # captures the seeding logit at the final position.
+    for model, cache in lanes[1:]:
+        _fill(model, cache, deepest, n)
+    return _target_last_logit(deepest, n)
+
+
 def verify_draft_greedy(
     draft_tokens: list[int],
     target_logits: mx.array,
@@ -253,6 +497,7 @@ class SpeculativeDecoder:
         acceptance_rate_ema: float = 0.9,
         tree_width: int = 1,
         tree_max_nodes: int = 8,
+        cache_slots: int = 0,
     ):
         if trim_prompt_cache is None:
             raise RuntimeError(
@@ -267,6 +512,14 @@ class SpeculativeDecoder:
         self._tree_width = max(tree_width, 1)
         self._tree_max_nodes = max(tree_max_nodes, 3)
         self._use_tree = self._tree_width >= 2
+
+        # Cross-request KV reuse (#421): persists target+draft snapshots keyed
+        # by token prefix so each agent turn prefills only the new suffix.
+        # ``cache_slots == 0`` disables it (fresh prefill every turn).
+        self._cache_store = _SpecCacheStore(cache_slots)
+        #: Tokens reused from a stored snapshot on the most recent prefill
+        #: (0 when fresh). Exposed for tests / diagnostics.
+        self._last_reused_tokens: int = 0
 
         # Persistent KV cache state (populated by prefill/step)
         self._target_cache: list | None = None
@@ -361,6 +614,9 @@ class SpeculativeDecoder:
             self._gdn_capture = None
             self._target_gdn_buffer = None
             self._draft_gdn_buffer = None
+        # Drop persisted snapshots so a model unload frees their (multi-GB) KV
+        # immediately rather than waiting on refcount GC.
+        self._cache_store.clear()
 
     def __del__(self) -> None:
         try:
@@ -389,9 +645,12 @@ class SpeculativeDecoder:
         self._cache_seq_len = 0
         self._last_target_logit = None
         self._pending_token = None
+        self._last_reused_tokens = 0
         self._stats_steps = 0
         self._stats_proposed = 0
         self._stats_accepted_draft = 0
+        # NB: ``self._cache_store`` is *not* cleared here — it persists across
+        # requests (that is the whole point of #421). Only ``close()`` drops it.
 
     def stats_summary(self) -> dict[str, Any]:
         steps = self._stats_steps
@@ -412,12 +671,22 @@ class SpeculativeDecoder:
         }
 
     def prefill(
-        self, prompt: mx.array, cancel_event: threading.Event | None = None
+        self,
+        prompt: mx.array,
+        *,
+        segmented: Any = None,
+        cancel_event: threading.Event | None = None,
     ) -> int:
         """Process the prompt through both models, populating KV caches.
 
         Args:
             prompt: (1, seq_len) input token IDs.
+            segmented: optional :class:`SegmentedPrompt` carrying message
+                boundaries. When provided and ``OLMLX_SPECULATIVE_CACHE_SLOTS``
+                is non-zero, enables cross-request KV reuse (#421): a stored
+                snapshot whose tokens form a prefix of ``prompt`` is reused so
+                only the new suffix is prefilled, and a fresh snapshot is taken
+                at the deepest interior message boundary for the next turn.
             cancel_event: if set during prefill, raises :class:`PrefillCancelled`
                 at the next sub-chunk boundary so a client disconnect interrupts
                 a long prefill promptly instead of pinning the GPU.
@@ -456,22 +725,130 @@ class SpeculativeDecoder:
             if self._gdn_capture is not None:
                 self._gdn_capture.use_buffer(None)
 
-            self._last_target_logit = _prefill_last_logit(
-                self._target, prompt, self._target_cache, cancel_event=cancel_event
+            # #421 reuse path: only when the store is enabled, the caller
+            # supplied message boundaries, and the cache is not a fragile
+            # pure-sliding-window layout (whose windowed attention an interior
+            # prefill split corrupts — those keep the legacy fresh prefill).
+            use_reuse = (
+                self._cache_store.enabled()
+                and segmented is not None
+                and not _is_pure_rotating_cache(self._target_cache)
             )
-            mx.eval(self._last_target_logit)
 
-            # Populate draft cache; logits not needed. Sub-chunked like the target
-            # prefill above so a long prompt doesn't OOM Metal in one forward.
-            _chunked_prefill(
-                self._draft, prompt, self._draft_cache, cancel_event=cancel_event
-            )
+            if use_reuse:
+                first_token = self._prefill_with_reuse(
+                    prompt, segmented, cancel_event=cancel_event
+                )
+            else:
+                self._last_target_logit = _prefill_last_logit(
+                    self._target, prompt, self._target_cache, cancel_event=cancel_event
+                )
+                mx.eval(self._last_target_logit)
+                # Populate draft cache; logits not needed. Sub-chunked like the
+                # target prefill above so a long prompt doesn't OOM Metal.
+                _chunked_prefill(
+                    self._draft, prompt, self._draft_cache, cancel_event=cancel_event
+                )
+                self._cache_seq_len = prompt.shape[1]
+                first_token = int(mx.argmax(self._last_target_logit).item())
 
-            self._cache_seq_len = prompt.shape[1]
-
-            first_token = int(mx.argmax(self._last_target_logit).item())
             self._pending_token = first_token
             return first_token
+
+    def _prefill_with_reuse(
+        self,
+        prompt: mx.array,
+        segmented: Any,
+        *,
+        cancel_event: threading.Event | None,
+    ) -> int:
+        """Reuse-aware prefill: look up a stored snapshot, continue it for the
+        new suffix, and snapshot the deepest interior boundary for next turn.
+
+        Caches (``self._target_cache`` / ``self._draft_cache``) are fresh on
+        entry; on a reuse hit they are replaced with deepcopies of the stored
+        snapshots (so ``step()``'s in-place mutations never touch the store).
+        """
+        flat = prompt[0].tolist()
+        n = len(flat)
+
+        # Cache layer types are invariant for a given model, so classifying the
+        # fresh caches is valid for the (same-type) restored snapshot below.
+        is_trimmable = _cache_is_trimmable(self._target_cache) and _cache_is_trimmable(
+            self._draft_cache
+        )
+        already_covered = 0
+        hit = self._cache_store.find(flat)
+        if hit is not None:
+            entry, common = hit
+            reuse, covered = _spec_reuse_decision(is_trimmable, entry.tokens, common, n)
+            if reuse:
+                target_snap, draft_snap = entry.payload
+                # Deepcopy the stored snapshots into the working caches so this
+                # request's mutations never touch the store. This is a copy of
+                # a copy (the store already holds deepcopies) — the unavoidable
+                # cost of copy-on-reuse isolation; see config docstring.
+                self._target_cache = snapshot_cache_for_persistence(
+                    target_snap, eager_eval=_cache_has_lazy_state(target_snap)
+                )
+                self._draft_cache = snapshot_cache_for_persistence(
+                    draft_snap, eager_eval=_cache_has_lazy_state(draft_snap)
+                )
+                if is_trimmable:
+                    trim = len(entry.tokens) - covered
+                    if trim > 0:
+                        trim_prompt_cache(self._target_cache, trim)
+                        trim_prompt_cache(self._draft_cache, trim)
+                already_covered = covered
+
+        self._last_target_logit = self._drive_segmented_prefill(
+            flat, segmented, already_covered, cancel_event=cancel_event
+        )
+        mx.eval(self._last_target_logit)
+        self._cache_seq_len = n
+        self._last_reused_tokens = already_covered
+        return int(mx.argmax(self._last_target_logit).item())
+
+    def _drive_segmented_prefill(
+        self,
+        flat: list[int],
+        segmented: Any,
+        already_covered: int,
+        *,
+        cancel_event: threading.Event | None,
+    ) -> mx.array:
+        """Forward target+draft over ``flat[already_covered:]`` and return the
+        target's last-position logit (lazy), snapshotting both caches at the
+        deepest interior message boundary for the next turn. See
+        :func:`_drive_spec_prefill` for the stream / chunking invariants."""
+        boundaries = segmented.boundary_offsets()
+        # Guard: boundaries are only meaningful if the segmentation tokenizes
+        # to exactly this prompt. A mismatch (re-tokenization drift) means no
+        # snapshot this turn rather than a misaligned one.
+        if segmented.flatten() != flat:
+            boundaries = []
+        return _drive_spec_prefill(
+            flat=flat,
+            boundaries=boundaries,
+            already_covered=already_covered,
+            lanes=[
+                (self._target, self._target_cache),
+                (self._draft, self._draft_cache),
+            ],
+            cancel_event=cancel_event,
+            on_boundary=lambda boundary: self._store_snapshot(flat[:boundary]),
+        )
+
+    def _store_snapshot(self, tokens: list[int]) -> None:
+        """Deep-copy + materialize the current caches and persist them under
+        ``tokens`` (which ends at a message boundary)."""
+        target_snap = snapshot_cache_for_persistence(
+            self._target_cache, eager_eval=_cache_has_lazy_state(self._target_cache)
+        )
+        draft_snap = snapshot_cache_for_persistence(
+            self._draft_cache, eager_eval=_cache_has_lazy_state(self._draft_cache)
+        )
+        self._cache_store.insert(tokens, (target_snap, draft_snap))
 
     def step(self) -> tuple[list[int], int]:
         """One speculative decoding step using persistent KV caches.
@@ -987,6 +1364,7 @@ class PromptLookupDecoder:
         min_ngram_size: int = 1,
         lookup_window: int | None = 8192,
         acceptance_rate_ema: float = 0.9,
+        cache_slots: int = 0,
     ):
         if trim_prompt_cache is None or make_prompt_cache is None:
             raise RuntimeError(
@@ -1018,6 +1396,12 @@ class PromptLookupDecoder:
         #: n-gram scan walks. ``None`` disables the cap. The pending
         #: token is always included regardless of this window.
         self._lookup_window = lookup_window
+
+        # Cross-request KV reuse (#421): persists target snapshots keyed by
+        # token prefix. ``cache_slots == 0`` disables it (fresh prefill).
+        self._cache_store = _SpecCacheStore(cache_slots)
+        #: Tokens reused from a stored snapshot on the most recent prefill.
+        self._last_reused_tokens: int = 0
         # Init to 0.0 (not 0.5 as in ``SpeculativeDecoder``): PLD's
         # acceptance rate before any step has run is honestly 0 (nothing
         # drafted, nothing accepted), and a 0.5 warm-up would mislead
@@ -1063,6 +1447,8 @@ class PromptLookupDecoder:
             self._gdn_capture.close()
             self._gdn_capture = None
             self._target_gdn_buffer = None
+        # Drop persisted snapshots so a model unload frees their KV promptly.
+        self._cache_store.clear()
 
     def __del__(self) -> None:
         try:
@@ -1076,6 +1462,7 @@ class PromptLookupDecoder:
         self._cache_seq_len = 0
         self._pending_token = None
         self._tokens = []
+        self._last_reused_tokens = 0
         self._stats_steps = 0
         self._stats_proposed = 0
         self._stats_accepted_draft = 0
@@ -1083,6 +1470,7 @@ class PromptLookupDecoder:
         # acceptance rate before any step is honestly 0", and that
         # invariant must hold per-request, not just per-decoder.
         self._alpha = 0.0
+        # NB: ``self._cache_store`` persists across requests — not cleared here.
 
     def stats_summary(self) -> dict[str, Any]:
         steps = self._stats_steps
@@ -1101,12 +1489,21 @@ class PromptLookupDecoder:
         }
 
     def prefill(
-        self, prompt: mx.array, cancel_event: threading.Event | None = None
+        self,
+        prompt: mx.array,
+        *,
+        segmented: Any = None,
+        cancel_event: threading.Event | None = None,
     ) -> int:
         """Process the prompt through the target, populating its KV cache.
 
         Args:
             prompt: (1, seq_len) input token IDs.
+            segmented: optional :class:`SegmentedPrompt`. When provided and
+                ``OLMLX_SPECULATIVE_CACHE_SLOTS`` is non-zero, enables
+                cross-request KV reuse (#421) — only the new suffix is
+                prefilled and a snapshot is taken at the deepest interior
+                message boundary for the next turn.
             cancel_event: if set during prefill, raises :class:`PrefillCancelled`
                 at the next sub-chunk boundary so a client disconnect interrupts
                 a long prefill promptly instead of pinning the GPU.
@@ -1131,18 +1528,29 @@ class PromptLookupDecoder:
         if self._gdn_capture is not None:
             self._gdn_capture.use_buffer(None)
 
-        last_logit = _prefill_last_logit(
-            self._target, prompt, self._target_cache, cancel_event=cancel_event
+        use_reuse = (
+            self._cache_store.enabled()
+            and segmented is not None
+            and not _is_pure_rotating_cache(self._target_cache)
         )
+        if use_reuse:
+            last_logit = self._prefill_with_reuse(
+                prompt, segmented, cancel_event=cancel_event
+            )
+        else:
+            last_logit = _prefill_last_logit(
+                self._target, prompt, self._target_cache, cancel_event=cancel_event
+            )
+            self._cache_seq_len = prompt.shape[1]
         mx.eval(last_logit)
 
-        self._cache_seq_len = prompt.shape[1]
-        # Seed the lookup table with the prompt tokens. The pending
-        # (first generated) token lives in ``_pending_token`` until the
-        # next ``step()`` puts it into the cache. Cap the seed to the
-        # lookup window so we don't pay an O(prompt_len) Metal-to-
-        # Python copy for tokens that will never participate in the
-        # n-gram scan (the cached prefix is still in the KV cache;
+        # Seed the lookup table with the FULL prompt tokens (regardless of how
+        # much was reused — the n-gram scan must see the whole history, not
+        # just the freshly-prefilled suffix). The pending (first generated)
+        # token lives in ``_pending_token`` until the next ``step()`` puts it
+        # into the cache. Cap the seed to the lookup window so we don't pay an
+        # O(prompt_len) Metal-to-Python copy for tokens that will never
+        # participate in the scan (the cached prefix is still in the KV cache;
         # this list only feeds the lookup heuristic).
         if self._lookup_window is not None and prompt.shape[1] > self._lookup_window:
             self._tokens = prompt[0, -self._lookup_window :].tolist()
@@ -1152,6 +1560,63 @@ class PromptLookupDecoder:
         first_token = int(mx.argmax(last_logit).item())
         self._pending_token = first_token
         return first_token
+
+    def _prefill_with_reuse(
+        self,
+        prompt: mx.array,
+        segmented: Any,
+        *,
+        cancel_event: threading.Event | None,
+    ) -> mx.array:
+        """Reuse-aware target-only prefill (#421). Mirrors
+        :meth:`SpeculativeDecoder._prefill_with_reuse` without the draft lane.
+        Returns the target's last-position logit (lazy)."""
+        flat = prompt[0].tolist()
+        n = len(flat)
+        # Cache layer types are invariant per model, so classifying the fresh
+        # cache is valid for the (same-type) restored snapshot below.
+        is_trimmable = _cache_is_trimmable(self._target_cache)
+
+        already_covered = 0
+        hit = self._cache_store.find(flat)
+        if hit is not None:
+            entry, common = hit
+            reuse, covered = _spec_reuse_decision(is_trimmable, entry.tokens, common, n)
+            if reuse:
+                # Deepcopy the stored snapshot (a copy of a copy) into the
+                # working cache so this request's mutations never touch the
+                # store — copy-on-reuse isolation; see config docstring.
+                self._target_cache = snapshot_cache_for_persistence(
+                    entry.payload, eager_eval=_cache_has_lazy_state(entry.payload)
+                )
+                if is_trimmable:
+                    trim = len(entry.tokens) - covered
+                    if trim > 0:
+                        trim_prompt_cache(self._target_cache, trim)
+                already_covered = covered
+
+        boundaries = segmented.boundary_offsets()
+        if segmented.flatten() != flat:
+            boundaries = []
+        logit = _drive_spec_prefill(
+            flat=flat,
+            boundaries=boundaries,
+            already_covered=already_covered,
+            lanes=[(self._target, self._target_cache)],
+            cancel_event=cancel_event,
+            on_boundary=lambda boundary: self._store_snapshot(flat[:boundary]),
+        )
+        self._cache_seq_len = n
+        self._last_reused_tokens = already_covered
+        return logit
+
+    def _store_snapshot(self, tokens: list[int]) -> None:
+        """Deep-copy + materialize the target cache and persist it under
+        ``tokens`` (which ends at a message boundary)."""
+        target_snap = snapshot_cache_for_persistence(
+            self._target_cache, eager_eval=_cache_has_lazy_state(self._target_cache)
+        )
+        self._cache_store.insert(tokens, target_snap)
 
     def step(self) -> tuple[list[int], int]:
         """One PLD step using the persistent target KV cache.

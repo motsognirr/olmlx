@@ -241,6 +241,18 @@ class TestSpeculativeConfig:
         with pytest.raises(ValidationError):
             Settings(speculative_tokens=0, _env_file=None)
 
+    def test_speculative_cache_slots_default(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_SPECULATIVE_CACHE_SLOTS", raising=False)
+        assert Settings().speculative_cache_slots == 2
+
+    def test_speculative_cache_slots_env_override(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_SPECULATIVE_CACHE_SLOTS", "0")
+        assert Settings().speculative_cache_slots == 0
+
+    def test_speculative_cache_slots_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            Settings(speculative_cache_slots=-1, _env_file=None)
+
     def test_speculative_draft_model_rejects_empty_string(self, monkeypatch):
         """``OLMLX_SPECULATIVE_DRAFT_MODEL=""`` slips past a ``str | None``
         check; ``Field(min_length=1)`` blocks it at parse time so the

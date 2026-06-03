@@ -43,7 +43,12 @@ class TokenizerProtocol(Protocol):
 
 
 class SpeculativeDecoderProtocol(Protocol):
-    """Structural protocol for any speculative decoder (SpeculativeDecoder, DFlashDecoder)."""
+    """Structural protocol for any speculative decoder (SpeculativeDecoder, DFlashDecoder).
+
+    ``prefill`` always accepts ``cancel_event``; the classic + PLD decoders
+    additionally accept a keyword-only ``segmented`` for cross-request KV reuse
+    (#421), which ``speculative_stream_generate`` passes only when present.
+    """
 
     def prefill(
         self, prompt: mx.array, cancel_event: threading.Event | None = ...
@@ -59,6 +64,7 @@ def speculative_stream_generate(
     cancel_event: threading.Event,
     eos_token_id: int | None = None,
     tokenizer: TokenizerProtocol | None = None,
+    segmented: Any = None,
 ) -> Generator[StreamToken, None, None]:
     """Sync generator that yields StreamToken objects for speculative decoding.
 
@@ -69,15 +75,26 @@ def speculative_stream_generate(
         cancel_event: Set to stop generation.
         eos_token_id: Stop generation when this token is produced.
         tokenizer: Tokenizer for incremental text decoding. If None, text is empty.
+        segmented: Optional ``SegmentedPrompt`` for cross-request KV reuse
+            (#421). Passed through to ``decoder.prefill`` only when non-None, so
+            decoders that don't accept the kwarg (dflash/eagle/self) are
+            unaffected.
     """
     from olmlx.engine.speculative import PrefillCancelled
 
     prompt_arr = mx.array([prompt_tokens])
     prompt_len = len(prompt_tokens)
 
+    # Only the classic + PLD decoders accept ``segmented``; pass it through
+    # solely when present so the experimental decoders keep their narrower
+    # ``prefill(prompt, cancel_event=...)`` signature.
+    prefill_kwargs: dict[str, Any] = {"cancel_event": cancel_event}
+    if segmented is not None:
+        prefill_kwargs["segmented"] = segmented
+
     t0 = time.perf_counter()
     try:
-        first_token = decoder.prefill(prompt_arr, cancel_event=cancel_event)
+        first_token = decoder.prefill(prompt_arr, **prefill_kwargs)
     except PrefillCancelled:
         # Client disconnected mid-prefill. Exit cleanly with no tokens so the
         # caller's drain_and_join() completes and the inference lock is released
@@ -187,10 +204,16 @@ def async_speculative_stream(
     tokenizer: Any,
     prompt: str | list[int],
     max_tokens: int,
+    segmented: Any = None,
 ) -> Any:
     """Create a CancellableStream for speculative decoding.
 
     Matches the interface of async_mlx_stream from utils/streaming.py.
+
+    ``segmented`` (optional) carries message boundaries for cross-request KV
+    reuse (#421). When provided it MUST tokenize to the same tokens as
+    ``prompt`` — callers pass the token list as ``prompt`` and build
+    ``segmented`` from those same tokens to guarantee alignment.
     """
     from olmlx.utils.streaming import CancellableStream
 
@@ -209,6 +232,7 @@ def async_speculative_stream(
             cancel_event=cancel_event,
             eos_token_id=eos_token_id,
             tokenizer=tokenizer,
+            segmented=segmented,
         )
 
     stream = CancellableStream(gen_factory)
