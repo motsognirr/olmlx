@@ -11,6 +11,7 @@ subclass that adds prefetching and neuron window sizing.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, cast
 
 import mlx.core as mx
@@ -49,6 +50,18 @@ def _spec_strategy(decoder: object) -> str:
 # caching is gated off for them), so they don't inherit the prompt-cache path's
 # segmented-prefill chunking — this is the equivalent bound for that path.
 _PREFILL_CHUNK = 2048
+
+
+class PrefillCancelled(Exception):
+    """Raised by the prefill helpers when ``cancel_event`` is set mid-prefill.
+
+    A long speculative prefill (e.g. a ~69k-token agentic prompt) is otherwise
+    non-interruptible: the decode loop checks ``cancel_event`` between steps,
+    but ``prefill()`` ran to completion regardless, pinning the GPU and the
+    inference lock for minutes after a client disconnect (and 503-ing the next
+    request via deferred cleanup). Checking ``cancel_event`` at each sub-chunk
+    boundary and raising this lets ``speculative_stream_generate`` exit cleanly.
+    """
 
 
 def _logits(out: Any) -> mx.array:
@@ -112,7 +125,12 @@ def _eval_cache(cache: list) -> None:
         )
 
 
-def _chunked_prefill(model: Any, tokens: mx.array, cache: list) -> None:
+def _chunked_prefill(
+    model: Any,
+    tokens: mx.array,
+    cache: list,
+    cancel_event: threading.Event | None = None,
+) -> None:
     """Run ``model`` over ``tokens`` (shape (1, T)) to populate ``cache``,
     in sub-chunks of at most ``_PREFILL_CHUNK`` tokens.
 
@@ -123,10 +141,16 @@ def _chunked_prefill(model: Any, tokens: mx.array, cache: list) -> None:
     OOMs Metal (the attention-score intermediate exceeds the ~41 GB
     single-buffer limit). Standard KV-cached attention is chunking-invariant,
     so the resulting cache state is identical to a single forward.
+
+    If ``cancel_event`` is set, raises :class:`PrefillCancelled` at the next
+    sub-chunk boundary (checked before each forward), bounding the post-cancel
+    GPU work to at most one sub-chunk instead of the whole prompt.
     """
     n = tokens.shape[1]
     pos = 0
     while pos < n:
+        if cancel_event is not None and cancel_event.is_set():
+            raise PrefillCancelled()
         stop = min(pos + _PREFILL_CHUNK, n)
         model(tokens[:, pos:stop], cache=cache)
         _eval_cache(cache)
@@ -134,7 +158,12 @@ def _chunked_prefill(model: Any, tokens: mx.array, cache: list) -> None:
         pos = stop
 
 
-def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
+def _prefill_last_logit(
+    model: Any,
+    prompt: mx.array,
+    cache: list,
+    cancel_event: threading.Event | None = None,
+) -> mx.array:
     """Return the logit for the last prompt position without materialising
     the full [batch, seq_len, vocab] tensor.
 
@@ -151,12 +180,18 @@ def _prefill_last_logit(model: Any, prompt: mx.array, cache: list) -> mx.array:
     the returned logit, which transitively forces pass-2's cache state.
     """
     if prompt.shape[1] <= 1:
+        if cancel_event is not None and cancel_event.is_set():
+            raise PrefillCancelled()
         return _logits(model(prompt, cache=cache))[0, -1, :]
     prefix, last = prompt[:, :-1], prompt[:, -1:]
     # Pass 1: fill the KV cache from the prefix in bounded sub-chunks. Output
     # is discarded (lm_head never materialised over seq_len-1 positions) and
     # cache state is materialised between passes for OOM avoidance.
-    _chunked_prefill(model, prefix, cache)
+    _chunked_prefill(model, prefix, cache, cancel_event=cancel_event)
+    # Cancel may have fired on the final prefix sub-chunk; skip the trailing
+    # forward too so post-cancel work stays bounded to one sub-chunk.
+    if cancel_event is not None and cancel_event.is_set():
+        raise PrefillCancelled()
     return _logits(model(last, cache=cache))[0, 0, :]
 
 
@@ -376,11 +411,16 @@ class SpeculativeDecoder:
             "lambda": self._lambda,
         }
 
-    def prefill(self, prompt: mx.array) -> int:
+    def prefill(
+        self, prompt: mx.array, cancel_event: threading.Event | None = None
+    ) -> int:
         """Process the prompt through both models, populating KV caches.
 
         Args:
             prompt: (1, seq_len) input token IDs.
+            cancel_event: if set during prefill, raises :class:`PrefillCancelled`
+                at the next sub-chunk boundary so a client disconnect interrupts
+                a long prefill promptly instead of pinning the GPU.
 
         Returns:
             The first generated token (from target model's greedy argmax).
@@ -417,13 +457,15 @@ class SpeculativeDecoder:
                 self._gdn_capture.use_buffer(None)
 
             self._last_target_logit = _prefill_last_logit(
-                self._target, prompt, self._target_cache
+                self._target, prompt, self._target_cache, cancel_event=cancel_event
             )
             mx.eval(self._last_target_logit)
 
             # Populate draft cache; logits not needed. Sub-chunked like the target
             # prefill above so a long prompt doesn't OOM Metal in one forward.
-            _chunked_prefill(self._draft, prompt, self._draft_cache)
+            _chunked_prefill(
+                self._draft, prompt, self._draft_cache, cancel_event=cancel_event
+            )
 
             self._cache_seq_len = prompt.shape[1]
 
@@ -1058,11 +1100,16 @@ class PromptLookupDecoder:
             "lambda": self._lambda,
         }
 
-    def prefill(self, prompt: mx.array) -> int:
+    def prefill(
+        self, prompt: mx.array, cancel_event: threading.Event | None = None
+    ) -> int:
         """Process the prompt through the target, populating its KV cache.
 
         Args:
             prompt: (1, seq_len) input token IDs.
+            cancel_event: if set during prefill, raises :class:`PrefillCancelled`
+                at the next sub-chunk boundary so a client disconnect interrupts
+                a long prefill promptly instead of pinning the GPU.
 
         Returns:
             The first generated token (target's greedy argmax).
@@ -1084,7 +1131,9 @@ class PromptLookupDecoder:
         if self._gdn_capture is not None:
             self._gdn_capture.use_buffer(None)
 
-        last_logit = _prefill_last_logit(self._target, prompt, self._target_cache)
+        last_logit = _prefill_last_logit(
+            self._target, prompt, self._target_cache, cancel_event=cancel_event
+        )
         mx.eval(last_logit)
 
         self._cache_seq_len = prompt.shape[1]
