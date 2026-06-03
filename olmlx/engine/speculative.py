@@ -132,6 +132,11 @@ class _SpecCacheStore:
         tokens share the longest leading run with ``tokens``, promoting that
         entry to most-recently-used. ``None`` when the store is empty/disabled
         or no entry shares any prefix.
+
+        Note: promotion happens on any prefix overlap, even one the caller
+        later rejects (e.g. a non-trimmable partial-prefix hit that falls back
+        to fresh prefill). At the small default slot counts this near-miss
+        promotion is immaterial; revisit if slots are raised substantially.
         """
         if not self.enabled() or not self._entries or not tokens:
             return None
@@ -767,6 +772,8 @@ class SpeculativeDecoder:
         flat = prompt[0].tolist()
         n = len(flat)
 
+        # Cache layer types are invariant for a given model, so classifying the
+        # fresh caches is valid for the (same-type) restored snapshot below.
         is_trimmable = _cache_is_trimmable(self._target_cache) and _cache_is_trimmable(
             self._draft_cache
         )
@@ -777,6 +784,10 @@ class SpeculativeDecoder:
             reuse, covered = _spec_reuse_decision(is_trimmable, entry.tokens, common, n)
             if reuse:
                 target_snap, draft_snap = entry.payload
+                # Deepcopy the stored snapshots into the working caches so this
+                # request's mutations never touch the store. This is a copy of
+                # a copy (the store already holds deepcopies) — the unavoidable
+                # cost of copy-on-reuse isolation; see config docstring.
                 self._target_cache = snapshot_cache_for_persistence(
                     target_snap, eager_eval=_cache_has_lazy_state(target_snap)
                 )
@@ -1562,6 +1573,8 @@ class PromptLookupDecoder:
         Returns the target's last-position logit (lazy)."""
         flat = prompt[0].tolist()
         n = len(flat)
+        # Cache layer types are invariant per model, so classifying the fresh
+        # cache is valid for the (same-type) restored snapshot below.
         is_trimmable = _cache_is_trimmable(self._target_cache)
 
         already_covered = 0
@@ -1570,6 +1583,9 @@ class PromptLookupDecoder:
             entry, common = hit
             reuse, covered = _spec_reuse_decision(is_trimmable, entry.tokens, common, n)
             if reuse:
+                # Deepcopy the stored snapshot (a copy of a copy) into the
+                # working cache so this request's mutations never touch the
+                # store — copy-on-reuse isolation; see config docstring.
                 self._target_cache = snapshot_cache_for_persistence(
                     entry.payload, eager_eval=_cache_has_lazy_state(entry.payload)
                 )
