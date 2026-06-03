@@ -24,6 +24,7 @@ from olmlx.engine.flash.bundler import (
     _DTYPE_BYTES,
     parse_header,
 )
+from olmlx.utils import tracing as _tracing
 
 logger = logging.getLogger(__name__)
 
@@ -269,9 +270,14 @@ class FlashWeightStore:
             up_cols:   (hidden_size, len(neuron_indices))
             down_rows: (len(neuron_indices), hidden_size)
         """
-        if self._use_preallocated:
-            return self._load_neurons_preallocated(layer_idx, neuron_indices)
-        return self._load_neurons_cache(layer_idx, neuron_indices)
+        with _tracing.span(
+            "flash.weight_load",
+            layer_idx=layer_idx,
+            active_neurons=len(neuron_indices),
+        ):
+            if self._use_preallocated:
+                return self._load_neurons_preallocated(layer_idx, neuron_indices)
+            return self._load_neurons_cache(layer_idx, neuron_indices)
 
     def _load_neurons_preallocated(
         self, layer_idx: int, neuron_indices: list[int]

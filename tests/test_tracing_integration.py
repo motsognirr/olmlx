@@ -188,3 +188,41 @@ def test_speculative_step_and_verify_spans(memory_exporter):
     attrs = dict(step.attributes)
     assert "proposed" in attrs and "accepted" in attrs
     assert attrs["strategy"] in {"classic", "pld", "dflash", "eagle", "self"}
+
+
+def test_flash_weight_load_span(memory_exporter, tmp_path):
+    """A flash weight load emits a flash.weight_load span with layer_idx."""
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    from olmlx.engine.flash.bundler import bundle_ffn_weights
+    from olmlx.engine.flash.weight_store import FlashWeightStore
+
+    hidden, inter, num_layers = 16, 8, 2
+    tensors = {}
+    for layer in range(num_layers):
+        prefix = f"model.layers.{layer}.mlp"
+        tensors[f"{prefix}.gate_proj.weight"] = np.random.randn(inter, hidden).astype(
+            np.float16
+        )
+        tensors[f"{prefix}.up_proj.weight"] = np.random.randn(inter, hidden).astype(
+            np.float16
+        )
+        tensors[f"{prefix}.down_proj.weight"] = np.random.randn(hidden, inter).astype(
+            np.float16
+        )
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    save_file(tensors, str(model_dir / "model.safetensors"))
+    output_dir = tmp_path / "flash"
+    bundle_ffn_weights(model_dir, output_dir)
+
+    store = FlashWeightStore(output_dir, num_io_threads=4, cache_budget_neurons=32)
+    store.load_neurons(1, [0, 2, 5])
+
+    span = next(
+        s for s in memory_exporter.get_finished_spans() if s.name == "flash.weight_load"
+    )
+    attrs = dict(span.attributes)
+    assert attrs["layer_idx"] == 1
+    assert attrs["active_neurons"] == 3

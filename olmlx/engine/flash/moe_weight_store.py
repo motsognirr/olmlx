@@ -23,6 +23,7 @@ from olmlx.engine.flash.moe_bundler import (
     MoeExpertLayout,
     parse_moe_header,
 )
+from olmlx.utils import tracing as _tracing
 
 # Map dtype string to numpy dtype (for parsing raw bytes)
 _STR_TO_NP_DTYPE = {
@@ -327,6 +328,18 @@ class FlashMoeWeightStore:
         expert_indices: list[int],
     ) -> LoadedExperts:
         """Load expert weights for given indices, using cache and parallel I/O."""
+        with _tracing.span(
+            "flash.weight_load",
+            layer_idx=layer_idx,
+            experts=len(expert_indices),
+        ):
+            return self._load_experts_impl(layer_idx, expert_indices)
+
+    def _load_experts_impl(
+        self,
+        layer_idx: int,
+        expert_indices: list[int],
+    ) -> LoadedExperts:
         if not expert_indices:
             raise ValueError("expert_indices must not be empty")
         layout = self._layouts[layer_idx]
