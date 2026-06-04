@@ -16,7 +16,12 @@ import mlx.core as mx
 
 from olmlx.config import FlashMoeConfig, SyncMode, experimental as global_experimental
 from olmlx.config import resolve_experimental, settings
-from olmlx.engine.registry import ModelRegistry, ResolvedFlashConfig, SpeculativeConfig
+from olmlx.engine.registry import (
+    _FLASH_MOE_INCOMPATIBLE_STRATEGIES,
+    ModelRegistry,
+    ResolvedFlashConfig,
+    SpeculativeConfig,
+)
 from olmlx.utils import memory as memory_utils
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
 from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore  # noqa: F401
@@ -27,13 +32,6 @@ if TYPE_CHECKING:
 from olmlx.models.store import _dir_size, _strip_ollama_tag
 
 logger = logging.getLogger(__name__)
-
-# Speculative strategies that consume target hidden states / run a
-# feature-conditioned verify forward and therefore can't compose with
-# flash_moe's per-token expert offload. Rejected at load.
-_FLASH_MOE_INCOMPATIBLE_STRATEGIES: frozenset[str] = frozenset(
-    ("dflash", "eagle", "mtp")
-)
 
 #: Default max tokens collected per head during SpectralQuant calibration.
 #: Duplicated from spectralquant_calibrate (which imports numpy/mlx_lm
