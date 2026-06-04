@@ -43,6 +43,8 @@ class MTPConfig:
     shared_expert_intermediate_size: int = 0
     norm_topk_prob: bool = True
     decoder_sparse_step: int = 1
+    # Concat order: [hidden, embed] when True (default), [embed, hidden] when False.
+    concat_hidden_first: bool = True
     # Quantization (None => not quantized)
     quant_group_size: int | None = None
     quant_bits: int | None = None
@@ -78,6 +80,7 @@ class MTPConfig:
             ),
             norm_topk_prob=text.get("norm_topk_prob", True),
             decoder_sparse_step=text.get("decoder_sparse_step", 1),
+            concat_hidden_first=text.get("concat_hidden_first", True),
             quant_group_size=quant.get("group_size"),
             quant_bits=quant.get("bits"),
         )
@@ -137,7 +140,7 @@ class MTPDraftModel(nn.Module):
     def __init__(self, args: MTPConfig):
         super().__init__()
         self.args = args
-        self.concat_hidden_first = True  # [hidden, embed]; a later task may flip
+        self.concat_hidden_first = args.concat_hidden_first
         self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.fc = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
@@ -162,6 +165,7 @@ class MTPDraftModel(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache() for _ in self.layers]
 
+    # NOTE: bind/_find_embed/_find_lm_head are copied from EagleDraftModel by design (the MTP path is kept independent of eagle/*). If a 4th caller appears, factor into a shared engine/_bind_helpers.py.
     def bind(self, target_model: Any) -> None:
         """Borrow ``embed_tokens`` and ``lm_head`` from the target.
 
@@ -260,6 +264,12 @@ class MTPDraftModel(nn.Module):
         cache: list[KVCache] | None = None,
         compute_logits: bool = True,
     ) -> tuple[mx.array | None, mx.array]:
+        """Forward pass.
+
+        ``compute_logits=False`` skips ``lm_head`` and returns ``(None, h_new)``.
+        ``h_new`` is the PRE-``norm`` layer output (unlike EAGLE's ``norm(x)``) so it
+        can be fed as ``h_prev`` to the next draft step without double-normalising.
+        """
         if self.embed_tokens is None:
             raise RuntimeError("MTPDraftModel.__call__ requires bind() first.")
         if compute_logits and self.lm_head is None:
@@ -273,7 +283,7 @@ class MTPDraftModel(nn.Module):
         x = self.fc(mx.concatenate(parts, axis=-1))
 
         L = x.shape[1]
-        mask = None
+        mask: mx.array | None = None
         if L > 1:
             mask = create_causal_mask(L, offset=cache[0].offset if cache else 0)
         layer_cache = cache[0] if cache is not None else None
