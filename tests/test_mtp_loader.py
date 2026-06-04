@@ -20,6 +20,7 @@ def _head_dir() -> Path | None:
 @pytest.mark.skipif(_head_dir() is None, reason="MTP head not downloadable")
 def test_load_mtp_draft_strict_no_leftover_keys():
     path = _head_dir()
+    assert path is not None  # guarded by skipif above; narrows for the type checker
     cfg = MTPConfig.from_dict(json.loads((path / "config.json").read_text()))
     draft = load_mtp_draft(path, cfg)
     assert isinstance(draft, MTPDraftModel)
