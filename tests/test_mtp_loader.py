@@ -47,3 +47,32 @@ def test_load_mtp_draft_moe_strict():
     assert cfg.is_moe
     draft = load_mtp_draft(path, cfg)
     assert isinstance(draft, MTPDraftModel)
+
+
+def test_mtp_in_flash_moe_incompatible_set():
+    """MTP must be rejected under flash_moe, like eagle/dflash."""
+    from olmlx.engine.model_manager import _FLASH_MOE_INCOMPATIBLE_STRATEGIES
+
+    assert "mtp" in _FLASH_MOE_INCOMPATIBLE_STRATEGIES
+    assert {"dflash", "eagle"} <= _FLASH_MOE_INCOMPATIBLE_STRATEGIES
+
+
+def test_mtp_loader_rejects_wrong_model_type(tmp_path, monkeypatch):
+    """_load_mtp_decoder rejects a draft repo that isn't a qwen3_5_mtp head."""
+    import json
+
+    from olmlx.engine import model_manager as mm
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    mgr = mm.ModelManager.__new__(mm.ModelManager)
+    monkeypatch.setattr(
+        mgr, "_resolve_draft_path", lambda p: str(tmp_path), raising=False
+    )
+
+    class _Cfg:
+        enabled = True
+        draft_model = "some/not-an-mtp-head"
+        num_tokens = None
+
+    with pytest.raises(ValueError, match="qwen3_5_mtp"):
+        mgr._load_mtp_decoder(object(), _Cfg())
