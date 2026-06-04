@@ -296,3 +296,29 @@ class MTPDraftModel(nn.Module):
                 raise RuntimeError("MTPDraftModel internal invariant: lm_head None.")
             return lm_head(self.norm(x)), h_new
         return None, h_new
+
+
+def load_mtp_draft(path: Any, cfg: MTPConfig) -> MTPDraftModel:
+    """Build an ``MTPDraftModel`` and load the shipped (quantized) weights.
+
+    Quantizes the module to match the head's stored layout before loading.
+    Loads with ``strict=True`` over the draft's own parameters: the head
+    file contains no ``embed_tokens``/``lm_head`` (those are borrowed), and
+    the draft does not register them, so there must be zero missing/unexpected
+    keys. Norm weights are loaded as-is (already standard form — NO +1.0 shift).
+    """
+    import glob
+    import os
+
+    path = str(path)
+    draft = MTPDraftModel(cfg)
+    if cfg.quant_bits is not None and cfg.quant_group_size is not None:
+        nn.quantize(draft, group_size=cfg.quant_group_size, bits=cfg.quant_bits)
+
+    weights: dict[str, mx.array] = {}
+    for wf in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
+        weights.update(mx.load(wf))
+
+    draft.load_weights(list(weights.items()), strict=True)
+    mx.eval(draft.parameters())
+    return draft
