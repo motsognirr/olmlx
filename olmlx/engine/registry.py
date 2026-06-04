@@ -14,9 +14,9 @@ import logging
 
 from olmlx.config import FlashMoeConfig, SyncMode, settings
 
-SpeculativeStrategy = Literal["classic", "dflash", "eagle", "pld", "self_speculative"]
+SpeculativeStrategy = Literal["classic", "dflash", "eagle", "pld", "self_speculative", "mtp"]
 _VALID_SPECULATIVE_STRATEGIES: frozenset[str] = frozenset(
-    ("classic", "dflash", "eagle", "pld", "self_speculative")
+    ("classic", "dflash", "eagle", "pld", "self_speculative", "mtp")
 )
 
 logger = logging.getLogger(__name__)
