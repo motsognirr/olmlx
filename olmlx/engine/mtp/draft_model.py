@@ -2,10 +2,13 @@
 
 The head consumes ``(token_{i+1}, h_i)`` where ``h_i`` is the target's
 last-layer (pre-``model.norm``) hidden, and produces ``(logits, h_new)``.
-``h_new`` is the layer output BEFORE the head's own ``norm`` — it is fed
-back as ``h_prev`` for the next autoregressive draft step (DeepSeek/Qwen
-MTP convention). ``norm`` is applied only to compute logits via the
-target's borrowed ``lm_head``.
+The fc front-end concatenates ``[norm_e(embed); norm_h(hidden)]`` (embed
+first — empirically the order the shipped Qwen3.6 heads use). ``h_new`` is
+the POST-``norm`` hidden — the same value fed to the borrowed ``lm_head``
+for logits — chained back as ``h_prev`` for the next draft step. Both the
+concat order and the post-norm chain were determined empirically (see
+``scripts/mtp_decoder_probe.py``); they are the difference between ~0.5
+and ~0.006 acceptance.
 """
 
 from __future__ import annotations
@@ -43,8 +46,11 @@ class MTPConfig:
     shared_expert_intermediate_size: int = 0
     norm_topk_prob: bool = True
     decoder_sparse_step: int = 1
-    # Concat order: [hidden, embed] when True (default), [embed, hidden] when False.
-    concat_hidden_first: bool = True
+    # fc input order: [hidden, embed] when True, [embed, hidden] when False.
+    # Default False: the shipped Qwen3.6 ``qwen3_5_mtp`` heads concatenate
+    # [norm(embed), norm(hidden)] — determined empirically (scripts/mtp_wiring_probe.py):
+    # [e,h] gives ~0.44 1-step teacher-forced agreement vs ~0.02 for [h,e].
+    concat_hidden_first: bool = False
     # Quantization (None => not quantized)
     quant_group_size: int | None = None
     quant_bits: int | None = None
@@ -81,7 +87,7 @@ class MTPConfig:
             ),
             norm_topk_prob=text.get("norm_topk_prob", True),
             decoder_sparse_step=text.get("decoder_sparse_step", 1),
-            concat_hidden_first=text.get("concat_hidden_first", True),
+            concat_hidden_first=text.get("concat_hidden_first", False),
             quant_group_size=quant.get("group_size"),
             quant_bits=quant.get("bits"),
         )
@@ -290,12 +296,17 @@ class MTPDraftModel(nn.Module):
         layer_cache = cache[0] if cache is not None else None
         x = self.layers[0](x, mask=mask, cache=layer_cache)
 
-        h_new = x  # pre-norm; chained for the next draft step (MTP convention)
+        # Chain the POST-norm hidden (``norm(x)``), same value used for logits.
+        # Empirically (scripts/mtp_decoder_probe.py) post-norm chaining beats
+        # pre-norm on the Qwen3.6 heads (0.525 vs 0.483 acceptance): the head's
+        # ``norm`` maps the layer output back into the space ``pre_fc_norm_hidden``
+        # expects for the next step.
+        h_new = self.norm(x)
         if compute_logits:
             lm_head = self.lm_head
             if lm_head is None:
                 raise RuntimeError("MTPDraftModel internal invariant: lm_head None.")
-            return lm_head(self.norm(x)), h_new
+            return lm_head(h_new), h_new
         return None, h_new
 
 

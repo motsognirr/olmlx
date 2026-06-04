@@ -58,21 +58,22 @@ def test_mtp_draft_compute_logits_false_returns_none():
     assert h_new.shape == (1, 1, cfg.hidden_size)
 
 
-def test_mtp_h_new_is_pre_norm():
-    # h_new must be the pre-norm layer output, NOT norm(x). Use a nonzero
-    # h_prev so the layer output is non-trivial.
+def test_mtp_h_new_is_post_norm_and_logits_consistent():
+    # The chained h_new is the POST-norm hidden (``norm(x)``) — the same value
+    # fed to lm_head. Empirically post-norm chaining beats pre-norm on the
+    # Qwen3.6 heads (see scripts/mtp_decoder_probe.py). Verify lm_head(h_new)
+    # reproduces the returned logits exactly, which pins the convention.
     cfg = _tiny_cfg()
     draft = MTPDraftModel(cfg)
-    draft.bind_via_modules(
-        nn.Embedding(cfg.vocab_size, cfg.hidden_size),
-        nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False),
-    )
+    lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+    draft.bind_via_modules(nn.Embedding(cfg.vocab_size, cfg.hidden_size), lm_head)
     mx.eval(draft.parameters())
     h_prev = mx.random.normal((1, 1, cfg.hidden_size))
-    _, h_new = draft(mx.array([[7]], dtype=mx.int32), h_prev, cache=draft.make_cache())
-    # norm(h_new) must differ from h_new (else h_new was already normed).
-    diff = float(mx.max(mx.abs(draft.norm(h_new) - h_new)).item())
-    assert diff > 1e-4, "h_new appears already-normalised; pre-norm chaining broken"
+    logits, h_new = draft(
+        mx.array([[7]], dtype=mx.int32), h_prev, cache=draft.make_cache()
+    )
+    diff = float(mx.max(mx.abs(lm_head(h_new) - logits)).item())
+    assert diff < 1e-4, "h_new must be the post-norm hidden that produced logits"
 
 
 def test_mtp_layer_is_full_attention():
