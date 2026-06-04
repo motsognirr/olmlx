@@ -274,8 +274,10 @@ class MTPDraftModel(nn.Module):
         """Forward pass.
 
         ``compute_logits=False`` skips ``lm_head`` and returns ``(None, h_new)``.
-        ``h_new`` is the PRE-``norm`` layer output (unlike EAGLE's ``norm(x)``) so it
-        can be fed as ``h_prev`` to the next draft step without double-normalising.
+        ``h_new`` is the POST-``norm`` hidden (``self.norm(x)``) — the same value
+        fed to ``lm_head`` — chained as ``h_prev`` to the next draft step.
+        Empirically the order/space that the shipped Qwen3.6 heads expect (see
+        ``scripts/mtp_decoder_probe.py``).
         """
         if self.embed_tokens is None:
             raise RuntimeError("MTPDraftModel.__call__ requires bind() first.")
