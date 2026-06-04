@@ -129,14 +129,12 @@ class MTPDecoder:
         self._draft = draft_model
         self._block_size = block_size
         # Default to the deepest (last) layer, i.e. ``len(layers) - 1``.
-        # In practice trained checkpoints always supply
-        # ``target_layer_id`` (recorded by ``olmlx eagle prepare`` from
-        # the precomputed shard ladder), so this default only fires for
-        # hand-constructed ``MTPDecoder`` instances and for legacy
-        # checkpoints from before the field was persisted. Mismatching
-        # this against the layer the draft was trained on collapses
-        # bench acceptance to ~5% — operators wanting a non-default
-        # layer must pass ``target_layer_id`` explicitly.
+        # The shipped MTP head always consumes the target's final-layer
+        # (pre-``model.norm``) hidden — there is no training step that
+        # could pin it elsewhere — so this default is the right and only
+        # value in normal use. ``target_layer_id`` stays overridable for
+        # tests and future heads, but mismatching it against the layer
+        # the head expects collapses acceptance toward zero.
         num_target_layers = len(_get_layers(target_model))
         if target_layer_id is None:
             target_layer_id = num_target_layers - 1
@@ -473,8 +471,7 @@ class MTPDecoder:
             # array, but pyright can't narrow across the union and a
             # future refactor that flipped the flag would crash on the
             # ``logits[:, -1, :]`` slice with a confusing ``NoneType``
-            # error rather than at the call site. Match the explicit-
-            # raise pattern used in ``_eagle_loss``.
+            # error rather than at the call site, so raise explicitly.
             if logits is None:
                 raise RuntimeError(
                     "MTPDraftModel returned None logits in the draft "
