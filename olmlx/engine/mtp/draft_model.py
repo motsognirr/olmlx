@@ -59,7 +59,8 @@ class MTPConfig:
         quant = config.get("quantization") or config.get("quantization_config") or {}
         return cls(
             hidden_size=text["hidden_size"],
-            intermediate_size=text["intermediate_size"],
+            intermediate_size=text.get("intermediate_size")
+            or text.get("moe_intermediate_size", 0),
             num_attention_heads=text["num_attention_heads"],
             num_key_value_heads=text["num_key_value_heads"],
             head_dim=text.get(

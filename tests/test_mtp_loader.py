@@ -25,3 +25,25 @@ def test_load_mtp_draft_strict_no_leftover_keys():
     draft = load_mtp_draft(path, cfg)
     assert isinstance(draft, MTPDraftModel)
     assert cfg.num_experts == 0  # 27B head is dense
+
+
+_MOE_HEAD = "mlx-community/Qwen3.6-35B-A3B-MTP-4bit"
+
+
+def _moe_head_dir() -> Path | None:
+    try:
+        from huggingface_hub import snapshot_download
+
+        return Path(snapshot_download(_MOE_HEAD))
+    except Exception:
+        return None
+
+
+@pytest.mark.skipif(_moe_head_dir() is None, reason="MoE MTP head not downloadable")
+def test_load_mtp_draft_moe_strict():
+    path = _moe_head_dir()
+    assert path is not None
+    cfg = MTPConfig.from_dict(json.loads((path / "config.json").read_text()))
+    assert cfg.is_moe
+    draft = load_mtp_draft(path, cfg)
+    assert isinstance(draft, MTPDraftModel)
