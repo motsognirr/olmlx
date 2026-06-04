@@ -329,7 +329,12 @@ def load_mtp_draft(path: Any, cfg: MTPConfig) -> MTPDraftModel:
 
     weights: dict[str, mx.array] = {}
     for wf in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
-        weights.update(mx.load(wf))
+        # mx.load is typed ``array | dict | tuple`` (npy / safetensors /
+        # safetensors-with-metadata); a .safetensors path always yields a dict.
+        loaded = mx.load(wf)
+        if not isinstance(loaded, dict):
+            raise TypeError(f"expected a weight dict from {wf}, got {type(loaded)}")
+        weights.update(loaded)
 
     draft.load_weights(list(weights.items()), strict=True)
     mx.eval(draft.parameters())
