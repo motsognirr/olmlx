@@ -22,13 +22,24 @@ pytestmark = pytest.mark.skipif(
     reason="set OLMLX_RUN_MTP_INTEGRATION=1 to run the heavy MTP acceptance test",
 )
 
-TARGET = "unsloth/Qwen3.6-27B-MLX-8bit"
-HEAD = "mlx-community/Qwen3.6-27B-MTP-4bit"
+# (target, MTP head). The 35B target is run with flash_moe OFF (MTP is
+# mutually exclusive with flash_moe, like eagle/dflash); mlx_lm.load gives a
+# plain non-flash_moe model, which is exactly that path.
+CASES = {
+    "27b_dense": (
+        "unsloth/Qwen3.6-27B-MLX-8bit",
+        "mlx-community/Qwen3.6-27B-MTP-4bit",
+    ),
+    "35b_moe": (
+        "mlx-community/Qwen3.6-35B-A3B-4bit",
+        "mlx-community/Qwen3.6-35B-A3B-MTP-4bit",
+    ),
+}
 PROMPT = "Write a Python function that returns the n-th Fibonacci number iteratively."
 N_TOKENS = 96
 
 
-def _setup():
+def _setup(target, head):
     import json
     from pathlib import Path
 
@@ -39,8 +50,8 @@ def _setup():
     from olmlx.engine.mtp.decoder import MTPDecoder
     from olmlx.engine.mtp.draft_model import MTPConfig, load_mtp_draft
 
-    model, tok = load(TARGET)
-    hd = Path(snapshot_download(HEAD))
+    model, tok = load(target)
+    hd = Path(snapshot_download(head))
     cfg = MTPConfig.from_dict(json.loads((hd / "config.json").read_text()))
     draft = load_mtp_draft(hd, cfg)
     ids = mx.array([tok.encode(PROMPT)], dtype=mx.int32)
@@ -61,8 +72,10 @@ def _greedy(model, ids, n, mx):
     return tokens
 
 
-def test_mtp_27b_exactness_and_acceptance():
-    model, draft, cfg, ids, mx, MTPDecoder = _setup()
+@pytest.mark.parametrize("case", list(CASES))
+def test_mtp_exactness_and_acceptance(case):
+    target, head = CASES[case]
+    model, draft, cfg, ids, mx, MTPDecoder = _setup(target, head)
 
     # Plain greedy reference.
     greedy = _greedy(model, ids, N_TOKENS, mx)
@@ -78,10 +91,10 @@ def test_mtp_27b_exactness_and_acceptance():
     dec.reset()
 
     # Exactness: the speculative sequence must match plain greedy.
-    assert spec[:N_TOKENS] == greedy[:N_TOKENS], "MTP output diverged from greedy"
+    assert spec[:N_TOKENS] == greedy[:N_TOKENS], f"{case}: MTP diverged from greedy"
 
-    # Acceptance well above the broken-wiring floor.
+    # Acceptance well above the broken-wiring floor (~0.006).
     assert stats["acceptance_rate"] > 0.5, (
-        f"acceptance {stats['acceptance_rate']:.3f} too low — draft wiring "
-        "(concat order / post-norm chain) likely regressed"
+        f"{case}: acceptance {stats['acceptance_rate']:.3f} too low — draft "
+        "wiring (concat order / post-norm chain) likely regressed"
     )
