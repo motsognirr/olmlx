@@ -21,7 +21,7 @@ This skill builds on the harness's native PR-activity subscription. Webhook
 events arrive wrapped in `<github-webhook-activity>` tags and wake this
 session — do **not** poll with `sleep` or busy-loop on status checks.
 
-## 0. Identify the PR
+## 1. Identify the PR
 
 - If args contain a PR number or URL, use it.
 - Otherwise find the open PR whose head matches the current branch:
@@ -32,8 +32,11 @@ session — do **not** poll with `sleep` or busy-loop on status checks.
   asks.)
 - Confirm the PR number, title, and head branch back to the user in one line,
   then proceed. The PR's head branch is the **only** branch you push to.
+- **Deferred tools**: some MCP tools (`subscribe_pr_activity`,
+  `resolve_review_thread`, etc.) may not be immediately callable. Use
+  `ToolSearch` first to load their schemas before calling them.
 
-## 1. Take stock of the current state
+## 2. Take stock of the current state
 
 Before subscribing, snapshot where things stand so you don't react to stale
 state:
@@ -50,7 +53,7 @@ Build an internal checklist of everything outstanding (each failing check, each
 unresolved thread, each actionable comment). You'll keep this checklist live in
 your replies so the thread shows real state.
 
-## 2. Decide whether to add a Claude Code review
+## 3. Decide whether to add a Claude Code review
 
 Automated reviewers catch a lot, but a complex diff deserves a deeper read.
 Judge complexity from the diff you just read. Add a Claude Code review when
@@ -80,21 +83,24 @@ alongside the other feedback:
 Then fold your own findings into the same outstanding checklist — treat them
 like any other reviewer's feedback.
 
-## 3. Subscribe and let events drive you
+## 4. Subscribe and let events drive you
 
 Once the initial pass is done, call `mcp__github__subscribe_pr_activity` for
 the PR and **end your turn**. Events (CI completion, new reviews, comments,
 pushes) will wake the session.
 
-Webhooks don't cover everything — CI *success*, fresh pushes, and
-merge-conflict transitions are never delivered. So in addition to events:
+`subscribe_pr_activity` may not surface every transition — depending on the
+underlying webhooks, CI *success*, fresh pushes, and merge-conflict transitions
+can be missed. So in addition to subscribing:
 
-- If a `send_later` tool is available, schedule a self check-in ~1 hour out
-  before ending the turn. When it fires, re-check PR state, CI, and
-  mergeability; act on anything actionable; then re-arm. If nothing changed,
-  re-arm silently — don't ping the user or comment on the PR.
+- If running in a `/loop` session, call `ScheduleWakeup` with
+  `delaySeconds: 3600` before ending the turn. When it fires, re-check PR
+  state, CI, and mergeability; act on anything actionable; then re-arm. If
+  nothing changed, re-arm silently — don't ping the user or comment on the PR.
+- Otherwise, if `CronCreate` is available, use it for longer-horizon
+  monitoring instead.
 
-## 4. Handle each event — the fix loop
+## 5. Handle each event — the fix loop
 
 For every event, investigate before acting. Determine whether it's actionable
 and what a fix looks like:
@@ -124,10 +130,11 @@ before acting.
 - Commit with clear, descriptive messages; group related fixes.
 - Push only to the PR's head branch, with `git push -u origin <head-branch>`.
 - On network failure, retry up to 4 times with exponential backoff (2s, 4s,
-  8s, 16s).
+  8s, 16s). If all retries fail, report the stall via `AskUserQuestion` and
+  pause further pushes until the user responds.
 - Refresh the live status checklist in your reply on every event.
 
-## 5. Termination
+## 6. Termination
 
 Keep cycling — re-diagnosing and re-kicking on each new failure or comment —
 until the PR is genuinely clean:
@@ -138,8 +145,8 @@ until the PR is genuinely clean:
 
 When you reach that state, reply with the green status (that's the deliverable,
 not a no-op). The subscription is not finished until the PR is **merged** or
-**closed** — webhooks won't tell you about a merge, so rely on the `send_later`
-re-checks to notice it, then stop the check-ins.
+**closed** — use the scheduled re-checks (§4) to notice a merge if the
+subscription doesn't surface it, then stop the check-ins.
 
 Stop immediately and `mcp__github__unsubscribe_pr_activity` the moment the user
 asks you to stop — and don't push further changes to that PR.
