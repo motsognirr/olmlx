@@ -7,8 +7,10 @@ paths that MTPDecoder relies on.
 """
 
 import inspect
+import threading
 
 import mlx.core as mx
+import pytest
 
 from olmlx.engine.mtp.decoder import MTPDecoder
 from olmlx.engine.mtp.draft_model import MTPConfig, MTPDraftModel
@@ -80,3 +82,53 @@ def test_mtp_step_before_prefill_raises():
         assert False, "expected RuntimeError"
     except RuntimeError:
         pass
+
+
+def test_mtp_prefill_subchunks_long_prefix(monkeypatch):
+    """Pass-1 of prefill must fill the KV cache in sub-chunks of at most
+    ``_PREFILL_CHUNK`` tokens, never a single forward over the whole prefix.
+
+    A single full-prefix forward materialises ``lm_head`` over every position
+    (a ``[1, seq-1, vocab]`` tensor) which OOMs Metal's single-buffer limit on
+    long agentic prompts (#360). Sub-chunking bounds peak activation memory.
+    """
+    from olmlx.engine import speculative
+
+    monkeypatch.setattr(speculative, "_PREFILL_CHUNK", 4)
+
+    decoder, target, _ = _make_mtp_decoder()
+
+    seq_lens: list[int] = []
+    orig_call = type(target).__call__
+
+    def recording_call(self, input_ids, cache=None):
+        seq_lens.append(input_ids.shape[1])
+        return orig_call(self, input_ids, cache=cache)
+
+    monkeypatch.setattr(type(target), "__call__", recording_call)
+
+    prompt = mx.arange(1, 21, dtype=mx.int32)[None, :]  # (1, 20)
+    decoder.prefill(prompt)
+
+    # No single target forward may span more than one sub-chunk's worth of
+    # prefix tokens; the trailing single-token pass-2 forward is allowed.
+    assert seq_lens, "target was never called"
+    assert max(seq_lens) <= 4, f"un-chunked prefix forward: {seq_lens}"
+    assert seq_lens[-1] == 1, f"pass-2 should be a single token: {seq_lens}"
+
+
+def test_mtp_prefill_honors_cancel_event():
+    """A cancel_event set before prefill aborts with PrefillCancelled and
+    leaves the decoder reset (caches dropped, target un-patched)."""
+    from olmlx.engine.speculative import PrefillCancelled
+
+    decoder, _, _ = _make_mtp_decoder()
+    cancel = threading.Event()
+    cancel.set()
+
+    prompt = mx.arange(1, 21, dtype=mx.int32)[None, :]
+    with pytest.raises(PrefillCancelled):
+        decoder.prefill(prompt, cancel_event=cancel)
+
+    assert decoder._target_cache is None
+    assert decoder._patched is False

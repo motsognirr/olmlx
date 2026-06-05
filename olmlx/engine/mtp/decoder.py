@@ -56,7 +56,11 @@ from olmlx.engine.gdn_rollback import (
     get_model_layers as _get_layers,
 )
 from olmlx.engine.mtp.draft_model import MTPDraftModel
-from olmlx.engine.speculative import _eval_cache, verify_draft_greedy
+from olmlx.engine.speculative import (
+    PrefillCancelled,
+    _chunked_prefill,
+    verify_draft_greedy,
+)
 
 try:
     from mlx_lm.models.cache import (
@@ -252,10 +256,11 @@ class MTPDecoder:
         decoder holds the target's last-layer hidden at position
         ``seq_len - 1`` and the greedily-sampled first token.
 
-        ``cancel_event`` is accepted for ``SpeculativeDecoderProtocol``
-        conformance but not honored: MTP prefills the target in a single
-        forward (no sub-chunk loop to check between), and it is an
-        experimental strategy off the default path.
+        ``cancel_event`` is honored at each pass-1 sub-chunk boundary (and
+        before the pass-2 single-token forward): a client disconnect during a
+        long agentic prefill raises :class:`PrefillCancelled`, bounding the
+        post-cancel GPU work to one sub-chunk. ``speculative_stream_generate``
+        catches it for a clean, token-less stream exit.
         """
         self.reset()
 
@@ -357,22 +362,35 @@ class MTPDecoder:
             # Two-pass: prefix fills the KV cache without materialising the
             # full [batch, seq_len, vocab] logit; final single-token pass
             # produces a [1, 1, vocab] logit and refreshes the capture slot.
+            #
+            # Pass 1 is sub-chunked via ``_chunked_prefill`` (mirrors the
+            # classic/PLD decoders): a single forward over a long prefix forces
+            # ``lm_head`` over every position — a [1, seq-1, vocab] tensor that
+            # exceeds Metal's ~41 GB single-buffer limit on agentic prompts and
+            # 500s the request (#360). Chunking bounds peak activation memory to
+            # one sub-chunk and evals/clears the cache between chunks. Standard
+            # KV-cached attention is chunking-invariant, so the resulting cache
+            # state (and the GDN capture's snapshot, overwritten on the last
+            # chunk) is identical to a single forward. ``_chunked_prefill`` also
+            # honours ``cancel_event`` at each sub-chunk boundary.
             if prompt.shape[1] > 1:
-                self._target(prompt[:, :-1], cache=self._target_cache)
-                # Force the pass-1 hidden (if captured) before dropping the
-                # slot reference, mirroring DFlash. Correctness does not
-                # require it today — _eval_cache transitively materialises
-                # the same graph — but the explicit eval makes the ordering
-                # robust to future narrowing of _eval_cache's scope.
-                _hidden_p1 = self._hidden_storage[0]
-                if _hidden_p1 is not None:
-                    mx.eval(_hidden_p1)
-                # Discard pass-1 capture so the pass-2 None-check below is
-                # an active guard rather than dead code.
+                _chunked_prefill(
+                    self._target,
+                    prompt[:, :-1],
+                    self._target_cache,
+                    cancel_event=cancel_event,
+                )
+                # Discard the pass-1 capture so the pass-2 None-check below is
+                # an active guard rather than dead code. (The cache — and any
+                # GDN state — was already materialised per sub-chunk inside
+                # ``_chunked_prefill``.)
                 self._hidden_storage[0] = None
-                _eval_cache(self._target_cache)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PrefillCancelled()
                 target_out = self._target(prompt[:, -1:], cache=self._target_cache)
             else:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PrefillCancelled()
                 target_out = self._target(prompt, cache=self._target_cache)
             target_logits = _logits(target_out)
             captured = self._hidden_storage[0]
