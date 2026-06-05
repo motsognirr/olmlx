@@ -56,7 +56,11 @@ from olmlx.engine.gdn_rollback import (
     get_model_layers as _get_layers,
 )
 from olmlx.engine.mtp.draft_model import MTPDraftModel
-from olmlx.engine.speculative import _eval_cache, verify_draft_greedy
+from olmlx.engine.speculative import (
+    PrefillCancelled,
+    _chunked_prefill,
+    verify_draft_greedy,
+)
 
 try:
     from mlx_lm.models.cache import (
@@ -252,10 +256,11 @@ class MTPDecoder:
         decoder holds the target's last-layer hidden at position
         ``seq_len - 1`` and the greedily-sampled first token.
 
-        ``cancel_event`` is accepted for ``SpeculativeDecoderProtocol``
-        conformance but not honored: MTP prefills the target in a single
-        forward (no sub-chunk loop to check between), and it is an
-        experimental strategy off the default path.
+        ``cancel_event`` is honored at each pass-1 sub-chunk boundary (and
+        before the pass-2 single-token forward): a client disconnect during a
+        long agentic prefill raises :class:`PrefillCancelled`, bounding the
+        post-cancel GPU work to one sub-chunk. ``speculative_stream_generate``
+        catches it for a clean, token-less stream exit.
         """
         self.reset()
 
@@ -338,41 +343,73 @@ class MTPDecoder:
         # the lock state has to be cleaned up here.
         try:
             if not self._target_can_trim:
-                # Install the patch — must happen *before* the prompt
-                # forward so the patched ``__call__`` records the prompt's
-                # GDN state, which subsequent rollbacks may need to replay
-                # against. ``_GDNStateCapture.__init__`` acquires
-                # ``_GDN_PATCH_LOCK``; ``reset()`` releases it via
+                # Install the patch — must happen *before* the prompt forward
+                # so the forwards run the patched ``__call__`` that maintains
+                # the GDN conv/delta cache state. ``_GDNStateCapture.__init__``
+                # acquires ``_GDN_PATCH_LOCK``; ``reset()`` releases it via
                 # ``capture.close()``. ``for_model`` locates the GDN class,
-                # constructs the capture and a buffer pre-populated with
-                # the target's GDN modules in forward-pass order, then
-                # registers the buffer as active so subsequent forwards
-                # snapshot into it.
+                # constructs the capture and a buffer pre-populated with the
+                # target's GDN modules in forward-pass order. The buffer is
+                # left *inactive* during prefill (see below) — the prompt
+                # forward's snapshots are never consumed: ``step()`` clears the
+                # buffer before every verify (``_step_impl``), and rollback
+                # replays only over the current step's verify window.
                 self._capture, self._capture_buffer = _GDNStateCapture.for_model(
                     self._target
                 )
-                self._capture.use_buffer(self._capture_buffer)
 
             # Run the target on the prompt and capture its last-layer hidden.
             # Two-pass: prefix fills the KV cache without materialising the
             # full [batch, seq_len, vocab] logit; final single-token pass
             # produces a [1, 1, vocab] logit and refreshes the capture slot.
+            #
+            # Pass 1 is sub-chunked via ``_chunked_prefill`` (mirrors the
+            # classic/PLD decoders): a single forward over a long prefix forces
+            # ``lm_head`` over every position — a [1, seq-1, vocab] tensor that
+            # exceeds Metal's ~41 GB single-buffer limit on agentic prompts and
+            # 500s the request (#360). Chunking bounds peak activation memory to
+            # one sub-chunk and evals/clears the cache between chunks. Standard
+            # KV-cached attention (and GDN linear-attention recurrence) is
+            # chunking-invariant, so the resulting cache state is identical to a
+            # single forward. ``_chunked_prefill`` also honours ``cancel_event``
+            # at each sub-chunk boundary.
+            #
+            # GDN capture is suppressed across the chunked prefix
+            # (``use_buffer(None)``, mirroring ``SpeculativeDecoder``):
+            # ``_capturing_gdn_call`` *appends* per forward, so leaving it
+            # active would pile every sub-chunk's q/k/v/conv tensors into the
+            # buffer and hold them live across all chunks — re-bloating exactly
+            # the memory the chunking just bounded, on the hybrid GDN targets
+            # (Qwen3.6) that are MTP's primary use case. It is re-enabled before
+            # pass-2 so the buffer is active when ``step()``'s verify runs
+            # (``step()`` never re-enables it; it only clears between verifies).
+            # No try/finally is needed to restore the buffer on error: if
+            # ``_chunked_prefill`` raises (cancel, OOM), the enclosing
+            # ``except`` runs ``reset()`` which closes the capture outright, so
+            # the transiently-suppressed buffer is never observed — a failed
+            # prefill forces the caller to re-``prefill`` before any ``step()``.
             if prompt.shape[1] > 1:
-                self._target(prompt[:, :-1], cache=self._target_cache)
-                # Force the pass-1 hidden (if captured) before dropping the
-                # slot reference, mirroring DFlash. Correctness does not
-                # require it today — _eval_cache transitively materialises
-                # the same graph — but the explicit eval makes the ordering
-                # robust to future narrowing of _eval_cache's scope.
-                _hidden_p1 = self._hidden_storage[0]
-                if _hidden_p1 is not None:
-                    mx.eval(_hidden_p1)
-                # Discard pass-1 capture so the pass-2 None-check below is
-                # an active guard rather than dead code.
+                if self._capture is not None:
+                    self._capture.use_buffer(None)
+                _chunked_prefill(
+                    self._target,
+                    prompt[:, :-1],
+                    self._target_cache,
+                    cancel_event=cancel_event,
+                )
+                if self._capture is not None:
+                    self._capture.use_buffer(self._capture_buffer)
+                # Discard the pass-1 capture slot so the pass-2 None-check below
+                # is an active guard rather than dead code.
                 self._hidden_storage[0] = None
-                _eval_cache(self._target_cache)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PrefillCancelled()
                 target_out = self._target(prompt[:, -1:], cache=self._target_cache)
             else:
+                if self._capture is not None:
+                    self._capture.use_buffer(self._capture_buffer)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PrefillCancelled()
                 target_out = self._target(prompt, cache=self._target_cache)
             target_logits = _logits(target_out)
             captured = self._hidden_storage[0]

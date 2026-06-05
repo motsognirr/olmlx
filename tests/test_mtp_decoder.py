@@ -7,8 +7,10 @@ paths that MTPDecoder relies on.
 """
 
 import inspect
+import threading
 
 import mlx.core as mx
+import pytest
 
 from olmlx.engine.mtp.decoder import MTPDecoder
 from olmlx.engine.mtp.draft_model import MTPConfig, MTPDraftModel
@@ -80,3 +82,116 @@ def test_mtp_step_before_prefill_raises():
         assert False, "expected RuntimeError"
     except RuntimeError:
         pass
+
+
+def test_mtp_prefill_subchunks_long_prefix(monkeypatch):
+    """Pass-1 of prefill must fill the KV cache in sub-chunks of at most
+    ``_PREFILL_CHUNK`` tokens, never a single forward over the whole prefix.
+
+    A single full-prefix forward materialises ``lm_head`` over every position
+    (a ``[1, seq-1, vocab]`` tensor) which OOMs Metal's single-buffer limit on
+    long agentic prompts (#360). Sub-chunking bounds peak activation memory.
+    """
+    from olmlx.engine import speculative
+
+    monkeypatch.setattr(speculative, "_PREFILL_CHUNK", 4)
+
+    decoder, target, _ = _make_mtp_decoder()
+
+    seq_lens: list[int] = []
+    orig_call = type(target).__call__
+
+    def recording_call(self, input_ids, cache=None):
+        seq_lens.append(input_ids.shape[1])
+        return orig_call(self, input_ids, cache=cache)
+
+    monkeypatch.setattr(type(target), "__call__", recording_call)
+
+    prompt = mx.arange(1, 21, dtype=mx.int32)[None, :]  # (1, 20)
+    decoder.prefill(prompt)
+
+    # No single target forward may span more than one sub-chunk's worth of
+    # prefix tokens; the trailing single-token pass-2 forward is allowed.
+    assert seq_lens, "target was never called"
+    assert max(seq_lens) <= 4, f"un-chunked prefix forward: {seq_lens}"
+    assert seq_lens[-1] == 1, f"pass-2 should be a single token: {seq_lens}"
+
+
+def test_mtp_prefill_suppresses_gdn_capture_during_chunked_prefix(monkeypatch):
+    """On a non-trimmable (GDN) target the capture buffer must be INACTIVE
+    during the chunked prefix forward.
+
+    ``_capturing_gdn_call`` appends per forward, so leaving the buffer active
+    would pile every sub-chunk's GDN q/k/v/conv tensors into it and hold them
+    live across all chunks — re-bloating exactly the memory the chunking
+    bounds (#360), on the hybrid GDN targets that are MTP's primary use case.
+    The buffer is re-enabled before the pass-2 single-token forward because
+    ``step()`` relies on an active buffer (it only clears between verifies).
+    """
+    from olmlx.engine import speculative
+    from olmlx.engine.mtp import decoder as decoder_mod
+
+    monkeypatch.setattr(speculative, "_PREFILL_CHUNK", 4)
+    monkeypatch.setattr(decoder_mod, "can_trim_prompt_cache", lambda _: False)
+    monkeypatch.setattr(decoder_mod, "_HAS_GDN", True)
+    monkeypatch.setattr(decoder_mod, "_find_gdn_class", lambda _m: object)
+
+    state: dict[str, bool | None] = {"active": None}
+
+    class _FakeBuffer:
+        def clear(self):
+            pass
+
+    class _FakeCapture:
+        @classmethod
+        def for_model(cls, _model):
+            return cls(), _FakeBuffer()
+
+        def use_buffer(self, buf):
+            state["active"] = buf is not None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(decoder_mod, "_GDNStateCapture", _FakeCapture)
+
+    decoder, target, _ = _make_mtp_decoder()
+
+    forwards: list[tuple[int, bool | None]] = []
+    orig_call = type(target).__call__
+
+    def recording_call(self, input_ids, cache=None):
+        forwards.append((input_ids.shape[1], state["active"]))
+        return orig_call(self, input_ids, cache=cache)
+
+    monkeypatch.setattr(type(target), "__call__", recording_call)
+
+    prompt = mx.arange(1, 21, dtype=mx.int32)[None, :]  # (1, 20)
+    decoder.prefill(prompt)
+
+    assert decoder._target_can_trim is False
+    assert len(forwards) >= 2, forwards
+    # Every prefix sub-chunk forward ran with the capture buffer suppressed.
+    for _seq_len, active in forwards[:-1]:
+        assert active is False, f"GDN capture active during prefix forward: {forwards}"
+    # The final pass-2 (single-token) forward ran with the buffer re-enabled.
+    last_seq, last_active = forwards[-1]
+    assert last_seq == 1, forwards
+    assert last_active is True, forwards
+
+
+def test_mtp_prefill_honors_cancel_event():
+    """A cancel_event set before prefill aborts with PrefillCancelled and
+    leaves the decoder reset (caches dropped, target un-patched)."""
+    from olmlx.engine.speculative import PrefillCancelled
+
+    decoder, _, _ = _make_mtp_decoder()
+    cancel = threading.Event()
+    cancel.set()
+
+    prompt = mx.arange(1, 21, dtype=mx.int32)[None, :]
+    with pytest.raises(PrefillCancelled):
+        decoder.prefill(prompt, cancel_event=cancel)
+
+    assert decoder._target_cache is None
+    assert decoder._patched is False
