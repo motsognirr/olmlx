@@ -5501,3 +5501,33 @@ def test_vlm_tools_image_count_mismatch_raises():
         _apply_chat_template_vlm(
             processor, MagicMock(), messages, ["a.jpg"], tools=tools
         )
+
+
+def test_vlm_tools_no_user_message_warns_and_renders_text_only(caplog):
+    """No user turn to attach images to -> warn, no markers injected."""
+
+    def fake_apply(messages, **kwargs):
+        # Emit a placeholder only if an image part is actually present.
+        has_image = any(
+            isinstance(m.get("content"), list)
+            and any(p.get("type") == "image" for p in m["content"])
+            for m in messages
+        )
+        return "system-only" + ("<|image|>" if has_image else "")
+
+    tok = MagicMock()
+    tok.apply_chat_template = MagicMock(side_effect=fake_apply)
+    tok.image_token = "<|image|>"
+    processor = MagicMock()
+    processor.tokenizer = tok
+    messages = [{"role": "system", "content": "you are a bot"}]
+    tools = [{"type": "function", "function": {"name": "record_metric"}}]
+
+    # No user message means no marker is injected; the count guard then sees 0
+    # placeholders for 1 image and raises, after the helper logs its warning.
+    with caplog.at_level("WARNING"):
+        with pytest.raises(ValueError, match="image placeholder"):
+            _apply_chat_template_vlm(
+                processor, MagicMock(), messages, ["a.jpg"], tools=tools
+            )
+    assert "no user message to attach" in caplog.text

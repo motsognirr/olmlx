@@ -2211,6 +2211,11 @@ def _apply_chat_template_vlm(
             **kwargs,
         )
         if images:
+            # Assumes one placeholder token per image — true for the Gemma-family
+            # native-tools targets in scope (#428). Templates that expand each
+            # image into many patch tokens (e.g. Qwen2-VL's repeated
+            # ``<|image_pad|>``) would trip this guard; revisit if such a model
+            # gains native-tools support.
             image_token = _vlm_image_token(processor)
             found = prompt.count(image_token)
             if found != len(images):
