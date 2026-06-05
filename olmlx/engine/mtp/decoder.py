@@ -383,6 +383,11 @@ class MTPDecoder:
             # (Qwen3.6) that are MTP's primary use case. It is re-enabled before
             # pass-2 so the buffer is active when ``step()``'s verify runs
             # (``step()`` never re-enables it; it only clears between verifies).
+            # No try/finally is needed to restore the buffer on error: if
+            # ``_chunked_prefill`` raises (cancel, OOM), the enclosing
+            # ``except`` runs ``reset()`` which closes the capture outright, so
+            # the transiently-suppressed buffer is never observed — a failed
+            # prefill forces the caller to re-``prefill`` before any ``step()``.
             if prompt.shape[1] > 1:
                 if self._capture is not None:
                     self._capture.use_buffer(None)
