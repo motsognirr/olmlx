@@ -982,9 +982,10 @@ def _audit_speculative_config(
       ``flash_speculative`` knob is the right one. Triggers a warning
       so users see the redirect. Flash-MoE supports standalone speculative
       (classic strategy only) and is excluded from this check.
-    - ``dflash_moe_conflicts`` — models that combine
-      ``speculative_strategy='dflash'`` with Flash-MoE. Triggers a
-      warning since dflash is unsupported on MoE targets (raises
+    - ``dflash_moe_conflicts`` — models that combine a feature-conditioned
+      speculative strategy (``dflash``/``eagle``/``mtp``, i.e.
+      ``_FLASH_MOE_INCOMPATIBLE_STRATEGIES``) with Flash-MoE. Triggers a
+      warning since these are unsupported on Flash-MoE targets (raises
       ValueError at load time).
     - ``global_draft_used`` — True if at least one model resolves to
       the global ``speculative_draft_model`` (i.e. has ``speculative=True``
@@ -994,6 +995,8 @@ def _audit_speculative_config(
     The registry is loaded from disk; failures are logged and treated
     as "nothing to validate" so this never blocks startup on its own.
     """
+    from olmlx.engine.registry import _FLASH_MOE_INCOMPATIBLE_STRATEGIES
+
     if registry is None:
         registry = _load_registry_for_audit()
     if registry is None:
@@ -1085,7 +1088,7 @@ def _audit_speculative_config(
             if (
                 mc is not None
                 and mc.resolved_flash_moe().enabled
-                and strategy in ("dflash", "eagle")
+                and strategy in _FLASH_MOE_INCOMPATIBLE_STRATEGIES
             ):
                 dflash_moe_conflicts.append(name)
     return bad, dormant, flash_conflicts, dflash_moe_conflicts, global_draft_used

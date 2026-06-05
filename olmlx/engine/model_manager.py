@@ -16,7 +16,12 @@ import mlx.core as mx
 
 from olmlx.config import FlashMoeConfig, SyncMode, experimental as global_experimental
 from olmlx.config import resolve_experimental, settings
-from olmlx.engine.registry import ModelRegistry, ResolvedFlashConfig, SpeculativeConfig
+from olmlx.engine.registry import (
+    _FLASH_MOE_INCOMPATIBLE_STRATEGIES,
+    ModelRegistry,
+    ResolvedFlashConfig,
+    SpeculativeConfig,
+)
 from olmlx.utils import memory as memory_utils
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
 from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore  # noqa: F401
@@ -2843,6 +2848,46 @@ class ModelManager:
             target_layer_id=target_layer_id,
         )
 
+    def _load_mtp_decoder(
+        self,
+        target_model: Any,
+        spec_config: SpeculativeConfig,
+    ) -> Any:
+        """Load Qwen3.6's native MTP head (``qwen3_5_mtp``) as the draft.
+
+        Pretrained/shipped — no training step. flash_moe exclusivity is
+        enforced upstream via ``_FLASH_MOE_INCOMPATIBLE_STRATEGIES``.
+        """
+        from olmlx.engine.mtp.decoder import MTPDecoder
+        from olmlx.engine.mtp.draft_model import MTPConfig, load_mtp_draft
+
+        if not spec_config.enabled:
+            raise RuntimeError(
+                "_load_mtp_decoder called with spec_config.enabled=False"
+            )
+        if not spec_config.draft_model:
+            raise ValueError(
+                "speculative_strategy='mtp' requires speculative_draft_model "
+                "to point at the MTP head repo (e.g. "
+                "mlx-community/Qwen3.6-27B-MTP-4bit)."
+            )
+        load_path = self._resolve_draft_path(spec_config.draft_model)
+        cfg_dict = json.loads((Path(load_path) / "config.json").read_text())
+        if cfg_dict.get("model_type") != "qwen3_5_mtp":
+            raise ValueError(
+                f"Expected an MTP head (model_type 'qwen3_5_mtp'); got "
+                f"'{cfg_dict.get('model_type')}' at {spec_config.draft_model}."
+            )
+        cfg = MTPConfig.from_dict(cfg_dict)
+        draft = load_mtp_draft(load_path, cfg)
+        self._check_vocab_match(target_model, draft)
+        block_size = (
+            spec_config.num_tokens
+            if spec_config.num_tokens is not None
+            else cfg.block_size
+        )
+        return MTPDecoder(target_model, draft, block_size=block_size)
+
     def _load_speculative_decoder(
         self,
         target_model: Any,
@@ -3327,7 +3372,10 @@ class ModelManager:
         if self._is_flash_moe_enabled(flash_moe_config):
             flash_moe_dir = self._flash_moe_dir(hf_path)
             if flash_moe_dir is not None:
-                if spec_enabled and spec_config.strategy in ("dflash", "eagle"):
+                if (
+                    spec_enabled
+                    and spec_config.strategy in _FLASH_MOE_INCOMPATIBLE_STRATEGIES
+                ):
                     # Both feature-conditioned strategies route through
                     # ``_load_dflash_decoder`` / ``_load_eagle_decoder``
                     # which expect a dense target; the Flash-MoE wrapper
@@ -3458,7 +3506,10 @@ class ModelManager:
                 # Apply HQQ weight quantization if configured
                 self._maybe_quantize_model(model, True, weight_quant_str, hf_path)
 
-                if spec_enabled and spec_config.strategy in ("dflash", "eagle"):
+                if (
+                    spec_enabled
+                    and spec_config.strategy in _FLASH_MOE_INCOMPATIBLE_STRATEGIES
+                ):
                     raise ValueError(
                         f"speculative_strategy={spec_config.strategy!r} is not "
                         "supported on VLM targets. Use "
@@ -3516,6 +3567,8 @@ class ModelManager:
                 decoder = self._load_dflash_decoder(model, spec_config)
             elif spec_config.strategy == "eagle":
                 decoder = self._load_eagle_decoder(model, spec_config)
+            elif spec_config.strategy == "mtp":
+                decoder = self._load_mtp_decoder(model, spec_config)
             elif spec_config.strategy == "pld":
                 decoder = self._load_pld_decoder(model, spec_config)
             elif spec_config.strategy == "self_speculative":

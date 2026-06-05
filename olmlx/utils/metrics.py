@@ -175,6 +175,7 @@ _STRATEGY_BY_CLASS = {
     "PromptLookupDecoder": "pld",
     "DFlashDecoder": "dflash",
     "EagleDecoder": "eagle",
+    "MTPDecoder": "mtp",
     "SelfSpeculativeDecoder": "self",
 }
 

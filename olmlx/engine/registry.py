@@ -14,9 +14,19 @@ import logging
 
 from olmlx.config import FlashMoeConfig, SyncMode, settings
 
-SpeculativeStrategy = Literal["classic", "dflash", "eagle", "pld", "self_speculative"]
+SpeculativeStrategy = Literal[
+    "classic", "dflash", "eagle", "pld", "self_speculative", "mtp"
+]
 _VALID_SPECULATIVE_STRATEGIES: frozenset[str] = frozenset(
-    ("classic", "dflash", "eagle", "pld", "self_speculative")
+    ("classic", "dflash", "eagle", "pld", "self_speculative", "mtp")
+)
+# Strategies that consume target hidden states / run a feature-conditioned
+# verify forward and therefore can't compose with flash_moe's per-token expert
+# offload. Rejected at load (model_manager) and flagged in the config audit
+# (cli). Defined here — the lightweight registry module both consumers import —
+# so CLI pre-flight checks don't pull in the heavy model_manager import chain.
+_FLASH_MOE_INCOMPATIBLE_STRATEGIES: frozenset[str] = frozenset(
+    ("dflash", "eagle", "mtp")
 )
 
 logger = logging.getLogger(__name__)
