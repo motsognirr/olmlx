@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from olmlx.engine.inference import INIT_ORPHAN_DETECT_LIMIT
-from olmlx.routers.openai import JSON_MODE_SYSTEM_MSG
+from olmlx.routers.openai import JSON_MODE_SYSTEM_MSG, _normalize_multimodal_messages
+from olmlx.schemas.openai import OpenAIChatRequest
 from olmlx.utils.streaming import flush_thinking_buffer, strip_thinking_streaming
 from olmlx.utils.timing import TimingStats
 
@@ -1733,3 +1734,94 @@ class TestToolCallParsing:
             )
 
         assert resp.status_code == 200
+
+
+# --- Multimodal image intake tests (#428) ---
+
+
+def test_openai_request_accepts_multimodal_content():
+    req = OpenAIChatRequest(
+        model="m",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+                ],
+            }
+        ],
+    )
+    assert isinstance(req.messages[0].content, list)
+
+
+def test_normalize_multimodal_splits_text_and_images():
+    msgs = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                },
+            ],
+        }
+    ]
+    out = _normalize_multimodal_messages(msgs)
+    assert out[0]["content"] == "what is this?"
+    assert out[0]["images"] == ["data:image/png;base64,AAAA"]
+
+
+def test_normalize_multimodal_leaves_string_content_untouched():
+    msgs = [{"role": "user", "content": "plain"}]
+    out = _normalize_multimodal_messages(msgs)
+    assert out[0]["content"] == "plain"
+    assert "images" not in out[0]
+
+
+def test_normalize_multimodal_text_only_list():
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "just text"}]}]
+    out = _normalize_multimodal_messages(msgs)
+    assert out[0]["content"] == "just text"
+    assert "images" not in out[0]
+
+
+def test_normalize_multimodal_image_only_message():
+    """Image-only content -> empty content string + images list."""
+    msgs = [
+        {
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": "http://x/y.png"}}],
+        }
+    ]
+    out = _normalize_multimodal_messages(msgs)
+    assert out[0]["content"] == ""
+    assert out[0]["images"] == ["http://x/y.png"]
+
+
+def test_normalize_multimodal_preserves_image_order():
+    msgs = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "compare"},
+                {"type": "image_url", "image_url": {"url": "http://x/a.png"}},
+                {"type": "image_url", "image_url": {"url": "http://x/b.png"}},
+            ],
+        }
+    ]
+    out = _normalize_multimodal_messages(msgs)
+    assert out[0]["images"] == ["http://x/a.png", "http://x/b.png"]
+
+
+def test_normalize_multimodal_malformed_image_raises():
+    """A bad image_url block surfaces as ValueError (handler maps to 422)."""
+    msgs = [
+        {
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {}}],
+        }
+    ]
+    with pytest.raises(ValueError, match="image_url"):
+        _normalize_multimodal_messages(msgs)

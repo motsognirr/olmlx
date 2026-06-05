@@ -2879,3 +2879,117 @@ class TestFlushThinkingBuffer:
         assert "Streamed text" in events[1]
         assert '"content_block_stop"' in events[2]
         assert new_idx == 0
+
+
+class TestConvertMessagesImages:
+    def test_anthropic_converts_base64_image_block(self):
+        req = AnthropicMessagesRequest(
+            model="m",
+            max_tokens=16,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": "QQ==",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        msgs = _convert_messages(req)
+        user = [m for m in msgs if m["role"] == "user"][0]
+        assert user["content"] == "describe"
+        assert user["images"] == ["data:image/jpeg;base64,QQ=="]
+
+    def test_anthropic_image_only_block_creates_user_message(self):
+        req = AnthropicMessagesRequest(
+            model="m",
+            max_tokens=16,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "data": "QQ=="}}
+                    ],
+                }
+            ],
+        )
+        msgs = _convert_messages(req)
+        user = [m for m in msgs if m["role"] == "user"][0]
+        assert user["content"] == ""
+        assert user["images"] == ["data:image/png;base64,QQ=="]
+
+    def test_anthropic_text_only_block_has_no_images_key(self):
+        req = AnthropicMessagesRequest(
+            model="m",
+            max_tokens=16,
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        )
+        msgs = _convert_messages(req)
+        user = [m for m in msgs if m["role"] == "user"][0]
+        assert user["content"] == "hello"
+        assert "images" not in user
+
+    def test_anthropic_url_source_block(self):
+        req = AnthropicMessagesRequest(
+            model="m",
+            max_tokens=16,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "url",
+                                "url": "https://example.com/img.png",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        msgs = _convert_messages(req)
+        user = [m for m in msgs if m["role"] == "user"][0]
+        assert user["images"] == ["https://example.com/img.png"]
+
+    def test_anthropic_preserves_image_order(self):
+        req = AnthropicMessagesRequest(
+            model="m",
+            max_tokens=16,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "url", "url": "u/a.png"}},
+                        {"type": "image", "source": {"type": "url", "url": "u/b.png"}},
+                    ],
+                }
+            ],
+        )
+        msgs = _convert_messages(req)
+        user = [m for m in msgs if m["role"] == "user"][0]
+        assert user["images"] == ["u/a.png", "u/b.png"]
+
+    def test_anthropic_malformed_image_source_raises(self):
+        """A base64 source missing 'data' surfaces as ValueError (handler -> 422)."""
+        req = AnthropicMessagesRequest(
+            model="m",
+            max_tokens=16,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "source": {"type": "base64"}}],
+                }
+            ],
+        )
+        with pytest.raises(ValueError, match="base64"):
+            _convert_messages(req)

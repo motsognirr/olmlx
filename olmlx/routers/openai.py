@@ -20,6 +20,7 @@ from olmlx.engine.tool_parser import (
     resolve_tool_names,
 )
 from olmlx.routers.common import build_inference_options, resolve_openai_think
+from olmlx.utils.images import normalize_image_block
 from olmlx.utils.streaming import flush_thinking_buffer, strip_thinking_streaming
 from olmlx.schemas.openai import (
     OpenAIChatMessage,
@@ -292,6 +293,39 @@ def _build_options(req) -> dict:
     )
 
 
+def _normalize_multimodal_messages(messages: list[dict]) -> list[dict]:
+    """Split OpenAI multimodal content lists into a text ``content`` string plus
+    a separate ``images`` list (the engine's Ollama-style convention, #428).
+
+    OpenAI carries images inline as content parts:
+        content: [{"type": "text", "text": ...},
+                  {"type": "image_url", "image_url": {"url": ...}}]
+    String content is left untouched.
+    """
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        texts: list[str] = []
+        images: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            # "input_text"/"input_image" are the Responses-API / newer-SDK
+            # spellings of the Chat-Completions "text"/"image_url" parts.
+            if ptype in ("text", "input_text"):
+                text = part.get("text") or ""
+                if text:
+                    texts.append(text)
+            elif ptype == "image_url":
+                images.append(normalize_image_block(part))
+        m["content"] = " ".join(texts)
+        if images:
+            m["images"] = (m.get("images") or []) + images
+    return messages
+
+
 @router.post(
     "/v1/chat/completions",
     response_model=OpenAIChatResponse,
@@ -309,6 +343,12 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
     )
     manager = request.app.state.model_manager
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
+    # A malformed image content part (e.g. image_url with no url) is a client
+    # error — surface as 422 rather than an uncaught 500.
+    try:
+        messages = _normalize_multimodal_messages(messages)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     grammar_spec = None
     if req.response_format and req.response_format.type in (
         "json_object",

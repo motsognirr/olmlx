@@ -33,6 +33,8 @@ class AnthropicContentBlock(BaseModel):
     tool_use_id: str | None = None
     content: str | list[Any] | None = None
     is_error: bool | None = None
+    # image fields
+    source: dict | None = None
 
     model_config = {"extra": "allow"}
 
