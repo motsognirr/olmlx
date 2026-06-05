@@ -149,8 +149,19 @@ def _fake_generate(model, tokenizer, *, prompt, max_tokens=512, **kwargs):
 
 
 @pytest.fixture(autouse=True)
-def mock_mlx_primitives(monkeypatch):
-    """Patch all MLX primitives so tests don't need a GPU."""
+def mock_mlx_primitives(request, monkeypatch):
+    """Patch all MLX primitives so tests don't need a GPU.
+
+    No-op for tests marked ``real_model``: those load an actual MLX model and
+    must hit the real ``mlx_lm`` / ``mlx_vlm`` load + generate path.  Without
+    this guard the autouse patches would silently mock ``mlx_lm.generate``
+    (returning a canned "Hello world"), so a ``real_model`` test would pass
+    against the mock instead of the model it claims to exercise.
+    """
+    if request.node.get_closest_marker("real_model"):
+        yield {}
+        return
+
     patches = []
 
     def _start(target, replacement=None):
