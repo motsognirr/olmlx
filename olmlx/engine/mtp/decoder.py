@@ -343,20 +343,20 @@ class MTPDecoder:
         # the lock state has to be cleaned up here.
         try:
             if not self._target_can_trim:
-                # Install the patch — must happen *before* the prompt
-                # forward so the patched ``__call__`` records the prompt's
-                # GDN state, which subsequent rollbacks may need to replay
-                # against. ``_GDNStateCapture.__init__`` acquires
-                # ``_GDN_PATCH_LOCK``; ``reset()`` releases it via
+                # Install the patch — must happen *before* the prompt forward
+                # so the forwards run the patched ``__call__`` that maintains
+                # the GDN conv/delta cache state. ``_GDNStateCapture.__init__``
+                # acquires ``_GDN_PATCH_LOCK``; ``reset()`` releases it via
                 # ``capture.close()``. ``for_model`` locates the GDN class,
-                # constructs the capture and a buffer pre-populated with
-                # the target's GDN modules in forward-pass order, then
-                # registers the buffer as active so subsequent forwards
-                # snapshot into it.
+                # constructs the capture and a buffer pre-populated with the
+                # target's GDN modules in forward-pass order. The buffer is
+                # left *inactive* during prefill (see below) — the prompt
+                # forward's snapshots are never consumed: ``step()`` clears the
+                # buffer before every verify (``_step_impl``), and rollback
+                # replays only over the current step's verify window.
                 self._capture, self._capture_buffer = _GDNStateCapture.for_model(
                     self._target
                 )
-                self._capture.use_buffer(self._capture_buffer)
 
             # Run the target on the prompt and capture its last-layer hidden.
             # Two-pass: prefix fills the KV cache without materialising the
@@ -369,26 +369,40 @@ class MTPDecoder:
             # exceeds Metal's ~41 GB single-buffer limit on agentic prompts and
             # 500s the request (#360). Chunking bounds peak activation memory to
             # one sub-chunk and evals/clears the cache between chunks. Standard
-            # KV-cached attention is chunking-invariant, so the resulting cache
-            # state (and the GDN capture's snapshot, overwritten on the last
-            # chunk) is identical to a single forward. ``_chunked_prefill`` also
-            # honours ``cancel_event`` at each sub-chunk boundary.
+            # KV-cached attention (and GDN linear-attention recurrence) is
+            # chunking-invariant, so the resulting cache state is identical to a
+            # single forward. ``_chunked_prefill`` also honours ``cancel_event``
+            # at each sub-chunk boundary.
+            #
+            # GDN capture is suppressed across the chunked prefix
+            # (``use_buffer(None)``, mirroring ``SpeculativeDecoder``):
+            # ``_capturing_gdn_call`` *appends* per forward, so leaving it
+            # active would pile every sub-chunk's q/k/v/conv tensors into the
+            # buffer and hold them live across all chunks — re-bloating exactly
+            # the memory the chunking just bounded, on the hybrid GDN targets
+            # (Qwen3.6) that are MTP's primary use case. It is re-enabled before
+            # pass-2 so the buffer is active when ``step()``'s verify runs
+            # (``step()`` never re-enables it; it only clears between verifies).
             if prompt.shape[1] > 1:
+                if self._capture is not None:
+                    self._capture.use_buffer(None)
                 _chunked_prefill(
                     self._target,
                     prompt[:, :-1],
                     self._target_cache,
                     cancel_event=cancel_event,
                 )
-                # Discard the pass-1 capture so the pass-2 None-check below is
-                # an active guard rather than dead code. (The cache — and any
-                # GDN state — was already materialised per sub-chunk inside
-                # ``_chunked_prefill``.)
+                if self._capture is not None:
+                    self._capture.use_buffer(self._capture_buffer)
+                # Discard the pass-1 capture slot so the pass-2 None-check below
+                # is an active guard rather than dead code.
                 self._hidden_storage[0] = None
                 if cancel_event is not None and cancel_event.is_set():
                     raise PrefillCancelled()
                 target_out = self._target(prompt[:, -1:], cache=self._target_cache)
             else:
+                if self._capture is not None:
+                    self._capture.use_buffer(self._capture_buffer)
                 if cancel_event is not None and cancel_event.is_set():
                     raise PrefillCancelled()
                 target_out = self._target(prompt, cache=self._target_cache)
