@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from functools import partial
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from olmlx.config import settings
@@ -17,6 +17,7 @@ from olmlx.engine.inference import (
     generate_chat,
 )
 from olmlx.routers.common import build_inference_options
+from olmlx.utils.images import normalize_image_block
 from olmlx.engine.tool_parser import (
     _make_tool_use_id,
     parse_model_output,
@@ -218,9 +219,16 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
 
         elif msg.role == "user":
             text_parts = []
+            user_images: list[str] = []
             for block in msg.content:
                 if block.type == "text" and block.text:
                     text_parts.append(block.text)
+                elif block.type == "image":
+                    user_images.append(
+                        normalize_image_block(
+                            {"type": "image", "source": block.source or {}}
+                        )
+                    )
                 elif block.type == "tool_result":
                     result_content = ""
                     if isinstance(block.content, str):
@@ -237,8 +245,11 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
                             "content": result_content,
                         }
                     )
-            if text_parts:
-                messages.append({"role": "user", "content": " ".join(text_parts)})
+            if text_parts or user_images:
+                user_msg: dict = {"role": "user", "content": " ".join(text_parts)}
+                if user_images:
+                    user_msg["images"] = user_images
+                messages.append(user_msg)
 
     if system_parts:
         messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
@@ -839,7 +850,10 @@ async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request
     lm = await manager.ensure_loaded(resolved_model, pin=True)
 
     try:
-        messages = _convert_messages(req)
+        try:
+            messages = _convert_messages(req)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         tools = _convert_tools(req)
 
         enable_thinking: bool | None = None
@@ -880,7 +894,12 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     )
     resolved_model = _resolve_anthropic_model(req.model)
     manager = request.app.state.model_manager
-    messages = _convert_messages(req)
+    # A malformed image content block is a client error — surface as 422
+    # rather than an uncaught 500 (mirrors the OpenAI surface).
+    try:
+        messages = _convert_messages(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     options = _build_options(req)
     tools = _convert_tools(req)
     has_tools = bool(tools)
