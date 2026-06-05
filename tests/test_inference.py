@@ -23,6 +23,7 @@ from olmlx.engine.inference import (
     _inference_locked,
     _inject_tools_into_system,
     _normalize_tool_calls_in_messages,
+    _apply_chat_template_vlm,
     apply_chat_template_text,
     _lock_boundary_sync,
     _safe_sync,
@@ -1194,13 +1195,16 @@ class TestApplyChatTemplateText:
 
 
 class TestApplyChatTemplateVlm:
-    def test_vlm_tools_with_images_warns(self, caplog):
-        """When tools and images are both provided, a warning must be logged."""
+    def test_vlm_tools_with_images_injects_not_ignores(self, caplog):
+        """tools+images now inject image markers (no warn-and-ignore) (#428)."""
         from olmlx.engine.inference import _apply_chat_template_vlm
 
         mock_processor = MagicMock()
         mock_tok = MagicMock()
-        mock_tok.apply_chat_template.return_value = "prompt"
+        mock_tok.image_token = "<|image|>"
+        mock_tok.apply_chat_template.side_effect = lambda messages, **kwargs: (
+            "<|image|>describe"
+        )
         mock_processor.tokenizer = mock_tok
         mock_model = MagicMock()
 
@@ -1215,9 +1219,10 @@ class TestApplyChatTemplateVlm:
                 tools=tools,
             )
 
-        assert any("image" in r.message.lower() for r in caplog.records), (
-            f"Expected warning about images, got: {[r.message for r in caplog.records]}"
-        )
+        sent = mock_tok.apply_chat_template.call_args[0][0]
+        user = [m for m in sent if m["role"] == "user"][-1]
+        assert {"type": "image"} in user["content"]
+        assert "will be ignored" not in caplog.text
 
     def test_vlm_template(self):
         from olmlx.engine.inference import _apply_chat_template_vlm
@@ -5414,3 +5419,85 @@ class TestIsPureRotatingCache:
         from olmlx.engine.inference import _is_pure_rotating_cache
 
         assert _is_pure_rotating_cache([]) is False
+
+
+def _fake_gemma_processor():
+    """Processor whose tokenizer renders one <|image|> per image content-part."""
+
+    def fake_apply(messages, **kwargs):
+        n = sum(
+            1
+            for m in messages
+            if m.get("role") == "user" and isinstance(m.get("content"), list)
+            for p in m["content"]
+            if isinstance(p, dict) and p.get("type") == "image"
+        )
+        tool_text = "<|tool>record_metric<tool|>" if kwargs.get("tools") else ""
+        return tool_text + ("<|image|>" * n) + "describe"
+
+    tok = MagicMock()
+    tok.apply_chat_template = MagicMock(side_effect=fake_apply)
+    tok.image_token = "<|image|>"
+    processor = MagicMock()
+    processor.tokenizer = tok
+    return processor, tok
+
+
+def test_vlm_tools_with_images_injects_markers(caplog):
+    processor, tok = _fake_gemma_processor()
+    messages = [{"role": "user", "content": "describe"}]
+    tools = [{"type": "function", "function": {"name": "record_metric"}}]
+
+    prompt = _apply_chat_template_vlm(
+        processor, MagicMock(), messages, ["a.jpg"], tools=tools
+    )
+
+    sent = tok.apply_chat_template.call_args[0][0]
+    user = [m for m in sent if m["role"] == "user"][-1]
+    assert isinstance(user["content"], list)
+    assert {"type": "image"} in user["content"]
+    assert {"type": "text", "text": "describe"} in user["content"]
+    assert prompt.count("<|image|>") == 1
+    assert "will be ignored" not in caplog.text
+
+
+def test_vlm_tools_two_images_inject_two_markers():
+    processor, tok = _fake_gemma_processor()
+    messages = [{"role": "user", "content": "compare"}]
+    tools = [{"type": "function", "function": {"name": "record_metric"}}]
+
+    prompt = _apply_chat_template_vlm(
+        processor, MagicMock(), messages, ["a.jpg", "b.jpg"], tools=tools
+    )
+    assert prompt.count("<|image|>") == 2
+
+
+def test_vlm_tools_no_images_unchanged():
+    processor, tok = _fake_gemma_processor()
+    messages = [{"role": "user", "content": "hi"}]
+    tools = [{"type": "function", "function": {"name": "record_metric"}}]
+
+    _apply_chat_template_vlm(processor, MagicMock(), messages, None, tools=tools)
+    sent = tok.apply_chat_template.call_args[0][0]
+    user = [m for m in sent if m["role"] == "user"][-1]
+    assert user["content"] == "hi"  # still a plain string
+
+
+def test_vlm_tools_image_count_mismatch_raises():
+    """Template that ignores image parts -> placeholder count mismatch -> error."""
+
+    def fake_apply(messages, **kwargs):
+        return "<|tool>record_metric<tool|>describe"  # no <|image|> emitted
+
+    tok = MagicMock()
+    tok.apply_chat_template = MagicMock(side_effect=fake_apply)
+    tok.image_token = "<|image|>"
+    processor = MagicMock()
+    processor.tokenizer = tok
+    messages = [{"role": "user", "content": "describe"}]
+    tools = [{"type": "function", "function": {"name": "record_metric"}}]
+
+    with pytest.raises(ValueError, match="image placeholder"):
+        _apply_chat_template_vlm(
+            processor, MagicMock(), messages, ["a.jpg"], tools=tools
+        )

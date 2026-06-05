@@ -2135,6 +2135,41 @@ def _convert_tool_messages_to_user_text(messages: list[dict]) -> list[dict]:
     return result
 
 
+def _vlm_image_token(processor: Any) -> str:
+    """Best-effort image placeholder token for a VLM processor/tokenizer."""
+    for obj in (processor, getattr(processor, "tokenizer", None)):
+        token = getattr(obj, "image_token", None)
+        if isinstance(token, str) and token:
+            return token
+    return "<image>"
+
+
+def _inject_image_markers(messages: list[dict], num_images: int) -> list[dict]:
+    """Rewrite the last user message's content into a parts list with
+    ``num_images`` image markers so the chat template emits image placeholders
+    while ``tools=`` still renders natively (issue #428).
+
+    Single-turn scope: all images attach to the last user turn.
+    """
+    out = [dict(m) for m in messages]
+    for m in reversed(out):
+        if m.get("role") == "user":
+            text = m.get("content")
+            parts: list[dict[str, Any]] = [{"type": "image"} for _ in range(num_images)]
+            if isinstance(text, list):
+                parts.extend(text)
+            elif isinstance(text, str) and text:
+                parts.append({"type": "text", "text": text})
+            m["content"] = parts
+            return out
+    logger.warning(
+        "VLM tools+images: no user message to attach %d image(s) to; "
+        "rendering text-only",
+        num_images,
+    )
+    return out
+
+
 def _apply_chat_template_vlm(
     processor: Any,
     model: Any,
@@ -2151,29 +2186,40 @@ def _apply_chat_template_vlm(
     the Jinja template renders as Python list repr — garbling the prompt.
     """
     if tools:
-        if images:
-            logger.warning(
-                "VLM native-tools path does not support images; "
-                "%d image(s) will be ignored",
-                len(images),
-            )
-        # Use tokenizer directly to get clean native tool formatting.
+        # Use the tokenizer directly to get clean native tool formatting.
+        # mlx_vlm.apply_chat_template wraps text content in dicts that some
+        # Jinja templates render as Python list repr — garbling the prompt.
         tok = (
             processor.tokenizer
             if hasattr(processor, "tokenizer")
             and hasattr(processor.tokenizer, "apply_chat_template")
             else processor
         )
+        # Images are carried separately (msg["images"]); inject content-part
+        # markers so the template emits image placeholders alongside the native
+        # tool tags (#428).  The image data is threaded to mlx_vlm.generate.
+        if images:
+            messages = _inject_image_markers(messages, len(images))
         kwargs: dict = {}
         if enable_thinking is not None:
             kwargs["enable_thinking"] = enable_thinking
-        return tok.apply_chat_template(
+        prompt = tok.apply_chat_template(
             messages,
             tools=tools,
             tokenize=False,
             add_generation_prompt=True,
             **kwargs,
         )
+        if images:
+            image_token = _vlm_image_token(processor)
+            found = prompt.count(image_token)
+            if found != len(images):
+                raise ValueError(
+                    f"VLM tools+images: expected {len(images)} image placeholder(s) "
+                    f"({image_token!r}) in the rendered prompt but found {found}; "
+                    "the model's chat template may not support image content parts."
+                )
+        return prompt
 
     import mlx_vlm
 
