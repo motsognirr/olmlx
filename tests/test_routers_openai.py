@@ -1792,9 +1792,7 @@ def test_normalize_multimodal_image_only_message():
     msgs = [
         {
             "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
-            ],
+            "content": [{"type": "image_url", "image_url": {"url": "http://x/y.png"}}],
         }
     ]
     out = _normalize_multimodal_messages(msgs)
