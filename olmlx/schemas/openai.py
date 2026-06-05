@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 class OpenAIChatMessage(BaseModel):
     role: str
-    content: str | None = None
+    content: str | list[dict[str, Any]] | None = None
     name: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
