@@ -488,6 +488,9 @@ class LoadedModel:
         default_factory=threading.Lock, compare=False, repr=False
     )
     prompt_cache_store: PromptCacheStore = field(default=None)  # type: ignore[assignment]
+    # Per-cache_id LRU of mlx_vlm PromptCacheState objects for cross-turn
+    # image-prefix KV reuse. Only populated for VLMs (None otherwise). #429.
+    vlm_prompt_cache_store: Any = None
     kv_cache_quant: str | None = None
     #: Weight quantization string (e.g. "hqq:4") applied at load time.
     #: ``None`` means no weight quantization was applied.
@@ -549,6 +552,12 @@ class LoadedModel:
                 model_name=self.name,
                 disk_max_bytes=disk_max_bytes,
                 ram_budget_bytes=ram_budget_bytes,
+            )
+        if self.is_vlm and self.vlm_prompt_cache_store is None:
+            from olmlx.engine.prompt_cache.vlm_state import VlmPromptCacheStore
+
+            self.vlm_prompt_cache_store = VlmPromptCacheStore(
+                capacity=settings.vlm_prompt_cache_slots
             )
 
     def acquire_ref(self) -> None:
@@ -780,6 +789,9 @@ class ModelManager:
             except Exception as exc:
                 logger.exception("Error clearing prompt cache for %s", lm.name)
                 errors.append(exc)
+        if getattr(lm, "vlm_prompt_cache_store", None) is not None:
+            lm.vlm_prompt_cache_store.clear()
+            lm.vlm_prompt_cache_store = None
         # ``lm.model.prefetcher`` is intentionally not nulled — it lives on
         # the FlashModelWrapper, not on the LM bookkeeping, and the wrapper
         # goes away with the LM.
