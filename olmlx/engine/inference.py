@@ -3545,7 +3545,10 @@ async def _stream_completion(
                 prompt=prompt,
                 cache_read_tokens=read,
                 cache_creation_tokens=creation,
-                full_prompt_tokens=prompt_tokens,
+                # None: the text-tokenizer count misses image-patch expansion;
+                # mlx_vlm's per-token prompt_tokens is the accurate full size, so
+                # let it stand instead of overriding with an undercount.
+                full_prompt_tokens=None,
                 cache_setup_done=True,
             )
         elif use_prompt_cache:
@@ -4020,7 +4023,12 @@ async def _full_completion(
                     cache_read_tokens, cache_creation_tokens = _setup_vlm_prompt_cache(
                         lm, prompt_tokens, gen_kwargs, cache_id=cache_id
                     )
-                    full_prompt_tokens = prompt_tokens
+                    # Leave full_prompt_tokens None: the text-tokenizer count
+                    # misses image-patch expansion, and mlx_vlm's GenerationResult
+                    # already reports the accurate full prompt size (reused + new)
+                    # on both hits and misses — let that engine count stand rather
+                    # than overriding stats.prompt_eval_count with an undercount.
+                    full_prompt_tokens = None
                     cache_setup_done = True
                 elif use_prompt_cache:
                     cs = await _setup_prompt_cache(
