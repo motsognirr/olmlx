@@ -135,6 +135,9 @@ class Settings(BaseSettings):
     # Below this token count, a radix-prefix hit falls back to fresh
     # prefill rather than taking over a near-empty match.
     prompt_cache_radix_min_prefix_tokens: Annotated[int, Field(ge=0)] = 256
+    # Max number of stored Responses-API responses for previous_response_id
+    # continuation (in-memory LRU; lost on restart).
+    responses_store_max: Annotated[int, Field(gt=0)] = 256
     inference_queue_timeout: Annotated[float, Field(gt=0)] | None = 300.0
     inference_timeout: Annotated[float, Field(gt=0)] | None = None
     sync_mode: SyncMode = "full"
