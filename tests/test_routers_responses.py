@@ -655,3 +655,89 @@ class TestRetrieveDelete:
     async def test_delete_unknown_404(self, app_client):
         resp = await app_client.delete("/v1/responses/resp_unknown")
         assert resp.status_code == 404
+
+
+class TestSDKShapeRegression:
+    @pytest.mark.asyncio
+    async def test_tool_choice_defaults_to_auto(self, app_client):
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses", json={"model": "qwen3", "input": "hi"}
+            )
+        assert resp.json()["tool_choice"] == "auto"
+
+    @pytest.mark.asyncio
+    async def test_tool_choice_explicit_echoed(self, app_client):
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi", "tool_choice": "none"},
+            )
+        assert resp.json()["tool_choice"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_stream_text_events_carry_logprobs(self, app_client):
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "hi", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch(
+            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi", "stream": True},
+            )
+        events = _parse_sse(resp.text)
+        delta = next(
+            e for e in events if e["event"] == "response.output_text.delta"
+        )
+        done = next(
+            e for e in events if e["event"] == "response.output_text.done"
+        )
+        assert delta["data"]["logprobs"] == []
+        assert done["data"]["logprobs"] == []
+
+    @pytest.mark.asyncio
+    async def test_stream_function_call_done_carries_name(self, app_client):
+        raw = '<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>'
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": raw, "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch(
+            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "go",
+                    "stream": True,
+                    "tools": [
+                        {"type": "function", "name": "f", "parameters": {"type": "object"}}
+                    ],
+                },
+            )
+        events = _parse_sse(resp.text)
+        done = next(
+            e
+            for e in events
+            if e["event"] == "response.function_call_arguments.done"
+        )
+        assert done["data"]["name"] == "f"
