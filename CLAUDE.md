@@ -39,6 +39,7 @@ olmlx/
 ├── routers/
 │   ├── anthropic.py    # /v1/messages — Anthropic Messages API
 │   ├── openai.py       # /v1/chat/completions, /v1/completions, /v1/models, /v1/embeddings
+│   ├── responses.py    # /v1/responses — OpenAI Responses API (state store, semantic SSE)
 │   ├── audio.py        # /v1/audio/transcriptions — Whisper STT
 │   ├── metrics.py      # GET /metrics — Prometheus exposition
 │   └── *.py            # /api/{chat,generate,tags,show,ps,pull,copy,create,delete,embed,blobs,version} (Ollama)
@@ -52,6 +53,7 @@ olmlx/
 ## Key Design Decisions
 
 - **Anthropic router**: Buffers full model output before emitting SSE so `<think>` and `<tool_call>` raw text from Qwen-family models can be split into proper content blocks. Also exposes `/v1/messages/count_tokens`.
+- **Responses router** (`routers/responses.py`): Translation layer over `generate_chat` implementing the OpenAI Responses API (`POST/GET/DELETE /v1/responses`). A bounded-LRU store (`OLMLX_RESPONSES_STORE_MAX`, default 256) holds completed responses; `previous_response_id` replays the stored history and reuses the same `cache_id` for KV cache continuity. `instructions` apply only to the current turn (not propagated via continuation — OpenAI semantics). Built-in tools (`web_search`, `code_interpreter`, `computer_use`) are rejected with 422; function tools and structured output via `text.format` are fully supported. No disk persistence — store is in-memory only.
 - **Thinking toggle**: Resolved per-request to engine's `enable_thinking: bool | None`. Ollama uses native top-level `think` field; OpenAI uses `reasoning_effort` (presence → on) or `chat_template_kwargs.enable_thinking` (authoritative, only clean OFF). Mapping helpers in `routers/common.py`. Omission on `/api/chat` and `/v1/chat/completions` falls back to per-model default (`ModelConfig.enable_thinking`), then engine default. `/api/generate` stays off-by-default and ignores the per-model default.
 - **Structured outputs** (`engine/grammar.py`): JSON-mode / JSON-Schema via xgrammar as an mlx-lm logits processor. Surfaces on OpenAI `response_format` and Ollama `format` (both `/api/chat` and `/api/generate`). Compiled grammars cached per (tokenizer-id, spec-hash). VLM, distributed, and speculative paths skip with a warning — `logits_processors` isn't threaded through any of them.
 - **Tool call parsing**: Qwen `<tool_call>`, Mistral `[TOOL_CALLS]`, Llama 3.x `<function=>`, DeepSeek, MiniMax `<minimax:tool_call>`, bare JSON. `tool_result` blocks → `role: "tool"` messages; `tool_use` blocks → `tool_calls`; thinking blocks in history are skipped.

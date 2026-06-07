@@ -489,9 +489,9 @@ def _parse_sse(body: str) -> list[dict]:
         data = None
         for line in block.splitlines():
             if line.startswith("event: "):
-                event = line[len("event: "):]
+                event = line[len("event: ") :]
             elif line.startswith("data: "):
-                data = json.loads(line[len("data: "):])
+                data = json.loads(line[len("data: ") :])
         events.append({"event": event, "data": data})
     return events
 
@@ -507,9 +507,7 @@ class TestStreaming:
 
             return gen()
 
-        with patch(
-            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
-        ):
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
             resp = await app_client.post(
                 "/v1/responses",
                 json={"model": "qwen3", "input": "hi", "stream": True},
@@ -542,9 +540,7 @@ class TestStreaming:
 
             return gen()
 
-        with patch(
-            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
-        ):
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
             resp = await app_client.post(
                 "/v1/responses",
                 json={
@@ -552,7 +548,11 @@ class TestStreaming:
                     "input": "go",
                     "stream": True,
                     "tools": [
-                        {"type": "function", "name": "f", "parameters": {"type": "object"}}
+                        {
+                            "type": "function",
+                            "name": "f",
+                            "parameters": {"type": "object"},
+                        }
                     ],
                 },
             )
@@ -577,9 +577,7 @@ class TestStreaming:
 
             return gen()
 
-        with patch(
-            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
-        ):
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
             resp = await app_client.post(
                 "/v1/responses",
                 json={"model": "qwen3", "input": "hi", "stream": True},
@@ -603,9 +601,7 @@ class TestStreaming:
 
             return gen()
 
-        with patch(
-            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
-        ):
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
             resp = await app_client.post(
                 "/v1/responses",
                 json={"model": "qwen3", "input": "hi", "stream": True},
@@ -692,20 +688,14 @@ class TestSDKShapeRegression:
 
             return gen()
 
-        with patch(
-            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
-        ):
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
             resp = await app_client.post(
                 "/v1/responses",
                 json={"model": "qwen3", "input": "hi", "stream": True},
             )
         events = _parse_sse(resp.text)
-        delta = next(
-            e for e in events if e["event"] == "response.output_text.delta"
-        )
-        done = next(
-            e for e in events if e["event"] == "response.output_text.done"
-        )
+        delta = next(e for e in events if e["event"] == "response.output_text.delta")
+        done = next(e for e in events if e["event"] == "response.output_text.done")
         assert delta["data"]["logprobs"] == []
         assert done["data"]["logprobs"] == []
 
@@ -720,9 +710,7 @@ class TestSDKShapeRegression:
 
             return gen()
 
-        with patch(
-            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
-        ):
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
             resp = await app_client.post(
                 "/v1/responses",
                 json={
@@ -730,14 +718,16 @@ class TestSDKShapeRegression:
                     "input": "go",
                     "stream": True,
                     "tools": [
-                        {"type": "function", "name": "f", "parameters": {"type": "object"}}
+                        {
+                            "type": "function",
+                            "name": "f",
+                            "parameters": {"type": "object"},
+                        }
                     ],
                 },
             )
         events = _parse_sse(resp.text)
         done = next(
-            e
-            for e in events
-            if e["event"] == "response.function_call_arguments.done"
+            e for e in events if e["event"] == "response.function_call_arguments.done"
         )
         assert done["data"]["name"] == "f"

@@ -24,7 +24,7 @@ class ResponsesRequest(BaseModel):
     previous_response_id: str | None = None
     store: bool = True
     reasoning: dict[str, Any] | None = None  # {"effort": "low"|"medium"|"high"}
-    text: dict[str, Any] | None = None       # {"format": {"type": ...}}
+    text: dict[str, Any] | None = None  # {"format": {"type": ...}}
     metadata: dict[str, Any] | None = None
     seed: int | None = None
 
