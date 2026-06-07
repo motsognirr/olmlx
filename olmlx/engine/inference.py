@@ -3886,9 +3886,11 @@ async def _stream_completion(
     finally:
         # Release GPU-backed references from gen_kwargs so they can be
         # garbage-collected.  prompt_cache is either stored in the cache
-        # store (successful path) or should be freed; input_ids is a
-        # temporary MLX array only needed during stream setup.
+        # store (successful path) or should be freed; prompt_cache_state
+        # (VLM path) is owned by the VLM store, so this just drops a
+        # duplicate reference; input_ids is legacy (no longer set).
         gen_kwargs.pop("prompt_cache", None)
+        gen_kwargs.pop("prompt_cache_state", None)
         gen_kwargs.pop("input_ids", None)
         # Invalidate cache on incomplete generation to avoid inconsistent state
         if not generation_complete and full_prompt_tokens is not None:
@@ -4084,11 +4086,13 @@ async def _full_completion(
                 _result = result_dict
             finally:
                 # Drop GPU-backed references from gen_kwargs so they can be
-                # garbage-collected.  ``prompt_cache`` is either persisted in
-                # the store (success) or should be released; ``input_ids``
-                # is set only for VLM, but the gate excludes VLM here — kept
-                # for symmetry with the streaming finally block.
+                # garbage-collected.  ``prompt_cache`` (text path) is either
+                # persisted in the store (success) or released here.
+                # ``prompt_cache_state`` (VLM path) is owned by the VLM store,
+                # so dropping the gen_kwargs reference just releases a duplicate.
+                # ``input_ids`` is legacy (no longer set) — popped defensively.
                 gen_kwargs.pop("prompt_cache", None)
+                gen_kwargs.pop("prompt_cache_state", None)
                 gen_kwargs.pop("input_ids", None)
                 if not generation_complete and full_prompt_tokens is not None:
                     logger.debug(
