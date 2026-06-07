@@ -327,6 +327,7 @@ async def _stream_response(
         obj = _build_response_object(
             req, response_id, created, output_items, stats, done_reason
         ).model_dump(exclude_none=True)
+        obj["status"] = status
         return obj
 
     try:
@@ -357,7 +358,6 @@ async def _stream_response(
         output_items = _build_output_items(thinking, visible_text, tool_uses)
 
         in_progress_resp = base_response("in_progress", [], stats, None)
-        in_progress_resp["status"] = "in_progress"
         yield ev("response.created", {"response": in_progress_resp})
         yield ev("response.in_progress", {"response": in_progress_resp})
 
@@ -426,7 +426,8 @@ async def _stream_response(
                 {"output_index": out_index, "item": item},
             )
 
-        final = base_response("completed", output_items, stats, done_reason)
+        final_status = "incomplete" if done_reason == "timeout" else "completed"
+        final = base_response(final_status, output_items, stats, done_reason)
         yield ev("response.completed", {"response": final})
 
         if req.store:

@@ -588,3 +588,29 @@ class TestStreaming:
         rid = events[-1]["data"]["response"]["id"]
         assert get_store().get(rid) is not None
         get_store().clear()
+
+    @pytest.mark.asyncio
+    async def test_stream_timeout_incomplete(self, app_client):
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "partial", "done": False}
+                yield {
+                    "text": "",
+                    "done": True,
+                    "done_reason": "timeout",
+                    "stats": TimingStats(),
+                }
+
+            return gen()
+
+        with patch(
+            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi", "stream": True},
+            )
+        events = _parse_sse(resp.text)
+        final = events[-1]["data"]["response"]
+        assert final["status"] == "incomplete"
+        assert final["incomplete_details"]["reason"] == "max_output_tokens"
