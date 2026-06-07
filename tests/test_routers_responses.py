@@ -614,3 +614,44 @@ class TestStreaming:
         final = events[-1]["data"]["response"]
         assert final["status"] == "incomplete"
         assert final["incomplete_details"]["reason"] == "max_output_tokens"
+
+
+class TestRetrieveDelete:
+    @pytest.fixture(autouse=True)
+    def _clear_store(self):
+        get_store().clear()
+        yield
+        get_store().clear()
+
+    @pytest.mark.asyncio
+    async def test_get_then_delete_lifecycle(self, app_client):
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            created = await app_client.post(
+                "/v1/responses", json={"model": "qwen3", "input": "hi"}
+            )
+        rid = created.json()["id"]
+
+        got = await app_client.get(f"/v1/responses/{rid}")
+        assert got.status_code == 200
+        assert got.json()["id"] == rid
+
+        deleted = await app_client.delete(f"/v1/responses/{rid}")
+        assert deleted.status_code == 200
+        assert deleted.json()["deleted"] is True
+
+        gone = await app_client.get(f"/v1/responses/{rid}")
+        assert gone.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_unknown_404(self, app_client):
+        resp = await app_client.get("/v1/responses/resp_unknown")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_unknown_404(self, app_client):
+        resp = await app_client.delete("/v1/responses/resp_unknown")
+        assert resp.status_code == 404

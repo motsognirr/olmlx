@@ -569,3 +569,22 @@ async def create_response(req: ResponsesRequest, request: Request):
             },
         )
     return response
+
+
+@router.get("/v1/responses/{response_id}")
+async def get_response(response_id: str):
+    entry = get_store().get(response_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"response not found: {response_id!r}"
+        )
+    return entry["response"]
+
+
+@router.delete("/v1/responses/{response_id}")
+async def delete_response(response_id: str):
+    if not get_store().delete(response_id):
+        raise HTTPException(
+            status_code=404, detail=f"response not found: {response_id!r}"
+        )
+    return {"id": response_id, "object": "response.deleted", "deleted": True}
