@@ -29,6 +29,7 @@ from olmlx.routers import (
     manage,
     models,
     openai,
+    responses,
     status,
 )
 from olmlx.routers import metrics as metrics_router
@@ -398,6 +399,7 @@ def create_app() -> FastAPI:
     app.include_router(embed.router)
     app.include_router(blobs.router)
     app.include_router(openai.router)
+    app.include_router(responses.router)
     app.include_router(audio.router)
     app.include_router(anthropic.router)
     app.include_router(metrics_router.router)

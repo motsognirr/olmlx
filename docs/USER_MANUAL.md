@@ -1037,6 +1037,88 @@ response = client.chat.completions.create(
 
 > **Note:** JSON mode appends an instruction to the system prompt. Schema enforcement is not strictly applied — the model is instructed to follow the schema but may deviate.
 
+#### POST /v1/responses
+
+OpenAI [Responses API](https://platform.openai.com/docs/api-reference/responses). Stateful multi-turn conversations with full semantic SSE streaming.
+
+```bash
+curl http://localhost:11434/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3:8b",
+    "input": "What is 2+2?",
+    "instructions": "You are a helpful assistant."
+  }'
+```
+
+**Supported request fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `model` | string | Model name (required) |
+| `input` | string or array | User message text, or array of input items (required) |
+| `instructions` | string | System prompt for this turn |
+| `previous_response_id` | string | ID of a prior response to continue from |
+| `stream` | boolean | Enable SSE streaming with semantic events |
+| `temperature` | float | 0–2 range |
+| `top_p` | float | 0–1 range |
+| `max_output_tokens` | int | Output token limit (default: 512) |
+| `tools` | array | Function tool definitions (`type: "function"`) |
+| `tool_choice` | string/object | `"auto"`, `"none"`, or `{"type":"function","name":"..."}` |
+| `text` | object | `{"format": {"type": "json_object"}}` or `{"format": {"type": "json_schema", "schema": {...}}}` for structured output |
+| `store` | boolean | If `false`, response is not saved (no `previous_response_id` reuse) |
+
+**Non-streaming response:**
+
+```json
+{
+  "id": "resp_abc123",
+  "object": "response",
+  "created_at": 1711100000,
+  "model": "qwen3:8b",
+  "status": "completed",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_abc123",
+      "role": "assistant",
+      "content": [{"type": "output_text", "text": "4"}]
+    }
+  ],
+  "usage": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}
+}
+```
+
+**Streaming** uses Server-Sent Events with semantic event types: `response.created`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.output_text.done`, `response.content_part.done`, `response.output_item.done`, `response.completed`.
+
+**Multi-turn continuation** via `previous_response_id`: pass the `id` of a previous response and the prior conversation history is replayed automatically. The store is bounded in memory (default 256 entries, configurable via `OLMLX_RESPONSES_STORE_MAX`). State is not persisted to disk — the store is cleared on restart.
+
+**Reasoning items**: if the model emits `<think>` tokens, they appear as a `reasoning` output item (with the reasoning text under `content`) before the `message` item.
+
+**Image input**: pass `input_image` content parts in a `message` input item for VLMs. The `image_url` field accepts an http(s) URL or a `data:image/...;base64,...` data URI (base64 images are carried inline in `image_url`, not a separate `source` block).
+
+**Not supported**: built-in OpenAI tools (`web_search`, `code_interpreter`, `computer_use`) — these are rejected with HTTP 422.
+
+#### GET /v1/responses/{id}
+
+Retrieve a stored response by ID:
+
+```bash
+curl http://localhost:11434/v1/responses/resp_abc123
+```
+
+Returns the full response object, or HTTP 404 if the ID is unknown or has been evicted.
+
+#### DELETE /v1/responses/{id}
+
+Delete a stored response:
+
+```bash
+curl -X DELETE http://localhost:11434/v1/responses/resp_abc123
+```
+
+Returns `{"id": "resp_abc123", "object": "response.deleted", "deleted": true}`.
+
 ---
 
 ### Anthropic Messages API
