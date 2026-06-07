@@ -4581,8 +4581,9 @@ async def generate_chat(
         # decoder via its own ``_SpecCacheStore`` (issue #421), driven by the
         # ``SegmentedPrompt`` built on the speculative branch above — so the
         # ``not lm.is_speculative`` gate here stays correct.
-        # Also disabled for VLMs on the non-streaming path because
-        # ``mlx_vlm.generate`` accepts neither ``prompt_cache`` nor ``input_ids``.
+        # VLMs (stream and non-stream) take the separate ``vlm_cache_ok`` path
+        # below — they reuse KV via mlx_vlm's ``PromptCacheState`` rather than
+        # the text store's ``prompt_cache``/checkpoint machinery (#429).
         # Per-model ``prompt_cache`` (set in models.json) overrides the global
         # ``OLMLX_PROMPT_CACHE`` toggle. Surfaced for architectures that hit
         # checkpoint-path bugs (e.g. Qwen3-Coder-Next MoE-quantized GatedDeltaNet
