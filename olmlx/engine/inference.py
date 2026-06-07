@@ -3535,7 +3535,20 @@ async def _stream_completion(
     stop_sequences: list[str] | None = gen_kwargs.pop("stop", None)
     try:
         # Cache setup — must happen after lock to prevent concurrent cache corruption
-        if use_prompt_cache:
+        if use_prompt_cache and lm.is_vlm:
+            # VLM: attach an mlx_vlm PromptCacheState. ``prompt`` stays the full
+            # str — mlx_vlm tokenizes it and reuses the KV prefix internally.
+            read, creation = _setup_vlm_prompt_cache(
+                lm, prompt_tokens, gen_kwargs, cache_id=cache_id
+            )
+            cs = _CacheSetupResult(
+                prompt=prompt,
+                cache_read_tokens=read,
+                cache_creation_tokens=creation,
+                full_prompt_tokens=prompt_tokens,
+                cache_setup_done=True,
+            )
+        elif use_prompt_cache:
             cs = await _setup_prompt_cache(
                 lm,
                 prompt,
@@ -3998,7 +4011,16 @@ async def _full_completion(
             generated_tokens: list[int] = []
             result_dict: dict = {}
             try:
-                if use_prompt_cache:
+                if use_prompt_cache and lm.is_vlm:
+                    # VLM: attach an mlx_vlm PromptCacheState. Leave ``prompt``
+                    # as the full str — mlx_vlm tokenizes it and reuses the KV
+                    # prefix internally (no suffix-only trimming on this path).
+                    cache_read_tokens, cache_creation_tokens = _setup_vlm_prompt_cache(
+                        lm, prompt_tokens, gen_kwargs, cache_id=cache_id
+                    )
+                    full_prompt_tokens = prompt_tokens
+                    cache_setup_done = True
+                elif use_prompt_cache:
                     cs = await _setup_prompt_cache(
                         lm,
                         prompt,
@@ -4552,12 +4574,21 @@ async def generate_chat(
         effective_prompt_cache = (
             lm.prompt_cache if lm.prompt_cache is not None else settings.prompt_cache
         )
+        # VLM now caches on both stream and non-stream via the VLM store path
+        # (mlx_vlm PromptCacheState); its KV reuse is independent of the text
+        # path's checkpoint/radix machinery. A VLM with its store disabled
+        # (vlm_prompt_cache_slots=0) is excluded so prompt_tokens stays None.
+        vlm_cache_ok = (
+            lm.is_vlm
+            and getattr(lm, "vlm_prompt_cache_store", None) is not None
+            and lm.vlm_prompt_cache_store.enabled()
+        )
         use_prompt_cache = (
             effective_prompt_cache
             and make_prompt_cache is not None
             and not lm.is_distributed
             and not lm.is_speculative
-            and (stream or not lm.is_vlm)
+            and (not lm.is_vlm or vlm_cache_ok)
         )
         prompt_tokens = None
         if use_prompt_cache:
