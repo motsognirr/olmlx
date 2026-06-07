@@ -1189,6 +1189,14 @@ class ModelManager:
                                 "for %s during hygiene flush; skipping",
                                 other_lm.name,
                             )
+                    # VLM image-prefix KV lives in vlm_prompt_cache_store as
+                    # live mlx arrays (in-memory only, no disk spill), so the
+                    # text-store eviction above doesn't free it. Clear it here
+                    # too so the _flush_metal() below can reclaim those buffers
+                    # — same #223 pre-load hygiene intent.
+                    vlm_store = getattr(other_lm, "vlm_prompt_cache_store", None)
+                    if vlm_store is not None:
+                        vlm_store.clear()
                 # Skip gc/clear when a deferred cleanup is pending:
                 # mx.clear_cache() is not safe to call concurrently with
                 # active Metal allocations from a background thread (see
