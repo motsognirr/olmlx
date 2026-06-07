@@ -488,6 +488,9 @@ class LoadedModel:
         default_factory=threading.Lock, compare=False, repr=False
     )
     prompt_cache_store: PromptCacheStore = field(default=None)  # type: ignore[assignment]
+    # Per-cache_id LRU of mlx_vlm PromptCacheState objects for cross-turn
+    # image-prefix KV reuse. Only populated for VLMs (None otherwise). #429.
+    vlm_prompt_cache_store: Any = None
     kv_cache_quant: str | None = None
     #: Weight quantization string (e.g. "hqq:4") applied at load time.
     #: ``None`` means no weight quantization was applied.
@@ -549,6 +552,12 @@ class LoadedModel:
                 model_name=self.name,
                 disk_max_bytes=disk_max_bytes,
                 ram_budget_bytes=ram_budget_bytes,
+            )
+        if self.is_vlm and self.vlm_prompt_cache_store is None:
+            from olmlx.engine.prompt_cache.vlm_state import VlmPromptCacheStore
+
+            self.vlm_prompt_cache_store = VlmPromptCacheStore(
+                capacity=settings.vlm_prompt_cache_slots
             )
 
     def acquire_ref(self) -> None:
@@ -780,6 +789,9 @@ class ModelManager:
             except Exception as exc:
                 logger.exception("Error clearing prompt cache for %s", lm.name)
                 errors.append(exc)
+        if getattr(lm, "vlm_prompt_cache_store", None) is not None:
+            lm.vlm_prompt_cache_store.clear()
+            lm.vlm_prompt_cache_store = None
         # ``lm.model.prefetcher`` is intentionally not nulled — it lives on
         # the FlashModelWrapper, not on the LM bookkeeping, and the wrapper
         # goes away with the LM.
@@ -1177,6 +1189,14 @@ class ModelManager:
                                 "for %s during hygiene flush; skipping",
                                 other_lm.name,
                             )
+                    # VLM image-prefix KV lives in vlm_prompt_cache_store as
+                    # live mlx arrays (in-memory only, no disk spill), so the
+                    # text-store eviction above doesn't free it. Clear it here
+                    # too so the _flush_metal() below can reclaim those buffers
+                    # — same #223 pre-load hygiene intent.
+                    vlm_store = getattr(other_lm, "vlm_prompt_cache_store", None)
+                    if vlm_store is not None:
+                        vlm_store.clear()
                 # Skip gc/clear when a deferred cleanup is pending:
                 # mx.clear_cache() is not safe to call concurrently with
                 # active Metal allocations from a background thread (see

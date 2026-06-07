@@ -4521,8 +4521,13 @@ class TestSetupPromptCache:
         assert result.cache_setup_done is False
 
     @pytest.mark.asyncio
-    async def test_vlm_uses_input_ids(self, mock_lm):
-        """VLM path sets input_ids in gen_kwargs instead of replacing prompt."""
+    async def test_vlm_prompt_set_to_tokens(self, mock_lm):
+        """VLM path sets result.prompt to token list (same as text models).
+
+        The old input_ids workaround was removed (#429) because it dropped
+        images.  Task 6 will redirect VLMs away from _setup_prompt_cache
+        entirely; until then the cache-miss branch sets prompt = prompt_tokens.
+        """
         from olmlx.engine.inference import _setup_prompt_cache
 
         mock_lm.is_vlm = True
@@ -4546,8 +4551,8 @@ class TestSetupPromptCache:
                 cache_id="test",
             )
 
-        assert "input_ids" in gen_kwargs
-        assert result.prompt == "hello"  # prompt unchanged for VLM
+        assert "input_ids" not in gen_kwargs
+        assert result.prompt == prompt_tokens  # tokens propagated like text models
 
 
 class TestKvCachePreflightCheckHelper:

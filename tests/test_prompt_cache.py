@@ -1334,9 +1334,13 @@ class TestStreamingSpeculativeCache:
 class TestVlmUsesCache:
     def _setup_vlm(self, mock_manager):
         """Set up a VLM model for cache testing."""
+        from olmlx.engine.prompt_cache.vlm_state import VlmPromptCacheStore
+
         lm = mock_manager._loaded["qwen3:latest"]
         lm.is_vlm = True
-        # _get_model_for_cache accesses lm.model.language_model, not lm.language_model
+        # Task 6: VLMs use vlm_prompt_cache_store (PromptCacheState), not the
+        # text-path make_prompt_cache / prompt_cache_store machinery.
+        lm.vlm_prompt_cache_store = VlmPromptCacheStore(capacity=2)
         lm.model.language_model = MagicMock()
         lm.model.language_model.layers = [None] * 32
         lm.tokenizer.tokenizer = MagicMock()
@@ -1349,13 +1353,23 @@ class TestVlmUsesCache:
 
     @pytest.mark.asyncio
     async def test_vlm_uses_cache(self, mock_manager):
-        """VLM models use prompt caching with language_model."""
+        """VLM models route prompt caching through _setup_vlm_prompt_cache.
+
+        Task 6 redirects VLMs away from make_prompt_cache / prompt_cache_store
+        and into the mlx_vlm PromptCacheState path keyed on vlm_prompt_cache_store.
+        Verify that a PromptCacheState is inserted into the VLM store and that
+        the text-path make_prompt_cache is never called.
+        """
         from olmlx.engine.inference import generate_chat
 
         lm = self._setup_vlm(mock_manager)
 
         mock_mlx_vlm = MagicMock()
         mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+        # PromptCacheState must be importable from mlx_vlm.generate.
+        mock_prompt_cache_state_cls = MagicMock(return_value=MagicMock())
+        mock_mlx_vlm_generate = MagicMock()
+        mock_mlx_vlm_generate.PromptCacheState = mock_prompt_cache_state_cls
 
         tokens = _make_stream_tokens("Hello", " world", prompt_tokens=5)
         mock_stream = _make_mock_stream(tokens)
@@ -1365,7 +1379,13 @@ class TestVlmUsesCache:
         mock_mx = MagicMock()
         with (
             patch("olmlx.engine.inference.mx", mock_mx),
-            patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}),
+            patch.dict(
+                "sys.modules",
+                {
+                    "mlx_vlm": mock_mlx_vlm,
+                    "mlx_vlm.generate": mock_mlx_vlm_generate,
+                },
+            ),
             patch(
                 "olmlx.engine.inference.async_mlx_stream",
                 return_value=mock_stream,
@@ -1387,69 +1407,18 @@ class TestVlmUsesCache:
             async for chunk in gen:
                 pass
 
-        # Cache should have been created with language_model (not the full VLM model)
-        call_args = mock_make_cache.call_args
-        assert call_args is not None, "make_prompt_cache was not called"
-        assert call_args[0][0] is lm.model.language_model
-        assert lm.prompt_cache_store.get("") is not None
+        # VLM path: make_prompt_cache (text path) must NOT be called.
+        mock_make_cache.assert_not_called()
+        # A new PromptCacheState was created and inserted into the VLM store.
+        mock_prompt_cache_state_cls.assert_called_once()
+        assert lm.vlm_prompt_cache_store.get("") is not None
+        # Prompt cache store (text path) remains empty for VLMs.
+        assert lm.prompt_cache_store.get("") is None
 
-    @pytest.mark.asyncio
-    async def test_vlm_passes_input_ids_not_token_list(self, mock_manager):
-        """VLM cache passes input_ids kwarg instead of overwriting prompt with tokens.
-
-        mlx_vlm.stream_generate expects prompt as str; passing a list[int]
-        causes ValueError in prepare_inputs. The fix is to pass pre-tokenized
-        tokens via the input_ids kwarg which bypasses prepare_inputs.
-        """
-        from olmlx.engine.inference import generate_chat
-
-        self._setup_vlm(mock_manager)
-
-        mock_mlx_vlm = MagicMock()
-        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
-
-        tokens = _make_stream_tokens("Hello", prompt_tokens=5)
-        mock_stream = _make_mock_stream(tokens)
-
-        mock_make_cache = MagicMock(return_value=[MagicMock()])
-
-        mock_mx = MagicMock()
-        with (
-            patch("olmlx.engine.inference.mx", mock_mx),
-            patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}),
-            patch(
-                "olmlx.engine.inference.async_mlx_stream",
-                return_value=mock_stream,
-            ) as mock_async_stream,
-            patch("olmlx.engine.inference.make_prompt_cache", mock_make_cache),
-            patch("olmlx.engine.inference.settings") as mock_settings,
-        ):
-            mock_settings.prompt_cache = True
-            mock_settings.prompt_cache_max_tokens = 32768
-            mock_settings.default_keep_alive = "5m"
-            mock_settings.inference_timeout = None
-            mock_settings.sync_mode = "full"
-            gen = await generate_chat(
-                mock_manager,
-                "qwen3",
-                [{"role": "user", "content": "describe"}],
-                stream=True,
-            )
-            async for chunk in gen:
-                pass
-
-        # Verify prompt is still a string (not overwritten with token list)
-        call_args = mock_async_stream.call_args
-        prompt_arg = (
-            call_args[0][2] if len(call_args[0]) > 2 else call_args[1]["prompt"]
-        )
-        assert isinstance(prompt_arg, str), (
-            f"VLM prompt should be a string, got {type(prompt_arg)}"
-        )
-        # input_ids should be passed as a kwarg
-        assert "input_ids" in call_args[1], (
-            "VLM cache should pass input_ids kwarg to bypass prepare_inputs"
-        )
+    # test_vlm_passes_input_ids_not_token_list was removed in #429:
+    # the input_ids workaround that passed text-only tokens (dropping images)
+    # is gone.  Task 6 redirects VLMs to _setup_vlm_prompt_cache which never
+    # overwrites the string prompt; end-to-end coverage lives in that PR.
 
 
 class TestCacheTokenCountLogging:

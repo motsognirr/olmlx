@@ -68,6 +68,9 @@ async def ps(request: Request):
         cache_store = getattr(lm, "prompt_cache_store", None)
         if cache_store is not None and hasattr(cache_store, "metrics"):
             cache_metrics = cache_store.metrics.to_dict()
+        vlm_store = getattr(lm, "vlm_prompt_cache_store", None)
+        if vlm_store is not None:
+            cache_metrics = {**cache_metrics, **vlm_store.metrics()}
 
         models.append(
             RunningModel(

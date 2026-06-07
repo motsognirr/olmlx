@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     # OTEL_TRACES_SAMPLER, OTEL_SERVICE_NAME, OTEL_TRACES_EXPORTER=console, …).
     tracing: bool = False
     prompt_cache: bool = True
+    # Number of per-cache_id VLM KV-cache slots retained for cross-turn image-prefix
+    # reuse (mlx_vlm PromptCacheState). 0 disables VLM prompt caching entirely.
+    # In-memory only (no disk spill / radix / KV-quant); 2 slots bound the memory.
+    vlm_prompt_cache_slots: int = 2
     prompt_cache_max_tokens: Annotated[int, Field(gt=0)] | None = 32768
     prompt_cache_max_slots: Annotated[int, Field(gt=0)] = 4
     prompt_cache_disk: bool = False

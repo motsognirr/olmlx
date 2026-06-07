@@ -100,7 +100,13 @@ def _resolve_model_vocab_size(lm: "LoadedModel") -> int | None:
     # iterating attr-first avoids returning the top-level embed_tokens
     # when a deeper lm_head exists.
     for attr in ("lm_head", "embed_tokens"):
-        for owner in (model, getattr(model, "model", None)):
+        language_model = getattr(model, "language_model", None)
+        for owner in (
+            model,
+            getattr(model, "model", None),
+            language_model,
+            getattr(language_model, "model", None),
+        ):
             if owner is None:
                 continue
             layer = getattr(owner, attr, None)
@@ -123,24 +129,17 @@ def _install_grammar_processor(
 ) -> bool:
     """Build and install a grammar logits processor on *gen_kwargs*.
 
-    Returns ``True`` when grammar is active for the request. VLM models
-    are not supported (mlx-vlm does not forward ``logits_processors``) and
-    return ``False`` with a one-line warning. Distributed mode is also
-    rejected: workers don't receive the processor over the sideband and
-    would diverge from rank-0. Tool-use requests are rejected: the JSON
-    grammar masks the format-specific tool-call tokens (``<tool_call>``,
-    ``[TOOL_CALLS]``, ``<function=...>``, …) so the model could never
-    emit a tool call. Constraining tool *arguments* is the deferred
-    Anthropic case (issue #361) — needs per-template trigger detection.
+    Returns ``True`` when grammar is active for the request. Works for both
+    text and VLM models — mlx_vlm's ``generate_step`` accepts
+    ``logits_processors`` and olmlx forwards ``gen_kwargs`` to it (#429).
+    Distributed mode is still rejected: workers don't receive the processor
+    over the sideband and would diverge from rank-0. Tool-use requests are
+    rejected: the JSON grammar masks the format-specific tool-call tokens
+    (``<tool_call>``, ``[TOOL_CALLS]``, ``<function=...>``, …) so the model
+    could never emit a tool call. Constraining tool *arguments* is the
+    deferred Anthropic case (issue #361).
     """
     if grammar_spec is None:
-        return False
-    if lm.is_vlm:
-        logger.warning(
-            "Grammar-constrained decoding requested but model is a VLM "
-            "(mlx-vlm does not accept logits_processors); ignoring "
-            "constraint for this request"
-        )
         return False
     if lm.is_distributed:
         logger.warning(
@@ -2859,6 +2858,62 @@ async def _setup_via_checkpoint_path(
     )
 
 
+def _setup_vlm_prompt_cache(
+    lm: LoadedModel,
+    prompt_tokens: list[int] | None,
+    gen_kwargs: dict,
+    *,
+    cache_id: str,
+) -> tuple[int, int]:
+    """Attach an mlx_vlm ``PromptCacheState`` to ``gen_kwargs`` for VLM KV reuse.
+
+    Returns ``(cache_read_tokens, cache_creation_tokens)`` for metrics. mlx_vlm
+    owns prefix matching / cache trimming / image-in-prefix detection and
+    updates the state in place after generation; here we only fetch-or-create
+    the per-cache_id state and report an *estimate* of the reused prefix.
+
+    The estimate uses ``lm.text_tokenizer`` tokenization, which can differ
+    slightly from mlx_vlm's internal ``input_ids`` (image placeholder
+    expansion), so the counts are approximate — the actual reuse is whatever
+    mlx_vlm's own ``find_prefix_length`` decides at generate time.
+    """
+    from mlx_vlm.generate import PromptCacheState
+
+    store = getattr(lm, "vlm_prompt_cache_store", None)
+    if store is None or not store.enabled() or prompt_tokens is None:
+        return 0, len(prompt_tokens) if prompt_tokens is not None else 0
+
+    # Memory pressure: drop the VLM store and fall back to a fresh state.
+    if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+        logger.warning("Memory pressure high, clearing VLM prompt cache")
+        store.clear()
+        mx.clear_cache()
+        _safe_sync()
+
+    state = store.get(cache_id)
+    if state is not None:
+        read = state.find_prefix_length(prompt_tokens)
+        # A full-prefix re-request reuses everything but the seed; clamp so we
+        # never claim more reuse than there are new tokens to process.
+        read = min(read, max(len(prompt_tokens) - 1, 0))
+        store.note_hit(reused_tokens=read)
+    else:
+        state = PromptCacheState()
+        store.insert(cache_id, state)
+        read = 0
+        store.note_miss()
+
+    gen_kwargs["prompt_cache_state"] = state
+    creation = len(prompt_tokens) - read
+    logger.info(
+        "VLM prompt cache: ~%d prefix tokens reusable, ~%d new (cache_id=%s)",
+        read,
+        creation,
+        cache_id,
+    )
+    return read, creation
+
+
 async def _setup_prompt_cache(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -3062,10 +3117,7 @@ async def _setup_prompt_cache(
                 len(prompt_tokens),
             )
             gen_kwargs["prompt_cache"] = working_cache
-            if lm.is_vlm:
-                gen_kwargs["input_ids"] = mx.array([suffix_tokens])
-            else:
-                result.prompt = suffix_tokens
+            result.prompt = suffix_tokens
 
     if "prompt_cache" not in gen_kwargs:
         # Reached on either: (a) no usable prefix in cache miss, or
@@ -3088,10 +3140,7 @@ async def _setup_prompt_cache(
             fresh_cache_label,
             len(prompt_tokens),
         )
-        if lm.is_vlm:
-            gen_kwargs["input_ids"] = mx.array([prompt_tokens])
-        else:
-            result.prompt = prompt_tokens
+        result.prompt = prompt_tokens
 
     result.cache_setup_done = True
 
@@ -3486,7 +3535,23 @@ async def _stream_completion(
     stop_sequences: list[str] | None = gen_kwargs.pop("stop", None)
     try:
         # Cache setup — must happen after lock to prevent concurrent cache corruption
-        if use_prompt_cache:
+        if use_prompt_cache and lm.is_vlm:
+            # VLM: attach an mlx_vlm PromptCacheState. ``prompt`` stays the full
+            # str — mlx_vlm tokenizes it and reuses the KV prefix internally.
+            read, creation = _setup_vlm_prompt_cache(
+                lm, prompt_tokens, gen_kwargs, cache_id=cache_id
+            )
+            cs = _CacheSetupResult(
+                prompt=prompt,
+                cache_read_tokens=read,
+                cache_creation_tokens=creation,
+                # None: the text-tokenizer count misses image-patch expansion;
+                # mlx_vlm's per-token prompt_tokens is the accurate full size, so
+                # let it stand instead of overriding with an undercount.
+                full_prompt_tokens=None,
+                cache_setup_done=True,
+            )
+        elif use_prompt_cache:
             cs = await _setup_prompt_cache(
                 lm,
                 prompt,
@@ -3824,9 +3889,11 @@ async def _stream_completion(
     finally:
         # Release GPU-backed references from gen_kwargs so they can be
         # garbage-collected.  prompt_cache is either stored in the cache
-        # store (successful path) or should be freed; input_ids is a
-        # temporary MLX array only needed during stream setup.
+        # store (successful path) or should be freed; prompt_cache_state
+        # (VLM path) is owned by the VLM store, so this just drops a
+        # duplicate reference; input_ids is legacy (no longer set).
         gen_kwargs.pop("prompt_cache", None)
+        gen_kwargs.pop("prompt_cache_state", None)
         gen_kwargs.pop("input_ids", None)
         # Invalidate cache on incomplete generation to avoid inconsistent state
         if not generation_complete and full_prompt_tokens is not None:
@@ -3949,7 +4016,21 @@ async def _full_completion(
             generated_tokens: list[int] = []
             result_dict: dict = {}
             try:
-                if use_prompt_cache:
+                if use_prompt_cache and lm.is_vlm:
+                    # VLM: attach an mlx_vlm PromptCacheState. Leave ``prompt``
+                    # as the full str — mlx_vlm tokenizes it and reuses the KV
+                    # prefix internally (no suffix-only trimming on this path).
+                    cache_read_tokens, cache_creation_tokens = _setup_vlm_prompt_cache(
+                        lm, prompt_tokens, gen_kwargs, cache_id=cache_id
+                    )
+                    # Leave full_prompt_tokens None: the text-tokenizer count
+                    # misses image-patch expansion, and mlx_vlm's GenerationResult
+                    # already reports the accurate full prompt size (reused + new)
+                    # on both hits and misses — let that engine count stand rather
+                    # than overriding stats.prompt_eval_count with an undercount.
+                    full_prompt_tokens = None
+                    cache_setup_done = True
+                elif use_prompt_cache:
                     cs = await _setup_prompt_cache(
                         lm,
                         prompt,
@@ -4013,11 +4094,13 @@ async def _full_completion(
                 _result = result_dict
             finally:
                 # Drop GPU-backed references from gen_kwargs so they can be
-                # garbage-collected.  ``prompt_cache`` is either persisted in
-                # the store (success) or should be released; ``input_ids``
-                # is set only for VLM, but the gate excludes VLM here — kept
-                # for symmetry with the streaming finally block.
+                # garbage-collected.  ``prompt_cache`` (text path) is either
+                # persisted in the store (success) or released here.
+                # ``prompt_cache_state`` (VLM path) is owned by the VLM store,
+                # so dropping the gen_kwargs reference just releases a duplicate.
+                # ``input_ids`` is legacy (no longer set) — popped defensively.
                 gen_kwargs.pop("prompt_cache", None)
+                gen_kwargs.pop("prompt_cache_state", None)
                 gen_kwargs.pop("input_ids", None)
                 if not generation_complete and full_prompt_tokens is not None:
                     logger.debug(
@@ -4098,21 +4181,28 @@ async def _full_completion_inner(
             if lm.is_speculative:
                 logger.debug("speculative decoding skipped: request includes images")
             import mlx_vlm
+            from mlx_vlm.generate import (
+                generation_stream,
+            )  # used by mx.synchronize below
 
-            # mlx_vlm.generate returns a plain str; prompt/generation token
-            # counts are not exposed, so stats.prompt_eval_count /
-            # stats.eval_count stay 0 on this path.
-            result = mlx_vlm.generate(
+            # Drain stream_generate (not generate): it forwards prompt_cache_state
+            # + logits_processors and yields GenerationResult with real token
+            # counts. Return (last_result, full_text) so the downstream tuple
+            # unpacking captures prompt/generation token counts (#429).
+            result = None
+            text_parts = []
+            for response in mlx_vlm.stream_generate(
                 lm.model,
                 lm.tokenizer,
                 prompt=prompt,
                 image=images,
                 max_tokens=max_tokens,
                 **gen_kwargs,
-            )
-            from mlx_vlm.generate import (
-                generation_stream,
-            )  # used by mx.synchronize below
+            ):
+                text_parts.append(response.text)
+                result = response
+            if result is not None:
+                result = (result, "".join(text_parts))
         elif use_speculative:
             import threading
 
@@ -4147,18 +4237,24 @@ async def _full_completion_inner(
             return result
         elif lm.is_vlm:
             import mlx_vlm
+            from mlx_vlm.generate import (
+                generation_stream,
+            )  # used by mx.synchronize below
 
-            result = mlx_vlm.generate(
+            result = None
+            text_parts = []
+            for response in mlx_vlm.stream_generate(
                 lm.model,
                 lm.tokenizer,
                 prompt=prompt,
                 image=images,
                 max_tokens=max_tokens,
                 **gen_kwargs,
-            )
-            from mlx_vlm.generate import (
-                generation_stream,
-            )  # used by mx.synchronize below
+            ):
+                text_parts.append(response.text)
+                result = response
+            if result is not None:
+                result = (result, "".join(text_parts))
         else:
             import mlx_lm
 
@@ -4493,8 +4589,9 @@ async def generate_chat(
         # decoder via its own ``_SpecCacheStore`` (issue #421), driven by the
         # ``SegmentedPrompt`` built on the speculative branch above — so the
         # ``not lm.is_speculative`` gate here stays correct.
-        # Also disabled for VLMs on the non-streaming path because
-        # ``mlx_vlm.generate`` accepts neither ``prompt_cache`` nor ``input_ids``.
+        # VLMs (stream and non-stream) take the separate ``vlm_cache_ok`` path
+        # below — they reuse KV via mlx_vlm's ``PromptCacheState`` rather than
+        # the text store's ``prompt_cache``/checkpoint machinery (#429).
         # Per-model ``prompt_cache`` (set in models.json) overrides the global
         # ``OLMLX_PROMPT_CACHE`` toggle. Surfaced for architectures that hit
         # checkpoint-path bugs (e.g. Qwen3-Coder-Next MoE-quantized GatedDeltaNet
@@ -4503,12 +4600,21 @@ async def generate_chat(
         effective_prompt_cache = (
             lm.prompt_cache if lm.prompt_cache is not None else settings.prompt_cache
         )
+        # VLM now caches on both stream and non-stream via the VLM store path
+        # (mlx_vlm PromptCacheState); its KV reuse is independent of the text
+        # path's checkpoint/radix machinery. A VLM with its store disabled
+        # (vlm_prompt_cache_slots=0) is excluded so prompt_tokens stays None.
+        vlm_cache_ok = (
+            lm.is_vlm
+            and getattr(lm, "vlm_prompt_cache_store", None) is not None
+            and lm.vlm_prompt_cache_store.enabled()
+        )
         use_prompt_cache = (
             effective_prompt_cache
             and make_prompt_cache is not None
             and not lm.is_distributed
             and not lm.is_speculative
-            and (stream or not lm.is_vlm)
+            and (not lm.is_vlm or vlm_cache_ok)
         )
         prompt_tokens = None
         if use_prompt_cache:
