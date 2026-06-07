@@ -2858,6 +2858,62 @@ async def _setup_via_checkpoint_path(
     )
 
 
+def _setup_vlm_prompt_cache(
+    lm: LoadedModel,
+    prompt_tokens: list[int] | None,
+    gen_kwargs: dict,
+    *,
+    cache_id: str,
+) -> tuple[int, int]:
+    """Attach an mlx_vlm ``PromptCacheState`` to ``gen_kwargs`` for VLM KV reuse.
+
+    Returns ``(cache_read_tokens, cache_creation_tokens)`` for metrics. mlx_vlm
+    owns prefix matching / cache trimming / image-in-prefix detection and
+    updates the state in place after generation; here we only fetch-or-create
+    the per-cache_id state and report an *estimate* of the reused prefix.
+
+    The estimate uses ``lm.text_tokenizer`` tokenization, which can differ
+    slightly from mlx_vlm's internal ``input_ids`` (image placeholder
+    expansion), so the counts are approximate — the actual reuse is whatever
+    mlx_vlm's own ``find_prefix_length`` decides at generate time.
+    """
+    from mlx_vlm.generate import PromptCacheState
+
+    store = getattr(lm, "vlm_prompt_cache_store", None)
+    if store is None or not store.enabled() or prompt_tokens is None:
+        return 0, len(prompt_tokens) if prompt_tokens is not None else 0
+
+    # Memory pressure: drop the VLM store and fall back to a fresh state.
+    if memory_utils.is_memory_pressure_high(settings.memory_limit_fraction):
+        logger.warning("Memory pressure high, clearing VLM prompt cache")
+        store.clear()
+        mx.clear_cache()
+        _safe_sync()
+
+    state = store.get(cache_id)
+    if state is not None:
+        read = state.find_prefix_length(prompt_tokens)
+        # A full-prefix re-request reuses everything but the seed; clamp so we
+        # never claim more reuse than there are new tokens to process.
+        read = min(read, max(len(prompt_tokens) - 1, 0))
+        store.note_hit(reused_tokens=read)
+    else:
+        state = PromptCacheState()
+        store.insert(cache_id, state)
+        read = 0
+        store.note_miss()
+
+    gen_kwargs["prompt_cache_state"] = state
+    creation = len(prompt_tokens) - read
+    logger.info(
+        "VLM prompt cache: ~%d prefix tokens reusable, ~%d new (cache_id=%s)",
+        read,
+        creation,
+        cache_id,
+    )
+    return read, creation
+
+
 async def _setup_prompt_cache(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -3061,10 +3117,7 @@ async def _setup_prompt_cache(
                 len(prompt_tokens),
             )
             gen_kwargs["prompt_cache"] = working_cache
-            if lm.is_vlm:
-                gen_kwargs["input_ids"] = mx.array([suffix_tokens])
-            else:
-                result.prompt = suffix_tokens
+            result.prompt = suffix_tokens
 
     if "prompt_cache" not in gen_kwargs:
         # Reached on either: (a) no usable prefix in cache miss, or
@@ -3087,10 +3140,7 @@ async def _setup_prompt_cache(
             fresh_cache_label,
             len(prompt_tokens),
         )
-        if lm.is_vlm:
-            gen_kwargs["input_ids"] = mx.array([prompt_tokens])
-        else:
-            result.prompt = prompt_tokens
+        result.prompt = prompt_tokens
 
     result.cache_setup_done = True
 
