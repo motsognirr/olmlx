@@ -4173,21 +4173,28 @@ async def _full_completion_inner(
             if lm.is_speculative:
                 logger.debug("speculative decoding skipped: request includes images")
             import mlx_vlm
+            from mlx_vlm.generate import (
+                generation_stream,
+            )  # used by mx.synchronize below
 
-            # mlx_vlm.generate returns a plain str; prompt/generation token
-            # counts are not exposed, so stats.prompt_eval_count /
-            # stats.eval_count stay 0 on this path.
-            result = mlx_vlm.generate(
+            # Drain stream_generate (not generate): it forwards prompt_cache_state
+            # + logits_processors and yields GenerationResult with real token
+            # counts. Return (last_result, full_text) so the downstream tuple
+            # unpacking captures prompt/generation token counts (#429).
+            result = None
+            text_parts = []
+            for response in mlx_vlm.stream_generate(
                 lm.model,
                 lm.tokenizer,
                 prompt=prompt,
                 image=images,
                 max_tokens=max_tokens,
                 **gen_kwargs,
-            )
-            from mlx_vlm.generate import (
-                generation_stream,
-            )  # used by mx.synchronize below
+            ):
+                text_parts.append(response.text)
+                result = response
+            if result is not None:
+                result = (result, "".join(text_parts))
         elif use_speculative:
             import threading
 
@@ -4222,18 +4229,24 @@ async def _full_completion_inner(
             return result
         elif lm.is_vlm:
             import mlx_vlm
+            from mlx_vlm.generate import (
+                generation_stream,
+            )  # used by mx.synchronize below
 
-            result = mlx_vlm.generate(
+            result = None
+            text_parts = []
+            for response in mlx_vlm.stream_generate(
                 lm.model,
                 lm.tokenizer,
                 prompt=prompt,
                 image=images,
                 max_tokens=max_tokens,
                 **gen_kwargs,
-            )
-            from mlx_vlm.generate import (
-                generation_stream,
-            )  # used by mx.synchronize below
+            ):
+                text_parts.append(response.text)
+                result = response
+            if result is not None:
+                result = (result, "".join(text_parts))
         else:
             import mlx_lm
 
