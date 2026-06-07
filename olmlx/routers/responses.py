@@ -301,7 +301,8 @@ def _build_response_object(
         parallel_tool_calls=req.parallel_tool_calls,
         temperature=req.temperature,
         top_p=req.top_p,
-        tool_choice=req.tool_choice,
+        # The OpenAI SDK requires tool_choice to be non-null; default to "auto".
+        tool_choice=req.tool_choice if req.tool_choice is not None else "auto",
         tools=req.tools or [],
     )
 
@@ -384,6 +385,7 @@ async def _stream_response(
                         "output_index": out_index,
                         "content_index": 0,
                         "delta": part["text"],
+                        "logprobs": [],
                     },
                 )
                 yield ev(
@@ -393,6 +395,7 @@ async def _stream_response(
                         "output_index": out_index,
                         "content_index": 0,
                         "text": part["text"],
+                        "logprobs": [],
                     },
                 )
                 yield ev(
@@ -419,6 +422,7 @@ async def _stream_response(
                         "item_id": item["id"],
                         "output_index": out_index,
                         "arguments": item["arguments"],
+                        "name": item["name"],
                     },
                 )
             yield ev(
