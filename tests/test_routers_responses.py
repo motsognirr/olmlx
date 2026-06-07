@@ -1,6 +1,5 @@
 """Tests for olmlx.routers.responses and its schemas."""
 
-import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -37,6 +36,7 @@ class TestResponsesRequestSchema:
 
     def test_empty_input_rejected(self):
         import pytest
+
         with pytest.raises(Exception):
             ResponsesRequest(model="qwen3", input="")
         with pytest.raises(Exception):
@@ -77,9 +77,7 @@ class TestTranslation:
         msgs = _build_input_messages(
             [{"type": "function_call_output", "call_id": "call_1", "output": "42"}]
         )
-        assert msgs == [
-            {"role": "tool", "tool_call_id": "call_1", "content": "42"}
-        ]
+        assert msgs == [{"role": "tool", "tool_call_id": "call_1", "content": "42"}]
 
     def test_function_call_item(self):
         msgs = _build_input_messages(
@@ -139,3 +137,50 @@ class TestTranslation:
     def test_function_tool_missing_name_raises(self):
         with pytest.raises(ValueError):
             _convert_tools([{"type": "function", "parameters": {}}])
+
+
+class TestNonStreamingText:
+    @pytest.mark.asyncio
+    async def test_text_response_shape(self, app_client):
+        stats = TimingStats(prompt_eval_count=5, eval_count=3)
+        mock_result = {"text": "Hello there.", "done": True, "stats": stats}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi", "stream": False},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "response"
+        assert data["status"] == "completed"
+        assert data["id"].startswith("resp_")
+        msg = next(it for it in data["output"] if it["type"] == "message")
+        assert msg["role"] == "assistant"
+        assert msg["content"][0]["type"] == "output_text"
+        assert msg["content"][0]["text"] == "Hello there."
+        assert data["usage"]["input_tokens"] == 5
+        assert data["usage"]["output_tokens"] == 3
+        assert data["usage"]["total_tokens"] == 8
+
+    @pytest.mark.asyncio
+    async def test_timeout_marks_incomplete(self, app_client):
+        mock_result = {
+            "text": "partial",
+            "done": True,
+            "done_reason": "timeout",
+            "stats": TimingStats(),
+        }
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi"},
+            )
+        data = resp.json()
+        assert data["status"] == "incomplete"
+        assert data["incomplete_details"]["reason"] == "max_output_tokens"

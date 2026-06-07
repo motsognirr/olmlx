@@ -4,11 +4,9 @@ import time
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
 
 from olmlx.engine.grammar import GrammarSpec, parse_response_format
 from olmlx.engine.inference import generate_chat
-from olmlx.engine.responses_state import get_store
 from olmlx.engine.tool_parser import (
     fill_missing_required_args,
     parse_model_output,
@@ -175,3 +173,156 @@ def _resolve_reasoning(reasoning: dict | None) -> bool | None:
     """Map Responses `reasoning.effort` to the engine enable_thinking flag."""
     effort = (reasoning or {}).get("effort")
     return resolve_openai_think(effort, None)
+
+
+def _build_output_items(
+    thinking: str, visible_text: str, tool_uses: list[dict]
+) -> list[dict]:
+    """Assemble Responses output items in canonical order."""
+    items: list[dict] = []
+    if thinking:
+        items.append(
+            {
+                "type": "reasoning",
+                "id": _make_reasoning_id(),
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": thinking}],
+            }
+        )
+    if visible_text:
+        items.append(
+            {
+                "type": "message",
+                "id": _make_message_id(),
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": visible_text, "annotations": []}
+                ],
+            }
+        )
+    for tu in tool_uses:
+        items.append(
+            {
+                "type": "function_call",
+                "id": _make_fc_id(),
+                "call_id": _make_call_id(),
+                "name": tu["name"],
+                "arguments": json.dumps(tu.get("input", {})),
+                "status": "completed",
+            }
+        )
+    return items
+
+
+def _usage_dict(stats) -> dict:
+    if stats is None:
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    prompt = stats.prompt_eval_count
+    completion = stats.eval_count
+    return {
+        "input_tokens": prompt,
+        "output_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
+
+
+def _build_response_object(
+    req: ResponsesRequest,
+    response_id: str,
+    created: int,
+    output_items: list[dict],
+    stats,
+    done_reason: str | None,
+) -> ResponsesResponse:
+    incomplete = None
+    status = "completed"
+    if done_reason == "timeout":
+        status = "incomplete"
+        incomplete = {"reason": "max_output_tokens"}
+    return ResponsesResponse(
+        id=response_id,
+        created_at=created,
+        status=status,
+        model=req.model,
+        output=output_items,
+        usage=_usage_dict(stats),
+        previous_response_id=req.previous_response_id,
+        incomplete_details=incomplete,
+        instructions=req.instructions,
+        max_output_tokens=req.max_output_tokens,
+        metadata=req.metadata,
+        parallel_tool_calls=req.parallel_tool_calls,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        tool_choice=req.tool_choice,
+        tools=req.tools or [],
+    )
+
+
+@router.post(
+    "/v1/responses",
+    response_model=ResponsesResponse,
+    response_model_exclude_none=True,
+)
+async def create_response(req: ResponsesRequest, request: Request):
+    manager = request.app.state.model_manager
+    logger.info(
+        "Responses request: model=%s stream=%s tools=%d prev=%s",
+        req.model,
+        req.stream,
+        len(req.tools or []),
+        req.previous_response_id,
+    )
+
+    try:
+        messages = _build_input_messages(req.input)
+        tools = _convert_tools(req.tools)
+        grammar_spec = _grammar_from_text_format(req.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if req.instructions:
+        messages.insert(0, {"role": "system", "content": req.instructions})
+
+    options = build_inference_options(
+        temperature=req.temperature, top_p=req.top_p, seed=req.seed
+    )
+    max_tokens = req.max_output_tokens or 512
+    enable_thinking = _resolve_reasoning(req.reasoning)
+    response_id = _make_response_id()
+    created = int(time.time())
+    cache_id = (req.previous_response_id or response_id)[:256]
+
+    result = await generate_chat(
+        manager,
+        req.model,
+        messages,
+        options,
+        tools=tools,
+        stream=False,
+        max_tokens=max_tokens,
+        cache_id=cache_id,
+        enable_thinking=enable_thinking,
+        grammar_spec=grammar_spec,
+    )
+
+    parse_text = result.get("raw_text") or result.get("text", "")
+    thinking, visible_text, tool_uses = parse_model_output(
+        parse_text,
+        bool(tools),
+        thinking_expected=bool(result.get("thinking_expected")),
+    )
+    resolve_tool_names(tool_uses, tools)
+    fill_missing_required_args(tool_uses, tools)
+
+    output_items = _build_output_items(thinking, visible_text, tool_uses)
+    response = _build_response_object(
+        req,
+        response_id,
+        created,
+        output_items,
+        result.get("stats"),
+        result.get("done_reason"),
+    )
+    return response
