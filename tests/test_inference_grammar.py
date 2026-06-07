@@ -46,6 +46,9 @@ class TestResolveModelVocabSize:
         lm.model.model.embed_tokens.weight.shape = (12345, 768)
         # Also clear top-level embed_tokens to force the model.model.embed_tokens path.
         del lm.model.embed_tokens
+        # VLM layout check: language_model is auto-created by MagicMock, so
+        # explicitly suppress it so the helper stays on the text-model path.
+        lm.model.language_model = None
         assert _resolve_model_vocab_size(lm) == 12345
 
     def test_prefers_nested_lm_head_over_top_embed_tokens(self):
@@ -82,13 +85,17 @@ class TestResolveModelVocabSize:
         lm.model.args = None
         # Strip all of the attributes the helper checks at both nesting
         # levels (model.lm_head, model.embed_tokens, model.model.lm_head,
-        # model.model.embed_tokens) so the helper returns None.
+        # model.model.embed_tokens, plus the VLM language_model subtree)
+        # so the helper returns None.
         for owner in (lm.model, lm.model.model):
             for attr in ("lm_head", "embed_tokens"):
                 try:
                     delattr(owner, attr)
                 except AttributeError:
                     pass
+        # Suppress the VLM language_model path (MagicMock auto-creates it
+        # with a synthetic lm_head, which would prevent returning None).
+        lm.model.language_model = None
         assert _resolve_model_vocab_size(lm) is None
 
 
@@ -99,16 +106,22 @@ class TestInstallGrammarProcessor:
         assert _install_grammar_processor(lm, gen_kwargs, None) is False
         assert "logits_processors" not in gen_kwargs
 
-    def test_vlm_warns_and_skips(self, caplog):
-        lm = _make_lm(is_vlm=True)
+    def test_vlm_not_blocked(self):
+        """VLMs are no longer skipped — mlx_vlm's generate_step accepts
+        logits_processors and olmlx forwards gen_kwargs to it (#429).
+        The VLM gate was removed; a VLM with a resolvable vocab proceeds to
+        grammar installation exactly as a text model does."""
+        lm = _make_lm(is_vlm=True, vocab_size=1024)
         gen_kwargs: dict = {}
-        with caplog.at_level("WARNING", logger="olmlx.engine.inference"):
+        sentinel = MagicMock(name="grammar_processor")
+        with patch(
+            "olmlx.engine.inference._make_grammar_processor", return_value=sentinel
+        ):
             installed = _install_grammar_processor(
                 lm, gen_kwargs, GrammarSpec("json_object")
             )
-        assert installed is False
-        assert "logits_processors" not in gen_kwargs
-        assert "VLM" in caplog.text
+        assert installed is True
+        assert gen_kwargs["logits_processors"] == [sentinel]
 
     def test_has_tools_warns_and_skips(self, caplog):
         """Grammar + tools is broken: the JSON grammar masks tool-call

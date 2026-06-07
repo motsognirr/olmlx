@@ -100,7 +100,13 @@ def _resolve_model_vocab_size(lm: "LoadedModel") -> int | None:
     # iterating attr-first avoids returning the top-level embed_tokens
     # when a deeper lm_head exists.
     for attr in ("lm_head", "embed_tokens"):
-        for owner in (model, getattr(model, "model", None)):
+        language_model = getattr(model, "language_model", None)
+        for owner in (
+            model,
+            getattr(model, "model", None),
+            language_model,
+            getattr(language_model, "model", None),
+        ):
             if owner is None:
                 continue
             layer = getattr(owner, attr, None)
@@ -123,24 +129,17 @@ def _install_grammar_processor(
 ) -> bool:
     """Build and install a grammar logits processor on *gen_kwargs*.
 
-    Returns ``True`` when grammar is active for the request. VLM models
-    are not supported (mlx-vlm does not forward ``logits_processors``) and
-    return ``False`` with a one-line warning. Distributed mode is also
-    rejected: workers don't receive the processor over the sideband and
-    would diverge from rank-0. Tool-use requests are rejected: the JSON
-    grammar masks the format-specific tool-call tokens (``<tool_call>``,
-    ``[TOOL_CALLS]``, ``<function=...>``, …) so the model could never
-    emit a tool call. Constraining tool *arguments* is the deferred
-    Anthropic case (issue #361) — needs per-template trigger detection.
+    Returns ``True`` when grammar is active for the request. Works for both
+    text and VLM models — mlx_vlm's ``generate_step`` accepts
+    ``logits_processors`` and olmlx forwards ``gen_kwargs`` to it (#429).
+    Distributed mode is still rejected: workers don't receive the processor
+    over the sideband and would diverge from rank-0. Tool-use requests are
+    rejected: the JSON grammar masks the format-specific tool-call tokens
+    (``<tool_call>``, ``[TOOL_CALLS]``, ``<function=...>``, …) so the model
+    could never emit a tool call. Constraining tool *arguments* is the
+    deferred Anthropic case (issue #361).
     """
     if grammar_spec is None:
-        return False
-    if lm.is_vlm:
-        logger.warning(
-            "Grammar-constrained decoding requested but model is a VLM "
-            "(mlx-vlm does not accept logits_processors); ignoring "
-            "constraint for this request"
-        )
         return False
     if lm.is_distributed:
         logger.warning(
