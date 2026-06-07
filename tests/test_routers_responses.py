@@ -1,5 +1,6 @@
 """Tests for olmlx.routers.responses and its schemas."""
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -184,3 +185,128 @@ class TestNonStreamingText:
         data = resp.json()
         assert data["status"] == "incomplete"
         assert data["incomplete_details"]["reason"] == "max_output_tokens"
+
+
+class TestNonStreamingFeatures:
+    @pytest.mark.asyncio
+    async def test_function_call_item_emitted(self, app_client):
+        raw = '<tool_call>{"name": "get_weather", "arguments": {"city": "SF"}}</tool_call>'
+        mock_result = {"text": raw, "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "weather in SF?",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get_weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
+        data = resp.json()
+        fc = next(it for it in data["output"] if it["type"] == "function_call")
+        assert fc["name"] == "get_weather"
+        assert json.loads(fc["arguments"]) == {"city": "SF"}
+        assert fc["call_id"].startswith("call_")
+
+    @pytest.mark.asyncio
+    async def test_reasoning_item_from_think(self, app_client):
+        mock_result = {
+            "text": "<think>step one</think>The answer is 42.",
+            "done": True,
+            "stats": TimingStats(),
+            "thinking_expected": True,
+        }
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "q", "reasoning": {"effort": "high"}},
+            )
+        data = resp.json()
+        reasoning = next(it for it in data["output"] if it["type"] == "reasoning")
+        assert "step one" in reasoning["content"][0]["text"]
+        msg = next(it for it in data["output"] if it["type"] == "message")
+        assert msg["content"][0]["text"] == "The answer is 42."
+        assert mock_gen.call_args.kwargs["enable_thinking"] is True
+
+    @pytest.mark.asyncio
+    async def test_structured_output_threads_grammar(self, app_client):
+        mock_result = {"text": "{}", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "q",
+                    "text": {
+                        "format": {
+                            "type": "json_schema",
+                            "name": "thing",
+                            "schema": {"type": "object"},
+                        }
+                    },
+                },
+            )
+        assert resp.status_code == 200
+        assert mock_gen.call_args.kwargs["grammar_spec"] is not None
+
+    @pytest.mark.asyncio
+    async def test_image_input_threads_images(self, app_client):
+        mock_result = {"text": "a cat", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "what is this?"},
+                                {
+                                    "type": "input_image",
+                                    "image_url": "http://x/cat.png",
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+        assert resp.status_code == 200
+        sent_messages = mock_gen.call_args.args[2]
+        assert sent_messages[0]["images"] == ["http://x/cat.png"]
+
+    @pytest.mark.asyncio
+    async def test_builtin_tool_rejected_422(self, app_client):
+        resp = await app_client.post(
+            "/v1/responses",
+            json={"model": "qwen3", "input": "q", "tools": [{"type": "web_search"}]},
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_unknown_input_item_422(self, app_client):
+        resp = await app_client.post(
+            "/v1/responses",
+            json={"model": "qwen3", "input": [{"type": "mystery"}]},
+        )
+        assert resp.status_code == 422
