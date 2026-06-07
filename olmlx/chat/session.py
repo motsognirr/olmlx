@@ -861,7 +861,7 @@ class ChatSession:
                     ):
                         continue
                     try:
-                        payload = json.loads(content[len("__question__") :])
+                        payload = json.loads(content[len("__question__:") :])
                         yield {
                             "type": "question",
                             "header": payload.get("header", ""),
