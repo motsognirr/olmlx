@@ -387,3 +387,93 @@ class TestStateContinuation:
             json={"model": "qwen3", "input": "x", "previous_response_id": "resp_nope"},
         )
         assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_three_turn_chain(self, app_client):
+        async def post(json_body):
+            mock_result = {"text": "ok", "done": True, "stats": TimingStats()}
+            with patch(
+                "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+            ) as mock_gen:
+                mock_gen.return_value = mock_result
+                resp = await app_client.post("/v1/responses", json=json_body)
+                return resp.json()["id"], mock_gen
+
+        id1, _ = await post({"model": "qwen3", "input": "one"})
+        id2, _ = await post(
+            {"model": "qwen3", "input": "two", "previous_response_id": id1}
+        )
+
+        mock_result = {"text": "ok", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "three", "previous_response_id": id2},
+            )
+            sent = mock_gen.call_args.args[2]
+            roles = [m["role"] for m in sent]
+            assert roles == ["user", "assistant", "user", "assistant", "user"]
+            contents = [m.get("content") for m in sent]
+            assert contents[0] == "one"
+            assert contents[2] == "two"
+            assert contents[4] == "three"
+
+    @pytest.mark.asyncio
+    async def test_instructions_not_carried_across_turns(self, app_client):
+        # Turn 1 with instructions.
+        mock_result = {"text": "ok", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            r1 = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi", "instructions": "Be terse."},
+            )
+        id1 = r1.json()["id"]
+
+        # Turn 2 continuation with NO instructions -> no system message at all.
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "more", "previous_response_id": id1},
+            )
+            sent = mock_gen.call_args.args[2]
+            assert all(m["role"] != "system" for m in sent), sent
+
+    @pytest.mark.asyncio
+    async def test_instructions_replace_not_stack_on_continuation(self, app_client):
+        mock_result = {"text": "ok", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            r1 = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi", "instructions": "First."},
+            )
+        id1 = r1.json()["id"]
+
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "more",
+                    "previous_response_id": id1,
+                    "instructions": "Second.",
+                },
+            )
+            sent = mock_gen.call_args.args[2]
+            systems = [m for m in sent if m["role"] == "system"]
+            assert len(systems) == 1
+            assert systems[0]["content"] == "Second."

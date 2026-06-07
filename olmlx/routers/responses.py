@@ -198,6 +198,7 @@ def _history_messages_from_store(previous_response_id: str) -> list[dict]:
                             "id": item.get("call_id"),
                             "type": "function",
                             "function": {
+                                # `name` is always present: set by _build_output_items invariant.
                                 "name": item["name"],
                                 "arguments": item.get("arguments", ""),
                             },
@@ -323,13 +324,21 @@ async def create_response(req: ResponsesRequest, request: Request):
         raise HTTPException(status_code=422, detail=str(exc))
 
     if req.previous_response_id:
-        messages = _history_messages_from_store(req.previous_response_id)
-        messages.extend(new_messages)
+        conversation = _history_messages_from_store(req.previous_response_id)
+        conversation.extend(new_messages)
     else:
-        messages = new_messages
+        conversation = new_messages
 
+    # Per OpenAI Responses semantics, `instructions` are NOT carried across
+    # previous_response_id — each turn supplies its own. So the system message
+    # is applied only to the engine input and is NOT part of the stored
+    # conversation (which is replayed on the next continuation turn).
+    engine_messages = conversation
     if req.instructions:
-        messages.insert(0, {"role": "system", "content": req.instructions})
+        engine_messages = [
+            {"role": "system", "content": req.instructions},
+            *conversation,
+        ]
 
     options = build_inference_options(
         temperature=req.temperature, top_p=req.top_p, seed=req.seed
@@ -343,7 +352,7 @@ async def create_response(req: ResponsesRequest, request: Request):
     result = await generate_chat(
         manager,
         req.model,
-        messages,
+        engine_messages,
         options,
         tools=tools,
         stream=False,
@@ -375,7 +384,7 @@ async def create_response(req: ResponsesRequest, request: Request):
         get_store().put(
             response_id,
             {
-                "input_messages": messages,
+                "input_messages": conversation,
                 "output_items": output_items,
                 "model": req.model,
                 "previous_response_id": req.previous_response_id,
