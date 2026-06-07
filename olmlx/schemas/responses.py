@@ -28,6 +28,20 @@ class ResponsesRequest(BaseModel):
     metadata: dict[str, Any] | None = None
     seed: int | None = None
 
+    parallel_tool_calls: bool = True
+
+    @field_validator("input")
+    @classmethod
+    def _validate_input_non_empty(
+        cls, v: str | list[dict[str, Any]]
+    ) -> str | list[dict[str, Any]]:
+        if isinstance(v, str):
+            if not v.strip():
+                raise ValueError("input string cannot be empty")
+        elif not v:
+            raise ValueError("input list cannot be empty")
+        return v
+
     @field_validator("max_output_tokens")
     @classmethod
     def _validate_max_tokens(cls, v: int | None) -> int | None:
@@ -56,6 +70,7 @@ class ResponsesResponse(BaseModel):
     instructions: str | None = None
     max_output_tokens: int | None = None
     metadata: dict[str, Any] | None = None
+    # Echoes ResponsesRequest.parallel_tool_calls (set by the router).
     parallel_tool_calls: bool = True
     temperature: float | None = None
     top_p: float | None = None

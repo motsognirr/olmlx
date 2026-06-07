@@ -28,3 +28,10 @@ class TestResponsesRequestSchema:
         assert req.previous_response_id is None
         assert req.tools is None
         assert req.max_output_tokens is None
+
+    def test_empty_input_rejected(self):
+        import pytest
+        with pytest.raises(Exception):
+            ResponsesRequest(model="qwen3", input="")
+        with pytest.raises(Exception):
+            ResponsesRequest(model="qwen3", input=[])
