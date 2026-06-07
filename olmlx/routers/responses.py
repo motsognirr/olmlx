@@ -103,7 +103,10 @@ def _build_input_messages(input_data: str | list[dict]) -> list[dict]:
                             "type": "function",
                             "function": {
                                 "name": name,
-                                "arguments": item.get("arguments", ""),
+                                # Default to "{}" (valid JSON), never "" — an
+                                # empty string breaks downstream JSON parsing of
+                                # tool-call arguments.
+                                "arguments": item.get("arguments") or "{}",
                             },
                         }
                     ],
@@ -205,7 +208,7 @@ def _history_messages_from_store(previous_response_id: str) -> list[dict]:
                             "function": {
                                 # `name` is always present: set by _build_output_items invariant.
                                 "name": item["name"],
-                                "arguments": item.get("arguments", ""),
+                                "arguments": item.get("arguments") or "{}",
                             },
                         }
                     ],
@@ -304,6 +307,32 @@ def _build_response_object(
         # The OpenAI SDK requires tool_choice to be non-null; default to "auto".
         tool_choice=req.tool_choice if req.tool_choice is not None else "auto",
         tools=req.tools or [],
+    )
+
+
+def _store_response(
+    req: ResponsesRequest,
+    response_id: str,
+    conversation: list[dict],
+    output_items: list[dict],
+    response_dict: dict,
+) -> None:
+    """Persist a completed response for previous_response_id continuation.
+
+    Shared by the streaming and non-streaming paths so the stored entry shape
+    can't drift between them. No-op when ``store`` is false.
+    """
+    if not req.store:
+        return
+    get_store().put(
+        response_id,
+        {
+            "input_messages": conversation,
+            "output_items": output_items,
+            "model": req.model,
+            "previous_response_id": req.previous_response_id,
+            "response": response_dict,
+        },
     )
 
 
@@ -434,17 +463,7 @@ async def _stream_response(
         final = base_response(final_status, output_items, stats, done_reason)
         yield ev("response.completed", {"response": final})
 
-        if req.store:
-            get_store().put(
-                response_id,
-                {
-                    "input_messages": conversation,
-                    "output_items": output_items,
-                    "model": req.model,
-                    "previous_response_id": req.previous_response_id,
-                    "response": final,
-                },
-            )
+        _store_response(req, response_id, conversation, output_items, final)
     except Exception as exc:
         logger.error("Error during Responses streaming: %s", exc, exc_info=True)
         yield ev(
@@ -461,7 +480,12 @@ async def _stream_response(
             },
         )
     finally:
-        await result.aclose()
+        # Guard cleanup: a raising aclose() (e.g. already-closed generator)
+        # must not propagate out of the finally and truncate the SSE stream.
+        try:
+            await result.aclose()
+        except Exception as exc:
+            logger.warning("Responses stream aclose failed: %s", exc)
 
 
 @router.post(
@@ -561,17 +585,13 @@ async def create_response(req: ResponsesRequest, request: Request):
         result.get("stats"),
         result.get("done_reason"),
     )
-    if req.store:
-        get_store().put(
-            response_id,
-            {
-                "input_messages": conversation,
-                "output_items": output_items,
-                "model": req.model,
-                "previous_response_id": req.previous_response_id,
-                "response": response.model_dump(exclude_none=True),
-            },
-        )
+    _store_response(
+        req,
+        response_id,
+        conversation,
+        output_items,
+        response.model_dump(exclude_none=True),
+    )
     return response
 
 

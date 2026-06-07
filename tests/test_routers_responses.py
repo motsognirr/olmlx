@@ -140,6 +140,13 @@ class TestTranslation:
         with pytest.raises(ValueError):
             _convert_tools([{"type": "function", "parameters": {}}])
 
+    def test_function_call_missing_arguments_defaults_to_empty_object(self):
+        # A missing/empty arguments must become "{}" (valid JSON), not "".
+        msgs = _build_input_messages(
+            [{"type": "function_call", "call_id": "c1", "name": "f"}]
+        )
+        assert msgs[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+
 
 class TestNonStreamingText:
     @pytest.mark.asyncio
