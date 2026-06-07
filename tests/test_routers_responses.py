@@ -131,3 +131,11 @@ class TestTranslation:
         assert _resolve_reasoning({"effort": "high"}) is True
         assert _resolve_reasoning({"effort": "none"}) is False
         assert _resolve_reasoning(None) is None
+
+    def test_function_call_missing_name_raises(self):
+        with pytest.raises(ValueError):
+            _build_input_messages([{"type": "function_call", "call_id": "c1"}])
+
+    def test_function_tool_missing_name_raises(self):
+        with pytest.raises(ValueError):
+            _convert_tools([{"type": "function", "parameters": {}}])

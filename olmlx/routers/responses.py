@@ -6,7 +6,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from olmlx.engine.grammar import parse_response_format
+from olmlx.engine.grammar import GrammarSpec, parse_response_format
 from olmlx.engine.inference import generate_chat
 from olmlx.engine.responses_state import get_store
 from olmlx.engine.tool_parser import (
@@ -87,6 +87,9 @@ def _build_input_messages(input_data: str | list[dict]) -> list[dict]:
         if itype in (None, "message") and role is not None:
             messages.append(_message_item_to_engine(item))
         elif itype == "function_call":
+            name = item.get("name")
+            if not name:
+                raise ValueError("function_call item missing 'name'")
             messages.append(
                 {
                     "role": "assistant",
@@ -95,7 +98,7 @@ def _build_input_messages(input_data: str | list[dict]) -> list[dict]:
                             "id": item.get("call_id"),
                             "type": "function",
                             "function": {
-                                "name": item["name"],
+                                "name": name,
                                 "arguments": item.get("arguments", ""),
                             },
                         }
@@ -129,11 +132,14 @@ def _convert_tools(tools: list[dict] | None) -> list[dict] | None:
                     "'function' tools are available"
                 )
             raise ValueError(f"unsupported tool type: {ttype!r}")
+        name = t.get("name")
+        if not name:
+            raise ValueError("function tool missing 'name'")
         converted.append(
             {
                 "type": "function",
                 "function": {
-                    "name": t["name"],
+                    "name": name,
                     "description": t.get("description", ""),
                     "parameters": t.get("parameters", {}),
                 },
@@ -142,7 +148,7 @@ def _convert_tools(tools: list[dict] | None) -> list[dict] | None:
     return converted
 
 
-def _grammar_from_text_format(text_cfg: dict | None):
+def _grammar_from_text_format(text_cfg: dict | None) -> GrammarSpec | None:
     """Map a Responses `text.format` config to a GrammarSpec (or None)."""
     fmt = (text_cfg or {}).get("format")
     if not fmt:
