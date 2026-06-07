@@ -4,6 +4,7 @@ import time
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from olmlx.engine.grammar import GrammarSpec, parse_response_format
 from olmlx.engine.inference import generate_chat
@@ -42,6 +43,10 @@ def _make_fc_id() -> str:
 
 def _make_call_id() -> str:
     return f"call_{uuid.uuid4().hex[:24]}"
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
 def _message_item_to_engine(item: dict) -> dict:
@@ -301,6 +306,159 @@ def _build_response_object(
     )
 
 
+async def _stream_response(
+    result,
+    req: ResponsesRequest,
+    response_id: str,
+    created: int,
+    tools: list[dict] | None,
+    conversation: list[dict],
+):
+    """Buffer the engine output, parse once, replay full semantic events."""
+    seq = 0
+
+    def ev(event: str, data: dict) -> str:
+        nonlocal seq
+        payload = {"type": event, "sequence_number": seq, **data}
+        seq += 1
+        return _sse(event, payload)
+
+    def base_response(status: str, output_items: list[dict], stats, done_reason):
+        obj = _build_response_object(
+            req, response_id, created, output_items, stats, done_reason
+        ).model_dump(exclude_none=True)
+        return obj
+
+    try:
+        full_text = ""
+        raw_text = ""
+        done_reason = None
+        thinking_expected = False
+        stats = None
+        async for chunk in result:
+            if chunk.get("cache_info"):
+                continue
+            if "thinking_expected" in chunk:
+                thinking_expected = bool(chunk["thinking_expected"])
+                continue
+            if chunk.get("done"):
+                raw_text = chunk.get("raw_text", raw_text)
+                done_reason = chunk.get("done_reason")
+                stats = chunk.get("stats")
+                break
+            full_text += chunk.get("text", "")
+
+        parse_text = raw_text or full_text
+        thinking, visible_text, tool_uses = parse_model_output(
+            parse_text, bool(tools), thinking_expected=thinking_expected
+        )
+        resolve_tool_names(tool_uses, tools)
+        fill_missing_required_args(tool_uses, tools)
+        output_items = _build_output_items(thinking, visible_text, tool_uses)
+
+        in_progress_resp = base_response("in_progress", [], stats, None)
+        in_progress_resp["status"] = "in_progress"
+        yield ev("response.created", {"response": in_progress_resp})
+        yield ev("response.in_progress", {"response": in_progress_resp})
+
+        for out_index, item in enumerate(output_items):
+            yield ev(
+                "response.output_item.added",
+                {"output_index": out_index, "item": item},
+            )
+            if item["type"] == "message":
+                part = item["content"][0]
+                yield ev(
+                    "response.content_part.added",
+                    {
+                        "item_id": item["id"],
+                        "output_index": out_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []},
+                    },
+                )
+                yield ev(
+                    "response.output_text.delta",
+                    {
+                        "item_id": item["id"],
+                        "output_index": out_index,
+                        "content_index": 0,
+                        "delta": part["text"],
+                    },
+                )
+                yield ev(
+                    "response.output_text.done",
+                    {
+                        "item_id": item["id"],
+                        "output_index": out_index,
+                        "content_index": 0,
+                        "text": part["text"],
+                    },
+                )
+                yield ev(
+                    "response.content_part.done",
+                    {
+                        "item_id": item["id"],
+                        "output_index": out_index,
+                        "content_index": 0,
+                        "part": part,
+                    },
+                )
+            elif item["type"] == "function_call":
+                yield ev(
+                    "response.function_call_arguments.delta",
+                    {
+                        "item_id": item["id"],
+                        "output_index": out_index,
+                        "delta": item["arguments"],
+                    },
+                )
+                yield ev(
+                    "response.function_call_arguments.done",
+                    {
+                        "item_id": item["id"],
+                        "output_index": out_index,
+                        "arguments": item["arguments"],
+                    },
+                )
+            yield ev(
+                "response.output_item.done",
+                {"output_index": out_index, "item": item},
+            )
+
+        final = base_response("completed", output_items, stats, done_reason)
+        yield ev("response.completed", {"response": final})
+
+        if req.store:
+            get_store().put(
+                response_id,
+                {
+                    "input_messages": conversation,
+                    "output_items": output_items,
+                    "model": req.model,
+                    "previous_response_id": req.previous_response_id,
+                    "response": final,
+                },
+            )
+    except Exception as exc:
+        logger.error("Error during Responses streaming: %s", exc, exc_info=True)
+        yield ev(
+            "response.failed",
+            {
+                "response": {
+                    "id": response_id,
+                    "status": "failed",
+                    "error": {
+                        "code": "server_error",
+                        "message": "An internal server error occurred during streaming.",
+                    },
+                }
+            },
+        )
+    finally:
+        await result.aclose()
+
+
 @router.post(
     "/v1/responses",
     response_model=ResponsesResponse,
@@ -348,6 +506,24 @@ async def create_response(req: ResponsesRequest, request: Request):
     response_id = _make_response_id()
     created = int(time.time())
     cache_id = (req.previous_response_id or response_id)[:256]
+
+    if req.stream:
+        result = await generate_chat(
+            manager,
+            req.model,
+            engine_messages,
+            options,
+            tools=tools,
+            stream=True,
+            max_tokens=max_tokens,
+            cache_id=cache_id,
+            enable_thinking=enable_thinking,
+            grammar_spec=grammar_spec,
+        )
+        return StreamingResponse(
+            _stream_response(result, req, response_id, created, tools, conversation),
+            media_type="text/event-stream",
+        )
 
     result = await generate_chat(
         manager,

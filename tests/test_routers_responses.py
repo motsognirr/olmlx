@@ -477,3 +477,114 @@ class TestStateContinuation:
             systems = [m for m in sent if m["role"] == "system"]
             assert len(systems) == 1
             assert systems[0]["content"] == "Second."
+
+
+def _parse_sse(body: str) -> list[dict]:
+    """Parse an SSE body into a list of {event, data} dicts."""
+    events = []
+    for block in body.strip().split("\n\n"):
+        if not block.strip():
+            continue
+        event = None
+        data = None
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                event = line[len("event: "):]
+            elif line.startswith("data: "):
+                data = json.loads(line[len("data: "):])
+        events.append({"event": event, "data": data})
+    return events
+
+
+class TestStreaming:
+    @pytest.mark.asyncio
+    async def test_text_stream_event_sequence(self, app_client):
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "Hel", "done": False}
+                yield {"text": "lo", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats(eval_count=2)}
+
+            return gen()
+
+        with patch(
+            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi", "stream": True},
+            )
+        assert resp.status_code == 200
+        events = _parse_sse(resp.text)
+        types = [e["event"] for e in events]
+        assert types[0] == "response.created"
+        assert "response.output_text.delta" in types
+        assert types[-1] == "response.completed"
+        seqs = [e["data"]["sequence_number"] for e in events]
+        assert seqs == sorted(seqs)
+        text = "".join(
+            e["data"]["delta"]
+            for e in events
+            if e["event"] == "response.output_text.delta"
+        )
+        assert text == "Hello"
+        final = events[-1]["data"]["response"]
+        assert final["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_tool_call_stream(self, app_client):
+        raw = '<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>'
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": raw, "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch(
+            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "go",
+                    "stream": True,
+                    "tools": [
+                        {"type": "function", "name": "f", "parameters": {"type": "object"}}
+                    ],
+                },
+            )
+        events = _parse_sse(resp.text)
+        types = [e["event"] for e in events]
+        assert "response.function_call_arguments.delta" in types
+        assert "response.function_call_arguments.done" in types
+        final = events[-1]["data"]["response"]
+        fc = next(it for it in final["output"] if it["type"] == "function_call")
+        assert fc["name"] == "f"
+
+    @pytest.mark.asyncio
+    async def test_stream_stores_response(self, app_client):
+        from olmlx.engine.responses_state import get_store
+
+        get_store().clear()
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "hi", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch(
+            "olmlx.routers.responses.generate_chat", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi", "stream": True},
+            )
+        events = _parse_sse(resp.text)
+        rid = events[-1]["data"]["response"]["id"]
+        assert get_store().get(rid) is not None
+        get_store().clear()
