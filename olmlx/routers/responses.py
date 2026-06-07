@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from olmlx.engine.grammar import GrammarSpec, parse_response_format
 from olmlx.engine.inference import generate_chat
+from olmlx.engine.responses_state import get_store
 from olmlx.engine.tool_parser import (
     fill_missing_required_args,
     parse_model_output,
@@ -169,6 +170,45 @@ def _grammar_from_text_format(text_cfg: dict | None) -> GrammarSpec | None:
     raise ValueError(f"unsupported text.format type: {ftype!r}")
 
 
+def _history_messages_from_store(previous_response_id: str) -> list[dict]:
+    """Rebuild engine messages from a stored response (input + output items)."""
+    entry = get_store().get(previous_response_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"previous_response_id not found: {previous_response_id!r}",
+        )
+    messages = list(entry["input_messages"])
+    for item in entry["output_items"]:
+        itype = item.get("type")
+        if itype == "message":
+            text = "".join(
+                part.get("text", "")
+                for part in item.get("content", [])
+                if part.get("type") == "output_text"
+            )
+            if text:
+                messages.append({"role": "assistant", "content": text})
+        elif itype == "function_call":
+            messages.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": item.get("call_id"),
+                            "type": "function",
+                            "function": {
+                                "name": item["name"],
+                                "arguments": item.get("arguments", ""),
+                            },
+                        }
+                    ],
+                }
+            )
+        # reasoning items are not replayed into prompt history
+    return messages
+
+
 def _resolve_reasoning(reasoning: dict | None) -> bool | None:
     """Map Responses `reasoning.effort` to the engine enable_thinking flag."""
     effort = (reasoning or {}).get("effort")
@@ -276,11 +316,17 @@ async def create_response(req: ResponsesRequest, request: Request):
     )
 
     try:
-        messages = _build_input_messages(req.input)
+        new_messages = _build_input_messages(req.input)
         tools = _convert_tools(req.tools)
         grammar_spec = _grammar_from_text_format(req.text)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+    if req.previous_response_id:
+        messages = _history_messages_from_store(req.previous_response_id)
+        messages.extend(new_messages)
+    else:
+        messages = new_messages
 
     if req.instructions:
         messages.insert(0, {"role": "system", "content": req.instructions})
@@ -325,4 +371,15 @@ async def create_response(req: ResponsesRequest, request: Request):
         result.get("stats"),
         result.get("done_reason"),
     )
+    if req.store:
+        get_store().put(
+            response_id,
+            {
+                "input_messages": messages,
+                "output_items": output_items,
+                "model": req.model,
+                "previous_response_id": req.previous_response_id,
+                "response": response.model_dump(exclude_none=True),
+            },
+        )
     return response

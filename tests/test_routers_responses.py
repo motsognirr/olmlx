@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from olmlx.engine.responses_state import get_store
 from olmlx.schemas.responses import ResponsesRequest
 from olmlx.utils.timing import TimingStats
 from olmlx.routers.responses import (
@@ -310,3 +311,79 @@ class TestNonStreamingFeatures:
             json={"model": "qwen3", "input": [{"type": "mystery"}]},
         )
         assert resp.status_code == 422
+
+
+class TestStateContinuation:
+    @pytest.fixture(autouse=True)
+    def _clear_store(self):
+        get_store().clear()
+        yield
+        get_store().clear()
+
+    @pytest.mark.asyncio
+    async def test_response_is_stored(self, app_client):
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses", json={"model": "qwen3", "input": "hi"}
+            )
+        rid = resp.json()["id"]
+        assert get_store().get(rid) is not None
+
+    @pytest.mark.asyncio
+    async def test_store_false_skips(self, app_client):
+        mock_result = {"text": "hi", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi", "store": False},
+            )
+        rid = resp.json()["id"]
+        assert get_store().get(rid) is None
+
+    @pytest.mark.asyncio
+    async def test_continuation_prepends_history_and_threads_cache_id(self, app_client):
+        first = {"text": "Blue.", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = first
+            r1 = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "favorite color?"},
+            )
+        rid = r1.json()["id"]
+
+        second = {"text": "Because.", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = second
+            await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "why?",
+                    "previous_response_id": rid,
+                },
+            )
+            sent_messages = mock_gen.call_args.args[2]
+            roles = [m["role"] for m in sent_messages]
+            assert roles == ["user", "assistant", "user"]
+            assert sent_messages[1]["content"] == "Blue."
+            assert sent_messages[-1]["content"] == "why?"
+            assert mock_gen.call_args.kwargs["cache_id"] == rid[:256]
+
+    @pytest.mark.asyncio
+    async def test_unknown_previous_id_404(self, app_client):
+        resp = await app_client.post(
+            "/v1/responses",
+            json={"model": "qwen3", "input": "x", "previous_response_id": "resp_nope"},
+        )
+        assert resp.status_code == 404
