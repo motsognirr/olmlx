@@ -1093,9 +1093,9 @@ curl http://localhost:11434/v1/responses \
 
 **Multi-turn continuation** via `previous_response_id`: pass the `id` of a previous response and the prior conversation history is replayed automatically. The store is bounded in memory (default 256 entries, configurable via `OLMLX_RESPONSES_STORE_MAX`). State is not persisted to disk — the store is cleared on restart.
 
-**Reasoning items**: if the model emits `<think>` tokens, they appear as a `reasoning` output item with `summary` content before the `message` item.
+**Reasoning items**: if the model emits `<think>` tokens, they appear as a `reasoning` output item (with the reasoning text under `content`) before the `message` item.
 
-**Image input**: pass `input_image` items in the `input` array with `image_url` or base64 `source` for VLMs.
+**Image input**: pass `input_image` content parts in a `message` input item for VLMs. The `image_url` field accepts an http(s) URL or a `data:image/...;base64,...` data URI (base64 images are carried inline in `image_url`, not a separate `source` block).
 
 **Not supported**: built-in OpenAI tools (`web_search`, `code_interpreter`, `computer_use`) — these are rejected with HTTP 422.
 
