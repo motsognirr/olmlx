@@ -1,4 +1,7 @@
+import mlx.core as mx
+
 from olmlx.engine.rerank.config import RerankerConfig
+from olmlx.engine.rerank.model import roberta_position_ids
 
 
 def test_rerankerconfig_from_dict_bge():
@@ -47,3 +50,17 @@ def test_rerankerconfig_num_labels_from_num_labels_key():
     assert cfg.num_labels == 1
     assert cfg.head_dim == 64
     assert cfg.hidden_act == "gelu"  # default applied when key absent
+
+
+def test_roberta_position_ids_offset_no_padding():
+    # pad_token_id=1; a fully-real sequence -> positions start at 2
+    input_ids = mx.array([[5, 6, 7, 8]])
+    pos = roberta_position_ids(input_ids, pad_token_id=1)
+    assert pos.tolist() == [[2, 3, 4, 5]]
+
+
+def test_roberta_position_ids_offset_with_padding():
+    # trailing pad tokens (id=1) keep position == pad_token_id (1)
+    input_ids = mx.array([[5, 6, 1, 1]])
+    pos = roberta_position_ids(input_ids, pad_token_id=1)
+    assert pos.tolist() == [[2, 3, 1, 1]]
