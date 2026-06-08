@@ -1162,3 +1162,11 @@ class TestXCacheIDHeader:
         assert resp.status_code == 200
         mock_gen.assert_called_once()
         assert mock_gen.call_args.kwargs.get("cache_id") == ""
+
+
+def test_chat_message_accepts_audio_field_and_dumps_it():
+    from olmlx.schemas.chat import Message
+
+    m = Message(role="user", content="hi", audio=["a.wav"])
+    dumped = m.model_dump(exclude_none=True)
+    assert dumped["audio"] == ["a.wav"]
