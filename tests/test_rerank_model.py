@@ -1,7 +1,11 @@
 import mlx.core as mx
 
 from olmlx.engine.rerank.config import RerankerConfig
-from olmlx.engine.rerank.model import XLMRobertaEmbeddings, roberta_position_ids
+from olmlx.engine.rerank.model import (
+    XLMRobertaCrossEncoder,
+    XLMRobertaEmbeddings,
+    roberta_position_ids,
+)
 
 
 def test_rerankerconfig_from_dict_bge():
@@ -66,8 +70,8 @@ def test_roberta_position_ids_offset_with_padding():
     assert pos.tolist() == [[2, 3, 1, 1]]
 
 
-def test_embeddings_output_shape():
-    cfg = RerankerConfig(
+def _tiny_config() -> RerankerConfig:
+    return RerankerConfig(
         hidden_size=16,
         num_hidden_layers=2,
         num_attention_heads=2,
@@ -79,8 +83,37 @@ def test_embeddings_output_shape():
         pad_token_id=1,
         num_labels=1,
     )
+
+
+def test_embeddings_output_shape():
+    cfg = _tiny_config()
     emb = XLMRobertaEmbeddings(cfg)
     input_ids = mx.array([[5, 6, 7, 2], [5, 6, 1, 1]])
     out = emb(input_ids)
     mx.eval(out)
     assert out.shape == (2, 4, cfg.hidden_size)
+
+
+def test_cross_encoder_forward_shape():
+    cfg = _tiny_config()
+    model = XLMRobertaCrossEncoder(cfg)
+    input_ids = mx.array([[5, 6, 7, 2], [5, 6, 1, 1]])  # 2nd row padded
+    attention_mask = mx.array([[1, 1, 1, 1], [1, 1, 0, 0]])
+    logits = model(input_ids, attention_mask)
+    mx.eval(logits)
+    assert logits.shape == (2, 1)
+
+
+def test_cross_encoder_padding_invariance():
+    # Scoring a sequence must not change when extra pad tokens are appended,
+    # because the attention mask zeroes them out.
+    cfg = _tiny_config()
+    model = XLMRobertaCrossEncoder(cfg)
+    short_ids = mx.array([[5, 6, 7, 2]])
+    short_mask = mx.array([[1, 1, 1, 1]])
+    padded_ids = mx.array([[5, 6, 7, 2, 1, 1]])
+    padded_mask = mx.array([[1, 1, 1, 1, 0, 0]])
+    a = model(short_ids, short_mask)
+    b = model(padded_ids, padded_mask)
+    mx.eval(a, b)
+    assert abs(float(a[0, 0]) - float(b[0, 0])) < 1e-4
