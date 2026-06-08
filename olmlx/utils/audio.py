@@ -13,10 +13,13 @@ ffmpeg is already a hard requirement for the Whisper path.
 from __future__ import annotations
 
 import asyncio
+import logging
 import struct
 from collections.abc import AsyncIterator
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_FORMATS: frozenset[str] = frozenset(
     {"mp3", "opus", "aac", "flac", "wav", "pcm"}
@@ -128,6 +131,12 @@ async def ffmpeg_encode(
             await feeder
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except Exception:
+            # A real upstream error (e.g. the PCM producer failed mid-stream).
+            # Log it — once the 200 is sent it can only surface as a broken
+            # stream — but re-raise: swallowing would silently truncate audio.
+            logger.warning("TTS audio feed failed mid-stream", exc_info=True)
+            raise
         await proc.wait()
         if proc.returncode not in (0, None):
             err = (await proc.stderr.read()).decode(errors="replace")
