@@ -266,7 +266,10 @@ async def _handle_grep(args: dict) -> str | ToolError:
                 proc.communicate(),
                 timeout=30,
             )
-        except BaseException:
+        except (Exception, KeyboardInterrupt, asyncio.CancelledError):
+            # Kill the child on error/timeout/cancel/Ctrl+C, then re-raise.
+            # Narrower than BaseException so a stray SystemExit isn't
+            # intercepted (#454).
             try:
                 proc.kill()
             except (ProcessLookupError, OSError):
@@ -430,7 +433,10 @@ async def _handle_bash(args: dict) -> str | ToolError:
             tool_name="bash",
             is_user_error=False,
         )
-    except BaseException:
+    except (Exception, KeyboardInterrupt, asyncio.CancelledError):
+        # Kill the whole process group on error/cancel/Ctrl+C, then re-raise.
+        # Narrower than BaseException so a stray SystemExit isn't
+        # intercepted (#454).
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, OSError):
