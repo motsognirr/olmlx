@@ -5553,3 +5553,32 @@ def test_extract_audio_returns_none_when_absent():
     from olmlx.engine.inference import _extract_audio
 
     assert _extract_audio([{"role": "user", "content": "hi"}]) is None
+
+
+def test_audio_capable_true_for_vlm_with_feature_extractor():
+    from types import SimpleNamespace
+
+    from olmlx.engine.inference import _audio_capable
+
+    proc = SimpleNamespace(feature_extractor=object())
+    lm = SimpleNamespace(is_vlm=True, tokenizer=proc)
+    assert _audio_capable(lm) is True
+
+
+def test_audio_capable_false_for_vlm_without_feature_extractor():
+    from types import SimpleNamespace
+
+    from olmlx.engine.inference import _audio_capable
+
+    proc = SimpleNamespace(feature_extractor=None)
+    lm = SimpleNamespace(is_vlm=True, tokenizer=proc)
+    assert _audio_capable(lm) is False
+
+
+def test_audio_capable_false_for_text_model():
+    from types import SimpleNamespace
+
+    from olmlx.engine.inference import _audio_capable
+
+    lm = SimpleNamespace(is_vlm=False, tokenizer=object())
+    assert _audio_capable(lm) is False

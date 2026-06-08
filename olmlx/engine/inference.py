@@ -2318,6 +2318,18 @@ def _extract_audio(messages: list[dict]) -> list[str] | None:
     return audio if audio else None
 
 
+def _audio_capable(lm: Any) -> bool:
+    """True when the loaded model can accept audio input.
+
+    Audio models are VLMs whose mlx-vlm processor wires a ``feature_extractor``
+    (Gemma 4, gemma3n, qwen3_omni_moe, phi4mm, minicpmo).  Read from the
+    already-loaded processor — no new ModelManager kind needed.
+    """
+    if not getattr(lm, "is_vlm", False):
+        return False
+    return getattr(lm.tokenizer, "feature_extractor", None) is not None
+
+
 def count_chat_tokens(
     tokenizer: Any,
     messages: list[dict],
