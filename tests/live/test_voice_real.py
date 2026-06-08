@@ -5,17 +5,43 @@ core word survives. Outside tests/integration/ to dodge its autouse MLX mock.
 Requires the [voice] extra (mlx-audio) and ffmpeg on PATH.
 """
 
+import shutil
 import wave
 
 import numpy as np
 import pytest
 
+from olmlx.config import settings
 from olmlx.engine.inference import generate_speech, generate_transcription
-
-pytestmark = [pytest.mark.real_model]
 
 KOKORO = "prince-canuma/Kokoro-82M"
 WHISPER = "mlx-community/whisper-large-v3-turbo"
+
+
+def _models_present() -> bool:
+    """True only when both models are already downloaded locally.
+
+    Mirrors tests/live/test_tts_speech.py: CI runs `pytest` without
+    `-m "not real_model"`, so a live test must skip itself when its models
+    aren't present — otherwise it downloads + runs real inference on the CI
+    runner (which is what `real_model` is meant to prevent).
+    """
+    from olmlx.models.store import _safe_dir_name
+
+    return all(
+        (settings.models_dir / _safe_dir_name(repo) / "config.json").exists()
+        for repo in (KOKORO, WHISPER)
+    )
+
+
+pytestmark = [
+    pytest.mark.real_model,
+    pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required"),
+    pytest.mark.skipif(
+        not _models_present(),
+        reason=f"{KOKORO} / {WHISPER} not downloaded in {settings.models_dir}",
+    ),
+]
 
 
 @pytest.fixture

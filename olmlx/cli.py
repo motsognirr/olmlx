@@ -1869,10 +1869,12 @@ def _check_voice_deps() -> None:
         except Exception:
             return True
 
-    missing = [name for name in ("sounddevice", "mlx_audio") if _absent(name)]
-    if missing:
+    # Only sounddevice lives in the [voice] extra; mlx-audio (Kokoro TTS) is a
+    # core dependency for /v1/audio/speech, so `--extra voice` wouldn't install
+    # it. Gate on sounddevice alone — the dep the hint can actually fix.
+    if _absent("sounddevice"):
         print(
-            f"--voice needs missing package(s): {', '.join(missing)}. "
+            "--voice needs the 'sounddevice' package (PortAudio). "
             "Install with: uv sync --extra voice",
             file=sys.stderr,
         )

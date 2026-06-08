@@ -9,8 +9,11 @@ from olmlx.chat.voice.capture import _require_sounddevice
 
 def play(pcm: np.ndarray, samplerate: int) -> None:
     """Play a float32 PCM buffer and block until it finishes."""
-    if pcm is None or np.asarray(pcm).size == 0:
+    if pcm is None:
+        return
+    buf = np.asarray(pcm)
+    if buf.size == 0:
         return
     sd = _require_sounddevice()
-    sd.play(np.asarray(pcm), samplerate)
+    sd.play(buf, samplerate)
     sd.wait()
