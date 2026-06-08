@@ -121,13 +121,24 @@ async def ffmpeg_encode(
             if not data:
                 break
             yield data
-        await feeder
+        # A broken pipe here means ffmpeg died mid-stream while the feeder was
+        # still writing stdin; swallow it so the returncode + stderr diagnostic
+        # below is what surfaces, rather than the less useful BrokenPipeError.
+        try:
+            await feeder
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         await proc.wait()
         if proc.returncode not in (0, None):
             err = (await proc.stderr.read()).decode(errors="replace")
             raise RuntimeError(f"ffmpeg encode failed ({proc.returncode}): {err}")
     finally:
-        feeder.cancel()
+        if not feeder.done():
+            feeder.cancel()
+            try:
+                await feeder
+            except asyncio.CancelledError:
+                pass
         if proc.returncode is None:
             proc.terminate()
             await proc.wait()

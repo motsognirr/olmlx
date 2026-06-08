@@ -62,3 +62,27 @@ async def test_generate_speech_rejects_non_tts():
         async for _ in generate_speech(manager, "qwen3", "hi", voice="af_heart"):
             pass
     lm.release_ref.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_generate_speech_releases_ref_on_early_close():
+    # Simulate a client disconnect mid-stream: the consumer aclose()s the
+    # generator after one segment. The finally must stop the worker and
+    # release the inference ref so the model isn't pinned forever.
+    lm = _fake_lm()
+
+    def _gen(text, voice=None, speed=1.0, **kw):
+        for _ in range(100):
+            yield _Result(np.array([0.1], dtype=np.float32))
+
+    lm.model = types.SimpleNamespace(generate=_gen)
+    manager = MagicMock()
+    manager.ensure_loaded = AsyncMock(return_value=lm)
+    manager.store = None
+
+    agen = generate_speech(manager, "kokoro", "hi", voice="af_heart")
+    first = await agen.__anext__()
+    assert np.allclose(first, [0.1])
+    await agen.aclose()  # client disconnect
+
+    lm.release_ref.assert_called_once()
