@@ -2129,6 +2129,27 @@ class TestGenerateChat:
 
         assert result["text"] == "tool response"
 
+    @pytest.mark.asyncio
+    async def test_generate_chat_rejects_audio_on_non_audio_model(self, mock_manager):
+        """generate_chat raises ValueError when audio is present but the model
+        cannot accept audio input (not an audio-capable VLM)."""
+        # mock_manager provides a text-only (is_vlm=False) model, so
+        # _audio_capable() returns False and the capability check must fire.
+        with patch("olmlx.engine.inference.settings.prompt_cache", False):
+            with pytest.raises(ValueError, match="cannot accept audio"):
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [
+                        {
+                            "role": "user",
+                            "content": "transcribe this",
+                            "audio": ["sample.wav"],
+                        }
+                    ],
+                    stream=False,
+                )
+
 
 class TestGenerateChatEnableThinking:
     @pytest.mark.asyncio

@@ -4561,6 +4561,14 @@ async def generate_chat(
             enable_thinking = lm.enable_thinking
 
         images = _extract_images(messages)
+        audio = _extract_audio(messages)
+
+        if audio and not _audio_capable(lm):
+            raise ValueError(
+                f"Model {lm.name!r} cannot accept audio input: it is not an "
+                "audio-capable multimodal model. Load a model with an audio "
+                "tower (e.g. a Gemma 4 checkpoint)."
+            )
 
         # Normalise OpenAI-format tool_calls ({function: {name, arguments: "json"}})
         # to the flat format chat templates expect ({name, arguments: {...}}).
@@ -4606,6 +4614,7 @@ async def generate_chat(
                     images,
                     tools=tools,
                     enable_thinking=vlm_thinking,
+                    audio=audio,
                 )
                 logger.info(
                     "VLM chat prompt with %d tools (native template)", len(tools)
@@ -4618,6 +4627,7 @@ async def generate_chat(
                     vlm_messages,
                     images,
                     enable_thinking=vlm_thinking,
+                    audio=audio,
                 )
                 logger.info(
                     "VLM chat prompt with %d tools (injected into system)", len(tools)
@@ -4629,6 +4639,7 @@ async def generate_chat(
                     messages,
                     images,
                     enable_thinking=vlm_thinking,
+                    audio=audio,
                 )
             logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
             logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
@@ -4749,6 +4760,7 @@ async def generate_chat(
                 gen_kwargs,
                 stats,
                 images,
+                audio,
                 use_prompt_cache=use_prompt_cache,
                 prompt_tokens=prompt_tokens,
                 cache_id=cache_id,
@@ -4786,6 +4798,7 @@ async def generate_chat(
                         gen_kwargs,
                         stats,
                         images,
+                        audio,
                         has_tools=bool(tools),
                         use_prompt_cache=use_prompt_cache,
                         prompt_tokens=prompt_tokens,
