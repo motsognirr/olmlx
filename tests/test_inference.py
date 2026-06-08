@@ -5624,3 +5624,16 @@ def test_apply_chat_template_vlm_rejects_tools_with_audio():
             audio=["a.wav"],
             tools=[{"type": "function", "function": {"name": "f"}}],
         )
+
+
+def test_completion_functions_accept_audio_param():
+    import inspect
+
+    from olmlx.engine import inference as inf
+
+    for fn in (
+        inf._stream_completion,
+        inf._full_completion,
+        inf._full_completion_inner,
+    ):
+        assert "audio" in inspect.signature(fn).parameters, fn.__name__
