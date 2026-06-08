@@ -1715,6 +1715,14 @@ class ModelManager:
         ):
             return "whisper"
 
+        # TTS (issue #367). Kokoro/StyleTTS configs carry no ``model_type``
+        # but ship a distinctive ``istftnet`` + ``plbert`` signature. Check
+        # before the empty-model_type return (Kokoro has no model_type) and
+        # after Whisper (Kokoro also has ``n_mels`` but not ``n_audio_state``,
+        # so the Whisper branch above already declined it).
+        if "istftnet" in config and "plbert" in config:
+            return "tts"
+
         if not model_type:
             return "unknown"
 
