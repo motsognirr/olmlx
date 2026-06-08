@@ -477,6 +477,7 @@ class LoadedModel:
     is_flash: bool = False
     is_flash_moe: bool = False
     is_whisper: bool = False
+    is_tts: bool = False
     speculative_decoder: Any = None
     weight_store: Any = None
     template_caps: TemplateCaps = field(default_factory=TemplateCaps)
@@ -806,7 +807,7 @@ class ModelManager:
         #
         # Whisper models (issue #366) return ``tokenizer=None``; guard the
         # grammar drop so it doesn't choke on the missing tokenizer.
-        if not lm.is_whisper:
+        if not (lm.is_whisper or lm.is_tts):
             try:
                 from olmlx.engine import grammar as _grammar
 
@@ -1098,7 +1099,7 @@ class ModelManager:
                 # Whisper models (issue #366) have no LLM KV cache — never
                 # apply KV-cache quantization / spectral calibration to them.
                 _model_kind = self._detect_model_kind(hf_path)
-                if _model_kind == "whisper":
+                if _model_kind in ("whisper", "tts"):
                     kv_cache_quant = None
                 flash_moe_config = model_config.resolved_flash_moe()
 
@@ -1454,6 +1455,7 @@ class ModelManager:
                         is_flash=is_flash,
                         is_flash_moe=is_flash_moe,
                         is_whisper=(_model_kind == "whisper"),
+                        is_tts=(_model_kind == "tts"),
                         speculative_decoder=_spec_decoder,
                         weight_store=_weight_store,
                         template_caps=caps,
@@ -2105,8 +2107,8 @@ class ModelManager:
         TurboQuant/Spectral factories would otherwise pull calibration data
         off disk on every model load only to throw the result away.
         """
-        if lm.is_whisper:
-            # Whisper has no LLM-style prompt cache; nothing to probe.
+        if lm.is_whisper or lm.is_tts:
+            # Whisper/TTS have no LLM-style prompt cache; nothing to probe.
             return
         try:
             from mlx_lm.models.cache import make_prompt_cache
@@ -3517,6 +3519,9 @@ class ModelManager:
             model = whisper_loader.load_model(load_path, dtype=mx.float16)
             return model, None, False, TemplateCaps(), None
 
+        if kind == "tts":
+            return self._load_model_tts(hf_path, load_path)
+
         if kind == "vlm":
             # VLM detected — load with mlx-vlm directly
             try:
@@ -3606,6 +3611,21 @@ class ModelManager:
             return model, tokenizer, is_vlm, caps, decoder
 
         return model, tokenizer, is_vlm, caps, None
+
+    def _load_model_tts(self, hf_path: str, load_path: str):
+        """Load a TTS model (Kokoro) via mlx-audio (issue #367).
+
+        Returns the 5-tuple shape ``_load_model`` uses
+        ``(model, tokenizer, is_vlm, caps, speculative_decoder)``. TTS has no
+        tokenizer / chat template / speculative decoder — the speech path
+        drives ``model.generate`` directly.
+        """
+        from pathlib import Path
+
+        import mlx_audio.tts.utils as tts_utils
+
+        model = tts_utils.load_model(Path(load_path))
+        return model, None, False, TemplateCaps(), None
 
     @staticmethod
     def _maybe_quantize_model(
