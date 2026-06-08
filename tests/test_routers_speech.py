@@ -91,6 +91,25 @@ async def test_speech_oversize_413(app_client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_speech_missing_ffmpeg_500(app_client, monkeypatch):
+    # Compressed formats need ffmpeg; a missing binary must be a clean error,
+    # not a broken mid-stream FileNotFoundError.
+    monkeypatch.setattr("olmlx.routers.audio.shutil.which", lambda _: None)
+    with patch("olmlx.routers.audio.generate_speech", _floats()):
+        resp = await app_client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "kokoro",
+                "input": "hi",
+                "voice": "alloy",
+                "response_format": "mp3",
+            },
+        )
+    assert resp.status_code == 500
+    assert "ffmpeg" in resp.text
+
+
+@pytest.mark.asyncio
 async def test_speech_non_tts_model_400(app_client):
     async def _raise(*a, **k):
         raise ValueError("Model 'qwen3' is not a TTS model.")

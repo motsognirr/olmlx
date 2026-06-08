@@ -7,6 +7,7 @@ see engine/inference.py::generate_transcription and CLAUDE.md.
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
@@ -169,6 +170,20 @@ async def create_speech(request: Request, body: SpeechRequest):
 
     manager = request.app.state.model_manager
     fmt = body.response_format
+
+    # Compressed formats are encoded by piping PCM through ffmpeg, which is
+    # only spawned once the StreamingResponse starts iterating (after the 200).
+    # Pre-check here so a missing ffmpeg becomes a clean error instead of a
+    # broken mid-stream FileNotFoundError. wav/pcm are encoder-free.
+    if fmt not in ("wav", "pcm") and shutil.which("ffmpeg") is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"ffmpeg not found on PATH; required for '{fmt}' output. "
+                "Install ffmpeg (e.g. `brew install ffmpeg`) or request "
+                "response_format='wav' or 'pcm'."
+            ),
+        )
 
     # Float segments -> PCM byte chunks.
     async def _pcm_chunks():

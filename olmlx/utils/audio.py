@@ -139,9 +139,12 @@ async def ffmpeg_encode(
         # retrieved" on generator close.
         if not feeder.done():
             feeder.cancel()
+        # Swallow ANY feeder exception here (cancellation, broken pipe, or an
+        # upstream error re-raised from the already-propagating body) — this is
+        # pure cleanup and must never skip the proc reaping below.
         try:
             await feeder
-        except (asyncio.CancelledError, BrokenPipeError, ConnectionResetError):
+        except (asyncio.CancelledError, Exception):
             pass
         if proc.returncode is None:
             proc.terminate()
