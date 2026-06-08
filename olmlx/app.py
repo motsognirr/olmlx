@@ -29,6 +29,7 @@ from olmlx.routers import (
     manage,
     models,
     openai,
+    rerank,
     responses,
     status,
 )
@@ -397,6 +398,7 @@ def create_app() -> FastAPI:
     app.include_router(models.router)
     app.include_router(manage.router)
     app.include_router(embed.router)
+    app.include_router(rerank.router)
     app.include_router(blobs.router)
     app.include_router(openai.router)
     app.include_router(responses.router)
