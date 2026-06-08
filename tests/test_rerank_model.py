@@ -1,7 +1,7 @@
 import mlx.core as mx
 
 from olmlx.engine.rerank.config import RerankerConfig
-from olmlx.engine.rerank.model import roberta_position_ids
+from olmlx.engine.rerank.model import XLMRobertaEmbeddings, roberta_position_ids
 
 
 def test_rerankerconfig_from_dict_bge():
@@ -64,3 +64,23 @@ def test_roberta_position_ids_offset_with_padding():
     input_ids = mx.array([[5, 6, 1, 1]])
     pos = roberta_position_ids(input_ids, pad_token_id=1)
     assert pos.tolist() == [[2, 3, 1, 1]]
+
+
+def test_embeddings_output_shape():
+    cfg = RerankerConfig(
+        hidden_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        intermediate_size=32,
+        max_position_embeddings=32,
+        vocab_size=50,
+        type_vocab_size=1,
+        layer_norm_eps=1e-5,
+        pad_token_id=1,
+        num_labels=1,
+    )
+    emb = XLMRobertaEmbeddings(cfg)
+    input_ids = mx.array([[5, 6, 7, 2], [5, 6, 1, 1]])
+    out = emb(input_ids)
+    mx.eval(out)
+    assert out.shape == (2, 4, cfg.hidden_size)

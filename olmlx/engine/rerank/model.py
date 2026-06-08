@@ -31,12 +31,15 @@ class XLMRobertaEmbeddings(nn.Module):
         self.token_type_embeddings = nn.Embedding(
             config.type_vocab_size, config.hidden_size
         )
+        # PascalCase matches the HF checkpoint weight key (embeddings.LayerNorm).
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         pos_ids = roberta_position_ids(input_ids, self.pad_token_id)
         words = self.word_embeddings(input_ids)
         positions = self.position_embeddings(pos_ids)
-        # token_type_ids are all zero (type_vocab_size == 1); add row-0 bias.
-        token_type = self.token_type_embeddings(mx.zeros_like(input_ids))
+        # token_type_ids are all zero (type_vocab_size == 1): embed token-type 0
+        # once as a [1, hidden] row and let it broadcast across batch/sequence,
+        # avoiding a full [batch, seq, hidden] gather.
+        token_type = self.token_type_embeddings(mx.array([0]))
         return self.LayerNorm(words + positions + token_type)
