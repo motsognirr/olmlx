@@ -5,6 +5,32 @@ import mlx.nn as nn
 
 from olmlx.engine.rerank.config import RerankerConfig
 
+# Additive attention-mask fill. -1e4 (not -1e9) so the value survives a cast to
+# float16/bfloat16 without saturating to -inf — a fully-masked softmax row would
+# then yield NaN instead of ~0. -1e4 still drives masked softmax weights to 0.
+_MASK_FILL = -1.0e4
+
+
+def _resolve_activation(hidden_act: str):
+    """Map an HF ``hidden_act`` string to an MLX activation function.
+
+    bge/jina rerankers use exact-erf ``gelu``; the tanh-approximation aliases are
+    mapped too. Unknown activations raise rather than silently using GELU.
+    """
+    table = {
+        "gelu": nn.gelu,
+        "gelu_new": nn.gelu_approx,
+        "gelu_pytorch_tanh": nn.gelu_approx,
+        "relu": nn.relu,
+    }
+    try:
+        return table[hidden_act]
+    except KeyError:
+        raise ValueError(
+            f"unsupported hidden_act {hidden_act!r} for reranker "
+            f"(supported: {sorted(table)})"
+        ) from None
+
 
 def roberta_position_ids(input_ids: mx.array, pad_token_id: int) -> mx.array:
     """Position ids with the RoBERTa offset.
@@ -90,11 +116,12 @@ class XLMRobertaLayer(nn.Module):
         self.intermediate_dense = nn.Linear(h, config.intermediate_size)
         self.output_dense = nn.Linear(config.intermediate_size, h)
         self.output_norm = nn.LayerNorm(h, eps=config.layer_norm_eps)
+        self.activation = _resolve_activation(config.hidden_act)
 
     def __call__(self, x: mx.array, additive_mask: mx.array) -> mx.array:
         attn = self.attention_self(x, additive_mask)
         x = self.attention_output_norm(self.attention_output_dense(attn) + x)
-        inter = nn.gelu(self.intermediate_dense(x))
+        inter = self.activation(self.intermediate_dense(x))
         x = self.output_norm(self.output_dense(inter) + x)
         return x
 
@@ -114,14 +141,16 @@ class XLMRobertaClassificationHead(nn.Module):
 class XLMRobertaCrossEncoder(nn.Module):
     def __init__(self, config: RerankerConfig):
         super().__init__()
-        self.config = config
+        self.config = config  # retained for introspection (HF-style)
         self.embeddings = XLMRobertaEmbeddings(config)
         self.layers = [XLMRobertaLayer(config) for _ in range(config.num_hidden_layers)]
         self.classifier = XLMRobertaClassificationHead(config)
 
     def __call__(self, input_ids: mx.array, attention_mask: mx.array) -> mx.array:
-        # additive mask: keep -> 0, pad -> -inf, shaped [b, 1, 1, s]
-        additive = (1.0 - attention_mask.astype(mx.float32))[:, None, None, :] * -1e9
+        # additive mask: keep -> 0, pad -> _MASK_FILL, shaped [b, 1, 1, s]
+        additive = (1.0 - attention_mask.astype(mx.float32))[
+            :, None, None, :
+        ] * _MASK_FILL
         x = self.embeddings(input_ids)
         for layer in self.layers:
             x = layer(x, additive)

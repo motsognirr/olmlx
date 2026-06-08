@@ -102,6 +102,7 @@ def test_cross_encoder_forward_shape():
     logits = model(input_ids, attention_mask)
     mx.eval(logits)
     assert logits.shape == (2, 1)
+    assert not bool(mx.any(mx.isnan(logits)))  # masking must not produce NaN
 
 
 def test_cross_encoder_padding_invariance():
@@ -116,4 +117,4 @@ def test_cross_encoder_padding_invariance():
     a = model(short_ids, short_mask)
     b = model(padded_ids, padded_mask)
     mx.eval(a, b)
-    assert abs(float(a[0, 0]) - float(b[0, 0])) < 1e-4
+    assert abs(float(a[0, 0]) - float(b[0, 0])) < 1e-5
