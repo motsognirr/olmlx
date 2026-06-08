@@ -1,12 +1,15 @@
+import base64
 import json
 import logging
 import re
+import struct
 import time
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from olmlx.config import settings
 from olmlx.engine.grammar import parse_response_format
 from olmlx.engine.inference import (
     INIT_ORPHAN_DETECT_LIMIT,
@@ -393,7 +396,9 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         else:
             messages.insert(0, {"role": "system", "content": json_prompt})
     options = _build_options(req)
-    max_tokens = req.max_completion_tokens or req.max_tokens or 512
+    max_tokens = (
+        req.max_completion_tokens or req.max_tokens or settings.default_max_tokens
+    )
     chat_id = _make_id()
     created = int(time.time())
     cache_id = request.headers.get("x-cache-id", "")[:256]
@@ -521,7 +526,7 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
     manager = request.app.state.model_manager
     options = _build_options(req)
     prompt = req.prompt if isinstance(req.prompt, str) else req.prompt[0]
-    max_tokens = req.max_tokens or 512
+    max_tokens = req.max_tokens or settings.default_max_tokens
     comp_id = f"cmpl-{uuid.uuid4().hex[:8]}"
     created = int(time.time())
 
@@ -595,9 +600,23 @@ async def openai_embeddings(req: OpenAIEmbeddingRequest, request: Request):
     manager = request.app.state.model_manager
     texts = req.input if isinstance(req.input, list) else [req.input]
     embeddings = await generate_embeddings(manager, req.model, texts)
-    data = [
-        OpenAIEmbeddingData(index=i, embedding=emb) for i, emb in enumerate(embeddings)
-    ]
+    if req.encoding_format == "base64":
+        # OpenAI's base64 format packs each embedding as little-endian
+        # float32 bytes, then base64-encodes the result into a string.
+        data = [
+            OpenAIEmbeddingData(
+                index=i,
+                embedding=base64.b64encode(struct.pack(f"<{len(emb)}f", *emb)).decode(
+                    "ascii"
+                ),
+            )
+            for i, emb in enumerate(embeddings)
+        ]
+    else:
+        data = [
+            OpenAIEmbeddingData(index=i, embedding=emb)
+            for i, emb in enumerate(embeddings)
+        ]
     return OpenAIEmbeddingResponse(
         data=data,
         model=req.model,

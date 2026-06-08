@@ -55,12 +55,10 @@ async def lifespan(app: FastAPI):
     registry.load()
     store = ModelStore(registry)
 
-    # -- Distributed inference --
-    from olmlx.config import settings
-
     if settings.tracing:
         tracing_mod.init_tracing(settings)
 
+    # -- Distributed inference --
     distributed_group = None
     coordinator = None
     distributed_strategy = "tensor"
@@ -138,7 +136,9 @@ async def lifespan(app: FastAPI):
     try:
         metrics_mod.REGISTRY.unregister(app.state.metrics_collector)
     except Exception:
-        pass
+        logger.debug(
+            "Failed to unregister metrics collector during shutdown", exc_info=True
+        )
     if coordinator is not None:
         coordinator.broadcast_shutdown()
         coordinator.close()
