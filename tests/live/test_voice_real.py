@@ -1,10 +1,18 @@
-"""Live STT+TTS round-trip (real models; skipped in CI).
+"""Live STT+TTS round-trip (real models; run locally, not in CI).
 
 Synthesize speech with Kokoro, transcribe it back with Whisper, and assert the
 core word survives. Outside tests/integration/ to dodge its autouse MLX mock.
 Requires the [voice] extra (mlx-audio) and ffmpeg on PATH.
+
+Skipped under GitHub Actions: this is the only live test that loads a real
+Whisper model in-process, and doing so on the self-hosted Apple-Silicon runner
+SIGBUSes the whole pytest process at interpreter teardown (exit 138) *after*
+every test passes — an MLX/Metal teardown hazard, not a logic failure. The TTS
+path is already exercised live by test_tts_speech.py; run this round-trip
+locally with `uv run pytest tests/live/test_voice_real.py`.
 """
 
+import os
 import shutil
 import wave
 
@@ -36,6 +44,11 @@ def _models_present() -> bool:
 
 pytestmark = [
     pytest.mark.real_model,
+    pytest.mark.skipif(
+        os.environ.get("GITHUB_ACTIONS") == "true",
+        reason="real Whisper load SIGBUSes the shared CI runner at teardown; "
+        "run locally (see module docstring)",
+    ),
     pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required"),
     pytest.mark.skipif(
         not _models_present(),
