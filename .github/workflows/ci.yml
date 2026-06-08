@@ -41,7 +41,13 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Run tests with coverage
-        run: uv sync --no-editable && uv run pytest --cov=olmlx --cov-report=xml --cov-report=term
+        # Deselect real_model tests: the self-hosted runner caches downloaded
+        # models, so any real-model test that finds its weights present runs
+        # real MLX inference and can SIGBUS the process at Metal teardown
+        # (exit 138). These tests are developer-run; CI covers the logic via
+        # mocked unit tests. (The marker's intent was already documented in
+        # tests/live/test_tts_speech.py.)
+        run: uv sync --no-editable && uv run pytest -m "not real_model" --cov=olmlx --cov-report=xml --cov-report=term
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
