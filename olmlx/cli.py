@@ -1595,6 +1595,33 @@ def _find_executable() -> str:
     return sys.executable
 
 
+# Heuristics for spotting credential-bearing env vars so they are never
+# persisted to the cleartext plist. Suffix matching (not substring) for the
+# generic markers so the LLM-token config keys this codebase is full of
+# (OLMLX_SPECULATIVE_TOKENS, OLMLX_PROMPT_CACHE_MAX_TOKENS, …) are NOT mistaken
+# for credentials — only an actual trailing _TOKEN/_KEY/_PASSWORD counts.
+_SECRET_ENV_SUFFIXES = (
+    "_SECRET",
+    "_TOKEN",
+    "_KEY",
+    "_APIKEY",
+    "_PASSWORD",
+    "_PASSWD",
+    "_CREDENTIAL",
+    "_CREDENTIALS",
+)
+# Substrings that are unambiguous credentials regardless of position.
+_SECRET_ENV_SUBSTRINGS = ("SECRET", "PASSWORD", "CREDENTIAL")
+
+
+def _is_secret_env_key(key: str) -> bool:
+    """True if an env var name looks like it carries a credential."""
+    upper = key.upper()
+    return upper.endswith(_SECRET_ENV_SUFFIXES) or any(
+        marker in upper for marker in _SECRET_ENV_SUBSTRINGS
+    )
+
+
 def _build_plist() -> dict:
     """Build a launchd plist dict for the olmlx service."""
     exe = _find_executable()
@@ -1604,9 +1631,11 @@ def _build_plist() -> dict:
         program_args = [exe]
 
     env_vars = {}
-    # Forward OLMLX_ env vars if set
+    # Forward OLMLX_ env vars if set, but never persist secrets into the
+    # cleartext launchd plist — ~/Library/LaunchAgents/com.olmlx.plist is
+    # readable by any local process and is not a safe credential store (#454).
     for key, value in os.environ.items():
-        if key.startswith("OLMLX_"):
+        if key.startswith("OLMLX_") and not _is_secret_env_key(key):
             env_vars[key] = value
     # Ensure PATH includes common tool locations
     env_vars["PATH"] = os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin")

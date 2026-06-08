@@ -79,6 +79,29 @@ class TestBuildPlist:
         plist = _build_plist()
         assert plist["EnvironmentVariables"]["OLMLX_PORT"] == "9999"
 
+    def test_plist_filters_secret_env_vars(self, monkeypatch):
+        # Secrets must never be persisted into the cleartext launchd plist
+        # (~/Library/LaunchAgents is readable by any local process). #454/#2
+        monkeypatch.setattr("olmlx.cli.shutil.which", lambda _: "/usr/local/bin/olmlx")
+        monkeypatch.setenv("OLMLX_PORT", "9999")
+        monkeypatch.setenv("OLMLX_DISTRIBUTED_SECRET", "topsecret")
+        monkeypatch.setenv("OLMLX_HF_TOKEN", "hf_xxx")
+        monkeypatch.setenv("OLMLX_API_KEY", "key123")
+        monkeypatch.setenv("OLMLX_REDIS_PASSWORD", "pw")
+        # Token-count config keys must NOT be mistaken for credentials.
+        monkeypatch.setenv("OLMLX_SPECULATIVE_TOKENS", "4")
+        monkeypatch.setenv("OLMLX_PROMPT_CACHE_MAX_TOKENS", "32768")
+        env = _build_plist()["EnvironmentVariables"]
+        # Non-sensitive keys still forwarded
+        assert env["OLMLX_PORT"] == "9999"
+        assert env["OLMLX_SPECULATIVE_TOKENS"] == "4"
+        assert env["OLMLX_PROMPT_CACHE_MAX_TOKENS"] == "32768"
+        # Sensitive keys filtered out entirely
+        assert "OLMLX_DISTRIBUTED_SECRET" not in env
+        assert "OLMLX_HF_TOKEN" not in env
+        assert "OLMLX_API_KEY" not in env
+        assert "OLMLX_REDIS_PASSWORD" not in env
+
 
 class TestServiceInstall:
     def test_install_creates_plist_and_loads(self, tmp_path, monkeypatch):

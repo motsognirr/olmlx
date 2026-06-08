@@ -115,7 +115,8 @@ class TestInstallGrammarProcessor:
         gen_kwargs: dict = {}
         sentinel = MagicMock(name="grammar_processor")
         with patch(
-            "olmlx.engine.inference._make_grammar_processor", return_value=sentinel
+            "olmlx.engine.logits_processors._make_grammar_processor",
+            return_value=sentinel,
         ):
             installed = _install_grammar_processor(
                 lm, gen_kwargs, GrammarSpec("json_object")
@@ -151,7 +152,8 @@ class TestInstallGrammarProcessor:
         lm = _make_lm()
         # Force the resolver to return None.
         with patch(
-            "olmlx.engine.inference._resolve_model_vocab_size", return_value=None
+            "olmlx.engine.logits_processors._resolve_model_vocab_size",
+            return_value=None,
         ):
             with caplog.at_level("WARNING", logger="olmlx.engine.inference"):
                 installed = _install_grammar_processor(
@@ -165,7 +167,8 @@ class TestInstallGrammarProcessor:
         gen_kwargs: dict = {}
         sentinel = MagicMock(name="grammar_processor")
         with patch(
-            "olmlx.engine.inference._make_grammar_processor", return_value=sentinel
+            "olmlx.engine.logits_processors._make_grammar_processor",
+            return_value=sentinel,
         ) as mock_make:
             installed = _install_grammar_processor(
                 lm, gen_kwargs, GrammarSpec("json_object")
@@ -184,7 +187,8 @@ class TestInstallGrammarProcessor:
         gen_kwargs: dict = {"logits_processors": [existing]}
         sentinel = MagicMock(name="grammar_processor")
         with patch(
-            "olmlx.engine.inference._make_grammar_processor", return_value=sentinel
+            "olmlx.engine.logits_processors._make_grammar_processor",
+            return_value=sentinel,
         ):
             installed = _install_grammar_processor(
                 lm, gen_kwargs, GrammarSpec("json_object")
@@ -216,7 +220,8 @@ class TestInstallGrammarProcessor:
 
         sentinel = MagicMock(name="grammar_processor")
         with patch(
-            "olmlx.engine.inference._make_grammar_processor", return_value=sentinel
+            "olmlx.engine.logits_processors._make_grammar_processor",
+            return_value=sentinel,
         ) as mock_make:
             installed = _install_grammar_processor(lm, {}, GrammarSpec("json_object"))
 
@@ -240,7 +245,8 @@ class TestInstallGrammarProcessor:
 
         sentinel = MagicMock(name="grammar_processor")
         with patch(
-            "olmlx.engine.inference._make_grammar_processor", return_value=sentinel
+            "olmlx.engine.logits_processors._make_grammar_processor",
+            return_value=sentinel,
         ) as mock_make:
             _install_grammar_processor(lm, {}, GrammarSpec("json_object"))
 

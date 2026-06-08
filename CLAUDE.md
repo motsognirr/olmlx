@@ -23,7 +23,10 @@ olmlx/
 │   └── voice/          # --voice push-to-talk STT (Whisper) + Kokoro TTS playback (issue #444)
 ├── engine/
 │   ├── inference.py    # generate_chat, generate_completion, generate_embeddings, generate_transcription, generate_rerank
+│   ├── logits_processors.py # Grammar installer, freq/presence penalties, gpt-oss channel filter (re-exported by inference.py)
+│   ├── chat_templating.py # apply_chat_template (text/VLM), tool injection, segmented tokenization (re-exported by inference.py)
 │   ├── model_manager.py # Model loading/unloading, keep-alive, LRU eviction
+│   ├── speculative_loaders.py # SpeculativeLoaderMixin: draft loaders for classic/dflash/eagle/mtp/pld/self (mixed into ModelManager)
 │   ├── rerank/         # Native MLX XLM-RoBERTa cross-encoder (config + model + weight remaps)
 │   ├── registry.py     # Ollama name → HF repo via models.json
 │   ├── distributed.py  # Multi-machine ring tensor parallelism (TCP sideband)
