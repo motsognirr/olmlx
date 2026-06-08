@@ -19,7 +19,7 @@ def detect_layout(keys: list[str]) -> str:
     return "standard"
 
 
-def _emb_and_head(sd: dict[str, Any], emb_ln_prefix: str) -> dict[str, np.ndarray]:
+def _emb_and_head(sd: dict[str, Any], emb_ln_prefix: str) -> dict[str, Any]:
     e = "roberta.embeddings."
     return {
         "embeddings.word_embeddings.weight": sd[f"{e}word_embeddings.weight"],
@@ -36,59 +36,81 @@ def _emb_and_head(sd: dict[str, Any], emb_ln_prefix: str) -> dict[str, np.ndarra
     }
 
 
+def _missing_key_error(layout: str, exc: KeyError) -> KeyError:
+    return KeyError(
+        f"{layout}-layout checkpoint is missing expected key {exc} "
+        "(was the wrong layout detected?)"
+    )
+
+
 def remap_standard(sd: dict[str, Any], cfg: RerankerConfig) -> dict[str, mx.array]:
-    out = _emb_and_head(sd, "roberta.embeddings.LayerNorm")
-    for i in range(cfg.num_hidden_layers):
-        p = f"roberta.encoder.layer.{i}."
-        q = f"layers.{i}."
-        for proj in ("query", "key", "value"):
-            out[f"{q}attention_self.{proj}.weight"] = sd[
-                f"{p}attention.self.{proj}.weight"
+    try:
+        out = _emb_and_head(sd, "roberta.embeddings.LayerNorm")
+        for i in range(cfg.num_hidden_layers):
+            p = f"roberta.encoder.layer.{i}."
+            q = f"layers.{i}."
+            for proj in ("query", "key", "value"):
+                out[f"{q}attention_self.{proj}.weight"] = sd[
+                    f"{p}attention.self.{proj}.weight"
+                ]
+                out[f"{q}attention_self.{proj}.bias"] = sd[
+                    f"{p}attention.self.{proj}.bias"
+                ]
+            out[f"{q}attention_output_dense.weight"] = sd[
+                f"{p}attention.output.dense.weight"
             ]
-            out[f"{q}attention_self.{proj}.bias"] = sd[f"{p}attention.self.{proj}.bias"]
-        out[f"{q}attention_output_dense.weight"] = sd[
-            f"{p}attention.output.dense.weight"
-        ]
-        out[f"{q}attention_output_dense.bias"] = sd[f"{p}attention.output.dense.bias"]
-        out[f"{q}attention_output_norm.weight"] = sd[
-            f"{p}attention.output.LayerNorm.weight"
-        ]
-        out[f"{q}attention_output_norm.bias"] = sd[
-            f"{p}attention.output.LayerNorm.bias"
-        ]
-        out[f"{q}intermediate_dense.weight"] = sd[f"{p}intermediate.dense.weight"]
-        out[f"{q}intermediate_dense.bias"] = sd[f"{p}intermediate.dense.bias"]
-        out[f"{q}output_dense.weight"] = sd[f"{p}output.dense.weight"]
-        out[f"{q}output_dense.bias"] = sd[f"{p}output.dense.bias"]
-        out[f"{q}output_norm.weight"] = sd[f"{p}output.LayerNorm.weight"]
-        out[f"{q}output_norm.bias"] = sd[f"{p}output.LayerNorm.bias"]
+            out[f"{q}attention_output_dense.bias"] = sd[
+                f"{p}attention.output.dense.bias"
+            ]
+            out[f"{q}attention_output_norm.weight"] = sd[
+                f"{p}attention.output.LayerNorm.weight"
+            ]
+            out[f"{q}attention_output_norm.bias"] = sd[
+                f"{p}attention.output.LayerNorm.bias"
+            ]
+            out[f"{q}intermediate_dense.weight"] = sd[f"{p}intermediate.dense.weight"]
+            out[f"{q}intermediate_dense.bias"] = sd[f"{p}intermediate.dense.bias"]
+            out[f"{q}output_dense.weight"] = sd[f"{p}output.dense.weight"]
+            out[f"{q}output_dense.bias"] = sd[f"{p}output.dense.bias"]
+            out[f"{q}output_norm.weight"] = sd[f"{p}output.LayerNorm.weight"]
+            out[f"{q}output_norm.bias"] = sd[f"{p}output.LayerNorm.bias"]
+    except KeyError as exc:
+        raise _missing_key_error("standard", exc) from exc
     return {k: mx.array(np.asarray(v)) for k, v in out.items()}
 
 
 def remap_flash(sd: dict[str, Any], cfg: RerankerConfig) -> dict[str, mx.array]:
     h = cfg.hidden_size
-    out = _emb_and_head(sd, "roberta.emb_ln")
-    for i in range(cfg.num_hidden_layers):
-        p = f"roberta.encoder.layers.{i}."
-        q = f"layers.{i}."
-        wqkv = np.asarray(sd[f"{p}mixer.Wqkv.weight"])
-        bqkv = np.asarray(sd[f"{p}mixer.Wqkv.bias"])
-        out[f"{q}attention_self.query.weight"] = wqkv[:h]
-        out[f"{q}attention_self.key.weight"] = wqkv[h : 2 * h]
-        out[f"{q}attention_self.value.weight"] = wqkv[2 * h :]
-        out[f"{q}attention_self.query.bias"] = bqkv[:h]
-        out[f"{q}attention_self.key.bias"] = bqkv[h : 2 * h]
-        out[f"{q}attention_self.value.bias"] = bqkv[2 * h :]
-        out[f"{q}attention_output_dense.weight"] = sd[f"{p}mixer.out_proj.weight"]
-        out[f"{q}attention_output_dense.bias"] = sd[f"{p}mixer.out_proj.bias"]
-        out[f"{q}attention_output_norm.weight"] = sd[f"{p}norm1.weight"]
-        out[f"{q}attention_output_norm.bias"] = sd[f"{p}norm1.bias"]
-        out[f"{q}intermediate_dense.weight"] = sd[f"{p}mlp.fc1.weight"]
-        out[f"{q}intermediate_dense.bias"] = sd[f"{p}mlp.fc1.bias"]
-        out[f"{q}output_dense.weight"] = sd[f"{p}mlp.fc2.weight"]
-        out[f"{q}output_dense.bias"] = sd[f"{p}mlp.fc2.bias"]
-        out[f"{q}output_norm.weight"] = sd[f"{p}norm2.weight"]
-        out[f"{q}output_norm.bias"] = sd[f"{p}norm2.bias"]
+    try:
+        out = _emb_and_head(sd, "roberta.emb_ln")
+        for i in range(cfg.num_hidden_layers):
+            p = f"roberta.encoder.layers.{i}."
+            q = f"layers.{i}."
+            wqkv = np.asarray(sd[f"{p}mixer.Wqkv.weight"])
+            bqkv = np.asarray(sd[f"{p}mixer.Wqkv.bias"])
+            if wqkv.shape[0] != 3 * h:
+                raise ValueError(
+                    f"layer {i}: expected fused Wqkv rows == 3 * hidden_size "
+                    f"({3 * h}), got {wqkv.shape[0]}"
+                )
+            out[f"{q}attention_self.query.weight"] = wqkv[:h]
+            out[f"{q}attention_self.key.weight"] = wqkv[h : 2 * h]
+            out[f"{q}attention_self.value.weight"] = wqkv[2 * h :]
+            out[f"{q}attention_self.query.bias"] = bqkv[:h]
+            out[f"{q}attention_self.key.bias"] = bqkv[h : 2 * h]
+            out[f"{q}attention_self.value.bias"] = bqkv[2 * h :]
+            out[f"{q}attention_output_dense.weight"] = sd[f"{p}mixer.out_proj.weight"]
+            out[f"{q}attention_output_dense.bias"] = sd[f"{p}mixer.out_proj.bias"]
+            out[f"{q}attention_output_norm.weight"] = sd[f"{p}norm1.weight"]
+            out[f"{q}attention_output_norm.bias"] = sd[f"{p}norm1.bias"]
+            out[f"{q}intermediate_dense.weight"] = sd[f"{p}mlp.fc1.weight"]
+            out[f"{q}intermediate_dense.bias"] = sd[f"{p}mlp.fc1.bias"]
+            out[f"{q}output_dense.weight"] = sd[f"{p}mlp.fc2.weight"]
+            out[f"{q}output_dense.bias"] = sd[f"{p}mlp.fc2.bias"]
+            out[f"{q}output_norm.weight"] = sd[f"{p}norm2.weight"]
+            out[f"{q}output_norm.bias"] = sd[f"{p}norm2.bias"]
+    except KeyError as exc:
+        raise _missing_key_error("flash", exc) from exc
     return {k: mx.array(np.asarray(v)) for k, v in out.items()}
 
 

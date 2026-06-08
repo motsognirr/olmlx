@@ -129,6 +129,8 @@ def test_detect_layout():
     )
     assert detect_layout(["roberta.encoder.layers.0.mixer.Wqkv.weight"]) == "flash"
     assert detect_layout(["roberta.emb_ln.weight"]) == "flash"
+    # Unrecognised keys fall back to standard (the deliberate default).
+    assert detect_layout(["some.unknown.key"]) == "standard"
 
 
 def test_remap_standard_keys():
