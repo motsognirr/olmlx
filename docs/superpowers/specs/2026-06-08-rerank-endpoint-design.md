@@ -16,7 +16,7 @@ run a second tool.
 | Decision | Choice |
 |----------|--------|
 | Model backend | **Native MLX XLM-RoBERTa** — no new runtime deps, pure MLX/Metal |
-| Model coverage | **Generic config-driven** cross-encoder (absolute *and* rotary position embeddings) to cover bge + jina + future XLM-RoBERTa-family rerankers |
+| Model coverage | **Generic config-driven** XLM-RoBERTa cross-encoder covering bge + jina + future family members. Both targets use absolute position embeddings + post-LN BERT attention; they differ only in **checkpoint weight layout** (see below), not math. |
 | API shape | **Cohere v2** rerank contract (`/v1/rerank`), drop-in for the Cohere SDK via `base_url` |
 | Long-document handling | **Silent truncation** (Cohere default) — truncate document side, preserve full query |
 
@@ -38,18 +38,35 @@ config-driven decision.
 
 ### 2. Native MLX encoder — `olmlx/engine/rerank/model.py`
 
-`XLMRobertaCrossEncoder(nn.Module)`, fully config-driven:
+`XLMRobertaCrossEncoder(nn.Module)` — **one** architecture for both targets (verified
+against jina's modeling source: it is *not* rotary), config-driven sizing:
 
-- **Embeddings**: word + position + token_type, followed by LayerNorm. The config's
-  `position_embedding_type` selects **absolute** (bge) vs **rotary** (jina) — the single
-  branch that covers both target architectures.
+- **Embeddings**: word + position + token_type, followed by LayerNorm. **Absolute**
+  position ids with the RoBERTa offset (`position_ids = cumsum(mask) * mask + pad_id`,
+  so the first real token is position `pad_id + 1 = 2`; this is why
+  `max_position_embeddings` is `8194 = 8192 + 2` for bge, `1026 = 1024 + 2` for jina).
+  `token_type_ids` are all zero (`type_vocab_size == 1`) but the learned row-0 bias is
+  still added.
 - **Encoder**: `num_hidden_layers` post-LN transformer blocks (self-attention + GELU
   FFN), sized from config (`hidden_size`, `num_attention_heads`, `intermediate_size`).
-- **Classification head**: project the first token's hidden state to a single relevance
-  logit (`num_labels == 1`).
-- **Weights**: load from HF safetensors via a key-remap table (HF `xlm-roberta.*` naming
-  → our module names). Forward signature: `(input_ids, attention_mask) -> [batch, 1]`
-  logits.
+- **Classification head** (`XLMRobertaClassificationHead`): take the **first token**
+  (`features[:, 0, :]`) → `dense` → tanh → `out_proj` → single relevance logit
+  (`num_labels == 1`). This is the `classifier`, *not* the base-model `pooler`.
+- **Forward**: `(input_ids, attention_mask) -> [batch, 1]` logits.
+
+**Two weight layouts, same module** (loader picks by key inspection, not model name):
+
+- **Standard HF (bge)**: `roberta.encoder.layer.{i}.attention.self.{query,key,value}`,
+  `attention.output.dense`/`LayerNorm`, `intermediate.dense`, `output.dense`/`LayerNorm`,
+  `embeddings.LayerNorm`, `classifier.{dense,out_proj}`.
+- **Flash (jina)**: flash-attention module naming —
+  `roberta.encoder.layers.{i}.mixer.Wqkv` (**fused** QKV, split into q/k/v on load),
+  `mixer.out_proj`, `mlp.fc1`/`fc2`, `norm1` (post-attention LN), `norm2` (post-MLP LN),
+  `emb_ln` (embedding LayerNorm). Post-LN math identical to bge.
+
+A discovery/validation test asserts each target's actual key set before its remap is
+trusted (jina's exact strings are inferred from the flash-attn conventions, not yet seen
+against the real checkpoint).
 
 ### 3. Loader + `LoadedModel`
 
@@ -112,20 +129,26 @@ routers.
 
 ### 7. Tests (TDD — write failing first)
 
-- **Unit (model)**: encoder forward parity against a tiny saved fixture; weight-remap
-  correctness; absolute vs rotary position-embedding branch.
+- **Unit (model)**: encoder forward parity against a tiny saved fixture; RoBERTa
+  position-id offset; both weight-remap paths (standard + fused-QKV flash split).
+- **Discovery**: assert the real checkpoint key set for bge (standard) and jina (flash)
+  before trusting each remap.
 - **Unit (engine)**: pair tokenization + `only_second` truncation; sigmoid scoring; sort +
   `top_n` clamp; empty-documents → empty results; non-reranker model → ValueError.
 - **Router**: Cohere v2 response shape; `return_documents` toggle; 422 on malformed
   request (empty documents, non-positive `top_n`).
 - **Live (`real_model`, outside `tests/integration/` to dodge the autouse MLX mock)**:
-  `bge-reranker-v2-m3` ranks a known-relevant document above an irrelevant one; smoke-test
-  scoring a batch of 100 documents.
+  `bge-reranker-v2-m3` (standard layout) **and** `jina-reranker-v2-base-multilingual`
+  (flash layout) each rank a known-relevant document above an irrelevant one; smoke-test
+  scoring a batch of 100 documents. Cross-check the top score against the HF/transformers
+  reference to within tolerance for at least one model.
 
 ## Out of scope (v1)
 
 - Document objects / `rank_fields` (string documents only).
 - Multi-label classification heads (`num_labels > 1`).
+- Rotary-position cross-encoders (neither target uses them; the encoder stays
+  absolute-position only until a real rotary reranker appears).
 - Streaming, distributed, and flash paths for rerankers.
 - Billed-units accounting in `meta`.
 
