@@ -5536,3 +5536,20 @@ def test_vlm_tools_no_user_message_warns_and_renders_text_only(caplog):
                 processor, MagicMock(), messages, ["a.jpg"], tools=tools
             )
     assert "no user message to attach" in caplog.text
+
+
+def test_extract_audio_collects_from_messages():
+    from olmlx.engine.inference import _extract_audio
+
+    msgs = [
+        {"role": "user", "content": "hi", "audio": ["a.wav"]},
+        {"role": "user", "content": "x", "audio": ["b.mp3", "c.flac"]},
+        {"role": "user", "content": "no audio"},
+    ]
+    assert _extract_audio(msgs) == ["a.wav", "b.mp3", "c.flac"]
+
+
+def test_extract_audio_returns_none_when_absent():
+    from olmlx.engine.inference import _extract_audio
+
+    assert _extract_audio([{"role": "user", "content": "hi"}]) is None

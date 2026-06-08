@@ -2309,6 +2309,15 @@ def _extract_images(messages: list[dict]) -> list[str] | None:
     return images if images else None
 
 
+def _extract_audio(messages: list[dict]) -> list[str] | None:
+    """Extract audio refs (URLs/paths/data-URIs) from message content (#426)."""
+    audio: list[str] = []
+    for msg in messages:
+        if msg.get("audio"):
+            audio.extend(msg["audio"])
+    return audio if audio else None
+
+
 def count_chat_tokens(
     tokenizer: Any,
     messages: list[dict],
