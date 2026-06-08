@@ -2110,8 +2110,9 @@ class ModelManager:
         TurboQuant/Spectral factories would otherwise pull calibration data
         off disk on every model load only to throw the result away.
         """
-        if lm.is_whisper:
-            # Whisper has no LLM-style prompt cache; nothing to probe.
+        if lm.is_whisper or lm.is_reranker:
+            # Whisper / cross-encoder rerankers have no LLM-style prompt cache;
+            # nothing to probe.
             return
         try:
             from mlx_lm.models.cache import make_prompt_cache
@@ -3521,6 +3522,18 @@ class ModelManager:
 
             model = whisper_loader.load_model(load_path, dtype=mx.float16)
             return model, None, False, TemplateCaps(), None
+
+        if kind == "reranker":
+            # Cross-encoder reranker (#369): native MLX XLM-RoBERTa loaded from
+            # safetensors; tokenizer via transformers. No chat template, no
+            # speculative decoder, no KV cache.
+            from transformers import AutoTokenizer
+
+            from olmlx.engine.rerank import load_cross_encoder
+
+            model = load_cross_encoder(load_path)
+            tokenizer = AutoTokenizer.from_pretrained(load_path)
+            return model, tokenizer, False, TemplateCaps(), None
 
         if kind == "vlm":
             # VLM detected — load with mlx-vlm directly
