@@ -999,6 +999,14 @@ wheels = [
 ]
 
 [[package]]
+name = "en-core-web-sm"
+version = "3.8.0"
+source = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+wheels = [
+    { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl", hash = "sha256:1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85" },
+]
+
+[[package]]
 name = "espeakng-loader"
 version = "0.2.4"
 source = { registry = "https://pypi.org/simple" }
@@ -2619,6 +2627,7 @@ name = "olmlx"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "en-core-web-sm" },
     { name = "fastapi" },
     { name = "huggingface-hub" },
     { name = "jinja2" },
@@ -2666,6 +2675,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "duckduckgo-search", marker = "extra == 'search'", specifier = ">=6.0" },
+    { name = "en-core-web-sm", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" },
     { name = "fastapi", specifier = ">=0.104" },
     { name = "huggingface-hub", specifier = ">=0.20" },
     { name = "jinja2", specifier = ">=3.0" },
