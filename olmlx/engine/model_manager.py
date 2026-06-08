@@ -477,6 +477,7 @@ class LoadedModel:
     is_flash: bool = False
     is_flash_moe: bool = False
     is_whisper: bool = False
+    is_reranker: bool = False
     speculative_decoder: Any = None
     weight_store: Any = None
     template_caps: TemplateCaps = field(default_factory=TemplateCaps)
@@ -585,6 +586,14 @@ class LoadedModel:
         if self.is_vlm and hasattr(tok, "tokenizer"):
             return tok.tokenizer
         return tok
+
+
+def _is_cross_encoder_config(config: dict) -> bool:
+    """True for an XLM-RoBERTa-family sequence-classification reranker (#369)."""
+    archs = config.get("architectures") or []
+    return any(
+        isinstance(a, str) and a.endswith("ForSequenceClassification") for a in archs
+    )
 
 
 def parse_keep_alive(value: str | int) -> float | None:
@@ -1098,7 +1107,7 @@ class ModelManager:
                 # Whisper models (issue #366) have no LLM KV cache — never
                 # apply KV-cache quantization / spectral calibration to them.
                 _model_kind = self._detect_model_kind(hf_path)
-                if _model_kind == "whisper":
+                if _model_kind in ("whisper", "reranker"):
                     kv_cache_quant = None
                 flash_moe_config = model_config.resolved_flash_moe()
 
@@ -1454,6 +1463,7 @@ class ModelManager:
                         is_flash=is_flash,
                         is_flash_moe=is_flash_moe,
                         is_whisper=(_model_kind == "whisper"),
+                        is_reranker=(_model_kind == "reranker"),
                         speculative_decoder=_spec_decoder,
                         weight_store=_weight_store,
                         template_caps=caps,
@@ -1714,6 +1724,9 @@ class ModelManager:
             "n_mels" in config and "n_audio_state" in config
         ):
             return "whisper"
+
+        if _is_cross_encoder_config(config):
+            return "reranker"
 
         if not model_type:
             return "unknown"
