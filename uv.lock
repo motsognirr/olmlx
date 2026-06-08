@@ -2686,7 +2686,7 @@ requires-dist = [
     { name = "misaki", extras = ["en"], specifier = ">=0.9.4" },
     { name = "mlx-audio", specifier = ">=0.4.4" },
     { name = "mlx-lm", specifier = ">=0.31.1" },
-    { name = "mlx-vlm", specifier = ">=0.4.3" },
+    { name = "mlx-vlm", specifier = ">=0.4.4" },
     { name = "mlx-whisper", specifier = ">=0.4.3" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.27" },
     { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.27" },
