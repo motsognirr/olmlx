@@ -5582,3 +5582,45 @@ def test_audio_capable_false_for_text_model():
 
     lm = SimpleNamespace(is_vlm=False, tokenizer=object())
     assert _audio_capable(lm) is False
+
+
+def test_apply_chat_template_vlm_passes_num_audios(monkeypatch):
+    import mlx_vlm
+
+    from olmlx.engine import inference as inf
+
+    captured = {}
+
+    def fake_apply(processor, config, messages, num_images=0, num_audios=0, **kw):
+        captured["num_images"] = num_images
+        captured["num_audios"] = num_audios
+        return "PROMPT"
+
+    monkeypatch.setattr(mlx_vlm, "apply_chat_template", fake_apply)
+
+    class _M:
+        config = {}
+
+    out = inf._apply_chat_template_vlm(
+        processor=object(),
+        model=_M(),
+        messages=[{"role": "user", "content": "hi"}],
+        images=None,
+        audio=["a.wav", "b.wav"],
+    )
+    assert out == "PROMPT"
+    assert captured == {"num_images": 0, "num_audios": 2}
+
+
+def test_apply_chat_template_vlm_rejects_tools_with_audio():
+    from olmlx.engine import inference as inf
+
+    with pytest.raises(ValueError, match="tools.*audio|audio.*tools"):
+        inf._apply_chat_template_vlm(
+            processor=object(),
+            model=object(),
+            messages=[{"role": "user", "content": "hi"}],
+            images=None,
+            audio=["a.wav"],
+            tools=[{"type": "function", "function": {"name": "f"}}],
+        )

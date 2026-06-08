@@ -2177,6 +2177,7 @@ def _apply_chat_template_vlm(
     images: list[str] | None = None,
     tools: list[dict] | None = None,
     enable_thinking: bool | None = None,
+    audio: list[str] | None = None,
 ) -> str:
     """Apply chat template for vision-language models (mlx-vlm).
 
@@ -2185,6 +2186,12 @@ def _apply_chat_template_vlm(
     text content in ``[{type: text, text: ..., content: ...}]`` dicts, which
     the Jinja template renders as Python list repr — garbling the prompt.
     """
+    if audio and tools:
+        raise ValueError(
+            "tools + audio is not supported in this version: combining native "
+            "tool calling with audio input is out of scope (#426). Send the "
+            "audio without tools, or the tools without audio."
+        )
     if tools:
         # Use the tokenizer directly to get clean native tool formatting.
         # mlx_vlm.apply_chat_template wraps text content in dicts that some
@@ -2230,6 +2237,7 @@ def _apply_chat_template_vlm(
 
     config = model.config if hasattr(model, "config") else {}
     num_images = len(images) if images else 0
+    num_audios = len(audio) if audio else 0
     # mlx_vlm.apply_chat_template forwards **kwargs to the tokenizer's
     # apply_chat_template, so enable_thinking reaches the Jinja template
     # (templates that don't declare the variable ignore it).  Only forward
@@ -2239,7 +2247,12 @@ def _apply_chat_template_vlm(
         extra_kwargs["enable_thinking"] = enable_thinking
     # Pass the full message list so the model gets proper conversation context
     result = mlx_vlm.apply_chat_template(
-        processor, config, messages, num_images=num_images, **extra_kwargs
+        processor,
+        config,
+        messages,
+        num_images=num_images,
+        num_audios=num_audios,
+        **extra_kwargs,
     )
     if not isinstance(result, str):
         raise TypeError(
