@@ -81,6 +81,16 @@ async def test_speech_empty_input_422(app_client):
 
 
 @pytest.mark.asyncio
+async def test_speech_oversize_413(app_client, monkeypatch):
+    monkeypatch.setattr("olmlx.routers.audio.settings.tts_max_input_chars", 5)
+    resp = await app_client.post(
+        "/v1/audio/speech",
+        json={"model": "kokoro", "input": "hello world", "voice": "alloy"},
+    )
+    assert resp.status_code == 413
+
+
+@pytest.mark.asyncio
 async def test_speech_non_tts_model_400(app_client):
     async def _raise(*a, **k):
         raise ValueError("Model 'qwen3' is not a TTS model.")

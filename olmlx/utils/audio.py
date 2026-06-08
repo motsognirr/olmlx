@@ -133,12 +133,16 @@ async def ffmpeg_encode(
             err = (await proc.stderr.read()).decode(errors="replace")
             raise RuntimeError(f"ffmpeg encode failed ({proc.returncode}): {err}")
     finally:
+        # Always await the feeder (cancel only if still running) so its
+        # result/exception is retrieved — if it already died with a broken
+        # pipe (ffmpeg gone), not awaiting it logs "Task exception was never
+        # retrieved" on generator close.
         if not feeder.done():
             feeder.cancel()
-            try:
-                await feeder
-            except asyncio.CancelledError:
-                pass
+        try:
+            await feeder
+        except (asyncio.CancelledError, BrokenPipeError, ConnectionResetError):
+            pass
         if proc.returncode is None:
             proc.terminate()
             await proc.wait()

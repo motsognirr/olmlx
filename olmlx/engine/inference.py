@@ -4962,6 +4962,12 @@ async def generate_transcription(
         lm.release_ref()
 
 
+# Max TTS audio segments buffered between the mlx-audio worker thread and the
+# streaming consumer. Bounds peak memory if the client stalls (see the
+# semaphore backpressure in generate_speech).
+_TTS_QUEUE_MAX_SEGMENTS = 4
+
+
 async def generate_speech(
     manager: ModelManager,
     model_name: str,
@@ -5006,11 +5012,19 @@ async def generate_speech(
                 queue: asyncio.Queue = asyncio.Queue()
                 stop = threading.Event()
                 sentinel = object()
+                # Bound in-flight segments so a slow/stalled consumer (or
+                # ffmpeg encoder) can't make the worker buffer the whole
+                # utterance in memory. The worker blocks on a free slot before
+                # producing; the consumer releases one per segment taken.
+                slots = threading.Semaphore(_TTS_QUEUE_MAX_SEGMENTS)
 
                 def _worker() -> None:
                     try:
                         for result in lm.model.generate(text, voice=voice, speed=speed):
                             if stop.is_set():
+                                break
+                            slots.acquire()
+                            if stop.is_set():  # woken by teardown, not a free slot
                                 break
                             # np.asarray forces eval on THIS thread, keeping
                             # the MLX graph materialization off the loop.
@@ -5028,9 +5042,11 @@ async def generate_speech(
                             break
                         if isinstance(item, Exception):
                             raise item
+                        slots.release()  # free the slot this segment occupied
                         yield item
                 finally:
                     stop.set()
+                    slots.release()  # unblock a worker parked in acquire()
                     await worker
     finally:
         lm.release_ref()
