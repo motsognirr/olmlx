@@ -185,14 +185,16 @@ async def create_speech(request: Request, body: SpeechRequest):
 
     # WAV is buffered so the header sizes are exact (small utterances).
     if fmt == "wav":
-        pcm = b""
+        # Collect into a list and join once — `pcm += chunk` in the loop is
+        # O(n^2) (each += copies the whole accumulated buffer).
+        parts: list[bytes] = []
         try:
             async for chunk in _pcm_chunks():
-                pcm += chunk
+                parts.append(chunk)
         except ValueError as exc:  # non-TTS model etc.
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return Response(
-            audio_utils.wav_bytes(pcm, sample_rate=_TTS_SAMPLE_RATE),
+            audio_utils.wav_bytes(b"".join(parts), sample_rate=_TTS_SAMPLE_RATE),
             media_type=media_type,
         )
 
