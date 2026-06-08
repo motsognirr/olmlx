@@ -58,6 +58,7 @@ from olmlx.context import surface_var
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils import metrics as _metrics
 from olmlx.utils import tracing as _tracing
+from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
 from olmlx.utils.streaming import async_mlx_stream
 from olmlx.utils.timing import Timer, TimingStats
 
@@ -3585,8 +3586,6 @@ async def _stream_completion(
     # Initialize before try so the finally can always reference it.
     _audio_temps: list[str] = []
     try:
-        from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
-
         audio_paths, _audio_temps = materialize_audio(audio)
         # Cache setup — must happen after lock to prevent concurrent cache corruption
         if use_prompt_cache and lm.is_vlm:
@@ -4213,8 +4212,6 @@ async def _full_completion_inner(
     generated_tokens_out: list[int] | None = None,
     grammar_active: bool = False,
 ) -> dict:
-    from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
-
     _audio_temps: list[str] = []
 
     def _generate_sync():
