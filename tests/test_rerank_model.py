@@ -227,3 +227,32 @@ def test_remap_flash_splits_fused_qkv():
     model = XLMRobertaCrossEncoder(cfg)
     model.load_weights(list(flat.items()))
     mx.eval(model.parameters())
+
+
+def test_load_cross_encoder_rejects_multilabel(tmp_path):
+    import json
+
+    import pytest
+
+    from olmlx.engine.rerank.weights import load_cross_encoder
+
+    # num_labels=2 is out of scope (#369); load must fail loudly before reading
+    # any weights.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["XLMRobertaForSequenceClassification"],
+                "hidden_size": 16,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "intermediate_size": 32,
+                "max_position_embeddings": 32,
+                "vocab_size": 50,
+                "type_vocab_size": 1,
+                "pad_token_id": 1,
+                "num_labels": 2,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="num_labels"):
+        load_cross_encoder(str(tmp_path))
