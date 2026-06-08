@@ -16,9 +16,19 @@ def test_rerank_request_rejects_empty_documents():
         RerankRequest(model="m", query="q", documents=[])
 
 
-def test_rerank_request_rejects_empty_query():
+def test_rerank_request_rejects_empty_documents_with_blank_element():
+    with pytest.raises(ValidationError):
+        RerankRequest(model="m", query="q", documents=["a", ""])
+
+
+def test_rerank_request_rejects_blank_query():
     with pytest.raises(ValidationError):
         RerankRequest(model="m", query="  ", documents=["a"])
+
+
+def test_rerank_request_rejects_empty_query():
+    with pytest.raises(ValidationError):
+        RerankRequest(model="m", query="", documents=["a"])
 
 
 def test_rerank_request_rejects_nonpositive_top_n():
@@ -35,7 +45,5 @@ def test_rerank_response_shape():
     dumped = resp.model_dump()
     assert dumped["results"][0]["index"] == 1
     assert dumped["results"][0]["relevance_score"] == 0.9
-    assert (
-        "document" not in dumped["results"][0]
-        or dumped["results"][0]["document"] is None
-    )
+    # document defaults to None when not requested.
+    assert dumped["results"][0]["document"] is None
