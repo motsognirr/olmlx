@@ -96,3 +96,64 @@ def test_materialize_none_returns_empty():
 def test_materialize_invalid_base64_raises():
     with pytest.raises(ValueError, match="invalid base64"):
         materialize_audio(["data:audio/wav;base64,!!!notbase64!!!"])
+
+
+def test_materialize_cleans_up_earlier_temps_on_later_failure(monkeypatch):
+    """When a later item in a multi-item list fails, temp files written for the
+    earlier (successful) items must be cleaned up, not leaked — the caller never
+    receives the partial list so it cannot clean them up itself."""
+    import olmlx.utils.audio_input as ai
+
+    created: list[str] = []
+    real_mkstemp = ai.tempfile.mkstemp
+
+    def spy_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        created.append(path)
+        return fd, path
+
+    monkeypatch.setattr(ai.tempfile, "mkstemp", spy_mkstemp)
+
+    good = "data:audio/wav;base64," + base64.b64encode(b"hello").decode()
+    bad = "data:audio/wav;base64,!!!notbase64!!!"
+    with pytest.raises(ValueError, match="invalid base64"):
+        materialize_audio([good, bad])
+
+    assert created, "expected a temp file to be created for the first (good) item"
+    for path in created:
+        assert not os.path.exists(path), f"leaked temp file: {path}"
+
+
+def test_materialize_non_data_uri_failure_cleans_temps(monkeypatch):
+    """A write failure (OSError) on a later item also cleans up earlier temps."""
+    import olmlx.utils.audio_input as ai
+
+    created: list[str] = []
+    real_mkstemp = ai.tempfile.mkstemp
+    calls = {"n": 0}
+
+    def spy_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        created.append(path)
+        return fd, path
+
+    monkeypatch.setattr(ai.tempfile, "mkstemp", spy_mkstemp)
+
+    real_fdopen = ai.os.fdopen
+
+    def flaky_fdopen(fd, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:  # fail writing the second item
+            os.close(fd)
+            raise OSError("disk full")
+        return real_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(ai.os, "fdopen", flaky_fdopen)
+
+    item = "data:audio/wav;base64," + base64.b64encode(b"x").decode()
+    with pytest.raises(OSError, match="disk full"):
+        materialize_audio([item, item])
+
+    assert len(created) == 2
+    for path in created:
+        assert not os.path.exists(path), f"leaked temp file: {path}"

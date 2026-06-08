@@ -49,7 +49,9 @@ def normalize_audio_block(block: dict[str, Any]) -> str:
 
     # OpenAI: {"type": "input_audio", "input_audio": {"data": "<b64>", "format": "wav"}}
     if btype == "input_audio":
-        spec = block.get("input_audio") or {}
+        spec = block.get("input_audio")
+        if not isinstance(spec, dict):
+            spec = {}
         data = spec.get("data")
         if not isinstance(data, str) or not data:
             raise ValueError("input_audio block missing input_audio.data")
@@ -58,7 +60,9 @@ def normalize_audio_block(block: dict[str, Any]) -> str:
 
     # Anthropic / internal: {"type": "audio", "source": {...}}  (olmlx extension)
     if btype == "audio":
-        source = block.get("source") or {}
+        source = block.get("source")
+        if not isinstance(source, dict):
+            source = {}
         stype = source.get("type")
         if stype == "url":
             url = source.get("url")
@@ -95,28 +99,30 @@ def materialize_audio(
     """
     paths: list[str] = []
     temp_paths: list[str] = []
-    for item in audio or []:
-        if isinstance(item, str) and item.startswith("data:"):
-            header, _, b64 = item.partition(",")
-            media_type = header[len("data:") :].split(";", 1)[0] or "audio/wav"
-            try:
-                raw = base64.b64decode(b64, validate=True)
-            except (binascii.Error, ValueError) as exc:
-                raise ValueError(f"invalid base64 audio data: {exc}") from exc
-            fd, tmp = tempfile.mkstemp(
-                suffix=_suffix_for_media_type(media_type), prefix="olmlx-audio-"
-            )
-            temp_paths.append(tmp)  # register for cleanup before we touch it
-            try:
+    # On any failure mid-list (e.g. a later item has invalid base64 or the write
+    # fails), delete every temp file created so far before re-raising — the
+    # caller never receives the partial list, so it cannot clean them up itself.
+    try:
+        for item in audio or []:
+            if isinstance(item, str) and item.startswith("data:"):
+                header, _, b64 = item.partition(",")
+                media_type = header[len("data:") :].split(";", 1)[0] or "audio/wav"
+                try:
+                    raw = base64.b64decode(b64, validate=True)
+                except (binascii.Error, ValueError) as exc:
+                    raise ValueError(f"invalid base64 audio data: {exc}") from exc
+                fd, tmp = tempfile.mkstemp(
+                    suffix=_suffix_for_media_type(media_type), prefix="olmlx-audio-"
+                )
+                temp_paths.append(tmp)  # register for cleanup before we touch it
                 with os.fdopen(fd, "wb") as fh:
                     fh.write(raw)
-            except OSError:
-                cleanup_temp_audio([tmp])
-                temp_paths.remove(tmp)
-                raise
-            paths.append(tmp)
-        else:
-            paths.append(item)
+                paths.append(tmp)
+            else:
+                paths.append(item)
+    except BaseException:
+        cleanup_temp_audio(temp_paths)
+        raise
     return paths, temp_paths
 
 

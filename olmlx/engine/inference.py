@@ -4212,6 +4212,7 @@ async def _full_completion_inner(
     generated_tokens_out: list[int] | None = None,
     grammar_active: bool = False,
 ) -> dict:
+    audio_paths: list[str] = []
     _audio_temps: list[str] = []
 
     def _generate_sync():
@@ -4565,6 +4566,16 @@ async def generate_chat(
                 f"Model {lm.name!r} cannot accept audio input: it is not an "
                 "audio-capable multimodal model. Load a model with an audio "
                 "tower (e.g. a Gemma 4 checkpoint)."
+            )
+        # Reject tools + audio here (out of scope v1) so the contract holds on
+        # every VLM template branch, not only the native-tools one: the
+        # system-injection branch calls _apply_chat_template_vlm without tools=,
+        # which would bypass that function's own audio+tools guard.
+        if audio and tools:
+            raise ValueError(
+                "tools + audio is not supported in this version: combining "
+                "native tool calling with audio input is out of scope (#426). "
+                "Send the audio without tools, or the tools without audio."
             )
 
         # Normalise OpenAI-format tool_calls ({function: {name, arguments: "json"}})

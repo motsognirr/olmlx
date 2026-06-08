@@ -2150,6 +2150,33 @@ class TestGenerateChat:
                     stream=False,
                 )
 
+    @pytest.mark.asyncio
+    async def test_generate_chat_rejects_tools_with_audio(
+        self, mock_manager, monkeypatch
+    ):
+        """tools + audio is rejected for every VLM template branch — the guard
+        lives in generate_chat, not only in _apply_chat_template_vlm (which the
+        system-injection branch bypasses since it omits tools=)."""
+        # Pretend the loaded model is audio-capable so the capability check
+        # passes and the tools+audio guard is what fires.
+        monkeypatch.setattr("olmlx.engine.inference._audio_capable", lambda lm: True)
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+        with patch("olmlx.engine.inference.settings.prompt_cache", False):
+            with pytest.raises(ValueError, match="tools . audio|audio . tools"):
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [
+                        {
+                            "role": "user",
+                            "content": "what is said?",
+                            "audio": ["sample.wav"],
+                        }
+                    ],
+                    tools=tools,
+                    stream=False,
+                )
+
 
 class TestGenerateChatEnableThinking:
     @pytest.mark.asyncio
