@@ -1,12 +1,14 @@
-import pytest
+from unittest.mock import patch
 
 from olmlx.engine.model_manager import LoadedModel, ModelManager
 
 
-@pytest.mark.asyncio
 async def test_probe_cache_capabilities_skips_reranker(registry):
-    # A reranker has no LLM prompt cache; the probe must early-return without
-    # touching mlx-lm's make_prompt_cache and must leave persistence off.
+    # A reranker has no LLM prompt cache; the probe must early-return BEFORE
+    # touching mlx-lm's make_prompt_cache, and leave persistence off. Patching
+    # make_prompt_cache and asserting it's never called proves the guard
+    # short-circuited the body (the persistence flags default to False, so they
+    # alone wouldn't catch a regression that ran the probe).
     mgr = ModelManager(registry)
     lm = LoadedModel(
         name="bge",
@@ -15,7 +17,9 @@ async def test_probe_cache_capabilities_skips_reranker(registry):
         tokenizer=object(),
         is_reranker=True,
     )
-    await mgr._probe_cache_capabilities(lm)  # must not raise
+    with patch("mlx_lm.models.cache.make_prompt_cache") as mock_make:
+        await mgr._probe_cache_capabilities(lm)  # must not raise
+    mock_make.assert_not_called()
     assert lm.supports_cache_persistence is False
     assert lm.uses_checkpoint_persistence is False
 
