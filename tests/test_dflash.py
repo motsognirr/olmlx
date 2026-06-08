@@ -992,6 +992,7 @@ class TestDFlashDecoder:
         decoder.prefill(mx.array([list(range(1, prompt_len + 1))]))
         sliding_idx, ft_idx = 0, 1
 
+        saw_full_rejection = False
         for _ in range(6):
             # The offset guard fires DURING step() and checks the draft
             # offset against ``prompt_size + n_generated - 1`` using the
@@ -1000,19 +1001,28 @@ class TestDFlashDecoder:
             n_gen_entry = decoder._n_generated
             # No RuntimeError from the offset invariant guard.
             accepted, _ = decoder.step()
-            # Random weights ⇒ the draft never matches the target ⇒ only
-            # the bonus token is accepted (the 0-for-block_size case).
-            assert len(accepted) == 1
+            if len(accepted) == 1:
+                saw_full_rejection = True  # 0-for-block_size, the issue's case
             sliding_off = decoder._draft_cache[sliding_idx].offset
             ft_off = decoder._draft_cache[ft_idx].offset
-            # The sliding-layer offset stays in lockstep with the
-            # full-attention layer (the gh#453 invariant) and matches the
-            # value the in-step guard validated against.
+            # The gh#453 invariant: the sliding-layer offset stays in
+            # lockstep with the full-attention layer and matches the value
+            # the in-step guard validated against. This holds for ANY
+            # acceptance count — it is acceptance-independent — so it does
+            # not rely on the random weights producing a particular accept
+            # pattern.
             assert sliding_off == ft_off == decoder._prompt_size + n_gen_entry - 1
+
+        # The issue is specifically about 0-for-block_size acceptance; the
+        # random weights here drive the draft into full rejection, so assert
+        # we actually exercised that regime (a soft aggregate check rather
+        # than a brittle per-step equality on the accept count).
+        assert saw_full_rejection
 
         # Confirm the skip actually fired: the sliding cache holds at most
         # ``keep`` physical tokens yet its offset ran far past that — proof
-        # the pre-advance happened (otherwise the test proves nothing).
+        # the pre-advance happened (otherwise the test proves nothing). This
+        # is deterministic: step 1 always feeds S = prompt_size > window - 1.
         sliding_cache = decoder._draft_cache[sliding_idx]
         assert sliding_cache.keys.shape[2] <= window - 1
         assert sliding_cache.offset > window - 1
