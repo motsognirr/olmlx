@@ -16,9 +16,44 @@ from olmlx.bench.runner import (
 from olmlx.bench.scenarios import Scenario
 
 
+def _fake_popen_factory(
+    *, results=None, returncode=0, stderr="", timeout=False, captured=None
+):
+    """Build a fake ``subprocess.Popen`` replacement for ``_run_worker`` tests.
+
+    Records the cmd/kwargs into ``captured`` (a dict) and returns a MagicMock
+    proc whose ``communicate`` either returns ``("", stderr)`` or raises
+    ``TimeoutExpired``. Writes ``results`` to the --results-json path on call.
+    """
+    import pathlib
+    import subprocess
+
+    def factory(cmd, **kwargs):
+        if captured is not None:
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+        if results is not None:
+            results_idx = cmd.index("--results-json") + 1
+            pathlib.Path(cmd[results_idx]).write_text(json.dumps(results))
+        proc = MagicMock()
+        proc.pid = 4242
+        proc.returncode = returncode
+        if timeout:
+            proc.communicate.side_effect = subprocess.TimeoutExpired(
+                cmd="worker", timeout=600
+            )
+        else:
+            proc.communicate.return_value = ("", stderr)
+        if captured is not None:
+            captured["proc"] = proc
+        return proc
+
+    return factory
+
+
 class TestRunWorker:
-    def test_worker_success(self, tmp_path, monkeypatch):
-        """Mock subprocess.run to return pre-built results."""
+    def test_worker_success(self):
+        """Mock Popen to return pre-built results."""
         fake_results = [
             {
                 "prompt_name": "factual",
@@ -33,26 +68,15 @@ class TestRunWorker:
             }
         ]
 
-        def fake_subprocess_run(cmd, env, capture_output, text, timeout):
-            # Write results to the path specified in cmd
-            results_idx = cmd.index("--results-json") + 1
-            results_path = cmd[results_idx]
-            import pathlib
-
-            pathlib.Path(results_path).write_text(json.dumps(fake_results))
-
-            class FakeResult:
-                returncode = 0
-                stderr = ""
-                stdout = ""
-
-            return FakeResult()
-
         scenario = Scenario(name="test", description="Test scenario")
         prompts_data = [PROMPTS[0].to_dict()]
 
-        with patch(
-            "olmlx.bench.runner.subprocess.run", side_effect=fake_subprocess_run
+        with (
+            patch(
+                "olmlx.bench.runner.subprocess.Popen",
+                side_effect=_fake_popen_factory(results=fake_results),
+            ),
+            patch("olmlx.bench.runner.os.killpg"),
         ):
             results = _run_worker(
                 "test-model", scenario, prompts_data, None, worker_timeout=600.0
@@ -63,16 +87,35 @@ class TestRunWorker:
         assert results[0].output_text == "Paris."
         assert results[0].tokens_per_second == 10.0
 
+    def test_worker_runs_in_new_session(self):
+        """Worker is launched in its own process group (start_new_session)."""
+        scenario = Scenario(name="test", description="Test")
+        captured: dict = {}
+
+        with (
+            patch(
+                "olmlx.bench.runner.subprocess.Popen",
+                side_effect=_fake_popen_factory(results=[], captured=captured),
+            ),
+            patch("olmlx.bench.runner.os.killpg"),
+        ):
+            _run_worker("model", scenario, [], None, worker_timeout=600.0)
+
+        assert captured["kwargs"].get("start_new_session") is True
+
     def test_worker_failure_returns_error(self):
         """Worker exit code != 0 produces error result."""
         scenario = Scenario(name="test", description="Test")
 
-        class FakeResult:
-            returncode = 1
-            stderr = "ImportError: no module"
-            stdout = ""
-
-        with patch("olmlx.bench.runner.subprocess.run", return_value=FakeResult()):
+        with (
+            patch(
+                "olmlx.bench.runner.subprocess.Popen",
+                side_effect=_fake_popen_factory(
+                    returncode=1, stderr="ImportError: no module"
+                ),
+            ),
+            patch("olmlx.bench.runner.os.killpg"),
+        ):
             results = _run_worker("model", scenario, [], None, worker_timeout=600.0)
 
         assert len(results) == 1
@@ -81,18 +124,65 @@ class TestRunWorker:
 
     def test_worker_timeout_returns_error(self):
         """Worker timeout produces error result."""
-        import subprocess
-
         scenario = Scenario(name="test", description="Test")
 
-        with patch(
-            "olmlx.bench.runner.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd="test", timeout=600),
+        with (
+            patch(
+                "olmlx.bench.runner.subprocess.Popen",
+                side_effect=_fake_popen_factory(timeout=True),
+            ),
+            patch("olmlx.bench.runner.os.killpg"),
         ):
             results = _run_worker("model", scenario, [], None, worker_timeout=600.0)
 
         assert len(results) == 1
         assert "timed out" in results[0].error.lower()
+
+    def test_worker_timeout_kills_process_group(self):
+        """On timeout, the worker's whole process group is SIGKILLed.
+
+        Regression guard: a timed-out worker must not leave its uvicorn server
+        orphaned (which would keep the model resident in RAM). _run_worker runs
+        the worker in its own session and kills the group on timeout.
+        """
+        scenario = Scenario(name="test", description="Test")
+        captured: dict = {}
+        killpg_calls = []
+
+        with (
+            patch(
+                "olmlx.bench.runner.subprocess.Popen",
+                side_effect=_fake_popen_factory(timeout=True, captured=captured),
+            ),
+            patch(
+                "olmlx.bench.runner.os.killpg",
+                side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig)),
+            ),
+        ):
+            _run_worker("model", scenario, [], None, worker_timeout=600.0)
+
+        # The group led by the worker pid is killed.
+        assert killpg_calls, "expected the worker process group to be killed"
+        assert killpg_calls[0][0] == captured["proc"].pid
+
+    def test_worker_clean_exit_still_reaps_group(self):
+        """Even on a clean exit the process group is reaped (crash backstop)."""
+        scenario = Scenario(name="test", description="Test")
+        killpg_calls = []
+
+        with (
+            patch(
+                "olmlx.bench.runner.subprocess.Popen",
+                side_effect=_fake_popen_factory(results=[]),
+            ),
+            patch(
+                "olmlx.bench.runner.os.killpg",
+                side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig)),
+            ),
+        ):
+            _run_worker("model", scenario, [], None, worker_timeout=600.0)
+
+        assert killpg_calls, "process group should be reaped on every path"
 
     def test_worker_passes_env_overrides(self):
         """Verify env overrides are passed to subprocess."""
@@ -101,50 +191,35 @@ class TestRunWorker:
             description="TurboQuant",
             env_overrides={"OLMLX_KV_CACHE_QUANT": "turboquant:4"},
         )
+        captured: dict = {}
 
-        captured_env = {}
-
-        def capture_run(cmd, env, **kwargs):
-            captured_env.update(env)
-            results_idx = cmd.index("--results-json") + 1
-            import pathlib
-
-            pathlib.Path(cmd[results_idx]).write_text("[]")
-
-            class FakeResult:
-                returncode = 0
-                stderr = ""
-
-            return FakeResult()
-
-        with patch("olmlx.bench.runner.subprocess.run", side_effect=capture_run):
+        with (
+            patch(
+                "olmlx.bench.runner.subprocess.Popen",
+                side_effect=_fake_popen_factory(results=[], captured=captured),
+            ),
+            patch("olmlx.bench.runner.os.killpg"),
+        ):
             _run_worker("model", scenario, [], None, worker_timeout=600.0)
 
-        assert captured_env.get("OLMLX_KV_CACHE_QUANT") == "turboquant:4"
+        assert captured["kwargs"]["env"].get("OLMLX_KV_CACHE_QUANT") == "turboquant:4"
 
     def test_worker_passes_max_tokens(self):
         """Verify --max-tokens is passed when provided."""
         scenario = Scenario(name="test", description="Test")
-        captured_cmd = []
+        captured: dict = {}
 
-        def capture_run(cmd, **kwargs):
-            captured_cmd.extend(cmd)
-            results_idx = cmd.index("--results-json") + 1
-            import pathlib
-
-            pathlib.Path(cmd[results_idx]).write_text("[]")
-
-            class FakeResult:
-                returncode = 0
-                stderr = ""
-
-            return FakeResult()
-
-        with patch("olmlx.bench.runner.subprocess.run", side_effect=capture_run):
+        with (
+            patch(
+                "olmlx.bench.runner.subprocess.Popen",
+                side_effect=_fake_popen_factory(results=[], captured=captured),
+            ),
+            patch("olmlx.bench.runner.os.killpg"),
+        ):
             _run_worker("model", scenario, [], max_tokens=64, worker_timeout=600.0)
 
-        assert "--max-tokens" in captured_cmd
-        assert "64" in captured_cmd
+        assert "--max-tokens" in captured["cmd"]
+        assert "64" in captured["cmd"]
 
 
 class TestRunBench:

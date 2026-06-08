@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -62,19 +63,21 @@ def _capture_bench_env() -> dict[str, str]:
     return captured
 
 
-_DEFAULT_WORKER_TIMEOUT = 600.0
+_DEFAULT_WORKER_TIMEOUT = 1800.0
 
 
 def _worker_timeout() -> float:
     """Per-scenario worker kill timeout, in seconds.
 
-    Defaults to 600s — fine for the 7-prompt throughput set. The 50-prompt
-    quality set (especially with thinking on and a high ``--max-tokens``)
-    can run much longer, so it is overridable via
-    ``OLMLX_BENCH_WORKER_TIMEOUT`` rather than hard-failing a long graded run.
+    Defaults to 1800s (30 min). The 7-prompt throughput set finishes in well
+    under that, but the 50-prompt quality set on a mid/large model (especially
+    with thinking on and a high ``--max-tokens``) can run many minutes per
+    scenario — the previous 600s default made those scenarios reliably time out
+    and lose their results. Still overridable via ``OLMLX_BENCH_WORKER_TIMEOUT``
+    for even longer graded runs rather than hard-failing.
 
-    Rejects ``inf`` / ``nan`` (these would silently disable the kill switch
-    in ``subprocess.run``) and warns on unparseable values so an ignored
+    Rejects ``inf`` / ``nan`` (these would silently disable the kill switch in
+    ``communicate(timeout=...)``) and warns on unparseable values so an ignored
     override is diagnosable instead of vanishing into the default.
     """
     raw = os.environ.get("OLMLX_BENCH_WORKER_TIMEOUT", "")
@@ -398,6 +401,29 @@ def run_bench(
     return run
 
 
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    """Kill the worker's whole process group, reaping any server it spawned.
+
+    The worker is launched with ``start_new_session=True``, so its PID is its
+    own process-group leader and the uvicorn server it spawns inherits that
+    group. Killing the group guarantees the server dies with the worker.
+
+    Without this, a worker killed on timeout (CPython SIGKILLs it on
+    ``TimeoutExpired``, so the worker's own ``finally`` cleanup cannot run)
+    leaves its server orphaned with the model still resident in RAM. Across a
+    multi-scenario / multi-model sweep these orphans accumulate to tens of GB
+    and eventually starve later loads (observed: 61 GB, cascading load failures).
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _run_worker(
     model: str,
     scenario: Scenario,
@@ -432,20 +458,37 @@ def _run_worker(
         if max_tokens is not None:
             cmd.extend(["--max-tokens", str(max_tokens)])
 
+        # start_new_session=True: run the worker (and the server it spawns) in a
+        # dedicated process group so _terminate_process_group can reap the whole
+        # tree — see that function for the orphaned-server leak this prevents.
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
         try:
-            result = subprocess.run(
-                cmd,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=worker_timeout,
-            )
-            if result.returncode != 0:
+            try:
+                _, stderr = proc.communicate(timeout=worker_timeout)
+            except subprocess.TimeoutExpired:
+                return [
+                    PromptResult(
+                        prompt_name="__worker_error__",
+                        category="error",
+                        output_text="",
+                        status_code=0,
+                        error=f"Worker timed out after {worker_timeout:.0f}s",
+                    )
+                ]
+
+            if proc.returncode != 0:
                 logger.error(
                     "Worker failed for %s (exit %d):\n%s",
                     scenario.name,
-                    result.returncode,
-                    result.stderr[-1000:] if result.stderr else "(no stderr)",
+                    proc.returncode,
+                    stderr[-1000:] if stderr else "(no stderr)",
                 )
                 return [
                     PromptResult(
@@ -453,7 +496,7 @@ def _run_worker(
                         category="error",
                         output_text="",
                         status_code=0,
-                        error=f"Worker exited with code {result.returncode}: {result.stderr[-500:] if result.stderr else ''}",
+                        error=f"Worker exited with code {proc.returncode}: {stderr[-500:] if stderr else ''}",
                     )
                 ]
 
@@ -471,16 +514,10 @@ def _run_worker(
             raw = json.loads(results_path.read_text())
             return [PromptResult.from_dict(r) for r in raw]
 
-        except subprocess.TimeoutExpired:
-            return [
-                PromptResult(
-                    prompt_name="__worker_error__",
-                    category="error",
-                    output_text="",
-                    status_code=0,
-                    error=f"Worker timed out after {worker_timeout:.0f}s",
-                )
-            ]
+        finally:
+            # Backstop on every path (timeout, crash, clean exit): ensure the
+            # worker's server child can never outlive this call.
+            _terminate_process_group(proc)
 
 
 def _get_server_port(scenario: Scenario) -> int:
