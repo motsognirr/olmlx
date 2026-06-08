@@ -6,6 +6,7 @@ inference lock, so listen() and speak() never overlap generation.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 
@@ -47,7 +48,9 @@ class VoiceIO:
 
     async def listen(self) -> str:
         """Record push-to-talk audio and return the transcribed text."""
-        path = capture.record_to_wav()
+        # record_to_wav blocks on input() until the user presses Enter; run it
+        # off the event loop so other async work isn't frozen during recording.
+        path = await asyncio.to_thread(capture.record_to_wav)
         try:
             result = await generate_transcription(self._manager, self._stt_model, path)
         finally:
@@ -67,4 +70,6 @@ class VoiceIO:
             async for segment in generate_speech(
                 self._manager, self._tts_model, sentence, voice=self._voice
             ):
-                playback.play(segment, _TTS_SAMPLE_RATE)
+                # play() blocks on sd.wait() until the segment finishes; keep it
+                # off the event loop.
+                await asyncio.to_thread(playback.play, segment, _TTS_SAMPLE_RATE)
