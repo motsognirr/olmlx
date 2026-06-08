@@ -4905,7 +4905,12 @@ def _score_pairs(
         # (enforced at load by load_cross_encoder); column 0 is the score.
         probs = mx.sigmoid(logits[:, 0])
         mx.eval(probs)
-        scores.extend(float(x) for x in probs.tolist())
+        # probs is 1-D (one score per doc) so tolist() is a list; the isinstance
+        # guard also narrows mlx's union return type for the type checker.
+        batch_scores = probs.tolist()
+        if not isinstance(batch_scores, list):
+            batch_scores = [batch_scores]
+        scores.extend(float(x) for x in batch_scores)
     return scores
 
 

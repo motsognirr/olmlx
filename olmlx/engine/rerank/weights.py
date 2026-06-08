@@ -126,7 +126,9 @@ def _load_state_dict(path: str) -> dict[str, mx.array]:
         raise FileNotFoundError(f"no .safetensors weights in {path}")
     sd: dict[str, mx.array] = {}
     for f in files:
-        sd.update(mx.load(f))  # mx.load returns {name: mx.array}
+        loaded = mx.load(f)  # a .safetensors file loads as {name: mx.array}
+        if isinstance(loaded, dict):
+            sd.update(loaded)
     return sd
 
 

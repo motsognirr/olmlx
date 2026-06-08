@@ -26,7 +26,10 @@ def test_is_cross_encoder_config_false_for_non_roberta_classifier():
 
 
 def test_is_cross_encoder_config_true_for_roberta_family():
-    cfg = {"architectures": ["RobertaForSequenceClassification"], "model_type": "roberta"}
+    cfg = {
+        "architectures": ["RobertaForSequenceClassification"],
+        "model_type": "roberta",
+    }
     assert _is_cross_encoder_config(cfg) is True
 
 
