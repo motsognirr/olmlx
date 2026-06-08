@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import mlx.core as mx
@@ -1451,13 +1452,12 @@ class TestGemma4TemplateOrdering:
     instructions (with examples) *before* the system prompt.
     """
 
-    GEMMA4_TEMPLATE = (
-        "/Users/daniel/.olmlx/models/"
-        "mlx-community_gemma-4-26b-a4b-it-4bit/chat_template.jinja"
-    )
-    QWEN35_TEMPLATE = (
-        "/Users/daniel/.olmlx/models/mlx-community_Qwen3.5-27B-4bit/chat_template.jinja"
-    )
+    # Vendored chat templates (tests/fixtures/chat_templates/) so the
+    # ordering assertions run in CI. Previously these pointed at
+    # developer-machine model paths, so the whole class silently skipped.
+    _TEMPLATE_DIR = Path(__file__).parent / "fixtures" / "chat_templates"
+    GEMMA4_TEMPLATE = str(_TEMPLATE_DIR / "gemma-4-26b-a4b-it.jinja")
+    QWEN35_TEMPLATE = str(_TEMPLATE_DIR / "Qwen3.5-27B.jinja")
 
     @staticmethod
     def _render(template_path, messages, tools=None, enable_thinking=None):

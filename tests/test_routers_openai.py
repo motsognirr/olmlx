@@ -445,6 +445,61 @@ class TestOpenAIRouter:
         assert len(data["data"]) == 2
 
     @pytest.mark.asyncio
+    async def test_embeddings_base64(self, app_client):
+        import base64
+        import struct
+
+        with patch(
+            "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
+        ) as mock_emb:
+            mock_emb.return_value = [[0.1, 0.2, 0.3]]
+            resp = await app_client.post(
+                "/v1/embeddings",
+                json={
+                    "model": "qwen3",
+                    "input": "hello world",
+                    "encoding_format": "base64",
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        emb = data["data"][0]["embedding"]
+        assert isinstance(emb, str)
+        decoded = struct.unpack("<3f", base64.b64decode(emb))
+        assert decoded == pytest.approx([0.1, 0.2, 0.3])
+
+    @pytest.mark.asyncio
+    async def test_embeddings_float_encoding_explicit(self, app_client):
+        with patch(
+            "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
+        ) as mock_emb:
+            mock_emb.return_value = [[0.1, 0.2, 0.3]]
+            resp = await app_client.post(
+                "/v1/embeddings",
+                json={
+                    "model": "qwen3",
+                    "input": "hello world",
+                    "encoding_format": "float",
+                },
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["data"][0]["embedding"] == [0.1, 0.2, 0.3]
+
+    @pytest.mark.asyncio
+    async def test_embeddings_rejects_invalid_encoding_format(self, app_client):
+        resp = await app_client.post(
+            "/v1/embeddings",
+            json={
+                "model": "qwen3",
+                "input": "hello world",
+                "encoding_format": "bogus",
+            },
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
     async def test_completions_streaming(self, app_client):
         async def mock_stream(*args, **kwargs):
             async def gen():

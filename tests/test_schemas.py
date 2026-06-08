@@ -547,6 +547,31 @@ class TestOpenAISchemas:
                 max_completion_tokens=0,
             )
 
+    def test_max_completion_tokens_limit_error_names_correct_field(self):
+        # The "exceeds configured limit" validator covers both max_tokens
+        # and max_completion_tokens; the error must name the field that
+        # actually failed, not always "max_tokens".
+        from olmlx.config import settings
+
+        over_limit = settings.max_tokens_limit + 1
+        with pytest.raises(ValidationError, match="max_completion_tokens"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                max_completion_tokens=over_limit,
+            )
+
+    def test_max_tokens_limit_error_names_correct_field(self):
+        from olmlx.config import settings
+
+        over_limit = settings.max_tokens_limit + 1
+        with pytest.raises(ValidationError, match="max_tokens"):
+            OpenAIChatRequest(
+                model="test",
+                messages=[OpenAIChatMessage(role="user", content="hi")],
+                max_tokens=over_limit,
+            )
+
     def test_chat_request_n_rejects_greater_than_one(self):
         with pytest.raises(ValidationError, match="less than or equal to 1"):
             OpenAIChatRequest(

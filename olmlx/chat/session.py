@@ -33,6 +33,40 @@ _MIN_MESSAGES_AFTER_TRUNCATE = 6
 # Emergency truncation target when first pass still exceeds memory
 _MIN_MESSAGES_EMERGENCY_TRUNCATE = 2
 
+
+def _truncate_keep_recent(
+    messages: list[dict], system_idx: int, target_count: int
+) -> list[dict]:
+    """Keep the system message (if any) plus the most recent messages.
+
+    Walk backwards collecting messages until ``target_count`` is reached,
+    then continue back to the next ``user`` message so a turn boundary is
+    never split (no orphan ``tool_result`` or dangling ``tool_call``).
+    ``system_idx`` is 1 when ``messages[0]`` is a system message, else 0.
+    """
+    kept: list[dict] = []
+    if system_idx > 0:
+        kept.append(messages[0])
+
+    recent: list[dict] = []
+    idx = len(messages) - 1
+    while idx >= system_idx:
+        recent.insert(0, messages[idx])
+        idx -= 1
+        if len(recent) >= target_count:
+            # Walk back to the next user message to avoid splitting a turn.
+            while idx >= system_idx:
+                msg = messages[idx]
+                recent.insert(0, msg)
+                idx -= 1
+                if msg.get("role") == "user":
+                    break
+            break
+
+    kept.extend(recent)
+    return kept
+
+
 # Thinking tag constants
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
@@ -425,34 +459,9 @@ class ChatSession:
         original_len = len(self.messages)
 
         # Keep system + N most recent (user, assistant) pairs
-        kept = []
-        if system_idx > 0:
-            kept.append(self.messages[0])  # system message
-
-        # Walk backwards from the end, collecting messages. After hitting
-        # the target count, continue walking back until we reach a clean
-        # turn boundary (a user message) so we never split tool_call /
-        # tool_result pairs or leave orphan tool results.
-        recent = []
-        idx = len(self.messages) - 1
-        while idx >= system_idx:
-            msg = self.messages[idx]
-            recent.insert(0, msg)
-            idx -= 1
-            if len(recent) >= _MIN_MESSAGES_AFTER_TRUNCATE:
-                # Walk back to next user message to avoid splitting a turn
-                while idx >= system_idx:
-                    msg = self.messages[idx]
-                    if msg.get("role") == "user":
-                        recent.insert(0, msg)
-                        idx -= 1
-                        break
-                    recent.insert(0, msg)
-                    idx -= 1
-                break
-
-        kept.extend(recent)
-        self.messages = kept
+        self.messages = _truncate_keep_recent(
+            self.messages, system_idx, _MIN_MESSAGES_AFTER_TRUNCATE
+        )
 
         # Re-verify the truncated history still fits; if not, truncate again
         # but with a shallower target — keep only the last 2 messages.
@@ -467,27 +476,9 @@ class ChatSession:
                 logger.warning(
                     "Truncated history still exceeds memory limit; reducing further"
                 )
-                kept = []
-                if system_idx > 0:
-                    kept.append(self.messages[0])
-                recent = []
-                idx = len(self.messages) - 1
-                while idx >= system_idx:
-                    msg = self.messages[idx]
-                    recent.insert(0, msg)
-                    idx -= 1
-                    if len(recent) >= _MIN_MESSAGES_EMERGENCY_TRUNCATE:
-                        while idx >= system_idx:
-                            msg = self.messages[idx]
-                            if msg.get("role") == "user":
-                                recent.insert(0, msg)
-                                idx -= 1
-                                break
-                            recent.insert(0, msg)
-                            idx -= 1
-                        break
-                kept.extend(recent)
-                self.messages = kept
+                self.messages = _truncate_keep_recent(
+                    self.messages, system_idx, _MIN_MESSAGES_EMERGENCY_TRUNCATE
+                )
 
         if len(self.messages) < original_len:
             self.manager.invalidate_prompt_cache(self.config.model_name, "chat")

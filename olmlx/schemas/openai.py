@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from olmlx.schemas.common import ModelName
 
@@ -65,12 +71,12 @@ class OpenAIChatRequest(BaseModel):
 
     @field_validator("max_tokens", "max_completion_tokens")
     @classmethod
-    def validate_max_tokens(cls, v: int | None) -> int | None:
+    def validate_max_tokens(cls, v: int | None, info: ValidationInfo) -> int | None:
         if v is None:
             return v
         from olmlx.schemas.common import validate_token_limit
 
-        return validate_token_limit(v, "max_tokens")
+        return validate_token_limit(v, info.field_name or "max_tokens")
 
     @field_validator("messages")
     @classmethod
@@ -186,7 +192,7 @@ class OpenAIModelList(BaseModel):
 class OpenAIEmbeddingRequest(BaseModel):
     model: ModelName
     input: str | list[str]
-    encoding_format: str = "float"
+    encoding_format: Literal["float", "base64"] = "float"
 
     @field_validator("input")
     @classmethod
@@ -199,7 +205,9 @@ class OpenAIEmbeddingRequest(BaseModel):
 class OpenAIEmbeddingData(BaseModel):
     object: str = "embedding"
     index: int = 0
-    embedding: list[float]
+    # ``list[float]`` for ``encoding_format="float"`` (default); a base64
+    # string of the little-endian float32 bytes for ``encoding_format="base64"``.
+    embedding: list[float] | str
 
 
 class OpenAIEmbeddingResponse(BaseModel):

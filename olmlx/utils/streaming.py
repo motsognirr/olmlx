@@ -445,6 +445,14 @@ class CancellableStream:
                         self._queue.put(tok), self._loop
                     ).result(timeout=_QUEUE_PUT_TIMEOUT)
                 except Exception:
+                    # The consumer/event loop is gone (e.g. client disconnect
+                    # mid-stream) or the put timed out. Stop generating; the
+                    # finally block below still runs clean GPU teardown. Logged
+                    # at debug since this is a routine teardown path, not an error.
+                    logger.debug(
+                        "CancellableStream: queue put failed, ending generation",
+                        exc_info=True,
+                    )
                     break
         except Exception as exc:
             tb = traceback.format_exc()

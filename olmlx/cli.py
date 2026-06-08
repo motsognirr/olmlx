@@ -13,7 +13,10 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from olmlx.engine.registry import ModelRegistry
 
 from olmlx.config import (
     settings,
@@ -767,7 +770,9 @@ def _apply_serve_overrides(args) -> None:
     _audit_per_model_flash_in_distributed(audit_registry)
 
 
-def _audit_per_model_flash_in_distributed(registry: "Any | None" = None) -> None:
+def _audit_per_model_flash_in_distributed(
+    registry: "ModelRegistry | None" = None,
+) -> None:
     """Audit per-model Flash settings against distributed-mode invariants.
 
     Two failure modes to surface at startup:
@@ -920,7 +925,7 @@ def _models_with_promoted_keys_in_experimental() -> list[str]:
     return bad
 
 
-def _load_registry_for_audit() -> "Any":
+def _load_registry_for_audit() -> "ModelRegistry | None":
     """Load the ModelRegistry once for the startup-audit helpers.
 
     Returns the loaded registry or ``None`` if the load failed.
@@ -965,7 +970,7 @@ def _load_registry_for_audit() -> "Any":
 
 
 def _audit_speculative_config(
-    registry: "Any | None" = None,
+    registry: "ModelRegistry | None" = None,
 ) -> tuple[list[str], list[str], list[str], list[str], bool]:
     """Walk the registry and audit each model's resolved speculative
     config.
@@ -1086,8 +1091,7 @@ def _audit_speculative_config(
             if resolved_flash is not None and resolved_flash.enabled:
                 flash_conflicts.append(name)
             if (
-                mc is not None
-                and mc.resolved_flash_moe().enabled
+                mc.resolved_flash_moe().enabled
                 and strategy in _FLASH_MOE_INCOMPATIBLE_STRATEGIES
             ):
                 dflash_moe_conflicts.append(name)

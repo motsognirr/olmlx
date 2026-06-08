@@ -6,6 +6,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from olmlx.config import settings
 from olmlx.engine.grammar import GrammarSpec, parse_response_format
 from olmlx.engine.inference import generate_chat
 from olmlx.engine.responses_state import get_store
@@ -530,7 +531,7 @@ async def create_response(req: ResponsesRequest, request: Request):
     options = build_inference_options(
         temperature=req.temperature, top_p=req.top_p, seed=req.seed
     )
-    max_tokens = req.max_output_tokens or 512
+    max_tokens = req.max_output_tokens or settings.default_max_tokens
     enable_thinking = _resolve_reasoning(req.reasoning)
     response_id = _make_response_id()
     created = int(time.time())

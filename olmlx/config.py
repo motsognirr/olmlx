@@ -160,6 +160,11 @@ class Settings(BaseSettings):
     inference_timeout: Annotated[float, Field(gt=0)] | None = None
     sync_mode: SyncMode = "full"
     max_tokens_limit: Annotated[int, Field(gt=0)] = 131072
+    # Default generation length when a request omits max_tokens /
+    # num_predict / max_completion_tokens / max_output_tokens. Shared by
+    # every router (Ollama, OpenAI chat/completions, Responses) so the
+    # fallback is configured in one place rather than hardcoded per route.
+    default_max_tokens: Annotated[int, Field(gt=0)] = 512
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
     anthropic_models: dict[str, str] = {}
 

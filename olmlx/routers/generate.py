@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from olmlx.config import settings
 from olmlx.engine.grammar import parse_response_format
 from olmlx.engine.inference import generate_completion
 from olmlx.engine.tool_parser import parse_model_output
@@ -24,7 +25,7 @@ async def generate(req: GenerateRequest, request: Request):
     options = req.options.model_dump(exclude_none=True) if req.options else {}
 
     prompt = req.prompt
-    max_tokens = options.pop("num_predict", 512)
+    max_tokens = options.pop("num_predict", settings.default_max_tokens)
     enable_thinking = resolve_think_flag(req.think)
     try:
         grammar_spec = parse_response_format(req.format)
