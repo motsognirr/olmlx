@@ -1,4 +1,5 @@
 import mlx.core as mx
+import numpy as np
 
 from olmlx.engine.rerank.config import RerankerConfig
 from olmlx.engine.rerank.model import (
@@ -6,6 +7,7 @@ from olmlx.engine.rerank.model import (
     XLMRobertaEmbeddings,
     roberta_position_ids,
 )
+from olmlx.engine.rerank.weights import detect_layout, remap_flash, remap_standard
 
 
 def test_rerankerconfig_from_dict_bge():
@@ -118,3 +120,108 @@ def test_cross_encoder_padding_invariance():
     b = model(padded_ids, padded_mask)
     mx.eval(a, b)
     assert abs(float(a[0, 0]) - float(b[0, 0])) < 1e-5
+
+
+def test_detect_layout():
+    assert (
+        detect_layout(["roberta.encoder.layer.0.attention.self.query.weight"])
+        == "standard"
+    )
+    assert detect_layout(["roberta.encoder.layers.0.mixer.Wqkv.weight"]) == "flash"
+    assert detect_layout(["roberta.emb_ln.weight"]) == "flash"
+
+
+def test_remap_standard_keys():
+    cfg = _tiny_config()
+    h = cfg.hidden_size
+    sd = {
+        "roberta.embeddings.word_embeddings.weight": np.zeros(
+            (cfg.vocab_size, h), np.float32
+        ),
+        "roberta.embeddings.position_embeddings.weight": np.zeros(
+            (cfg.max_position_embeddings, h), np.float32
+        ),
+        "roberta.embeddings.token_type_embeddings.weight": np.zeros(
+            (cfg.type_vocab_size, h), np.float32
+        ),
+        "roberta.embeddings.LayerNorm.weight": np.ones((h,), np.float32),
+        "roberta.embeddings.LayerNorm.bias": np.zeros((h,), np.float32),
+        "classifier.dense.weight": np.zeros((h, h), np.float32),
+        "classifier.dense.bias": np.zeros((h,), np.float32),
+        "classifier.out_proj.weight": np.zeros((1, h), np.float32),
+        "classifier.out_proj.bias": np.zeros((1,), np.float32),
+    }
+    for i in range(cfg.num_hidden_layers):
+        p = f"roberta.encoder.layer.{i}."
+        for proj in ("query", "key", "value"):
+            sd[f"{p}attention.self.{proj}.weight"] = np.zeros((h, h), np.float32)
+            sd[f"{p}attention.self.{proj}.bias"] = np.zeros((h,), np.float32)
+        sd[f"{p}attention.output.dense.weight"] = np.zeros((h, h), np.float32)
+        sd[f"{p}attention.output.dense.bias"] = np.zeros((h,), np.float32)
+        sd[f"{p}attention.output.LayerNorm.weight"] = np.ones((h,), np.float32)
+        sd[f"{p}attention.output.LayerNorm.bias"] = np.zeros((h,), np.float32)
+        sd[f"{p}intermediate.dense.weight"] = np.zeros(
+            (cfg.intermediate_size, h), np.float32
+        )
+        sd[f"{p}intermediate.dense.bias"] = np.zeros(
+            (cfg.intermediate_size,), np.float32
+        )
+        sd[f"{p}output.dense.weight"] = np.zeros((h, cfg.intermediate_size), np.float32)
+        sd[f"{p}output.dense.bias"] = np.zeros((h,), np.float32)
+        sd[f"{p}output.LayerNorm.weight"] = np.ones((h,), np.float32)
+        sd[f"{p}output.LayerNorm.bias"] = np.zeros((h,), np.float32)
+    flat = remap_standard(sd, cfg)
+    model = XLMRobertaCrossEncoder(cfg)
+    model.load_weights(list(flat.items()))  # raises if any key/shape mismatches
+    mx.eval(model.parameters())
+
+
+def test_remap_flash_splits_fused_qkv():
+    cfg = _tiny_config()
+    h = cfg.hidden_size
+    # Fused QKV: rows [q | k | v] each h.
+    wqkv = np.arange(3 * h * h, dtype=np.float32).reshape(3 * h, h)
+    bqkv = np.arange(3 * h, dtype=np.float32)
+    sd = {
+        "roberta.embeddings.word_embeddings.weight": np.zeros(
+            (cfg.vocab_size, h), np.float32
+        ),
+        "roberta.embeddings.position_embeddings.weight": np.zeros(
+            (cfg.max_position_embeddings, h), np.float32
+        ),
+        "roberta.embeddings.token_type_embeddings.weight": np.zeros(
+            (cfg.type_vocab_size, h), np.float32
+        ),
+        "roberta.emb_ln.weight": np.ones((h,), np.float32),
+        "roberta.emb_ln.bias": np.zeros((h,), np.float32),
+        "classifier.dense.weight": np.zeros((h, h), np.float32),
+        "classifier.dense.bias": np.zeros((h,), np.float32),
+        "classifier.out_proj.weight": np.zeros((1, h), np.float32),
+        "classifier.out_proj.bias": np.zeros((1,), np.float32),
+    }
+    for i in range(cfg.num_hidden_layers):
+        p = f"roberta.encoder.layers.{i}."
+        sd[f"{p}mixer.Wqkv.weight"] = wqkv.copy()
+        sd[f"{p}mixer.Wqkv.bias"] = bqkv.copy()
+        sd[f"{p}mixer.out_proj.weight"] = np.zeros((h, h), np.float32)
+        sd[f"{p}mixer.out_proj.bias"] = np.zeros((h,), np.float32)
+        sd[f"{p}norm1.weight"] = np.ones((h,), np.float32)
+        sd[f"{p}norm1.bias"] = np.zeros((h,), np.float32)
+        sd[f"{p}mlp.fc1.weight"] = np.zeros((cfg.intermediate_size, h), np.float32)
+        sd[f"{p}mlp.fc1.bias"] = np.zeros((cfg.intermediate_size,), np.float32)
+        sd[f"{p}mlp.fc2.weight"] = np.zeros((h, cfg.intermediate_size), np.float32)
+        sd[f"{p}mlp.fc2.bias"] = np.zeros((h,), np.float32)
+        sd[f"{p}norm2.weight"] = np.ones((h,), np.float32)
+        sd[f"{p}norm2.bias"] = np.zeros((h,), np.float32)
+    flat = remap_flash(sd, cfg)
+    # Q slice is the first h rows of the fused matrix.
+    assert np.allclose(np.array(flat["layers.0.attention_self.query.weight"]), wqkv[:h])
+    assert np.allclose(
+        np.array(flat["layers.0.attention_self.key.weight"]), wqkv[h : 2 * h]
+    )
+    assert np.allclose(
+        np.array(flat["layers.0.attention_self.value.weight"]), wqkv[2 * h :]
+    )
+    model = XLMRobertaCrossEncoder(cfg)
+    model.load_weights(list(flat.items()))
+    mx.eval(model.parameters())
