@@ -135,6 +135,13 @@ class Settings(BaseSettings):
             description="Max input length for /v1/audio/speech (OLMLX_TTS_MAX_INPUT_CHARS).",
         ),
     ] = 8192
+    # Voice mode for `olmlx chat --voice` (issue #444). STT reuses the Whisper
+    # ModelManager kind; TTS reuses the Kokoro `tts` kind + streaming
+    # generate_speech from the /v1/audio/speech work (#367). Models resolve
+    # through the normal registry/store, so these accept Ollama names or HF repos.
+    chat_stt_model: str = "mlx-community/whisper-large-v3-turbo"
+    chat_tts_model: str = "prince-canuma/Kokoro-82M"
+    chat_tts_voice: str = "af_heart"
     # Cross-request radix prefix cache (issue #365). When enabled, a
     # cache_id miss falls back to a token-prefix lookup over the in-memory
     # store; on hit, the matched entry is re-keyed to the new cache_id

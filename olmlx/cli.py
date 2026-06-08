@@ -1844,6 +1844,41 @@ def _configure_logging():
     root.addHandler(handler)
 
 
+_VOICE_FLAGS = ("--voice", "--stt-model", "--tts-model", "--voice-name")
+
+
+def _build_chat_arg_parser_voice_defaults() -> tuple[str, ...]:
+    """Return the voice flag strings the chat subparser registers (test seam)."""
+    return _VOICE_FLAGS
+
+
+def _check_voice_deps() -> None:
+    """Exit with an install hint if voice deps are unavailable."""
+    import importlib.util
+
+    def _absent(name: str) -> bool:
+        mod = sys.modules.get(name, "x")
+        if mod is None:
+            # Explicitly stubbed-out as missing.
+            return True
+        if mod != "x":
+            # Already imported as a real module object -> present.
+            return False
+        try:
+            return importlib.util.find_spec(name) is None
+        except Exception:
+            return True
+
+    missing = [name for name in ("sounddevice", "mlx_audio") if _absent(name)]
+    if missing:
+        print(
+            f"--voice needs missing package(s): {', '.join(missing)}. "
+            "Install with: uv sync --extra voice",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
 def cmd_chat(args):
     """Start an interactive chat session."""
     from olmlx.chat.config import ChatConfig, load_mcp_config, load_tool_safety_config
@@ -2004,10 +2039,44 @@ def cmd_chat(args):
                 tools = tools + builtin.get_tool_definitions()
             tui.display_welcome(model_name, tools)
 
+            voice_io = None
+            if getattr(args, "voice", False):
+                _check_voice_deps()
+                from olmlx.chat.voice.io import VoiceIO
+
+                stt_model = args.stt_model or settings.chat_stt_model
+                tts_model = args.tts_model or settings.chat_tts_model
+                voice_name = args.voice_name or settings.chat_tts_voice
+                tui.console.print(f"[dim]Loading STT {stt_model}...[/dim]")
+                await manager.ensure_loaded(stt_model, keep_alive="-1")
+                tui.console.print(f"[dim]Loading TTS {tts_model}...[/dim]")
+                await manager.ensure_loaded(tts_model, keep_alive="-1")
+                voice_io = VoiceIO(
+                    manager=manager,
+                    stt_model=stt_model,
+                    tts_model=tts_model,
+                    voice=voice_name,
+                )
+                tui.console.print(
+                    "[dim]Voice on. Press Enter at the prompt to talk; "
+                    "type to send text.[/dim]"
+                )
+
             while True:
                 user_input = tui.get_user_input()
                 if user_input is None:
                     break
+
+                # Empty line in voice mode => push-to-talk.
+                if voice_io is not None and not user_input.strip():
+                    try:
+                        user_input = await voice_io.listen()
+                    except RuntimeError as exc:  # device/dep failure
+                        tui.display_error(str(exc))
+                        continue
+                    if not user_input:
+                        continue
+                    tui.console.print(f"[dim]heard:[/dim] {user_input}")
 
                 user_input = user_input.strip()
                 if not user_input:
@@ -2121,6 +2190,7 @@ def cmd_chat(args):
                 # Collect events while streaming tokens
                 pending_events = []
                 confirmed_tool_ids: set[str] = set()
+                spoken_parts: list[str] = []
                 stream_ctx = tui.stream_response()
                 active_stream_ctx = stream_ctx
                 try:
@@ -2134,6 +2204,8 @@ def cmd_chat(args):
                                 stream_ctx.update(event["text"])
                             elif event["type"] == "token":
                                 stream_ctx.update(event["text"])
+                                if voice_io is not None:
+                                    spoken_parts.append(event["text"])
                             elif event["type"] == "tool_approved":
                                 # Track confirmed IDs to avoid duplicate display
                                 confirmed_tool_ids.add(event["id"])
@@ -2193,6 +2265,12 @@ def cmd_chat(args):
                     elif event["type"] == "model_load_error":
                         tui.display_model_load_error(event["error"])
                         break
+
+                if voice_io is not None and spoken_parts:
+                    try:
+                        await voice_io.speak("".join(spoken_parts))
+                    except RuntimeError as exc:
+                        tui.display_error(str(exc))
 
         except MemoryError as exc:
             tui.display_error(str(exc))
@@ -3047,6 +3125,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Max consecutive tool failure turns before stopping (default: 3, 0=unlimited)",
+    )
+    chat_p.add_argument(
+        "--voice",
+        action="store_true",
+        help="Enable push-to-talk STT input and Kokoro TTS output (issue #444).",
+    )
+    chat_p.add_argument(
+        "--stt-model", default=None, help="Override STT (Whisper) model."
+    )
+    chat_p.add_argument(
+        "--tts-model", default=None, help="Override TTS (Kokoro) model."
+    )
+    chat_p.add_argument(
+        "--voice-name", default=None, help="Kokoro voice (e.g. af_heart)."
     )
 
     # Flash inference
