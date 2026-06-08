@@ -6,10 +6,16 @@ import os
 from typing import Any
 
 import mlx.core as mx
-import numpy as np
 
 from olmlx.engine.rerank.config import RerankerConfig
 from olmlx.engine.rerank.model import XLMRobertaCrossEncoder
+
+
+def _to_f32(v: Any) -> mx.array:
+    """Coerce a numpy array or mx.array (any dtype, incl. bfloat16) to an
+    mx.array in float32. Staying in mx avoids numpy, which has no bfloat16
+    dtype and raises on ``np.asarray`` of a bf16 mx.array (jina ships bf16)."""
+    return mx.array(v).astype(mx.float32)
 
 
 def detect_layout(keys: list[str]) -> str:
@@ -76,7 +82,7 @@ def remap_standard(sd: dict[str, Any], cfg: RerankerConfig) -> dict[str, mx.arra
             out[f"{q}output_norm.bias"] = sd[f"{p}output.LayerNorm.bias"]
     except KeyError as exc:
         raise _missing_key_error("standard", exc) from exc
-    return {k: mx.array(np.asarray(v)) for k, v in out.items()}
+    return {k: _to_f32(v) for k, v in out.items()}
 
 
 def remap_flash(sd: dict[str, Any], cfg: RerankerConfig) -> dict[str, mx.array]:
@@ -86,8 +92,8 @@ def remap_flash(sd: dict[str, Any], cfg: RerankerConfig) -> dict[str, mx.array]:
         for i in range(cfg.num_hidden_layers):
             p = f"roberta.encoder.layers.{i}."
             q = f"layers.{i}."
-            wqkv = np.asarray(sd[f"{p}mixer.Wqkv.weight"])
-            bqkv = np.asarray(sd[f"{p}mixer.Wqkv.bias"])
+            wqkv = sd[f"{p}mixer.Wqkv.weight"]
+            bqkv = sd[f"{p}mixer.Wqkv.bias"]
             if wqkv.shape[0] != 3 * h:
                 raise ValueError(
                     f"layer {i}: expected fused Wqkv rows == 3 * hidden_size "
@@ -111,7 +117,7 @@ def remap_flash(sd: dict[str, Any], cfg: RerankerConfig) -> dict[str, mx.array]:
             out[f"{q}output_norm.bias"] = sd[f"{p}norm2.bias"]
     except KeyError as exc:
         raise _missing_key_error("flash", exc) from exc
-    return {k: mx.array(np.asarray(v)) for k, v in out.items()}
+    return {k: _to_f32(v) for k, v in out.items()}
 
 
 def _load_state_dict(path: str) -> dict[str, mx.array]:

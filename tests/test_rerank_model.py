@@ -229,6 +229,52 @@ def test_remap_flash_splits_fused_qkv():
     mx.eval(model.parameters())
 
 
+def test_remap_flash_handles_bfloat16_weights():
+    # jina-reranker-v2 ships bfloat16 weights; mx.load returns bf16 mx.arrays.
+    # numpy has no bf16 dtype, so the remap must stay in mx-land (not route
+    # through np.asarray) and cast to float32 for uniform compute. Regression
+    # for the live-test crash on the real jina checkpoint.
+    cfg = _tiny_config()
+    h = cfg.hidden_size
+
+    def bf16(*shape):
+        return mx.zeros(shape, dtype=mx.bfloat16)
+
+    sd = {
+        "roberta.embeddings.word_embeddings.weight": bf16(cfg.vocab_size, h),
+        "roberta.embeddings.position_embeddings.weight": bf16(
+            cfg.max_position_embeddings, h
+        ),
+        "roberta.embeddings.token_type_embeddings.weight": bf16(cfg.type_vocab_size, h),
+        "roberta.emb_ln.weight": bf16(h),
+        "roberta.emb_ln.bias": bf16(h),
+        "classifier.dense.weight": bf16(h, h),
+        "classifier.dense.bias": bf16(h),
+        "classifier.out_proj.weight": bf16(1, h),
+        "classifier.out_proj.bias": bf16(1),
+    }
+    for i in range(cfg.num_hidden_layers):
+        p = f"roberta.encoder.layers.{i}."
+        sd[f"{p}mixer.Wqkv.weight"] = bf16(3 * h, h)
+        sd[f"{p}mixer.Wqkv.bias"] = bf16(3 * h)
+        sd[f"{p}mixer.out_proj.weight"] = bf16(h, h)
+        sd[f"{p}mixer.out_proj.bias"] = bf16(h)
+        sd[f"{p}norm1.weight"] = bf16(h)
+        sd[f"{p}norm1.bias"] = bf16(h)
+        sd[f"{p}mlp.fc1.weight"] = bf16(cfg.intermediate_size, h)
+        sd[f"{p}mlp.fc1.bias"] = bf16(cfg.intermediate_size)
+        sd[f"{p}mlp.fc2.weight"] = bf16(h, cfg.intermediate_size)
+        sd[f"{p}mlp.fc2.bias"] = bf16(h)
+        sd[f"{p}norm2.weight"] = bf16(h)
+        sd[f"{p}norm2.bias"] = bf16(h)
+    flat = remap_flash(sd, cfg)  # must not raise on bf16
+    # Weights are upcast to float32 for uniform compute.
+    assert flat["layers.0.attention_self.query.weight"].dtype == mx.float32
+    model = XLMRobertaCrossEncoder(cfg)
+    model.load_weights(list(flat.items()))
+    mx.eval(model.parameters())
+
+
 def test_load_cross_encoder_rejects_multilabel(tmp_path):
     import json
 
