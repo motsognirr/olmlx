@@ -3754,7 +3754,7 @@ async def _stream_completion(
             else:
                 if lm.is_speculative:
                     logger.debug(
-                        "speculative decoding skipped: request includes images"
+                        "speculative decoding skipped: request includes images or audio"
                     )
                 # The decode loop runs in the CancellableStream worker thread;
                 # OTel context does not cross threads, so hand the current context
@@ -4011,8 +4011,6 @@ async def _stream_completion(
         else:
             # Normal path — thread exited, safe to clean up and release.
             # Delete temp audio files now that the worker thread is done.
-            from olmlx.utils.audio_input import cleanup_temp_audio
-
             cleanup_temp_audio(_audio_temps)
             try:
                 _lock_boundary_sync(lm.sync_mode)
@@ -4218,7 +4216,6 @@ async def _full_completion_inner(
     from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
 
     _audio_temps: list[str] = []
-    audio_paths, _audio_temps = materialize_audio(audio)
 
     def _generate_sync():
         """Run generate + synchronize in the same thread so GPU work completes
@@ -4378,6 +4375,7 @@ async def _full_completion_inner(
     # span wraps the generation work and carries the finalized token counts. Both
     # nest under the entry-point ``inference`` span via the active OTel context.
     try:
+        audio_paths, _audio_temps = materialize_audio(audio)
         prompt_token_count = len(prompt) if isinstance(prompt, list) else None
         with _tracing.span(
             "prefill", prompt_tokens=prompt_token_count, **{"gen.stream": False}
