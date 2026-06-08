@@ -21,8 +21,9 @@ olmlx/
 ├── cli.py              # CLI subcommands (serve, chat, service, models, config, dflash, eagle, flash, spectral)
 ├── chat/               # In-process terminal chat (ChatSession + MCP tool client + Rich TUI)
 ├── engine/
-│   ├── inference.py    # generate_chat, generate_completion, generate_embeddings, generate_transcription
+│   ├── inference.py    # generate_chat, generate_completion, generate_embeddings, generate_transcription, generate_rerank
 │   ├── model_manager.py # Model loading/unloading, keep-alive, LRU eviction
+│   ├── rerank/         # Native MLX XLM-RoBERTa cross-encoder (config + model + weight remaps)
 │   ├── registry.py     # Ollama name → HF repo via models.json
 │   ├── distributed.py  # Multi-machine ring tensor parallelism (TCP sideband)
 │   ├── grammar.py      # xgrammar JSON-mode / JSON-Schema logits processor
@@ -41,6 +42,7 @@ olmlx/
 │   ├── openai.py       # /v1/chat/completions, /v1/completions, /v1/models, /v1/embeddings
 │   ├── responses.py    # /v1/responses — OpenAI Responses API (state store, semantic SSE)
 │   ├── audio.py        # /v1/audio/transcriptions — Whisper STT
+│   ├── rerank.py       # /v1/rerank (+ /rerank) — Cohere-v2 cross-encoder reranking
 │   ├── metrics.py      # GET /metrics — Prometheus exposition
 │   └── *.py            # /api/{chat,generate,tags,show,ps,pull,copy,create,delete,embed,blobs,version} (Ollama)
 ├── schemas/            # Pydantic request/response models per API surface
@@ -92,6 +94,7 @@ olmlx/
   - DFlash precompute (`olmlx dflash precompute`): dump `(input_ids, target_hidden)` shards to skip per-step target forward in subsequent training. Same shards work for both DFlash and EAGLE.
   - EAGLE: `--use-precomputed` only. Pairing is `(h_{t-1}, token_t) → token_{t+1}` (off-by-one collapses bench acceptance to ~1%). `--sample-positions N` (default 256) subsamples vocab projection (~10× speedup, unbiased CE estimator). `iter_precomputed_shards` retries transient `mx.load()` failures (macOS mmap/fd pressure).
 - **Speculative prefetch** (`OLMLX_FLASH_PREFETCH`): Pre-loads neurons from SSD ahead of need. Cross-layer (layer L predicts L+1 from L's pre-MLP hidden, optional dedicated `LookaheadBank`), draft-informed (bulk prefetch for all target layers from draft hiddens). **Prediction synchronous** (MLX `mx.eval` deadlocks under concurrent multi-thread use); only I/O is async via dedicated `ThreadPoolExecutor`. **Prefetcher must be closed before weight store** on model unload (prefetch tasks submit into the store's pool).
+- **Rerank endpoint** (`routers/rerank.py`, #369): `POST /v1/rerank` (+ `/rerank` alias), Cohere-v2 shape (`{model, query, documents, top_n?, max_tokens_per_doc?, return_documents?}` → `{id, results:[{index, relevance_score, document?}], meta}`). Cross-encoder rerankers are a first-class `ModelManager` kind (`reranker`): `_detect_model_kind` matches an `architectures` entry ending in `ForSequenceClassification`; `LoadedModel.is_reranker` guards the LLM-only paths (the cache-capability probe early-returns, like `is_whisper`). The encoder is a native MLX `XLMRobertaCrossEncoder` (`engine/rerank/`): absolute-position (RoBERTa `pad_id+1` offset), post-LN BERT attention, first-token (`<s>`/CLS) classification head, config-driven sizing, dtype-safe `-1e4` mask fill. **Two checkpoint layouts load into one module** via key-inspection remaps (`weights.py`): standard HF (`attention.self.{query,key,value}` — bge-reranker-v2-m3) and flash (`mixer.Wqkv` fused-QKV split + `emb_ln`/`norm1`/`norm2` — jina-reranker-v2). `load_cross_encoder` rejects `num_labels != 1` (multi-label out of scope). `generate_rerank` tokenizes `(query, doc)` pairs (`transformers` tokenizer, `truncation="only_second"` — silent doc-side truncation), micro-batches, `sigmoid` → `[0,1]`, sorts, applies `top_n`; runs under the inference lock with the same trailing `mx.synchronize()` barrier as `generate_embeddings`. No KV cache, speculative, distributed, or streaming for rerankers. Live coverage: `tests/live/test_rerank_real.py` (real_model, bge + jina, incl. a checkpoint-layout gate and a transformers parity check).
 - **Audio transcription**: OpenAI-compatible `/v1/audio/transcriptions` via mlx-whisper. Whisper is a first-class `ModelManager` kind: `_detect_model_kind` matches `model_type == "whisper"` or mlx-whisper dims (`n_mels`/`n_audio_state`); `LoadedModel.is_whisper` guards LLM-only prompt-cache/KV-quant paths. `generate_transcription` injects the managed model into `mlx_whisper.transcribe.ModelHolder` (the module-level singleton — race-free under the serialized lock) and runs transcribe in a worker thread. Formats: `json`, `verbose_json`, `text`, `srt`, `vtt`. `ForceJSONMiddleware` skips `multipart/form-data` so upload boundary survives. **Requires ffmpeg on PATH**. Streaming and diarization out of scope.
 - **Terminal chat**: `olmlx chat` runs in-process via `ModelManager`/`generate_chat()` — no HTTP. Connects to external MCP servers (stdio/SSE) with a full agent loop. MCP config in Claude Desktop format at `~/.olmlx/mcp.json`.
 - **Model load timeout**: `OLMLX_MODEL_LOAD_TIMEOUT` → `ModelLoadTimeoutError` (HTTP 504).

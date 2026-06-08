@@ -4869,6 +4869,130 @@ async def generate_embeddings(
         lm.release_ref()
 
 
+def _score_pairs(
+    model,
+    tokenizer,
+    query: str,
+    documents: list[str],
+    *,
+    max_tokens_per_doc: int,
+    batch_size: int = 32,
+) -> list[float]:
+    """Tokenize (query, doc) pairs, batch-score, sigmoid -> [0,1] scores."""
+    import numpy as np
+
+    model_max = int(getattr(tokenizer, "model_max_length", 512) or 512)
+    # transformers sometimes reports a sentinel (very large) model_max_length.
+    if model_max > 100_000:
+        model_max = 512
+    max_len = min(max_tokens_per_doc, model_max)
+
+    scores: list[float] = []
+    for start in range(0, len(documents), batch_size):
+        chunk = documents[start : start + batch_size]
+        enc = tokenizer(
+            [query] * len(chunk),
+            chunk,
+            truncation="only_second",
+            max_length=max_len,
+            padding=True,
+            return_tensors="np",
+        )
+        input_ids = mx.array(np.asarray(enc["input_ids"]).astype(np.int32))
+        attn = mx.array(np.asarray(enc["attention_mask"]).astype(np.int32))
+        logits = model(input_ids, attn)  # [b, 1] (num_labels == 1)
+        # Single relevance logit -> probability. Assumes num_labels == 1
+        # (enforced at load by load_cross_encoder); column 0 is the score.
+        probs = mx.sigmoid(logits[:, 0])
+        mx.eval(probs)
+        # probs is 1-D (one score per doc) so tolist() is a list; the isinstance
+        # guard also narrows mlx's union return type for the type checker.
+        batch_scores = probs.tolist()
+        if not isinstance(batch_scores, list):
+            batch_scores = [batch_scores]
+        scores.extend(float(x) for x in batch_scores)
+    return scores
+
+
+def _build_rerank_results(
+    *,
+    scores: list[float],
+    documents: list[str],
+    top_n: int | None,
+    return_documents: bool,
+) -> list[dict]:
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    if top_n is not None:
+        order = order[: min(top_n, len(order))]
+    results: list[dict] = []
+    for idx in order:
+        item: dict = {"index": idx, "relevance_score": scores[idx]}
+        if return_documents:
+            item["document"] = documents[idx]
+        results.append(item)
+    return results
+
+
+async def generate_rerank(
+    manager: ModelManager,
+    model_name: str,
+    query: str,
+    documents: list[str],
+    *,
+    top_n: int | None = None,
+    max_tokens_per_doc: int = 4096,
+    return_documents: bool = False,
+    keep_alive: int | str | None = None,
+) -> dict:
+    """Score documents against a query with a cross-encoder reranker (#369)."""
+    lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
+    try:
+        if not getattr(lm, "is_reranker", False):
+            raise ValueError(
+                f"Model '{model_name}' is not a reranker. /v1/rerank requires "
+                "an XLM-RoBERTa cross-encoder (e.g. bge-reranker-v2-m3)."
+            )
+        async with _inference_locked(
+            lm.inference_queue_timeout, sync_mode=lm.sync_mode
+        ):
+            with (
+                _tracing.span(
+                    "inference",
+                    model=lm.name,
+                    surface=surface_var.get(),
+                    strategy="none",
+                ),
+                _inference_ref(lm, keep_alive=keep_alive, adopt=True),
+            ):
+                scores = _score_pairs(
+                    lm.model,
+                    lm.text_tokenizer,
+                    query,
+                    documents,
+                    max_tokens_per_doc=max_tokens_per_doc,
+                )
+                results = _build_rerank_results(
+                    scores=scores,
+                    documents=documents,
+                    top_n=top_n,
+                    return_documents=return_documents,
+                )
+                # Load-bearing when sync_mode="none": same rationale as
+                # generate_embeddings — this is the only Metal barrier before
+                # the lock is released. Suppress+log so caller still gets
+                # results; Metal error surfaces on the next inference.
+                try:
+                    mx.synchronize()
+                except Exception:
+                    logger.warning(
+                        "rerank post-compute sync failed — next inference will crash",
+                        exc_info=True,
+                    )
+                return {"results": results}
+    finally:
+        lm.release_ref()
+
+
 async def generate_transcription(
     manager: ModelManager,
     model_name: str,

@@ -477,6 +477,7 @@ class LoadedModel:
     is_flash: bool = False
     is_flash_moe: bool = False
     is_whisper: bool = False
+    is_reranker: bool = False
     speculative_decoder: Any = None
     weight_store: Any = None
     template_caps: TemplateCaps = field(default_factory=TemplateCaps)
@@ -585,6 +586,22 @@ class LoadedModel:
         if self.is_vlm and hasattr(tok, "tokenizer"):
             return tok.tokenizer
         return tok
+
+
+def _is_cross_encoder_config(config: dict) -> bool:
+    """True for an XLM-RoBERTa-family sequence-classification reranker (#369).
+
+    Requires both a ``*ForSequenceClassification`` architecture AND a
+    roberta-family ``model_type`` — the encoder and weight remaps only support
+    XLM-RoBERTa/RoBERTa, so a plain BERT/DistilBERT text classifier must NOT be
+    routed here (it would otherwise be detected as a reranker and fail at load).
+    """
+    archs = config.get("architectures") or []
+    if not any(
+        isinstance(a, str) and a.endswith("ForSequenceClassification") for a in archs
+    ):
+        return False
+    return "roberta" in (config.get("model_type") or "").lower()
 
 
 def parse_keep_alive(value: str | int) -> float | None:
@@ -1098,7 +1115,7 @@ class ModelManager:
                 # Whisper models (issue #366) have no LLM KV cache — never
                 # apply KV-cache quantization / spectral calibration to them.
                 _model_kind = self._detect_model_kind(hf_path)
-                if _model_kind == "whisper":
+                if _model_kind in ("whisper", "reranker"):
                     kv_cache_quant = None
                 flash_moe_config = model_config.resolved_flash_moe()
 
@@ -1454,6 +1471,7 @@ class ModelManager:
                         is_flash=is_flash,
                         is_flash_moe=is_flash_moe,
                         is_whisper=(_model_kind == "whisper"),
+                        is_reranker=(_model_kind == "reranker"),
                         speculative_decoder=_spec_decoder,
                         weight_store=_weight_store,
                         template_caps=caps,
@@ -1714,6 +1732,9 @@ class ModelManager:
             "n_mels" in config and "n_audio_state" in config
         ):
             return "whisper"
+
+        if _is_cross_encoder_config(config):
+            return "reranker"
 
         if not model_type:
             return "unknown"
@@ -2097,8 +2118,9 @@ class ModelManager:
         TurboQuant/Spectral factories would otherwise pull calibration data
         off disk on every model load only to throw the result away.
         """
-        if lm.is_whisper:
-            # Whisper has no LLM-style prompt cache; nothing to probe.
+        if lm.is_whisper or lm.is_reranker:
+            # Whisper / cross-encoder rerankers have no LLM-style prompt cache;
+            # nothing to probe.
             return
         try:
             from mlx_lm.models.cache import make_prompt_cache
@@ -3508,6 +3530,18 @@ class ModelManager:
 
             model = whisper_loader.load_model(load_path, dtype=mx.float16)
             return model, None, False, TemplateCaps(), None
+
+        if kind == "reranker":
+            # Cross-encoder reranker (#369): native MLX XLM-RoBERTa loaded from
+            # safetensors; tokenizer via transformers. No chat template, no
+            # speculative decoder, no KV cache.
+            from transformers import AutoTokenizer
+
+            from olmlx.engine.rerank import load_cross_encoder
+
+            model = load_cross_encoder(load_path)
+            tokenizer = AutoTokenizer.from_pretrained(load_path)
+            return model, tokenizer, False, TemplateCaps(), None
 
         if kind == "vlm":
             # VLM detected — load with mlx-vlm directly
