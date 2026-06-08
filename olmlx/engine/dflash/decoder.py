@@ -469,19 +469,25 @@ class DFlashDecoder:
         if ft_idx is not None:
             draft_offset = self._draft_cache[ft_idx].offset
             target_offset = self._prompt_size + self._n_generated - 1
-            # If the draft model has sliding-window attention layers and
-            # the prompt exceeds the sliding window, the first draft
-            # step advances ``cache.offset`` by ``skip + S`` (see
-            # ``DFlashAttention.__call__``).  If ALL draft tokens from
-            # that first step are rejected, ``self._n_generated`` stays
-            # at 1 (the prefill token) while the draft cache offset is
-            # ``prompt_size``, and the next step's check trips.  This is
-            # an extremely narrow window (requires a sliding-window draft
-            # *and* 0-for-block_size acceptance on the first step) and no
-            # known draft model hits it today.
-            # FIXME: undo the ``cache.offset += skip`` pre-advance on
-            # rejection rollback so the draft cache offset stays correct
-            # across steps even in this edge case.
+            # Sliding-window draft layers do NOT desync this check, even
+            # on full rejection (gh#453 conjectured they would). When a
+            # sliding layer's context exceeds its window,
+            # ``DFlashAttention.__call__`` truncates ``x_ctx`` to ``keep
+            # = window - 1`` tokens and pre-advances ``cache.offset +=
+            # skip`` for the dropped positions. The subsequent
+            # ``RotatingKVCache.update_and_fetch`` then advances offset
+            # by the *post-truncation* count (``keep``), so the net
+            # advance is ``skip + keep == S`` — identical to a
+            # full-attention layer. The skipped positions are real
+            # (evicted from the window), so the pre-advance is correct
+            # and is deliberately NOT rolled back on rejection: undoing
+            # it would apply wrong RoPE positions to later context
+            # writes. This check runs on a full-attention layer (which
+            # never skips), whose offset therefore always equals
+            # ``prompt_size + n_generated - 1`` by construction. The
+            # guard remains a fail-stop against future bookkeeping bugs.
+            # Locked by ``test_sliding_draft_offset_stays_in_lockstep_
+            # on_full_rejection``.
             if draft_offset != target_offset:
                 msg = (
                     f"DFlash internal invariant violated: draft cache offset "

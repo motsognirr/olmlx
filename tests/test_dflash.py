@@ -945,6 +945,78 @@ class TestDFlashDecoder:
         assert stats["proposed"] == 2
         assert stats["lambda"] == 2
 
+    def test_sliding_draft_offset_stays_in_lockstep_on_full_rejection(self):
+        """Regression for gh#453.
+
+        The issue conjectured that a sliding-window draft layer's
+        ``cache.offset += skip`` pre-advance (in ``DFlashAttention``)
+        is never rolled back on full rejection, desyncing the draft
+        cache offset and tripping the full-attention invariant check in
+        ``step()``.
+
+        It cannot: ``RotatingKVCache.update_and_fetch`` advances
+        ``offset`` by the *post-truncation* token count (``keep``), and
+        the layer already truncated ``x_ctx`` to ``keep`` tokens before
+        the write, so the net advance is ``skip + keep == S`` — exactly
+        the same advance a full-attention layer makes. The skipped
+        positions are real (evicted from the window), so the advance is
+        correct and must NOT be undone on rollback.
+
+        This drives the exact scenario from the issue — sliding+full
+        draft, prompt longer than the window, full rejection on every
+        step (random weights guarantee draft/target tokens disagree) —
+        and asserts the sliding-layer draft cache offset stays in
+        lockstep with the full-attention layer's and with
+        ``prompt_size + n_generated - 1`` across steps, with no
+        ``RuntimeError``. Subtracting ``skip`` on rollback (the issue's
+        suggested "fix") would break the lockstep assertion.
+        """
+        mx.random.seed(0)
+        vocab_size, hidden_size = 32, 16
+        window = 4  # keep = window - 1 = 3
+        prompt_len = 12  # >> window so the skip pre-advance fires on step 1
+
+        target = _Target(vocab_size, hidden_size, num_layers=4)
+        cfg = _make_draft_config(
+            vocab_size,
+            hidden_size,
+            target_layer_ids=[1, 3],
+            num_hidden_layers=2,
+            sliding_window=window,
+            layer_types=("sliding_attention", "full_attention"),
+            block_size=4,
+        )
+        draft = DFlashDraftModel(cfg)
+        decoder = DFlashDecoder(target, draft, cfg, block_size=4)
+
+        decoder.prefill(mx.array([list(range(1, prompt_len + 1))]))
+        sliding_idx, ft_idx = 0, 1
+
+        for _ in range(6):
+            # The offset guard fires DURING step() and checks the draft
+            # offset against ``prompt_size + n_generated - 1`` using the
+            # *entry* value of ``_n_generated`` (before the post-step
+            # increment), so snapshot it now.
+            n_gen_entry = decoder._n_generated
+            # No RuntimeError from the offset invariant guard.
+            accepted, _ = decoder.step()
+            # Random weights ⇒ the draft never matches the target ⇒ only
+            # the bonus token is accepted (the 0-for-block_size case).
+            assert len(accepted) == 1
+            sliding_off = decoder._draft_cache[sliding_idx].offset
+            ft_off = decoder._draft_cache[ft_idx].offset
+            # The sliding-layer offset stays in lockstep with the
+            # full-attention layer (the gh#453 invariant) and matches the
+            # value the in-step guard validated against.
+            assert sliding_off == ft_off == decoder._prompt_size + n_gen_entry - 1
+
+        # Confirm the skip actually fired: the sliding cache holds at most
+        # ``keep`` physical tokens yet its offset ran far past that — proof
+        # the pre-advance happened (otherwise the test proves nothing).
+        sliding_cache = decoder._draft_cache[sliding_idx]
+        assert sliding_cache.keys.shape[2] <= window - 1
+        assert sliding_cache.offset > window - 1
+
 
 # ---------------------------------------------------------------------------
 # Migration / config routing
