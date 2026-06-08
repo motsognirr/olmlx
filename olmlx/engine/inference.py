@@ -863,7 +863,9 @@ async def _await_deferred_cleanup():
             )
 
 
-async def _schedule_deferred_inference_cleanup(stream) -> None:
+async def _schedule_deferred_inference_cleanup(
+    stream, audio_temps: list[str] | None = None
+) -> None:
     """Schedule deferred GPU cleanup when the inference thread is stuck.
 
     Polls the thread until it exits, then syncs Metal and releases the
@@ -875,6 +877,10 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
     better than permanent deadlock).
 
     Uses _deferred_cleanup_lock to prevent TOCTOU races on _deferred_cleanup_tasks (Bug #119).
+
+    ``audio_temps``: temp audio file paths to delete after the thread exits
+    (or after timeout).  Passed from ``_stream_completion`` so that temp files
+    are never deleted while the worker thread may still be reading them.
     """
     lock = _get_inference_lock()
     loop = asyncio.get_running_loop()
@@ -905,6 +911,13 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
             else:
                 logger.info("Deferred inference cleanup: thread exited cleanly")
         finally:
+            # Clean up temp audio files now that the worker thread is done
+            # (or we've given up waiting for it).  Must happen before lock
+            # release so callers can rely on "lock released ⇒ temps gone".
+            if audio_temps:
+                from olmlx.utils.audio_input import cleanup_temp_audio
+
+                cleanup_temp_audio(audio_temps)
             # ``_safe_sync`` already suppresses errors from its own
             # ``mx.synchronize`` calls, but wrap defensively so
             # ``lock.release()`` is truly unconditional — a future refactor
@@ -3656,7 +3669,7 @@ async def _stream_completion(
                 lm, tokens, original_prompt, max_tokens, broadcast_kwargs
             )
 
-        if lm.is_speculative and not images and grammar_active:
+        if lm.is_speculative and not (images or audio_paths) and grammar_active:
             # Speculative decoders do not consume gen_kwargs["logits_processors"],
             # so a grammar-constrained request would bypass the mask entirely.
             # Disable speculative for this request (issue #361). Constrain-after-
@@ -3668,7 +3681,7 @@ async def _stream_completion(
             )
             use_speculative = False
         else:
-            use_speculative = lm.is_speculative and not images
+            use_speculative = lm.is_speculative and not (images or audio_paths)
 
         # prompt is a str or a token-id list; only the latter gives a count here.
         _prefill_prompt_tokens = len(prompt) if isinstance(prompt, list) else None
@@ -3929,12 +3942,6 @@ async def _stream_completion(
             logger.debug("metrics: observe_inference failed (stream)", exc_info=True)
         yield done_chunk
     finally:
-        # Clean up any temp audio files created by materialize_audio.
-        # This runs after the stream is fully drained (the worker thread has
-        # already read the audio file), so there is no race against the reader.
-        from olmlx.utils.audio_input import cleanup_temp_audio
-
-        cleanup_temp_audio(_audio_temps)
         # Release GPU-backed references from gen_kwargs so they can be
         # garbage-collected.  prompt_cache is either stored in the cache
         # store (successful path) or should be freed; prompt_cache_state
@@ -3994,13 +4001,19 @@ async def _stream_completion(
             # Thread is stuck (likely in long prefill).  Defer cleanup to
             # avoid calling _safe_sync() while the thread is still using
             # the GPU — that causes an uncatchable Metal assertion crash.
+            # Pass _audio_temps so temp files are deleted only after the
+            # thread exits (deleting them now would race the reader).
             logger.warning(
                 "Inference thread still alive after cleanup attempts — "
                 "deferring Metal sync and lock release until thread exits"
             )
-            await _schedule_deferred_inference_cleanup(stream)
+            await _schedule_deferred_inference_cleanup(stream, audio_temps=_audio_temps)
         else:
-            # Normal path — thread exited, safe to sync and release.
+            # Normal path — thread exited, safe to clean up and release.
+            # Delete temp audio files now that the worker thread is done.
+            from olmlx.utils.audio_input import cleanup_temp_audio
+
+            cleanup_temp_audio(_audio_temps)
             try:
                 _lock_boundary_sync(lm.sync_mode)
             except ValueError:
