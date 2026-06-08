@@ -25,7 +25,7 @@ def _local_dir_or_skip(repo: str) -> str:
 
     try:
         return snapshot_download(repo, local_files_only=True)
-    except (LocalEntryNotFoundError, FileNotFoundError, OSError):
+    except LocalEntryNotFoundError:
         pytest.skip(f"{repo} not downloaded; skipping live rerank test")
 
 
@@ -33,11 +33,14 @@ def _safetensors_keys(path: str) -> list[str]:
     import glob
     import os
 
-    import mlx.core as mx
+    from safetensors import safe_open
 
+    # Header-only read — avoids materializing ~2.3 GB of weights just to
+    # inspect the key names for layout detection.
     keys: list[str] = []
     for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
-        keys.extend(mx.load(f).keys())
+        with safe_open(f, framework="numpy") as st:
+            keys.extend(st.keys())
     return keys
 
 
@@ -76,6 +79,9 @@ def test_load_and_rank(repo):
 
 
 def test_batch_of_100_documents():
+    # Throughput / no-crash check: scores a 100-doc batch (multiple internal
+    # micro-batches) and confirms the count and that scores are valid
+    # probabilities. Not a ranking-quality assertion.
     from transformers import AutoTokenizer
 
     from olmlx.engine.inference import _score_pairs
