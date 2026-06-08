@@ -27,6 +27,7 @@ def test_rerankerconfig_from_dict_bge():
     assert cfg.pad_token_id == 1
     assert cfg.num_labels == 1
     assert cfg.head_dim == 64
+    assert cfg.hidden_act == "gelu"
 
 
 def test_rerankerconfig_num_labels_from_num_labels_key():
@@ -45,3 +46,4 @@ def test_rerankerconfig_num_labels_from_num_labels_key():
     cfg = RerankerConfig.from_dict(raw)
     assert cfg.num_labels == 1
     assert cfg.head_dim == 64
+    assert cfg.hidden_act == "gelu"  # default applied when key absent

@@ -28,8 +28,8 @@ class RerankerConfig:
     def from_dict(cls, raw: dict[str, Any]) -> RerankerConfig:
         num_labels = raw.get("num_labels")
         if num_labels is None:
-            id2label = raw.get("id2label") or {"0": "LABEL_0"}
-            num_labels = len(id2label)
+            id2label = raw.get("id2label")
+            num_labels = len(id2label) if id2label is not None else 1
         return cls(
             hidden_size=int(raw["hidden_size"]),
             num_hidden_layers=int(raw["num_hidden_layers"]),
