@@ -3509,6 +3509,7 @@ async def _stream_completion(
     gen_kwargs: dict,
     stats: TimingStats,
     images: list[str] | None = None,
+    audio: list[str] | None = None,
     *,
     use_prompt_cache: bool = False,
     prompt_tokens: list[int] | None = None,
@@ -3568,7 +3569,12 @@ async def _stream_completion(
     # Pop stop sequences before cache setup / stream creation so they are not
     # forwarded to mlx-lm (which does not support them).
     stop_sequences: list[str] | None = gen_kwargs.pop("stop", None)
+    # Initialize before try so the finally can always reference it.
+    _audio_temps: list[str] = []
     try:
+        from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
+
+        audio_paths, _audio_temps = materialize_audio(audio)
         # Cache setup — must happen after lock to prevent concurrent cache corruption
         if use_prompt_cache and lm.is_vlm:
             # VLM: attach an mlx_vlm PromptCacheState. ``prompt`` stays the full
@@ -3748,6 +3754,7 @@ async def _stream_completion(
                     max_tokens=max_tokens,
                     is_vlm=lm.is_vlm,
                     images=images,
+                    audio=audio_paths,
                     memory_limit=memory_limit,
                     trace_context=_tracing.current_context(),
                     **gen_kwargs,
@@ -3922,6 +3929,12 @@ async def _stream_completion(
             logger.debug("metrics: observe_inference failed (stream)", exc_info=True)
         yield done_chunk
     finally:
+        # Clean up any temp audio files created by materialize_audio.
+        # This runs after the stream is fully drained (the worker thread has
+        # already read the audio file), so there is no race against the reader.
+        from olmlx.utils.audio_input import cleanup_temp_audio
+
+        cleanup_temp_audio(_audio_temps)
         # Release GPU-backed references from gen_kwargs so they can be
         # garbage-collected.  prompt_cache is either stored in the cache
         # store (successful path) or should be freed; prompt_cache_state
@@ -4014,6 +4027,7 @@ async def _full_completion(
     gen_kwargs: dict,
     stats: TimingStats,
     images: list[str] | None = None,
+    audio: list[str] | None = None,
     has_tools: bool = False,
     *,
     use_prompt_cache: bool = False,
@@ -4101,6 +4115,7 @@ async def _full_completion(
                     gen_kwargs,
                     stats,
                     images,
+                    audio,
                     has_tools=has_tools,
                     generated_tokens_out=generated_tokens if use_prompt_cache else None,
                     grammar_active=grammar_active,
@@ -4181,11 +4196,17 @@ async def _full_completion_inner(
     gen_kwargs: dict,
     stats: TimingStats,
     images: list[str] | None = None,
+    audio: list[str] | None = None,
     has_tools: bool = False,
     *,
     generated_tokens_out: list[int] | None = None,
     grammar_active: bool = False,
 ) -> dict:
+    from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
+
+    _audio_temps: list[str] = []
+    audio_paths, _audio_temps = materialize_audio(audio)
+
     def _generate_sync():
         """Run generate + synchronize in the same thread so GPU work completes
         before the thread returns to the pool."""
@@ -4202,7 +4223,11 @@ async def _full_completion_inner(
         # The disable-on-grammar path is taken when both speculative is
         # loaded and grammar is requested for this request; otherwise
         # fall through to the speculative branch unchanged.
-        if lm.is_speculative and grammar_active and not (lm.is_vlm and images):
+        if (
+            lm.is_speculative
+            and grammar_active
+            and not (lm.is_vlm and (images or audio_paths))
+        ):
             logger.warning(
                 "Speculative decoding disabled for this request: "
                 "grammar-constrained decoding is not yet plumbed through "
@@ -4212,7 +4237,7 @@ async def _full_completion_inner(
         else:
             use_speculative = lm.is_speculative
 
-        if lm.is_vlm and images:
+        if lm.is_vlm and (images or audio_paths):
             if lm.is_speculative:
                 logger.debug("speculative decoding skipped: request includes images")
             import mlx_vlm
@@ -4231,6 +4256,7 @@ async def _full_completion_inner(
                 lm.tokenizer,
                 prompt=prompt,
                 image=images,
+                audio=audio_paths,
                 max_tokens=max_tokens,
                 **gen_kwargs,
             ):
@@ -4283,6 +4309,7 @@ async def _full_completion_inner(
                 lm.tokenizer,
                 prompt=prompt,
                 image=images,
+                audio=audio_paths,
                 max_tokens=max_tokens,
                 **gen_kwargs,
             ):
@@ -4337,97 +4364,105 @@ async def _full_completion_inner(
     # in _stream_completion. The prefill span marks prompt readiness; the decode
     # span wraps the generation work and carries the finalized token counts. Both
     # nest under the entry-point ``inference`` span via the active OTel context.
-    prompt_token_count = len(prompt) if isinstance(prompt, list) else None
-    with _tracing.span(
-        "prefill", prompt_tokens=prompt_token_count, **{"gen.stream": False}
-    ):
-        pass
-    with _tracing.span("decode") as _decode_span:
-        with Timer() as total_timer:
-            with Timer() as eval_timer:
-                result = await asyncio.to_thread(_generate_sync)
-        stats.total_duration = total_timer.duration_ns
-
-        # Unpack (GenerationResult, full_text) tuple from stream_generate path
-        full_text = None
-        if isinstance(result, tuple):
-            gen_result, full_text = result
-            result = gen_result
-
-        # Extract token counts from GenerationResult (stream_generate) or string
-        if hasattr(result, "prompt_tokens"):
-            stats.prompt_eval_count = result.prompt_tokens
-        if hasattr(result, "generation_tokens"):
-            stats.eval_count = result.generation_tokens
-
-        prompt_tps, gen_tps = _derive_timing_stats(
-            stats,
-            getattr(result, "prompt_tps", 0) or 0,
-            getattr(result, "generation_tps", 0) or 0,
-            eval_timer.duration_ns,
-            # Non-streaming reports the mlx-lm-prefilled count as prompt_eval_count
-            # already, so this matches — passed explicitly for parity with the
-            # streaming path's cache-hit handling.
-            prefilled_count=getattr(result, "prompt_tokens", None),
-        )
-        # ttft_ns: prefill + decode are fused in the single _generate_sync
-        # thread call here, so surface the measured prefill duration as the
-        # time-to-first-token attribute (the prefill span only marks readiness).
-        _decode_span.set_attributes(
-            {
-                "eval_count": stats.eval_count,
-                "decode_tok_s": _metrics._decode_tps(stats),
-                "ttft_ns": stats.prompt_eval_duration,
-            }
-        )
-    total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
-    logger.info(
-        "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
-        stats.prompt_eval_count,
-        prompt_tps,
-        stats.eval_count,
-        gen_tps,
-        total_secs,
-    )
-
-    # Extract text: prefer accumulated full_text, fall back to result
-    if full_text is not None:
-        text = full_text
-    elif result is None:
-        text = ""
-    elif hasattr(result, "text"):
-        text = result.text
-    elif isinstance(result, str):
-        text = result
-    else:
-        text = str(result)
-
-    # Strip gpt-oss channel tokens for non-streaming path.
-    # Keep raw_text so routers can parse tool calls from the full output.
-    raw_text = None
-    tool_uses = None
-    thinking = ""
-    if lm.template_caps.has_channel_format and "<|channel|>" in text:
-        from olmlx.engine.tool_parser import _parse_gpt_oss_channels
-
-        raw_text = text
-        parsed = _parse_gpt_oss_channels(text, has_tools=has_tools)
-        if parsed is not None:
-            thinking, visible, tool_uses = parsed
-            text = visible
-
-    result_dict: dict = {"text": text, "done": True, "stats": stats}
-    if raw_text is not None:
-        result_dict["raw_text"] = raw_text
-    if tool_uses:
-        result_dict["tool_uses"] = tool_uses
-    if thinking:
-        result_dict["thinking"] = thinking
     try:
-        _metrics.observe_inference(lm.name, surface_var.get(), stats)
-    except Exception:
-        logger.debug("metrics: observe_inference failed (non-stream)", exc_info=True)
-    return result_dict
+        prompt_token_count = len(prompt) if isinstance(prompt, list) else None
+        with _tracing.span(
+            "prefill", prompt_tokens=prompt_token_count, **{"gen.stream": False}
+        ):
+            pass
+        with _tracing.span("decode") as _decode_span:
+            with Timer() as total_timer:
+                with Timer() as eval_timer:
+                    result = await asyncio.to_thread(_generate_sync)
+            stats.total_duration = total_timer.duration_ns
+
+            # Unpack (GenerationResult, full_text) tuple from stream_generate path
+            full_text = None
+            if isinstance(result, tuple):
+                gen_result, full_text = result
+                result = gen_result
+
+            # Extract token counts from GenerationResult (stream_generate) or string
+            if hasattr(result, "prompt_tokens"):
+                stats.prompt_eval_count = result.prompt_tokens
+            if hasattr(result, "generation_tokens"):
+                stats.eval_count = result.generation_tokens
+
+            prompt_tps, gen_tps = _derive_timing_stats(
+                stats,
+                getattr(result, "prompt_tps", 0) or 0,
+                getattr(result, "generation_tps", 0) or 0,
+                eval_timer.duration_ns,
+                # Non-streaming reports the mlx-lm-prefilled count as prompt_eval_count
+                # already, so this matches — passed explicitly for parity with the
+                # streaming path's cache-hit handling.
+                prefilled_count=getattr(result, "prompt_tokens", None),
+            )
+            # ttft_ns: prefill + decode are fused in the single _generate_sync
+            # thread call here, so surface the measured prefill duration as the
+            # time-to-first-token attribute (the prefill span only marks readiness).
+            _decode_span.set_attributes(
+                {
+                    "eval_count": stats.eval_count,
+                    "decode_tok_s": _metrics._decode_tps(stats),
+                    "ttft_ns": stats.prompt_eval_duration,
+                }
+            )
+        total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
+        logger.info(
+            "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
+            stats.prompt_eval_count,
+            prompt_tps,
+            stats.eval_count,
+            gen_tps,
+            total_secs,
+        )
+
+        # Extract text: prefer accumulated full_text, fall back to result
+        if full_text is not None:
+            text = full_text
+        elif result is None:
+            text = ""
+        elif hasattr(result, "text"):
+            text = result.text
+        elif isinstance(result, str):
+            text = result
+        else:
+            text = str(result)
+
+        # Strip gpt-oss channel tokens for non-streaming path.
+        # Keep raw_text so routers can parse tool calls from the full output.
+        raw_text = None
+        tool_uses = None
+        thinking = ""
+        if lm.template_caps.has_channel_format and "<|channel|>" in text:
+            from olmlx.engine.tool_parser import _parse_gpt_oss_channels
+
+            raw_text = text
+            parsed = _parse_gpt_oss_channels(text, has_tools=has_tools)
+            if parsed is not None:
+                thinking, visible, tool_uses = parsed
+                text = visible
+
+        result_dict: dict = {"text": text, "done": True, "stats": stats}
+        if raw_text is not None:
+            result_dict["raw_text"] = raw_text
+        if tool_uses:
+            result_dict["tool_uses"] = tool_uses
+        if thinking:
+            result_dict["thinking"] = thinking
+        try:
+            _metrics.observe_inference(lm.name, surface_var.get(), stats)
+        except Exception:
+            logger.debug(
+                "metrics: observe_inference failed (non-stream)", exc_info=True
+            )
+        return result_dict
+    finally:
+        # Clean up any temp audio files created by materialize_audio.
+        # The worker thread (_generate_sync) has returned via asyncio.to_thread,
+        # so all audio reads are complete before this runs — no race condition.
+        cleanup_temp_audio(_audio_temps)
 
 
 @overload
