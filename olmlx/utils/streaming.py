@@ -664,6 +664,7 @@ def async_mlx_stream(
     max_tokens: int = 512,
     is_vlm: bool = False,
     images: list[str] | None = None,
+    audio: list[str] | None = None,
     memory_limit: int = 0,
     trace_context: Any = None,
     **kwargs: Any,
@@ -703,6 +704,7 @@ def async_mlx_stream(
                 tokenizer,
                 prompt=prompt,
                 image=images,
+                audio=audio,
                 max_tokens=max_tokens,
                 **kwargs,
             )

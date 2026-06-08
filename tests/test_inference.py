@@ -2129,6 +2129,54 @@ class TestGenerateChat:
 
         assert result["text"] == "tool response"
 
+    @pytest.mark.asyncio
+    async def test_generate_chat_rejects_audio_on_non_audio_model(self, mock_manager):
+        """generate_chat raises ValueError when audio is present but the model
+        cannot accept audio input (not an audio-capable VLM)."""
+        # mock_manager provides a text-only (is_vlm=False) model, so
+        # _audio_capable() returns False and the capability check must fire.
+        with patch("olmlx.engine.inference.settings.prompt_cache", False):
+            with pytest.raises(ValueError, match="cannot accept audio"):
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [
+                        {
+                            "role": "user",
+                            "content": "transcribe this",
+                            "audio": ["sample.wav"],
+                        }
+                    ],
+                    stream=False,
+                )
+
+    @pytest.mark.asyncio
+    async def test_generate_chat_rejects_tools_with_audio(
+        self, mock_manager, monkeypatch
+    ):
+        """tools + audio is rejected for every VLM template branch — the guard
+        lives in generate_chat, not only in _apply_chat_template_vlm (which the
+        system-injection branch bypasses since it omits tools=)."""
+        # Pretend the loaded model is audio-capable so the capability check
+        # passes and the tools+audio guard is what fires.
+        monkeypatch.setattr("olmlx.engine.inference._audio_capable", lambda lm: True)
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+        with patch("olmlx.engine.inference.settings.prompt_cache", False):
+            with pytest.raises(ValueError, match="tools . audio|audio . tools"):
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [
+                        {
+                            "role": "user",
+                            "content": "what is said?",
+                            "audio": ["sample.wav"],
+                        }
+                    ],
+                    tools=tools,
+                    stream=False,
+                )
+
 
 class TestGenerateChatEnableThinking:
     @pytest.mark.asyncio
@@ -5536,3 +5584,104 @@ def test_vlm_tools_no_user_message_warns_and_renders_text_only(caplog):
                 processor, MagicMock(), messages, ["a.jpg"], tools=tools
             )
     assert "no user message to attach" in caplog.text
+
+
+def test_extract_audio_collects_from_messages():
+    from olmlx.engine.inference import _extract_audio
+
+    msgs = [
+        {"role": "user", "content": "hi", "audio": ["a.wav"]},
+        {"role": "user", "content": "x", "audio": ["b.mp3", "c.flac"]},
+        {"role": "user", "content": "no audio"},
+    ]
+    assert _extract_audio(msgs) == ["a.wav", "b.mp3", "c.flac"]
+
+
+def test_extract_audio_returns_none_when_absent():
+    from olmlx.engine.inference import _extract_audio
+
+    assert _extract_audio([{"role": "user", "content": "hi"}]) is None
+
+
+def test_audio_capable_true_for_vlm_with_feature_extractor():
+    from types import SimpleNamespace
+
+    from olmlx.engine.inference import _audio_capable
+
+    proc = SimpleNamespace(feature_extractor=object())
+    lm = SimpleNamespace(is_vlm=True, tokenizer=proc)
+    assert _audio_capable(lm) is True
+
+
+def test_audio_capable_false_for_vlm_without_feature_extractor():
+    from types import SimpleNamespace
+
+    from olmlx.engine.inference import _audio_capable
+
+    proc = SimpleNamespace(feature_extractor=None)
+    lm = SimpleNamespace(is_vlm=True, tokenizer=proc)
+    assert _audio_capable(lm) is False
+
+
+def test_audio_capable_false_for_text_model():
+    from types import SimpleNamespace
+
+    from olmlx.engine.inference import _audio_capable
+
+    lm = SimpleNamespace(is_vlm=False, tokenizer=object())
+    assert _audio_capable(lm) is False
+
+
+def test_apply_chat_template_vlm_passes_num_audios(monkeypatch):
+    import mlx_vlm
+
+    from olmlx.engine import inference as inf
+
+    captured = {}
+
+    def fake_apply(processor, config, messages, num_images=0, num_audios=0, **kw):
+        captured["num_images"] = num_images
+        captured["num_audios"] = num_audios
+        return "PROMPT"
+
+    monkeypatch.setattr(mlx_vlm, "apply_chat_template", fake_apply)
+
+    class _M:
+        config = {}
+
+    out = inf._apply_chat_template_vlm(
+        processor=object(),
+        model=_M(),
+        messages=[{"role": "user", "content": "hi"}],
+        images=None,
+        audio=["a.wav", "b.wav"],
+    )
+    assert out == "PROMPT"
+    assert captured == {"num_images": 0, "num_audios": 2}
+
+
+def test_apply_chat_template_vlm_rejects_tools_with_audio():
+    from olmlx.engine import inference as inf
+
+    with pytest.raises(ValueError, match="tools.*audio|audio.*tools"):
+        inf._apply_chat_template_vlm(
+            processor=object(),
+            model=object(),
+            messages=[{"role": "user", "content": "hi"}],
+            images=None,
+            audio=["a.wav"],
+            tools=[{"type": "function", "function": {"name": "f"}}],
+        )
+
+
+def test_completion_functions_accept_audio_param():
+    import inspect
+
+    from olmlx.engine import inference as inf
+
+    for fn in (
+        inf._stream_completion,
+        inf._full_completion,
+        inf._full_completion_inner,
+    ):
+        assert "audio" in inspect.signature(fn).parameters, fn.__name__

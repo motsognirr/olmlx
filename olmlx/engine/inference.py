@@ -58,6 +58,7 @@ from olmlx.context import surface_var
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils import metrics as _metrics
 from olmlx.utils import tracing as _tracing
+from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
 from olmlx.utils.streaming import async_mlx_stream
 from olmlx.utils.timing import Timer, TimingStats
 
@@ -863,7 +864,9 @@ async def _await_deferred_cleanup():
             )
 
 
-async def _schedule_deferred_inference_cleanup(stream) -> None:
+async def _schedule_deferred_inference_cleanup(
+    stream, audio_temps: list[str] | None = None
+) -> None:
     """Schedule deferred GPU cleanup when the inference thread is stuck.
 
     Polls the thread until it exits, then syncs Metal and releases the
@@ -875,6 +878,10 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
     better than permanent deadlock).
 
     Uses _deferred_cleanup_lock to prevent TOCTOU races on _deferred_cleanup_tasks (Bug #119).
+
+    ``audio_temps``: temp audio file paths to delete after the thread exits
+    (or after timeout).  Passed from ``_stream_completion`` so that temp files
+    are never deleted while the worker thread may still be reading them.
     """
     lock = _get_inference_lock()
     loop = asyncio.get_running_loop()
@@ -905,6 +912,13 @@ async def _schedule_deferred_inference_cleanup(stream) -> None:
             else:
                 logger.info("Deferred inference cleanup: thread exited cleanly")
         finally:
+            # Clean up temp audio files now that the worker thread is done
+            # (or we've given up waiting for it).  Must happen before lock
+            # release so callers can rely on "lock released ⇒ temps gone".
+            if audio_temps:
+                from olmlx.utils.audio_input import cleanup_temp_audio
+
+                cleanup_temp_audio(audio_temps)
             # ``_safe_sync`` already suppresses errors from its own
             # ``mx.synchronize`` calls, but wrap defensively so
             # ``lock.release()`` is truly unconditional — a future refactor
@@ -2177,6 +2191,7 @@ def _apply_chat_template_vlm(
     images: list[str] | None = None,
     tools: list[dict] | None = None,
     enable_thinking: bool | None = None,
+    audio: list[str] | None = None,
 ) -> str:
     """Apply chat template for vision-language models (mlx-vlm).
 
@@ -2185,6 +2200,12 @@ def _apply_chat_template_vlm(
     text content in ``[{type: text, text: ..., content: ...}]`` dicts, which
     the Jinja template renders as Python list repr — garbling the prompt.
     """
+    if audio and tools:
+        raise ValueError(
+            "tools + audio is not supported in this version: combining native "
+            "tool calling with audio input is out of scope (#426). Send the "
+            "audio without tools, or the tools without audio."
+        )
     if tools:
         # Use the tokenizer directly to get clean native tool formatting.
         # mlx_vlm.apply_chat_template wraps text content in dicts that some
@@ -2230,6 +2251,7 @@ def _apply_chat_template_vlm(
 
     config = model.config if hasattr(model, "config") else {}
     num_images = len(images) if images else 0
+    num_audios = len(audio) if audio else 0
     # mlx_vlm.apply_chat_template forwards **kwargs to the tokenizer's
     # apply_chat_template, so enable_thinking reaches the Jinja template
     # (templates that don't declare the variable ignore it).  Only forward
@@ -2239,7 +2261,12 @@ def _apply_chat_template_vlm(
         extra_kwargs["enable_thinking"] = enable_thinking
     # Pass the full message list so the model gets proper conversation context
     result = mlx_vlm.apply_chat_template(
-        processor, config, messages, num_images=num_images, **extra_kwargs
+        processor,
+        config,
+        messages,
+        num_images=num_images,
+        num_audios=num_audios,
+        **extra_kwargs,
     )
     if not isinstance(result, str):
         raise TypeError(
@@ -2307,6 +2334,27 @@ def _extract_images(messages: list[dict]) -> list[str] | None:
         if msg.get("images"):
             images.extend(msg["images"])
     return images if images else None
+
+
+def _extract_audio(messages: list[dict]) -> list[str] | None:
+    """Extract audio refs (URLs/paths/data-URIs) from message content (#426)."""
+    audio: list[str] = []
+    for msg in messages:
+        if msg.get("audio"):
+            audio.extend(msg["audio"])
+    return audio if audio else None
+
+
+def _audio_capable(lm: Any) -> bool:
+    """True when the loaded model can accept audio input.
+
+    Audio models are VLMs whose mlx-vlm processor wires a ``feature_extractor``
+    (Gemma 4, gemma3n, qwen3_omni_moe, phi4mm, minicpmo).  Read from the
+    already-loaded processor — no new ModelManager kind needed.
+    """
+    if not getattr(lm, "is_vlm", False):
+        return False
+    return getattr(lm.tokenizer, "feature_extractor", None) is not None
 
 
 def count_chat_tokens(
@@ -3475,6 +3523,7 @@ async def _stream_completion(
     gen_kwargs: dict,
     stats: TimingStats,
     images: list[str] | None = None,
+    audio: list[str] | None = None,
     *,
     use_prompt_cache: bool = False,
     prompt_tokens: list[int] | None = None,
@@ -3534,7 +3583,10 @@ async def _stream_completion(
     # Pop stop sequences before cache setup / stream creation so they are not
     # forwarded to mlx-lm (which does not support them).
     stop_sequences: list[str] | None = gen_kwargs.pop("stop", None)
+    # Initialize before try so the finally can always reference it.
+    _audio_temps: list[str] = []
     try:
+        audio_paths, _audio_temps = materialize_audio(audio)
         # Cache setup — must happen after lock to prevent concurrent cache corruption
         if use_prompt_cache and lm.is_vlm:
             # VLM: attach an mlx_vlm PromptCacheState. ``prompt`` stays the full
@@ -3616,7 +3668,7 @@ async def _stream_completion(
                 lm, tokens, original_prompt, max_tokens, broadcast_kwargs
             )
 
-        if lm.is_speculative and not images and grammar_active:
+        if lm.is_speculative and not (images or audio_paths) and grammar_active:
             # Speculative decoders do not consume gen_kwargs["logits_processors"],
             # so a grammar-constrained request would bypass the mask entirely.
             # Disable speculative for this request (issue #361). Constrain-after-
@@ -3628,7 +3680,7 @@ async def _stream_completion(
             )
             use_speculative = False
         else:
-            use_speculative = lm.is_speculative and not images
+            use_speculative = lm.is_speculative and not (images or audio_paths)
 
         # prompt is a str or a token-id list; only the latter gives a count here.
         _prefill_prompt_tokens = len(prompt) if isinstance(prompt, list) else None
@@ -3701,7 +3753,7 @@ async def _stream_completion(
             else:
                 if lm.is_speculative:
                     logger.debug(
-                        "speculative decoding skipped: request includes images"
+                        "speculative decoding skipped: request includes images or audio"
                     )
                 # The decode loop runs in the CancellableStream worker thread;
                 # OTel context does not cross threads, so hand the current context
@@ -3714,6 +3766,7 @@ async def _stream_completion(
                     max_tokens=max_tokens,
                     is_vlm=lm.is_vlm,
                     images=images,
+                    audio=audio_paths,
                     memory_limit=memory_limit,
                     trace_context=_tracing.current_context(),
                     **gen_kwargs,
@@ -3947,13 +4000,17 @@ async def _stream_completion(
             # Thread is stuck (likely in long prefill).  Defer cleanup to
             # avoid calling _safe_sync() while the thread is still using
             # the GPU — that causes an uncatchable Metal assertion crash.
+            # Pass _audio_temps so temp files are deleted only after the
+            # thread exits (deleting them now would race the reader).
             logger.warning(
                 "Inference thread still alive after cleanup attempts — "
                 "deferring Metal sync and lock release until thread exits"
             )
-            await _schedule_deferred_inference_cleanup(stream)
+            await _schedule_deferred_inference_cleanup(stream, audio_temps=_audio_temps)
         else:
-            # Normal path — thread exited, safe to sync and release.
+            # Normal path — thread exited, safe to clean up and release.
+            # Delete temp audio files now that the worker thread is done.
+            cleanup_temp_audio(_audio_temps)
             try:
                 _lock_boundary_sync(lm.sync_mode)
             except ValueError:
@@ -3980,6 +4037,7 @@ async def _full_completion(
     gen_kwargs: dict,
     stats: TimingStats,
     images: list[str] | None = None,
+    audio: list[str] | None = None,
     has_tools: bool = False,
     *,
     use_prompt_cache: bool = False,
@@ -4067,6 +4125,7 @@ async def _full_completion(
                     gen_kwargs,
                     stats,
                     images,
+                    audio,
                     has_tools=has_tools,
                     generated_tokens_out=generated_tokens if use_prompt_cache else None,
                     grammar_active=grammar_active,
@@ -4147,11 +4206,15 @@ async def _full_completion_inner(
     gen_kwargs: dict,
     stats: TimingStats,
     images: list[str] | None = None,
+    audio: list[str] | None = None,
     has_tools: bool = False,
     *,
     generated_tokens_out: list[int] | None = None,
     grammar_active: bool = False,
 ) -> dict:
+    audio_paths: list[str] = []
+    _audio_temps: list[str] = []
+
     def _generate_sync():
         """Run generate + synchronize in the same thread so GPU work completes
         before the thread returns to the pool."""
@@ -4168,7 +4231,11 @@ async def _full_completion_inner(
         # The disable-on-grammar path is taken when both speculative is
         # loaded and grammar is requested for this request; otherwise
         # fall through to the speculative branch unchanged.
-        if lm.is_speculative and grammar_active and not (lm.is_vlm and images):
+        if (
+            lm.is_speculative
+            and grammar_active
+            and not (lm.is_vlm and (images or audio_paths))
+        ):
             logger.warning(
                 "Speculative decoding disabled for this request: "
                 "grammar-constrained decoding is not yet plumbed through "
@@ -4178,7 +4245,7 @@ async def _full_completion_inner(
         else:
             use_speculative = lm.is_speculative
 
-        if lm.is_vlm and images:
+        if lm.is_vlm and (images or audio_paths):
             if lm.is_speculative:
                 logger.debug("speculative decoding skipped: request includes images")
             import mlx_vlm
@@ -4197,6 +4264,7 @@ async def _full_completion_inner(
                 lm.tokenizer,
                 prompt=prompt,
                 image=images,
+                audio=audio_paths,
                 max_tokens=max_tokens,
                 **gen_kwargs,
             ):
@@ -4249,6 +4317,7 @@ async def _full_completion_inner(
                 lm.tokenizer,
                 prompt=prompt,
                 image=images,
+                audio=audio_paths,
                 max_tokens=max_tokens,
                 **gen_kwargs,
             ):
@@ -4303,97 +4372,106 @@ async def _full_completion_inner(
     # in _stream_completion. The prefill span marks prompt readiness; the decode
     # span wraps the generation work and carries the finalized token counts. Both
     # nest under the entry-point ``inference`` span via the active OTel context.
-    prompt_token_count = len(prompt) if isinstance(prompt, list) else None
-    with _tracing.span(
-        "prefill", prompt_tokens=prompt_token_count, **{"gen.stream": False}
-    ):
-        pass
-    with _tracing.span("decode") as _decode_span:
-        with Timer() as total_timer:
-            with Timer() as eval_timer:
-                result = await asyncio.to_thread(_generate_sync)
-        stats.total_duration = total_timer.duration_ns
-
-        # Unpack (GenerationResult, full_text) tuple from stream_generate path
-        full_text = None
-        if isinstance(result, tuple):
-            gen_result, full_text = result
-            result = gen_result
-
-        # Extract token counts from GenerationResult (stream_generate) or string
-        if hasattr(result, "prompt_tokens"):
-            stats.prompt_eval_count = result.prompt_tokens
-        if hasattr(result, "generation_tokens"):
-            stats.eval_count = result.generation_tokens
-
-        prompt_tps, gen_tps = _derive_timing_stats(
-            stats,
-            getattr(result, "prompt_tps", 0) or 0,
-            getattr(result, "generation_tps", 0) or 0,
-            eval_timer.duration_ns,
-            # Non-streaming reports the mlx-lm-prefilled count as prompt_eval_count
-            # already, so this matches — passed explicitly for parity with the
-            # streaming path's cache-hit handling.
-            prefilled_count=getattr(result, "prompt_tokens", None),
-        )
-        # ttft_ns: prefill + decode are fused in the single _generate_sync
-        # thread call here, so surface the measured prefill duration as the
-        # time-to-first-token attribute (the prefill span only marks readiness).
-        _decode_span.set_attributes(
-            {
-                "eval_count": stats.eval_count,
-                "decode_tok_s": _metrics._decode_tps(stats),
-                "ttft_ns": stats.prompt_eval_duration,
-            }
-        )
-    total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
-    logger.info(
-        "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
-        stats.prompt_eval_count,
-        prompt_tps,
-        stats.eval_count,
-        gen_tps,
-        total_secs,
-    )
-
-    # Extract text: prefer accumulated full_text, fall back to result
-    if full_text is not None:
-        text = full_text
-    elif result is None:
-        text = ""
-    elif hasattr(result, "text"):
-        text = result.text
-    elif isinstance(result, str):
-        text = result
-    else:
-        text = str(result)
-
-    # Strip gpt-oss channel tokens for non-streaming path.
-    # Keep raw_text so routers can parse tool calls from the full output.
-    raw_text = None
-    tool_uses = None
-    thinking = ""
-    if lm.template_caps.has_channel_format and "<|channel|>" in text:
-        from olmlx.engine.tool_parser import _parse_gpt_oss_channels
-
-        raw_text = text
-        parsed = _parse_gpt_oss_channels(text, has_tools=has_tools)
-        if parsed is not None:
-            thinking, visible, tool_uses = parsed
-            text = visible
-
-    result_dict: dict = {"text": text, "done": True, "stats": stats}
-    if raw_text is not None:
-        result_dict["raw_text"] = raw_text
-    if tool_uses:
-        result_dict["tool_uses"] = tool_uses
-    if thinking:
-        result_dict["thinking"] = thinking
     try:
-        _metrics.observe_inference(lm.name, surface_var.get(), stats)
-    except Exception:
-        logger.debug("metrics: observe_inference failed (non-stream)", exc_info=True)
-    return result_dict
+        audio_paths, _audio_temps = materialize_audio(audio)
+        prompt_token_count = len(prompt) if isinstance(prompt, list) else None
+        with _tracing.span(
+            "prefill", prompt_tokens=prompt_token_count, **{"gen.stream": False}
+        ):
+            pass
+        with _tracing.span("decode") as _decode_span:
+            with Timer() as total_timer:
+                with Timer() as eval_timer:
+                    result = await asyncio.to_thread(_generate_sync)
+            stats.total_duration = total_timer.duration_ns
+
+            # Unpack (GenerationResult, full_text) tuple from stream_generate path
+            full_text = None
+            if isinstance(result, tuple):
+                gen_result, full_text = result
+                result = gen_result
+
+            # Extract token counts from GenerationResult (stream_generate) or string
+            if hasattr(result, "prompt_tokens"):
+                stats.prompt_eval_count = result.prompt_tokens
+            if hasattr(result, "generation_tokens"):
+                stats.eval_count = result.generation_tokens
+
+            prompt_tps, gen_tps = _derive_timing_stats(
+                stats,
+                getattr(result, "prompt_tps", 0) or 0,
+                getattr(result, "generation_tps", 0) or 0,
+                eval_timer.duration_ns,
+                # Non-streaming reports the mlx-lm-prefilled count as prompt_eval_count
+                # already, so this matches — passed explicitly for parity with the
+                # streaming path's cache-hit handling.
+                prefilled_count=getattr(result, "prompt_tokens", None),
+            )
+            # ttft_ns: prefill + decode are fused in the single _generate_sync
+            # thread call here, so surface the measured prefill duration as the
+            # time-to-first-token attribute (the prefill span only marks readiness).
+            _decode_span.set_attributes(
+                {
+                    "eval_count": stats.eval_count,
+                    "decode_tok_s": _metrics._decode_tps(stats),
+                    "ttft_ns": stats.prompt_eval_duration,
+                }
+            )
+        total_secs = stats.total_duration / 1e9 if stats.total_duration else 0
+        logger.info(
+            "Generation complete: %d prompt tokens (%.1f tok/s), %d tokens generated (%.1f tok/s), %.2fs total",
+            stats.prompt_eval_count,
+            prompt_tps,
+            stats.eval_count,
+            gen_tps,
+            total_secs,
+        )
+
+        # Extract text: prefer accumulated full_text, fall back to result
+        if full_text is not None:
+            text = full_text
+        elif result is None:
+            text = ""
+        elif hasattr(result, "text"):
+            text = result.text
+        elif isinstance(result, str):
+            text = result
+        else:
+            text = str(result)
+
+        # Strip gpt-oss channel tokens for non-streaming path.
+        # Keep raw_text so routers can parse tool calls from the full output.
+        raw_text = None
+        tool_uses = None
+        thinking = ""
+        if lm.template_caps.has_channel_format and "<|channel|>" in text:
+            from olmlx.engine.tool_parser import _parse_gpt_oss_channels
+
+            raw_text = text
+            parsed = _parse_gpt_oss_channels(text, has_tools=has_tools)
+            if parsed is not None:
+                thinking, visible, tool_uses = parsed
+                text = visible
+
+        result_dict: dict = {"text": text, "done": True, "stats": stats}
+        if raw_text is not None:
+            result_dict["raw_text"] = raw_text
+        if tool_uses:
+            result_dict["tool_uses"] = tool_uses
+        if thinking:
+            result_dict["thinking"] = thinking
+        try:
+            _metrics.observe_inference(lm.name, surface_var.get(), stats)
+        except Exception:
+            logger.debug(
+                "metrics: observe_inference failed (non-stream)", exc_info=True
+            )
+        return result_dict
+    finally:
+        # Clean up any temp audio files created by materialize_audio.
+        # The worker thread (_generate_sync) has returned via asyncio.to_thread,
+        # so all audio reads are complete before this runs — no race condition.
+        cleanup_temp_audio(_audio_temps)
 
 
 @overload
@@ -4481,6 +4559,24 @@ async def generate_chat(
             enable_thinking = lm.enable_thinking
 
         images = _extract_images(messages)
+        audio = _extract_audio(messages)
+
+        if audio and not _audio_capable(lm):
+            raise ValueError(
+                f"Model {lm.name!r} cannot accept audio input: it is not an "
+                "audio-capable multimodal model. Load a model with an audio "
+                "tower (e.g. a Gemma 4 checkpoint)."
+            )
+        # Reject tools + audio here (out of scope v1) so the contract holds on
+        # every VLM template branch, not only the native-tools one: the
+        # system-injection branch calls _apply_chat_template_vlm without tools=,
+        # which would bypass that function's own audio+tools guard.
+        if audio and tools:
+            raise ValueError(
+                "tools + audio is not supported in this version: combining "
+                "native tool calling with audio input is out of scope (#426). "
+                "Send the audio without tools, or the tools without audio."
+            )
 
         # Normalise OpenAI-format tool_calls ({function: {name, arguments: "json"}})
         # to the flat format chat templates expect ({name, arguments: {...}}).
@@ -4526,6 +4622,7 @@ async def generate_chat(
                     images,
                     tools=tools,
                     enable_thinking=vlm_thinking,
+                    audio=audio,
                 )
                 logger.info(
                     "VLM chat prompt with %d tools (native template)", len(tools)
@@ -4538,6 +4635,7 @@ async def generate_chat(
                     vlm_messages,
                     images,
                     enable_thinking=vlm_thinking,
+                    audio=audio,
                 )
                 logger.info(
                     "VLM chat prompt with %d tools (injected into system)", len(tools)
@@ -4549,6 +4647,7 @@ async def generate_chat(
                     messages,
                     images,
                     enable_thinking=vlm_thinking,
+                    audio=audio,
                 )
             logger.debug("Prompt (first 2000 chars): %s", prompt[:2000])
             logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
@@ -4669,6 +4768,7 @@ async def generate_chat(
                 gen_kwargs,
                 stats,
                 images,
+                audio,
                 use_prompt_cache=use_prompt_cache,
                 prompt_tokens=prompt_tokens,
                 cache_id=cache_id,
@@ -4706,6 +4806,7 @@ async def generate_chat(
                         gen_kwargs,
                         stats,
                         images,
+                        audio,
                         has_tools=bool(tools),
                         use_prompt_cache=use_prompt_cache,
                         prompt_tokens=prompt_tokens,

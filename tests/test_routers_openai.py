@@ -1825,3 +1825,23 @@ def test_normalize_multimodal_malformed_image_raises():
     ]
     with pytest.raises(ValueError, match="image_url"):
         _normalize_multimodal_messages(msgs)
+
+
+def test_normalize_splits_input_audio_into_audio_list():
+    from olmlx.routers.openai import _normalize_multimodal_messages
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is said?"},
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "QQ==", "format": "wav"},
+                },
+            ],
+        }
+    ]
+    out = _normalize_multimodal_messages(messages)
+    assert out[0]["content"] == "what is said?"
+    assert out[0]["audio"] == ["data:audio/wav;base64,QQ=="]
