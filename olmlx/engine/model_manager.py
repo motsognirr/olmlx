@@ -589,11 +589,19 @@ class LoadedModel:
 
 
 def _is_cross_encoder_config(config: dict) -> bool:
-    """True for an XLM-RoBERTa-family sequence-classification reranker (#369)."""
+    """True for an XLM-RoBERTa-family sequence-classification reranker (#369).
+
+    Requires both a ``*ForSequenceClassification`` architecture AND a
+    roberta-family ``model_type`` — the encoder and weight remaps only support
+    XLM-RoBERTa/RoBERTa, so a plain BERT/DistilBERT text classifier must NOT be
+    routed here (it would otherwise be detected as a reranker and fail at load).
+    """
     archs = config.get("architectures") or []
-    return any(
+    if not any(
         isinstance(a, str) and a.endswith("ForSequenceClassification") for a in archs
-    )
+    ):
+        return False
+    return "roberta" in (config.get("model_type") or "").lower()
 
 
 def parse_keep_alive(value: str | int) -> float | None:

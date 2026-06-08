@@ -21,7 +21,7 @@ JINA = "jinaai/jina-reranker-v2-base-multilingual"
 def _local_dir_or_skip(repo: str) -> str:
     """Return the local snapshot dir for an already-cached repo, else skip."""
     from huggingface_hub import snapshot_download
-    from huggingface_hub.utils import LocalEntryNotFoundError
+    from huggingface_hub.errors import LocalEntryNotFoundError
 
     try:
         return snapshot_download(repo, local_files_only=True)
