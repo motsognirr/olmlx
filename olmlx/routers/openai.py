@@ -20,6 +20,7 @@ from olmlx.engine.tool_parser import (
     resolve_tool_names,
 )
 from olmlx.routers.common import build_inference_options, resolve_openai_think
+from olmlx.utils.audio_input import normalize_audio_block
 from olmlx.utils.images import normalize_image_block
 from olmlx.utils.streaming import flush_thinking_buffer, strip_thinking_streaming
 from olmlx.schemas.openai import (
@@ -308,6 +309,7 @@ def _normalize_multimodal_messages(messages: list[dict]) -> list[dict]:
             continue
         texts: list[str] = []
         images: list[str] = []
+        audio: list[str] = []
         for part in content:
             if not isinstance(part, dict):
                 continue
@@ -320,9 +322,13 @@ def _normalize_multimodal_messages(messages: list[dict]) -> list[dict]:
                     texts.append(text)
             elif ptype == "image_url":
                 images.append(normalize_image_block(part))
+            elif ptype == "input_audio":
+                audio.append(normalize_audio_block(part))
         m["content"] = " ".join(texts)
         if images:
             m["images"] = (m.get("images") or []) + images
+        if audio:
+            m["audio"] = (m.get("audio") or []) + audio
     return messages
 
 
