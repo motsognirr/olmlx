@@ -413,6 +413,13 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
     leaves its server orphaned with the model still resident in RAM. Across a
     multi-scenario / multi-model sweep these orphans accumulate to tens of GB
     and eventually starve later loads (observed: 61 GB, cascading load failures).
+
+    Order matters: ``killpg`` must run *before* ``wait``. The server grandchild
+    inherits the worker's stderr PIPE, so it holds a write end open; killing the
+    whole group first closes every write end, letting the ``waitpid``-only
+    ``wait`` return without blocking on unread pipe data. Do not refactor this to
+    read pipes (e.g. ``communicate``) after the group is gone, and do not narrow
+    the kill to a single PID — either would risk a hang on a surviving server.
     """
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -472,14 +479,22 @@ def _run_worker(
         try:
             try:
                 _, stderr = proc.communicate(timeout=worker_timeout)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
+                # communicate() attaches whatever it had drained before the
+                # deadline to the exception — surface its tail so a timed-out
+                # scenario is diagnosable instead of silent. (bytes if the
+                # decoder hadn't run yet; guard for that and for None.)
+                partial = exc.stderr
+                if isinstance(partial, bytes):
+                    partial = partial.decode(errors="replace")
+                tail = f": {partial[-500:]}" if partial else ""
                 return [
                     PromptResult(
                         prompt_name="__worker_error__",
                         category="error",
                         output_text="",
                         status_code=0,
-                        error=f"Worker timed out after {worker_timeout:.0f}s",
+                        error=f"Worker timed out after {worker_timeout:.0f}s{tail}",
                     )
                 ]
 

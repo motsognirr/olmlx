@@ -17,7 +17,13 @@ from olmlx.bench.scenarios import Scenario
 
 
 def _fake_popen_factory(
-    *, results=None, returncode=0, stderr="", timeout=False, captured=None
+    *,
+    results=None,
+    returncode=0,
+    stderr="",
+    timeout=False,
+    timeout_stderr=None,
+    captured=None,
 ):
     """Build a fake ``subprocess.Popen`` replacement for ``_run_worker`` tests.
 
@@ -39,9 +45,9 @@ def _fake_popen_factory(
         proc.pid = 4242
         proc.returncode = returncode
         if timeout:
-            proc.communicate.side_effect = subprocess.TimeoutExpired(
-                cmd="worker", timeout=600
-            )
+            exc = subprocess.TimeoutExpired(cmd="worker", timeout=600)
+            exc.stderr = timeout_stderr
+            proc.communicate.side_effect = exc
         else:
             proc.communicate.return_value = ("", stderr)
         if captured is not None:
@@ -137,6 +143,25 @@ class TestRunWorker:
 
         assert len(results) == 1
         assert "timed out" in results[0].error.lower()
+
+    def test_worker_timeout_surfaces_partial_stderr(self):
+        """A timed-out worker surfaces the stderr tail communicate() captured."""
+        scenario = Scenario(name="test", description="Test")
+
+        with (
+            patch(
+                "olmlx.bench.runner.subprocess.Popen",
+                side_effect=_fake_popen_factory(
+                    timeout=True, timeout_stderr="boom: model load wedged"
+                ),
+            ),
+            patch("olmlx.bench.runner.os.killpg"),
+        ):
+            results = _run_worker("model", scenario, [], None, worker_timeout=600.0)
+
+        assert len(results) == 1
+        assert "timed out" in results[0].error.lower()
+        assert "model load wedged" in results[0].error
 
     def test_worker_timeout_kills_process_group(self):
         """On timeout, the worker's whole process group is SIGKILLed.
