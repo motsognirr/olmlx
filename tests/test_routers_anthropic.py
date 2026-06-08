@@ -2993,3 +2993,32 @@ class TestConvertMessagesImages:
         )
         with pytest.raises(ValueError, match="base64"):
             _convert_messages(req)
+
+
+def test_convert_messages_collects_audio_block():
+    from olmlx.routers.anthropic import _convert_messages
+    from olmlx.schemas.anthropic import AnthropicMessagesRequest
+
+    req = AnthropicMessagesRequest(
+        model="m",
+        max_tokens=16,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "transcribe"},
+                    {
+                        "type": "audio",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "audio/wav",
+                            "data": "QQ==",
+                        },
+                    },
+                ],
+            }
+        ],
+    )
+    msgs = _convert_messages(req)
+    user = [m for m in msgs if m["role"] == "user"][0]
+    assert user["audio"] == ["data:audio/wav;base64,QQ=="]

@@ -17,6 +17,7 @@ from olmlx.engine.inference import (
     generate_chat,
 )
 from olmlx.routers.common import build_inference_options
+from olmlx.utils.audio_input import normalize_audio_block
 from olmlx.utils.images import normalize_image_block
 from olmlx.engine.tool_parser import (
     _make_tool_use_id,
@@ -220,6 +221,7 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
         elif msg.role == "user":
             text_parts = []
             user_images: list[str] = []
+            user_audio: list[str] = []
             for block in msg.content:
                 if block.type == "text" and block.text:
                     text_parts.append(block.text)
@@ -227,6 +229,12 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
                     user_images.append(
                         normalize_image_block(
                             {"type": "image", "source": block.source or {}}
+                        )
+                    )
+                elif block.type == "audio":
+                    user_audio.append(
+                        normalize_audio_block(
+                            {"type": "audio", "source": block.source or {}}
                         )
                     )
                 elif block.type == "tool_result":
@@ -245,10 +253,12 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
                             "content": result_content,
                         }
                     )
-            if text_parts or user_images:
+            if text_parts or user_images or user_audio:
                 user_msg: dict = {"role": "user", "content": " ".join(text_parts)}
                 if user_images:
                     user_msg["images"] = user_images
+                if user_audio:
+                    user_msg["audio"] = user_audio
                 messages.append(user_msg)
 
     if system_parts:
