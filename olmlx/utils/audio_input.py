@@ -100,16 +100,21 @@ def materialize_audio(
             header, _, b64 = item.partition(",")
             media_type = header[len("data:") :].split(";", 1)[0] or "audio/wav"
             try:
-                raw = base64.b64decode(b64, validate=False)
+                raw = base64.b64decode(b64, validate=True)
             except (binascii.Error, ValueError) as exc:
                 raise ValueError(f"invalid base64 audio data: {exc}") from exc
             fd, tmp = tempfile.mkstemp(
                 suffix=_suffix_for_media_type(media_type), prefix="olmlx-audio-"
             )
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(raw)
+            temp_paths.append(tmp)  # register for cleanup before we touch it
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(raw)
+            except OSError:
+                cleanup_temp_audio([tmp])
+                temp_paths.remove(tmp)
+                raise
             paths.append(tmp)
-            temp_paths.append(tmp)
         else:
             paths.append(item)
     return paths, temp_paths

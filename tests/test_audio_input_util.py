@@ -91,3 +91,8 @@ def test_cleanup_is_idempotent_and_swallows_missing():
 def test_materialize_none_returns_empty():
     paths, temps = materialize_audio(None)
     assert paths == [] and temps == []
+
+
+def test_materialize_invalid_base64_raises():
+    with pytest.raises(ValueError, match="invalid base64"):
+        materialize_audio(["data:audio/wav;base64,!!!notbase64!!!"])
