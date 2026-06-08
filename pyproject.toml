@@ -20,6 +20,10 @@ dependencies = [
     "xgrammar>=0.2.1",
     "mlx-whisper>=0.4.3",
     "mlx-audio>=0.4.4",
+    # Kokoro TTS (mlx-audio) needs misaki for English grapheme->phoneme text
+    # processing; without it /v1/audio/speech raises ImportError at generate
+    # time. The [en] extra pulls the English pipeline (spacy etc.). Issue #367.
+    "misaki[en]>=0.9.4",
     "prometheus-client>=0.20",
 ]
 
