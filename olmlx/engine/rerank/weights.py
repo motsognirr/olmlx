@@ -128,6 +128,14 @@ def load_cross_encoder(path: str) -> XLMRobertaCrossEncoder:
     """Build an XLMRobertaCrossEncoder from a local model directory."""
     with open(os.path.join(path, "config.json")) as fh:
         cfg = RerankerConfig.from_dict(json.load(fh))
+    if cfg.num_labels != 1:
+        # The engine reads a single relevance logit (column 0). Multi-label
+        # heads are out of scope (#369) — fail loudly rather than silently
+        # producing inverted/garbage rankings.
+        raise ValueError(
+            f"reranker has num_labels={cfg.num_labels}; only single-label "
+            "cross-encoders (num_labels == 1) are supported"
+        )
     sd = _load_state_dict(path)
     layout = detect_layout(list(sd.keys()))
     flat = remap_flash(sd, cfg) if layout == "flash" else remap_standard(sd, cfg)

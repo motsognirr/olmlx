@@ -4900,7 +4900,9 @@ def _score_pairs(
         )
         input_ids = mx.array(np.asarray(enc["input_ids"]).astype(np.int32))
         attn = mx.array(np.asarray(enc["attention_mask"]).astype(np.int32))
-        logits = model(input_ids, attn)  # [b, 1]
+        logits = model(input_ids, attn)  # [b, 1] (num_labels == 1)
+        # Single relevance logit -> probability. Assumes num_labels == 1
+        # (enforced at load by load_cross_encoder); column 0 is the score.
         probs = mx.sigmoid(logits[:, 0])
         mx.eval(probs)
         scores.extend(float(x) for x in probs.tolist())
@@ -4978,7 +4980,7 @@ async def generate_rerank(
                     mx.synchronize()
                 except Exception:
                     logger.warning(
-                        "rerank post-compute sync failed — next inference may crash",
+                        "rerank post-compute sync failed — next inference will crash",
                         exc_info=True,
                     )
                 return {"results": results}
