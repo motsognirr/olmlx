@@ -7,18 +7,22 @@ see engine/inference.py::generate_transcription and CLAUDE.md.
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 
 from olmlx.config import settings
-from olmlx.engine.inference import generate_transcription
+from olmlx.engine.inference import generate_speech, generate_transcription
+from olmlx.engine.tts import UnknownVoiceError, resolve_voice
 from olmlx.schemas.audio import (
+    SpeechRequest,
     TranscriptionResponse,
     TranscriptionSegment,
     VerboseTranscriptionResponse,
 )
+from olmlx.utils import audio as audio_utils
 
 router = APIRouter()
 
@@ -137,3 +141,103 @@ async def create_transcription(
         )
     # default: json
     return TranscriptionResponse(text=text)
+
+
+_TTS_SAMPLE_RATE = 24000
+
+
+@router.post("/v1/audio/speech")
+async def create_speech(request: Request, body: SpeechRequest):
+    # --- cheap validation before touching the model -----------------------
+    if not body.input.strip():
+        raise HTTPException(status_code=422, detail="input must not be empty.")
+    if len(body.input) > settings.tts_max_input_chars:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"input exceeds {settings.tts_max_input_chars} characters "
+                "(OLMLX_TTS_MAX_INPUT_CHARS)."
+            ),
+        )
+    try:
+        audio_utils.validate_format(body.response_format)
+    except audio_utils.UnsupportedFormatError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        kokoro_voice = resolve_voice(body.voice)
+    except UnknownVoiceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    manager = request.app.state.model_manager
+    fmt = body.response_format
+
+    # Compressed formats are encoded by piping PCM through ffmpeg, which is
+    # only spawned once the StreamingResponse starts iterating (after the 200).
+    # Pre-check here so a missing ffmpeg becomes a clean error instead of a
+    # broken mid-stream FileNotFoundError. wav/pcm are encoder-free.
+    if fmt not in ("wav", "pcm") and shutil.which("ffmpeg") is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"ffmpeg not found on PATH; required for '{fmt}' output. "
+                "Install ffmpeg (e.g. `brew install ffmpeg`) or request "
+                "response_format='wav' or 'pcm'."
+            ),
+        )
+
+    # Float segments -> PCM byte chunks.
+    async def _pcm_chunks():
+        async for seg in generate_speech(
+            manager,
+            body.model,
+            body.input,
+            voice=kokoro_voice,
+            speed=body.speed,
+        ):
+            yield audio_utils.float_to_pcm16(seg)
+
+    media_type = audio_utils.FORMAT_MEDIA_TYPES[fmt]
+
+    # WAV is buffered so the header sizes are exact (small utterances).
+    if fmt == "wav":
+        # Collect into a list and join once — `pcm += chunk` in the loop is
+        # O(n^2) (each += copies the whole accumulated buffer).
+        parts: list[bytes] = []
+        try:
+            async for chunk in _pcm_chunks():
+                parts.append(chunk)
+        except ValueError as exc:  # non-TTS model etc.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return Response(
+            audio_utils.wav_bytes(b"".join(parts), sample_rate=_TTS_SAMPLE_RATE),
+            media_type=media_type,
+        )
+
+    # Prime the first PCM chunk so model-load / non-TTS errors (ValueError)
+    # become a clean HTTP 400 *before* the 200 streaming response starts. We
+    # prime the PCM source itself rather than the encoded stream because ffmpeg
+    # emits a container header before consuming any input, which would let the
+    # upstream error slip past after the response had already begun.
+    pcm_agen = _pcm_chunks().__aiter__()
+    try:
+        first = await pcm_agen.__anext__()
+    except StopAsyncIteration:
+        first = b""
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def _primed_pcm():
+        if first:
+            yield first
+        async for chunk in pcm_agen:
+            yield chunk
+
+    # PCM streams raw; compressed formats stream through ffmpeg.
+    if fmt == "pcm":
+        byte_stream = _primed_pcm()
+    else:
+        byte_stream = audio_utils.ffmpeg_encode(
+            _primed_pcm(), fmt=fmt, sample_rate=_TTS_SAMPLE_RATE
+        )
+
+    return StreamingResponse(byte_stream, media_type=media_type)

@@ -477,6 +477,7 @@ class LoadedModel:
     is_flash: bool = False
     is_flash_moe: bool = False
     is_whisper: bool = False
+    is_tts: bool = False
     is_reranker: bool = False
     speculative_decoder: Any = None
     weight_store: Any = None
@@ -823,7 +824,7 @@ class ModelManager:
         #
         # Whisper models (issue #366) return ``tokenizer=None``; guard the
         # grammar drop so it doesn't choke on the missing tokenizer.
-        if not lm.is_whisper:
+        if not (lm.is_whisper or lm.is_tts):
             try:
                 from olmlx.engine import grammar as _grammar
 
@@ -1115,7 +1116,7 @@ class ModelManager:
                 # Whisper models (issue #366) have no LLM KV cache — never
                 # apply KV-cache quantization / spectral calibration to them.
                 _model_kind = self._detect_model_kind(hf_path)
-                if _model_kind in ("whisper", "reranker"):
+                if _model_kind in ("whisper", "tts", "reranker"):
                     kv_cache_quant = None
                 flash_moe_config = model_config.resolved_flash_moe()
 
@@ -1471,6 +1472,7 @@ class ModelManager:
                         is_flash=is_flash,
                         is_flash_moe=is_flash_moe,
                         is_whisper=(_model_kind == "whisper"),
+                        is_tts=(_model_kind == "tts"),
                         is_reranker=(_model_kind == "reranker"),
                         speculative_decoder=_spec_decoder,
                         weight_store=_weight_store,
@@ -1732,6 +1734,14 @@ class ModelManager:
             "n_mels" in config and "n_audio_state" in config
         ):
             return "whisper"
+
+        # TTS (issue #367). Kokoro/StyleTTS configs carry no ``model_type``
+        # but ship a distinctive ``istftnet`` + ``plbert`` signature. Check
+        # before the empty-model_type return (Kokoro has no model_type) and
+        # after Whisper (Kokoro also has ``n_mels`` but not ``n_audio_state``,
+        # so the Whisper branch above already declined it).
+        if "istftnet" in config and "plbert" in config:
+            return "tts"
 
         if _is_cross_encoder_config(config):
             return "reranker"
@@ -2118,9 +2128,9 @@ class ModelManager:
         TurboQuant/Spectral factories would otherwise pull calibration data
         off disk on every model load only to throw the result away.
         """
-        if lm.is_whisper or lm.is_reranker:
-            # Whisper / cross-encoder rerankers have no LLM-style prompt cache;
-            # nothing to probe.
+        if lm.is_whisper or lm.is_tts or lm.is_reranker:
+            # Whisper / TTS / cross-encoder rerankers have no LLM-style prompt
+            # cache; nothing to probe.
             return
         try:
             from mlx_lm.models.cache import make_prompt_cache
@@ -3531,6 +3541,9 @@ class ModelManager:
             model = whisper_loader.load_model(load_path, dtype=mx.float16)
             return model, None, False, TemplateCaps(), None
 
+        if kind == "tts":
+            return self._load_model_tts(hf_path, load_path)
+
         if kind == "reranker":
             # Cross-encoder reranker (#369): native MLX XLM-RoBERTa loaded from
             # safetensors; tokenizer via transformers. No chat template, no
@@ -3632,6 +3645,21 @@ class ModelManager:
             return model, tokenizer, is_vlm, caps, decoder
 
         return model, tokenizer, is_vlm, caps, None
+
+    def _load_model_tts(self, hf_path: str, load_path: str):
+        """Load a TTS model (Kokoro) via mlx-audio (issue #367).
+
+        Returns the 5-tuple shape ``_load_model`` uses
+        ``(model, tokenizer, is_vlm, caps, speculative_decoder)``. TTS has no
+        tokenizer / chat template / speculative decoder — the speech path
+        drives ``model.generate`` directly.
+        """
+        from pathlib import Path
+
+        import mlx_audio.tts.utils as tts_utils
+
+        model = tts_utils.load_model(Path(load_path))
+        return model, None, False, TemplateCaps(), None
 
     @staticmethod
     def _maybe_quantize_model(

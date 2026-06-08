@@ -128,6 +128,13 @@ class Settings(BaseSettings):
             description="Max upload size for /v1/audio/transcriptions (OLMLX_AUDIO_MAX_BYTES).",
         ),
     ] = 100 * 1024 * 1024
+    tts_max_input_chars: Annotated[
+        int,
+        Field(
+            gt=0,
+            description="Max input length for /v1/audio/speech (OLMLX_TTS_MAX_INPUT_CHARS).",
+        ),
+    ] = 8192
     # Cross-request radix prefix cache (issue #365). When enabled, a
     # cache_id miss falls back to a token-prefix lookup over the in-memory
     # store; on hit, the matched entry is re-keyed to the new cache_id

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class TranscriptionResponse(BaseModel):
@@ -36,3 +36,13 @@ class VerboseTranscriptionResponse(BaseModel):
     duration: float = 0.0
     text: str = ""
     segments: list[TranscriptionSegment] = []
+
+
+class SpeechRequest(BaseModel):
+    """`POST /v1/audio/speech` request body (OpenAI-compatible)."""
+
+    model: str
+    input: str
+    voice: str = "alloy"
+    response_format: str = "mp3"
+    speed: float = Field(default=1.0, ge=0.25, le=4.0)

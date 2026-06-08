@@ -15,6 +15,7 @@ from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import mlx.core as mx
+import numpy as np
 
 from olmlx.engine.model_manager import (
     CachedPromptState,
@@ -5081,5 +5082,95 @@ async def generate_transcription(
                         raise ValueError(f"Audio decoding failed: {exc}") from exc
 
                 return await asyncio.to_thread(_run)
+    finally:
+        lm.release_ref()
+
+
+# Max TTS audio segments buffered between the mlx-audio worker thread and the
+# streaming consumer. Bounds peak memory if the client stalls (see the
+# semaphore backpressure in generate_speech).
+_TTS_QUEUE_MAX_SEGMENTS = 4
+
+
+async def generate_speech(
+    manager: ModelManager,
+    model_name: str,
+    text: str,
+    *,
+    voice: str,
+    speed: float = 1.0,
+    keep_alive: str | None = None,
+):
+    """Stream TTS audio segments for a managed mlx-audio model (issue #367).
+
+    Async generator yielding 1-D float32 numpy arrays (24 kHz mono), one per
+    mlx-audio segment, under the serialized inference lock. mlx-audio's
+    ``model.generate`` is a *synchronous* generator; we run the whole loop in
+    one worker thread (keeping all MLX work on a single thread, per the #284
+    stream hazards) and bridge segments to the event loop via a queue.
+
+    Raises ``ValueError`` (-> HTTP 400) if the model is not a TTS model.
+    """
+    lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
+    try:
+        if not lm.is_tts:
+            raise ValueError(
+                f"Model '{model_name}' is not a TTS model. "
+                "/v1/audio/speech requires a TTS model (e.g. a Kokoro repo "
+                "such as prince-canuma/Kokoro-82M)."
+            )
+
+        async with _inference_locked(
+            lm.inference_queue_timeout, sync_mode=lm.sync_mode
+        ):
+            with (
+                _tracing.span(
+                    "inference",
+                    model=lm.name,
+                    surface=surface_var.get(),
+                    strategy="none",
+                ),
+                _inference_ref(lm, adopt=True),
+            ):
+                loop = asyncio.get_running_loop()
+                queue: asyncio.Queue = asyncio.Queue()
+                stop = threading.Event()
+                sentinel = object()
+                # Bound in-flight segments so a slow/stalled consumer (or
+                # ffmpeg encoder) can't make the worker buffer the whole
+                # utterance in memory. The worker blocks on a free slot before
+                # producing; the consumer releases one per segment taken.
+                slots = threading.Semaphore(_TTS_QUEUE_MAX_SEGMENTS)
+
+                def _worker() -> None:
+                    try:
+                        for result in lm.model.generate(text, voice=voice, speed=speed):
+                            if stop.is_set():
+                                break
+                            slots.acquire()
+                            if stop.is_set():  # woken by teardown, not a free slot
+                                break
+                            # np.asarray forces eval on THIS thread, keeping
+                            # the MLX graph materialization off the loop.
+                            audio = np.asarray(result.audio, dtype=np.float32)
+                            loop.call_soon_threadsafe(queue.put_nowait, audio)
+                        loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+                    except Exception as exc:  # noqa: BLE001 - re-raised on loop
+                        loop.call_soon_threadsafe(queue.put_nowait, exc)
+
+                worker = asyncio.create_task(asyncio.to_thread(_worker))
+                try:
+                    while True:
+                        item = await queue.get()
+                        if item is sentinel:
+                            break
+                        if isinstance(item, Exception):
+                            raise item
+                        slots.release()  # free the slot this segment occupied
+                        yield item
+                finally:
+                    stop.set()
+                    slots.release()  # unblock a worker parked in acquire()
+                    await worker
     finally:
         lm.release_ref()

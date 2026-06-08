@@ -19,6 +19,18 @@ dependencies = [
     "rich>=13.0",
     "xgrammar>=0.2.1",
     "mlx-whisper>=0.4.3",
+    "mlx-audio>=0.4.4",
+    # Kokoro TTS (mlx-audio) needs misaki for English grapheme->phoneme text
+    # processing; without it /v1/audio/speech raises ImportError at generate
+    # time. The [en] extra pulls the English pipeline (spacy etc.). Issue #367.
+    "misaki[en]>=0.9.4",
+    # misaki.en calls spacy.load("en_core_web_sm") at generate time. spaCy's
+    # runtime auto-download does NOT become importable in-process, so a fresh
+    # `uv sync` would otherwise 500 on the first /v1/audio/speech request.
+    # The wheel (3.8.x matches the locked spaCy 3.8.x) is pinned via
+    # [tool.uv.sources] below so it's present after sync; bump in lockstep with
+    # spaCy's major.minor. Issue #367.
+    "en-core-web-sm",
     "prometheus-client>=0.20",
 ]
 
@@ -38,6 +50,12 @@ build-backend = "hatchling.build"
 
 [tool.uv]
 package = true
+
+[tool.uv.sources]
+# spaCy English model for Kokoro TTS (#367) — not on PyPI, distributed as a
+# GitHub release wheel. Keep the version aligned with the locked spaCy
+# major.minor (currently 3.8.x).
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
 
 [tool.coverage.run]
 source = ["olmlx"]
