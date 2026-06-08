@@ -473,6 +473,35 @@ class TestPrefillCancelCallback:
         call_kwargs = mock_mlx_vlm.stream_generate.call_args
         assert "prompt_progress_callback" not in call_kwargs.kwargs
 
+    @pytest.mark.asyncio
+    async def test_async_mlx_stream_forwards_audio_to_mlx_vlm(self):
+        """async_mlx_stream should forward audio= to mlx_vlm.stream_generate."""
+        captured = {}
+
+        def fake_stream_generate(model, tokenizer, **kwargs):
+            captured.update(kwargs)
+            return iter(())
+
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.stream_generate = fake_stream_generate
+
+        with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+            stream = async_mlx_stream(
+                MagicMock(),
+                MagicMock(),
+                prompt="hi",
+                max_tokens=4,
+                is_vlm=True,
+                images=["i.png"],
+                audio=["a.wav"],
+            )
+            # Drain the worker so gen_factory runs on the background thread.
+            async for _ in stream:
+                pass
+
+        assert captured.get("audio") == ["a.wav"]
+        assert captured.get("image") == ["i.png"]
+
 
 class TestSafeNdjsonStream:
     """Tests for the safe_ndjson_stream helper."""
