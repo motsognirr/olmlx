@@ -218,12 +218,16 @@ class TestParseBufferedOutput:
         assert tool_uses[0]["input"] == {"city": "London"}
 
     def test_fill_missing_args_default_on(self):
-        out = self._out('<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>')
+        out = self._out(
+            '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+        )
         _, _, tool_uses = parse_buffered_output(out, self.TOOLS)
         assert tool_uses[0]["input"] == {"city": ""}
 
     def test_fill_missing_args_off(self):
-        out = self._out('<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>')
+        out = self._out(
+            '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+        )
         _, _, tool_uses = parse_buffered_output(
             out, self.TOOLS, fill_missing_args=False
         )

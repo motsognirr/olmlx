@@ -189,9 +189,7 @@ async def _stream_openai_sse_with_tools(
     try:
         out = await collect_stream(result)
         done_reason = out.done_reason
-        _thinking, visible_text, tool_uses = parse_buffered_output(
-            out, declared_tools
-        )
+        _thinking, visible_text, tool_uses = parse_buffered_output(out, declared_tools)
         logger.debug(
             "Buffered tool stream (%d chars): thinking=%d visible=%d tool_uses=%d raw=%s",
             len(out.full_text),

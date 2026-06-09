@@ -182,7 +182,10 @@ class TestCollectContentParts:
                 {"type": "text", "text": "what is this?"},
                 {"type": "input_text", "text": "responses-api text"},
                 {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
-                {"type": "input_audio", "input_audio": {"data": "QQ==", "format": "wav"}},
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "QQ==", "format": "wav"},
+                },
             ]
         )
         assert texts == ["what is this?", "responses-api text"]
@@ -197,7 +200,11 @@ class TestCollectContentParts:
                 {"type": "text", "text": "look:"},
                 {
                     "type": "image",
-                    "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"},
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": "AAAA",
+                    },
                 },
                 {"type": "audio", "source": {"type": "url", "url": "http://x/a.wav"}},
             ]
