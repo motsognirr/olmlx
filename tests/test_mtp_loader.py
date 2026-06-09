@@ -17,10 +17,14 @@ def _head_dir() -> Path | None:
         return None
 
 
-@pytest.mark.skipif(_head_dir() is None, reason="MTP head not downloadable")
+# real_model (#470): downloads and loads the real MTP head. The skip
+# decision lives inside the test (not a ``skipif`` expression) so
+# collection never touches the network.
+@pytest.mark.real_model
 def test_load_mtp_draft_strict_no_leftover_keys():
     path = _head_dir()
-    assert path is not None  # guarded by skipif above; narrows for the type checker
+    if path is None:
+        pytest.skip("MTP head not downloadable")
     cfg = MTPConfig.from_dict(json.loads((path / "config.json").read_text()))
     draft = load_mtp_draft(path, cfg)
     assert isinstance(draft, MTPDraftModel)
@@ -39,10 +43,11 @@ def _moe_head_dir() -> Path | None:
         return None
 
 
-@pytest.mark.skipif(_moe_head_dir() is None, reason="MoE MTP head not downloadable")
+@pytest.mark.real_model
 def test_load_mtp_draft_moe_strict():
     path = _moe_head_dir()
-    assert path is not None
+    if path is None:
+        pytest.skip("MoE MTP head not downloadable")
     cfg = MTPConfig.from_dict(json.loads((path / "config.json").read_text()))
     assert cfg.is_moe
     draft = load_mtp_draft(path, cfg)

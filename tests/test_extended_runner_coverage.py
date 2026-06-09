@@ -470,8 +470,15 @@ class TestRunModelOrchestration:
         # t_start=0, then deadline check returns increasing time. With
         # per_model_timeout=10 and deadline=10, the 2nd loop check at t=20
         # has remaining<=0 → breakout after 1 prompt.
-        times = iter([0.0, 1.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0])
-        monkeypatch.setattr(er.time, "monotonic", lambda: next(times))
+        #
+        # ``er.time`` is the global ``time`` module, so this patch leaks
+        # to *every* monotonic caller during the test (asyncio, fixture
+        # teardown). Repeat the last value once exhausted — a bare
+        # ``next(times)`` raised StopIteration out of unrelated yield
+        # fixtures whenever a conftest change perturbed the call count.
+        times = [0.0, 1.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
+        times_iter = iter(times)
+        monkeypatch.setattr(er.time, "monotonic", lambda: next(times_iter, times[-1]))
 
         async def fake_drive(client, model, prompt, suite):
             return PromptResult(prompt.name, prompt.category, suite, True, 1.0, "", "")

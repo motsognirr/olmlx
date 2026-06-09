@@ -377,6 +377,89 @@ class TestValidateSignature:
             with pytest.raises(RuntimeError, match="Cannot introspect"):
                 validate_gated_delta_update_signature()
 
+    def test_raises_on_reordered_params(self):
+        """#468: a presence-only check accepts a reordering that breaks
+        the positional call in ``_capturing_gdn_call``/rollback. The
+        probe must compare order, not just the set of names.
+        """
+        fake_mod = MagicMock()
+
+        # Same names as upstream, ``q`` and ``k`` swapped.
+        def _reordered(k, q, v, a, b, A_log, dt_bias, state, mask, use_kernel):
+            return None
+
+        fake_mod.gated_delta_update = _reordered
+        with patch.object(gr, "_gd_mod", fake_mod):
+            with pytest.raises(RuntimeError, match="order"):
+                validate_gated_delta_update_signature()
+
+
+# ---------------------------------------------------------------------------
+# validate_gdn_upstream_sources (#468 follow-up)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateUpstreamSources:
+    """Source-hash guard: an out-of-sync vendored ``GatedDeltaNet.__call__``
+    copy (or a changed ``gated_delta_update`` kernel) must fail at patch
+    time instead of silently degrading acceptance / corrupting state.
+    """
+
+    @staticmethod
+    def _real_gdn_cls():
+        from mlx_lm.models.qwen3_5 import GatedDeltaNet as RealGDN
+
+        return RealGDN
+
+    def test_passes_with_real_mlx_lm(self):
+        # The verified-hash table must match the installed (pinned) mlx-lm.
+        gr.validate_gdn_upstream_sources(self._real_gdn_cls())
+
+    def test_raises_on_drifted_gdn_call_source(self):
+        stale = dict(gr._VERIFIED_UPSTREAM_SHA256)
+        stale["GatedDeltaNet.__call__"] = frozenset({"0" * 64})
+        with patch.object(gr, "_VERIFIED_UPSTREAM_SHA256", stale):
+            with pytest.raises(RuntimeError, match="GatedDeltaNet.__call__"):
+                gr.validate_gdn_upstream_sources(self._real_gdn_cls())
+
+    def test_raises_on_drifted_gated_delta_update_source(self):
+        stale = dict(gr._VERIFIED_UPSTREAM_SHA256)
+        stale["gated_delta_update"] = frozenset({"0" * 64})
+        with patch.object(gr, "_VERIFIED_UPSTREAM_SHA256", stale):
+            with pytest.raises(RuntimeError, match="gated_delta_update"):
+                gr.validate_gdn_upstream_sources(self._real_gdn_cls())
+
+    def test_skips_non_mlx_lm_classes(self):
+        # The contract is with upstream mlx-lm; hand-built stand-ins
+        # (this file's fake ``GatedDeltaNet``) are exempt from the class
+        # hash even with a poisoned table.
+        stale = dict(gr._VERIFIED_UPSTREAM_SHA256)
+        stale["GatedDeltaNet.__call__"] = frozenset({"0" * 64})
+        with patch.object(gr, "_VERIFIED_UPSTREAM_SHA256", stale):
+            gr.validate_gdn_upstream_sources(GatedDeltaNet)
+
+    def test_skips_uninspectable_gated_delta_update(self):
+        # A MagicMock module (as other tests install) has no source —
+        # skip with a warning rather than blocking inference.
+        fake_mod = MagicMock()
+        with patch.object(gr, "_gd_mod", fake_mod):
+            gr.validate_gdn_upstream_sources(GatedDeltaNet)
+
+    def test_capture_init_validates_sources(self):
+        # The guard must run before the patch is installed, and a
+        # failed construction must leave the lock free.
+        stale = dict(gr._VERIFIED_UPSTREAM_SHA256)
+        stale["GatedDeltaNet.__call__"] = frozenset({"0" * 64})
+        real_cls = self._real_gdn_cls()
+        orig_call = real_cls.__call__
+        with patch.object(gr, "_VERIFIED_UPSTREAM_SHA256", stale):
+            with pytest.raises(RuntimeError, match="GatedDeltaNet.__call__"):
+                GDNStateCapture(real_cls)
+        assert real_cls.__call__ is orig_call  # never patched
+        # Lock free → a capture on the fake class still installs.
+        cap = GDNStateCapture(GatedDeltaNet)
+        cap.close()
+
 
 # ---------------------------------------------------------------------------
 # Patch lifecycle: __init__ / _patch / close / __del__ / for_model

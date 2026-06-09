@@ -80,6 +80,31 @@ _GATED_DELTA_UPDATE_EXPECTED_PARAMS: tuple[str, ...] = (
 )
 
 
+# **Sync point** (#468): sha256 of the *dedented* ``inspect.getsource``
+# of the upstream functions whose exact behavior this module copies or
+# depends on, as verified against mlx-lm 0.31.2:
+#
+# - ``GatedDeltaNet.__call__`` — ``_capturing_gdn_call`` is a verbatim
+#   copy of it; any upstream edit (even a comment) means the copy must
+#   be re-diffed and re-synced.
+# - ``gated_delta_update`` — ``rollback_autoregressive`` relies on a
+#   documented linearity assumption about this kernel; a change would
+#   not raise, it would silently corrupt the rolled-back state.
+#
+# When bumping mlx-lm: re-diff ``_capturing_gdn_call`` against the new
+# ``GatedDeltaNet.__call__``, re-verify the linearity assumption against
+# the new kernel, then add the new hashes here (a frozenset so one olmlx
+# release can span verified mlx-lm patch releases).
+_VERIFIED_UPSTREAM_SHA256: dict[str, frozenset[str]] = {
+    "GatedDeltaNet.__call__": frozenset(
+        {"bb28b030fb520defc6c059913d5327ef5ba2b4bca63eb6a57e0fabd4bae4cc06"}
+    ),
+    "gated_delta_update": frozenset(
+        {"ffe520f93b13109db81e9a0e4e27446fcf3e6f6f73ea93f93bd35a0b50bf02ce"}
+    ),
+}
+
+
 # Attributes that ``_capturing_gdn_call`` reads off the patched layer.
 # Used by ``_find_gdn_class`` as a structural check so the patch only
 # attaches to a class that actually exposes the GDN interface — a
@@ -214,6 +239,84 @@ def validate_gated_delta_update_signature() -> None:
             "update ``_capturing_gdn_call`` / rollback methods and "
             "``_GATED_DELTA_UPDATE_EXPECTED_PARAMS`` together."
         )
+    # Presence is not enough (#468): ``_capturing_gdn_call`` and the
+    # rollback methods pass some of these positionally, so a reorder
+    # with unchanged names would bind tensors to the wrong parameters
+    # without raising. Compare the leading parameter *order* too (new
+    # trailing parameters with defaults are tolerated — they can't
+    # shift existing positions).
+    actual_order = tuple(sig.parameters)
+    n = len(_GATED_DELTA_UPDATE_EXPECTED_PARAMS)
+    if actual_order[:n] != _GATED_DELTA_UPDATE_EXPECTED_PARAMS:
+        raise RuntimeError(
+            "mlx-lm's ``gated_delta_update`` parameter order changed: "
+            f"expected {_GATED_DELTA_UPDATE_EXPECTED_PARAMS}, got "
+            f"{actual_order[:n]}. A reorder silently misbinds the "
+            "positional arguments in ``_capturing_gdn_call`` / rollback; "
+            "re-verify both against the new mlx-lm and update "
+            "``_GATED_DELTA_UPDATE_EXPECTED_PARAMS``."
+        )
+
+
+def _source_sha256(fn: Any) -> str | None:
+    """sha256 of *fn*'s dedented source, or ``None`` when the source is
+    unavailable (builtins, mocks, frozen installs without .py files).
+    """
+    import hashlib
+    import inspect
+    import textwrap
+
+    try:
+        src = inspect.getsource(fn)
+    except (OSError, TypeError):
+        return None
+    return hashlib.sha256(textwrap.dedent(src).encode()).hexdigest()
+
+
+def validate_gdn_upstream_sources(gdn_cls: type) -> None:
+    """Raise if the upstream sources this module is bit-for-bit coupled
+    to have drifted from the verified copies (#468).
+
+    ``_capturing_gdn_call`` is a verbatim copy of *gdn_cls*'s
+    ``__call__`` and ``rollback_autoregressive`` assumes
+    ``gated_delta_update`` is linear in its recurrent state; neither
+    coupling raises on drift by itself — acceptance degrades or state
+    corrupts silently. Hash the upstream sources at patch-install time
+    and fail loudly instead.
+
+    Only classes that actually come from mlx-lm are checked — test
+    stand-ins and user-defined GDN classes are not governed by the copy.
+    A function whose source can't be introspected is skipped with a
+    warning rather than blocking inference.
+    """
+    checks: list[tuple[str, Any]] = []
+    if getattr(gdn_cls, "__module__", "").startswith("mlx_lm"):
+        checks.append(("GatedDeltaNet.__call__", gdn_cls.__call__))
+    if _gd_mod is not None:
+        checks.append(("gated_delta_update", _gd_mod.gated_delta_update))
+
+    for name, fn in checks:
+        actual = _source_sha256(fn)
+        if actual is None:
+            logger.warning(
+                "validate_gdn_upstream_sources: cannot read the source of "
+                "``%s``; skipping the upstream-drift check.",
+                name,
+            )
+            continue
+        if actual not in _VERIFIED_UPSTREAM_SHA256[name]:
+            raise RuntimeError(
+                f"mlx-lm's ``{name}`` source changed since the GDN "
+                "capture/rollback path was last verified (sha256 "
+                f"{actual} is not in the verified set). The vendored "
+                "copy in ``_capturing_gdn_call`` and the "
+                "``gated_delta_update`` linearity assumption must be "
+                "re-verified against the installed mlx-lm before this "
+                "model can run with speculative rollback: diff the "
+                "upstream functions, re-sync the copy if needed, then "
+                "add the new hash to ``_VERIFIED_UPSTREAM_SHA256`` "
+                "(olmlx/engine/gdn_rollback.py). See issue #468."
+            )
 
 
 def find_gdn_class(model: nn.Module) -> type | None:
@@ -349,6 +452,7 @@ class GDNStateCapture:
                 "GatedDeltaNet state for rollback"
             )
         validate_gated_delta_update_signature()
+        validate_gdn_upstream_sources(gdn_cls)
         self._gdn_cls: type = gdn_cls
         self._active_buffer: GDNBuffer | None = None
         self._orig_call: Any = None
