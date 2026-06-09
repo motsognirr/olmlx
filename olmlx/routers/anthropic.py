@@ -15,7 +15,7 @@ from olmlx.engine.inference import (
     count_chat_tokens,
     generate_chat,
 )
-from olmlx.routers.common import build_inference_options
+from olmlx.routers.common import build_inference_options, collect_content_parts
 from olmlx.routers.streaming_common import (
     BufferedModelOutput,
     buffer_stream,
@@ -23,8 +23,6 @@ from olmlx.routers.streaming_common import (
     with_keepalive_pings,
 )
 from olmlx.routers.thinking_split import flush_split_thinking, split_thinking_parts
-from olmlx.utils.audio_input import normalize_audio_block
-from olmlx.utils.images import normalize_image_block
 from olmlx.engine.tool_parser import (
     _make_tool_use_id,
     parse_model_output,
@@ -225,25 +223,9 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
             messages.append(entry)
 
         elif msg.role == "user":
-            text_parts = []
-            user_images: list[str] = []
-            user_audio: list[str] = []
+            content_parts: list[dict] = []
             for block in msg.content:
-                if block.type == "text" and block.text:
-                    text_parts.append(block.text)
-                elif block.type == "image":
-                    user_images.append(
-                        normalize_image_block(
-                            {"type": "image", "source": block.source or {}}
-                        )
-                    )
-                elif block.type == "audio":
-                    user_audio.append(
-                        normalize_audio_block(
-                            {"type": "audio", "source": block.source or {}}
-                        )
-                    )
-                elif block.type == "tool_result":
+                if block.type == "tool_result":
                     result_content = ""
                     if isinstance(block.content, str):
                         result_content = block.content
@@ -259,6 +241,15 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
                             "content": result_content,
                         }
                     )
+                elif block.type in ("image", "audio"):
+                    content_parts.append(
+                        {"type": block.type, "source": block.source or {}}
+                    )
+                else:
+                    content_parts.append({"type": block.type, "text": block.text})
+            # Shared part-type dispatch + image/audio normalization (#471);
+            # a malformed source raises ValueError → 422 at the endpoint.
+            text_parts, user_images, user_audio = collect_content_parts(content_parts)
             if text_parts or user_images or user_audio:
                 user_msg: dict = {"role": "user", "content": " ".join(text_parts)}
                 if user_images:

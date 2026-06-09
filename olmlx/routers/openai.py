@@ -22,14 +22,16 @@ from olmlx.engine.tool_parser import (
     parse_model_output,
     resolve_tool_names,
 )
-from olmlx.routers.common import build_inference_options, resolve_openai_think
+from olmlx.routers.common import (
+    build_inference_options,
+    collect_content_parts,
+    resolve_openai_think,
+)
 from olmlx.routers.streaming_common import collect_stream, parse_buffered_output
 from olmlx.routers.thinking_split import (
     flush_thinking_buffer,
     strip_thinking_streaming,
 )
-from olmlx.utils.audio_input import normalize_audio_block
-from olmlx.utils.images import normalize_image_block
 from olmlx.schemas.openai import (
     OpenAIChatMessage,
     OpenAIChatRequest,
@@ -280,34 +282,20 @@ def _build_options(req) -> dict:
 
 def _normalize_multimodal_messages(messages: list[dict]) -> list[dict]:
     """Split OpenAI multimodal content lists into a text ``content`` string plus
-    a separate ``images`` list (the engine's Ollama-style convention, #428).
+    separate ``images``/``audio`` lists (the engine's Ollama-style convention,
+    #428).
 
     OpenAI carries images inline as content parts:
         content: [{"type": "text", "text": ...},
                   {"type": "image_url", "image_url": {"url": ...}}]
-    String content is left untouched.
+    String content is left untouched.  Part-type recognition lives in the
+    shared ``collect_content_parts`` (issue #471).
     """
     for m in messages:
         content = m.get("content")
         if not isinstance(content, list):
             continue
-        texts: list[str] = []
-        images: list[str] = []
-        audio: list[str] = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            ptype = part.get("type")
-            # "input_text"/"input_image" are the Responses-API / newer-SDK
-            # spellings of the Chat-Completions "text"/"image_url" parts.
-            if ptype in ("text", "input_text"):
-                text = part.get("text") or ""
-                if text:
-                    texts.append(text)
-            elif ptype == "image_url":
-                images.append(normalize_image_block(part))
-            elif ptype == "input_audio":
-                audio.append(normalize_audio_block(part))
+        texts, images, audio = collect_content_parts(content)
         m["content"] = " ".join(texts)
         if images:
             m["images"] = (m.get("images") or []) + images

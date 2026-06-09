@@ -1,8 +1,12 @@
-"""Shared utilities for NDJSON streaming routers."""
+"""Shared request-shaping utilities for the chat-surface routers."""
 
 import json
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
+
+from olmlx.utils.audio_input import normalize_audio_block
+from olmlx.utils.images import normalize_image_block
 
 # Likely-mistake strings that mean "thinking off".  Shared by both resolvers
 # so the Ollama `think` and OpenAI `reasoning_effort` routes agree (a client
@@ -65,6 +69,39 @@ def resolve_openai_think(
             return False
         return True
     return None
+
+
+def collect_content_parts(
+    parts: Iterable[Any],
+) -> tuple[list[str], list[str], list[str]]:
+    """Collect ``(texts, images, audio)`` from multimodal content parts.
+
+    The one place that recognizes every surface's spelling (issue #471):
+    OpenAI Chat ``text``/``image_url``/``input_audio``, Responses-API
+    ``input_text``, and Anthropic ``text``/``image``/``audio``.  Images and
+    audio are normalized to engine-loadable strings (URL, path, or data URI)
+    via ``normalize_image_block``/``normalize_audio_block``, which raise
+    ``ValueError`` on malformed blocks — callers surface that as a 422.
+
+    Non-dict, unknown-type, and empty-text parts are skipped; per-channel
+    order is preserved.
+    """
+    texts: list[str] = []
+    images: list[str] = []
+    audio: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype in ("text", "input_text"):
+            text = part.get("text") or ""
+            if text:
+                texts.append(text)
+        elif ptype in ("image_url", "image"):
+            images.append(normalize_image_block(part))
+        elif ptype in ("input_audio", "audio"):
+            audio.append(normalize_audio_block(part))
+    return texts, images, audio
 
 
 def format_error(model: str) -> str:

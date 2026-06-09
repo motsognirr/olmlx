@@ -168,3 +168,76 @@ class TestResolveOpenAIThink:
         # Truthy/falsey values are coerced to bool.
         assert resolve_openai_think(None, {"enable_thinking": 0}) is False
         assert resolve_openai_think(None, {"enable_thinking": 1}) is True
+
+
+class TestCollectContentParts:
+    """The shared multimodal content-part collector (issue #471) — one place
+    that recognizes every surface's spelling of text/image/audio parts."""
+
+    def test_openai_spellings(self):
+        from olmlx.routers.common import collect_content_parts
+
+        texts, images, audio = collect_content_parts(
+            [
+                {"type": "text", "text": "what is this?"},
+                {"type": "input_text", "text": "responses-api text"},
+                {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+                {"type": "input_audio", "input_audio": {"data": "QQ==", "format": "wav"}},
+            ]
+        )
+        assert texts == ["what is this?", "responses-api text"]
+        assert images == ["http://x/y.png"]
+        assert audio == ["data:audio/wav;base64,QQ=="]
+
+    def test_anthropic_spellings(self):
+        from olmlx.routers.common import collect_content_parts
+
+        texts, images, audio = collect_content_parts(
+            [
+                {"type": "text", "text": "look:"},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"},
+                },
+                {"type": "audio", "source": {"type": "url", "url": "http://x/a.wav"}},
+            ]
+        )
+        assert texts == ["look:"]
+        assert images == ["data:image/jpeg;base64,AAAA"]
+        assert audio == ["http://x/a.wav"]
+
+    def test_empty_text_and_unknown_parts_skipped(self):
+        from olmlx.routers.common import collect_content_parts
+
+        texts, images, audio = collect_content_parts(
+            [
+                {"type": "text", "text": ""},
+                {"type": "text"},
+                {"type": "tool_result", "content": "ignored"},
+                "not-a-dict",
+                {"no": "type"},
+            ]
+        )
+        assert texts == []
+        assert images == []
+        assert audio == []
+
+    def test_malformed_image_raises_value_error(self):
+        import pytest
+
+        from olmlx.routers.common import collect_content_parts
+
+        with pytest.raises(ValueError, match="image_url"):
+            collect_content_parts([{"type": "image_url", "image_url": {}}])
+
+    def test_order_preserved_per_channel(self):
+        from olmlx.routers.common import collect_content_parts
+
+        _, images, _ = collect_content_parts(
+            [
+                {"type": "image_url", "image_url": {"url": "http://x/a.png"}},
+                {"type": "text", "text": "between"},
+                {"type": "image_url", "image_url": {"url": "http://x/b.png"}},
+            ]
+        )
+        assert images == ["http://x/a.png", "http://x/b.png"]
