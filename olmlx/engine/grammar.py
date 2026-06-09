@@ -110,17 +110,47 @@ _compiler_cache: dict[int, tuple[weakref.ref[Any], Any]] = {}
 _compiler_cache_lock = threading.Lock()
 
 
+# Classes already warned about in _make_ref, to keep the log at one line
+# per offending tokenizer type rather than one per request.
+_unrefable_warned_classes: set[type] = set()
+
+
 def _make_ref(tokenizer: Any) -> weakref.ref[Any] | None:
     """A weakref to *tokenizer*, or ``None`` if it isn't weakref-able.
 
     HF tokenizers are plain Python classes and always weakref-able; the
     fallback only matters for exotic stand-ins, which then simply skip
-    caching (correctness over speed).
+    caching (correctness over speed). That silently turns every
+    structured-output request into a full recompile (grammar + the
+    vocab-walking GrammarCompiler), so warn once per class to make the
+    degradation diagnosable.
     """
     try:
         return weakref.ref(tokenizer)
     except TypeError:
+        cls = type(tokenizer)
+        if cls not in _unrefable_warned_classes:
+            _unrefable_warned_classes.add(cls)
+            logger.warning(
+                "tokenizer type %s is not weakref-able; grammar compile "
+                "caching is disabled for it — every structured-output "
+                "request recompiles the grammar",
+                cls.__name__,
+            )
         return None
+
+
+def _live_value(entry: tuple[weakref.ref[Any], Any] | None, tokenizer: Any) -> Any:
+    """*entry*'s cached value if it is owned by this live *tokenizer*.
+
+    ``None`` for a missing entry, a dead referent, or an entry owned by
+    a different tokenizer whose ``id()`` was recycled (issue #464) —
+    serving the latter would apply a grammar compiled for a different
+    vocabulary.
+    """
+    if entry is not None and entry[0]() is tokenizer:
+        return entry[1]
+    return None
 
 
 def _sweep_dead_entries_locked(cache: dict[Any, tuple[weakref.ref[Any], Any]]) -> None:
@@ -144,9 +174,9 @@ def _get_compiler(tokenizer: Any, vocab_size: int) -> Any:
         )
     key = id(tokenizer)
     with _compiler_cache_lock:
-        entry = _compiler_cache.get(key)
-        if entry is not None and entry[0]() is tokenizer:
-            return entry[1]
+        cached = _live_value(_compiler_cache.get(key), tokenizer)
+        if cached is not None:
+            return cached
         info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
         compiler = xgr.GrammarCompiler(info, max_threads=4)
         _sweep_dead_entries_locked(_compiler_cache)
@@ -175,13 +205,12 @@ def compile_for_tokenizer(tokenizer: Any, vocab_size: int, spec: GrammarSpec) ->
         )
     cache_key = (id(tokenizer), spec.cache_key())
     with _compile_cache_lock:
-        entry = _compile_cache.get(cache_key)
-        # Serve only entries owned by *this live tokenizer* — an id-keyed
-        # entry may belong to a dead tokenizer whose address was recycled
-        # (issue #464); serving it would apply a grammar compiled for a
-        # different vocabulary.
-        if entry is not None and entry[0]() is tokenizer:
-            return entry[1]
+        # _live_value serves only entries owned by *this live tokenizer*
+        # — an id-keyed entry may belong to a dead tokenizer whose
+        # address was recycled (issue #464).
+        cached = _live_value(_compile_cache.get(cache_key), tokenizer)
+        if cached is not None:
+            return cached
     # Compile outside the lock — see docstring.
     compiler = _get_compiler(tokenizer, vocab_size)
     if spec.kind == "json_object":
@@ -192,9 +221,9 @@ def compile_for_tokenizer(tokenizer: Any, vocab_size: int, spec: GrammarSpec) ->
     with _compile_cache_lock:
         # A concurrent compile may have stored already; prefer the
         # existing entry so callers see object identity stability.
-        existing = _compile_cache.get(cache_key)
-        if existing is not None and existing[0]() is tokenizer:
-            return existing[1]
+        existing = _live_value(_compile_cache.get(cache_key), tokenizer)
+        if existing is not None:
+            return existing
         _sweep_dead_entries_locked(_compile_cache)
         ref = _make_ref(tokenizer)
         if ref is not None:

@@ -318,6 +318,57 @@ class TestStaleEntryProtection:
         assert 987654321 not in _grammar._compiler_cache
 
 
+class TestMakeRefWarning:
+    """A non-weakref-able tokenizer silently disables both compile caches
+    (every request recompiles the grammar and rebuilds the GrammarCompiler).
+    That degradation must be diagnosable: warn once per class.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_warned(self):
+        from olmlx.engine import grammar as _grammar
+
+        _grammar._unrefable_warned_classes.clear()
+        yield
+        _grammar._unrefable_warned_classes.clear()
+
+    def test_warns_once_per_class(self, caplog):
+        import logging
+
+        from olmlx.engine import grammar as _grammar
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.grammar"):
+            assert _grammar._make_ref(42) is None
+            assert _grammar._make_ref(43) is None  # same class: no second warning
+
+        warnings = [r for r in caplog.records if "not weakref-able" in r.message]
+        assert len(warnings) == 1
+        assert "int" in warnings[0].message
+
+    def test_distinct_classes_each_warn(self, caplog):
+        import logging
+
+        from olmlx.engine import grammar as _grammar
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.grammar"):
+            assert _grammar._make_ref(42) is None
+            assert _grammar._make_ref("not refable") is None
+
+        warnings = [r for r in caplog.records if "not weakref-able" in r.message]
+        assert len(warnings) == 2
+
+    def test_no_warning_for_weakrefable(self, caplog):
+        import logging
+
+        from olmlx.engine import grammar as _grammar
+
+        tok = type("FakeTok", (), {})()
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.grammar"):
+            assert _grammar._make_ref(tok) is not None
+
+        assert not [r for r in caplog.records if "not weakref-able" in r.message]
+
+
 class TestLogitsProcessor:
     def test_first_call_treats_tokens_as_prompt(self, gpt2_tokenizer):
         spec = GrammarSpec("json_object")
