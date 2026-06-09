@@ -329,9 +329,9 @@ class TestAgentLoop:
         assert "<think>" not in token_text
         assert "The answer" in token_text
 
-    @pytest.mark.asyncio
-    async def test_tool_call_agent_loop(self):
-        """Model calls a tool, result is fed back, model continues."""
+    @staticmethod
+    def _read_file_mcp():
+        """MCP mock exposing a single ``read_file`` tool."""
         mcp = MagicMock()
         mcp.get_tools_for_chat.return_value = [
             {
@@ -347,6 +347,12 @@ class TestAgentLoop:
             }
         ]
         mcp.call_tool = AsyncMock(return_value="file contents here")
+        return mcp
+
+    @pytest.mark.asyncio
+    async def test_tool_call_agent_loop(self):
+        """Model calls a tool, result is fed back, model continues."""
+        mcp = self._read_file_mcp()
 
         session = _make_session(mcp=mcp)
         call_count = 0
@@ -393,21 +399,7 @@ class TestAgentLoop:
     @pytest.mark.asyncio
     async def test_tool_timeout_passed_to_mcp_when_set(self):
         """A user-set tool_timeout is passed through to MCP tool calls."""
-        mcp = MagicMock()
-        mcp.get_tools_for_chat.return_value = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "description": "Read a file",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"path": {"type": "string"}},
-                    },
-                },
-            }
-        ]
-        mcp.call_tool = AsyncMock(return_value="file contents here")
+        mcp = self._read_file_mcp()
 
         session = _make_session(mcp=mcp, tool_timeout=7.5)
         call_count = 0
