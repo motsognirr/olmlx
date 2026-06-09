@@ -1005,14 +1005,11 @@ class TestAnthropicEndpoint:
         opener as part of a thinking content block. The opener-before-closer
         order signals a standard `<think>...</think>` pair.
 
-        Pre-existing limitation: the Anthropic ``text`` state does not
-        re-detect a mid-text ``<think>`` block (interleaving thinking into
-        an in-flight text block is awkward in the SSE content-block model),
-        so the literal tags currently survive into the text delta for this
-        assembly pattern. The OpenAI passthrough state does re-detect. Out
-        of scope for #307; this test only asserts the orphan-branch
-        correctness — that ``<think>``/``thoughts``/``preamble`` are NOT
-        misclassified as thinking content."""
+        Since the rebuild on the shared splitter (issue #471), the mid-text
+        ``<think>`` pair is detected and routed to a proper thinking block
+        — matching the non-streaming path, which extracts the pair via
+        ``parse_model_output`` — instead of leaking the literal tags into
+        the text delta."""
 
         async def mock_stream(*args, **kwargs):
             async def gen():
@@ -1056,15 +1053,15 @@ class TestAnthropicEndpoint:
                 visible_text += delta.get("text", "")
 
         # Critical: the orphan branch must NOT fire when `<think>` comes
-        # first.  Neither the literal opener nor "preamble" nor the
-        # thinking content should appear in a thinking_delta — they must
-        # stay in text (where the literal tag survives, per the docstring
-        # note above).
+        # first.  The pair is extracted as a thinking block; the
+        # surrounding text stays text; no literal tag survives anywhere.
         assert "<think>" not in thinking_text
-        assert "thoughts" not in thinking_text
         assert "preamble" not in thinking_text
+        assert thinking_text == "thoughts"
         assert "preamble" in visible_text
         assert "answer" in visible_text
+        assert "<think>" not in visible_text
+        assert "</think>" not in visible_text
 
     @pytest.mark.asyncio
     async def test_streaming_orphan_close_at_position_zero_no_empty_thinking_block(
@@ -1297,6 +1294,58 @@ class TestAnthropicEndpoint:
         text = resp.text
         assert "thinking_delta" in text
         assert "text_delta" in text
+
+    @pytest.mark.asyncio
+    async def test_streaming_gemma4_channel_thinking_block(self, app_client):
+        """Gemma 4's ``<|channel>thought\\n...<channel|>`` thinking must map
+        to an Anthropic thinking block.  Capability gained when the state
+        machine was rebuilt on the shared splitter (issue #471) — the old
+        bespoke machine only knew the ``<think>`` spelling and leaked the
+        channel markup into text deltas."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "<|channel>thought\n", "done": False}
+                yield {"text": "pondering deeply", "done": False}
+                yield {"text": "<channel|>", "done": False}
+                yield {"text": "The answer is 391.", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "think"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        thinking_text = ""
+        visible_text = ""
+        for line in resp.text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") != "content_block_delta":
+                continue
+            delta = payload.get("delta", {})
+            if delta.get("type") == "thinking_delta":
+                thinking_text += delta.get("thinking", "")
+            elif delta.get("type") == "text_delta":
+                visible_text += delta.get("text", "")
+
+        assert thinking_text == "pondering deeply"
+        assert visible_text == "The answer is 391."
+        assert "<|channel>" not in resp.text
+        assert "<channel|>" not in resp.text
 
     @pytest.mark.asyncio
     async def test_streaming_tools_keepalive_ping(self, app_client):
@@ -2708,116 +2757,13 @@ class TestStreamBufferedWithTools:
         assert full_text == expected or full_text == expected.strip()
 
 
-class TestFlushThinkingBuffer:
-    """Tests for _flush_thinking_buffer extracted from _stream_thinking_state_machine."""
-
-    def test_flush_from_thinking_state_with_buffer(self):
-        from olmlx.routers.anthropic import _flush_thinking_buffer
-
-        events, new_idx = _flush_thinking_buffer(
-            state="thinking",
-            buffer="remaining thought",
-            block_idx=0,
-            text_block_started=False,
-        )
-        # Should emit: thinking delta, signature_delta, thinking stop,
-        # empty text start+stop
-        assert len(events) == 5
-        assert '"thinking_delta"' in events[0]
-        assert "remaining thought" in events[0]
-        assert '"signature_delta"' in events[1]
-        assert '"signature": ""' in events[1]
-        assert '"content_block_stop"' in events[2]
-        assert '"content_block_start"' in events[3]
-        assert '"type": "text"' in events[3]
-        assert '"content_block_stop"' in events[4]
-        assert new_idx == 1  # thinking block 0, text block 1
-
-    def test_flush_from_thinking_state_empty_buffer(self):
-        from olmlx.routers.anthropic import _flush_thinking_buffer
-
-        events, new_idx = _flush_thinking_buffer(
-            state="thinking", buffer="", block_idx=0, text_block_started=False
-        )
-        # Should emit: signature_delta, thinking stop, empty text start+stop
-        assert len(events) == 4
-        assert '"signature_delta"' in events[0]
-        assert '"content_block_stop"' in events[1]
-        assert '"content_block_start"' in events[2]
-        assert '"content_block_stop"' in events[3]
-        assert new_idx == 1
-
-    def test_flush_text_block_started(self):
-        from olmlx.routers.anthropic import _flush_thinking_buffer
-
-        events, new_idx = _flush_thinking_buffer(
-            state="text", buffer="", block_idx=1, text_block_started=True
-        )
-        # Should emit: content_block_stop only
-        assert len(events) == 1
-        assert '"content_block_stop"' in events[0]
-        assert new_idx == 1  # unchanged
-
-    def test_flush_text_not_started_with_buffer(self):
-        from olmlx.routers.anthropic import _flush_thinking_buffer
-
-        events, new_idx = _flush_thinking_buffer(
-            state="text", buffer="leftover text", block_idx=1, text_block_started=False
-        )
-        # Should emit: text start, text delta, text stop
-        assert len(events) == 3
-        assert '"content_block_start"' in events[0]
-        assert '"text_delta"' in events[1]
-        assert "leftover text" in events[1]
-        assert '"content_block_stop"' in events[2]
-        assert new_idx == 1
-
-    def test_flush_text_not_started_empty_buffer(self):
-        from olmlx.routers.anthropic import _flush_thinking_buffer
-
-        events, new_idx = _flush_thinking_buffer(
-            state="text", buffer="", block_idx=1, text_block_started=False
-        )
-        # Should emit: text start, text stop (no delta)
-        assert len(events) == 2
-        assert '"content_block_start"' in events[0]
-        assert '"content_block_stop"' in events[1]
-        assert new_idx == 1
-
-    def test_flush_init_state(self):
-        from olmlx.routers.anthropic import _flush_thinking_buffer
-
-        events, new_idx = _flush_thinking_buffer(
-            state="init", buffer="", block_idx=0, text_block_started=False
-        )
-        # Should emit: empty text start+stop
-        assert len(events) == 2
-        assert '"content_block_start"' in events[0]
-        assert '"type": "text"' in events[0]
-        assert '"content_block_stop"' in events[1]
-        assert new_idx == 0
-
-    def test_flush_init_state_with_buffer(self):
-        """Issue #307: when `thinking_expected` holds the init state waiting
-        for an orphan `</think>` that never arrives (short non-thinking
-        response on a thinking-capable model), the buffered content must be
-        emitted as a text block — not silently dropped."""
-        from olmlx.routers.anthropic import _flush_thinking_buffer
-
-        events, new_idx = _flush_thinking_buffer(
-            state="init",
-            buffer="Streamed text",
-            block_idx=0,
-            text_block_started=False,
-        )
-        # Should emit: text start + delta + stop
-        assert len(events) == 3
-        assert '"content_block_start"' in events[0]
-        assert '"type": "text"' in events[0]
-        assert '"text_delta"' in events[1]
-        assert "Streamed text" in events[1]
-        assert '"content_block_stop"' in events[2]
-        assert new_idx == 0
+# NOTE: TestFlushThinkingBuffer was removed with the bespoke
+# ``_flush_thinking_buffer`` helper (issue #471) — the state machine is now
+# built on ``routers/thinking_split.py`` and its end-of-stream flush
+# behaviours are pinned at the endpoint level (``test_streaming_empty_output``,
+# ``test_streaming_thinking_ends_midstream``,
+# ``test_streaming_thinking_expected_but_direct_answer``,
+# ``test_streaming_no_output_at_all``).
 
 
 class TestConvertMessagesImages:
