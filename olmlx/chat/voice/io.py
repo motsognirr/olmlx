@@ -7,6 +7,7 @@ inference lock, so listen() and speak() never overlap generation.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 
@@ -14,6 +15,8 @@ from olmlx.chat.voice import capture, playback
 from olmlx.engine.inference import generate_speech, generate_transcription
 from olmlx.engine.model_manager import ModelManager
 from olmlx.engine.tts import resolve_voice
+
+logger = logging.getLogger(__name__)
 
 _SENTENCE_RE = re.compile(r".+?(?:[.!?](?:\s+|$)|$)", re.DOTALL)
 
@@ -56,8 +59,8 @@ class VoiceIO:
         finally:
             try:
                 os.unlink(path)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Failed to remove recording temp file %s: %s", path, exc)
         return (result.get("text") or "").strip()
 
     async def speak(self, text: str) -> None:

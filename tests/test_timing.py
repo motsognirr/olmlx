@@ -2,6 +2,8 @@
 
 import time
 
+import pytest
+
 from olmlx.utils.timing import Timer, TimingStats
 
 
@@ -60,8 +62,15 @@ class TestTimer:
         assert result is timer
         timer.__exit__(None, None, None)
 
-    def test_initial_values(self):
+    def test_duration_before_enter_raises(self):
+        """A never-entered timer must fail loudly, not report 0 ns."""
         t = Timer()
-        assert t._start == 0
-        assert t._end == 0
-        assert t.duration_ns == 0
+        with pytest.raises(RuntimeError, match="never entered"):
+            t.duration_ns
+
+    def test_duration_before_exit_raises(self):
+        """Reading duration inside the with-block is misuse, not 'now - start'."""
+        t = Timer()
+        t.__enter__()
+        with pytest.raises(RuntimeError, match="not exited"):
+            t.duration_ns

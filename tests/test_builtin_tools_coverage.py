@@ -447,3 +447,19 @@ class TestBashBranches:
         assert result.tool_name == "bash"
         assert "Error running command" in result.message
         assert result.is_user_error is False
+
+    @pytest.mark.asyncio
+    async def test_bash_spawn_enoent_names_missing_shell(self, manager):
+        """ENOENT means the shell binary itself is missing — say so explicitly
+        instead of the generic spawn-failure message."""
+        import errno
+
+        with patch(
+            "olmlx.chat.builtin_tools.asyncio.create_subprocess_shell",
+            side_effect=OSError(errno.ENOENT, "No such file or directory"),
+        ):
+            result = await manager.call_tool("bash", {"command": "echo hi"})
+        assert isinstance(result, ToolError)
+        assert result.tool_name == "bash"
+        assert "shell not found" in result.message
+        assert result.is_user_error is False
