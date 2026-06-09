@@ -1012,6 +1012,16 @@ class BuiltinToolManager:
         return list(_TOOL_DEFS)
 
     async def call_tool(self, name: str, arguments: dict) -> str | ToolError:
+        # One knob governs both tool families (#462): a user-set
+        # tool_timeout is the default bash bound; the model's explicit
+        # timeout arg stays the more specific override. Other builtin
+        # handlers keep their own internal bounds (grep/web 30s).
+        if (
+            name == "bash"
+            and "timeout" not in arguments
+            and self._config.tool_timeout is not None
+        ):
+            arguments = {**arguments, "timeout": self._config.tool_timeout}
         if name in _SIMPLE_HANDLERS:
             return await _SIMPLE_HANDLERS[name](arguments)
         if name in _PLAN_HANDLERS:

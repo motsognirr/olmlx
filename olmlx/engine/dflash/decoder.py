@@ -438,6 +438,24 @@ class DFlashDecoder:
         ):
             raise RuntimeError("Call prefill() before step()")
 
+        # Mirror EAGLE/MTP: a mid-step exception in the draft forward,
+        # the verify forward (Metal error, OOM, shape mismatch), or the
+        # rollback would otherwise leave both KV caches partially
+        # modified and the GDN capture buffer with leftover entries —
+        # the next ``step()`` would silently consume corrupt state.
+        # ``reset()`` forces the caller to re-``prefill`` to recover,
+        # the right semantic for a hard inference failure (#460).
+        try:
+            return self._step_impl()
+        except Exception:
+            self.reset()
+            raise
+
+    def _step_impl(self) -> tuple[list[int], int]:
+        """Inner body of ``step()``, wrapped by the try/reset above so
+        the exception-safety boundary stays at one call site.
+        """
+
         pending = self._pending_token
         bs_total = self._block_size + 1  # block length including pending token
         mask_id = int(self._config.mask_token_id)

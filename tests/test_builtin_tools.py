@@ -292,6 +292,37 @@ class TestBash:
         assert "timed out" in result.message.lower()
 
     @pytest.mark.asyncio
+    async def test_bash_default_timeout_from_config(self, tmp_path):
+        """#462: a user-set tool_timeout must govern builtin tools too,
+        not just MCP. With no model-provided timeout arg, bash uses
+        config.tool_timeout as its bound.
+        """
+        config = ChatConfig(
+            model_name="test:latest",
+            plans_dir=tmp_path / "plans",
+            tool_timeout=0.2,
+        )
+        manager = BuiltinToolManager(config)
+        result = await manager.call_tool("bash", {"command": "sleep 5"})
+        assert isinstance(result, ToolError)
+        assert "timed out after 0.2s" in result.message
+
+    @pytest.mark.asyncio
+    async def test_bash_explicit_timeout_wins_over_config(self, tmp_path):
+        """The model's explicit timeout arg is the more specific bound
+        and overrides the config-wide tool_timeout.
+        """
+        config = ChatConfig(
+            model_name="test:latest",
+            plans_dir=tmp_path / "plans",
+            tool_timeout=60.0,
+        )
+        manager = BuiltinToolManager(config)
+        result = await manager.call_tool("bash", {"command": "sleep 5", "timeout": 0.2})
+        assert isinstance(result, ToolError)
+        assert "timed out after 0.2s" in result.message
+
+    @pytest.mark.asyncio
     async def test_bash_output_truncated(self, manager):
         # Generate output larger than _BASH_MAX_BYTES (100KB)
         # python3 writes all at once, avoiding pipe buffer issues

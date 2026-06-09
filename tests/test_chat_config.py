@@ -17,6 +17,12 @@ class TestChatConfig:
         assert cfg.mcp_enabled is True
         assert cfg.mcp_config_path.name == "mcp.json"
 
+    def test_tool_timeout_defaults_to_none(self):
+        # None = per-family defaults apply (MCP 30s, bash 120s); a set
+        # value governs both tool families (#462).
+        cfg = ChatConfig(model_name="qwen3:8b")
+        assert cfg.tool_timeout is None
+
     def test_custom_values(self, tmp_path):
         cfg = ChatConfig(
             model_name="llama3:8b",

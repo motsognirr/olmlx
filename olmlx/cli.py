@@ -3135,7 +3135,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--tool-timeout",
         type=float,
         default=None,
-        help="Timeout for MCP tool calls in seconds (default: 30)",
+        help=(
+            "Timeout in seconds for tool calls, MCP and builtin "
+            "(default: per-tool defaults — MCP 30, bash 120)"
+        ),
     )
     chat_p.add_argument(
         "--mcp-connect-retries",

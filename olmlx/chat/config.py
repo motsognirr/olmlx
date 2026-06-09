@@ -52,7 +52,9 @@ class ChatConfig:
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
-    tool_timeout: float = 30.0
+    # One knob for both tool families (#462). None = per-family defaults
+    # apply (MCP client 30s, bash 120s); a set value governs both.
+    tool_timeout: float | None = None
     repetition_min_phrase_len: int = 20
     repetition_min_repeats: int = 4
     local_tool_safety: bool = False
