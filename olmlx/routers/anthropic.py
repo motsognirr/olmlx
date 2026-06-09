@@ -17,6 +17,12 @@ from olmlx.engine.inference import (
     generate_chat,
 )
 from olmlx.routers.common import build_inference_options
+from olmlx.routers.streaming_common import (
+    BufferedModelOutput,
+    buffer_stream,
+    parse_buffered_output,
+    with_keepalive_pings,
+)
 from olmlx.utils.audio_input import normalize_audio_block
 from olmlx.utils.images import normalize_image_block
 from olmlx.engine.tool_parser import (
@@ -300,39 +306,6 @@ def _signature_delta_sse(block_idx: int, signature: str = "") -> str:
     )
 
 
-_PING_SENTINEL = object()
-
-
-async def _with_keepalive_pings(
-    aiter: AsyncIterator[Any],
-    interval: float = KEEPALIVE_PING_INTERVAL,
-) -> AsyncIterator[Any]:
-    """Yield items from aiter; yield _PING_SENTINEL if no item arrives within interval seconds."""
-    ait = aiter.__aiter__()
-    next_item_task = None
-    try:
-        while True:
-            if next_item_task is None:
-                next_item_task = asyncio.ensure_future(ait.__anext__())
-            done, _ = await asyncio.wait({next_item_task}, timeout=interval)
-            if done:
-                try:
-                    item = next_item_task.result()
-                except StopAsyncIteration:
-                    return
-                next_item_task = None
-                yield item
-            else:
-                yield _PING_SENTINEL
-    finally:
-        if next_item_task is not None and not next_item_task.done():
-            next_item_task.cancel()
-            try:
-                await next_item_task
-            except (asyncio.CancelledError, StopAsyncIteration):
-                pass
-
-
 def _emit_content_block(
     block_idx: int,
     block_type: str,
@@ -409,60 +382,42 @@ async def _stream_buffered_with_tools(
        ``id`` and ``name`` upfront, so the JSON body must be parsed before
        any tool events can be emitted.
 
-    Keepalive ping events (see ``_with_keepalive_pings``) prevent connection
-    timeouts during the buffering window.
+    Keepalive ping events (see ``streaming_common.with_keepalive_pings``)
+    prevent connection timeouts during the buffering window.
     """
-    text_chunks: list[str] = []
-    raw_text = ""
-    output_tokens = 0
-    # Engine meta chunk arrives before any text — capture it so the orphan
-    # `</think>` heuristic in `parse_model_output` is gated symmetrically
-    # with the non-tools paths (issue #307 review round 5).
-    thinking_expected = False
+    out = BufferedModelOutput()
+    async for item in buffer_stream(
+        result,
+        keepalive_interval=KEEPALIVE_PING_INTERVAL,
+        ping=_sse("ping", {"type": "ping"}),
+    ):
+        if isinstance(item, BufferedModelOutput):
+            out = item
+        else:
+            # Keepalive ping SSE string, or a cache_info dict forwarded to
+            # stream_sse for message_start.
+            yield item
 
-    async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
-        if chunk is _PING_SENTINEL:
-            yield _sse("ping", {"type": "ping"})
-            continue
-        if isinstance(chunk, dict) and chunk.get("cache_info"):
-            yield chunk  # Forward to stream_sse for message_start
-            continue
-        if isinstance(chunk, dict) and "thinking_expected" in chunk:
-            thinking_expected = bool(chunk["thinking_expected"])
-            continue
-        if chunk.get("done"):
-            stats = chunk.get("stats")
-            if stats:
-                output_tokens = stats.eval_count
-            # For gpt-oss channel format, raw_text is in the done chunk
-            raw_text = chunk.get("raw_text", "")
-            done_reason = chunk.get("done_reason")
-            break
-        text_chunks.append(chunk.get("text", ""))
-    else:
-        done_reason = None
+    output_tokens = out.stats.eval_count if out.stats else 0
+    done_reason = out.done_reason
 
-    full_text = "".join(text_chunks)
-
-    if raw_text:
+    if out.raw_text:
         logger.info(
             "Raw model output (%d chars before filter, %d chars visible): %s",
-            len(raw_text),
-            len(full_text),
-            raw_text[:1000],
+            len(out.raw_text),
+            len(out.full_text),
+            out.raw_text[:1000],
         )
-        text_for_parsing = raw_text
     else:
-        logger.info("Model output (%d chars): %s", len(full_text), full_text[:1000])
-        text_for_parsing = full_text
+        logger.info(
+            "Model output (%d chars): %s", len(out.full_text), out.full_text[:1000]
+        )
 
-    thinking, visible_text, tool_uses = parse_model_output(
-        text_for_parsing,
-        True,
-        thinking_expected=thinking_expected,
+    # `fill_missing_args` off: the Anthropic surface reports the model's tool
+    # call as-is and lets the client see omitted required args.
+    thinking, visible_text, tool_uses = parse_buffered_output(
+        out, declared_tools, fill_missing_args=False
     )
-
-    resolve_tool_names(tool_uses, declared_tools)
 
     if tool_uses:
         logger.info(
@@ -660,9 +615,11 @@ async def _stream_thinking_state_machine(result):
     # (issue #307 — Qwen3.5/3.6 emit thinking without the `<think>` opener).
     thinking_expected = False
 
-    async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
-        if chunk is _PING_SENTINEL:
-            yield _sse("ping", {"type": "ping"})
+    async for chunk in with_keepalive_pings(
+        result, KEEPALIVE_PING_INTERVAL, _sse("ping", {"type": "ping"})
+    ):
+        if isinstance(chunk, str):
+            yield chunk
             continue
         if isinstance(chunk, dict) and chunk.get("cache_info"):
             yield chunk  # Forward to stream_sse for message_start

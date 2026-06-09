@@ -23,6 +23,7 @@ from olmlx.engine.tool_parser import (
     resolve_tool_names,
 )
 from olmlx.routers.common import build_inference_options, resolve_openai_think
+from olmlx.routers.streaming_common import collect_stream, parse_buffered_output
 from olmlx.utils.audio_input import normalize_audio_block
 from olmlx.utils.images import normalize_image_block
 from olmlx.utils.streaming import flush_thinking_buffer, strip_thinking_streaming
@@ -180,42 +181,19 @@ async def _stream_openai_sse_with_tools(
        b. Args:   delta={tool_calls: [{index, function: {arguments: "<json>"}}]}
     4. Done:  delta={}, finish_reason="tool_calls"
     """
-    full_text = ""
-    raw_text = ""
-    done_reason = None
-    # Engine meta chunk arrives before any text — capture it so the orphan
-    # `</think>` heuristic in `parse_model_output` is gated symmetrically
-    # with the non-tools paths (issue #307 review round 5).
-    thinking_expected = False
     try:
-        async for chunk in result:
-            if chunk.get("cache_info"):
-                continue
-            if "thinking_expected" in chunk:
-                thinking_expected = bool(chunk["thinking_expected"])
-                continue
-            if chunk.get("done"):
-                # Read raw_text from done chunk for gpt-oss tool call parsing
-                raw_text = chunk.get("raw_text", raw_text)
-                done_reason = chunk.get("done_reason")
-                break
-            full_text += chunk.get("text", "")
-
-        # Use raw_text for parsing so channel-format tool calls aren't lost;
-        # fall back to full_text for non-gpt-oss models
-        text_for_parsing = raw_text if raw_text else full_text
-        _thinking, visible_text, tool_uses = parse_model_output(
-            text_for_parsing, True, thinking_expected=thinking_expected
+        out = await collect_stream(result)
+        done_reason = out.done_reason
+        _thinking, visible_text, tool_uses = parse_buffered_output(
+            out, declared_tools
         )
-        resolve_tool_names(tool_uses, declared_tools)
-        fill_missing_required_args(tool_uses, declared_tools)
         logger.debug(
             "Buffered tool stream (%d chars): thinking=%d visible=%d tool_uses=%d raw=%s",
-            len(full_text),
+            len(out.full_text),
             len(_thinking),
             len(visible_text),
             len(tool_uses),
-            full_text[:2000],
+            out.full_text[:2000],
         )
 
         def _chunk(choices_0):

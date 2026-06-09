@@ -15,6 +15,7 @@ from olmlx.engine.tool_parser import (
     resolve_tool_names,
 )
 from olmlx.routers.common import format_error, resolve_think_flag
+from olmlx.routers.streaming_common import collect_stream
 from olmlx.routers.thinking_split import (
     flush_split_thinking,
     split_thinking_streaming,
@@ -83,42 +84,19 @@ async def _stream_chat_with_tools(
     (+ optional ``thinking``) + ``tool_calls``, followed by a done
     chunk.  Mirrors ``_stream_openai_sse_with_tools``.
     """
-    full_text = ""
-    raw_text = ""
-    thinking_expected = False
-    done_reason = "stop"
-    stats = None
     try:
         try:
-            async for chunk in result:
-                if chunk.get("cache_info"):
-                    continue
-                if "thinking_expected" in chunk:
-                    thinking_expected = bool(chunk["thinking_expected"])
-                    continue
-                if chunk.get("done"):
-                    # ``raw_text`` here is set by gpt-oss models so the
-                    # re-parse below sees the full channel-formatted
-                    # output (the visible-only ``text`` would lose
-                    # tool-call markup).  For Gemma 4 / Qwen ``raw_text``
-                    # is absent and we fall back to the accumulated
-                    # ``full_text``.  Invariant: ``generate_chat`` only
-                    # emits ``raw_text`` on the done chunk.
-                    raw_text = chunk.get("raw_text", raw_text)
-                    done_reason = chunk.get("done_reason", "stop")
-                    stats = chunk.get("stats")
-                    break
-                full_text += chunk.get("text", "")
+            out = await collect_stream(result)
         except Exception as exc:
             logger.error("Error during chat streaming (tools): %s", exc, exc_info=True)
             yield format_error(model_name)
             return
     finally:
-        # ``result`` is the async generator from ``generate_chat``; we
-        # exit the inner loop via ``break`` on the done chunk, leaving
-        # the underlying ``CancellableStream`` suspended.  Calling
-        # ``aclose`` drains it and releases the inference lock — required
-        # on both the clean-break path and the inner-exception path.
+        # ``result`` is the async generator from ``generate_chat``;
+        # ``collect_stream`` stops at the done chunk, leaving the
+        # underlying ``CancellableStream`` suspended.  Calling ``aclose``
+        # drains it and releases the inference lock — required on both
+        # the clean path and the inner-exception path.
         #
         # On the inner-exception path the inference lock stays held
         # until the consumer pulls one more time after the error chunk:
@@ -135,15 +113,14 @@ async def _stream_chat_with_tools(
         await result.aclose()
 
     try:
-        if raw_text and full_text:
+        if out.raw_text and out.full_text:
             logger.debug(
                 "raw_text supersedes %d-char accumulated full_text for "
                 "tool-call parsing (gpt-oss-style channel payload)",
-                len(full_text),
+                len(out.full_text),
             )
-        parse_text = raw_text or full_text
         thinking, visible_text, tool_calls = _build_tool_calls(
-            parse_text, tools, thinking_expected=thinking_expected
+            out.parse_text, tools, thinking_expected=out.thinking_expected
         )
         now = datetime.now(timezone.utc).isoformat()
         # Skip the non-done chunk when the model emitted only thinking
@@ -173,10 +150,10 @@ async def _stream_chat_with_tools(
                 exclude_none=True
             ),
             "done": True,
-            "done_reason": done_reason,
+            "done_reason": out.done_reason or "stop",
         }
-        if stats:
-            final.update(stats.to_dict())
+        if out.stats:
+            final.update(out.stats.to_dict())
         yield json.dumps(final) + "\n"
     except Exception as exc:
         logger.error("Error building chat tool response: %s", exc, exc_info=True)
