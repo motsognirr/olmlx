@@ -1,0 +1,39 @@
+name: Real-model smoke
+
+# Nightly real-inference coverage (#470): regular CI mocks MLX and
+# deselects real_model tests, so real-model bugs (e.g. the VLM
+# image-drop, #429) can pass CI silently. This runs a small curated
+# real_model subset on the self-hosted Mac, which caches model
+# downloads between runs. No pull_request trigger → no fork-PR
+# exposure, so the same-repo guard ci.yml uses is not needed here.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: real-model-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: Real-model smoke
+    runs-on: self-hosted
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Report disk and model cache
+        run: |
+          df -h .
+          du -sh ~/.cache/huggingface 2>/dev/null || echo "no HF cache yet"
+      - name: Install dependencies
+        run: uv sync --no-editable
+      - name: Run real-model smoke subset
+        # Per-file pytest processes; tolerates the known SIGBUS-at-
+        # Metal-teardown (exit 138) after a green run. Edit the curated
+        # file list in the script to grow coverage.
+        run: bash scripts/real_model_smoke.sh

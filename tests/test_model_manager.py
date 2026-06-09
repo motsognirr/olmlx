@@ -5992,6 +5992,13 @@ class TestWhisperLoad:
     def test_load_model_whisper_branch(self, tmp_path, registry, mock_store):
         manager = ModelManager(registry, mock_store)
         fake_whisper = MagicMock()
+        # Pre-create the local model dir so ensure_downloaded() takes the
+        # is_downloaded() short-circuit. Without it this test reached the
+        # real ``snapshot_download("test/whisper")`` over the network
+        # (caught by the real-model guard, #470).
+        local_dir = mock_store.local_path("test/whisper")
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text("{}")
         with (
             patch.object(manager, "_detect_model_kind", return_value="whisper"),
             patch(

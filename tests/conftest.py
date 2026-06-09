@@ -3,6 +3,9 @@
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import huggingface_hub
+import mlx_lm
+import mlx_vlm
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -11,6 +14,55 @@ from olmlx.engine.model_manager import LoadedModel, ModelManager
 from olmlx.engine.registry import ModelRegistry
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.models.store import ModelStore
+
+
+@pytest.fixture(autouse=True)
+def block_real_model_loads(request, monkeypatch):
+    """Fail any test that reaches a real model-loading entry point
+    without ``@pytest.mark.real_model`` (#470).
+
+    CI deselects ``-m "not real_model"`` and the integration suite
+    autouse-mocks MLX, so a forgotten marker either downloads gigabytes
+    in CI or silently passes against a mock — the false-positive gap
+    that let the VLM image-drop bug through (#429). Guarded seams:
+    ``mlx_lm.load``, ``mlx_vlm.load`` (every olmlx text/VLM load goes
+    through them; both modules are already imported transitively) and
+    ``huggingface_hub.snapshot_download`` (every fresh download,
+    including whisper/TTS pulls — olmlx resolves it at call time via
+    function-local imports). Cached whisper/TTS weights are *not*
+    covered; importing ``mlx_audio`` here would drag in spaCy.
+
+    Tests marked ``real_model`` get the real entry points; the
+    integration suite's ``mock_mlx_primitives`` layers its mocks over
+    this guard (inner fixture wins during the test, unwinds cleanly).
+    """
+    if request.node.get_closest_marker("real_model"):
+        yield
+        return
+
+    def _blocked(entry: str):
+        def _fail(*_args, **_kwargs):
+            pytest.fail(
+                f"{entry} was called by a test without "
+                "@pytest.mark.real_model. Loading or downloading real "
+                "models must be opted into via the marker so CI "
+                "(-m 'not real_model') deselects it; otherwise the "
+                "integration MLX mock can turn a real-model bug into a "
+                "silent pass. Add @pytest.mark.real_model (and put live "
+                "coverage under tests/live/), or mock the load."
+            )
+
+        _fail._olmlx_real_model_guard = True
+        return _fail
+
+    monkeypatch.setattr(mlx_lm, "load", _blocked("mlx_lm.load"))
+    monkeypatch.setattr(mlx_vlm, "load", _blocked("mlx_vlm.load"))
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        _blocked("huggingface_hub.snapshot_download"),
+    )
+    yield
 
 
 def make_error_stream(chunks, error_msg="GPU error"):

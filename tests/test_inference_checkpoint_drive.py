@@ -606,6 +606,7 @@ def test_tokenize_segmented_chat_returns_empty_segment_for_unrecognised_shape():
 
 
 @pytest.mark.slow
+@pytest.mark.real_model
 def test_tokenize_segmented_chat_real_qwen3_5_template():
     """Real-template test: Qwen3.5 chat template should produce one
     segment per message, with token boundaries at <|im_end|> positions."""
