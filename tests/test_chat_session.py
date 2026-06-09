@@ -20,12 +20,14 @@ def _make_session(
     max_turns=25,
     system_prompt=None,
     template_has_thinking=False,
+    tool_timeout=None,
 ):
     config = ChatConfig(
         model_name=model_name,
         thinking=thinking,
         max_turns=max_turns,
         system_prompt=system_prompt,
+        tool_timeout=tool_timeout,
     )
     manager = MagicMock()
     # Set up ensure_loaded to return a mock LoadedModel with template_caps
@@ -327,9 +329,9 @@ class TestAgentLoop:
         assert "<think>" not in token_text
         assert "The answer" in token_text
 
-    @pytest.mark.asyncio
-    async def test_tool_call_agent_loop(self):
-        """Model calls a tool, result is fed back, model continues."""
+    @staticmethod
+    def _read_file_mcp():
+        """MCP mock exposing a single ``read_file`` tool."""
         mcp = MagicMock()
         mcp.get_tools_for_chat.return_value = [
             {
@@ -345,6 +347,12 @@ class TestAgentLoop:
             }
         ]
         mcp.call_tool = AsyncMock(return_value="file contents here")
+        return mcp
+
+    @pytest.mark.asyncio
+    async def test_tool_call_agent_loop(self):
+        """Model calls a tool, result is fed back, model continues."""
+        mcp = self._read_file_mcp()
 
         session = _make_session(mcp=mcp)
         call_count = 0
@@ -381,13 +389,44 @@ class TestAgentLoop:
         assert len(tool_result_events) == 1
         assert "file contents here" in tool_result_events[0]["result"]
 
-        # MCP should have been called
-        mcp.call_tool.assert_awaited_once_with(
-            "read_file", {"path": "/tmp/test.txt"}, timeout=30.0
-        )
+        # MCP should have been called without a timeout kwarg — with
+        # tool_timeout unset, the MCP client's own default applies (#462).
+        mcp.call_tool.assert_awaited_once_with("read_file", {"path": "/tmp/test.txt"})
 
         # Should have two generate_chat calls
         assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_tool_timeout_passed_to_mcp_when_set(self):
+        """A user-set tool_timeout is passed through to MCP tool calls."""
+        mcp = self._read_file_mcp()
+
+        session = _make_session(mcp=mcp, tool_timeout=7.5)
+        call_count = 0
+
+        async def fake_generate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield {
+                    "text": '<tool_call>{"name": "read_file", "arguments": {"path": "/tmp/test.txt"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": MagicMock()}
+            else:
+                yield {"text": "done", "done": False}
+                yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            async for _event in session.send_message("Read /tmp/test.txt"):
+                pass
+
+        mcp.call_tool.assert_awaited_once_with(
+            "read_file", {"path": "/tmp/test.txt"}, timeout=7.5
+        )
 
     @pytest.mark.asyncio
     async def test_max_turns_limit(self):

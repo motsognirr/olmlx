@@ -506,9 +506,14 @@ class ChatSession:
                     result = await self.builtin.call_tool(tool_name, tool_input)
                 elif self.mcp is not None:
                     _sp.set_attribute("mcp.server", getattr(self.mcp, "name", "mcp"))
-                    result = await self.mcp.call_tool(
-                        tool_name, tool_input, timeout=self.config.tool_timeout
-                    )
+                    # tool_timeout=None → let the MCP client's own default
+                    # apply (single source of that default).
+                    if self.config.tool_timeout is not None:
+                        result = await self.mcp.call_tool(
+                            tool_name, tool_input, timeout=self.config.tool_timeout
+                        )
+                    else:
+                        result = await self.mcp.call_tool(tool_name, tool_input)
                 else:
                     result = ToolError(
                         message=f"No handler for tool: {tool_name!r}",

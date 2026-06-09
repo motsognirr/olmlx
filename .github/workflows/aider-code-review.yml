@@ -11,6 +11,9 @@ permissions:
 jobs:
   gpt-review:
     runs-on: ubuntu-latest
+    # Same-repo PRs only: fork PRs don't receive repo secrets, so the review
+    # would only fail noisily — skip it instead. Issue #470.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,6 +29,8 @@ jobs:
 
   deepseek-review:
     runs-on: ubuntu-latest
+    # Same-repo PRs only (see `gpt-review`). Issue #470.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

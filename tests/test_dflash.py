@@ -1027,6 +1027,42 @@ class TestDFlashDecoder:
         assert sliding_cache.keys.shape[2] <= window - 1
         assert sliding_cache.offset > window - 1
 
+    def test_step_resets_on_verify_forward_exception(self, components, monkeypatch):
+        """Issue #460: a mid-step exception (Metal error, OOM in the
+        verify forward, rollback failure) must force a full reset —
+        EAGLE and MTP wrap ``step()`` in try/reset, DFlash didn't.
+        Without it the target/draft caches stay partially modified and
+        ``speculative_stream_generate`` calls ``step()`` again on the
+        corrupt state.
+        """
+        target, draft, cfg = components
+        decoder = DFlashDecoder(target, draft, cfg, block_size=2)
+        decoder.prefill(mx.array([[1, 2, 3]]))
+        assert decoder._patched is True
+        assert decoder._bound is True
+
+        # Make the verify forward fail by raising from embed_tokens
+        # (called first thing inside the synthetic target's
+        # ``__call__``). The draft forward is independent of
+        # embed_tokens, so only the verify blows up — mid-step, after
+        # the draft cache has already been advanced.
+        def raising_embed(*_a, **_kw):
+            raise RuntimeError("simulated verify forward failure")
+
+        monkeypatch.setattr(target.model, "embed_tokens", raising_embed)
+        with pytest.raises(RuntimeError, match="simulated verify"):
+            decoder.step()
+
+        # reset() ran: patch removed, draft unbound, caches cleared —
+        # the caller must re-prefill to recover.
+        assert decoder._patched is False
+        assert decoder._bound is False
+        assert decoder._target_cache is None
+        assert decoder._draft_cache is None
+        assert decoder._pending_token is None
+        layers = _get_layers(target)
+        assert not any(isinstance(layer, _LayerHook) for layer in layers)
+
 
 # ---------------------------------------------------------------------------
 # Migration / config routing

@@ -16,6 +16,10 @@ jobs:
   checks:
     name: Ruff
     runs-on: self-hosted
+    # Same-repo PRs only: these jobs run on a self-hosted Mac, so a fork PR
+    # would mean arbitrary code execution on that host (checkout + uv sync +
+    # pytest of attacker-controlled code). Issue #470.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install dependencies
@@ -28,6 +32,8 @@ jobs:
   typecheck:
     name: Pyright
     runs-on: self-hosted
+    # Same-repo PRs only — self-hosted runner (see `checks`). Issue #470.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install dependencies
@@ -38,6 +44,8 @@ jobs:
   test:
     name: Tests
     runs-on: self-hosted
+    # Same-repo PRs only — self-hosted runner (see `checks`). Issue #470.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Run tests with coverage
