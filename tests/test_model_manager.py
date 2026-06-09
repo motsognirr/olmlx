@@ -81,6 +81,86 @@ class TestLoadedModel:
         assert lm.loaded_at > 0
 
 
+class TestCloseLoadedModelGrammarDrop:
+    """The xgrammar compile cache is keyed on ``id(tokenizer)``; entries
+    must be dropped before the tokenizer can be GC'd or a future tokenizer
+    landing on the recycled address would be served a stale grammar
+    (issue #464). ``_close_loaded_model`` therefore must reach
+    ``drop_for_tokenizer`` no matter which earlier close step fails.
+    """
+
+    @staticmethod
+    def _make_lm(**overrides):
+        from types import SimpleNamespace
+
+        defaults = dict(
+            name="test:latest",
+            hf_path="test/model",
+            # SimpleNamespace: no ``prefetcher`` attribute, so the flash
+            # close branch is skipped.
+            model=SimpleNamespace(),
+            tokenizer=MagicMock(),
+            prompt_cache_store=MagicMock(),
+        )
+        defaults.update(overrides)
+        return LoadedModel(**defaults)
+
+    def test_grammar_drop_runs_when_vlm_cache_clear_raises(self, monkeypatch):
+        """A failing ``vlm_prompt_cache_store.clear()`` must not skip the
+        grammar-cache drop — pre-#464 this step was the only unguarded one
+        in ``_close_loaded_model``, so its raise skipped every later step
+        and escaped as a bare exception instead of the documented
+        ExceptionGroup.
+        """
+        drop_calls: list[Any] = []
+        monkeypatch.setattr(
+            "olmlx.engine.grammar.drop_for_tokenizer", drop_calls.append
+        )
+        vlm_store = MagicMock()
+        vlm_store.clear.side_effect = RuntimeError("vlm clear boom")
+        lm = self._make_lm(vlm_prompt_cache_store=vlm_store)
+
+        with pytest.raises(ExceptionGroup) as excinfo:
+            ModelManager._close_loaded_model(lm)
+
+        # The failure is folded into the documented ExceptionGroup contract
+        # (unload()'s ``except ExceptionGroup`` absorbs it) ...
+        assert any(
+            isinstance(e, RuntimeError) and "vlm clear boom" in str(e)
+            for e in excinfo.value.exceptions
+        )
+        # ... and the grammar drop still ran, with the tokenizer the cache
+        # was keyed on.
+        assert drop_calls == [lm.text_tokenizer]
+
+    def test_grammar_drop_runs_when_every_other_close_step_raises(self, monkeypatch):
+        """Defense in depth: even if all guarded steps fail, the drop runs."""
+        drop_calls: list[Any] = []
+        monkeypatch.setattr(
+            "olmlx.engine.grammar.drop_for_tokenizer", drop_calls.append
+        )
+        weight_store = MagicMock()
+        weight_store.close.side_effect = RuntimeError("ws boom")
+        spec_decoder = MagicMock()
+        spec_decoder.close.side_effect = RuntimeError("spec boom")
+        prompt_store = MagicMock()
+        prompt_store.clear.side_effect = RuntimeError("pc boom")
+        vlm_store = MagicMock()
+        vlm_store.clear.side_effect = RuntimeError("vlm boom")
+        lm = self._make_lm(
+            weight_store=weight_store,
+            speculative_decoder=spec_decoder,
+            prompt_cache_store=prompt_store,
+            vlm_prompt_cache_store=vlm_store,
+        )
+
+        with pytest.raises(ExceptionGroup) as excinfo:
+            ModelManager._close_loaded_model(lm)
+
+        assert len(excinfo.value.exceptions) == 4
+        assert drop_calls == [lm.text_tokenizer]
+
+
 class TestModelManager:
     def test_init(self, registry, mock_store):
         manager = ModelManager(registry, mock_store)

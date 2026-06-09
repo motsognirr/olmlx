@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import threading
+import weakref
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -88,21 +89,51 @@ class GrammarSpec:
 
 
 # Module-level cache keyed on (tokenizer id, spec cache_key). Tokenizer ID
-# is ``id(tokenizer)`` — safe only because ``drop_for_tokenizer`` is wired
-# into ``ModelManager._close_loaded_model`` so entries are removed *while
-# the tokenizer is still alive*, before CPython can reuse the freed
-# address for a new allocation. If you change the lifecycle (e.g. clear
-# the cache after the tokenizer is GC'd), switch to a ``WeakKeyDictionary``
-# keyed on the tokenizer object — otherwise the next tokenizer may land
-# on the same ``id`` and return a stale ``CompiledGrammar`` built for a
-# different vocabulary, producing wrong-token masks.
-_compile_cache: dict[tuple[int, str], Any] = {}
+# is ``id(tokenizer)``, and CPython freely recycles addresses, so every
+# entry also carries a ``weakref.ref`` to the owning tokenizer; lookups
+# validate that the referent is *the same live object* before serving.
+# Without that check, an entry surviving a partially-failed unload
+# (issue #464 — ``unload()`` absorbs ``_close_loaded_model`` failures)
+# could collide with a later tokenizer's id and return a stale
+# ``CompiledGrammar`` built for a different vocabulary, producing
+# wrong-token masks. ``drop_for_tokenizer`` (wired into
+# ``ModelManager._close_loaded_model``) remains the deterministic
+# cleanup path; dead entries it missed are additionally swept on insert
+# so they cannot accumulate.
+_compile_cache: dict[tuple[int, str], tuple[weakref.ref[Any], Any]] = {}
 _compile_cache_lock = threading.Lock()
 
 # A separate cache for the per-tokenizer ``GrammarCompiler`` itself, since
-# constructing it walks the full vocab once. Keyed on ``id(tokenizer)``.
-_compiler_cache: dict[int, Any] = {}
+# constructing it walks the full vocab once. Keyed on ``id(tokenizer)``,
+# same (weakref, value) entry shape and validation as ``_compile_cache``.
+_compiler_cache: dict[int, tuple[weakref.ref[Any], Any]] = {}
 _compiler_cache_lock = threading.Lock()
+
+
+def _make_ref(tokenizer: Any) -> weakref.ref[Any] | None:
+    """A weakref to *tokenizer*, or ``None`` if it isn't weakref-able.
+
+    HF tokenizers are plain Python classes and always weakref-able; the
+    fallback only matters for exotic stand-ins, which then simply skip
+    caching (correctness over speed).
+    """
+    try:
+        return weakref.ref(tokenizer)
+    except TypeError:
+        return None
+
+
+def _sweep_dead_entries_locked(cache: dict[Any, tuple[weakref.ref[Any], Any]]) -> None:
+    """Remove entries whose owning tokenizer has been GC'd.
+
+    Caller must hold the cache's lock. Bounds leakage when
+    ``drop_for_tokenizer`` was skipped by a failed unload — dead entries
+    can never be *served* (identity validation) but would otherwise
+    linger forever.
+    """
+    dead = [k for k, (ref, _) in cache.items() if ref() is None]
+    for k in dead:
+        del cache[k]
 
 
 def _get_compiler(tokenizer: Any, vocab_size: int) -> Any:
@@ -113,12 +144,15 @@ def _get_compiler(tokenizer: Any, vocab_size: int) -> Any:
         )
     key = id(tokenizer)
     with _compiler_cache_lock:
-        compiler = _compiler_cache.get(key)
-        if compiler is not None:
-            return compiler
+        entry = _compiler_cache.get(key)
+        if entry is not None and entry[0]() is tokenizer:
+            return entry[1]
         info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
         compiler = xgr.GrammarCompiler(info, max_threads=4)
-        _compiler_cache[key] = compiler
+        _sweep_dead_entries_locked(_compiler_cache)
+        ref = _make_ref(tokenizer)
+        if ref is not None:
+            _compiler_cache[key] = (ref, compiler)
         return compiler
 
 
@@ -141,9 +175,13 @@ def compile_for_tokenizer(tokenizer: Any, vocab_size: int, spec: GrammarSpec) ->
         )
     cache_key = (id(tokenizer), spec.cache_key())
     with _compile_cache_lock:
-        cached = _compile_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        entry = _compile_cache.get(cache_key)
+        # Serve only entries owned by *this live tokenizer* — an id-keyed
+        # entry may belong to a dead tokenizer whose address was recycled
+        # (issue #464); serving it would apply a grammar compiled for a
+        # different vocabulary.
+        if entry is not None and entry[0]() is tokenizer:
+            return entry[1]
     # Compile outside the lock — see docstring.
     compiler = _get_compiler(tokenizer, vocab_size)
     if spec.kind == "json_object":
@@ -155,9 +193,12 @@ def compile_for_tokenizer(tokenizer: Any, vocab_size: int, spec: GrammarSpec) ->
         # A concurrent compile may have stored already; prefer the
         # existing entry so callers see object identity stability.
         existing = _compile_cache.get(cache_key)
-        if existing is not None:
-            return existing
-        _compile_cache[cache_key] = compiled
+        if existing is not None and existing[0]() is tokenizer:
+            return existing[1]
+        _sweep_dead_entries_locked(_compile_cache)
+        ref = _make_ref(tokenizer)
+        if ref is not None:
+            _compile_cache[cache_key] = (ref, compiled)
         return compiled
 
 
@@ -355,8 +396,15 @@ def drop_for_tokenizer(tokenizer: Any) -> None:
     Must be called *while the tokenizer object is still alive* — the
     cache key is ``id(tokenizer)`` and CPython can recycle freed
     addresses for new allocations. Called from
-    ``ModelManager._close_loaded_model`` so eviction runs before the
-    LoadedModel's tokenizer reference is nulled.
+    ``ModelManager._close_loaded_model`` (first, so no earlier close
+    failure can skip it — issue #464) before the LoadedModel's tokenizer
+    reference is nulled.
+
+    This is the deterministic cleanup path; correctness no longer
+    depends on it. Entries carry a weakref to their owning tokenizer
+    and lookups validate referent identity, so an entry that survives a
+    skipped/failed drop can never be served to a colliding tokenizer
+    and is swept on the next cache insert.
     """
     tid = id(unwrap_mlx_tokenizer(tokenizer))
     with _compile_cache_lock:

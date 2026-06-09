@@ -215,6 +215,109 @@ class TestCompileCache:
         assert tid not in _grammar._compiler_cache
 
 
+class TestStaleEntryProtection:
+    """CPython recycles ``id()`` addresses, so an entry surviving a
+    partially-failed unload could collide with a later tokenizer's id and
+    serve a ``CompiledGrammar`` built for a different vocabulary
+    (issue #464). Cache entries therefore carry a weakref to the owning
+    tokenizer and lookups validate referent identity before serving.
+    """
+
+    def test_stale_compile_entry_for_recycled_id_not_served(self, gpt2_tokenizer):
+        """An entry left behind by a *different* tokenizer that happens to
+        share the lookup id must be ignored (recompiled), not served."""
+        import weakref
+
+        from olmlx.engine import grammar as _grammar
+
+        spec = GrammarSpec("json_object")
+        other_tokenizer = type("FakeTok", (), {})()  # weakref-able stand-in
+        sentinel = object()
+        # Simulate the id-collision: a stale entry owned by another
+        # tokenizer sits under *this* tokenizer's id.
+        key = (id(gpt2_tokenizer), spec.cache_key())
+        _grammar._compile_cache[key] = (weakref.ref(other_tokenizer), sentinel)
+
+        result = compile_for_tokenizer(gpt2_tokenizer, gpt2_tokenizer.vocab_size, spec)
+
+        assert result is not sentinel
+        # The stale entry was replaced by one owned by the live tokenizer.
+        ref, value = _grammar._compile_cache[key]
+        assert ref() is gpt2_tokenizer
+        assert value is result
+
+    def test_stale_compiler_entry_for_recycled_id_not_used(self, gpt2_tokenizer):
+        """Same hazard for the per-tokenizer ``GrammarCompiler`` cache."""
+        import weakref
+
+        from olmlx.engine import grammar as _grammar
+
+        other_tokenizer = type("FakeTok", (), {})()
+        bogus_compiler = object()  # would blow up if actually used
+        _grammar._compiler_cache[id(gpt2_tokenizer)] = (
+            weakref.ref(other_tokenizer),
+            bogus_compiler,
+        )
+
+        spec = GrammarSpec("json_object")
+        compiled = compile_for_tokenizer(
+            gpt2_tokenizer, gpt2_tokenizer.vocab_size, spec
+        )
+
+        assert compiled is not None
+        ref, compiler = _grammar._compiler_cache[id(gpt2_tokenizer)]
+        assert ref() is gpt2_tokenizer
+        assert compiler is not bogus_compiler
+
+    def test_dead_entry_for_recycled_id_not_served(self, gpt2_tokenizer):
+        """An entry whose owning tokenizer has been GC'd must never be
+        served, even when its key collides with a live tokenizer's id."""
+        import gc
+        import weakref
+
+        from olmlx.engine import grammar as _grammar
+
+        spec = GrammarSpec("json_object")
+        dead_tok = type("FakeTok", (), {})()
+        dead_ref = weakref.ref(dead_tok)
+        del dead_tok
+        gc.collect()
+        assert dead_ref() is None
+        sentinel = object()
+        key = (id(gpt2_tokenizer), spec.cache_key())
+        _grammar._compile_cache[key] = (dead_ref, sentinel)
+
+        result = compile_for_tokenizer(gpt2_tokenizer, gpt2_tokenizer.vocab_size, spec)
+        assert result is not sentinel
+        # A fresh, correctly-owned entry replaced the dead one.
+        ref, value = _grammar._compile_cache[key]
+        assert ref() is gpt2_tokenizer
+        assert value is result
+
+    def test_dead_entries_swept_on_insert(self, gpt2_tokenizer):
+        """Entries owned by GC'd tokenizers are purged on the next insert,
+        so a failed ``drop_for_tokenizer`` can't leak entries forever."""
+        import gc
+        import weakref
+
+        from olmlx.engine import grammar as _grammar
+
+        dead_tok = type("FakeTok", (), {})()
+        dead_ref = weakref.ref(dead_tok)
+        del dead_tok
+        gc.collect()
+        assert dead_ref() is None
+        stale_key = (123456789, "json_object")
+        _grammar._compile_cache[stale_key] = (dead_ref, object())
+        _grammar._compiler_cache[987654321] = (dead_ref, object())
+
+        spec = GrammarSpec("json_object")
+        compile_for_tokenizer(gpt2_tokenizer, gpt2_tokenizer.vocab_size, spec)
+
+        assert stale_key not in _grammar._compile_cache
+        assert 987654321 not in _grammar._compiler_cache
+
+
 class TestLogitsProcessor:
     def test_first_call_treats_tokens_as_prompt(self, gpt2_tokenizer):
         spec = GrammarSpec("json_object")
