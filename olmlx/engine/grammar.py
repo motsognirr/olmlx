@@ -137,11 +137,11 @@ def _make_ref(tokenizer: Any) -> weakref.ref[Any] | None:
                 return None
             _unrefable_warned_classes.add(cls)
         logger.warning(
-                "tokenizer type %s is not weakref-able; grammar compile "
-                "caching is disabled for it — every structured-output "
-                "request recompiles the grammar",
-                cls.__name__,
-            )
+            "tokenizer type %s is not weakref-able; grammar compile "
+            "caching is disabled for it — every structured-output "
+            "request recompiles the grammar",
+            cls.__name__,
+        )
         return None
 
 
