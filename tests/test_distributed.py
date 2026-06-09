@@ -1735,3 +1735,281 @@ class TestSidebandProtocolExtended:
         finally:
             conn.close()
             server_sock.close()
+
+
+@pytest.fixture(autouse=True)
+def _restore_signal_disposition():
+    """Snapshot/restore SIGTERM/SIGINT dispositions for every test here.
+
+    Tests that drive _launch_distributed_workers now install real signal
+    handlers (#461); without restoration they leak into later tests in
+    this process.
+    """
+    import signal
+
+    import olmlx.cli as cli_module
+
+    old_term = signal.getsignal(signal.SIGTERM)
+    old_int = signal.getsignal(signal.SIGINT)
+    old_flag = cli_module._signal_handlers_installed
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGINT, old_int)
+        cli_module._signal_handlers_installed = old_flag
+
+
+class TestSignalCleanup:
+    """Issue #461: SIGTERM during startup must clean up SSH workers.
+
+    Python's default SIGTERM disposition skips atexit handlers, so the
+    atexit-only cleanup orphaned remote workers when the coordinator was
+    killed in the long pre-uvicorn window.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _default_signal_state(self, _restore_signal_disposition):
+        """Start each test from the interpreter-default dispositions."""
+        import signal
+
+        import olmlx.cli as cli_module
+
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        cli_module._signal_handlers_installed = False
+        yield
+
+    def test_install_registers_sigterm_and_sigint(self):
+        """After install, both handlers are non-default Python callables."""
+        import signal
+
+        import olmlx.cli as cli_module
+
+        cli_module._install_signal_handlers()
+
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            handler = signal.getsignal(signum)
+            assert callable(handler)
+            assert handler is not signal.SIG_DFL
+            assert handler is not signal.default_int_handler
+
+    def test_handler_cleans_up_and_exits_128_plus_signum(self, monkeypatch):
+        """The SIGTERM handler calls _cleanup_workers and exits 128+15."""
+        import signal
+
+        import olmlx.cli as cli_module
+
+        cleanup = MagicMock()
+        monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
+
+        cli_module._install_signal_handlers()
+        handler = signal.getsignal(signal.SIGTERM)
+
+        with pytest.raises(SystemExit) as excinfo:
+            handler(signal.SIGTERM, None)
+
+        cleanup.assert_called_once()
+        assert excinfo.value.code == 128 + signal.SIGTERM
+
+    def test_handler_exits_even_if_cleanup_raises(self, monkeypatch):
+        """A cleanup failure must not leave the coordinator alive on signal."""
+        import signal
+
+        import olmlx.cli as cli_module
+
+        cleanup = MagicMock(side_effect=ProcessLookupError("worker already gone"))
+        monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
+
+        cli_module._install_signal_handlers()
+        handler = signal.getsignal(signal.SIGTERM)
+
+        with pytest.raises(SystemExit) as excinfo:
+            handler(signal.SIGTERM, None)
+
+        cleanup.assert_called_once()
+        assert excinfo.value.code == 128 + signal.SIGTERM
+
+    def test_handler_exits_even_if_chained_previous_raises(self, monkeypatch):
+        """A raising chained handler must not prevent the exit either."""
+        import signal
+
+        import olmlx.cli as cli_module
+
+        cleanup = MagicMock()
+        monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
+
+        def previous(signum, frame):
+            raise RuntimeError("previous handler failed")
+
+        signal.signal(signal.SIGTERM, previous)
+        cli_module._install_signal_handlers()
+        handler = signal.getsignal(signal.SIGTERM)
+
+        with pytest.raises(SystemExit) as excinfo:
+            handler(signal.SIGTERM, None)
+
+        cleanup.assert_called_once()
+        assert excinfo.value.code == 128 + signal.SIGTERM
+
+    def test_sigint_handler_exits_130_not_keyboardinterrupt(self, monkeypatch):
+        """Default SIGINT disposition (default_int_handler) is not chained."""
+        import signal
+
+        import olmlx.cli as cli_module
+
+        cleanup = MagicMock()
+        monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
+
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        cli_module._install_signal_handlers()
+        handler = signal.getsignal(signal.SIGINT)
+
+        with pytest.raises(SystemExit) as excinfo:
+            handler(signal.SIGINT, None)
+
+        cleanup.assert_called_once()
+        assert excinfo.value.code == 128 + signal.SIGINT
+
+    def test_preexisting_handler_is_chained(self, monkeypatch):
+        """A non-default handler installed earlier still runs."""
+        import signal
+
+        import olmlx.cli as cli_module
+
+        cleanup = MagicMock()
+        monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
+
+        previous_calls: list[tuple] = []
+
+        def previous(signum, frame):
+            previous_calls.append((signum, frame))
+
+        signal.signal(signal.SIGTERM, previous)
+        cli_module._install_signal_handlers()
+        handler = signal.getsignal(signal.SIGTERM)
+
+        with pytest.raises(SystemExit):
+            handler(signal.SIGTERM, None)
+
+        cleanup.assert_called_once()
+        assert previous_calls == [(signal.SIGTERM, None)]
+
+    def test_install_is_idempotent(self):
+        """Calling install twice must not re-wrap (no self-chaining)."""
+        import signal
+
+        import olmlx.cli as cli_module
+
+        cli_module._install_signal_handlers()
+        first = signal.getsignal(signal.SIGTERM)
+        cli_module._install_signal_handlers()
+        assert signal.getsignal(signal.SIGTERM) is first
+
+    def test_cleanup_workers_idempotent(self):
+        """Safe to run from both the signal path and atexit."""
+        import olmlx.cli as cli_module
+
+        mock_proc = MagicMock()
+        cli_module._worker_procs.clear()
+        cli_module._worker_log_fhs.clear()
+        cli_module._worker_procs.append(mock_proc)
+
+        cli_module._cleanup_workers()
+        cli_module._cleanup_workers()  # second call must be a no-op
+
+        mock_proc.terminate.assert_called_once()
+        assert cli_module._worker_procs == []
+        assert cli_module._worker_log_fhs == []
+
+    def test_launch_installs_handlers_before_spawning_workers(
+        self, tmp_path, monkeypatch
+    ):
+        """Handlers must already be installed when Popen runs."""
+        import signal
+
+        import olmlx.cli as cli_module
+
+        cli_module._worker_procs.clear()
+        cli_module._worker_log_fhs.clear()
+        cli_module._atexit_registered = False
+
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text('{"hosts": ["host0", "host1"], "model": "test/model"}')
+
+        monkeypatch.setattr(
+            "olmlx.config.settings",
+            MagicMock(
+                distributed_hostfile=str(hostfile),
+                distributed_backend="ring",
+                distributed_sideband_port=32400,
+                distributed_port=32323,
+                distributed_secret="",
+                distributed_remote_working_dir="",
+                distributed_remote_python="python",
+                distributed_pre_shard=False,
+                flash_moe=False,
+                flash=False,
+                distributed_worker_shard_dir="",
+            ),
+        )
+
+        installed_at_spawn: list[object] = []
+
+        def fake_popen(*args, **kwargs):
+            installed_at_spawn.append(signal.getsignal(signal.SIGTERM))
+            raise OSError("popen failed")
+
+        monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+        with pytest.raises(OSError, match="popen failed"):
+            cli_module._launch_distributed_workers()
+
+        assert installed_at_spawn, "Popen was never reached"
+        handler = installed_at_spawn[0]
+        assert callable(handler) and handler is not signal.default_int_handler, (
+            "SIGTERM handler must be installed before workers are spawned"
+        )
+        # And it must clean up + exit with 128+signum.
+        cleanup = MagicMock()
+        monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
+        with pytest.raises(SystemExit) as excinfo:
+            handler(signal.SIGTERM, None)
+        cleanup.assert_called_once()
+        assert excinfo.value.code == 128 + signal.SIGTERM
+
+
+class TestDegradedShutdownWarning:
+    """Issue #461 (related): per-worker shutdown-send failures must be logged."""
+
+    def test_failed_shutdown_send_logs_warning(self, monkeypatch, caplog):
+        """A failed shutdown send during degradation names the worker."""
+        import logging
+
+        from olmlx.engine import distributed as dist_module
+        from olmlx.engine.distributed import DistributedCoordinator
+
+        coordinator = object.__new__(DistributedCoordinator)
+        coordinator._workers = [MagicMock(), MagicMock()]
+
+        def fake_send(sock, msg):
+            if msg.get("action") == "generate" and sock is coordinator._workers[1]:
+                raise OSError("worker 2 unreachable")
+            if msg.get("action") == "shutdown":
+                raise OSError("worker 1 shutdown send failed")
+
+        monkeypatch.setattr(dist_module, "_send_message", fake_send)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.distributed"):
+            with pytest.raises(RuntimeError, match="cannot recover"):
+                coordinator.broadcast_inference([1, 2], "ab", 10, {})
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "shutdown" in r.getMessage().lower()
+        ]
+        assert warnings, "expected a warning for the failed shutdown send"
+        assert "1" in warnings[0].getMessage(), (
+            "warning must identify which worker failed"
+        )

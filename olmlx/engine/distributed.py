@@ -280,7 +280,13 @@ class DistributedCoordinator:
                     try:
                         _send_message(self._workers[j], shutdown_msg)
                     except Exception:
-                        pass
+                        logger.warning(
+                            "Failed to send shutdown to worker %d/%d during "
+                            "cluster degradation — it may still be running",
+                            j + 1,
+                            len(self._workers),
+                            exc_info=True,
+                        )
                 # Clean up all worker sockets — cluster is unrecoverable
                 num_workers = len(self._workers)
                 for w in self._workers:

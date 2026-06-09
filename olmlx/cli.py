@@ -1110,6 +1110,49 @@ _VALID_HOSTNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 _worker_procs: list[subprocess.Popen] = []
 _worker_log_fhs: list = []
 _atexit_registered = False
+_signal_handlers_installed = False
+
+
+def _install_signal_handlers() -> None:
+    """Install SIGTERM/SIGINT handlers that clean up distributed workers.
+
+    Python's default SIGTERM disposition terminates the process *without*
+    running atexit handlers, so the atexit-only cleanup orphans the SSH
+    worker processes when the coordinator is killed during the long
+    pre-uvicorn startup window (worker launch + slow ``import transformers``).
+    Once ``uvicorn.run()`` takes over it installs its own signal handlers
+    (replacing these) and shuts down gracefully, which runs atexit — so
+    these handlers only need to cover the startup window.
+
+    A pre-existing non-default Python handler is chained after cleanup;
+    ``signal.default_int_handler`` is intentionally not chained (it raises
+    KeyboardInterrupt, preempting the ``128 + signum`` exit).
+    """
+    import signal
+
+    global _signal_handlers_installed
+    if _signal_handlers_installed:
+        return
+    _signal_handlers_installed = True
+
+    def _make_handler(previous):
+        def _signal_cleanup(signum, frame):
+            # The exit must happen even if cleanup or the chained handler
+            # raises — surviving the signal would leave the coordinator
+            # alive in an undefined state.
+            try:
+                _cleanup_workers()
+                if callable(previous) and previous is not signal.default_int_handler:
+                    previous(signum, frame)
+            except Exception:
+                logger.exception("Worker cleanup failed during signal shutdown")
+            finally:
+                sys.exit(128 + signum)
+
+        return _signal_cleanup
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, _make_handler(signal.getsignal(signum)))
 
 
 def _cleanup_workers():
@@ -1380,6 +1423,11 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
     if not _atexit_registered:
         atexit.register(_cleanup_workers)
         _atexit_registered = True
+
+    # atexit alone is insufficient: the default SIGTERM disposition skips
+    # atexit handlers, orphaning SSH workers if the coordinator is killed
+    # before uvicorn (which installs its own handlers) takes over (#461).
+    _install_signal_handlers()
 
     remote_python = settings.distributed_remote_python
     validate_remote_python(remote_python)
