@@ -26,8 +26,8 @@ class Timer:
     """Nanosecond timer context manager."""
 
     def __init__(self):
-        self._start: int = 0
-        self._end: int = 0
+        self._start: int | None = None
+        self._end: int | None = None
 
     def __enter__(self):
         self._start = time.perf_counter_ns()
@@ -38,4 +38,12 @@ class Timer:
 
     @property
     def duration_ns(self) -> int:
+        # Fail loudly on misuse — a silent 0 would flow into TimingStats
+        # and Prometheus as a plausible-looking measurement.
+        if self._start is None:
+            raise RuntimeError("Timer was never entered; duration_ns is undefined")
+        if self._end is None:
+            raise RuntimeError(
+                "Timer was entered but not exited; duration_ns is undefined"
+            )
         return self._end - self._start

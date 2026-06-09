@@ -42,6 +42,31 @@ async def test_listen_records_and_transcribes(mock_manager):
     unlink.assert_called_once_with("/tmp/x.wav")
 
 
+@pytest.mark.asyncio
+async def test_listen_unlink_oserror_is_logged_not_raised(mock_manager, caplog):
+    """A failed temp-file cleanup must not clobber a successful transcription."""
+    import logging
+
+    vio = VoiceIO(
+        manager=mock_manager,
+        stt_model="whisper",
+        tts_model="kokoro",
+        voice="af_heart",
+    )
+    with (
+        patch("olmlx.chat.voice.io.capture.record_to_wav", return_value="/tmp/x.wav"),
+        patch("olmlx.chat.voice.io.os.unlink", side_effect=OSError("gone")),
+        patch(
+            "olmlx.chat.voice.io.generate_transcription",
+            new=AsyncMock(return_value={"text": "hello"}),
+        ),
+        caplog.at_level(logging.DEBUG, logger="olmlx.chat.voice.io"),
+    ):
+        text = await vio.listen()
+    assert text == "hello"
+    assert any("/tmp/x.wav" in r.getMessage() for r in caplog.records)
+
+
 def _fake_speech_stream(segments):
     """Return a callable producing a fresh async generator of ``segments``.
 

@@ -491,12 +491,34 @@ class TestFlashModelWrapperShard:
             wrapper.shard(FakeGroup(rank=0, size=8))
 
     def test_shard_raises_if_called_twice(self, wrapper_setup):
-        """shard() must raise RuntimeError if called a second time."""
+        """A retry after a *successful* shard() must say so — not claim a
+        mid-loop failure that never happened."""
         from olmlx.engine.pre_shard import FakeGroup
 
         wrapper, *_ = wrapper_setup
         wrapper.shard(FakeGroup(rank=0, size=2))
-        with pytest.raises(RuntimeError, match="already been called|indeterminate"):
+        with pytest.raises(RuntimeError, match="already been called") as excinfo:
+            wrapper.shard(FakeGroup(rank=0, size=2))
+        assert "failed" not in str(excinfo.value)
+
+    def test_shard_retry_after_midloop_failure_says_reload(self, wrapper_setup):
+        """A retry after shard() died mid-mutation must say the model is
+        partially sharded and needs a reload, not 'already been called'."""
+        from unittest.mock import patch
+
+        from olmlx.engine.pre_shard import FakeGroup
+
+        wrapper, *_ = wrapper_setup
+        with (
+            patch(
+                "mlx.nn.layers.distributed.shard_linear",
+                side_effect=RuntimeError("boom"),
+            ),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            wrapper.shard(FakeGroup(rank=0, size=2))
+
+        with pytest.raises(RuntimeError, match="failed mid-mutation.*reload"):
             wrapper.shard(FakeGroup(rank=0, size=2))
 
     def test_shard_requires_group(self, wrapper_setup):

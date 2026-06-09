@@ -1,6 +1,7 @@
 """Built-in tools for the chat client — file system, shell, research, planning."""
 
 import asyncio
+import errno
 import glob as glob_module
 import http.client
 import ipaddress
@@ -402,8 +403,14 @@ async def _handle_bash(args: dict) -> str | ToolError:
             start_new_session=True,
         )
     except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            # The shell binary itself is missing (minimal containers etc.) —
+            # name the real problem instead of a generic spawn failure.
+            message = f"Error running command: shell not found ({exc})"
+        else:
+            message = f"Error running command: {exc}"
         return ToolError(
-            message=f"Error running command: {exc}",
+            message=message,
             tool_name="bash",
             is_user_error=False,
         )

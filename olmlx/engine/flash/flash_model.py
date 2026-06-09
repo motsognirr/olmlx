@@ -66,6 +66,7 @@ class FlashModelWrapper(nn.Module):
         # for _-prefixed names).
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_sharded", False)
+        object.__setattr__(self, "_shard_failed", False)
         # Surface the weight store so ModelManager can close it on
         # eviction / keep-alive expiry. Without this attribute, the
         # FlashWeightStore's 32-thread ThreadPoolExecutor and per-layer
@@ -154,10 +155,13 @@ class FlashModelWrapper(nn.Module):
         all_sum, so every rank feeds identical input to FlashMLP.
         """
         if self._sharded:
-            raise RuntimeError(
-                "shard() has already been called or failed mid-loop — "
-                "model is in an indeterminate state, reload to retry"
-            )
+            if self._shard_failed:
+                raise RuntimeError(
+                    "shard() failed mid-mutation — attention weights are "
+                    "partially sharded; discard this instance and reload "
+                    "the model"
+                )
+            raise RuntimeError("shard() has already been called")
         if group is None:
             raise ValueError("shard() requires an explicit distributed group")
         from mlx.nn.layers.distributed import shard_linear
@@ -196,23 +200,29 @@ class FlashModelWrapper(nn.Module):
             )
 
         # Mark sharded before mutation so a mid-loop failure still prevents
-        # a second shard() call on a partially-mutated model.
+        # a second shard() call on a partially-mutated model; _shard_failed
+        # distinguishes that case so the retry error doesn't claim a prior
+        # success.
         object.__setattr__(self, "_sharded", True)
-        # Shard projections first; update head counts in a second pass so
-        # a shard_linear failure doesn't leave some layers with halved heads.
-        for layer in self._model.layers:
-            if not hasattr(layer, "self_attn"):
-                continue
-            attn = layer.self_attn
-            attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
-            attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
-            attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
-            attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
-        for layer in self._model.layers:
-            if not hasattr(layer, "self_attn"):
-                continue
-            layer.self_attn.n_heads //= N
-            layer.self_attn.n_kv_heads //= N
+        try:
+            # Shard projections first; update head counts in a second pass so
+            # a shard_linear failure doesn't leave some layers with halved heads.
+            for layer in self._model.layers:
+                if not hasattr(layer, "self_attn"):
+                    continue
+                attn = layer.self_attn
+                attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
+                attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
+                attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
+                attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+            for layer in self._model.layers:
+                if not hasattr(layer, "self_attn"):
+                    continue
+                layer.self_attn.n_heads //= N
+                layer.self_attn.n_kv_heads //= N
+        except BaseException:
+            object.__setattr__(self, "_shard_failed", True)
+            raise
         logger.info(
             "Sharded %d attention layers (MLP handled by Flash SSD)",
             attn_layer_count,
