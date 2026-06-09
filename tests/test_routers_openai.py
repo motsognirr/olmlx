@@ -8,7 +8,10 @@ import pytest
 from olmlx.engine.inference import INIT_ORPHAN_DETECT_LIMIT
 from olmlx.routers.openai import JSON_MODE_SYSTEM_MSG, _normalize_multimodal_messages
 from olmlx.schemas.openai import OpenAIChatRequest
-from olmlx.utils.streaming import flush_thinking_buffer, strip_thinking_streaming
+from olmlx.routers.thinking_split import (
+    flush_thinking_buffer,
+    strip_thinking_streaming,
+)
 from olmlx.utils.timing import TimingStats
 
 

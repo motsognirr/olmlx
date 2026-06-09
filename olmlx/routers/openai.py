@@ -24,9 +24,12 @@ from olmlx.engine.tool_parser import (
 )
 from olmlx.routers.common import build_inference_options, resolve_openai_think
 from olmlx.routers.streaming_common import collect_stream, parse_buffered_output
+from olmlx.routers.thinking_split import (
+    flush_thinking_buffer,
+    strip_thinking_streaming,
+)
 from olmlx.utils.audio_input import normalize_audio_block
 from olmlx.utils.images import normalize_image_block
-from olmlx.utils.streaming import flush_thinking_buffer, strip_thinking_streaming
 from olmlx.schemas.openai import (
     OpenAIChatMessage,
     OpenAIChatRequest,
