@@ -111,8 +111,11 @@ _compiler_cache_lock = threading.Lock()
 
 
 # Classes already warned about in _make_ref, to keep the log at one line
-# per offending tokenizer type rather than one per request.
+# per offending tokenizer type rather than one per request. Guarded by
+# its own lock: _make_ref is called under both cache locks, so neither
+# alone makes the check-then-add atomic.
 _unrefable_warned_classes: set[type] = set()
+_unrefable_warned_lock = threading.Lock()
 
 
 def _make_ref(tokenizer: Any) -> weakref.ref[Any] | None:
@@ -129,9 +132,11 @@ def _make_ref(tokenizer: Any) -> weakref.ref[Any] | None:
         return weakref.ref(tokenizer)
     except TypeError:
         cls = type(tokenizer)
-        if cls not in _unrefable_warned_classes:
+        with _unrefable_warned_lock:
+            if cls in _unrefable_warned_classes:
+                return None
             _unrefable_warned_classes.add(cls)
-            logger.warning(
+        logger.warning(
                 "tokenizer type %s is not weakref-able; grammar compile "
                 "caching is disabled for it — every structured-output "
                 "request recompiles the grammar",
