@@ -1137,10 +1137,17 @@ def _install_signal_handlers() -> None:
 
     def _make_handler(previous):
         def _signal_cleanup(signum, frame):
-            _cleanup_workers()
-            if callable(previous) and previous is not signal.default_int_handler:
-                previous(signum, frame)
-            sys.exit(128 + signum)
+            # The exit must happen even if cleanup or the chained handler
+            # raises — surviving the signal would leave the coordinator
+            # alive in an undefined state.
+            try:
+                _cleanup_workers()
+                if callable(previous) and previous is not signal.default_int_handler:
+                    previous(signum, frame)
+            except Exception:
+                logger.exception("Worker cleanup failed during signal shutdown")
+            finally:
+                sys.exit(128 + signum)
 
         return _signal_cleanup
 

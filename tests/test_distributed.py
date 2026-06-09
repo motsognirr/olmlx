@@ -1812,6 +1812,46 @@ class TestSignalCleanup:
         cleanup.assert_called_once()
         assert excinfo.value.code == 128 + signal.SIGTERM
 
+    def test_handler_exits_even_if_cleanup_raises(self, monkeypatch):
+        """A cleanup failure must not leave the coordinator alive on signal."""
+        import signal
+
+        import olmlx.cli as cli_module
+
+        cleanup = MagicMock(side_effect=ProcessLookupError("worker already gone"))
+        monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
+
+        cli_module._install_signal_handlers()
+        handler = signal.getsignal(signal.SIGTERM)
+
+        with pytest.raises(SystemExit) as excinfo:
+            handler(signal.SIGTERM, None)
+
+        cleanup.assert_called_once()
+        assert excinfo.value.code == 128 + signal.SIGTERM
+
+    def test_handler_exits_even_if_chained_previous_raises(self, monkeypatch):
+        """A raising chained handler must not prevent the exit either."""
+        import signal
+
+        import olmlx.cli as cli_module
+
+        cleanup = MagicMock()
+        monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
+
+        def previous(signum, frame):
+            raise RuntimeError("previous handler failed")
+
+        signal.signal(signal.SIGTERM, previous)
+        cli_module._install_signal_handlers()
+        handler = signal.getsignal(signal.SIGTERM)
+
+        with pytest.raises(SystemExit) as excinfo:
+            handler(signal.SIGTERM, None)
+
+        cleanup.assert_called_once()
+        assert excinfo.value.code == 128 + signal.SIGTERM
+
     def test_sigint_handler_exits_130_not_keyboardinterrupt(self, monkeypatch):
         """Default SIGINT disposition (default_int_handler) is not chained."""
         import signal
