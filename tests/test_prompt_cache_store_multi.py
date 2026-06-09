@@ -162,3 +162,97 @@ def test_estimate_state_bytes_counts_owned_arrays_outside_state():
     assert nbytes == expected, (
         f"expected {expected} bytes (including dequant side buffers), got {nbytes}"
     )
+
+
+def test_estimate_state_bytes_warns_once_for_unrecognized_layout(caplog):
+    """Issue #465: a cache layer class that matches none of the sizing
+    strategies (no .keys/.values, no .state, no mlx arrays reachable from
+    __dict__) silently contributes 0 bytes — bytes_in_ram undercounts and
+    the RAM budget never fires. The estimator must warn once per class so
+    the failure points back at the estimator instead of surfacing later as
+    unexplained Metal memory pressure."""
+    import logging
+
+    import olmlx.engine.prompt_cache.store as store_mod
+    from olmlx.engine.prompt_cache.state import CachedPromptState
+    from olmlx.engine.prompt_cache.store import _estimate_state_bytes
+
+    getattr(store_mod, "_UNSIZED_LAYER_CLASSES", set()).clear()
+
+    class _OpaqueCache:
+        """Future cache layout the estimator does not understand."""
+
+        def __init__(self):
+            self._payload = {"tokens": 128}  # data, but no mlx arrays
+
+    state = CachedPromptState(
+        tokens=[1, 2, 3],
+        cache=[_OpaqueCache(), _OpaqueCache()],
+    )
+    with caplog.at_level(logging.WARNING, logger="olmlx.engine.prompt_cache.store"):
+        assert _estimate_state_bytes(state) == 0
+        # Repeated estimates (and multiple layers) must not spam the log.
+        assert _estimate_state_bytes(state) == 0
+
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "_OpaqueCache" in r.getMessage()
+    ]
+    assert len(warnings) == 1, (
+        f"expected exactly one warning for _OpaqueCache, got {len(warnings)}"
+    )
+
+
+def test_estimate_state_bytes_warns_per_distinct_unknown_class(caplog):
+    """The once-only suppression is per class, not global: a second unknown
+    layout must still get its own warning."""
+    import logging
+
+    import olmlx.engine.prompt_cache.store as store_mod
+    from olmlx.engine.prompt_cache.state import CachedPromptState
+    from olmlx.engine.prompt_cache.store import _estimate_state_bytes
+
+    getattr(store_mod, "_UNSIZED_LAYER_CLASSES", set()).clear()
+
+    class _OpaqueA:
+        pass
+
+    class _OpaqueB:
+        pass
+
+    state = CachedPromptState(tokens=[1], cache=[_OpaqueA(), _OpaqueB()])
+    with caplog.at_level(logging.WARNING, logger="olmlx.engine.prompt_cache.store"):
+        _estimate_state_bytes(state)
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert sum("_OpaqueA" in m for m in messages) == 1
+    assert sum("_OpaqueB" in m for m in messages) == 1
+
+
+def test_estimate_state_bytes_no_warning_for_empty_known_layouts(caplog):
+    """Legitimately-empty caches of *known* layouts must not warn: a fresh
+    KVCache (keys/values are None, .state raises AttributeError until the
+    first update) and an empty ArraysCache (.state is a list of Nones) both
+    contribute 0 bytes but their classes match a sizing strategy."""
+    import logging
+
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    import olmlx.engine.prompt_cache.store as store_mod
+    from olmlx.engine.prompt_cache.state import CachedPromptState
+    from olmlx.engine.prompt_cache.store import _estimate_state_bytes
+
+    getattr(store_mod, "_UNSIZED_LAYER_CLASSES", set()).clear()
+
+    state = CachedPromptState(
+        tokens=[1, 2, 3],
+        cache=[KVCache(), ArraysCache(2)],
+    )
+    with caplog.at_level(logging.WARNING, logger="olmlx.engine.prompt_cache.store"):
+        assert _estimate_state_bytes(state) == 0
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == [], (
+        f"empty known layouts must not warn, got: {[r.getMessage() for r in warnings]}"
+    )

@@ -31,6 +31,15 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+# Layer classes the byte estimator failed to size (issue #465). Warned once
+# per class so bytes_in_ram undercounting is visible without log spam.
+_UNSIZED_LAYER_CLASSES: set[type] = set()
+
+# Sentinel distinguishing "no .state attribute" from ".state is None":
+# presence of the attribute means the layer matches the ArraysCache-style
+# sizing strategy even when the state is currently empty.
+_MISSING: Any = object()
+
 
 def _estimate_state_bytes(state: CachedPromptState) -> int:
     """Best-effort byte estimate of a cached state.
@@ -48,7 +57,17 @@ def _estimate_state_bytes(state: CachedPromptState) -> int:
     state-only walk would undercount their snapshot RAM by ~8x at 4-bit
     and ~16x at 2-bit, defeating the ``ram_budget_bytes`` soft-eviction
     guard. Walking ``__dict__`` plus the ``.state`` view (deduped by
-    ``id``) covers both surfaces. Unknown layer types still contribute 0.
+    ``id``) covers both surfaces.
+
+    Unknown layer types still contribute 0, but a layer whose class
+    matches *none* of the sizing strategies (no ``.keys``/``.values``
+    attributes, no ``.state``, no mlx arrays reachable from ``__dict__``)
+    logs a one-time warning per class (issue #465) — otherwise
+    ``bytes_in_ram`` undercounts silently and the RAM budget never fires.
+    Legitimately-empty caches of known layouts (a fresh ``KVCache`` whose
+    ``keys``/``values`` are still ``None``, an ``ArraysCache`` whose
+    ``.state`` is a list of ``None``) do not warn: the attribute presence
+    itself marks the layout as recognized.
     """
     total = 0
     for layer in state.cache or ():
@@ -74,7 +93,14 @@ def _estimate_state_bytes(state: CachedPromptState) -> int:
         stack: list[Any] = []
         if hasattr(layer, "__dict__"):
             stack.extend(vars(layer).values())
-        stack.append(getattr(layer, "state", None))
+        # ``_MISSING`` (not ``None``) so a present-but-empty ``.state``
+        # still counts as a strategy match below. Note ``getattr`` with a
+        # default also swallows a *property* that raises AttributeError —
+        # e.g. a fresh KVCache, whose ``.state`` getter touches
+        # ``self.keys.shape`` while ``keys`` is still None.
+        state_attr = getattr(layer, "state", _MISSING)
+        if state_attr is not _MISSING:
+            stack.append(state_attr)
         while stack:
             item = stack.pop()
             if item is None:
@@ -97,6 +123,23 @@ def _estimate_state_bytes(state: CachedPromptState) -> int:
                     continue
                 seen_ids.add(key)
                 total += nbytes
+        # No sizing strategy matched this layer's class: warn once per
+        # class (issue #465). ``seen_ids`` non-empty means the __dict__ /
+        # .state walk found at least one array, i.e. the layer was sized.
+        if (
+            not seen_ids
+            and state_attr is _MISSING
+            and not hasattr(layer, "keys")
+            and not hasattr(layer, "values")
+        ):
+            layer_cls = type(layer)
+            if layer_cls not in _UNSIZED_LAYER_CLASSES:
+                _UNSIZED_LAYER_CLASSES.add(layer_cls)
+                logger.warning(
+                    "prompt cache byte estimator does not understand %s; "
+                    "RAM budget accounting will undercount",
+                    layer_cls.__name__,
+                )
     return total
 
 
