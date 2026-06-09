@@ -737,6 +737,29 @@ class ModelManager(SpeculativeLoaderMixin):
         earlier exceptions when a later finally also raised.
         """
         errors: list[BaseException] = []
+        # Drop xgrammar compile cache entries keyed on this tokenizer's id
+        # while the tokenizer is still alive. After this returns,
+        # ``_close_evictees`` nulls the LoadedModel's tokenizer reference
+        # and CPython may recycle the address for a future tokenizer.
+        # Runs FIRST so no other close step's failure can skip it
+        # (issue #464); it has no ordering dependency on the other
+        # resources. The grammar cache also validates entry ownership via
+        # weakrefs, so even a failure here cannot lead to a stale grammar
+        # being served — this drop is the deterministic, eager path.
+        # Must use ``lm.text_tokenizer`` (the HF tokenizer,
+        # post-VLM-unwrap) to match what ``_install_grammar_processor``
+        # keyed the cache on.
+        #
+        # Whisper models (issue #366) return ``tokenizer=None``; guard the
+        # grammar drop so it doesn't choke on the missing tokenizer.
+        if not (lm.is_whisper or lm.is_tts):
+            try:
+                from olmlx.engine import grammar as _grammar
+
+                _grammar.drop_for_tokenizer(lm.text_tokenizer)
+            except Exception as exc:
+                logger.exception("Error dropping grammar cache for %s", lm.name)
+                errors.append(exc)
         if getattr(lm.model, "prefetcher", None) is not None:
             try:
                 lm.model.prefetcher.close()
@@ -783,30 +806,19 @@ class ModelManager(SpeculativeLoaderMixin):
                 logger.exception("Error clearing prompt cache for %s", lm.name)
                 errors.append(exc)
         if getattr(lm, "vlm_prompt_cache_store", None) is not None:
-            lm.vlm_prompt_cache_store.clear()
-            lm.vlm_prompt_cache_store = None
+            # Guarded like every other step: an unguarded raise here used
+            # to skip the remaining cleanup AND escape as a bare exception
+            # that ``unload()``'s ``except ExceptionGroup`` doesn't absorb
+            # (issue #464).
+            try:
+                lm.vlm_prompt_cache_store.clear()
+                lm.vlm_prompt_cache_store = None
+            except Exception as exc:
+                logger.exception("Error clearing VLM prompt cache for %s", lm.name)
+                errors.append(exc)
         # ``lm.model.prefetcher`` is intentionally not nulled — it lives on
         # the FlashModelWrapper, not on the LM bookkeeping, and the wrapper
         # goes away with the LM.
-        # Drop xgrammar compile cache entries keyed on this tokenizer's id
-        # while the tokenizer is still alive. After this returns,
-        # ``_close_evictees`` nulls the LoadedModel's tokenizer reference
-        # and CPython may recycle the address for a future tokenizer;
-        # stale id-keyed entries would then return a CompiledGrammar built
-        # for the wrong vocab. Must use ``lm.text_tokenizer`` (the HF
-        # tokenizer, post-VLM-unwrap) to match what
-        # ``_install_grammar_processor`` keyed the cache on.
-        #
-        # Whisper models (issue #366) return ``tokenizer=None``; guard the
-        # grammar drop so it doesn't choke on the missing tokenizer.
-        if not (lm.is_whisper or lm.is_tts):
-            try:
-                from olmlx.engine import grammar as _grammar
-
-                _grammar.drop_for_tokenizer(lm.text_tokenizer)
-            except Exception as exc:
-                logger.exception("Error dropping grammar cache for %s", lm.name)
-                errors.append(exc)
         # Whisper models (issue #366) are injected into mlx_whisper's
         # module-level ModelHolder by generate_transcription so transcribe()
         # reuses the managed weights. ModelManager owns that lifetime, so on
