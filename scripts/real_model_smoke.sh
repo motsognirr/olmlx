@@ -34,8 +34,14 @@ for f in "${FILES[@]}"; do
   uv run pytest "$f" -m real_model -q 2>&1 | tee "$log"
   code=${PIPESTATUS[0]}
   echo "::endgroup::"
-  if [ "$code" -eq 0 ]; then
+  if [ "$code" -eq 0 ] && grep -qE '[0-9]+ passed' "$log"; then
     results+=("PASS ${f}")
+  elif [ "$code" -eq 0 ]; then
+    # Exit 0 but nothing actually ran (everything skipped — e.g. the
+    # model wasn't downloadable). Silent zero coverage must not read
+    # as a green smoke run.
+    results+=("FAIL (exit 0 but no tests ran — all skipped?) ${f}")
+    overall=1
   elif [ "$code" -eq 138 ] \
       && grep -qE '[0-9]+ passed' "$log" \
       && ! grep -qE '[0-9]+ (failed|error)' "$log"; then

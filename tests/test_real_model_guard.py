@@ -29,6 +29,23 @@ class TestRealModelGuard:
         with pytest.raises(pytest.fail.Exception, match="real_model"):
             huggingface_hub.snapshot_download("olmlx-tests/no-such-repo")
 
+    def test_hf_hub_download_raises_offline_error_without_marker(self):
+        # Metadata fetches (config.json, chat templates) have designed
+        # except-Exception fallbacks at every production call site, so
+        # the guard raises the offline-mode error instead of failing
+        # the test — fallback tests stay meaningful without a real
+        # network 404 per test.
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        with pytest.raises(LocalEntryNotFoundError, match="real-model guard"):
+            huggingface_hub.hf_hub_download("olmlx-tests/no-such-repo", "config.json")
+
+    def test_model_info_raises_offline_error_without_marker(self):
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        with pytest.raises(LocalEntryNotFoundError, match="real-model guard"):
+            huggingface_hub.model_info("olmlx-tests/no-such-repo")
+
     def test_guard_is_installed_for_unmarked_tests(self):
         # The patched callables are tagged so this test (and humans
         # debugging a confusing failure) can tell guard from real.

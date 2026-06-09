@@ -27,10 +27,19 @@ def block_real_model_loads(request, monkeypatch):
     that let the VLM image-drop bug through (#429). Guarded seams:
     ``mlx_lm.load``, ``mlx_vlm.load`` (every olmlx text/VLM load goes
     through them; both modules are already imported transitively) and
-    ``huggingface_hub.snapshot_download`` (every fresh download,
-    including whisper/TTS pulls — olmlx resolves it at call time via
-    function-local imports). Cached whisper/TTS weights are *not*
-    covered; importing ``mlx_audio`` here would drag in spaCy.
+    ``huggingface_hub.snapshot_download`` (every fresh weight download
+    — olmlx resolves it at call time via function-local imports).
+    Cached whisper/TTS weights are *not* covered; importing
+    ``mlx_audio`` here would drag in spaCy.
+
+    The single-file metadata fetches (``hf_hub_download`` for
+    config.json / chat templates, ``model_info`` for model cards) get
+    softer treatment: every production call site wraps them in a
+    designed ``except Exception`` fallback, and dozens of unit tests
+    exercise exactly those fallbacks — previously via a *real* network
+    404 per test. Those entry points raise ``LocalEntryNotFoundError``
+    (what genuine offline mode raises) instead of failing the test, so
+    fallback tests stay meaningful, deterministic, and offline.
 
     Tests marked ``real_model`` get the real entry points; the
     integration suite's ``mock_mlx_primitives`` layers its mocks over
@@ -55,12 +64,35 @@ def block_real_model_loads(request, monkeypatch):
         _fail._olmlx_real_model_guard = True
         return _fail
 
+    def _offline(entry: str):
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        def _raise(*_args, **_kwargs):
+            raise LocalEntryNotFoundError(
+                f"{entry} blocked by the olmlx real-model guard (no "
+                "@pytest.mark.real_model on this test); raising the "
+                "offline-mode error so designed fallbacks engage."
+            )
+
+        _raise._olmlx_real_model_guard = True
+        return _raise
+
     monkeypatch.setattr(mlx_lm, "load", _blocked("mlx_lm.load"))
     monkeypatch.setattr(mlx_vlm, "load", _blocked("mlx_vlm.load"))
     monkeypatch.setattr(
         huggingface_hub,
         "snapshot_download",
         _blocked("huggingface_hub.snapshot_download"),
+    )
+    monkeypatch.setattr(
+        huggingface_hub,
+        "hf_hub_download",
+        _offline("huggingface_hub.hf_hub_download"),
+    )
+    monkeypatch.setattr(
+        huggingface_hub,
+        "model_info",
+        _offline("huggingface_hub.model_info"),
     )
     yield
 
