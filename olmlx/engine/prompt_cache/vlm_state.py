@@ -43,10 +43,12 @@ class VlmPromptCacheStore:
 
     def clear(self) -> None:
         """Drop retained states. Counters are cumulative and NOT reset here, so
-        /api/ps reuse totals survive memory-pressure flushes."""
-        # _entries has no internal locking: mutators (including the LRU
-        # promotion in get) must run on the loop thread (#463).
-        assert_loop_thread("VlmPromptCacheStore.clear")
+        /api/ps reuse totals survive memory-pressure flushes.
+
+        Deliberately NOT loop-affine (#463): like PromptCacheStore.clear, the
+        production caller is the worker-thread close path in
+        ``_close_loaded_model``, which owns the store exclusively by then.
+        """
         self._entries.clear()
 
     def note_hit(self, reused_tokens: int) -> None:

@@ -47,10 +47,13 @@ def assert_loop_thread(what: str) -> None:
     ``what`` names the violated operation (e.g. ``"ModelRegistry.add_mapping"``)
     so the failure is attributable at the call site.  No-op when unbound.
     """
-    if _bound_thread_ident is not None and threading.get_ident() != _bound_thread_ident:
+    # Single read: an unbind racing this check (lifespan shutdown) can't flip
+    # the comparison to None mid-expression and raise a spurious error.
+    bound = _bound_thread_ident
+    if bound is not None and threading.get_ident() != bound:
         raise RuntimeError(
             f"{what} must run on the event-loop thread: its read-modify-write "
             f"is only safe because all mutators are serialized on the loop "
             f"(issue #463). Called from thread {threading.get_ident()!r} "
-            f"(loop thread is {_bound_thread_ident!r})."
+            f"(loop thread is {bound!r})."
         )

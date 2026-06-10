@@ -691,8 +691,14 @@ class PromptCacheStore:
             await asyncio.to_thread(self._save_entries_to_disk, snapshot)
 
     def clear(self) -> None:
-        """Remove all cache entries and disk cache files."""
-        assert_loop_thread("PromptCacheStore.clear")
+        """Remove all cache entries and disk cache files.
+
+        Deliberately NOT loop-affine (#463): the only production caller is
+        ``_close_loaded_model``, which runs on a worker thread via
+        ``asyncio.to_thread`` during unload/eviction/expiry — by then the
+        LoadedModel is popped from ``_loaded``, so the closer owns this store
+        exclusively and no loop-side caller can race it.
+        """
         self._entries.clear()
         self._radix = PrefixCacheIndex()
         self.metrics.bytes_in_ram = 0

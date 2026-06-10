@@ -132,7 +132,6 @@ class TestPromptCacheStoreAffinity:
             ("set", lambda: store.set("b", _make_state(2))),
             ("get", lambda: store.get("a")),
             ("remove", lambda: store.remove("a")),
-            ("clear", lambda: store.clear()),
             ("evict_all_to_disk", lambda: store.evict_all_to_disk()),
             ("takeover", lambda: store.takeover("a", "b")),
             ("fetch_nearest", lambda: store.fetch_nearest([1, 2])),
@@ -164,6 +163,18 @@ class TestPromptCacheStoreAffinity:
         store.remove("a")
         assert store.get("a") is None
 
+    def test_clear_allowed_off_loop(self):
+        # clear()'s only production caller is _close_loaded_model, which runs
+        # on a worker thread via asyncio.to_thread during unload/eviction/
+        # expiry — by then the LoadedModel is popped from _loaded, so the
+        # closer owns the store exclusively and loop affinity is not its
+        # contract.
+        store = PromptCacheStore(max_slots=4)
+        store.set("a", _make_state(1))
+        loop_affinity.bind_loop_thread()
+        assert _run_in_thread(lambda: store.clear()) is None
+        assert len(store) == 0
+
 
 class TestVlmPromptCacheStoreAffinity:
     def test_mutators_off_loop_raise(self):
@@ -173,7 +184,6 @@ class TestVlmPromptCacheStoreAffinity:
         for name, fn in [
             ("insert", lambda: store.insert("b", object())),
             ("get", lambda: store.get("a")),
-            ("clear", lambda: store.clear()),
         ]:
             exc = _run_in_thread(fn)
             assert isinstance(exc, RuntimeError), f"{name} did not raise off-loop"
@@ -185,6 +195,32 @@ class TestVlmPromptCacheStoreAffinity:
         loop_affinity.bind_loop_thread()
         store.insert("a", object())
         assert store.get("a") is not None
+
+    def test_clear_allowed_off_loop(self):
+        # Same exclusive-ownership contract as PromptCacheStore.clear():
+        # called from the worker-thread close path in _close_loaded_model.
+        store = VlmPromptCacheStore(capacity=2)
+        store.insert("a", object())
+        loop_affinity.bind_loop_thread()
+        assert _run_in_thread(lambda: store.clear()) is None
+
+
+class TestWorkerThreadClosePath:
+    def test_close_loaded_model_clears_stores_off_loop(
+        self, mock_manager, mock_loaded_model
+    ):
+        """Regression: _close_loaded_model runs via asyncio.to_thread on every
+        unload/eviction/expiry and clears both prompt-cache stores there.  A
+        loop-affinity assert on clear() turns every production unload into a
+        logged error that leaves the cache (incl. disk entries) uncleared."""
+        mock_loaded_model.prompt_cache_store.set("a", _make_state(1))
+        loop_affinity.bind_loop_thread()
+        exc = _run_in_thread(
+            lambda: mock_manager._close_loaded_model(mock_loaded_model)
+        )
+        assert exc is None  # an ExceptionGroup here means a close step failed
+        # clear() succeeded, so the store was nulled (success-only nulling).
+        assert mock_loaded_model.prompt_cache_store is None
 
 
 class TestSpecCacheStoreSerializedAccess:
