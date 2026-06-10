@@ -50,3 +50,17 @@ def test_voice_extra_includes_audio_extra(project):
     assert any(
         req.replace(" ", "").lower().startswith("olmlx[audio]") for req in voice
     ), "[voice] extra must include olmlx[audio]"
+
+
+def test_lockfile_expands_voice_extra_to_audio_deps():
+    # The self-reference is only as good as its resolution: assert uv.lock
+    # actually expanded olmlx[voice] to the audio deps (a malformed
+    # self-reference would resolve to sounddevice alone).
+    with (PYPROJECT.parent / "uv.lock").open("rb") as f:
+        lock = tomllib.load(f)
+    olmlx = next(p for p in lock["package"] if p["name"] == "olmlx")
+    extras = olmlx["optional-dependencies"]
+    audio = {d["name"] for d in extras["audio"]}
+    voice = {d["name"] for d in extras["voice"]}
+    assert {"mlx-audio", "misaki", "en-core-web-sm"} <= audio
+    assert audio | {"sounddevice"} <= voice
