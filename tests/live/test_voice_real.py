@@ -35,9 +35,19 @@ def _models_present() -> bool:
     )
 
 
+def _mlx_audio_installed() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("mlx_audio") is not None
+
+
 pytestmark = [
     pytest.mark.real_model,
     pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required"),
+    pytest.mark.skipif(
+        not _mlx_audio_installed(),
+        reason="mlx-audio not installed (uv sync --extra voice, #469)",
+    ),
     pytest.mark.skipif(
         not _models_present(),
         reason=f"{KOKORO} / {WHISPER} not downloaded in {settings.models_dir}",

@@ -102,6 +102,17 @@ uv tool install 'git+ssh://git@github.com/motsognirr/olmlx.git[search]'
 uv sync --no-editable --extra search
 ```
 
+Other extras:
+
+| Extra | Enables | Carries |
+|-------|---------|---------|
+| `audio` | `/v1/audio/speech` text-to-speech (Kokoro) | `mlx-audio`, `misaki[en]`, spaCy `en_core_web_sm` (several GB) |
+| `voice` | `olmlx chat --voice` push-to-talk | everything in `audio`, plus `sounddevice` (PortAudio) |
+| `otel` | OpenTelemetry tracing | OTel SDK + OTLP HTTP exporter |
+
+Audio *transcription* (`/v1/audio/transcriptions`, Whisper) is part of the
+core install — no extra needed.
+
 ### First Run
 
 On first run, olmlx creates:

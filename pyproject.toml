@@ -18,24 +18,15 @@ dependencies = [
     "pydantic-settings>=2.0",
     "mlx-vlm>=0.4.4,<0.5",
     "transformers>=5.5.0",
-    "torch>=2.10.0",
-    "torchvision>=0.25.0",
+    # torch is NOT declared here on purpose (#469): xgrammar and mlx-whisper
+    # both require it transitively, so it is always installed — but olmlx
+    # itself never imports it. torchvision is gone entirely: transformers 5.x
+    # auto-falls-back to its PIL image-processor backend when torchvision is
+    # absent (every VLM ships both variants), so the VLM path keeps working.
     "mcp>=1.0",
     "rich>=13.0",
     "xgrammar>=0.2.1",
     "mlx-whisper>=0.4.3",
-    "mlx-audio>=0.4.4",
-    # Kokoro TTS (mlx-audio) needs misaki for English grapheme->phoneme text
-    # processing; without it /v1/audio/speech raises ImportError at generate
-    # time. The [en] extra pulls the English pipeline (spacy etc.). Issue #367.
-    "misaki[en]>=0.9.4",
-    # misaki.en calls spacy.load("en_core_web_sm") at generate time. spaCy's
-    # runtime auto-download does NOT become importable in-process, so a fresh
-    # `uv sync` would otherwise 500 on the first /v1/audio/speech request.
-    # The wheel (3.8.x matches the locked spaCy 3.8.x) is pinned via
-    # [tool.uv.sources] below so it's present after sync; bump in lockstep with
-    # spaCy's major.minor. Issue #367.
-    "en-core-web-sm",
     "prometheus-client>=0.20",
 ]
 
@@ -48,10 +39,25 @@ otel = [
     "opentelemetry-sdk>=1.27",
     "opentelemetry-exporter-otlp-proto-http>=1.27",
 ]
-# Terminal voice chat (`olmlx chat --voice`, #444). mlx-audio (Kokoro TTS) is
-# already a core dependency for /v1/audio/speech; this extra only adds mic
-# capture + playback via PortAudio.
-voice = ["sounddevice>=0.4.6"]
+# Kokoro TTS for /v1/audio/speech and `olmlx chat --voice` (#367, #469).
+# Not core: this stack is several GB and only serves speech synthesis.
+audio = [
+    "mlx-audio>=0.4.4",
+    # Kokoro TTS (mlx-audio) needs misaki for English grapheme->phoneme text
+    # processing; without it /v1/audio/speech raises ImportError at generate
+    # time. The [en] extra pulls the English pipeline (spacy etc.). Issue #367.
+    "misaki[en]>=0.9.4",
+    # misaki.en calls spacy.load("en_core_web_sm") at generate time. spaCy's
+    # runtime auto-download does NOT become importable in-process, so a fresh
+    # `uv sync` would otherwise 500 on the first /v1/audio/speech request.
+    # The wheel (3.8.x matches the locked spaCy 3.8.x) is pinned via
+    # [tool.uv.sources] below so it's present after sync; bump in lockstep with
+    # spaCy's major.minor. Issue #367.
+    "en-core-web-sm",
+]
+# Terminal voice chat (`olmlx chat --voice`, #444): mic capture + playback via
+# PortAudio, plus the TTS stack it speaks through (self-referential extra).
+voice = ["olmlx[audio]", "sounddevice>=0.4.6"]
 
 [build-system]
 requires = ["hatchling"]

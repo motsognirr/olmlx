@@ -23,8 +23,29 @@ def test_check_voice_deps_missing(monkeypatch):
         _check_voice_deps()
 
 
-def test_check_voice_deps_present(monkeypatch):
+def test_check_voice_deps_missing_mlx_audio(monkeypatch):
+    # mlx-audio moved to the [audio] extra (#469); --voice needs it for TTS,
+    # so its absence must exit with the install hint too.
     monkeypatch.setitem(sys.modules, "sounddevice", types.ModuleType("sounddevice"))
-    monkeypatch.setitem(sys.modules, "mlx_audio", types.ModuleType("mlx_audio"))
+    monkeypatch.setitem(sys.modules, "mlx_audio", None)
+    with pytest.raises(SystemExit):
+        _check_voice_deps()
+
+
+@pytest.mark.parametrize("missing", ["misaki", "en_core_web_sm"])
+def test_check_voice_deps_missing_audio_transitives(monkeypatch, missing):
+    # A hand-installed mlx-audio (pip install, no extra) lacks misaki /
+    # en_core_web_sm and would otherwise pass the gate, then fail at the
+    # first TTS call. The gate must front-load that failure too (#469).
+    for mod in ("sounddevice", "mlx_audio", "misaki", "en_core_web_sm"):
+        monkeypatch.setitem(sys.modules, mod, types.ModuleType(mod))
+    monkeypatch.setitem(sys.modules, missing, None)
+    with pytest.raises(SystemExit):
+        _check_voice_deps()
+
+
+def test_check_voice_deps_present(monkeypatch):
+    for mod in ("sounddevice", "mlx_audio", "misaki", "en_core_web_sm"):
+        monkeypatch.setitem(sys.modules, mod, types.ModuleType(mod))
     # Should not raise.
     _check_voice_deps()

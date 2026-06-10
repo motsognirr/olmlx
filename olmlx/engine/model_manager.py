@@ -2943,7 +2943,16 @@ class ModelManager(SpeculativeLoaderMixin):
         """
         from pathlib import Path
 
-        import mlx_audio.tts.utils as tts_utils
+        try:
+            import mlx_audio.tts.utils as tts_utils  # type: ignore[import-not-found]
+        except ImportError as exc:
+            # ValueError -> HTTP 400 on /v1/audio/speech (the router's
+            # primed-first-chunk error path), instead of an opaque 500.
+            raise ValueError(
+                f"Model '{hf_path}' is a TTS model, but the TTS dependencies "
+                "are not installed. Install with: uv sync --extra audio "
+                "(issue #469)."
+            ) from exc
 
         model = tts_utils.load_model(Path(load_path))
         return model, None, False, TemplateCaps(), None

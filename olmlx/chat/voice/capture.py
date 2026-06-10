@@ -26,7 +26,7 @@ def _require_sounddevice():
     if sd is None:  # explicitly stubbed-out in tests / unavailable
         raise RuntimeError(_INSTALL_HINT)
     try:
-        import sounddevice as sd  # noqa: F811
+        import sounddevice as sd  # type: ignore[import-not-found]  # noqa: F811
     except Exception as exc:  # ImportError or PortAudio load failure
         raise RuntimeError(_INSTALL_HINT) from exc
     return sd

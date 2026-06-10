@@ -26,9 +26,19 @@ def _model_present() -> bool:
     return (settings.models_dir / _safe_dir_name(KOKORO) / "config.json").exists()
 
 
+def _mlx_audio_installed() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("mlx_audio") is not None
+
+
 pytestmark = [
     pytest.mark.real_model,
     pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required"),
+    pytest.mark.skipif(
+        not _mlx_audio_installed(),
+        reason="mlx-audio not installed (uv sync --extra audio, #469)",
+    ),
     pytest.mark.skipif(
         not _model_present(),
         reason=f"{KOKORO} not downloaded in {settings.models_dir}",
