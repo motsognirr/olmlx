@@ -597,6 +597,12 @@ class PromptCacheStore:
         # it now so a chain of disk hits can't quietly blow the budget
         # until the next write.
         for over_id, over_state in self._enforce_ram_budget():
+            if over_id == cache_id:
+                # The just-restored entry bounced straight back out under
+                # budget pressure. Its original disk file is still intact
+                # (the unlink below is guarded on residency), so rewriting
+                # the same bytes would be pure disk churn — skip the save.
+                continue
             await self._to_thread_traced(self._save_to_disk, over_id, over_state)
         # Only unlink the original disk file if the restored entry is
         # still in RAM. If the budget evicted it back to disk, the file

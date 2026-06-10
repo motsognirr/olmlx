@@ -15,6 +15,18 @@ def _make_state(token_id: int = 1) -> CachedPromptState:
     return CachedPromptState(tokens=[token_id], cache=[f"cache_{token_id}"])
 
 
+def _sized_state(token_id: int, nbytes: int) -> CachedPromptState:
+    """Create a CachedPromptState whose estimated size is ``nbytes``."""
+    from unittest.mock import MagicMock
+
+    layer = MagicMock()
+    layer.keys = MagicMock()
+    layer.keys.nbytes = nbytes
+    layer.values = MagicMock()
+    layer.values.nbytes = 0
+    return CachedPromptState(tokens=[token_id], cache=[layer])
+
+
 class TestPromptCacheStoreDiskEviction:
     """Test that evicted caches are saved to disk instead of deleted."""
 
@@ -586,16 +598,6 @@ class TestAsyncDiskCache:
     async def test_async_get_disk_restore_enforces_ram_budget(self, tmp_path):
         """Disk-restored entries must trigger _enforce_ram_budget on
         the async path (issue raised in PR #391 review)."""
-        from unittest.mock import MagicMock
-
-        def _sized_state(token_id: int, nbytes: int) -> CachedPromptState:
-            layer = MagicMock()
-            layer.keys = MagicMock()
-            layer.keys.nbytes = nbytes
-            layer.values = MagicMock()
-            layer.values.nbytes = 0
-            return CachedPromptState(tokens=[token_id], cache=[layer])
-
         store = PromptCacheStore(
             max_slots=10,
             disk_path=tmp_path,
@@ -634,18 +636,56 @@ class TestAsyncDiskCache:
         spilled_ids = [call.args[0] for call in mock_save.call_args_list]
         assert "a" in spilled_ids
 
+    @pytest.mark.asyncio
+    async def test_async_get_restored_entry_evicted_by_budget_not_respilled(
+        self, tmp_path
+    ):
+        """Issue #466: when _enforce_ram_budget evicts the just-restored
+        entry, async_get must not rewrite it to disk — its original file
+        is still intact (the unlink is guarded on residency), so the
+        re-save is a pure read-then-rewrite of multi-GB state. Other
+        budget evictees still spill normally."""
+        store = PromptCacheStore(
+            max_slots=10,
+            disk_path=tmp_path,
+            model_name="test-model",
+            ram_budget_bytes=2500,
+        )
+        # Seed two 1000-byte entries (under budget).
+        store.set("a", _sized_state(1, 1000))
+        store.set("b", _sized_state(2, 1000))
+
+        # "c" on disk is 3000 bytes — over the whole budget by itself, so
+        # enforcement evicts a, b, AND the just-restored c.
+        disk_file = store._disk_file_path("c")
+        disk_file.parent.mkdir(parents=True, exist_ok=True)
+        disk_file.write_bytes(b"placeholder")
+
+        loaded = _sized_state(3, 3000)
+        with (
+            patch.object(store, "_read_from_disk", return_value=(loaded, disk_file)),
+            patch.object(store, "_save_to_disk") as mock_save,
+        ):
+            result = await store.async_get("c")
+
+        # The caller still gets the loaded state for this request.
+        assert result is loaded
+        # Everything was budget-evicted, including the restored entry.
+        assert store.peek("a") is None
+        assert store.peek("b") is None
+        assert store.peek("c") is None
+        # The displaced residents spilled to disk, but the restored entry
+        # was NOT rewritten — its original file is the surviving copy.
+        spilled_ids = [call.args[0] for call in mock_save.call_args_list]
+        assert "a" in spilled_ids
+        assert "b" in spilled_ids
+        assert "c" not in spilled_ids
+        assert disk_file.exists()
+
     def test_sync_get_disk_restore_enforces_ram_budget(self, tmp_path):
         """Disk-restored entries must trigger _enforce_ram_budget on
         the sync path too."""
         from unittest.mock import MagicMock
-
-        def _sized_state(token_id: int, nbytes: int) -> CachedPromptState:
-            layer = MagicMock()
-            layer.keys = MagicMock()
-            layer.keys.nbytes = nbytes
-            layer.values = MagicMock()
-            layer.values.nbytes = 0
-            return CachedPromptState(tokens=[token_id], cache=[layer])
 
         store = PromptCacheStore(
             max_slots=10,
