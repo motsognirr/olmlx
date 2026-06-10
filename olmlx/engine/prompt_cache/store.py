@@ -20,6 +20,7 @@ from olmlx.engine.prompt_cache.metrics import CacheMetrics
 from olmlx.engine.prompt_cache.radix import PrefixCacheIndex
 from olmlx.engine.prompt_cache.state import CachedPromptState
 from olmlx.utils import tracing as _tracing
+from olmlx.utils.loop_affinity import assert_loop_thread
 
 try:
     from mlx_lm.models.cache import (
@@ -376,6 +377,9 @@ class PromptCacheStore:
 
         Checks memory first, then disk.  Returns None if not found in either.
         """
+        # _entries/_radix have no internal locking: every mutating entry point
+        # (including LRU promotion here) must run on the loop thread (#463).
+        assert_loop_thread("PromptCacheStore.get")
         state = self._entries.get(cache_id)
         if state is not None:
             self._entries.move_to_end(cache_id)
@@ -446,6 +450,7 @@ class PromptCacheStore:
         cleanup (different .cache object), or None when no cleanup is needed.
         Evicted entries are saved to disk if disk offload is enabled.
         """
+        assert_loop_thread("PromptCacheStore.set")
         evicted_id, evicted = self._set_in_memory(cache_id, state)
         if evicted_id is not None and evicted is not None:
             self._save_to_disk(evicted_id, evicted)
@@ -456,6 +461,7 @@ class PromptCacheStore:
 
     def remove(self, cache_id: str) -> None:
         """Remove a specific cache entry from memory and disk."""
+        assert_loop_thread("PromptCacheStore.remove")
         existing = self._entries.pop(cache_id, None)
         if existing is not None:
             self._radix.remove(existing.tokens, cache_id)
@@ -495,6 +501,7 @@ class PromptCacheStore:
         Used during memory pressure to free GPU memory while preserving
         cache state on disk for later restoration.
         """
+        assert_loop_thread("PromptCacheStore.evict_all_to_disk")
         self._evict_all_to_disk_sync()
 
     def _evict_all_to_disk_sync(self) -> None:
@@ -589,6 +596,7 @@ class PromptCacheStore:
 
     async def async_get(self, cache_id: str) -> CachedPromptState | None:
         """Async version of get(). Memory lookup is sync; disk fallback runs in a thread."""
+        assert_loop_thread("PromptCacheStore.async_get")
         state = self._entries.get(cache_id)
         if state is not None:
             self._entries.move_to_end(cache_id)
@@ -650,6 +658,7 @@ class PromptCacheStore:
         self, cache_id: str, state: CachedPromptState
     ) -> CachedPromptState | None:
         """Async version of set(). Memory ops are sync; disk save runs in a thread."""
+        assert_loop_thread("PromptCacheStore.async_set")
         evicted_id, evicted = self._set_in_memory(cache_id, state)
         if evicted_id is not None and evicted is not None:
             await self._to_thread_traced(self._save_to_disk, evicted_id, evicted)
@@ -668,6 +677,7 @@ class PromptCacheStore:
         during this window will return None (cache miss).  This is acceptable
         for a single-user server where this only runs under memory pressure.
         """
+        assert_loop_thread("PromptCacheStore.async_evict_all_to_disk")
         if self._disk_enabled:
             snapshot = list(self._entries.items())
         else:
@@ -681,7 +691,18 @@ class PromptCacheStore:
             await asyncio.to_thread(self._save_entries_to_disk, snapshot)
 
     def clear(self) -> None:
-        """Remove all cache entries and disk cache files."""
+        """Remove all cache entries and disk cache files.
+
+        Deliberately NOT loop-affine (#463): the only production caller is
+        ``_close_loaded_model``, which runs on a worker thread via
+        ``asyncio.to_thread`` during unload/eviction/expiry — by then the
+        LoadedModel is popped from ``_loaded``, so the closer owns this store
+        exclusively and no loop-side caller can race it.
+
+        Note this does blocking disk I/O (``shutil.rmtree``) — do not call it
+        from the event loop; loop-side cleanup goes through ``remove`` /
+        ``async_evict_all_to_disk`` instead.
+        """
         self._entries.clear()
         self._radix = PrefixCacheIndex()
         self.metrics.bytes_in_ram = 0
@@ -766,6 +787,7 @@ class PromptCacheStore:
         disk-tier prefix index is tracked separately — see the issue
         thread on PR #397.
         """
+        assert_loop_thread("PromptCacheStore.fetch_nearest")
         cid, depth = self._radix.find_strict_prefix(tokens, min_depth=1)
         if cid is None or depth == 0:
             self.metrics.radix_misses += 1
@@ -798,6 +820,7 @@ class PromptCacheStore:
         entry is promoted to MRU under the new key. Returns the state,
         or None if old_cache_id is no longer present.
         """
+        assert_loop_thread("PromptCacheStore.takeover")
         state = self._entries.pop(old_cache_id, None)
         if state is None:
             return None

@@ -13,6 +13,7 @@ from typing import Any, Literal, NamedTuple, get_args
 import logging
 
 from olmlx.config import FlashMoeConfig, SyncMode, settings
+from olmlx.utils.loop_affinity import assert_loop_thread
 
 SpeculativeStrategy = Literal[
     "classic", "dflash", "eagle", "pld", "self_speculative", "mtp"
@@ -1252,6 +1253,8 @@ class ModelRegistry:
 
     def add_alias(self, alias: str, source: str):
         """Create an alias from source model."""
+        # _aliases mutation + save is lock-free; safe only on the loop (#463).
+        assert_loop_thread("ModelRegistry.add_alias")
         validate_model_name(alias)
         alias = self.normalize_name(alias)
         resolved = self.resolve(source)
@@ -1291,6 +1294,9 @@ class ModelRegistry:
         already has the same ``hf_path``, the existing entry is preserved
         (avoids erasing per-model config from callers that don't carry it).
         """
+        # The mutate-then-save below is a lock-free read-modify-write of
+        # _mappings/_dirty_keys; safe only on the loop thread (#463).
+        assert_loop_thread("ModelRegistry.add_mapping")
         validate_model_name(name)
         validate_hf_path(hf_path)
         normalized = self.normalize_name(name)
@@ -1414,6 +1420,8 @@ class ModelRegistry:
 
     def remove(self, name: str):
         """Remove a model alias or mapping."""
+        # Lock-free pop-then-save of _aliases/_mappings; loop-only (#463).
+        assert_loop_thread("ModelRegistry.remove")
         validate_model_name(name)
         normalized = self.normalize_name(name)
         if self._aliases.pop(normalized, None) is not None:
