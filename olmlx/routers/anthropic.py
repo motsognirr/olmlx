@@ -560,10 +560,11 @@ async def _stream_thinking_state_machine(result):
         )
         return events
 
-    async for chunk in with_keepalive_pings(
-        result, KEEPALIVE_PING_INTERVAL, _sse("ping", {"type": "ping"})
-    ):
-        if isinstance(chunk, str):
+    ping = _sse("ping", {"type": "ping"})
+    async for chunk in with_keepalive_pings(result, KEEPALIVE_PING_INTERVAL, ping):
+        if chunk is ping:
+            # Identity check (like the pre-#471 sentinel): a non-dict chunk
+            # that isn't the ping is a protocol violation and raises below.
             yield chunk
             continue
         if chunk.get("cache_info"):

@@ -139,6 +139,16 @@ class TestBufferStream:
         assert isinstance(items[-1], BufferedModelOutput)
         assert items[-1].full_text == "a"
 
+    @pytest.mark.asyncio
+    async def test_protocol_violating_chunk_raises(self):
+        """A non-dict chunk that is NOT the keepalive ping must surface as an
+        error, not be silently forwarded as if it were a ping — only the
+        exact ping object passes through (identity, like the pre-#471
+        sentinel)."""
+        with pytest.raises(AttributeError):
+            async for _ in buffer_stream(_agen(["stray string", {"done": True}])):
+                pass
+
 
 class TestWithKeepalivePings:
     @pytest.mark.asyncio

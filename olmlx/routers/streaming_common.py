@@ -105,8 +105,10 @@ async def buffer_stream(
     )
     parts: list[str] = []
     async for chunk in chunks:
-        if not isinstance(chunk, dict):
-            # Keepalive ping — forward to the consumer.
+        if ping is not None and chunk is ping:
+            # Keepalive ping — forward to the consumer.  Identity check
+            # (like the pre-#471 sentinel): anything else that isn't a dict
+            # is a protocol violation and surfaces as an error below.
             yield chunk
             continue
         if chunk.get("cache_info"):
