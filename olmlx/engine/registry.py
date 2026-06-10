@@ -13,6 +13,7 @@ from typing import Any, Literal, NamedTuple, get_args
 import logging
 
 from olmlx.config import FlashMoeConfig, SyncMode, settings
+from olmlx.utils.affinity import ThreadAffinityGuard
 
 SpeculativeStrategy = Literal[
     "classic", "dflash", "eagle", "pld", "self_speculative", "mtp"
@@ -1140,6 +1141,11 @@ class ModelRegistry:
         self._save_lock = threading.Lock()
         self._aliases: dict[str, str] = {}
         self._aliases_path = settings.models_config.parent / "aliases.json"
+        # All mutations (add_alias/add_mapping/remove) must happen on one
+        # thread — the event-loop thread in the server, the main thread in
+        # the CLI. The read-modify-write of models.json and the dict
+        # mutations are only atomic under that affinity (issue #463).
+        self._mutation_guard = ThreadAffinityGuard("ModelRegistry mutation")
 
     def load(self):
         """Load model mappings from config file and aliases.
@@ -1252,6 +1258,7 @@ class ModelRegistry:
 
     def add_alias(self, alias: str, source: str):
         """Create an alias from source model."""
+        self._mutation_guard.check()
         validate_model_name(alias)
         alias = self.normalize_name(alias)
         resolved = self.resolve(source)
@@ -1291,6 +1298,7 @@ class ModelRegistry:
         already has the same ``hf_path``, the existing entry is preserved
         (avoids erasing per-model config from callers that don't carry it).
         """
+        self._mutation_guard.check()
         validate_model_name(name)
         validate_hf_path(hf_path)
         normalized = self.normalize_name(name)
@@ -1328,8 +1336,9 @@ class ModelRegistry:
 
     def _save_mappings_locked(self):
         # The lock is defensive — it serializes disk I/O but does not cover
-        # dict mutations in add_mapping/remove. This is safe today because
-        # all callers run on the single-threaded asyncio event loop. If
+        # dict mutations in add_mapping/remove. This is safe because all
+        # mutators run on a single thread, an invariant now enforced by
+        # ``self._mutation_guard`` at the mutating entry points (#463). If
         # multi-threaded access is ever needed, the lock must be expanded
         # to cover all _mappings/_dirty_keys/_removed_keys mutations.
         #
@@ -1414,6 +1423,7 @@ class ModelRegistry:
 
     def remove(self, name: str):
         """Remove a model alias or mapping."""
+        self._mutation_guard.check()
         validate_model_name(name)
         normalized = self.normalize_name(name)
         if self._aliases.pop(normalized, None) is not None:

@@ -38,6 +38,7 @@ from olmlx.engine.spec_decoder_base import (
     verify_draft_greedy as verify_draft_greedy,
 )
 from olmlx.utils import tracing as _tracing
+from olmlx.utils.affinity import SerializedMutationGuard
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,11 @@ class _SpecCacheStore:
         # LRU order: index 0 is the least-recently-used entry (evicted first),
         # the last index is most-recently-used.
         self._entries: list[_SpecCacheEntry] = []
+        # Mutations run on a different decode worker thread each request, so
+        # (unlike the registry/prompt-cache stores) there is no single owning
+        # thread to pin — the contract is "never concurrent", normally upheld
+        # by the inference lock. The guard trips on overlap (issue #463).
+        self._guard = SerializedMutationGuard("_SpecCacheStore")
 
     @property
     def capacity(self) -> int:
@@ -124,7 +130,8 @@ class _SpecCacheStore:
         return self._capacity > 0
 
     def clear(self) -> None:
-        self._entries = []
+        with self._guard:
+            self._entries = []
 
     def find(self, tokens: list[int]) -> tuple[_SpecCacheEntry, int] | None:
         """Return ``(entry, common_prefix_len)`` for the entry whose stored
@@ -137,35 +144,37 @@ class _SpecCacheStore:
         to fresh prefill). At the small default slot counts this near-miss
         promotion is immaterial; revisit if slots are raised substantially.
         """
-        if not self.enabled() or not self._entries or not tokens:
-            return None
-        best: _SpecCacheEntry | None = None
-        best_common = 0
-        for entry in self._entries:
-            common = _common_prefix_len(entry.tokens, tokens)
-            if common > best_common:
-                best_common = common
-                best = entry
-        if best is None or best_common == 0:
-            return None
-        self._entries.remove(best)
-        self._entries.append(best)
-        return best, best_common
+        with self._guard:
+            if not self.enabled() or not self._entries or not tokens:
+                return None
+            best: _SpecCacheEntry | None = None
+            best_common = 0
+            for entry in self._entries:
+                common = _common_prefix_len(entry.tokens, tokens)
+                if common > best_common:
+                    best_common = common
+                    best = entry
+            if best is None or best_common == 0:
+                return None
+            self._entries.remove(best)
+            self._entries.append(best)
+            return best, best_common
 
     def insert(self, tokens: list[int], payload: Any) -> None:
         """Store ``payload`` under ``tokens`` as the most-recently-used entry,
         replacing any existing entry with identical tokens, and evict the
         least-recently-used entries past ``capacity``. No-op when disabled.
         """
-        if not self.enabled():
-            return
-        toks = list(tokens)
-        # Refresh: drop any prior entry for the same lineage so a re-prefill
-        # of the same prompt doesn't consume two slots.
-        self._entries = [e for e in self._entries if e.tokens != toks]
-        self._entries.append(_SpecCacheEntry(tokens=toks, payload=payload))
-        while len(self._entries) > self._capacity:
-            self._entries.pop(0)
+        with self._guard:
+            if not self.enabled():
+                return
+            toks = list(tokens)
+            # Refresh: drop any prior entry for the same lineage so a re-prefill
+            # of the same prompt doesn't consume two slots.
+            self._entries = [e for e in self._entries if e.tokens != toks]
+            self._entries.append(_SpecCacheEntry(tokens=toks, payload=payload))
+            while len(self._entries) > self._capacity:
+                self._entries.pop(0)
 
 
 # Cache-layer class names used to classify a working cache for reuse.

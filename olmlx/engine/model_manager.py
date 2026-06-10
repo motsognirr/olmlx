@@ -23,6 +23,7 @@ from olmlx.engine.registry import (
     SpeculativeConfig,
 )
 from olmlx.utils import memory as memory_utils
+from olmlx.utils.affinity import ThreadAffinityGuard
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
 from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore  # noqa: F401
 
@@ -659,6 +660,11 @@ class ModelManager(SpeculativeLoaderMixin):
         self._pending_load_tasks: dict[str, asyncio.Task] = {}
         self._flush_lock = asyncio.Lock()
         self._flush_thread_lock = threading.Lock()
+        # All ``_loaded`` mutations (ensure_loaded/unload/_expire_stale) must
+        # happen on one thread — the event-loop thread. unload's
+        # ``active_refs > 0`` check-then-pop and _expire_stale's expiry
+        # check-then-pop are only atomic under that affinity (issue #463).
+        self._mutation_guard = ThreadAffinityGuard("ModelManager mutation")
 
     def start_expiry_checker(self):
         self._expiry_task = asyncio.create_task(self._check_expiry_loop())
@@ -1017,6 +1023,7 @@ class ModelManager(SpeculativeLoaderMixin):
         about to use. The caller MUST release the pin exactly once (the
         inference paths adopt it via ``_inference_ref(..., adopt=True)``).
         """
+        self._mutation_guard.check()
         normalized = self.registry.normalize_name(name)
         if normalized != name:
             logger.info("Normalized model name '%s' -> '%s'", name, normalized)
@@ -1629,6 +1636,7 @@ class ModelManager(SpeculativeLoaderMixin):
         client unable to distinguish "close failed, model is gone" from
         an unrelated 500 — and either way, the model is gone.
         """
+        self._mutation_guard.check()
         normalized = self.registry.normalize_name(name)
         lm = self._loaded.get(normalized)
         if lm is None:
@@ -3094,6 +3102,7 @@ class ModelManager(SpeculativeLoaderMixin):
 
     async def _expire_stale(self):
         """Unload models whose keep-alive has expired (active_refs == 0)."""
+        self._mutation_guard.check()
         now = time.time()
         # Pop expired entries under the lock, then close them after releasing
         # it. _close_loaded_model calls executor.shutdown(wait=True) which

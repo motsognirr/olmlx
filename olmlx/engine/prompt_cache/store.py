@@ -20,6 +20,7 @@ from olmlx.engine.prompt_cache.metrics import CacheMetrics
 from olmlx.engine.prompt_cache.radix import PrefixCacheIndex
 from olmlx.engine.prompt_cache.state import CachedPromptState
 from olmlx.utils import tracing as _tracing
+from olmlx.utils.affinity import ThreadAffinityGuard
 
 try:
     from mlx_lm.models.cache import (
@@ -169,6 +170,10 @@ class PromptCacheStore:
         self._evict_generation = 0  # bumped by async_evict_all_to_disk
         self._radix = PrefixCacheIndex()
         self.metrics = CacheMetrics()
+        # All _entries/_radix mutations (including LRU promotion on reads)
+        # must happen on one thread — the event-loop thread in the server.
+        # Worker threads only ever do pure disk I/O (#463).
+        self._mutation_guard = ThreadAffinityGuard("PromptCacheStore mutation")
 
     @property
     def _disk_enabled(self) -> bool:
@@ -376,6 +381,7 @@ class PromptCacheStore:
 
         Checks memory first, then disk.  Returns None if not found in either.
         """
+        self._mutation_guard.check()  # LRU promotion mutates _entries
         state = self._entries.get(cache_id)
         if state is not None:
             self._entries.move_to_end(cache_id)
@@ -446,6 +452,7 @@ class PromptCacheStore:
         cleanup (different .cache object), or None when no cleanup is needed.
         Evicted entries are saved to disk if disk offload is enabled.
         """
+        self._mutation_guard.check()
         evicted_id, evicted = self._set_in_memory(cache_id, state)
         if evicted_id is not None and evicted is not None:
             self._save_to_disk(evicted_id, evicted)
@@ -456,6 +463,7 @@ class PromptCacheStore:
 
     def remove(self, cache_id: str) -> None:
         """Remove a specific cache entry from memory and disk."""
+        self._mutation_guard.check()
         existing = self._entries.pop(cache_id, None)
         if existing is not None:
             self._radix.remove(existing.tokens, cache_id)
@@ -495,6 +503,7 @@ class PromptCacheStore:
         Used during memory pressure to free GPU memory while preserving
         cache state on disk for later restoration.
         """
+        self._mutation_guard.check()
         self._evict_all_to_disk_sync()
 
     def _evict_all_to_disk_sync(self) -> None:
@@ -589,6 +598,7 @@ class PromptCacheStore:
 
     async def async_get(self, cache_id: str) -> CachedPromptState | None:
         """Async version of get(). Memory lookup is sync; disk fallback runs in a thread."""
+        self._mutation_guard.check()
         state = self._entries.get(cache_id)
         if state is not None:
             self._entries.move_to_end(cache_id)
@@ -650,6 +660,7 @@ class PromptCacheStore:
         self, cache_id: str, state: CachedPromptState
     ) -> CachedPromptState | None:
         """Async version of set(). Memory ops are sync; disk save runs in a thread."""
+        self._mutation_guard.check()
         evicted_id, evicted = self._set_in_memory(cache_id, state)
         if evicted_id is not None and evicted is not None:
             await self._to_thread_traced(self._save_to_disk, evicted_id, evicted)
@@ -668,6 +679,7 @@ class PromptCacheStore:
         during this window will return None (cache miss).  This is acceptable
         for a single-user server where this only runs under memory pressure.
         """
+        self._mutation_guard.check()
         if self._disk_enabled:
             snapshot = list(self._entries.items())
         else:
@@ -681,7 +693,14 @@ class PromptCacheStore:
             await asyncio.to_thread(self._save_entries_to_disk, snapshot)
 
     def clear(self) -> None:
-        """Remove all cache entries and disk cache files."""
+        """Remove all cache entries and disk cache files.
+
+        Deliberately NOT affinity-guarded: ``_close_loaded_model`` calls it
+        from an ``asyncio.to_thread`` worker during model teardown, after the
+        ``LoadedModel`` is popped from ``_loaded`` — at that point nothing
+        else can reach this store, so exclusive access is guaranteed without
+        loop affinity (#463).
+        """
         self._entries.clear()
         self._radix = PrefixCacheIndex()
         self.metrics.bytes_in_ram = 0
@@ -766,6 +785,7 @@ class PromptCacheStore:
         disk-tier prefix index is tracked separately — see the issue
         thread on PR #397.
         """
+        self._mutation_guard.check()  # LRU promotion + stale-terminal removal
         cid, depth = self._radix.find_strict_prefix(tokens, min_depth=1)
         if cid is None or depth == 0:
             self.metrics.radix_misses += 1
@@ -798,6 +818,7 @@ class PromptCacheStore:
         entry is promoted to MRU under the new key. Returns the state,
         or None if old_cache_id is no longer present.
         """
+        self._mutation_guard.check()
         state = self._entries.pop(old_cache_id, None)
         if state is None:
             return None
