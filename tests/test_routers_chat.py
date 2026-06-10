@@ -41,6 +41,35 @@ class TestSplitThinkingStreaming:
         flush_split_thinking(state)
         assert not state.get("thinking_expected")
 
+    def test_detect_limit_holds_partial_open_tag_at_tail(self):
+        """When the detect-limit fires, a partial open-tag suffix must be
+        held back so a tag straddling the detect→passthrough transition is
+        still recognized on the next chunk (parity with the OpenAI-side
+        stripper, issue #471)."""
+        state: dict = {}
+        prefix = "x" * 210
+        thinking = ""
+        content = ""
+        for chunk in [prefix + "<|channel>though", "t\nhidden", "<channel|>", "vis"]:
+            t, c = split_thinking_streaming(chunk, state)
+            thinking += t
+            content += c
+        t, c = flush_split_thinking(state)
+        thinking += t
+        content += c
+        assert content == prefix + "vis"
+        assert thinking == "hidden"
+
+    def test_detect_limit_state_override_honored(self):
+        """An explicit ``state["detect_limit"]`` overrides the default so
+        callers can widen (or narrow) the detect window."""
+        state: dict = {"detect_limit": 10}
+        # 11 chars, no tag — must exit detect immediately under the override
+        # (the default 200-char window would keep it buffered).
+        _, content = split_thinking_streaming("hello world", state)
+        assert content == "hello world"
+        assert state["phase"] == "passthrough"
+
 
 class TestChatRouter:
     @pytest.mark.asyncio

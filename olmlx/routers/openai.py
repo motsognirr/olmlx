@@ -22,10 +22,16 @@ from olmlx.engine.tool_parser import (
     parse_model_output,
     resolve_tool_names,
 )
-from olmlx.routers.common import build_inference_options, resolve_openai_think
-from olmlx.utils.audio_input import normalize_audio_block
-from olmlx.utils.images import normalize_image_block
-from olmlx.utils.streaming import flush_thinking_buffer, strip_thinking_streaming
+from olmlx.routers.common import (
+    build_inference_options,
+    collect_content_parts,
+    resolve_openai_think,
+)
+from olmlx.routers.streaming_common import collect_stream, parse_buffered_output
+from olmlx.routers.thinking_split import (
+    flush_thinking_buffer,
+    strip_thinking_streaming,
+)
 from olmlx.schemas.openai import (
     OpenAIChatMessage,
     OpenAIChatRequest,
@@ -180,42 +186,17 @@ async def _stream_openai_sse_with_tools(
        b. Args:   delta={tool_calls: [{index, function: {arguments: "<json>"}}]}
     4. Done:  delta={}, finish_reason="tool_calls"
     """
-    full_text = ""
-    raw_text = ""
-    done_reason = None
-    # Engine meta chunk arrives before any text — capture it so the orphan
-    # `</think>` heuristic in `parse_model_output` is gated symmetrically
-    # with the non-tools paths (issue #307 review round 5).
-    thinking_expected = False
     try:
-        async for chunk in result:
-            if chunk.get("cache_info"):
-                continue
-            if "thinking_expected" in chunk:
-                thinking_expected = bool(chunk["thinking_expected"])
-                continue
-            if chunk.get("done"):
-                # Read raw_text from done chunk for gpt-oss tool call parsing
-                raw_text = chunk.get("raw_text", raw_text)
-                done_reason = chunk.get("done_reason")
-                break
-            full_text += chunk.get("text", "")
-
-        # Use raw_text for parsing so channel-format tool calls aren't lost;
-        # fall back to full_text for non-gpt-oss models
-        text_for_parsing = raw_text if raw_text else full_text
-        _thinking, visible_text, tool_uses = parse_model_output(
-            text_for_parsing, True, thinking_expected=thinking_expected
-        )
-        resolve_tool_names(tool_uses, declared_tools)
-        fill_missing_required_args(tool_uses, declared_tools)
+        out = await collect_stream(result)
+        done_reason = out.done_reason
+        _thinking, visible_text, tool_uses = parse_buffered_output(out, declared_tools)
         logger.debug(
             "Buffered tool stream (%d chars): thinking=%d visible=%d tool_uses=%d raw=%s",
-            len(full_text),
+            len(out.full_text),
             len(_thinking),
             len(visible_text),
             len(tool_uses),
-            full_text[:2000],
+            out.full_text[:2000],
         )
 
         def _chunk(choices_0):
@@ -299,34 +280,20 @@ def _build_options(req) -> dict:
 
 def _normalize_multimodal_messages(messages: list[dict]) -> list[dict]:
     """Split OpenAI multimodal content lists into a text ``content`` string plus
-    a separate ``images`` list (the engine's Ollama-style convention, #428).
+    separate ``images``/``audio`` lists (the engine's Ollama-style convention,
+    #428).
 
     OpenAI carries images inline as content parts:
         content: [{"type": "text", "text": ...},
                   {"type": "image_url", "image_url": {"url": ...}}]
-    String content is left untouched.
+    String content is left untouched.  Part-type recognition lives in the
+    shared ``collect_content_parts`` (issue #471).
     """
     for m in messages:
         content = m.get("content")
         if not isinstance(content, list):
             continue
-        texts: list[str] = []
-        images: list[str] = []
-        audio: list[str] = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            ptype = part.get("type")
-            # "input_text"/"input_image" are the Responses-API / newer-SDK
-            # spellings of the Chat-Completions "text"/"image_url" parts.
-            if ptype in ("text", "input_text"):
-                text = part.get("text") or ""
-                if text:
-                    texts.append(text)
-            elif ptype == "image_url":
-                images.append(normalize_image_block(part))
-            elif ptype == "input_audio":
-                audio.append(normalize_audio_block(part))
+        texts, images, audio = collect_content_parts(content)
         m["content"] = " ".join(texts)
         if images:
             m["images"] = (m.get("images") or []) + images

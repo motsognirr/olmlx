@@ -11,14 +11,18 @@ from fastapi.responses import StreamingResponse
 
 from olmlx.config import settings
 from olmlx.engine.inference import (
-    INIT_ORPHAN_DETECT_LIMIT,
     _inference_ref,
     count_chat_tokens,
     generate_chat,
 )
-from olmlx.routers.common import build_inference_options
-from olmlx.utils.audio_input import normalize_audio_block
-from olmlx.utils.images import normalize_image_block
+from olmlx.routers.common import build_inference_options, collect_content_parts
+from olmlx.routers.streaming_common import (
+    BufferedModelOutput,
+    buffer_stream,
+    parse_buffered_output,
+    with_keepalive_pings,
+)
+from olmlx.routers.thinking_split import flush_split_thinking, split_thinking_parts
 from olmlx.engine.tool_parser import (
     _make_tool_use_id,
     parse_model_output,
@@ -219,25 +223,9 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
             messages.append(entry)
 
         elif msg.role == "user":
-            text_parts = []
-            user_images: list[str] = []
-            user_audio: list[str] = []
+            content_parts: list[dict] = []
             for block in msg.content:
-                if block.type == "text" and block.text:
-                    text_parts.append(block.text)
-                elif block.type == "image":
-                    user_images.append(
-                        normalize_image_block(
-                            {"type": "image", "source": block.source or {}}
-                        )
-                    )
-                elif block.type == "audio":
-                    user_audio.append(
-                        normalize_audio_block(
-                            {"type": "audio", "source": block.source or {}}
-                        )
-                    )
-                elif block.type == "tool_result":
+                if block.type == "tool_result":
                     result_content = ""
                     if isinstance(block.content, str):
                         result_content = block.content
@@ -253,6 +241,15 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
                             "content": result_content,
                         }
                     )
+                elif block.type in ("image", "audio"):
+                    content_parts.append(
+                        {"type": block.type, "source": block.source or {}}
+                    )
+                else:
+                    content_parts.append({"type": block.type, "text": block.text})
+            # Shared part-type dispatch + image/audio normalization (#471);
+            # a malformed source raises ValueError → 422 at the endpoint.
+            text_parts, user_images, user_audio = collect_content_parts(content_parts)
             if text_parts or user_images or user_audio:
                 user_msg: dict = {"role": "user", "content": " ".join(text_parts)}
                 if user_images:
@@ -298,39 +295,6 @@ def _signature_delta_sse(block_idx: int, signature: str = "") -> str:
             "delta": {"type": "signature_delta", "signature": signature},
         },
     )
-
-
-_PING_SENTINEL = object()
-
-
-async def _with_keepalive_pings(
-    aiter: AsyncIterator[Any],
-    interval: float = KEEPALIVE_PING_INTERVAL,
-) -> AsyncIterator[Any]:
-    """Yield items from aiter; yield _PING_SENTINEL if no item arrives within interval seconds."""
-    ait = aiter.__aiter__()
-    next_item_task = None
-    try:
-        while True:
-            if next_item_task is None:
-                next_item_task = asyncio.ensure_future(ait.__anext__())
-            done, _ = await asyncio.wait({next_item_task}, timeout=interval)
-            if done:
-                try:
-                    item = next_item_task.result()
-                except StopAsyncIteration:
-                    return
-                next_item_task = None
-                yield item
-            else:
-                yield _PING_SENTINEL
-    finally:
-        if next_item_task is not None and not next_item_task.done():
-            next_item_task.cancel()
-            try:
-                await next_item_task
-            except (asyncio.CancelledError, StopAsyncIteration):
-                pass
 
 
 def _emit_content_block(
@@ -409,60 +373,42 @@ async def _stream_buffered_with_tools(
        ``id`` and ``name`` upfront, so the JSON body must be parsed before
        any tool events can be emitted.
 
-    Keepalive ping events (see ``_with_keepalive_pings``) prevent connection
-    timeouts during the buffering window.
+    Keepalive ping events (see ``streaming_common.with_keepalive_pings``)
+    prevent connection timeouts during the buffering window.
     """
-    text_chunks: list[str] = []
-    raw_text = ""
-    output_tokens = 0
-    # Engine meta chunk arrives before any text — capture it so the orphan
-    # `</think>` heuristic in `parse_model_output` is gated symmetrically
-    # with the non-tools paths (issue #307 review round 5).
-    thinking_expected = False
+    out = BufferedModelOutput()
+    async for item in buffer_stream(
+        result,
+        keepalive_interval=KEEPALIVE_PING_INTERVAL,
+        ping=_sse("ping", {"type": "ping"}),
+    ):
+        if isinstance(item, BufferedModelOutput):
+            out = item
+        else:
+            # Keepalive ping SSE string, or a cache_info dict forwarded to
+            # stream_sse for message_start.
+            yield item
 
-    async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
-        if chunk is _PING_SENTINEL:
-            yield _sse("ping", {"type": "ping"})
-            continue
-        if isinstance(chunk, dict) and chunk.get("cache_info"):
-            yield chunk  # Forward to stream_sse for message_start
-            continue
-        if isinstance(chunk, dict) and "thinking_expected" in chunk:
-            thinking_expected = bool(chunk["thinking_expected"])
-            continue
-        if chunk.get("done"):
-            stats = chunk.get("stats")
-            if stats:
-                output_tokens = stats.eval_count
-            # For gpt-oss channel format, raw_text is in the done chunk
-            raw_text = chunk.get("raw_text", "")
-            done_reason = chunk.get("done_reason")
-            break
-        text_chunks.append(chunk.get("text", ""))
-    else:
-        done_reason = None
+    output_tokens = out.stats.eval_count if out.stats else 0
+    done_reason = out.done_reason
 
-    full_text = "".join(text_chunks)
-
-    if raw_text:
+    if out.raw_text:
         logger.info(
             "Raw model output (%d chars before filter, %d chars visible): %s",
-            len(raw_text),
-            len(full_text),
-            raw_text[:1000],
+            len(out.raw_text),
+            len(out.full_text),
+            out.raw_text[:1000],
         )
-        text_for_parsing = raw_text
     else:
-        logger.info("Model output (%d chars): %s", len(full_text), full_text[:1000])
-        text_for_parsing = full_text
+        logger.info(
+            "Model output (%d chars): %s", len(out.full_text), out.full_text[:1000]
+        )
 
-    thinking, visible_text, tool_uses = parse_model_output(
-        text_for_parsing,
-        True,
-        thinking_expected=thinking_expected,
+    # `fill_missing_args` off: the Anthropic surface reports the model's tool
+    # call as-is and lets the client see omitted required args.
+    thinking, visible_text, tool_uses = parse_buffered_output(
+        out, declared_tools, fill_missing_args=False
     )
-
-    resolve_tool_names(tool_uses, declared_tools)
 
     if tool_uses:
         logger.info(
@@ -534,24 +480,35 @@ async def _stream_buffered_with_tools(
     }
 
 
-def _flush_thinking_buffer(
-    state: str, buffer: str, block_idx: int, text_block_started: bool
-) -> tuple[list[str], int]:
-    """Flush remaining buffer at end of stream. Returns (sse_events, updated_block_idx)."""
-    events: list[str] = []
-    if state == "thinking":
-        if buffer:
-            events.append(
-                _sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "thinking_delta", "thinking": buffer},
-                    },
-                )
-            )
-        events.append(_signature_delta_sse(block_idx))
+async def _stream_thinking_state_machine(result):
+    """Stream incrementally, mapping the shared thinking splitter onto
+    Anthropic content blocks.
+
+    Consumes ``split_thinking_parts`` (routers/thinking_split.py — the same
+    state machine behind the Ollama splitter and the OpenAI stripper, issue
+    #471) and turns its ordered ``(channel, fragment)`` parts into
+    ``content_block_start``/``content_block_delta``/``content_block_stop``
+    sequences, closing the open block whenever the channel switches.
+    Thinking blocks get a ``signature_delta`` before their stop event (the
+    SDK populates ``ThinkingBlock.signature`` from it, issue #309).
+
+    Yields SSE strings, forwards ``cache_info`` dicts to ``stream_sse`` for
+    ``message_start``, and ends with a metadata dict.  At least one text
+    block is always emitted (possibly empty) so the wire shape matches the
+    pre-#471 machine and the non-streaming empty-response path.
+    """
+    block_idx = 0
+    output_tokens = 0
+    done_reason = None
+    split_state: dict = {}
+    current: str | None = None  # open block type: None | "thinking" | "text"
+    text_block_emitted = False
+
+    def _close_current() -> list[str]:
+        nonlocal block_idx, current
+        events = []
+        if current == "thinking":
+            events.append(_signature_delta_sse(block_idx))
         events.append(
             _sse(
                 "content_block_stop",
@@ -559,116 +516,65 @@ def _flush_thinking_buffer(
             )
         )
         block_idx += 1
-        events.append(
-            _sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": block_idx,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            )
-        )
-        events.append(
-            _sse(
-                "content_block_stop",
-                {"type": "content_block_stop", "index": block_idx},
-            )
-        )
-    elif text_block_started:
-        events.append(
-            _sse(
-                "content_block_stop",
-                {"type": "content_block_stop", "index": block_idx},
-            )
-        )
-    elif state == "text" and not text_block_started:
-        events.append(
-            _sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": block_idx,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            )
-        )
-        if buffer:
+        current = None
+        return events
+
+    def _route(channel: str, fragment: str) -> list[str]:
+        """Events that emit *fragment*, opening/closing blocks as needed.
+
+        Empty fragments emit nothing — in particular, an orphan ``</think>``
+        at position zero must not produce an empty thinking block (issue
+        #307 review round 10; the non-streaming path produces none).
+        """
+        nonlocal current, text_block_emitted
+        if not fragment:
+            return []
+        block_type = "thinking" if channel == "thinking" else "text"
+        events = []
+        if current is not None and current != block_type:
+            events.extend(_close_current())
+        if current is None:
             events.append(
                 _sse(
-                    "content_block_delta",
+                    "content_block_start",
                     {
-                        "type": "content_block_delta",
+                        "type": "content_block_start",
                         "index": block_idx,
-                        "delta": {"type": "text_delta", "text": buffer},
+                        "content_block": {"type": block_type, block_type: ""},
                     },
                 )
             )
+            current = block_type
+            if block_type == "text":
+                text_block_emitted = True
+        delta_type = f"{block_type}_delta"
         events.append(
             _sse(
-                "content_block_stop",
-                {"type": "content_block_stop", "index": block_idx},
-            )
-        )
-    else:
-        # state == "init" — the stream ended before we could classify the
-        # leading buffer.  This happens when `thinking_expected` held the
-        # init state waiting for an orphan `</think>` that never arrived
-        # (issue #307 — short non-thinking output on a thinking-capable
-        # model).  Emit any held content as a text block so the response
-        # isn't dropped.
-        events.append(
-            _sse(
-                "content_block_start",
+                "content_block_delta",
                 {
-                    "type": "content_block_start",
+                    "type": "content_block_delta",
                     "index": block_idx,
-                    "content_block": {"type": "text", "text": ""},
+                    "delta": {"type": delta_type, block_type: fragment},
                 },
             )
         )
-        if buffer:
-            events.append(
-                _sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "text_delta", "text": buffer},
-                    },
-                )
-            )
-        events.append(
-            _sse(
-                "content_block_stop",
-                {"type": "content_block_stop", "index": block_idx},
-            )
-        )
-    return events, block_idx
+        return events
 
-
-async def _stream_thinking_state_machine(result):
-    """Stream incrementally with thinking state machine. Yields a final dict with metadata."""
-    block_idx = 0
-    output_tokens = 0
-    buffer = ""
-    state = "init"  # "init", "thinking", "text"
-    text_block_started = False
-    done_reason = None
-    # Engine forwards this via a meta chunk; when set, we wait for an orphan
-    # `</think>` to classify the leading buffer as thinking instead of text
-    # (issue #307 — Qwen3.5/3.6 emit thinking without the `<think>` opener).
-    thinking_expected = False
-
-    async for chunk in _with_keepalive_pings(result, interval=KEEPALIVE_PING_INTERVAL):
-        if chunk is _PING_SENTINEL:
-            yield _sse("ping", {"type": "ping"})
+    ping = _sse("ping", {"type": "ping"})
+    async for chunk in with_keepalive_pings(result, KEEPALIVE_PING_INTERVAL, ping):
+        if chunk is ping:
+            # Identity check (like the pre-#471 sentinel): a non-dict chunk
+            # that isn't the ping is a protocol violation and raises below.
+            yield chunk
             continue
-        if isinstance(chunk, dict) and chunk.get("cache_info"):
+        if chunk.get("cache_info"):
             yield chunk  # Forward to stream_sse for message_start
             continue
-        if isinstance(chunk, dict) and "thinking_expected" in chunk:
-            thinking_expected = bool(chunk["thinking_expected"])
+        if "thinking_expected" in chunk:
+            # Engine meta chunk: lets the splitter wait for an orphan
+            # `</think>` to classify the leading buffer as thinking
+            # (issue #307 — Qwen3.5/3.6 emit thinking without the opener).
+            split_state["thinking_expected"] = bool(chunk["thinking_expected"])
             continue
         if chunk.get("done"):
             stats = chunk.get("stats")
@@ -677,165 +583,35 @@ async def _stream_thinking_state_machine(result):
             done_reason = chunk.get("done_reason")
             break
 
-        token_text = chunk.get("text", "")
-        buffer += token_text
+        for channel, fragment in split_thinking_parts(
+            chunk.get("text", ""), split_state
+        ):
+            for event in _route(channel, fragment):
+                yield event
 
-        while buffer:
-            if state == "init":
-                open_idx = buffer.find("<think>")
-                close_idx = buffer.find("</think>")
-                if buffer.startswith("<think>"):
-                    state = "thinking"
-                    buffer = buffer[7:]
-                    yield _sse(
-                        "content_block_start",
-                        {
-                            "type": "content_block_start",
-                            "index": block_idx,
-                            "content_block": {"type": "thinking", "thinking": ""},
-                        },
-                    )
-                elif (
-                    close_idx >= 0
-                    and thinking_expected
-                    and (open_idx == -1 or close_idx < open_idx)
-                ):
-                    # Orphaned `</think>` — Qwen3.5/3.6 chat templates miss
-                    # the `<think>` opener but still emit the closer (#307).
-                    # Everything buffered before it is the thinking block.
-                    # Gated on `thinking_expected` so a non-thinking model
-                    # that legitimately mentions the literal `</think>`
-                    # token isn't silently reclassified as thinking, and on
-                    # the open/close order so that a buffer assembled with
-                    # `preamble<think>...</think>answer` (text-before-tag,
-                    # uncommon but real for slow first tokens) routes through
-                    # the standard `<think>` branch instead of swallowing the
-                    # `<think>` opener as orphan content.
-                    orphan_thinking = buffer[:close_idx]
-                    # Skip the whole content block when `</think>` is the
-                    # very first token — emitting an empty thinking block
-                    # would diverge from the non-streaming path which
-                    # produces no block in that case (issue #307 review
-                    # round 10).
-                    if orphan_thinking:
-                        yield _sse(
-                            "content_block_start",
-                            {
-                                "type": "content_block_start",
-                                "index": block_idx,
-                                "content_block": {"type": "thinking", "thinking": ""},
-                            },
-                        )
-                        yield _sse(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": block_idx,
-                                "delta": {
-                                    "type": "thinking_delta",
-                                    "thinking": orphan_thinking,
-                                },
-                            },
-                        )
-                        yield _signature_delta_sse(block_idx)
-                        yield _sse(
-                            "content_block_stop",
-                            {"type": "content_block_stop", "index": block_idx},
-                        )
-                        block_idx += 1
-                    buffer = buffer[close_idx + len("</think>") :].lstrip("\n")
-                    state = "text"
-                elif len(buffer) < 7 and "<think>".startswith(buffer):
-                    break
-                elif (
-                    thinking_expected
-                    and close_idx == -1
-                    and len(buffer) <= INIT_ORPHAN_DETECT_LIMIT
-                ):
-                    # Keep waiting for a (possibly orphaned) `</think>`.
-                    # Gated on `close_idx == -1`: once we've seen `</think>`
-                    # we have enough information to make a decision (either
-                    # the orphan branch above already fired, or the text
-                    # state will emit the buffered content) — no point
-                    # waiting longer.
-                    # NOTE: this can delay the first `text_delta` event by
-                    # up to `INIT_ORPHAN_DETECT_LIMIT` characters (currently
-                    # 1024) for a thinking-capable model that produces a
-                    # short direct answer with no `</think>`; the keep-alive
-                    # ping loop covers the wait, and the buffered content
-                    # is emitted at stream end via `_flush_thinking_buffer`.
-                    break
-                else:
-                    state = "text"
-
-            elif state == "thinking":
-                end_idx = buffer.find("</think>")
-                if end_idx >= 0:
-                    thinking_chunk = buffer[:end_idx]
-                    if thinking_chunk:
-                        yield _sse(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": block_idx,
-                                "delta": {
-                                    "type": "thinking_delta",
-                                    "thinking": thinking_chunk,
-                                },
-                            },
-                        )
-                    yield _signature_delta_sse(block_idx)
-                    yield _sse(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": block_idx},
-                    )
-                    block_idx += 1
-                    buffer = buffer[end_idx + len("</think>") :]
-                    state = "text"
-                elif len(buffer) > len("</think>"):
-                    safe = buffer[: -len("</think>")]
-                    buffer = buffer[-len("</think>") :]
-                    yield _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_idx,
-                            "delta": {"type": "thinking_delta", "thinking": safe},
-                        },
-                    )
-                    break
-                else:
-                    break
-
-            elif state == "text":
-                if not text_block_started:
-                    yield _sse(
-                        "content_block_start",
-                        {
-                            "type": "content_block_start",
-                            "index": block_idx,
-                            "content_block": {"type": "text", "text": ""},
-                        },
-                    )
-                    text_block_started = True
-                if buffer:
-                    yield _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_idx,
-                            "delta": {"type": "text_delta", "text": buffer},
-                        },
-                    )
-                    buffer = ""
-                break
-
-    # Flush remaining buffer
-    flush_events, block_idx = _flush_thinking_buffer(
-        state, buffer, block_idx, text_block_started
-    )
-    for event in flush_events:
-        yield event
+    # Flush whatever the splitter still holds (detect-phase buffer of a
+    # short non-thinking answer, or an unterminated thinking block), close
+    # the open block, and guarantee at least one text block.
+    thinking_tail, content_tail = flush_split_thinking(split_state)
+    for channel, fragment in (("thinking", thinking_tail), ("content", content_tail)):
+        for event in _route(channel, fragment):
+            yield event
+    if current is not None:
+        for event in _close_current():
+            yield event
+    if not text_block_emitted:
+        yield _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_idx,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+        yield _sse(
+            "content_block_stop", {"type": "content_block_stop", "index": block_idx}
+        )
+        block_idx += 1
 
     yield {
         "stop_reason": "max_tokens" if done_reason == "timeout" else "end_turn",
