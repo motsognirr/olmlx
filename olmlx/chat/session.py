@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncGenerator
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, cast
 
 from olmlx.chat.builtin_tools import BuiltinToolManager
 from olmlx.chat.config import ChatConfig
@@ -666,7 +666,7 @@ class ChatSession:
         self,
         tools: list[dict],
         *,
-        request_event: str,
+        request_event: Literal["tool_confirmation_needed", "tool_auto_judging"],
         context: list[dict] | None,
         denial_reason: str,
         denial_content: str,
@@ -682,12 +682,17 @@ class ChatSession:
         name).
         """
         for tu in tools:
-            yield {
-                "type": request_event,
-                "name": tu["name"],
-                "arguments": tu["input"],
-                "id": tu["id"],
-            }
+            # Both request-event TypedDicts share this shape; only the
+            # Literal tag differs, which request_event's type pins down.
+            yield cast(
+                "_ToolConfirmationNeededEvent | _ToolAutoJudgingEvent",
+                {
+                    "type": request_event,
+                    "name": tu["name"],
+                    "arguments": tu["input"],
+                    "id": tu["id"],
+                },
+            )
             if await self.tool_safety.check_and_confirm(
                 tu["name"], tu["input"], context=context
             ):
