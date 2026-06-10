@@ -1951,11 +1951,18 @@ def _check_voice_deps() -> None:
             return True
 
     # The [voice] extra carries sounddevice (PortAudio) and, via the
-    # self-referential olmlx[audio] requirement, mlx-audio (Kokoro TTS) —
-    # both moved out of core deps in #469, so gate on both.
+    # self-referential olmlx[audio] requirement, the Kokoro TTS stack —
+    # all moved out of core deps in #469. Gate on the TTS transitives too:
+    # a hand-installed mlx-audio (pip install, no extra) lacks misaki /
+    # en_core_web_sm and would otherwise fail at the first TTS call.
     missing = [
         pkg
-        for pkg, mod in (("sounddevice", "sounddevice"), ("mlx-audio", "mlx_audio"))
+        for pkg, mod in (
+            ("sounddevice", "sounddevice"),
+            ("mlx-audio", "mlx_audio"),
+            ("misaki", "misaki"),
+            ("en-core-web-sm", "en_core_web_sm"),
+        )
         if _absent(mod)
     ]
     if missing:
