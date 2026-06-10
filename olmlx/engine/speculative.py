@@ -131,10 +131,14 @@ class _SpecCacheStore:
         races the decode thread against another caller) into an immediate
         RuntimeError instead of silent LRU-list corruption.
         """
+        # Deliberately a plain Lock, not RLock: same-thread reentry (a future
+        # find → ... → find/clear chain mutating mid-scan) is just as unsafe
+        # as cross-thread overlap, so it should raise too, not silently pass.
         if not self._access_guard.acquire(blocking=False):
             raise RuntimeError(
-                "_SpecCacheStore accessed concurrently; accesses must be "
-                "serialized under the inference lock (issue #463)"
+                "_SpecCacheStore accessed concurrently or re-entered "
+                "mid-operation; accesses must be serialized under the "
+                "inference lock (issue #463)"
             )
         try:
             yield

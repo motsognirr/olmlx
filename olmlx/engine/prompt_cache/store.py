@@ -698,6 +698,10 @@ class PromptCacheStore:
         ``asyncio.to_thread`` during unload/eviction/expiry — by then the
         LoadedModel is popped from ``_loaded``, so the closer owns this store
         exclusively and no loop-side caller can race it.
+
+        Note this does blocking disk I/O (``shutil.rmtree``) — do not call it
+        from the event loop; loop-side cleanup goes through ``remove`` /
+        ``async_evict_all_to_disk`` instead.
         """
         self._entries.clear()
         self._radix = PrefixCacheIndex()
