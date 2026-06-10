@@ -660,6 +660,8 @@ class TestAsyncDiskCache:
         disk_file = store._disk_file_path("c")
         disk_file.parent.mkdir(parents=True, exist_ok=True)
         disk_file.write_bytes(b"placeholder")
+        # Age the file so we can assert the skip refreshes its mtime.
+        os.utime(disk_file, (1000, 1000))
 
         loaded = _sized_state(3, 3000)
         with (
@@ -681,6 +683,41 @@ class TestAsyncDiskCache:
         assert "b" in spilled_ids
         assert "c" not in spilled_ids
         assert disk_file.exists()
+        # The surviving file was touched: _cleanup_disk evicts by oldest
+        # mtime, so a stale mtime would make the just-used entry the
+        # first one deleted under the disk cap (LRU inversion).
+        assert disk_file.stat().st_mtime > 1000
+
+    @pytest.mark.asyncio
+    async def test_async_get_budget_bounced_entry_resaved_if_file_gone(self, tmp_path):
+        """If a sibling evictee's save triggered _cleanup_disk and it
+        deleted the restored entry's original file (oldest mtime) before
+        the skip runs, the skip must fall back to a real save — otherwise
+        the entry is lost from both tiers."""
+        store = PromptCacheStore(
+            max_slots=10,
+            disk_path=tmp_path,
+            model_name="test-model",
+            ram_budget_bytes=2500,
+        )
+        store.set("a", _sized_state(1, 1000))
+
+        # _read_from_disk reports a path that no longer exists by the
+        # time the spill loop runs (as if disk-cap cleanup removed it).
+        disk_file = store._disk_file_path("c")
+        disk_file.parent.mkdir(parents=True, exist_ok=True)
+
+        loaded = _sized_state(3, 3000)
+        with (
+            patch.object(store, "_read_from_disk", return_value=(loaded, disk_file)),
+            patch.object(store, "_save_to_disk") as mock_save,
+        ):
+            result = await store.async_get("c")
+
+        assert result is loaded
+        # No surviving file to rely on — the entry must be re-saved.
+        spilled_ids = [call.args[0] for call in mock_save.call_args_list]
+        assert "c" in spilled_ids
 
     def test_sync_get_disk_restore_enforces_ram_budget(self, tmp_path):
         """Disk-restored entries must trigger _enforce_ram_budget on

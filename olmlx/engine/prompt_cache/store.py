@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 from collections import OrderedDict
@@ -283,6 +284,25 @@ class PromptCacheStore:
                 file_path.unlink(missing_ok=True)
                 self._refresh_disk_bytes()
                 return None
+
+    def _touch_or_resave(
+        self, cache_id: str, state: CachedPromptState, file_path: Path
+    ) -> None:
+        """Refresh the surviving disk copy of a budget-bounced restore.
+
+        Called from async_get's spill loop when the RAM budget evicts the
+        entry that was just restored from ``file_path``. Rewriting the
+        same bytes would be pure churn (issue #466), but the file's mtime
+        must move: ``_cleanup_disk`` evicts oldest-mtime files under the
+        disk cap, so a stale timestamp would make the just-used entry the
+        first one deleted. If a sibling evictee's save already triggered a
+        cleanup that removed the file, fall back to a real save so the
+        entry isn't lost from both tiers.
+        """
+        try:
+            os.utime(file_path)
+        except FileNotFoundError:
+            self._save_to_disk(cache_id, state)
 
     def _unlink_and_refresh(self, file_path: Path) -> None:
         """Unlink a disk cache file and refresh ``bytes_on_disk``.
@@ -597,11 +617,16 @@ class PromptCacheStore:
         # it now so a chain of disk hits can't quietly blow the budget
         # until the next write.
         for over_id, over_state in self._enforce_ram_budget():
-            if over_id == cache_id:
+            if over_id == cache_id and disk_path is not None:
                 # The just-restored entry bounced straight back out under
-                # budget pressure. Its original disk file is still intact
-                # (the unlink below is guarded on residency), so rewriting
-                # the same bytes would be pure disk churn — skip the save.
+                # budget pressure. Its original disk file is the surviving
+                # copy (the unlink below is guarded on residency), so
+                # rewriting the same bytes would be pure disk churn — touch
+                # it instead so the disk-cap LRU sees it as fresh, and only
+                # re-save if a sibling evictee's save already cleaned it up.
+                await self._to_thread_traced(
+                    self._touch_or_resave, cache_id, over_state, disk_path
+                )
                 continue
             await self._to_thread_traced(self._save_to_disk, over_id, over_state)
         # Only unlink the original disk file if the restored entry is
