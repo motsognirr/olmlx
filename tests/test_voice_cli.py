@@ -23,6 +23,15 @@ def test_check_voice_deps_missing(monkeypatch):
         _check_voice_deps()
 
 
+def test_check_voice_deps_missing_mlx_audio(monkeypatch):
+    # mlx-audio moved to the [audio] extra (#469); --voice needs it for TTS,
+    # so its absence must exit with the install hint too.
+    monkeypatch.setitem(sys.modules, "sounddevice", types.ModuleType("sounddevice"))
+    monkeypatch.setitem(sys.modules, "mlx_audio", None)
+    with pytest.raises(SystemExit):
+        _check_voice_deps()
+
+
 def test_check_voice_deps_present(monkeypatch):
     monkeypatch.setitem(sys.modules, "sounddevice", types.ModuleType("sounddevice"))
     monkeypatch.setitem(sys.modules, "mlx_audio", types.ModuleType("mlx_audio"))
