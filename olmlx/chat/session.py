@@ -202,6 +202,18 @@ ChatEvent = (
 )
 
 
+class _TurnStreamResult(TypedDict):
+    """Out-of-band results from ``_stream_one_turn``.
+
+    Filled in place by the helper because an async generator cannot
+    return values.
+    """
+
+    full_text: str
+    thinking_expected: bool
+    repetition_stopped: bool
+
+
 class ThinkingTracker:
     """Tracks <think> tag boundaries during streaming generation.
 
@@ -904,6 +916,97 @@ class ChatSession:
             # (agent loop) handle recovery and track consecutive failures.
             return
 
+    async def _stream_one_turn(
+        self,
+        *,
+        options: dict[str, Any],
+        mcp_tools: list[dict] | None,
+        implicit_thinking: bool,
+        template_has_thinking: bool,
+        result: _TurnStreamResult,
+    ) -> AsyncGenerator[ChatEvent, None]:
+        """Consume one generate_chat turn, splitting thinking from visible text.
+
+        Feeds each chunk through a ThinkingTracker, yields streaming events
+        (token / thinking_* / repetition_detected) and stops early on
+        repetitive output. Fills ``result`` in place: ``full_text`` is the
+        raw accumulated output for the parse step (with any incomplete
+        <think> block stripped on repetition), ``thinking_expected`` mirrors
+        the engine's meta chunk, and ``repetition_stopped`` is True when
+        generation was cut short.
+        """
+        repetition_stopped = False
+        token_count = 0
+        tracker = ThinkingTracker(
+            implicit_mode=implicit_thinking,
+            thinking_disabled=not self.config.thinking,
+            template_has_thinking=template_has_thinking,
+        )
+
+        async for chunk in await generate_chat(
+            self.manager,
+            self.config.model_name,
+            self.messages,
+            options=options,
+            tools=mcp_tools,
+            stream=True,
+            keep_alive="-1",
+            max_tokens=self.config.max_tokens,
+            cache_id="chat",
+            enable_thinking=self.config.thinking,
+        ):
+            if chunk.get("cache_info"):
+                continue
+            if "thinking_expected" in chunk:
+                # Captured so `parse_model_output` only fires the orphan-
+                # `</think>` heuristic when thinking was actually
+                # requested (issue #307).
+                result["thinking_expected"] = bool(chunk["thinking_expected"])
+                continue
+            if chunk.get("done"):
+                break
+            text = chunk.get("text", "")
+            if text:
+                token_count += 1
+                think_delta, visible_delta, thinking_ended, thinking_started = (
+                    tracker.feed(text)
+                )
+
+                if thinking_started:
+                    yield {"type": "thinking_start"}
+                if think_delta:
+                    yield {"type": "thinking_token", "text": think_delta}
+                if thinking_ended:
+                    yield {"type": "thinking_end"}
+                if visible_delta:
+                    yield {"type": "token", "text": visible_delta}
+
+                if token_count % 10 == 0 and _detect_repetition(
+                    tracker.accumulated,
+                    min_phrase_len=self.config.repetition_min_phrase_len,
+                    min_repeats=self.config.repetition_min_repeats,
+                ):
+                    logger.warning("Repetitive output detected, stopping generation")
+                    repetition_stopped = True
+                    yield {"type": "repetition_detected"}
+                    break
+
+        # Flush disabled-thinking content
+        if flush_text := tracker.flush_disabled():
+            yield {"type": "token", "text": flush_text}
+
+        # Strip incomplete thinking on repetition BEFORE yielding final events
+        was_in_thinking = tracker.in_thinking
+        if repetition_stopped:
+            tracker.strip_on_repetition()
+
+        # Close any open thinking block (only if content was stripped mid-think)
+        if was_in_thinking:
+            yield {"type": "thinking_end"}
+
+        result["full_text"] = tracker.accumulated
+        result["repetition_stopped"] = repetition_stopped
+
     async def send_message(self, user_text: str) -> AsyncGenerator[ChatEvent, None]:
         """Send a user message and run the agent loop.
 
@@ -976,102 +1079,28 @@ class ChatSession:
 
         consecutive_failures = 0
         for turn in range(self.config.max_turns):
-            repetition_stopped = False
-            token_count = 0
-            tracker = ThinkingTracker(
-                implicit_mode=assume_implicit_thinking and turn == 0,
-                thinking_disabled=not self.config.thinking,
-                template_has_thinking=template_has_thinking,
-            )
-
-            # Captured from the engine's `thinking_expected` meta chunk so
-            # `parse_model_output` only fires the orphan-`</think>`
-            # heuristic when thinking was actually requested (issue #307).
-            thinking_expected = False
-
-            async for chunk in await generate_chat(
-                self.manager,
-                self.config.model_name,
-                self.messages,
+            turn_result: _TurnStreamResult = {
+                "full_text": "",
+                "thinking_expected": False,
+                "repetition_stopped": False,
+            }
+            async for event in self._stream_one_turn(
                 options=options,
-                tools=mcp_tools,
-                stream=True,
-                keep_alive="-1",
-                max_tokens=self.config.max_tokens,
-                cache_id="chat",
-                enable_thinking=self.config.thinking,
+                mcp_tools=mcp_tools,
+                implicit_thinking=assume_implicit_thinking and turn == 0,
+                template_has_thinking=template_has_thinking,
+                result=turn_result,
             ):
-                if chunk.get("cache_info"):
-                    continue
-                if "thinking_expected" in chunk:
-                    thinking_expected = bool(chunk["thinking_expected"])
-                    continue
-                if chunk.get("done"):
-                    break
-                text = chunk.get("text", "")
-                if text:
-                    token_count += 1
-                    think_delta, visible_delta, thinking_ended, thinking_started = (
-                        tracker.feed(text)
-                    )
+                yield event
+            repetition_stopped = turn_result["repetition_stopped"]
 
-                    if thinking_started:
-                        yield {"type": "thinking_start"}
-                    if think_delta:
-                        yield {"type": "thinking_token", "text": think_delta}
-                    if thinking_ended:
-                        yield {"type": "thinking_end"}
-                    if visible_delta:
-                        yield {"type": "token", "text": visible_delta}
-
-                    if token_count % 10 == 0 and _detect_repetition(
-                        tracker.accumulated,
-                        min_phrase_len=self.config.repetition_min_phrase_len,
-                        min_repeats=self.config.repetition_min_repeats,
-                    ):
-                        logger.warning(
-                            "Repetitive output detected, stopping generation"
-                        )
-                        repetition_stopped = True
-                        yield {"type": "repetition_detected"}
-                        break
-
-            # Flush disabled-thinking content
-            if flush_text := tracker.flush_disabled():
-                yield {"type": "token", "text": flush_text}
-
-            # Strip incomplete thinking on repetition BEFORE yielding final events
-            was_in_thinking = tracker.in_thinking
-            if repetition_stopped:
-                tracker.strip_on_repetition()
-
-            # Close any open thinking block (only if content was stripped mid-think)
-            if was_in_thinking:
-                yield {"type": "thinking_end"}
-
-            full_text = tracker.accumulated
-
-            try:
-                _, visible_text, tool_uses = parse_model_output(
-                    full_text,
-                    has_tools=(mcp_tools is not None),
-                    thinking_expected=thinking_expected,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Failed to parse model output: %s\ntext: %.200s",
-                    exc,
-                    full_text,
-                )
-                visible_text = _strip_thinking(full_text)
-                tool_uses = []
-                yield {
-                    "type": "tool_error",
-                    "name": "(parse error)",
-                    "error": f"Failed to parse model output; tools were dropped: {exc}",
-                    "id": "",
-                    "is_user_error": False,
-                }
+            visible_text, tool_uses, parse_error = _parse_turn_output(
+                turn_result["full_text"],
+                has_tools=(mcp_tools is not None),
+                thinking_expected=turn_result["thinking_expected"],
+            )
+            if parse_error is not None:
+                yield parse_error
 
             # Build assistant message
             assistant_msg: dict[str, Any] = {
@@ -1142,6 +1171,39 @@ class ChatSession:
             yield {"type": "max_turns_exceeded"}
 
         yield {"type": "done"}
+
+
+def _parse_turn_output(
+    full_text: str, *, has_tools: bool, thinking_expected: bool
+) -> tuple[str, list[dict[str, Any]], _ToolErrorEvent | None]:
+    """Parse one turn's raw model output into visible text and tool calls.
+
+    Returns ``(visible_text, tool_uses, parse_error)``. On parse failure,
+    falls back to thinking-stripped text with no tool calls and returns a
+    ``tool_error`` event for the caller to yield. (Named to avoid colliding
+    with the ``parse_model_output`` import from ``engine.tool_parser``.)
+    """
+    try:
+        _, visible_text, tool_uses = parse_model_output(
+            full_text,
+            has_tools=has_tools,
+            thinking_expected=thinking_expected,
+        )
+        return visible_text, tool_uses, None
+    except Exception as exc:
+        logger.error(
+            "Failed to parse model output: %s\ntext: %.200s",
+            exc,
+            full_text,
+        )
+        error: _ToolErrorEvent = {
+            "type": "tool_error",
+            "name": "(parse error)",
+            "error": f"Failed to parse model output; tools were dropped: {exc}",
+            "id": "",
+            "is_user_error": False,
+        }
+        return _strip_thinking(full_text), [], error
 
 
 def _strip_thinking(text: str) -> str:
