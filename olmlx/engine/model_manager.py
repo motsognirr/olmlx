@@ -2944,7 +2944,7 @@ class ModelManager(SpeculativeLoaderMixin):
         from pathlib import Path
 
         try:
-            import mlx_audio.tts.utils as tts_utils
+            import mlx_audio.tts.utils as tts_utils  # type: ignore[import-not-found]
         except ImportError as exc:
             # ValueError -> HTTP 400 on /v1/audio/speech (the router's
             # primed-first-chunk error path), instead of an opaque 500.
