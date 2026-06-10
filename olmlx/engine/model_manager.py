@@ -1018,6 +1018,11 @@ class ModelManager(SpeculativeLoaderMixin):
         about to use. The caller MUST release the pin exactly once (the
         inference paths adopt it via ``_inference_ref(..., adopt=True)``).
         """
+        # Same loop-affinity contract as unload/_expire_stale (#463):
+        # ensure_loaded inserts into _loaded and drives LRU eviction, and
+        # self._lock is an asyncio.Lock, which only serializes coroutines
+        # on the loop — it offers no protection against an off-loop caller.
+        assert_loop_thread("ModelManager.ensure_loaded")
         normalized = self.registry.normalize_name(name)
         if normalized != name:
             logger.info("Normalized model name '%s' -> '%s'", name, normalized)

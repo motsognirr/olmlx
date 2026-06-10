@@ -403,6 +403,11 @@ class PromptCacheStore:
         - On LRU eviction: (evicted_id, evicted_state)
         - No eviction needed: (None, None)
         """
+        # Redundant for current callers (every public entry point asserts),
+        # but this is the insertion chokepoint for _entries/_radix — a
+        # future caller that bypasses the public surface still trips the
+        # contract here (#463).
+        assert_loop_thread("PromptCacheStore._set_in_memory")
         if cache_id in self._entries:
             self._entries.move_to_end(cache_id)
             old = self._entries[cache_id]

@@ -122,6 +122,18 @@ class TestModelManagerAffinity:
         assert isinstance(exc, RuntimeError)
         assert "event-loop thread" in str(exc)
 
+    def test_ensure_loaded_off_loop_raises(self, mock_manager):
+        # ensure_loaded mutates _loaded (insert + LRU eviction) under the
+        # same loop-affinity contract as unload's check-then-pop; an
+        # off-loop caller must trip before touching anything.
+        loop_affinity.bind_loop_thread()
+        exc = _run_in_thread(
+            lambda: asyncio.run(mock_manager.ensure_loaded("qwen3:latest"))
+        )
+        assert isinstance(exc, RuntimeError)
+        assert "ModelManager.ensure_loaded" in str(exc)
+        assert "qwen3:latest" in mock_manager._loaded
+
 
 class TestPromptCacheStoreAffinity:
     def test_mutators_off_loop_raise(self):
@@ -162,6 +174,18 @@ class TestPromptCacheStoreAffinity:
         assert store.get("a") is not None
         store.remove("a")
         assert store.get("a") is None
+
+    def test_set_in_memory_off_loop_raises(self):
+        # _set_in_memory is the insertion chokepoint for _entries/_radix;
+        # every public entry point asserts, but the helper carries its own
+        # (idempotent on-loop) check so a future caller that bypasses the
+        # public surface still trips the contract.
+        store = PromptCacheStore(max_slots=4)
+        loop_affinity.bind_loop_thread()
+        exc = _run_in_thread(lambda: store._set_in_memory("a", _make_state(1)))
+        assert isinstance(exc, RuntimeError)
+        assert "PromptCacheStore._set_in_memory" in str(exc)
+        assert store.peek("a") is None
 
     def test_clear_allowed_off_loop(self):
         # clear()'s only production caller is _close_loaded_model, which runs
