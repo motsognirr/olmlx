@@ -90,7 +90,7 @@ class TestSpecialTokenTextStripping:
             self._tokens = tokens
             self._idx = 0
 
-        def prefill(self, prompt, cancel_event=None):  # noqa: ARG002 - protocol compliance
+        def prefill(self, prompt, *, segmented=None, cancel_event=None):  # noqa: ARG002 - protocol compliance
             self._idx = 1
             return self._tokens[0]
 

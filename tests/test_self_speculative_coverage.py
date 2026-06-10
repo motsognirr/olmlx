@@ -362,11 +362,14 @@ class TestLifecycle:
         assert decoder._stats_proposed == 0
         assert decoder._stats_accepted_draft == 0
 
-    def test_close_is_noop(self, decoder):
-        # close() must not raise and must not disturb state.
+    def test_close_resets_state(self, decoder):
+        # close() must not raise. Since #467 it follows the uniform
+        # SpecDecoderBase lifecycle (close == reset), releasing the KV
+        # cache eagerly at unload instead of the old state-preserving
+        # no-op (nothing reads decoder state after close).
         decoder.prefill(mx.array([[1, 2, 3]]))
         decoder.close()
-        assert decoder._cache is not None
+        assert decoder._cache is None
 
     def test_step_before_prefill_raises(self, decoder):
         with pytest.raises(AssertionError):

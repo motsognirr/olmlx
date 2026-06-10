@@ -20,7 +20,8 @@ except ImportError:  # pragma: no cover — mlx-lm is always available at runtim
     trim_prompt_cache = None
 
 from olmlx.engine.gdn_rollback import find_gdn_class, get_model_layers
-from olmlx.engine.speculative import PrefillCancelled, verify_draft_greedy
+from olmlx.engine.spec_decoder_base import SpecDecoderBase
+from olmlx.engine.speculative import PrefillCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,7 @@ def _prefill_last_logit(
     return _logits(model(last, cache=cache))[0, 0, :]
 
 
-class SelfSpeculativeDecoder:
+class SelfSpeculativeDecoder(SpecDecoderBase):
     """Self-speculative decoding using the target's own early layers.
 
     The first ``num_early_layers`` of the target serve as the draft
@@ -153,6 +154,7 @@ class SelfSpeculativeDecoder:
         num_speculative_tokens: int = 4,
         acceptance_rate_ema: float = 0.9,
     ):
+        super().__init__()
         if make_prompt_cache is None or trim_prompt_cache is None:
             raise RuntimeError(
                 "mlx_lm.models.cache is unavailable; self-speculative "
@@ -254,30 +256,14 @@ class SelfSpeculativeDecoder:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def close(self) -> None:
-        """No-op — no GDN patches or external resources to release."""
-
-    def reset(self) -> None:
+    def _reset_state(self) -> None:
         self._cache = None
         self._last_logit = None
         self._pending_token = None
         self._prompt_len = 0
-        self._stats_steps = 0
-        self._stats_proposed = 0
-        self._stats_accepted_draft = 0
 
-    def stats_summary(self) -> dict[str, Any]:
-        steps = self._stats_steps
-        proposed = self._stats_proposed
-        accepted_draft = self._stats_accepted_draft
-        acceptance_rate = accepted_draft / proposed if proposed else 0.0
-        avg_tokens_per_step = (accepted_draft + steps) / steps if steps else 0.0
+    def _stats_extra(self) -> dict[str, Any]:
         return {
-            "steps": steps,
-            "proposed": proposed,
-            "accepted_draft": accepted_draft,
-            "acceptance_rate": acceptance_rate,
-            "avg_tokens_per_step": avg_tokens_per_step,
             "ema_acceptance_rate": self._alpha,
             "lambda": self._lambda,
         }
@@ -286,21 +272,23 @@ class SelfSpeculativeDecoder:
     # Protocol: prefill / step
     # ------------------------------------------------------------------
 
-    def prefill(
-        self, prompt: mx.array, cancel_event: threading.Event | None = None
+    def _prefill_impl(
+        self,
+        prompt: mx.array,
+        *,
+        segmented: Any = None,
+        cancel_event: threading.Event | None = None,
     ) -> int:
         """Process the prompt through the full model, populating KV cache.
 
         Returns the first generated token.
 
-        ``cancel_event`` is required by ``SpeculativeDecoderProtocol`` (which
-        ``speculative_stream_generate`` calls with the kwarg). Self-speculative
-        prefills in a single forward, so it is honored only at the two
-        ``_prefill_last_logit`` pass boundaries — enough to interrupt a
-        disconnected request before the second large forward.
+        ``segmented`` is accepted for the canonical ``SpecDecoderBase``
+        signature but ignored (no snapshot store). Self-speculative
+        prefills in a single forward, so ``cancel_event`` is honored only
+        at the two ``_prefill_last_logit`` pass boundaries — enough to
+        interrupt a disconnected request before the second large forward.
         """
-        self.reset()
-
         self._cache = make_prompt_cache(self._target)
 
         # Reset cached RoPE state on VLM targets (mlx-vlm 0.4.4)
@@ -318,10 +306,12 @@ class SelfSpeculativeDecoder:
         self._pending_token = first_token
         return first_token
 
-    def step(self) -> tuple[list[int], int]:
+    def _step_impl(self) -> tuple[list[int], int]:
         """One self-speculative decoding step.
 
-        Must call ``prefill()`` first.
+        Must call ``prefill()`` first. ``SpecDecoderBase.step`` wraps
+        this in try/reset so a mid-step exception cannot leave the KV
+        cache partially modified (#460).
         Returns (accepted_tokens, num_draft_generated).
 
         Cache-length invariant
@@ -370,7 +360,7 @@ class SelfSpeculativeDecoder:
         verification_logits = target_out[0]  # (lambda+1, vocab)
 
         # --- Accept/reject ---
-        accepted = verify_draft_greedy(draft_tokens, verification_logits)
+        accepted = self._verify_greedy(draft_tokens, verification_logits)
         num_accepted = len(accepted)
 
         # --- Trim caches to accepted prefix ---

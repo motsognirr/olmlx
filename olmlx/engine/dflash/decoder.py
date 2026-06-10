@@ -34,11 +34,20 @@ from mlx_lm.models.cache import (
 
 from olmlx.engine.dflash.draft_model import DFlashDraftModel, DraftConfig
 from olmlx.engine.gdn_rollback import (
-    GDNBuffer,
-    GDNStateCapture,
-    get_model_layers as _get_layers,
+    # Re-export: dflash/prepare.py, tests, and scripts import ``_get_layers``
+    # from this module.
+    get_model_layers as _get_layers,  # noqa: F401
 )
-from olmlx.engine.speculative import _eval_cache, verify_draft_greedy
+from olmlx.engine.spec_decoder_base import (
+    SpecDecoderBase,
+    # Canonical home moved to spec_decoder_base (#467); re-exported here
+    # because cli, prepare, eagle/mtp tests and scripts import them from
+    # this module.
+    _LayerHook as _LayerHook,
+    _patch_model as _patch_model,
+    _unpatch_model as _unpatch_model,
+)
+from olmlx.engine.speculative import _eval_cache
 
 
 # ``_trim_recent_cache`` reaches into ``RotatingKVCache._temporal_order`` and
@@ -73,68 +82,6 @@ def _probe_rotating_kv_privates() -> bool:
 _HAS_ROTATING_KV_PRIVATES = _probe_rotating_kv_privates()
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Layer hooks
-# ---------------------------------------------------------------------------
-
-
-class _LayerHook:
-    """Wrap a target layer to capture its output hidden state.
-
-    Transparently proxies attribute access via ``__getattr__`` so the
-    rest of the model sees the original layer's interface.
-    """
-
-    def __init__(self, layer: Any, idx: int, storage: list[Any]):
-        self._layer = layer
-        self._idx = idx
-        self._storage = storage
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        out = self._layer(*args, **kwargs)
-        self._storage[self._idx] = out[0] if isinstance(out, tuple) else out
-        return out
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._layer, name)
-
-
-def _patch_model(model: nn.Module, layer_ids: list[int], storage: list[Any]) -> None:
-    """Install ``_LayerHook`` on the target's selected layers (idempotent).
-
-    The caller owns *storage* — a pre-allocated list of length
-    ``len(layer_ids)`` that each hook writes its slot into. Keeping the
-    storage off the ``nn.Module`` avoids contaminating ``model.parameters()``
-    once captured ``mx.array``s land in it (mlx's ``Module.__setattr__``
-    puts ``list`` attributes into the parameter tree, which would corrupt
-    ``mx.eval(model.parameters())`` in distributed setups and serialize
-    transient tensors via ``save_weights``).
-
-    Idempotency is detected by checking whether all requested layers
-    are already ``_LayerHook``; the second call is a no-op. When
-    partially patched (some indices wrapped, others not — e.g. a prior
-    call raised mid-loop), only the unwrapped indices are wrapped. We
-    must avoid double-wrapping (``_LayerHook(_LayerHook(layer))``)
-    because ``_unpatch_model`` peels exactly one level and would leave
-    a stale outer hook writing into a dead storage slot.
-    """
-    layers = _get_layers(model)
-    if all(isinstance(layers[lid], _LayerHook) for lid in layer_ids):
-        return
-    for i, lid in enumerate(layer_ids):
-        if isinstance(layers[lid], _LayerHook):
-            continue
-        layers[lid] = _LayerHook(layers[lid], i, storage)
-
-
-def _unpatch_model(model: nn.Module) -> None:
-    """Remove ``_LayerHook`` wrappers from the target. Safe to call twice."""
-    layers = _get_layers(model)
-    for i, layer in enumerate(layers):
-        if isinstance(layer, _LayerHook):
-            layers[i] = layer._layer
 
 
 def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
@@ -188,7 +135,7 @@ def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-class DFlashDecoder:
+class DFlashDecoder(SpecDecoderBase):
     """Block-diffusion speculative decoder.
 
     Each ``step()`` builds a masked block ``[pending_token, MASK,
@@ -212,17 +159,18 @@ class DFlashDecoder:
         draft_config: DraftConfig,
         block_size: int = 16,
     ):
+        super().__init__()
         self._target = target_model
         self._draft = draft_model
         self._config = draft_config
         self._block_size = block_size
 
-        # State (populated by prefill())
+        # State (populated by prefill()). The hook/capture lifecycle
+        # fields (``_patched``/``_bound``/``_capture``/``_capture_buffer``)
+        # and the stats counters live on ``SpecDecoderBase``.
         self._target_cache: list[Any] | None = None
         self._draft_cache: list[Any] | None = None
         self._target_can_trim: bool = True
-        self._capture: GDNStateCapture | None = None
-        self._capture_buffer: GDNBuffer | None = None
         self._hidden: mx.array | None = None
         self._pending_token: int | None = None
         self._prompt_size: int = 0
@@ -234,46 +182,11 @@ class DFlashDecoder:
         # used to compute draft-cache trim amounts.
         self._n_generated: int = 0
 
-        # Idempotency guards for reset() — a double-call (e.g. eviction
-        # path followed by __del__) must not double-unpatch the GDN
-        # class-level monkey-patch.
-        self._patched: bool = False
-        self._bound: bool = False
-
-        # Diagnostic counters (reset on prefill, mirrors SpeculativeDecoder)
-        self._stats_steps: int = 0
-        self._stats_proposed: int = 0
-        self._stats_accepted_draft: int = 0
-
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def close(self) -> None:
-        """Alias for :meth:`reset` so callers can use the same
-        ``close()`` lifecycle name as :class:`SpeculativeDecoder` —
-        important because ``ModelManager`` holds whichever decoder type
-        the strategy resolved to and treats them uniformly at unload.
-        """
-        self.reset()
-
-    def reset(self) -> None:
-        if self._capture is not None:
-            try:
-                self._capture.close()
-            finally:
-                self._capture = None
-                self._capture_buffer = None
-        if self._patched:
-            try:
-                _unpatch_model(self._target)
-            finally:
-                self._patched = False
-        if self._bound:
-            try:
-                self._draft.unbind()
-            finally:
-                self._bound = False
+    def _reset_state(self) -> None:
         self._target_cache = None
         self._draft_cache = None
         self._target_can_trim = True
@@ -282,63 +195,31 @@ class DFlashDecoder:
         self._prompt_size = 0
         self._hidden_capture = []
         self._n_generated = 0
-        self._stats_steps = 0
-        self._stats_proposed = 0
-        self._stats_accepted_draft = 0
 
-    def __del__(self) -> None:
-        # Without this finalizer, a decoder dropped without explicit
-        # ``reset()`` (e.g. cancelled request, exception unwinding past
-        # the streaming pipeline's cleanup) would leak the GDN patch
-        # and the patch lock indefinitely. Reason: the patched
-        # ``gdn_cls.__call__`` closure holds a strong reference to the
-        # ``GDNStateCapture`` instance through ``capture = self``. That
-        # external class-level reference can't be broken by Python's
-        # cyclic GC, so ``GDNStateCapture.__del__`` never fires on its
-        # own. Calling ``reset()`` here invokes ``_capture.close()``,
-        # which restores the original ``__call__`` and breaks the
-        # reference. ``DFlashDecoder`` itself has no cycle preventing
-        # its own ``__del__`` from running.
-        try:
-            self.reset()
-        except Exception:
-            # Finalizers must never raise — interpreter may already be
-            # tearing down at this point.
-            pass
-
-    def stats_summary(self) -> dict[str, Any]:
-        steps = self._stats_steps
-        proposed = self._stats_proposed
-        accepted_draft = self._stats_accepted_draft
-        acceptance_rate = accepted_draft / proposed if proposed else 0.0
-        avg_tokens_per_step = (accepted_draft + steps) / steps if steps else 0.0
-        return {
-            "steps": steps,
-            "proposed": proposed,
-            "accepted_draft": accepted_draft,
-            "acceptance_rate": acceptance_rate,
-            "avg_tokens_per_step": avg_tokens_per_step,
-            "lambda": self._block_size,
-        }
+    def _stats_extra(self) -> dict[str, Any]:
+        return {"lambda": self._block_size}
 
     # ------------------------------------------------------------------
     # Main API
     # ------------------------------------------------------------------
 
-    def prefill(
-        self, prompt: mx.array, cancel_event: threading.Event | None = None
+    def _prefill_impl(
+        self,
+        prompt: mx.array,
+        *,
+        segmented: Any = None,
+        cancel_event: threading.Event | None = None,
     ) -> int:
         """Process the prompt through the target, capturing hidden states.
 
         Returns the first generated token (target greedy argmax).
 
-        ``cancel_event`` is accepted for ``SpeculativeDecoderProtocol``
-        conformance but not honored: DFlash prefills the target in a single
-        forward (no sub-chunk loop to check between), and it is an
-        experimental strategy off the default path.
+        ``segmented`` and ``cancel_event`` are accepted for the canonical
+        ``SpecDecoderBase`` signature but not honored: DFlash has no
+        snapshot store, prefills the target in a single forward (no
+        sub-chunk loop to check between), and is an experimental strategy
+        off the default path.
         """
-        self.reset()
-
         target_layer_ids = list(self._config.target_layer_ids)
         # Build the target cache before patching: ``make_prompt_cache``
         # walks ``model.layers`` to pick a per-layer cache type (sliding
@@ -349,10 +230,8 @@ class DFlashDecoder:
         # decouples cache selection from the patch.
         self._target_cache = make_prompt_cache(self._target)
         self._hidden_capture = [None] * len(target_layer_ids)
-        _patch_model(self._target, target_layer_ids, self._hidden_capture)
-        self._patched = True
-        self._draft.bind(self._target)
-        self._bound = True
+        self._install_layer_hooks(target_layer_ids, self._hidden_capture)
+        self._bind_draft()
 
         # Call the draft's own ``make_cache`` directly. ``make_prompt_cache``
         # would defer to it via ``hasattr(model, "make_cache")`` today, but
@@ -367,9 +246,7 @@ class DFlashDecoder:
             # if mlx_lm.models.gated_delta is unavailable or if the
             # target has no ``GatedDeltaNet`` submodule, so a separate
             # pre-check would just duplicate the same error.
-            self._capture, self._capture_buffer = GDNStateCapture.for_model(
-                self._target
-            )
+            self._install_gdn_capture()
             self._capture.use_buffer(self._capture_buffer)
 
         # Two-pass prefill avoids materialising the full [batch, N, vocab] logit
@@ -425,8 +302,11 @@ class DFlashDecoder:
         self._n_generated = 1
         return first_token
 
-    def step(self) -> tuple[list[int], int]:
-        """One block-diffusion speculative step."""
+    def _step_impl(self) -> tuple[list[int], int]:
+        """One block-diffusion speculative step. ``SpecDecoderBase.step``
+        wraps this in try/reset so a mid-step exception (Metal error,
+        OOM, rollback failure) can never leave corrupt caches behind
+        (#460)."""
         # ``raise`` rather than ``assert`` — these are API-contract
         # guards, not debug checks, and ``assert`` is stripped under
         # ``python -O``.
@@ -437,24 +317,6 @@ class DFlashDecoder:
             or self._hidden is None
         ):
             raise RuntimeError("Call prefill() before step()")
-
-        # Mirror EAGLE/MTP: a mid-step exception in the draft forward,
-        # the verify forward (Metal error, OOM, shape mismatch), or the
-        # rollback would otherwise leave both KV caches partially
-        # modified and the GDN capture buffer with leftover entries —
-        # the next ``step()`` would silently consume corrupt state.
-        # ``reset()`` forces the caller to re-``prefill`` to recover,
-        # the right semantic for a hard inference failure (#460).
-        try:
-            return self._step_impl()
-        except Exception:
-            self.reset()
-            raise
-
-    def _step_impl(self) -> tuple[list[int], int]:
-        """Inner body of ``step()``, wrapped by the try/reset above so
-        the exception-safety boundary stays at one call site.
-        """
 
         pending = self._pending_token
         bs_total = self._block_size + 1  # block length including pending token
@@ -555,7 +417,7 @@ class DFlashDecoder:
 
         # 3. Greedy verification.
         verification_logits = logits[0]  # (block_size + 1, vocab)
-        accepted = verify_draft_greedy(draft_tokens, verification_logits)
+        accepted = self._verify_greedy(draft_tokens, verification_logits)
         num_accepted = len(accepted)  # 1..block_size+1
         # accepted_drafts is the count BEFORE the bonus position
         # (excludes the target's correction or all-accepted bonus).

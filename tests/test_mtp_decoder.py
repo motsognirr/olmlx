@@ -128,7 +128,7 @@ def test_mtp_prefill_suppresses_gdn_capture_during_chunked_prefix(monkeypatch):
     The buffer is re-enabled before the pass-2 single-token forward because
     ``step()`` relies on an active buffer (it only clears between verifies).
     """
-    from olmlx.engine import speculative
+    from olmlx.engine import spec_decoder_base as base_mod, speculative
     from olmlx.engine.mtp import decoder as decoder_mod
 
     monkeypatch.setattr(speculative, "_PREFILL_CHUNK", 4)
@@ -153,7 +153,9 @@ def test_mtp_prefill_suppresses_gdn_capture_during_chunked_prefix(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(decoder_mod, "_GDNStateCapture", _FakeCapture)
+    # The capture is installed via ``SpecDecoderBase._install_gdn_capture``,
+    # so the patch seam lives on the base module (#467).
+    monkeypatch.setattr(base_mod, "GDNStateCapture", _FakeCapture)
 
     decoder, target, _ = _make_mtp_decoder()
 
