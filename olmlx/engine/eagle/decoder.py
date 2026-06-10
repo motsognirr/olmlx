@@ -18,17 +18,17 @@ Two regimes, picked at prefill time based on
   draft caches at the end of each ``step()``.
 
 - **Non-trim-able caches** (``GatedDeltaNet`` linear-attention layers
-  in Qwen3.5/3.6 hybrids): we install DFlash's ``_GDNStateCapture``
-  to monkey-patch ``GatedDeltaNet.__call__`` and snapshot the
-  recurrent state per layer. After a partial-acceptance verify,
-  ``rollback`` replays ``gated_delta_update`` on the accepted prefix
-  to restore the correct state. The draft cache is always trim-able
-  (the draft is a small standard-attention transformer), so we trim
-  it directly.
+  in Qwen3.5/3.6 hybrids): we install ``gdn_rollback.GDNStateCapture``
+  (via ``SpecDecoderBase._install_gdn_capture``) to monkey-patch
+  ``GatedDeltaNet.__call__`` and snapshot the recurrent state per
+  layer. After a partial-acceptance verify, ``rollback`` replays
+  ``gated_delta_update`` on the accepted prefix to restore the correct
+  state. The draft cache is always trim-able (the draft is a small
+  standard-attention transformer), so we trim it directly.
 
-Layer hooking is shared with DFlash via ``_patch_model`` /
-``_get_layers`` / ``_LayerHook`` so we don't reimplement the universal
-target-layer-output capture pattern.
+Layer hooking comes from ``SpecDecoderBase`` (``_install_layer_hooks``
+over ``spec_decoder_base._LayerHook``) so we don't reimplement the
+universal target-layer-output capture pattern.
 """
 
 from __future__ import annotations
@@ -40,19 +40,14 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from olmlx.engine.dflash.decoder import (
-    _patch_model,
-    _unpatch_model,
-)
 from olmlx.engine.gdn_rollback import (
     _HAS_GDN,
     find_gdn_class as _find_gdn_class,
-    GDNBuffer as _GDNBuffer,
-    GDNStateCapture as _GDNStateCapture,
     get_model_layers as _get_layers,
 )
 from olmlx.engine.eagle.draft_model import EagleDraftModel
-from olmlx.engine.speculative import _eval_cache, verify_draft_greedy
+from olmlx.engine.spec_decoder_base import SpecDecoderBase
+from olmlx.engine.speculative import _eval_cache
 
 try:
     from mlx_lm.models.cache import (
@@ -73,7 +68,7 @@ def _logits(out: Any) -> mx.array:
     return getattr(out, "logits", out)
 
 
-class EagleDecoder:
+class EagleDecoder(SpecDecoderBase):
     """Autoregressive draft + verify protocol for EAGLE.
 
     State transitions
@@ -114,6 +109,7 @@ class EagleDecoder:
         block_size: int = 4,
         target_layer_id: int | None = None,
     ):
+        super().__init__()
         if make_prompt_cache is None:
             raise RuntimeError(
                 "mlx_lm.models.cache is unavailable; EagleDecoder requires it "
@@ -153,96 +149,39 @@ class EagleDecoder:
         self._target_layer_id = target_layer_id
         self._hidden_storage: list[Any] = [None]
 
-        # Per-request state populated by ``prefill``.
+        # Per-request state populated by ``prefill``. The hook/capture
+        # lifecycle fields (``_patched``/``_bound``/``_capture``/
+        # ``_capture_buffer``) and the stats counters live on
+        # ``SpecDecoderBase``; the GDN capture is created in ``prefill``
+        # only when the target cache is non-trim-able (Qwen3.5/3.6
+        # hybrid linear-attention case).
         self._target_cache: list | None = None
         self._draft_cache: list | None = None
         self._seed_token: int | None = None
         self._seed_hidden: mx.array | None = None
-        self._patched: bool = False
-        self._bound: bool = False
-        # GDN state capture for non-trim-able targets. Created in
-        # ``prefill`` only when the target cache is non-trim-able
-        # (Qwen3.5/3.6 hybrid linear-attention case). ``None`` for
-        # standard-attention targets that take the trim path. The
-        # capture owns the class-level monkey-patch; the buffer holds
-        # the per-step snapshots that ``rollback_single`` replays.
-        self._capture: _GDNStateCapture | None = None
-        self._capture_buffer: _GDNBuffer | None = None
         self._target_can_trim: bool = True
-
-        # Stats (reset on prefill).
-        self._stats_steps = 0
-        self._stats_proposed = 0
-        self._stats_accepted_draft = 0
 
     # ----- lifecycle -------------------------------------------------------
 
-    def close(self) -> None:
-        """Alias for :meth:`reset` so callers can use the same
-        ``close()`` lifecycle name as :class:`SpeculativeDecoder` and
-        :class:`DFlashDecoder` — ``ModelManager`` holds whichever
-        decoder type the strategy resolved to and treats them uniformly
-        on unload, eviction, and keep-alive expiry.
-        """
-        self.reset()
-
-    def reset(self) -> None:
-        # Close the GDN capture *first* — it holds ``_GDN_PATCH_LOCK``,
-        # and if any of the steps below raises we still want the lock
-        # released so subsequent decoder instances can use the patch.
-        if self._capture is not None:
-            try:
-                self._capture.close()
-            finally:
-                self._capture = None
-                self._capture_buffer = None
-        if self._patched:
-            try:
-                _unpatch_model(self._target)
-            finally:
-                self._patched = False
-        if self._bound:
-            try:
-                self._draft.unbind()
-            finally:
-                self._bound = False
+    def _reset_state(self) -> None:
         self._target_cache = None
         self._draft_cache = None
         self._seed_token = None
         self._seed_hidden = None
         self._target_can_trim = True
         self._hidden_storage = [None]
-        self._stats_steps = 0
-        self._stats_proposed = 0
-        self._stats_accepted_draft = 0
 
-    def __del__(self) -> None:
-        # Belt-and-braces: if the decoder is dropped without explicit
-        # ``reset()`` (cancelled request, exception unwinding past the
-        # streaming bridge), the GDN patch lock would otherwise leak.
-        # Mirrors DFlashDecoder's finalizer.
-        try:
-            self.reset()
-        except Exception:
-            pass
-
-    def stats_summary(self) -> dict[str, Any]:
-        steps = self._stats_steps
-        proposed = self._stats_proposed
-        accepted_draft = self._stats_accepted_draft
-        return {
-            "steps": steps,
-            "proposed": proposed,
-            "accepted_draft": accepted_draft,
-            "acceptance_rate": accepted_draft / proposed if proposed else 0.0,
-            "avg_tokens_per_step": (accepted_draft + steps) / steps if steps else 0.0,
-            "block_size": self._block_size,
-        }
+    def _stats_extra(self) -> dict[str, Any]:
+        return {"block_size": self._block_size}
 
     # ----- prefill ---------------------------------------------------------
 
-    def prefill(
-        self, prompt: mx.array, cancel_event: threading.Event | None = None
+    def _prefill_impl(
+        self,
+        prompt: mx.array,
+        *,
+        segmented: Any = None,
+        cancel_event: threading.Event | None = None,
     ) -> int:
         """Run the target on the prompt; return the first sampled token.
 
@@ -250,19 +189,16 @@ class EagleDecoder:
         decoder holds the target's last-layer hidden at position
         ``seq_len - 1`` and the greedily-sampled first token.
 
-        ``cancel_event`` is accepted for ``SpeculativeDecoderProtocol``
-        conformance but not honored: EAGLE prefills the target in a single
-        forward (no sub-chunk loop to check between), and it is an
-        experimental strategy off the default path.
+        ``segmented`` and ``cancel_event`` are accepted for the canonical
+        ``SpecDecoderBase`` signature but not honored: EAGLE has no
+        snapshot store, prefills the target in a single forward (no
+        sub-chunk loop to check between), and is an experimental strategy
+        off the default path.
         """
-        self.reset()
-
         # Hook the chosen target layer so its output is captured into
         # ``_hidden_storage[0]`` on every target forward.
-        _patch_model(self._target, [self._target_layer_id], self._hidden_storage)
-        self._patched = True
-        self._draft.bind(self._target)
-        self._bound = True
+        self._install_layer_hooks([self._target_layer_id], self._hidden_storage)
+        self._bind_draft()
 
         # Build fresh caches for both models.
         self._target_cache = make_prompt_cache(self._target)
@@ -282,7 +218,6 @@ class EagleDecoder:
         )
         if not self._target_can_trim:
             if not _HAS_GDN:
-                self.reset()
                 raise RuntimeError(
                     "Target model has non-trim-able KV cache (likely "
                     "GatedDeltaNet linear-attention layers) but "
@@ -308,7 +243,6 @@ class EagleDecoder:
             # path and never reach this branch — this is a
             # forward-compatibility guard, not a current-bug fix.
             if _find_gdn_class(self._target) is None:
-                self.reset()
                 raise RuntimeError(
                     "Target reports a non-trim-able KV cache but no "
                     "``GatedDeltaNet`` submodule is present. EAGLE's "
@@ -319,89 +253,69 @@ class EagleDecoder:
                     "Disable EAGLE for this target or replace the "
                     "non-trim cache with a trim-able variant."
                 )
-        # Wrap the GDN capture install + the prompt forward in
-        # try/reset so any exception (lock contention or unexpected
-        # state inside ``_GDNStateCapture.__init__``; OOM / Metal
-        # stream / shape mismatch inside the forward) doesn't leave
-        # the model patched and (for GDN targets) the
-        # ``_GDN_PATCH_LOCK`` held. Without this, ``_patched=True``
-        # and the patch lock are retained until the next
-        # ``prefill()`` self-heals via ``reset()`` (called at its
-        # top) or until ``__del__`` fires — a window during which
-        # another in-flight request inspecting the target's layers
-        # sees the monkey-patched ``__call__`` and (for GDN targets)
-        # blocks on the lock. The capture install in particular is
-        # not covered by the "after the forward" wrapper because
-        # ``__init__`` acquires the lock — if that itself raises,
-        # the lock state has to be cleaned up here.
-        try:
-            if not self._target_can_trim:
-                # Install the patch — must happen *before* the prompt
-                # forward so the patched ``__call__`` records the prompt's
-                # GDN state, which subsequent rollbacks may need to replay
-                # against. ``_GDNStateCapture.__init__`` acquires
-                # ``_GDN_PATCH_LOCK``; ``reset()`` releases it via
-                # ``capture.close()``. ``for_model`` locates the GDN class,
-                # constructs the capture and a buffer pre-populated with
-                # the target's GDN modules in forward-pass order, then
-                # registers the buffer as active so subsequent forwards
-                # snapshot into it.
-                self._capture, self._capture_buffer = _GDNStateCapture.for_model(
-                    self._target
-                )
-                self._capture.use_buffer(self._capture_buffer)
+        # Any exception from here on (lock contention or unexpected state
+        # inside ``GDNStateCapture.__init__``; OOM / Metal stream / shape
+        # mismatch inside the forward) is handled by ``SpecDecoderBase.
+        # prefill``'s try/reset, so the model is never left patched and
+        # the ``_GDN_PATCH_LOCK`` never stays held.
+        if not self._target_can_trim:
+            # Install the patch — must happen *before* the prompt
+            # forward so the patched ``__call__`` records the prompt's
+            # GDN state, which subsequent rollbacks may need to replay
+            # against. ``GDNStateCapture.__init__`` acquires
+            # ``_GDN_PATCH_LOCK``; ``reset()`` releases it via
+            # ``capture.close()``. ``_install_gdn_capture`` locates the
+            # GDN class, constructs the capture and a buffer
+            # pre-populated with the target's GDN modules in
+            # forward-pass order; activating the buffer makes subsequent
+            # forwards snapshot into it.
+            self._install_gdn_capture()
+            self._capture.use_buffer(self._capture_buffer)
 
-            # Run the target on the prompt and capture its last-layer hidden.
-            # Two-pass: prefix fills the KV cache without materialising the
-            # full [batch, seq_len, vocab] logit; final single-token pass
-            # produces a [1, 1, vocab] logit and refreshes the capture slot.
-            if prompt.shape[1] > 1:
-                self._target(prompt[:, :-1], cache=self._target_cache)
-                # Force the pass-1 hidden (if captured) before dropping the
-                # slot reference, mirroring DFlash. Correctness does not
-                # require it today — _eval_cache transitively materialises
-                # the same graph — but the explicit eval makes the ordering
-                # robust to future narrowing of _eval_cache's scope.
-                _hidden_p1 = self._hidden_storage[0]
-                if _hidden_p1 is not None:
-                    mx.eval(_hidden_p1)
-                # Discard pass-1 capture so the pass-2 None-check below is
-                # an active guard rather than dead code.
-                self._hidden_storage[0] = None
-                _eval_cache(self._target_cache)
-                target_out = self._target(prompt[:, -1:], cache=self._target_cache)
-            else:
-                target_out = self._target(prompt, cache=self._target_cache)
-            target_logits = _logits(target_out)
-            captured = self._hidden_storage[0]
-            if captured is None:
-                raise RuntimeError(
-                    "EagleDecoder prefill: target forward did not populate "
-                    f"the hidden capture slot for layer "
-                    f"{self._target_layer_id}. Either ``_patch_model`` is "
-                    "incompatible with this target structure, or the chosen "
-                    "layer wasn't visited."
-                )
+        # Run the target on the prompt and capture its last-layer hidden.
+        # Two-pass: prefix fills the KV cache without materialising the
+        # full [batch, seq_len, vocab] logit; final single-token pass
+        # produces a [1, 1, vocab] logit and refreshes the capture slot.
+        if prompt.shape[1] > 1:
+            self._target(prompt[:, :-1], cache=self._target_cache)
+            # Force the pass-1 hidden (if captured) before dropping the
+            # slot reference, mirroring DFlash. Correctness does not
+            # require it today — _eval_cache transitively materialises
+            # the same graph — but the explicit eval makes the ordering
+            # robust to future narrowing of _eval_cache's scope.
+            _hidden_p1 = self._hidden_storage[0]
+            if _hidden_p1 is not None:
+                mx.eval(_hidden_p1)
+            # Discard pass-1 capture so the pass-2 None-check below is
+            # an active guard rather than dead code.
+            self._hidden_storage[0] = None
+            _eval_cache(self._target_cache)
+            target_out = self._target(prompt[:, -1:], cache=self._target_cache)
+        else:
+            target_out = self._target(prompt, cache=self._target_cache)
+        target_logits = _logits(target_out)
+        captured = self._hidden_storage[0]
+        if captured is None:
+            raise RuntimeError(
+                "EagleDecoder prefill: target forward did not populate "
+                f"the hidden capture slot for layer "
+                f"{self._target_layer_id}. Either ``_patch_model`` is "
+                "incompatible with this target structure, or the chosen "
+                "layer wasn't visited."
+            )
 
-            # Greedy sample at the prompt-tail position.
-            last_logits = target_logits[:, -1:, :]
-            seed_token = int(mx.argmax(last_logits, axis=-1).item())
-            # Hidden at the prompt-tail position becomes the conditioning
-            # for the first draft step.
-            self._seed_hidden = captured[:, -1:, :]
-        except Exception:
-            # Best-effort cleanup. ``reset()`` itself swallows nested
-            # exceptions from each step (unpatch, unbind, capture
-            # close) so the caller sees the original error, not the
-            # cleanup error.
-            self.reset()
-            raise
+        # Greedy sample at the prompt-tail position.
+        last_logits = target_logits[:, -1:, :]
+        seed_token = int(mx.argmax(last_logits, axis=-1).item())
+        # Hidden at the prompt-tail position becomes the conditioning
+        # for the first draft step.
+        self._seed_hidden = captured[:, -1:, :]
         self._seed_token = seed_token
         return seed_token
 
     # ----- step ------------------------------------------------------------
 
-    def step(self) -> tuple[list[int], int]:
+    def _step_impl(self) -> tuple[list[int], int]:
         """Generate ``block_size`` draft candidates, verify against the
         target, return ``(accepted_tokens, num_accepted_draft)``.
 
@@ -411,6 +325,14 @@ class EagleDecoder:
         accepted draft tokens followed by the target's preferred token
         at the first mismatch (or the target's bonus token if all
         drafts were accepted).
+
+        ``SpecDecoderBase.step`` wraps this in try/reset: a mid-step
+        exception in the draft loop (MLX Metal error during ``.item()``)
+        or the verify forward (OOM, shape mismatch) would otherwise
+        leave both KV caches partially modified and the GDN capture's
+        ``_gdn_inputs`` list with leftover entries from the failed
+        verify. The forced ``reset()`` makes the caller re-``prefill``
+        to recover — the right semantic for a hard inference failure.
         """
         if self._target_cache is None or self._draft_cache is None:
             raise RuntimeError(
@@ -420,29 +342,6 @@ class EagleDecoder:
         if self._seed_token is None or self._seed_hidden is None:
             raise RuntimeError("EagleDecoder.step(): seed state is unset")
 
-        # Mirror ``prefill``'s try/reset wrapper. A mid-step exception
-        # in the draft loop (MLX Metal error during ``.item()``) or
-        # the verify forward (OOM, shape mismatch) would otherwise
-        # leave both KV caches in a partially-modified state and the
-        # GDN capture's ``_gdn_inputs`` list with leftover entries
-        # from the failed verify — the next ``step()`` would either
-        # consume corrupt caches or trip the cardinality check
-        # inside ``rollback`` in a confusing way. ``reset()`` here
-        # forces the caller to re-``prefill`` to recover, which is
-        # the right semantic for a hard inference failure.
-        try:
-            return self._step_impl()
-        except Exception:
-            self.reset()
-            raise
-
-    def _step_impl(self) -> tuple[list[int], int]:
-        """Inner body of ``step()``. Wrapped by ``step()`` in a
-        try/reset so any exception forces a clean tear-down. Split
-        into a separate method for readability — the exception-safety
-        boundary stays at the single ``step()`` call site instead of
-        being inlined around every forward.
-        """
         # ---- Draft phase: produce block_size candidates autoregressively.
         #
         # Note: the ``.item()`` below forces an MLX eval each draft
@@ -516,7 +415,7 @@ class EagleDecoder:
         # logits, i.e. shape (n+1, vocab) where n = len(draft_tokens).
         # ``target_logits`` is (B=1, n+1, vocab); squeeze batch.
         flat_logits = target_logits[0]
-        accepted = verify_draft_greedy(draft_tokens, flat_logits)
+        accepted = self._verify_greedy(draft_tokens, flat_logits)
 
         # ---- Cache trimming + state rotation.
         # We accepted ``num_accepted = len(accepted)`` tokens. The

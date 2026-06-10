@@ -30,17 +30,16 @@ from olmlx.engine.gdn_rollback import (
     find_gdn_class,
 )
 from olmlx.engine.prompt_cache.checkpoint import snapshot_cache_for_persistence
+from olmlx.engine.spec_decoder_base import (
+    SpecDecoderBase,
+    # Canonical home moved to spec_decoder_base (#467); re-exported here
+    # for remaining importers (tests; the decoders verify via the base's
+    # ``_verify_greedy`` instead).
+    verify_draft_greedy as verify_draft_greedy,
+)
 from olmlx.utils import tracing as _tracing
 
 logger = logging.getLogger(__name__)
-
-
-def _spec_strategy(decoder: object) -> str:
-    """Tracing ``strategy`` attribute for a decoder, reusing the metrics
-    class→label map (classic/pld/dflash/eagle/self)."""
-    from olmlx.utils import metrics as _metrics
-
-    return _metrics._STRATEGY_BY_CLASS.get(type(decoder).__name__, "unknown")
 
 
 # Sub-chunk size for prefill forward passes. Matches mlx-lm's
@@ -439,42 +438,7 @@ def _drive_spec_prefill(
     return _target_last_logit(deepest, n)
 
 
-def verify_draft_greedy(
-    draft_tokens: list[int],
-    target_logits: mx.array,
-) -> list[int]:
-    """Verify draft tokens against target model logits (greedy).
-
-    Accept draft tokens that match the target's greedy argmax. On first
-    mismatch, return the target's preferred token instead.
-
-    Args:
-        draft_tokens: list of draft token IDs, length n.
-        target_logits: (n+1, vocab) target model logits.
-
-    Returns:
-        List of accepted token IDs (1 to n+1 tokens).
-    """
-    n = len(draft_tokens)
-
-    target_choices = mx.argmax(target_logits, axis=-1)
-    mx.eval(target_choices)
-
-    accepted: list[int] = []
-    for i in range(n):
-        target_token = int(target_choices[i].item())
-        if draft_tokens[i] == target_token:
-            accepted.append(draft_tokens[i])
-        else:
-            accepted.append(target_token)
-            return accepted
-
-    # All draft tokens accepted — add bonus token
-    accepted.append(int(target_choices[n].item()))
-    return accepted
-
-
-class SpeculativeDecoder:
+class SpeculativeDecoder(SpecDecoderBase):
     """Speculative decoding with a draft model.
 
     The draft model generates lambda candidate tokens autoregressively.
@@ -499,6 +463,7 @@ class SpeculativeDecoder:
         tree_max_nodes: int = 8,
         cache_slots: int = 0,
     ):
+        super().__init__()
         if trim_prompt_cache is None:
             raise RuntimeError(
                 "trim_prompt_cache is unavailable (mlx-lm import missing); "
@@ -595,35 +560,35 @@ class SpeculativeDecoder:
                 self._draft_gdn_buffer = None
                 raise
 
-        # Diagnostic counters (reset on prefill)
-        self._stats_steps: int = 0
-        self._stats_proposed: int = 0
-        self._stats_accepted_draft: int = 0
-
     def close(self) -> None:
         """Release the GDN class-level monkey-patch (idempotent).
 
-        Decoders should be ``close()``-d explicitly when no longer used;
-        the ``__del__`` finaliser is best-effort because the patched
-        ``__call__`` holds a strong reference to ``GDNStateCapture``
-        through its closure, breaking the GC cycle that would otherwise
-        run our finaliser.
-        """
-        if self._gdn_capture is not None:
-            self._gdn_capture.close()
-            self._gdn_capture = None
-            self._target_gdn_buffer = None
-            self._draft_gdn_buffer = None
-        # Drop persisted snapshots so a model unload frees their (multi-GB) KV
-        # immediately rather than waiting on refcount GC.
-        self._cache_store.clear()
+        Overrides the base ``close()`` (which is just ``reset()``)
+        because the classic decoder's GDN capture and snapshot store are
+        decoder-lifetime, not request-lifetime. Decoders should be
+        ``close()``-d explicitly when no longer used; the ``__del__``
+        finaliser is best-effort because the patched ``__call__`` holds
+        a strong reference to ``GDNStateCapture`` through its closure,
+        breaking the GC cycle that would otherwise run our finaliser.
 
-    def __del__(self) -> None:
+        The ``finally`` matters: ``ModelManager`` preserves the decoder
+        reference when ``close()`` raises, so a failing capture close
+        must not skip dropping the (multi-GB) snapshot store and working
+        KV caches that reference would otherwise pin.
+        """
         try:
-            self.close()
-        except Exception:
-            # Finalisers must never raise.
-            pass
+            if self._gdn_capture is not None:
+                self._gdn_capture.close()
+                self._gdn_capture = None
+                self._target_gdn_buffer = None
+                self._draft_gdn_buffer = None
+        finally:
+            # Drop persisted snapshots so a model unload frees their
+            # (multi-GB) KV immediately rather than waiting on refcount GC.
+            self._cache_store.clear()
+            # Release the last request's working KV caches eagerly too —
+            # the uniform base lifecycle (close ⊇ reset). Never raises.
+            self.reset()
 
     def _update_acceptance_rate(self, num_accepted: int) -> int:
         """Update the rolling acceptance rate via EMA and return accepted-draft count."""
@@ -639,38 +604,23 @@ class SpeculativeDecoder:
     # Cached API: prefill() + step()
     # ------------------------------------------------------------------
 
-    def reset(self) -> None:
+    def _reset_state(self) -> None:
         self._target_cache = None
         self._draft_cache = None
         self._cache_seq_len = 0
         self._last_target_logit = None
         self._pending_token = None
         self._last_reused_tokens = 0
-        self._stats_steps = 0
-        self._stats_proposed = 0
-        self._stats_accepted_draft = 0
         # NB: ``self._cache_store`` is *not* cleared here — it persists across
         # requests (that is the whole point of #421). Only ``close()`` drops it.
 
-    def stats_summary(self) -> dict[str, Any]:
-        steps = self._stats_steps
-        proposed = self._stats_proposed
-        accepted_draft = self._stats_accepted_draft
-        acceptance_rate = accepted_draft / proposed if proposed else 0.0
-        # Mean accepted length: accepted drafts plus one guaranteed target
-        # token per step, i.e. total new tokens emitted per verification pass.
-        avg_tokens_per_step = (accepted_draft + steps) / steps if steps else 0.0
+    def _stats_extra(self) -> dict[str, Any]:
         return {
-            "steps": steps,
-            "proposed": proposed,
-            "accepted_draft": accepted_draft,
-            "acceptance_rate": acceptance_rate,
-            "avg_tokens_per_step": avg_tokens_per_step,
             "ema_acceptance_rate": self._alpha,
             "lambda": self._lambda,
         }
 
-    def prefill(
+    def _prefill_impl(
         self,
         prompt: mx.array,
         *,
@@ -694,66 +644,59 @@ class SpeculativeDecoder:
         Returns:
             The first generated token (from target model's greedy argmax).
         """
-        with _tracing.span(
-            "spec.prefill",
-            strategy=_spec_strategy(self),
-            prompt_tokens=int(prompt.shape[-1]),
-        ):
-            self.reset()
-
-            if make_prompt_cache is None or trim_prompt_cache is None:
-                raise RuntimeError(
-                    "mlx_lm.models.cache not available; cannot use cached speculative decoding"
-                )
-
-            self._target_cache = make_prompt_cache(self._target)
-            self._draft_cache = make_prompt_cache(self._draft)
-
-            # Observed on mlx-vlm 0.4.4 with Qwen3_5: the language model caches
-            # `_position_ids` and `_rope_deltas` on the module instance across
-            # calls.  Left over from a prior request they produce broadcast
-            # mismatches when a new prompt has a different length.  Reset them
-            # at the start of each prefill.  If a future VLM caches analogous
-            # state under a different attribute name, add it here.
-            for attr in ("_position_ids", "_rope_deltas"):
-                if hasattr(self._target, attr):
-                    setattr(self._target, attr, None)
-
-            # Suppress GDN capture during prefill: no rollback is needed
-            # for the prompt forward, and recording it would just bloat the
-            # buffers (which are sized for one step's worth of captures).
-            if self._gdn_capture is not None:
-                self._gdn_capture.use_buffer(None)
-
-            # #421 reuse path: only when the store is enabled, the caller
-            # supplied message boundaries, and the cache is not a fragile
-            # pure-sliding-window layout (whose windowed attention an interior
-            # prefill split corrupts — those keep the legacy fresh prefill).
-            use_reuse = (
-                self._cache_store.enabled()
-                and segmented is not None
-                and not _is_pure_rotating_cache(self._target_cache)
+        if make_prompt_cache is None or trim_prompt_cache is None:
+            raise RuntimeError(
+                "mlx_lm.models.cache not available; cannot use cached speculative decoding"
             )
 
-            if use_reuse:
-                first_token = self._prefill_with_reuse(
-                    prompt, segmented, cancel_event=cancel_event
-                )
-            else:
-                self._last_target_logit = _prefill_last_logit(
-                    self._target, prompt, self._target_cache, cancel_event=cancel_event
-                )
-                mx.eval(self._last_target_logit)
-                # Populate draft cache; logits not needed. Sub-chunked like the
-                # target prefill above so a long prompt doesn't OOM Metal.
-                _chunked_prefill(
-                    self._draft, prompt, self._draft_cache, cancel_event=cancel_event
-                )
-                self._cache_seq_len = prompt.shape[1]
-                first_token = int(mx.argmax(self._last_target_logit).item())
+        self._target_cache = make_prompt_cache(self._target)
+        self._draft_cache = make_prompt_cache(self._draft)
 
-            self._pending_token = first_token
-            return first_token
+        # Observed on mlx-vlm 0.4.4 with Qwen3_5: the language model caches
+        # `_position_ids` and `_rope_deltas` on the module instance across
+        # calls.  Left over from a prior request they produce broadcast
+        # mismatches when a new prompt has a different length.  Reset them
+        # at the start of each prefill.  If a future VLM caches analogous
+        # state under a different attribute name, add it here.
+        for attr in ("_position_ids", "_rope_deltas"):
+            if hasattr(self._target, attr):
+                setattr(self._target, attr, None)
+
+        # Suppress GDN capture during prefill: no rollback is needed
+        # for the prompt forward, and recording it would just bloat the
+        # buffers (which are sized for one step's worth of captures).
+        if self._gdn_capture is not None:
+            self._gdn_capture.use_buffer(None)
+
+        # #421 reuse path: only when the store is enabled, the caller
+        # supplied message boundaries, and the cache is not a fragile
+        # pure-sliding-window layout (whose windowed attention an interior
+        # prefill split corrupts — those keep the legacy fresh prefill).
+        use_reuse = (
+            self._cache_store.enabled()
+            and segmented is not None
+            and not _is_pure_rotating_cache(self._target_cache)
+        )
+
+        if use_reuse:
+            first_token = self._prefill_with_reuse(
+                prompt, segmented, cancel_event=cancel_event
+            )
+        else:
+            self._last_target_logit = _prefill_last_logit(
+                self._target, prompt, self._target_cache, cancel_event=cancel_event
+            )
+            mx.eval(self._last_target_logit)
+            # Populate draft cache; logits not needed. Sub-chunked like the
+            # target prefill above so a long prompt doesn't OOM Metal.
+            _chunked_prefill(
+                self._draft, prompt, self._draft_cache, cancel_event=cancel_event
+            )
+            self._cache_seq_len = prompt.shape[1]
+            first_token = int(mx.argmax(self._last_target_logit).item())
+
+        self._pending_token = first_token
+        return first_token
 
     def _prefill_with_reuse(
         self,
@@ -850,7 +793,7 @@ class SpeculativeDecoder:
         )
         self._cache_store.insert(tokens, (target_snap, draft_snap))
 
-    def step(self) -> tuple[list[int], int]:
+    def _step_impl(self) -> tuple[list[int], int]:
         """One speculative decoding step using persistent KV caches.
 
         Must call ``prefill()`` first to populate caches.
@@ -868,14 +811,9 @@ class SpeculativeDecoder:
 
         pending_token = self._pending_token
 
-        with _tracing.span("spec.step", strategy=_spec_strategy(self)) as _sp:
-            if self._use_tree:
-                result = self._step_tree(pending_token)
-            else:
-                result = self._step_linear(pending_token)
-            accepted, num_proposed = result
-            _sp.set_attributes({"proposed": num_proposed, "accepted": len(accepted)})
-            return result
+        if self._use_tree:
+            return self._step_tree(pending_token)
+        return self._step_linear(pending_token)
 
     def _step_linear(self, pending_token: int) -> tuple[list[int], int]:
         """Linear speculative decoding (the existing algorithm)."""
@@ -908,7 +846,7 @@ class SpeculativeDecoder:
         verification_logits = target_out[0]  # (lambda+1, vocab)
 
         # 3. Verify
-        with _tracing.span("spec.verify", strategy=_spec_strategy(self)):
+        with _tracing.span("spec.verify", strategy=self._strategy_label):
             accepted = self._verify(draft_tokens, verification_logits)
         num_accepted = len(accepted)
 
@@ -1335,7 +1273,7 @@ class SpeculativeDecoder:
         return accepted, self._lambda
 
 
-class PromptLookupDecoder:
+class PromptLookupDecoder(SpecDecoderBase):
     """Prompt-lookup decoding (PLD): zero-cost draft via n-gram lookup.
 
     Reference: https://github.com/apoorvumang/prompt-lookup-decoding
@@ -1366,6 +1304,7 @@ class PromptLookupDecoder:
         acceptance_rate_ema: float = 0.9,
         cache_slots: int = 0,
     ):
+        super().__init__()
         if trim_prompt_cache is None or make_prompt_cache is None:
             raise RuntimeError(
                 "mlx_lm.models.cache imports failed (trim_prompt_cache / "
@@ -1436,59 +1375,47 @@ class PromptLookupDecoder:
                 self._target_gdn_buffer = None
                 raise
 
-        # Diagnostic counters (reset on prefill)
-        self._stats_steps: int = 0
-        self._stats_proposed: int = 0
-        self._stats_accepted_draft: int = 0
-
     def close(self) -> None:
-        """Release the GDN class-level monkey-patch (idempotent)."""
-        if self._gdn_capture is not None:
-            self._gdn_capture.close()
-            self._gdn_capture = None
-            self._target_gdn_buffer = None
-        # Drop persisted snapshots so a model unload frees their KV promptly.
-        self._cache_store.clear()
+        """Release the GDN class-level monkey-patch (idempotent).
 
-    def __del__(self) -> None:
+        Overrides the base ``close()`` because PLD's GDN capture and
+        snapshot store are decoder-lifetime (created in ``__init__``),
+        not request-lifetime. The ``finally`` mirrors the classic
+        decoder: a failing capture close must not skip dropping the
+        snapshot store and working KV cache, since ``ModelManager``
+        preserves the decoder reference when ``close()`` raises.
+        """
         try:
-            self.close()
-        except Exception:
-            # Finalisers must never raise.
-            pass
+            if self._gdn_capture is not None:
+                self._gdn_capture.close()
+                self._gdn_capture = None
+                self._target_gdn_buffer = None
+        finally:
+            # Drop persisted snapshots so a model unload frees their KV
+            # promptly, and release the last request's working cache too
+            # (the uniform base lifecycle: close ⊇ reset). Never raises.
+            self._cache_store.clear()
+            self.reset()
 
-    def reset(self) -> None:
+    def _reset_state(self) -> None:
         self._target_cache = None
         self._cache_seq_len = 0
         self._pending_token = None
         self._tokens = []
         self._last_reused_tokens = 0
-        self._stats_steps = 0
-        self._stats_proposed = 0
-        self._stats_accepted_draft = 0
         # Reset EMA too; ``stats_summary`` is documented as "PLD's
         # acceptance rate before any step is honestly 0", and that
         # invariant must hold per-request, not just per-decoder.
         self._alpha = 0.0
         # NB: ``self._cache_store`` persists across requests — not cleared here.
 
-    def stats_summary(self) -> dict[str, Any]:
-        steps = self._stats_steps
-        proposed = self._stats_proposed
-        accepted_draft = self._stats_accepted_draft
-        acceptance_rate = accepted_draft / proposed if proposed else 0.0
-        avg_tokens_per_step = (accepted_draft + steps) / steps if steps else 0.0
+    def _stats_extra(self) -> dict[str, Any]:
         return {
-            "steps": steps,
-            "proposed": proposed,
-            "accepted_draft": accepted_draft,
-            "acceptance_rate": acceptance_rate,
-            "avg_tokens_per_step": avg_tokens_per_step,
             "ema_acceptance_rate": self._alpha,
             "lambda": self._lambda,
         }
 
-    def prefill(
+    def _prefill_impl(
         self,
         prompt: mx.array,
         *,
@@ -1511,8 +1438,6 @@ class PromptLookupDecoder:
         Returns:
             The first generated token (target's greedy argmax).
         """
-        self.reset()
-
         # ``__init__`` already enforces ``make_prompt_cache`` /
         # ``trim_prompt_cache`` non-None at construction, so any
         # ``PromptLookupDecoder`` that reaches this point has them.
@@ -1618,7 +1543,7 @@ class PromptLookupDecoder:
         )
         self._cache_store.insert(tokens, target_snap)
 
-    def step(self) -> tuple[list[int], int]:
+    def _step_impl(self) -> tuple[list[int], int]:
         """One PLD step using the persistent target KV cache.
 
         Must call ``prefill()`` first. Returns
@@ -1658,8 +1583,7 @@ class PromptLookupDecoder:
         verification_logits = target_out[0]  # (num_drafted+1, vocab)
 
         # 3. Greedy verification — identical to SpeculativeDecoder.
-        with _tracing.span("spec.verify", strategy=_spec_strategy(self)):
-            accepted = verify_draft_greedy(draft_tokens, verification_logits)
+        accepted = self._verify_greedy(draft_tokens, verification_logits)
         num_accepted = len(accepted)
 
         # 4. Trim target cache to keep only the accepted prefix.

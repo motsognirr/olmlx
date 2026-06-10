@@ -43,15 +43,21 @@ class TokenizerProtocol(Protocol):
 
 
 class SpeculativeDecoderProtocol(Protocol):
-    """Structural protocol for any speculative decoder (SpeculativeDecoder, DFlashDecoder).
+    """Structural protocol for any speculative decoder.
 
-    ``prefill`` always accepts ``cancel_event``; the classic + PLD decoders
-    additionally accept a keyword-only ``segmented`` for cross-request KV reuse
-    (#421), which ``speculative_stream_generate`` passes only when present.
+    ``prefill`` has the canonical ``SpecDecoderBase`` signature (#467):
+    keyword-only ``segmented`` (cross-request KV reuse, #421 — accepted
+    and ignored by strategies without a snapshot store) and keyword-only
+    ``cancel_event``. ``speculative_stream_generate`` passes both
+    unconditionally — no per-decoder signature special-casing.
     """
 
     def prefill(
-        self, prompt: mx.array, cancel_event: threading.Event | None = ...
+        self,
+        prompt: mx.array,
+        *,
+        segmented: Any = ...,
+        cancel_event: threading.Event | None = ...,
     ) -> int: ...
     def step(self) -> tuple[list[int], int]: ...
     def reset(self) -> None: ...
@@ -76,25 +82,20 @@ def speculative_stream_generate(
         eos_token_id: Stop generation when this token is produced.
         tokenizer: Tokenizer for incremental text decoding. If None, text is empty.
         segmented: Optional ``SegmentedPrompt`` for cross-request KV reuse
-            (#421). Passed through to ``decoder.prefill`` only when non-None, so
-            decoders that don't accept the kwarg (dflash/eagle/self) are
-            unaffected.
+            (#421). Always passed through to ``decoder.prefill`` — every
+            decoder accepts the canonical signature (#467); strategies
+            without a snapshot store ignore it.
     """
     from olmlx.engine.speculative import PrefillCancelled
 
     prompt_arr = mx.array([prompt_tokens])
     prompt_len = len(prompt_tokens)
 
-    # Only the classic + PLD decoders accept ``segmented``; pass it through
-    # solely when present so the experimental decoders keep their narrower
-    # ``prefill(prompt, cancel_event=...)`` signature.
-    prefill_kwargs: dict[str, Any] = {"cancel_event": cancel_event}
-    if segmented is not None:
-        prefill_kwargs["segmented"] = segmented
-
     t0 = time.perf_counter()
     try:
-        first_token = decoder.prefill(prompt_arr, **prefill_kwargs)
+        first_token = decoder.prefill(
+            prompt_arr, segmented=segmented, cancel_event=cancel_event
+        )
     except PrefillCancelled:
         # Client disconnected mid-prefill. Exit cleanly with no tokens so the
         # caller's drain_and_join() completes and the inference lock is released

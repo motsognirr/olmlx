@@ -167,7 +167,7 @@ class TestStreamPrefillCancellation:
         cancel = threading.Event()
 
         class _FakeDecoder:
-            def prefill(self, prompt, cancel_event=None):
+            def prefill(self, prompt, *, segmented=None, cancel_event=None):
                 # Simulate the cancel firing during prefill.
                 raise PrefillCancelled()
 
@@ -201,7 +201,7 @@ class TestStreamPrefillCancellation:
                 self.reset_calls = 0
                 self.cache = None
 
-            def prefill(self, prompt, cancel_event=None):
+            def prefill(self, prompt, *, segmented=None, cancel_event=None):
                 self.cache = ["partial-kv"]  # simulate populated caches
                 raise PrefillCancelled()
 

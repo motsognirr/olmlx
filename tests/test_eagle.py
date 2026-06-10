@@ -714,6 +714,7 @@ class TestEagleDecoderGDNPath:
             decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
 
     def test_prefill_installs_capture_when_cache_is_non_trimmable(self, monkeypatch):
+        from olmlx.engine import spec_decoder_base as base_mod
         from olmlx.engine.eagle import decoder as decoder_mod
 
         # Fake ``can_trim_prompt_cache`` to claim the cache is non-
@@ -748,7 +749,9 @@ class TestEagleDecoderGDNPath:
             def rollback_single(self, _buffer, _cache, accepted, trim):
                 captured_calls["rollback"].append((accepted, trim))
 
-        monkeypatch.setattr(decoder_mod, "_GDNStateCapture", _FakeCapture)
+        # The capture is installed via ``SpecDecoderBase._install_gdn_capture``,
+        # so the patch seam lives on the base module (#467).
+        monkeypatch.setattr(base_mod, "GDNStateCapture", _FakeCapture)
         # Force _HAS_GDN to True so the ``not _HAS_GDN`` early-error
         # path doesn't fire.
         monkeypatch.setattr(decoder_mod, "_HAS_GDN", True)
@@ -771,6 +774,7 @@ class TestEagleDecoderGDNPath:
         # ``buffer.clear()`` before the verify forward and
         # ``capture.rollback_single(...)`` instead of
         # ``trim_prompt_cache`` for the target cache.
+        from olmlx.engine import spec_decoder_base as base_mod
         from olmlx.engine.eagle import decoder as decoder_mod
 
         monkeypatch.setattr(decoder_mod, "can_trim_prompt_cache", lambda _: False)
@@ -787,9 +791,11 @@ class TestEagleDecoderGDNPath:
         # would promise coverage it doesn't deliver. We patch
         # ``verify_draft_greedy`` rather than tweaking the target's
         # weights because patching is explicit and the verify
-        # helper is the right surface for "what was accepted".
+        # helper is the right surface for "what was accepted". The
+        # decoder verifies via ``SpecDecoderBase._verify_greedy``, so the
+        # patch seam lives on the base module (#467).
         monkeypatch.setattr(
-            decoder_mod,
+            base_mod,
             "verify_draft_greedy",
             lambda drafts, _logits: [drafts[0], 99],  # accept 1 draft + 1 substitute
         )
@@ -814,7 +820,7 @@ class TestEagleDecoderGDNPath:
             def rollback_single(self, _buffer, _cache, accepted, trim):
                 captured_calls["rollback"].append((accepted, trim))
 
-        monkeypatch.setattr(decoder_mod, "_GDNStateCapture", _FakeCapture)
+        monkeypatch.setattr(base_mod, "GDNStateCapture", _FakeCapture)
 
         # ``trim_prompt_cache`` for target should NOT be called when
         # we're in the GDN regime. Patch it to detect.
