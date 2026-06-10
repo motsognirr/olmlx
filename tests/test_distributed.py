@@ -816,14 +816,17 @@ class TestShutdownOrdering:
 
     def test_manager_stop_before_coordinator_teardown(self):
         """Verify the shutdown order in lifespan is correct."""
-        # This is a code inspection test — we verify the pattern in app.py
+        # This is a code inspection test — we verify the pattern in app.py.
+        # The startup/shutdown body lives in _lifespan_inner; the public
+        # lifespan is a thin loop-affinity binding wrapper (#463).
         import inspect
-        from olmlx.app import lifespan
+        from olmlx.app import _lifespan_inner
 
-        source = inspect.getsource(lifespan)
+        source = inspect.getsource(_lifespan_inner)
         # manager.stop() must appear before coordinator.broadcast_shutdown()
         stop_pos = source.find("await manager.stop()")
         shutdown_pos = source.find("coordinator.broadcast_shutdown()")
+        assert stop_pos != -1 and shutdown_pos != -1
         assert stop_pos < shutdown_pos, (
             "manager.stop() must be called before coordinator.broadcast_shutdown()"
         )

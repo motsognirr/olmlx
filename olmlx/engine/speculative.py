@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -115,6 +117,29 @@ class _SpecCacheStore:
         # LRU order: index 0 is the least-recently-used entry (evicted first),
         # the last index is most-recently-used.
         self._entries: list[_SpecCacheEntry] = []
+        # Guard backing _serialized() — never blocked on, only try-acquired.
+        self._access_guard = threading.Lock()
+
+    @contextmanager
+    def _serialized(self) -> Iterator[None]:
+        """Enforce the no-concurrent-access contract explicitly (#463).
+
+        Unlike the loop-bound prompt-cache stores, this store legitimately
+        runs on the decode worker thread — its safety comes from the
+        inference lock serializing all access, not from loop affinity.  A
+        non-blocking acquire turns an overlapping access (a refactor that
+        races the decode thread against another caller) into an immediate
+        RuntimeError instead of silent LRU-list corruption.
+        """
+        if not self._access_guard.acquire(blocking=False):
+            raise RuntimeError(
+                "_SpecCacheStore accessed concurrently; accesses must be "
+                "serialized under the inference lock (issue #463)"
+            )
+        try:
+            yield
+        finally:
+            self._access_guard.release()
 
     @property
     def capacity(self) -> int:
@@ -124,7 +149,8 @@ class _SpecCacheStore:
         return self._capacity > 0
 
     def clear(self) -> None:
-        self._entries = []
+        with self._serialized():
+            self._entries = []
 
     def find(self, tokens: list[int]) -> tuple[_SpecCacheEntry, int] | None:
         """Return ``(entry, common_prefix_len)`` for the entry whose stored
@@ -137,35 +163,37 @@ class _SpecCacheStore:
         to fresh prefill). At the small default slot counts this near-miss
         promotion is immaterial; revisit if slots are raised substantially.
         """
-        if not self.enabled() or not self._entries or not tokens:
-            return None
-        best: _SpecCacheEntry | None = None
-        best_common = 0
-        for entry in self._entries:
-            common = _common_prefix_len(entry.tokens, tokens)
-            if common > best_common:
-                best_common = common
-                best = entry
-        if best is None or best_common == 0:
-            return None
-        self._entries.remove(best)
-        self._entries.append(best)
-        return best, best_common
+        with self._serialized():
+            if not self.enabled() or not self._entries or not tokens:
+                return None
+            best: _SpecCacheEntry | None = None
+            best_common = 0
+            for entry in self._entries:
+                common = _common_prefix_len(entry.tokens, tokens)
+                if common > best_common:
+                    best_common = common
+                    best = entry
+            if best is None or best_common == 0:
+                return None
+            self._entries.remove(best)
+            self._entries.append(best)
+            return best, best_common
 
     def insert(self, tokens: list[int], payload: Any) -> None:
         """Store ``payload`` under ``tokens`` as the most-recently-used entry,
         replacing any existing entry with identical tokens, and evict the
         least-recently-used entries past ``capacity``. No-op when disabled.
         """
-        if not self.enabled():
-            return
-        toks = list(tokens)
-        # Refresh: drop any prior entry for the same lineage so a re-prefill
-        # of the same prompt doesn't consume two slots.
-        self._entries = [e for e in self._entries if e.tokens != toks]
-        self._entries.append(_SpecCacheEntry(tokens=toks, payload=payload))
-        while len(self._entries) > self._capacity:
-            self._entries.pop(0)
+        with self._serialized():
+            if not self.enabled():
+                return
+            toks = list(tokens)
+            # Refresh: drop any prior entry for the same lineage so a re-prefill
+            # of the same prompt doesn't consume two slots.
+            self._entries = [e for e in self._entries if e.tokens != toks]
+            self._entries.append(_SpecCacheEntry(tokens=toks, payload=payload))
+            while len(self._entries) > self._capacity:
+                self._entries.pop(0)
 
 
 # Cache-layer class names used to classify a working cache for reuse.

@@ -23,6 +23,7 @@ from olmlx.engine.registry import (
     SpeculativeConfig,
 )
 from olmlx.utils import memory as memory_utils
+from olmlx.utils.loop_affinity import assert_loop_thread
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
 from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore  # noqa: F401
 
@@ -1629,6 +1630,9 @@ class ModelManager(SpeculativeLoaderMixin):
         client unable to distinguish "close failed, model is gone" from
         an unrelated 500 — and either way, the model is gone.
         """
+        # The active_refs check-then-pop below is atomic only because every
+        # acquire_ref()/unload() caller runs on the loop thread (#463).
+        assert_loop_thread("ModelManager.unload")
         normalized = self.registry.normalize_name(name)
         lm = self._loaded.get(normalized)
         if lm is None:
@@ -3094,6 +3098,8 @@ class ModelManager(SpeculativeLoaderMixin):
 
     async def _expire_stale(self):
         """Unload models whose keep-alive has expired (active_refs == 0)."""
+        # Same check-then-pop hazard as unload(): only safe on the loop (#463).
+        assert_loop_thread("ModelManager._expire_stale")
         now = time.time()
         # Pop expired entries under the lock, then close them after releasing
         # it. _close_loaded_model calls executor.shutdown(wait=True) which

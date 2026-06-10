@@ -34,6 +34,7 @@ from olmlx.routers import (
     status,
 )
 from olmlx.routers import metrics as metrics_router
+from olmlx.utils import loop_affinity
 from olmlx.utils import metrics as metrics_mod
 from olmlx.utils import tracing as tracing_mod
 
@@ -42,6 +43,21 @@ logger = logging.getLogger("olmlx")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Bind the event-loop thread so the lock-free mutators (registry RMW,
+    # unload's check-then-pop, prompt-cache stores) can enforce their
+    # loop-affinity contract (issue #463).  Unbound in the finally so a
+    # failed startup or repeated create_app() in tests leaves no stale
+    # binding behind.
+    loop_affinity.bind_loop_thread()
+    try:
+        async with _lifespan_inner(app):
+            yield
+    finally:
+        loop_affinity.unbind_loop_thread()
+
+
+@asynccontextmanager
+async def _lifespan_inner(app: FastAPI):
     # SIGUSR1 dumps Python stacks of all threads to stderr — use
     # `kill -USR1 <pid>` to diagnose hangs without needing sudo/py-spy.
     import faulthandler

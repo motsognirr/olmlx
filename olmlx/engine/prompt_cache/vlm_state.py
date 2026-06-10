@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from olmlx.utils.loop_affinity import assert_loop_thread
+
 
 class VlmPromptCacheStore:
     def __init__(self, capacity: int) -> None:
@@ -42,6 +44,9 @@ class VlmPromptCacheStore:
     def clear(self) -> None:
         """Drop retained states. Counters are cumulative and NOT reset here, so
         /api/ps reuse totals survive memory-pressure flushes."""
+        # _entries has no internal locking: mutators (including the LRU
+        # promotion in get) must run on the loop thread (#463).
+        assert_loop_thread("VlmPromptCacheStore.clear")
         self._entries.clear()
 
     def note_hit(self, reused_tokens: int) -> None:
@@ -61,6 +66,7 @@ class VlmPromptCacheStore:
     def get(self, cache_id: str) -> Any | None:
         """Return the PromptCacheState for ``cache_id`` and promote it to
         most-recently-used, or ``None`` on miss / when disabled."""
+        assert_loop_thread("VlmPromptCacheStore.get")
         if not self.enabled():
             return None
         state = self._entries.pop(cache_id, None)
@@ -72,6 +78,7 @@ class VlmPromptCacheStore:
     def insert(self, cache_id: str, state: Any) -> None:
         """Store ``state`` under ``cache_id`` as most-recently-used, evicting
         the least-recently-used entries past ``capacity``. No-op when disabled."""
+        assert_loop_thread("VlmPromptCacheStore.insert")
         if not self.enabled():
             return
         self._entries.pop(cache_id, None)  # refresh position if already present
