@@ -18,17 +18,17 @@ Two regimes, picked at prefill time based on
   draft caches at the end of each ``step()``.
 
 - **Non-trim-able caches** (``GatedDeltaNet`` linear-attention layers
-  in Qwen3.5/3.6 hybrids): we install DFlash's ``_GDNStateCapture``
-  to monkey-patch ``GatedDeltaNet.__call__`` and snapshot the
-  recurrent state per layer. After a partial-acceptance verify,
-  ``rollback`` replays ``gated_delta_update`` on the accepted prefix
-  to restore the correct state. The draft cache is always trim-able
-  (the draft is a small standard-attention transformer), so we trim
-  it directly.
+  in Qwen3.5/3.6 hybrids): we install ``gdn_rollback.GDNStateCapture``
+  (via ``SpecDecoderBase._install_gdn_capture``) to monkey-patch
+  ``GatedDeltaNet.__call__`` and snapshot the recurrent state per
+  layer. After a partial-acceptance verify, ``rollback`` replays
+  ``gated_delta_update`` on the accepted prefix to restore the correct
+  state. The draft cache is always trim-able (the draft is a small
+  standard-attention transformer), so we trim it directly.
 
-Layer hooking is shared with DFlash via ``_patch_model`` /
-``_get_layers`` / ``_LayerHook`` so we don't reimplement the universal
-target-layer-output capture pattern.
+Layer hooking comes from ``SpecDecoderBase`` (``_install_layer_hooks``
+over ``spec_decoder_base._LayerHook``) so we don't reimplement the
+universal target-layer-output capture pattern.
 """
 
 from __future__ import annotations

@@ -157,6 +157,14 @@ def verify_draft_greedy(
     return accepted
 
 
+def _strategy_label_for(cls: type) -> str:
+    """Tracing/metrics ``strategy`` label for a decoder class, reusing the
+    metrics class→label map (classic/pld/dflash/eagle/mtp/self)."""
+    from olmlx.utils import metrics as _metrics
+
+    return _metrics._STRATEGY_BY_CLASS.get(cls.__name__, "unknown")
+
+
 # ---------------------------------------------------------------------------
 # Base class
 # ---------------------------------------------------------------------------
@@ -201,6 +209,12 @@ class SpecDecoderBase(abc.ABC):
         self._stats_proposed: int = 0
         self._stats_accepted_draft: int = 0
 
+        # Tracing label, resolved once — span() evaluates its kwargs
+        # eagerly even with tracing disabled, and step()/_verify_greedy
+        # run per decode step, so a per-call lookup would re-execute
+        # import machinery on the hot path for a value that never changes.
+        self._strategy_label: str = _strategy_label_for(type(self))
+
     # ----- canonical protocol ----------------------------------------------
 
     def prefill(
@@ -228,7 +242,7 @@ class SpecDecoderBase(abc.ABC):
         """
         with _tracing.span(
             "spec.prefill",
-            strategy=self._strategy(),
+            strategy=self._strategy_label,
             prompt_tokens=int(prompt.shape[-1]),
         ):
             self.reset()
@@ -254,7 +268,7 @@ class SpecDecoderBase(abc.ABC):
         inference failure.
         """
         try:
-            with _tracing.span("spec.step", strategy=self._strategy()) as _sp:
+            with _tracing.span("spec.step", strategy=self._strategy_label) as _sp:
                 proposed_before = self._stats_proposed
                 accepted, num_draft = self._step_impl()
                 _sp.set_attributes(
@@ -269,28 +283,37 @@ class SpecDecoderBase(abc.ABC):
             raise
 
     def reset(self) -> None:
-        """Tear down request state; safe to call repeatedly.
+        """Tear down request state; safe to call repeatedly. Never raises
+        from the teardown steps themselves.
 
         Ordering is load-bearing: the GDN capture is closed **first**
-        because it holds ``_GDN_PATCH_LOCK`` — if a later step raises we
-        still want the lock released so subsequent decoder instances can
-        patch. Each step's flag/field is cleared in a ``finally`` so a
+        because it holds ``_GDN_PATCH_LOCK`` — releasing it must not
+        depend on the later steps. Each step is swallowed-and-logged so
+        one failing step can neither abort the rest of the teardown nor
+        replace the original inference error in ``step()``/``prefill()``'s
+        exception paths; each flag/field is cleared in a ``finally`` so a
         double-call never double-unpatches.
         """
         if self._capture is not None:
             try:
                 self._capture.close()
+            except Exception:
+                logger.warning("reset: GDN capture close failed", exc_info=True)
             finally:
                 self._capture = None
                 self._capture_buffer = None
         if self._patched:
             try:
                 _unpatch_model(self._target)
+            except Exception:
+                logger.warning("reset: layer-hook unpatch failed", exc_info=True)
             finally:
                 self._patched = False
         if self._bound:
             try:
                 self._draft.unbind()
+            except Exception:
+                logger.warning("reset: draft unbind failed", exc_info=True)
             finally:
                 self._bound = False
         self._stats_steps = 0
@@ -330,8 +353,8 @@ class SpecDecoderBase(abc.ABC):
         self,
         prompt: mx.array,
         *,
-        segmented: Any,
-        cancel_event: threading.Event | None,
+        segmented: Any = None,
+        cancel_event: threading.Event | None = None,
     ) -> int:
         """Strategy prefill. State is already ``reset()``; raise freely —
         the base wrapper guarantees teardown."""
@@ -349,9 +372,17 @@ class SpecDecoderBase(abc.ABC):
     # ----- shared helpers ----------------------------------------------------
 
     def _install_layer_hooks(self, layer_ids: list[int], storage: list[Any]) -> None:
-        """Install hidden-capture hooks on the target; ``reset()`` unpatches."""
-        _patch_model(self._target, layer_ids, storage)
+        """Install hidden-capture hooks on the target; ``reset()`` unpatches.
+
+        ``_patched`` is set **before** the install: ``_patch_model`` can
+        raise mid-loop with some layers already wrapped (e.g. a corrupt
+        config with one valid and one out-of-range layer id), and with the
+        flag unset ``reset()`` would skip the unpatch and leak ``_LayerHook``
+        proxies onto the shared target model. ``_unpatch_model`` scans all
+        layers and is idempotent, so flag-first is strictly safer.
+        """
         self._patched = True
+        _patch_model(self._target, layer_ids, storage)
 
     def _bind_draft(self) -> None:
         """Bind the draft to the target; ``reset()`` unbinds."""
@@ -373,15 +404,8 @@ class SpecDecoderBase(abc.ABC):
         self, draft_tokens: list[int], target_logits: mx.array
     ) -> list[int]:
         """:func:`verify_draft_greedy` under a ``spec.verify`` span."""
-        with _tracing.span("spec.verify", strategy=self._strategy()):
+        with _tracing.span("spec.verify", strategy=self._strategy_label):
             return verify_draft_greedy(draft_tokens, target_logits)
-
-    def _strategy(self) -> str:
-        """Tracing ``strategy`` attribute, reusing the metrics class→label
-        map (classic/pld/dflash/eagle/mtp/self)."""
-        from olmlx.utils import metrics as _metrics
-
-        return _metrics._STRATEGY_BY_CLASS.get(type(self).__name__, "unknown")
 
     # ----- stats --------------------------------------------------------------
 

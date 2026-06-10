@@ -33,7 +33,8 @@ from olmlx.engine.prompt_cache.checkpoint import snapshot_cache_for_persistence
 from olmlx.engine.spec_decoder_base import (
     SpecDecoderBase,
     # Canonical home moved to spec_decoder_base (#467); re-exported here
-    # because dflash/eagle/mtp/self and tests import it from this module.
+    # for remaining importers (tests; the decoders verify via the base's
+    # ``_verify_greedy`` instead).
     verify_draft_greedy as verify_draft_greedy,
 )
 from olmlx.utils import tracing as _tracing
@@ -559,11 +560,6 @@ class SpeculativeDecoder(SpecDecoderBase):
                 self._draft_gdn_buffer = None
                 raise
 
-        # Diagnostic counters (reset on prefill)
-        self._stats_steps: int = 0
-        self._stats_proposed: int = 0
-        self._stats_accepted_draft: int = 0
-
     def close(self) -> None:
         """Release the GDN class-level monkey-patch (idempotent).
 
@@ -574,15 +570,25 @@ class SpeculativeDecoder(SpecDecoderBase):
         finaliser is best-effort because the patched ``__call__`` holds
         a strong reference to ``GDNStateCapture`` through its closure,
         breaking the GC cycle that would otherwise run our finaliser.
+
+        The ``finally`` matters: ``ModelManager`` preserves the decoder
+        reference when ``close()`` raises, so a failing capture close
+        must not skip dropping the (multi-GB) snapshot store and working
+        KV caches that reference would otherwise pin.
         """
-        if self._gdn_capture is not None:
-            self._gdn_capture.close()
-            self._gdn_capture = None
-            self._target_gdn_buffer = None
-            self._draft_gdn_buffer = None
-        # Drop persisted snapshots so a model unload frees their (multi-GB) KV
-        # immediately rather than waiting on refcount GC.
-        self._cache_store.clear()
+        try:
+            if self._gdn_capture is not None:
+                self._gdn_capture.close()
+                self._gdn_capture = None
+                self._target_gdn_buffer = None
+                self._draft_gdn_buffer = None
+        finally:
+            # Drop persisted snapshots so a model unload frees their
+            # (multi-GB) KV immediately rather than waiting on refcount GC.
+            self._cache_store.clear()
+            # Release the last request's working KV caches eagerly too —
+            # the uniform base lifecycle (close ⊇ reset). Never raises.
+            self.reset()
 
     def _update_acceptance_rate(self, num_accepted: int) -> int:
         """Update the rolling acceptance rate via EMA and return accepted-draft count."""
@@ -840,7 +846,7 @@ class SpeculativeDecoder(SpecDecoderBase):
         verification_logits = target_out[0]  # (lambda+1, vocab)
 
         # 3. Verify
-        with _tracing.span("spec.verify", strategy=self._strategy()):
+        with _tracing.span("spec.verify", strategy=self._strategy_label):
             accepted = self._verify(draft_tokens, verification_logits)
         num_accepted = len(accepted)
 
@@ -1369,24 +1375,27 @@ class PromptLookupDecoder(SpecDecoderBase):
                 self._target_gdn_buffer = None
                 raise
 
-        # Diagnostic counters (reset on prefill)
-        self._stats_steps: int = 0
-        self._stats_proposed: int = 0
-        self._stats_accepted_draft: int = 0
-
     def close(self) -> None:
         """Release the GDN class-level monkey-patch (idempotent).
 
         Overrides the base ``close()`` because PLD's GDN capture and
         snapshot store are decoder-lifetime (created in ``__init__``),
-        not request-lifetime.
+        not request-lifetime. The ``finally`` mirrors the classic
+        decoder: a failing capture close must not skip dropping the
+        snapshot store and working KV cache, since ``ModelManager``
+        preserves the decoder reference when ``close()`` raises.
         """
-        if self._gdn_capture is not None:
-            self._gdn_capture.close()
-            self._gdn_capture = None
-            self._target_gdn_buffer = None
-        # Drop persisted snapshots so a model unload frees their KV promptly.
-        self._cache_store.clear()
+        try:
+            if self._gdn_capture is not None:
+                self._gdn_capture.close()
+                self._gdn_capture = None
+                self._target_gdn_buffer = None
+        finally:
+            # Drop persisted snapshots so a model unload frees their KV
+            # promptly, and release the last request's working cache too
+            # (the uniform base lifecycle: close ⊇ reset). Never raises.
+            self._cache_store.clear()
+            self.reset()
 
     def _reset_state(self) -> None:
         self._target_cache = None

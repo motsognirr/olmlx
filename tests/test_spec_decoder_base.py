@@ -141,6 +141,49 @@ class TestResetTeardownOrdering:
         assert dec._bound is False
         assert dec.reset_state_calls == 1
 
+    def test_reset_swallows_teardown_errors_and_completes(self, caplog):
+        """A raising teardown step must not abort the rest of reset() —
+        reset() never raises (close()/__del__ and the step()/prefill()
+        exception paths rely on it)."""
+        from olmlx.engine.spec_decoder_base import _LayerHook
+
+        class _RaisingCapture:
+            def close(self):
+                raise RuntimeError("capture close failed")
+
+        log: list[str] = []
+        dec = _DummyDecoder()
+        target = MockModel(8, 4)
+        dec._target = target
+        dec._draft = TestResetTeardownOrdering._FakeDraft(log)
+        dec._capture = _RaisingCapture()
+        dec._capture_buffer = object()
+        dec._install_layer_hooks([0], [None])
+        dec._bound = True
+
+        dec.reset()  # must not raise
+
+        assert dec._capture is None
+        assert not isinstance(target.layers[0], _LayerHook)
+        assert log == ["unbind"]
+        assert dec._patched is False
+        assert dec._bound is False
+        assert dec.reset_state_calls == 1
+
+    def test_step_original_error_survives_teardown_failure(self):
+        """The exception out of step() must be _step_impl's error, not a
+        secondary teardown error from the reset."""
+
+        class _RaisingCapture:
+            def close(self):
+                raise RuntimeError("teardown error")
+
+        dec = _DummyDecoder()
+        dec.fail_step = True
+        dec._capture = _RaisingCapture()
+        with pytest.raises(_Boom):
+            dec.step()
+
     def test_reset_clears_stats(self):
         dec = _DummyDecoder()
         dec.step()
@@ -163,6 +206,28 @@ class TestInstallHelpers:
         storage = [None]
         dec._install_layer_hooks([1], storage)
         assert dec._patched is True
+
+    def test_install_layer_hooks_flags_before_patching(self, monkeypatch):
+        """If _patch_model raises mid-loop with some layers already
+        wrapped, _patched must already be True so reset() unpatches the
+        partial wrap instead of leaking hooks onto the shared target."""
+        import olmlx.engine.spec_decoder_base as base_mod
+
+        dec = _DummyDecoder()
+        target = MockModel(8, 4)
+        dec._target = target
+        real_patch = base_mod._patch_model
+
+        def patch_then_raise(model, layer_ids, storage):
+            real_patch(model, layer_ids[:1], storage)  # wrap one layer
+            raise IndexError("corrupt layer id")
+
+        monkeypatch.setattr(base_mod, "_patch_model", patch_then_raise)
+        with pytest.raises(IndexError):
+            dec._install_layer_hooks([0, 99], [None, None])
+        assert dec._patched is True
+        dec.reset()
+        assert not isinstance(target.layers[0], base_mod._LayerHook)
 
     def test_bind_draft_sets_bound(self):
         class _Draft:
@@ -221,6 +286,38 @@ class TestLifecycle:
 
         dec = _Bad()
         dec.__del__()  # must swallow
+
+
+class TestCloseReleasesState:
+    """close() must release the last request's KV state eagerly at model
+    unload for every decoder — classic/PLD additionally drop their
+    decoder-lifetime capture + snapshot store."""
+
+    def test_classic_close_releases_per_request_state(self):
+        from olmlx.engine.speculative import SpeculativeDecoder
+
+        dec = SpeculativeDecoder(
+            draft_model=MockModel(32, 16),
+            target_model=MockModel(32, 16),
+            num_speculative_tokens=2,
+        )
+        dec.prefill(mx.array([[1, 2, 3]]))
+        assert dec._target_cache is not None
+        dec.close()
+        assert dec._target_cache is None
+        assert dec._draft_cache is None
+
+    def test_pld_close_releases_per_request_state(self):
+        from olmlx.engine.speculative import PromptLookupDecoder
+
+        dec = PromptLookupDecoder(
+            target_model=MockModel(32, 16), num_speculative_tokens=2
+        )
+        dec.prefill(mx.array([[1, 2, 3]]))
+        assert dec._target_cache is not None
+        dec.close()
+        assert dec._target_cache is None
+        assert dec._pending_token is None
 
 
 class TestTracingSeams:

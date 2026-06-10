@@ -241,16 +241,12 @@ class SelfSpeculativeDecoder(SpecDecoderBase):
         self._alpha = 0.5
         self._alpha_ema = acceptance_rate_ema
 
-        # Per-request state (populated by prefill)
+        # Per-request state (populated by prefill). Stats counters live
+        # on ``SpecDecoderBase``.
         self._cache: list | None = None
         self._last_logit: mx.array | None = None
         self._pending_token: int | None = None
         self._prompt_len: int = 0
-
-        # Stats (reset on prefill)
-        self._stats_steps: int = 0
-        self._stats_proposed: int = 0
-        self._stats_accepted_draft: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
