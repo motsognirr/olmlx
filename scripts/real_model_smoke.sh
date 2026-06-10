@@ -13,7 +13,9 @@
 set -u
 
 FILES=("$@")
+DEFAULT_RUN=0
 if [ ${#FILES[@]} -eq 0 ]; then
+  DEFAULT_RUN=1
   FILES=(
     # Text model end-to-end (tiny: Qwen2.5-0.5B-4bit).
     tests/integration/test_real_model.py
@@ -24,6 +26,25 @@ if [ ${#FILES[@]} -eq 0 ]; then
     # Speculative: real MTP draft-head download + strict weight load.
     tests/test_mtp_loader.py
   )
+fi
+
+# Models the curated default subset's live tests skipif when absent from the
+# olmlx store (~/.olmlx/models). Without them present those files skip every
+# test, which the summary below (correctly) treats as a failed smoke run, not a
+# green one. Pre-pull them so the run exercises real coverage. Pull reuses the
+# HF blob cache, so this is cheap once the runner has downloaded them once
+# (test_real_model.py and test_mtp_loader.py self-provision and are omitted).
+# Only for the default subset — explicit file args manage their own models.
+DEFAULT_MODELS=(
+  "mlx-community/Qwen3-4B-4bit"
+  "mlx-community/gemma-4-26B-A4B-it-4bit"
+)
+if [ "$DEFAULT_RUN" -eq 1 ]; then
+  for m in "${DEFAULT_MODELS[@]}"; do
+    echo "::group::pull ${m}"
+    uv run olmlx models pull "$m" || echo "warning: pull failed for ${m} (its test will skip)"
+    echo "::endgroup::"
+  done
 fi
 
 overall=0
