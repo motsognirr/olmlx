@@ -15,6 +15,18 @@ def _make_state(token_id: int = 1) -> CachedPromptState:
     return CachedPromptState(tokens=[token_id], cache=[f"cache_{token_id}"])
 
 
+def _sized_state(token_id: int, nbytes: int) -> CachedPromptState:
+    """Create a CachedPromptState whose estimated size is ``nbytes``."""
+    from unittest.mock import MagicMock
+
+    layer = MagicMock()
+    layer.keys = MagicMock()
+    layer.keys.nbytes = nbytes
+    layer.values = MagicMock()
+    layer.values.nbytes = 0
+    return CachedPromptState(tokens=[token_id], cache=[layer])
+
+
 class TestPromptCacheStoreDiskEviction:
     """Test that evicted caches are saved to disk instead of deleted."""
 
@@ -586,16 +598,6 @@ class TestAsyncDiskCache:
     async def test_async_get_disk_restore_enforces_ram_budget(self, tmp_path):
         """Disk-restored entries must trigger _enforce_ram_budget on
         the async path (issue raised in PR #391 review)."""
-        from unittest.mock import MagicMock
-
-        def _sized_state(token_id: int, nbytes: int) -> CachedPromptState:
-            layer = MagicMock()
-            layer.keys = MagicMock()
-            layer.keys.nbytes = nbytes
-            layer.values = MagicMock()
-            layer.values.nbytes = 0
-            return CachedPromptState(tokens=[token_id], cache=[layer])
-
         store = PromptCacheStore(
             max_slots=10,
             disk_path=tmp_path,
@@ -634,18 +636,130 @@ class TestAsyncDiskCache:
         spilled_ids = [call.args[0] for call in mock_save.call_args_list]
         assert "a" in spilled_ids
 
+    @pytest.mark.asyncio
+    async def test_async_get_restored_entry_evicted_by_budget_not_respilled(
+        self, tmp_path
+    ):
+        """Issue #466: when _enforce_ram_budget evicts the just-restored
+        entry, async_get must not rewrite it to disk — its original file
+        is still intact (the unlink is guarded on residency), so the
+        re-save is a pure read-then-rewrite of multi-GB state. Other
+        budget evictees still spill normally."""
+        store = PromptCacheStore(
+            max_slots=10,
+            disk_path=tmp_path,
+            model_name="test-model",
+            ram_budget_bytes=2500,
+        )
+        # Seed two 1000-byte entries (under budget).
+        store.set("a", _sized_state(1, 1000))
+        store.set("b", _sized_state(2, 1000))
+
+        # "c" on disk is 3000 bytes — over the whole budget by itself, so
+        # enforcement evicts a, b, AND the just-restored c.
+        disk_file = store._disk_file_path("c")
+        disk_file.parent.mkdir(parents=True, exist_ok=True)
+        disk_file.write_bytes(b"placeholder")
+        # Age the file so we can assert the skip refreshes its mtime.
+        os.utime(disk_file, (1000, 1000))
+
+        loaded = _sized_state(3, 3000)
+        with (
+            patch.object(store, "_read_from_disk", return_value=(loaded, disk_file)),
+            patch.object(store, "_save_to_disk") as mock_save,
+        ):
+            result = await store.async_get("c")
+
+        # The caller still gets the loaded state for this request.
+        assert result is loaded
+        # Everything was budget-evicted, including the restored entry.
+        assert store.peek("a") is None
+        assert store.peek("b") is None
+        assert store.peek("c") is None
+        # The displaced residents spilled to disk, but the restored entry
+        # was NOT rewritten — its original file is the surviving copy.
+        spilled_ids = [call.args[0] for call in mock_save.call_args_list]
+        assert "a" in spilled_ids
+        assert "b" in spilled_ids
+        assert "c" not in spilled_ids
+        assert disk_file.exists()
+        # The surviving file was touched: _cleanup_disk evicts by oldest
+        # mtime, so a stale mtime would make the just-used entry the
+        # first one deleted under the disk cap (LRU inversion).
+        assert disk_file.stat().st_mtime > 1000
+
+    @pytest.mark.asyncio
+    async def test_async_get_budget_bounced_entry_resaved_if_file_gone(self, tmp_path):
+        """If a sibling evictee's save triggered _cleanup_disk and it
+        deleted the restored entry's original file (oldest mtime) before
+        the skip runs, the skip must fall back to a real save — otherwise
+        the entry is lost from both tiers."""
+        store = PromptCacheStore(
+            max_slots=10,
+            disk_path=tmp_path,
+            model_name="test-model",
+            ram_budget_bytes=2500,
+        )
+        store.set("a", _sized_state(1, 1000))
+
+        # _read_from_disk reports a path that no longer exists by the
+        # time the spill loop runs (as if disk-cap cleanup removed it).
+        disk_file = store._disk_file_path("c")
+        disk_file.parent.mkdir(parents=True, exist_ok=True)
+
+        loaded = _sized_state(3, 3000)
+        with (
+            patch.object(store, "_read_from_disk", return_value=(loaded, disk_file)),
+            patch.object(store, "_save_to_disk") as mock_save,
+        ):
+            result = await store.async_get("c")
+
+        assert result is loaded
+        # No surviving file to rely on — the entry must be re-saved.
+        spilled_ids = [call.args[0] for call in mock_save.call_args_list]
+        assert "c" in spilled_ids
+
+    @pytest.mark.asyncio
+    async def test_async_get_touch_failure_does_not_fail_request(
+        self, tmp_path, caplog
+    ):
+        """A non-missing-file OSError from os.utime (e.g. PermissionError)
+        must not propagate out of the worker thread and fail the in-flight
+        request — cache maintenance is best-effort, like _save_to_disk's
+        internal exception handling."""
+        import logging
+
+        store = PromptCacheStore(
+            max_slots=10,
+            disk_path=tmp_path,
+            model_name="test-model",
+            ram_budget_bytes=2500,
+        )
+        store.set("a", _sized_state(1, 1000))
+
+        disk_file = store._disk_file_path("c")
+        disk_file.parent.mkdir(parents=True, exist_ok=True)
+        disk_file.write_bytes(b"placeholder")
+
+        loaded = _sized_state(3, 3000)
+        with (
+            patch.object(store, "_read_from_disk", return_value=(loaded, disk_file)),
+            patch.object(store, "_save_to_disk"),
+            patch(
+                "olmlx.engine.prompt_cache.store.os.utime",
+                side_effect=PermissionError("read-only filesystem"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await store.async_get("c")
+
+        assert result is loaded
+        assert "read-only filesystem" in caplog.text
+
     def test_sync_get_disk_restore_enforces_ram_budget(self, tmp_path):
         """Disk-restored entries must trigger _enforce_ram_budget on
         the sync path too."""
         from unittest.mock import MagicMock
-
-        def _sized_state(token_id: int, nbytes: int) -> CachedPromptState:
-            layer = MagicMock()
-            layer.keys = MagicMock()
-            layer.keys.nbytes = nbytes
-            layer.values = MagicMock()
-            layer.values.nbytes = 0
-            return CachedPromptState(tokens=[token_id], cache=[layer])
 
         store = PromptCacheStore(
             max_slots=10,
