@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncGenerator
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, cast
 
 from olmlx.chat.builtin_tools import BuiltinToolManager
 from olmlx.chat.config import ChatConfig
@@ -631,21 +631,17 @@ class ChatSession:
 
         return tools
 
-    async def _execute_tool_calls(
+    def _classify_tool_calls(
         self, tool_uses: list[dict]
-    ) -> AsyncGenerator[ChatEvent, None]:
-        """Classify, confirm, and execute tool calls. Yields event dicts.
+    ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+        """Split tool calls into (allow, confirm, auto, deny) per safety policy.
 
-        Appends tool result messages to self.messages in original call order.
-        Tool errors are fed back to the model for recovery via tool_error
-        events and error messages appended to the conversation history.
+        Local tools (skills, builtins) bypass the safety policy by default
+        (local_tool_safety=False) because they run in-process and were
+        already trusted by the user when configured. Set
+        local_tool_safety=True to apply the safety policy to local tools
+        as well.
         """
-        # Classify tools by safety policy.
-        # Local tools (skills, builtins) bypass the safety policy
-        # by default (local_tool_safety=False) because they run
-        # in-process and were already trusted by the user when
-        # configured. Set local_tool_safety=True to apply the
-        # safety policy to local tools as well.
         local_tools = []
         remote_tools = []
         for tu in tool_uses:
@@ -664,6 +660,75 @@ class ChatSession:
             allow = local_tools + allow
         else:
             allow, confirm, auto, deny = local_tools + remote_tools, [], [], []
+        return allow, confirm, auto, deny
+
+    async def _confirm_tools(
+        self,
+        tools: list[dict],
+        *,
+        request_event: Literal["tool_confirmation_needed", "tool_auto_judging"],
+        context: list[dict] | None,
+        denial_reason: str,
+        denial_content: str,
+        approved: list[dict],
+        results_by_id: dict[str, dict],
+    ) -> AsyncGenerator[ChatEvent, None]:
+        """Run one confirmation phase (user confirm or LLM auto-judge).
+
+        Yields a `request_event` per tool, then `tool_approved` or
+        `tool_denied` based on `check_and_confirm`. Approved tools are
+        appended to `approved`; denials record a tool-result message in
+        `results_by_id` with `denial_content` (formatted with the tool
+        name).
+        """
+        for tu in tools:
+            # Both request-event TypedDicts share this shape; only the
+            # Literal tag differs, which request_event's type pins down.
+            yield cast(
+                "_ToolConfirmationNeededEvent | _ToolAutoJudgingEvent",
+                {
+                    "type": request_event,
+                    "name": tu["name"],
+                    "arguments": tu["input"],
+                    "id": tu["id"],
+                },
+            )
+            if await self.tool_safety.check_and_confirm(
+                tu["name"], tu["input"], context=context
+            ):
+                approved.append(tu)
+                yield {
+                    "type": "tool_approved",
+                    "name": tu["name"],
+                    "id": tu["id"],
+                }
+            else:
+                yield {
+                    "type": "tool_denied",
+                    "name": tu["name"],
+                    "arguments": tu["input"],
+                    "id": tu["id"],
+                    "reason": denial_reason,
+                }
+                results_by_id[tu["id"]] = {
+                    "message": {
+                        "role": "tool",
+                        "tool_call_id": tu["id"],
+                        "name": tu["name"],
+                        "content": denial_content.format(name=tu["name"]),
+                    },
+                }
+
+    async def _execute_tool_calls(
+        self, tool_uses: list[dict]
+    ) -> AsyncGenerator[ChatEvent, None]:
+        """Classify, confirm, and execute tool calls. Yields event dicts.
+
+        Appends tool result messages to self.messages in original call order.
+        Tool errors are fed back to the model for recovery via tool_error
+        events and error messages appended to the conversation history.
+        """
+        allow, confirm, auto, deny = self._classify_tool_calls(tool_uses)
 
         # Collect results by tool_call_id for call-order output.
         results_by_id: dict[str, dict] = {}
@@ -687,71 +752,29 @@ class ChatSession:
             }
 
         # Prompt for confirmation on confirm tools
-        approved = []
-        for tu in confirm:
-            yield {
-                "type": "tool_confirmation_needed",
-                "name": tu["name"],
-                "arguments": tu["input"],
-                "id": tu["id"],
-            }
-            if await self.tool_safety.check_and_confirm(tu["name"], tu["input"]):
-                approved.append(tu)
-                yield {
-                    "type": "tool_approved",
-                    "name": tu["name"],
-                    "id": tu["id"],
-                }
-            else:
-                yield {
-                    "type": "tool_denied",
-                    "name": tu["name"],
-                    "arguments": tu["input"],
-                    "id": tu["id"],
-                    "reason": "user",
-                }
-                results_by_id[tu["id"]] = {
-                    "message": {
-                        "role": "tool",
-                        "tool_call_id": tu["id"],
-                        "name": tu["name"],
-                        "content": f"Tool '{tu['name']}' was not approved",
-                    },
-                }
+        approved: list[dict] = []
+        async for event in self._confirm_tools(
+            confirm,
+            request_event="tool_confirmation_needed",
+            context=None,
+            denial_reason="user",
+            denial_content="Tool '{name}' was not approved",
+            approved=approved,
+            results_by_id=results_by_id,
+        ):
+            yield event
 
         # Auto-judge tools via LLM
-        for tu in auto:
-            yield {
-                "type": "tool_auto_judging",
-                "name": tu["name"],
-                "arguments": tu["input"],
-                "id": tu["id"],
-            }
-            if await self.tool_safety.check_and_confirm(
-                tu["name"], tu["input"], context=self.messages
-            ):
-                approved.append(tu)
-                yield {
-                    "type": "tool_approved",
-                    "name": tu["name"],
-                    "id": tu["id"],
-                }
-            else:
-                yield {
-                    "type": "tool_denied",
-                    "name": tu["name"],
-                    "arguments": tu["input"],
-                    "id": tu["id"],
-                    "reason": "auto",
-                }
-                results_by_id[tu["id"]] = {
-                    "message": {
-                        "role": "tool",
-                        "tool_call_id": tu["id"],
-                        "name": tu["name"],
-                        "content": f"Tool '{tu['name']}' was not approved by safety check",
-                    },
-                }
+        async for event in self._confirm_tools(
+            auto,
+            request_event="tool_auto_judging",
+            context=self.messages,
+            denial_reason="auto",
+            denial_content="Tool '{name}' was not approved by safety check",
+            approved=approved,
+            results_by_id=results_by_id,
+        ):
+            yield event
 
         # Execute allowed + approved tools
         to_execute = allow + approved

@@ -1636,6 +1636,170 @@ class TestExecuteToolCalls:
         assert session.messages[1]["tool_call_id"] == "tc_b"
 
 
+class TestClassifyToolCalls:
+    """Tests for ChatSession._classify_tool_calls."""
+
+    def _make_tool_use(self, name="read_file", id_="tc_1"):
+        return {"name": name, "input": {}, "id": id_}
+
+    def test_no_safety_policy_all_allowed(self):
+        session = _make_session()
+        tu = self._make_tool_use()
+        allow, confirm, auto, deny = session._classify_tool_calls([tu])
+        assert allow == [tu]
+        assert confirm == [] and auto == [] and deny == []
+
+    def test_policy_buckets(self):
+        config = ToolSafetyConfig(
+            tool_policies={
+                "reader": ToolPolicy.ALLOW,
+                "writer": ToolPolicy.CONFIRM,
+                "judged": ToolPolicy.AUTO,
+                "blocked": ToolPolicy.DENY,
+            }
+        )
+        policy = ToolSafetyPolicy(config)
+        session = _make_session(tool_safety=policy)
+        tus = [
+            self._make_tool_use(name=n, id_=f"tc_{n}")
+            for n in ("reader", "writer", "judged", "blocked")
+        ]
+        allow, confirm, auto, deny = session._classify_tool_calls(tus)
+        assert [t["name"] for t in allow] == ["reader"]
+        assert [t["name"] for t in confirm] == ["writer"]
+        assert [t["name"] for t in auto] == ["judged"]
+        assert [t["name"] for t in deny] == ["blocked"]
+
+    def test_local_builtin_bypasses_policy(self):
+        config = ToolSafetyConfig(tool_policies={"bash": ToolPolicy.DENY})
+        policy = ToolSafetyPolicy(config)
+        session = _make_session(tool_safety=policy)
+        session.builtin = MagicMock(tool_names={"bash"})
+        tu = self._make_tool_use(name="bash")
+        allow, confirm, auto, deny = session._classify_tool_calls([tu])
+        assert allow == [tu]
+        assert deny == []
+
+    def test_local_tool_safety_applies_policy_to_builtin(self):
+        config = ToolSafetyConfig(tool_policies={"bash": ToolPolicy.DENY})
+        policy = ToolSafetyPolicy(config)
+        session = _make_session(tool_safety=policy)
+        session.builtin = MagicMock(tool_names={"bash"})
+        session.config.local_tool_safety = True
+        tu = self._make_tool_use(name="bash")
+        allow, confirm, auto, deny = session._classify_tool_calls([tu])
+        assert allow == []
+        assert deny == [tu]
+
+    def test_use_skill_is_local_when_skills_configured(self):
+        config = ToolSafetyConfig(tool_policies={"use_skill": ToolPolicy.DENY})
+        policy = ToolSafetyPolicy(config)
+        session = _make_session(tool_safety=policy)
+        session.skills = MagicMock()
+        tu = self._make_tool_use(name="use_skill")
+        allow, confirm, auto, deny = session._classify_tool_calls([tu])
+        assert allow == [tu]
+        assert deny == []
+
+    def test_local_tools_precede_remote_allowed(self):
+        """Local tools are prepended to the policy-allowed bucket."""
+        config = ToolSafetyConfig(tool_policies={"read_file": ToolPolicy.ALLOW})
+        policy = ToolSafetyPolicy(config)
+        session = _make_session(tool_safety=policy)
+        session.builtin = MagicMock(tool_names={"bash"})
+        tu_remote = self._make_tool_use(name="read_file", id_="tc_r")
+        tu_local = self._make_tool_use(name="bash", id_="tc_l")
+        allow, _, _, _ = session._classify_tool_calls([tu_remote, tu_local])
+        assert [t["id"] for t in allow] == ["tc_l", "tc_r"]
+
+
+class TestConfirmTools:
+    """Tests for ChatSession._confirm_tools (parameterized confirm/auto-judge phase)."""
+
+    def _make_tool_use(self, name="write_file", id_="tc_1"):
+        return {"name": name, "input": {"path": "/tmp/x"}, "id": id_}
+
+    def _make_session_with_policy(self, *, confirm_result: bool):
+        policy = MagicMock()
+        policy.check_and_confirm = AsyncMock(return_value=confirm_result)
+        return _make_session(tool_safety=policy)
+
+    @pytest.mark.asyncio
+    async def test_approved_yields_events_and_collects(self):
+        session = self._make_session_with_policy(confirm_result=True)
+        tu = self._make_tool_use()
+        approved: list[dict] = []
+        results_by_id: dict[str, dict] = {}
+        events = [
+            e
+            async for e in session._confirm_tools(
+                [tu],
+                request_event="tool_confirmation_needed",
+                context=None,
+                denial_reason="user",
+                denial_content="Tool '{name}' was not approved",
+                approved=approved,
+                results_by_id=results_by_id,
+            )
+        ]
+        assert [e["type"] for e in events] == [
+            "tool_confirmation_needed",
+            "tool_approved",
+        ]
+        assert events[0]["name"] == "write_file"
+        assert events[0]["arguments"] == {"path": "/tmp/x"}
+        assert approved == [tu]
+        assert results_by_id == {}
+        session.tool_safety.check_and_confirm.assert_awaited_once_with(
+            "write_file", {"path": "/tmp/x"}, context=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_denied_records_result_message(self):
+        session = self._make_session_with_policy(confirm_result=False)
+        tu = self._make_tool_use()
+        approved: list[dict] = []
+        results_by_id: dict[str, dict] = {}
+        events = [
+            e
+            async for e in session._confirm_tools(
+                [tu],
+                request_event="tool_auto_judging",
+                context=session.messages,
+                denial_reason="auto",
+                denial_content="Tool '{name}' was not approved by safety check",
+                approved=approved,
+                results_by_id=results_by_id,
+            )
+        ]
+        assert [e["type"] for e in events] == ["tool_auto_judging", "tool_denied"]
+        assert events[1]["reason"] == "auto"
+        assert approved == []
+        msg = results_by_id["tc_1"]["message"]
+        assert msg["role"] == "tool"
+        assert msg["tool_call_id"] == "tc_1"
+        assert msg["content"] == "Tool 'write_file' was not approved by safety check"
+
+    @pytest.mark.asyncio
+    async def test_context_threaded_to_check(self):
+        session = self._make_session_with_policy(confirm_result=True)
+        tu = self._make_tool_use()
+        context = [{"role": "user", "content": "hi"}]
+        async for _ in session._confirm_tools(
+            [tu],
+            request_event="tool_auto_judging",
+            context=context,
+            denial_reason="auto",
+            denial_content="Tool '{name}' was not approved by safety check",
+            approved=[],
+            results_by_id={},
+        ):
+            pass
+        session.tool_safety.check_and_confirm.assert_awaited_once_with(
+            "write_file", {"path": "/tmp/x"}, context=context
+        )
+
+
 class TestConsecutiveToolFailures:
     """Tests for max_consecutive_tool_failures config option."""
 
