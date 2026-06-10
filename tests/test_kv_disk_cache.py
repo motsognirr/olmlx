@@ -719,6 +719,43 @@ class TestAsyncDiskCache:
         spilled_ids = [call.args[0] for call in mock_save.call_args_list]
         assert "c" in spilled_ids
 
+    @pytest.mark.asyncio
+    async def test_async_get_touch_failure_does_not_fail_request(
+        self, tmp_path, caplog
+    ):
+        """A non-missing-file OSError from os.utime (e.g. PermissionError)
+        must not propagate out of the worker thread and fail the in-flight
+        request — cache maintenance is best-effort, like _save_to_disk's
+        internal exception handling."""
+        import logging
+
+        store = PromptCacheStore(
+            max_slots=10,
+            disk_path=tmp_path,
+            model_name="test-model",
+            ram_budget_bytes=2500,
+        )
+        store.set("a", _sized_state(1, 1000))
+
+        disk_file = store._disk_file_path("c")
+        disk_file.parent.mkdir(parents=True, exist_ok=True)
+        disk_file.write_bytes(b"placeholder")
+
+        loaded = _sized_state(3, 3000)
+        with (
+            patch.object(store, "_read_from_disk", return_value=(loaded, disk_file)),
+            patch.object(store, "_save_to_disk"),
+            patch(
+                "olmlx.engine.prompt_cache.store.os.utime",
+                side_effect=PermissionError("read-only filesystem"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await store.async_get("c")
+
+        assert result is loaded
+        assert "read-only filesystem" in caplog.text
+
     def test_sync_get_disk_restore_enforces_ram_budget(self, tmp_path):
         """Disk-restored entries must trigger _enforce_ram_budget on
         the sync path too."""

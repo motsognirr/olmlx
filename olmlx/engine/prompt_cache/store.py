@@ -303,6 +303,14 @@ class PromptCacheStore:
             os.utime(file_path)
         except FileNotFoundError:
             self._save_to_disk(cache_id, state)
+        except OSError:
+            # Best-effort, like _save_to_disk's internal handling — a
+            # failed mtime refresh must not fail the in-flight request.
+            logger.warning(
+                "Failed to refresh disk cache mtime for '%s'",
+                cache_id,
+                exc_info=True,
+            )
 
     def _unlink_and_refresh(self, file_path: Path) -> None:
         """Unlink a disk cache file and refresh ``bytes_on_disk``.
