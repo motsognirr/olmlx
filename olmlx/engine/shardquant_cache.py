@@ -20,6 +20,7 @@ materializes in-place-write graphs before any cross-thread reuse (#284).
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,20 @@ logger = logging.getLogger(__name__)
 #: Default sink/window sizes from the Shard reference design.
 SINK_TOKENS = 4
 WINDOW_TOKENS = 64
+
+
+@dataclass
+class ShardFusedKV:
+    """Decode-step handle returned by a fused ShardKVCache (#377 Tier 2).
+
+    Deliberately not an ``mx.array``: any unpatched attention that feeds it
+    to ``mx.fast.scaled_dot_product_attention`` raises immediately instead
+    of silently attending over a partial history.
+    """
+
+    cache: "ShardKVCache"
+    k_exact: mx.array
+    v_exact: mx.array
 
 
 class ShardKVCache(_BaseCache):
