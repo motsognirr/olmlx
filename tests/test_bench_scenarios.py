@@ -53,6 +53,13 @@ class TestScenariosList:
         assert len(baseline) == 1
         assert baseline[0].env_overrides == {}
 
+    def test_dflash_scenario_present_with_correct_env(self):
+        names = {s.name: s for s in SCENARIOS}
+        assert "dflash" in names, "dflash scenario must be present"
+        dflash = names["dflash"]
+        assert dflash.env_overrides.get("OLMLX_SPECULATIVE") == "true"
+        assert dflash.env_overrides.get("OLMLX_SPECULATIVE_STRATEGY") == "dflash"
+
     def test_flash_prefetch_and_speculative_scenarios_present(self):
         names = {s.name for s in SCENARIOS}
         assert "flash+prefetch" in names

@@ -233,6 +233,15 @@ SCENARIOS: list[Scenario] = [
         should_skip=_requires_speculative_draft,
     ),
     Scenario(
+        name="dflash",
+        description="DFlash block-diffusion speculative decoding",
+        env_overrides={
+            "OLMLX_SPECULATIVE": "true",
+            "OLMLX_SPECULATIVE_STRATEGY": "dflash",
+        },
+        should_skip=_requires_speculative_draft,
+    ),
+    Scenario(
         name="self-speculative",
         description=(
             "Self-speculative decoding (LayerSkip — no external draft "
