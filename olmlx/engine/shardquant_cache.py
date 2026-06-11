@@ -150,25 +150,35 @@ class ShardKVCache(_BaseCache):
             and self._v_mid is not None
             and self._v_mid_norms is not None
         )
+        # Decompress the FULL capacity-aligned buffers, not [: mid_len]
+        # slices: the middle grows one token per decode step, and a
+        # per-step shape change would force a fresh mx.compile trace of
+        # the decompress kernels on every step.  Capacity changes only
+        # every `step` tokens, so traces are reused.  Padding slots have
+        # zero norms (or trimmed-stale values), produce garbage tokens
+        # that the final [:m] slice drops, and cost at most `step - 1`
+        # tokens of overcompute.
         m = self._mid_len
         k = shard_decompress_keys(
-            self._k_mid[..., :m, :],
-            self._k_mid_norms[..., :m, :],
+            self._k_mid,
+            self._k_mid_norms,
             self.k_basis,
             self.k_rank,
             self.k_codebook,
             self.k_bits,
             mean=self.k_mean,
+            dtype=dtype,
         )
         if self.rope_spec is not None:
             k = rope_transform(k, self.rope_spec, self._sink_len())
         v = shard_decompress_values(
-            self._v_mid[..., :m, :],
-            self._v_mid_norms[..., :m, :],
+            self._v_mid,
+            self._v_mid_norms,
             self.v_rotation,
             self.v_codebooks,
+            dtype=dtype,
         )
-        return k.astype(dtype), v.astype(dtype)
+        return k[..., :m, :], v[..., :m, :]
 
     # -- _BaseCache interface -----------------------------------------------
 

@@ -5,9 +5,11 @@ collected chunks each start at sample position 0, which is what makes the
 chunk-wise de-rope below exact) and spectral's covariance / eigh / d_eff /
 Lloyd-Max helpers. The shard-specific analysis is:
 
-- K: de-rope each chunk -> per-head covariance + eigendecomposition ->
-  per-layer rank = max participation ratio over heads -> one pooled
-  Lloyd-Max codebook over the kept rotated coefficients.
+- K: de-rope each chunk -> unit-normalize -> per-head mean-centering ->
+  per-head covariance + eigendecomposition -> per-layer rank = max over
+  heads of the smallest rank capturing ``k_energy`` of the eigenvalue
+  spectrum -> one Lloyd-Max codebook per head over its kept centered
+  coefficients.
 - V: pooled across heads -> normalize -> fixed orthonormal rotation
   (Hadamard / seeded QR) -> per-position k-means PQ codebooks (256 entries,
   group size 8 // bits).
