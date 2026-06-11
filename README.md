@@ -333,7 +333,7 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_SPECULATIVE_DRAFT_MODEL` | `None` | HuggingFace path of the draft model (also `--speculative-draft-model`) |
 | `OLMLX_SPECULATIVE_TOKENS` | `4` | Candidate tokens generated per verification step (also `--speculative-tokens`) |
 | `OLMLX_SPECULATIVE_CACHE_SLOTS` | `2` | Cross-request KV snapshots kept per model so each agent turn prefills only the new suffix (`classic`/`pld` only). `0` disables (fresh prefill every turn). Each slot is a full target (+draft) KV snapshot — keep small. |
-| `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), or `spectral:2` (also `--kv-cache-quant`) |
+| `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), `spectral:2`, or `shard:{2,4,8}` (asymmetric K/V + sink/window) (also `--kv-cache-quant`) |
 
 ### Flash inference settings
 
@@ -583,7 +583,17 @@ olmlx spectral prepare <model>
 OLMLX_KV_CACHE_QUANT=spectral:4
 ```
 
-Note: TurboQuant and SpectralQuant are incompatible with disk cache offload.
+**Shard** (issue #377, ref [krish1905/shard](https://github.com/krish1905/shard)) treats K and V asymmetrically: keys are de-RoPE'd into a per-head PCA basis with rank truncation, values get a Hadamard rotation + product vector quantization, and the first 4 (sink) + last 64 (window) tokens stay uncompressed. The compressed middle is dequantized on read, so this is a memory-capacity win (longer context in the same RAM), not a speed win. Requires one-time calibration:
+
+```bash
+# Calibrate the model (one-time)
+olmlx shard prepare <model>
+
+# Use shard quant (2, 4, or 8 bits)
+OLMLX_KV_CACHE_QUANT=shard:4
+```
+
+Note: TurboQuant, SpectralQuant, and Shard are incompatible with disk cache offload.
 
 ## Distributed Inference (Experimental)
 

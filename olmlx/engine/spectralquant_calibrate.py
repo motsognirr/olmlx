@@ -320,53 +320,19 @@ def load_calibration(calibration_dir: Path) -> CalibrationData:
 # ---------------------------------------------------------------------------
 
 
-def calibrate_model(
-    model_path: str,
-    output_dir: Path | None = None,
-    num_samples: int = _SPECTRAL_DEFAULT_NUM_SAMPLES,
-    calibration_dataset: str | None = None,
-    avg_bits: int = 4,
-    max_tokens_per_head: int = _SPECTRAL_DEFAULT_MAX_TOKENS_PER_HEAD,
-    progress_callback: Any | None = None,
-) -> Path:
-    """Run spectral calibration on a model.
+def _load_calibration_model(model_path: str):
+    """Load a model for calibration; returns model + architecture facts.
 
-    Loads the model, runs calibration text through it to collect K/V vectors
-    from attention layers, then performs eigenspectral analysis per head.
-
-    Args:
-        model_path: HF model path or local directory.
-        output_dir: Where to write calibration files. Defaults to model_dir/spectral.
-        num_samples: Number of calibration text samples.
-        calibration_dataset: "c4", "synthetic", or None (defaults to c4).
-        avg_bits: Target average bits per dimension.
-        max_tokens_per_head: Max tokens to collect per head for covariance.
-        progress_callback: Called with (description, fraction).
-
-    Returns:
-        Path to the spectral calibration directory.
+    Shared by the spectral and shard calibration pipelines.  Imports stay
+    inside the function (call-time) so tests can patch the helpers on their
+    home modules.
     """
-    import gc
-    import time
-
     from olmlx.engine.flash.prepare import (
         _get_backbone,
-        _get_c4_calibration_data,
-        _get_calibration_data,
-        _encode_tokens,
         load_model_with_strict_fallback,
     )
     from olmlx.engine.turboquant_cache import _detect_head_dim
 
-    if output_dir is None:
-        output_dir = Path(model_path) / "spectral"
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if progress_callback:
-        progress_callback("Loading model", 0.0)
-
-    # Load model
     try:
         model, tokenizer = load_model_with_strict_fallback(model_path, lazy=False)
     except ValueError:
@@ -378,32 +344,44 @@ def calibrate_model(
         )
 
     inner = _get_backbone(model)
-    layers = inner.layers
-    num_layers = len(layers)
+    num_layers = len(inner.layers)
     cfg_holder = _resolve_config_holder(inner, model)
     cfg_ns = _config_namespace(cfg_holder)
     head_dim = _detect_head_dim(cfg_holder, layers_hint=inner)
-    logger.debug("calibrate_model: resolved head_dim=%d", head_dim)
+    logger.debug("calibration: resolved head_dim=%d", head_dim)
 
-    # Determine number of KV heads
     n_kv_heads = getattr(cfg_ns, "num_key_value_heads", None)
     if n_kv_heads is None:
         n_kv_heads = getattr(cfg_ns, "num_attention_heads", 1)
 
-    if progress_callback:
-        progress_callback("Generating calibration data", 0.05)
+    return model, tokenizer, inner, head_dim, n_kv_heads, num_layers
 
-    # Generate calibration data
-    if calibration_dataset == "synthetic":
-        texts = _get_calibration_data(num_samples)
-    else:
-        texts = _get_c4_calibration_data(num_samples)
 
-    if progress_callback:
-        progress_callback("Collecting KV vectors", 0.1)
+def collect_kv_vectors(
+    model: Any,
+    tokenizer: Any,
+    inner: Any,
+    *,
+    num_layers: int,
+    n_kv_heads: int,
+    head_dim: int,
+    texts: list[str],
+    max_tokens_per_head: int,
+    progress_callback: Any | None = None,
+    progress_lo: float = 0.1,
+    progress_hi: float = 0.5,
+) -> dict[int, dict[int, dict[str, list[mx.array]]]]:
+    """Collect post-RoPE K/V vectors per (layer, head) from forward passes.
 
-    # Collect K/V vectors per (layer, head)
-    # kv_collectors[layer][head]["key"|"value"] = list of mx.array chunks
+    Returns kv_collectors[layer][head]["key"|"value"] = list of
+    (seq, head_dim) chunks.  Each chunk starts at position 0 of its sample
+    (relevant for de-roping in the shard pipeline).  Raises if nothing was
+    collected.
+    """
+    from mlx_lm.models.cache import make_prompt_cache
+
+    from olmlx.engine.flash.prepare import _encode_tokens
+
     kv_collectors: dict[int, dict[int, dict[str, list[mx.array]]]] = {}
     for i in range(num_layers):
         kv_collectors[i] = {}
@@ -421,8 +399,6 @@ def calibrate_model(
     # KV cache, then extracting the cached tensors.  This captures keys and
     # values *after* rotary positional embeddings — the actual distribution
     # that gets stored in the KV cache at inference time.
-    from mlx_lm.models.cache import make_prompt_cache
-
     cache_model = _resolve_cache_owner(inner, model)
     first_exc: Exception | None = None
     for sample_idx, text in enumerate(texts):
@@ -485,13 +461,87 @@ def calibrate_model(
 
         del prompt_cache
         if progress_callback:
-            frac = 0.1 + (sample_idx + 1) / len(texts) * 0.4
+            frac = progress_lo + (sample_idx + 1) / len(texts) * (
+                progress_hi - progress_lo
+            )
             progress_callback(f"Collected {sample_idx + 1}/{len(texts)} samples", frac)
 
     # Guard: if no KV vectors were collected, fail early with a clear message
-    total_collected = sum(tokens_collected.values())
-    if total_collected == 0:
+    if sum(tokens_collected.values()) == 0:
         raise _build_empty_collection_error(first_exc)
+
+    return kv_collectors
+
+
+def calibrate_model(
+    model_path: str,
+    output_dir: Path | None = None,
+    num_samples: int = _SPECTRAL_DEFAULT_NUM_SAMPLES,
+    calibration_dataset: str | None = None,
+    avg_bits: int = 4,
+    max_tokens_per_head: int = _SPECTRAL_DEFAULT_MAX_TOKENS_PER_HEAD,
+    progress_callback: Any | None = None,
+) -> Path:
+    """Run spectral calibration on a model.
+
+    Loads the model, runs calibration text through it to collect K/V vectors
+    from attention layers, then performs eigenspectral analysis per head.
+
+    Args:
+        model_path: HF model path or local directory.
+        output_dir: Where to write calibration files. Defaults to model_dir/spectral.
+        num_samples: Number of calibration text samples.
+        calibration_dataset: "c4", "synthetic", or None (defaults to c4).
+        avg_bits: Target average bits per dimension.
+        max_tokens_per_head: Max tokens to collect per head for covariance.
+        progress_callback: Called with (description, fraction).
+
+    Returns:
+        Path to the spectral calibration directory.
+    """
+    import gc
+    import time
+
+    if output_dir is None:
+        output_dir = Path(model_path) / "spectral"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if progress_callback:
+        progress_callback("Loading model", 0.0)
+
+    model, tokenizer, inner, head_dim, n_kv_heads, num_layers = _load_calibration_model(
+        model_path
+    )
+
+    if progress_callback:
+        progress_callback("Generating calibration data", 0.05)
+
+    from olmlx.engine.flash.prepare import (
+        _get_c4_calibration_data,
+        _get_calibration_data,
+    )
+
+    # Generate calibration data
+    if calibration_dataset == "synthetic":
+        texts = _get_calibration_data(num_samples)
+    else:
+        texts = _get_c4_calibration_data(num_samples)
+
+    if progress_callback:
+        progress_callback("Collecting KV vectors", 0.1)
+
+    kv_collectors = collect_kv_vectors(
+        model,
+        tokenizer,
+        inner,
+        num_layers=num_layers,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        texts=texts,
+        max_tokens_per_head=max_tokens_per_head,
+        progress_callback=progress_callback,
+    )
 
     if progress_callback:
         progress_callback("Running eigenspectral analysis", 0.5)

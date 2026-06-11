@@ -60,14 +60,21 @@ def validate_kv_cache_quant_format(v: str | None) -> str | None:
     """
     if v is None:
         return v
-    _VALID_METHODS = {"turboquant", "spectral"}
-    _VALID_BITS = {"2", "4"}
+    _VALID_BITS_BY_METHOD = {
+        "turboquant": {"2", "4"},
+        "spectral": {"2", "4"},
+        "shard": {"2", "4", "8"},
+    }
     parts = v.split(":", 1)
-    if len(parts) != 2 or parts[0] not in _VALID_METHODS or parts[1] not in _VALID_BITS:
+    if (
+        len(parts) != 2
+        or parts[0] not in _VALID_BITS_BY_METHOD
+        or parts[1] not in _VALID_BITS_BY_METHOD[parts[0]]
+    ):
         raise ValueError(
             f"Invalid kv_cache_quant={v!r}. "
-            f"Expected '<method>:<bits>' where method is one of {_VALID_METHODS} "
-            f"and bits is one of {_VALID_BITS}."
+            f"Expected '<method>:<bits>' where method:bits is one of "
+            f"turboquant:{{2,4}}, spectral:{{2,4}}, shard:{{2,4,8}}."
         )
     return v
 
@@ -168,16 +175,16 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
     anthropic_models: dict[str, str] = {}
 
-    # KV cache quantization (TurboQuant or SpectralQuant).
-    # Format: "<method>:<bits>" where method ∈ {turboquant, spectral} and
-    # bits ∈ {2, 4}. Per-model overrides live on ``ModelConfig`` in
-    # ``olmlx.engine.registry``.
+    # KV cache quantization (TurboQuant, SpectralQuant, or Shard).
+    # Format: "<method>:<bits>" where method ∈ {turboquant, spectral, shard};
+    # bits ∈ {2, 4} for turboquant/spectral, {2, 4, 8} for shard. Per-model
+    # overrides live on ``ModelConfig`` in ``olmlx.engine.registry``.
     kv_cache_quant: str | None = None
 
-    # Auto-run spectral calibration when spectral quant is configured but
-    # calibration data is missing. Uses the default calibration dataset
-    # (c4) and 64 samples. Set to ``true`` to avoid manual ``olmlx spectral
-    # prepare <model>`` on first load.
+    # Auto-run spectral/shard calibration when the configured KV quant
+    # needs calibration data that is missing. Uses the default calibration
+    # dataset (c4) and 64 samples. Set to ``true`` to avoid manual
+    # ``olmlx {spectral,shard} prepare <model>`` on first load.
     kv_cache_auto_calibrate: bool = False
 
     # Weight quantization (HQQ).
@@ -325,11 +332,11 @@ class Settings(BaseSettings):
     def validate_auto_calibrate(self) -> "Settings":
         if self.kv_cache_auto_calibrate and (
             self.kv_cache_quant is None
-            or not self.kv_cache_quant.startswith("spectral:")
+            or not self.kv_cache_quant.startswith(("spectral:", "shard:"))
         ):
             raise ValueError(
                 "OLMLX_KV_CACHE_AUTO_CALIBRATE=true requires "
-                "OLMLX_KV_CACHE_QUANT=spectral:<bits>"
+                "OLMLX_KV_CACHE_QUANT=spectral:<bits> or shard:<bits>"
             )
         return self
 

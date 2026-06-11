@@ -2583,6 +2583,42 @@ def cmd_spectral_prepare(args):
     print(f"  OLMLX_KV_CACHE_QUANT=spectral:{args.avg_bits} olmlx serve")
 
 
+def cmd_shard_prepare(args):
+    """Prepare a model for shard quant (per-head PCA-K + VQ-V calibration)."""
+    _configure_logging()
+
+    store = _create_store()
+    _resolved = store.registry.resolve(args.model)
+    hf_path = _resolved.hf_path if _resolved is not None else args.model
+    local_dir = store.ensure_downloaded(hf_path)
+    model_path = str(local_dir)
+
+    print(f"Running shard calibration for {args.model}...")
+    print(f"  Model path: {model_path}")
+    print(f"  Bits: {args.bits}")
+    dataset_label = args.calibration_dataset or "c4"
+    print(f"  Calibration dataset: {dataset_label}")
+    print(f"  Calibration samples: {args.samples}")
+    print(f"  Max tokens per head: {args.max_tokens}")
+    print()
+
+    from olmlx.engine.shardquant_calibrate import calibrate_model_shard
+
+    output_dir = calibrate_model_shard(
+        model_path=model_path,
+        num_samples=args.samples,
+        calibration_dataset=args.calibration_dataset,
+        bits=args.bits,
+        max_tokens_per_head=args.max_tokens,
+        progress_callback=_flash_progress,
+    )
+
+    print("\nShard calibration complete!")
+    print(f"  Output: {output_dir}")
+    print("\nTo use shard quant:")
+    print(f"  OLMLX_KV_CACHE_QUANT=shard:{args.bits} olmlx serve")
+
+
 def cmd_flash_prepare(args):
     """Prepare a model for flash inference (auto-detects MoE vs dense)."""
     _configure_logging()
@@ -3092,7 +3128,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="kv_cache_quant",
         type=str,
         default=None,
-        help="KV cache quantization method and bits (e.g. turboquant:4, spectral:2)",
+        help=(
+            "KV cache quantization method and bits "
+            "(e.g. turboquant:4, spectral:2, shard:4)"
+        ),
     )
     serve_p.add_argument(
         "--flash",
@@ -3666,6 +3705,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max tokens to collect per head (default: 8192)",
     )
 
+    # Shard quant calibration (#377)
+    shard = sub.add_parser("shard", help="Shard KV cache compression")
+    shard_sub = shard.add_subparsers(dest="shard_command")
+
+    shard_prepare_p = shard_sub.add_parser(
+        "prepare", help="Run shard calibration for a model"
+    )
+    shard_prepare_p.add_argument("model", help="Model name or HF path")
+    shard_prepare_p.add_argument(
+        "--samples",
+        type=int,
+        default=256,
+        help="Number of calibration samples (default: 256)",
+    )
+    shard_prepare_p.add_argument(
+        "--bits",
+        type=int,
+        default=4,
+        choices=[2, 4, 8],
+        help="Bits per dimension for K and V (default: 4)",
+    )
+    shard_prepare_p.add_argument(
+        "--calibration-dataset",
+        type=str,
+        default=None,
+        help="Calibration dataset: 'c4' (default) or 'synthetic'",
+    )
+    shard_prepare_p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=8192,
+        help="Max tokens to collect per head (default: 8192)",
+    )
+
     # Bench (benchmarking)
     bench = sub.add_parser("bench", help="Benchmarking and functional tests")
     bench_sub = bench.add_subparsers(dest="bench_command")
@@ -3783,6 +3856,7 @@ _COMMAND_HANDLERS: dict[tuple[str, str | None], str] = {
     ("dflash", "precompute"): "cmd_dflash_precompute",
     ("eagle", "prepare"): "cmd_eagle_prepare",
     ("spectral", "prepare"): "cmd_spectral_prepare",
+    ("shard", "prepare"): "cmd_shard_prepare",
     ("bench", "run"): "cmd_bench_run",
     ("bench", "compare"): "cmd_bench_compare",
     ("bench", "list"): "cmd_bench_list",
