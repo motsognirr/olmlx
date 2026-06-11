@@ -216,6 +216,38 @@ class TestProductVQ:
         assert np.isfinite(np.array(cbs)).all()
 
 
+class TestConfigValidation:
+    def test_shard_4_accepted(self):
+        from olmlx.config import validate_kv_cache_quant_format
+
+        assert validate_kv_cache_quant_format("shard:4") == "shard:4"
+
+    def test_shard_2_accepted(self):
+        from olmlx.config import validate_kv_cache_quant_format
+
+        assert validate_kv_cache_quant_format("shard:2") == "shard:2"
+
+    def test_shard_8_accepted(self):
+        from olmlx.config import validate_kv_cache_quant_format
+
+        assert validate_kv_cache_quant_format("shard:8") == "shard:8"
+
+    def test_shard_3_rejected(self):
+        from olmlx.config import validate_kv_cache_quant_format
+
+        with pytest.raises(ValueError):
+            validate_kv_cache_quant_format("shard:3")
+
+    def test_spectral_8_still_rejected(self):
+        """8-bit is shard-only; spectral/turboquant stay {2,4}."""
+        from olmlx.config import validate_kv_cache_quant_format
+
+        with pytest.raises(ValueError):
+            validate_kv_cache_quant_format("spectral:8")
+        with pytest.raises(ValueError):
+            validate_kv_cache_quant_format("turboquant:8")
+
+
 def _random_orthogonal(dim, seed):
     rng = np.random.RandomState(seed)
     q, _ = np.linalg.qr(rng.randn(dim, dim).astype(np.float32))
