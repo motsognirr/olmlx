@@ -99,3 +99,64 @@ class TestFusedSdpaDecodeRef:
         assert mx.allclose(got.astype(mx.float32), want, atol=2e-3), float(
             mx.abs(got.astype(mx.float32) - want).max()
         )
+
+
+class TestFusedCacheMode:
+    def _fused_cache(self, **kw):
+        cache = _make_cache(**kw)
+        cache.fused = True
+        return cache
+
+    def test_handle_returned_only_for_single_token_with_middle(self):
+        from olmlx.engine.shardquant_cache import ShardFusedKV
+
+        D, H = 64, 2
+        cache = self._fused_cache(D=D, H=H)
+        # Prefill (multi-token): arrays, never a handle.
+        k, v = _feed(cache, 30, D=D, H=H, step=10)[2]
+        assert isinstance(k, mx.array) and isinstance(v, mx.array)
+        # Decode with mid_len > 0: handle.
+        assert cache._mid_len > 0
+        k1 = mx.random.normal((1, H, 1, D)).astype(mx.float16)
+        out = cache.update_and_fetch(k1, k1)
+        assert isinstance(out[0], ShardFusedKV) and out[0] is out[1]
+        assert out[0].k_exact.shape[2] == cache._sink_len() + cache._win_len()
+
+    def test_no_handle_before_middle_exists(self):
+        D, H = 64, 2
+        cache = self._fused_cache(D=D, H=H, sink=4, window=16)
+        k1 = mx.random.normal((1, H, 1, D)).astype(mx.float16)
+        for _ in range(10):  # 10 tokens < sink + window: middle stays empty
+            k, v = cache.update_and_fetch(k1, k1)
+        assert isinstance(k, mx.array)
+
+    def test_handle_exact_equals_materialized_exact_regions(self):
+        D, H = 64, 2
+        cache = self._fused_cache(D=D, H=H)
+        _feed(cache, 30, D=D, H=H, step=10)
+        ref = copy.deepcopy(cache)
+        ref.fused = False
+        k1 = mx.random.normal((1, H, 1, D)).astype(mx.float16)
+        h, _ = cache.update_and_fetch(k1, k1)
+        k_full, _ = ref.update_and_fetch(k1, k1)
+        m = cache._mid_len
+        sink = cache._sink_len()
+        assert mx.allclose(h.k_exact[..., :sink, :], k_full[..., :sink, :])
+        assert mx.allclose(h.k_exact[..., sink:, :], k_full[..., sink + m :, :])
+
+    def test_trim_and_state_unaffected_by_fused_flag(self):
+        D, H = 64, 2
+        cache = self._fused_cache(D=D, H=H)
+        _feed(cache, 30, D=D, H=H, step=10)
+        n = cache.trim(5)
+        assert n == 5 and cache.offset == 25
+        assert all(isinstance(a, mx.array) for a in cache.state)
+
+    def test_make_shard_cache_fused_parameter(self):
+        import inspect
+
+        from olmlx.engine.shardquant_cache import make_shard_cache
+
+        sig = inspect.signature(make_shard_cache)
+        assert "fused" in sig.parameters
+        assert sig.parameters["fused"].default is False

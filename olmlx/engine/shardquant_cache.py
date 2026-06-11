@@ -88,6 +88,11 @@ class ShardKVCache(_BaseCache):
         self.v_codebooks = v_codebooks
         self.sink_size = sink_size
         self.window_size = window_size
+        # Tier-2 fused decode mode (#377): update_and_fetch returns a
+        # ShardFusedKV handle for single-token steps once a compressed
+        # middle exists; the patched sdpa computes attention from the
+        # packed form.  Off by default — make_shard_cache opts in.
+        self.fused = False
 
         # Exact regions (input dtype). Window buffers are small (<= window
         # + one prefill batch transiently); plain concat/slice is fine.
@@ -199,7 +204,7 @@ class ShardKVCache(_BaseCache):
 
     def update_and_fetch(
         self, keys: mx.array, values: mx.array
-    ) -> tuple[mx.array, mx.array]:
+    ) -> tuple[mx.array, mx.array] | tuple[ShardFusedKV, ShardFusedKV]:
         num_steps = keys.shape[2]
         dtype = keys.dtype
 
@@ -234,7 +239,31 @@ class ShardKVCache(_BaseCache):
 
         self.offset += num_steps
 
-        # 4. Assemble the full view (transient middle dequant).
+        # 4. Fused decode handoff (#377 Tier 2): single new token, B == 1,
+        # and a compressed middle to attend over.  The exact regions ride
+        # on the handle; the patched sdpa reads the middle from the cache.
+        if (
+            self.fused
+            and num_steps == 1
+            and keys.shape[0] == 1
+            and self._mid_len > 0
+        ):
+            assert self._k_sink is not None and self._k_win is not None
+            handle = ShardFusedKV(
+                cache=self,
+                k_exact=mx.concatenate([self._k_sink, self._k_win], axis=2),
+                v_exact=mx.concatenate([self._v_sink, self._v_win], axis=2),
+            )
+            return handle, handle
+
+        # 5. Assemble the full view (transient middle dequant).
+        return self.materialize(dtype)
+
+    def materialize(self, dtype: mx.Dtype) -> tuple[mx.array, mx.array]:
+        """Full [sink | middle | window] K/V with transient middle dequant.
+
+        The Tier-1 fetch path, also used as the fused-mode fallback when a
+        request isn't kernel-eligible (multi-token, sinks, masks)."""
         parts_k, parts_v = [], []
         if self._k_sink is not None:
             parts_k.append(self._k_sink)
@@ -327,7 +356,9 @@ class ShardKVCache(_BaseCache):
         return self.offset == 0
 
 
-def make_shard_cache(model: Any, calibration_dir: Path, bits: int) -> list:
+def make_shard_cache(
+    model: Any, calibration_dir: Path, bits: int, fused: bool = False
+) -> list:
     """Create a cache list with ShardKVCache for attention layers.
 
     Mirrors ``make_spectral_cache``: non-attention caches (ArraysCache for
@@ -388,24 +419,25 @@ def make_shard_cache(model: Any, calibration_dir: Path, bits: int) -> list:
                 freqs=entry["rope_freqs"],
                 traditional=entry["rope_traditional"],
             )
-        caches.append(
-            ShardKVCache(
-                rope_spec=rope_spec,
-                k_basis=entry["k_basis"],
-                k_rank=entry["k_rank"],
-                k_codebook=entry["k_codebook"],
-                k_bits=bits,
-                v_rotation=entry["v_rotation"],
-                v_codebooks=entry["v_codebooks"],
-                k_mean=entry.get("k_mean"),
-            )
+        cache = ShardKVCache(
+            rope_spec=rope_spec,
+            k_basis=entry["k_basis"],
+            k_rank=entry["k_rank"],
+            k_codebook=entry["k_codebook"],
+            k_bits=bits,
+            v_rotation=entry["v_rotation"],
+            v_codebooks=entry["v_codebooks"],
+            k_mean=entry.get("k_mean"),
         )
+        cache.fused = fused
+        caches.append(cache)
         quantized += 1
 
     logger.info(
-        "Created Shard KV cache: %d/%d layers quantized, %d-bit",
+        "Created Shard KV cache: %d/%d layers quantized, %d-bit%s",
         quantized,
         len(caches),
         bits,
+        ", fused decode" if fused else "",
     )
     return caches
