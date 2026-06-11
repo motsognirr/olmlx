@@ -1321,6 +1321,16 @@ def _make_spectral_prompt_cache(
     return make_spectral_cache(cache_model, calibration_dir, avg_bits=bits)
 
 
+def _make_shard_prompt_cache(
+    model: Any, bits: int, calibration_dir: Any, is_vlm: bool = False
+) -> list:
+    """Create a Shard-compressed prompt cache for the model (#377)."""
+    from olmlx.engine.shardquant_cache import make_shard_cache
+
+    cache_model = _get_model_for_cache(model, is_vlm)
+    return make_shard_cache(cache_model, calibration_dir, bits=bits)
+
+
 def _parse_kv_cache_quant(spec: str) -> tuple[str, int]:
     """Split an `OLMLX_KV_CACHE_QUANT` value like `"spectral:4"`
     into `(method, bits)`.  Format is validated at config load time."""
@@ -1337,6 +1347,10 @@ def _make_prompt_cache_for_lm(lm: LoadedModel) -> list:
         if method == "spectral":
             return _make_spectral_prompt_cache(
                 lm.model, bits, lm.spectral_calibration_dir, is_vlm=lm.is_vlm
+            )
+        if method == "shard":
+            return _make_shard_prompt_cache(
+                lm.model, bits, lm.shard_calibration_dir, is_vlm=lm.is_vlm
             )
         return _make_turboquant_prompt_cache(lm.model, bits, is_vlm=lm.is_vlm)
     cache_model = _get_model_for_cache(lm.model, lm.is_vlm)

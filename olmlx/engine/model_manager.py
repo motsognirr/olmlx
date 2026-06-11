@@ -240,11 +240,13 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
 
 def _is_serializable_cache(cache: list) -> bool:
     """Check if a cache list can be serialized with mlx-lm's save_prompt_cache."""
+    from olmlx.engine.shardquant_cache import ShardKVCache
     from olmlx.engine.spectralquant_cache import SpectralQuantKVCache
     from olmlx.engine.turboquant_cache import TurboQuantKVCache
 
     return not any(
-        isinstance(c, (TurboQuantKVCache, SpectralQuantKVCache)) for c in cache
+        isinstance(c, (TurboQuantKVCache, SpectralQuantKVCache, ShardKVCache))
+        for c in cache
     )
 
 
@@ -465,6 +467,14 @@ class SpectralCalibrationMissingError(Exception):
     """Raised when SpectralQuant is configured but calibration data is absent."""
 
 
+class ShardCalibrationMissingError(SpectralCalibrationMissingError):
+    """Shard quant configured but calibration artifacts missing/mismatched.
+
+    Subclasses SpectralCalibrationMissingError so the existing app.py
+    exception handler (HTTP 400) catches it via Starlette's MRO walk.
+    """
+
+
 class ActiveRequestsError(RuntimeError):
     """Raised by ``ModelManager.unload`` when a model has in-flight requests.
 
@@ -527,6 +537,7 @@ class LoadedModel:
     # Defaults to False until the probe populates it.
     uses_checkpoint_persistence: bool = False
     spectral_calibration_dir: Any = None  # Path | None, typed as Any to avoid import
+    shard_calibration_dir: Any = None  # Path | None, typed as Any to avoid import
     default_options: dict = field(default_factory=dict)
     inference_queue_timeout: float | None = None
     inference_timeout: float | None = None
@@ -1450,10 +1461,14 @@ class ModelManager(SpeculativeLoaderMixin):
                                     _dir_size, _local_dir
                                 )
 
-                    # _find_spectral_dir may trigger multi-minute calibration.
-                    # Run it in a thread so it does not block the event loop.
+                    # _find_spectral_dir / _find_shard_dir may trigger
+                    # multi-minute calibration.  Run them in a thread so they
+                    # do not block the event loop.
                     _spectral_dir = await asyncio.to_thread(
                         self._find_spectral_dir, hf_path, kv_cache_quant
+                    )
+                    _shard_dir = await asyncio.to_thread(
+                        self._find_shard_dir, hf_path, kv_cache_quant
                     )
                     lm = LoadedModel(
                         name=normalized,
@@ -1475,6 +1490,7 @@ class ModelManager(SpeculativeLoaderMixin):
                         kv_cache_quant=kv_cache_quant,
                         weight_quant=weight_quant_str,
                         spectral_calibration_dir=_spectral_dir,
+                        shard_calibration_dir=_shard_dir,
                         default_options=dict(model_config.options),
                         inference_queue_timeout=model_config.inference_queue_timeout,
                         inference_timeout=model_config.inference_timeout,
@@ -2425,6 +2441,118 @@ class ModelManager(SpeculativeLoaderMixin):
         raise SpectralCalibrationMissingError(
             f"Auto-calibration completed but spectral data not found at "
             f"{spectral_path}. Run 'olmlx spectral prepare {hf_path}' manually."
+        )
+
+    def _find_shard_dir(
+        self, hf_path: str, kv_cache_quant: str | None
+    ) -> Path | None:
+        """Return the shard calibration directory if shard quant is configured."""
+        if kv_cache_quant is None or not kv_cache_quant.startswith("shard:"):
+            return None
+        if self.store is None:
+            return None
+
+        # Parse and validate bit width before checking for calibration data.
+        # Defence-in-depth, mirroring _find_spectral_dir: config.py's
+        # validator gates all real entrypoints; this protects direct callers.
+        try:
+            configured_bits = int(kv_cache_quant.split(":", 1)[1])
+        except (ValueError, IndexError):
+            raise ValueError(
+                f"Invalid shard quant config {kv_cache_quant!r}; "
+                f"expected shard:2, shard:4 or shard:8"
+            )
+        if configured_bits not in (2, 4, 8):
+            raise ValueError(
+                f"Invalid shard bit width {kv_cache_quant!r}; expected 2, 4 or 8"
+            )
+
+        shard_path = self.store.local_path(hf_path) / "shard"
+        if shard_path.exists() and (shard_path / "shard_config.json").exists():
+            try:
+                config = json.loads((shard_path / "shard_config.json").read_text())
+            except (json.JSONDecodeError, OSError) as exc:
+                recalibrate_cmd = f"olmlx shard prepare {hf_path}"
+                if configured_bits != 4:
+                    recalibrate_cmd += f" --bits {configured_bits}"
+                raise ShardCalibrationMissingError(
+                    f"Shard quant configured ({kv_cache_quant}) but calibration "
+                    f"file at {shard_path}/shard_config.json is unreadable "
+                    f"({exc}). Re-run '{recalibrate_cmd}'."
+                )
+            cal_bits = config.get("meta", {}).get("bits")
+            if cal_bits is not None and cal_bits != configured_bits:
+                calibrate_cmd = (
+                    f"olmlx shard prepare {hf_path} --bits {configured_bits}"
+                )
+                raise ShardCalibrationMissingError(
+                    f"Shard quant configured ({kv_cache_quant}) but calibration "
+                    f"data at {shard_path} was generated with --bits {cal_bits}. "
+                    f"Run '{calibrate_cmd}' to re-calibrate at "
+                    f"{configured_bits}-bit, or set "
+                    f"OLMLX_KV_CACHE_QUANT=shard:{cal_bits} to use the "
+                    f"existing calibration."
+                )
+            return shard_path
+
+        # Auto-calibrate if enabled
+        if settings.kv_cache_auto_calibrate:
+            return self._auto_calibrate_shard(hf_path, kv_cache_quant)
+
+        calibrate_cmd = f"olmlx shard prepare {hf_path}"
+        if configured_bits != 4:  # 4 is calibrate_model_shard's default bits
+            calibrate_cmd += f" --bits {configured_bits}"
+        raise ShardCalibrationMissingError(
+            f"Shard quant configured ({kv_cache_quant}) but no calibration data "
+            f"found at {shard_path}. Run '{calibrate_cmd}' to calibrate. "
+            f"Calibration collects KV vectors from text samples (C4 by "
+            f"default), fits per-head no-RoPE PCA bases for keys and "
+            f"product-VQ codebooks for values. "
+            f"Use --samples N to change sample count, "
+            f"--calibration-dataset synthetic to override dataset. "
+            f"Or set OLMLX_KV_CACHE_AUTO_CALIBRATE=true to auto-calibrate."
+        )
+
+    def _auto_calibrate_shard(self, hf_path: str, kv_cache_quant: str) -> Path:
+        """Run shard calibration automatically with default settings."""
+        import logging
+
+        from olmlx.engine.shardquant_calibrate import calibrate_model_shard
+
+        method, bits_str = kv_cache_quant.split(":")
+        assert method == "shard", (
+            f"_auto_calibrate_shard called with non-shard quant: "
+            f"{kv_cache_quant!r}"
+        )
+        bits = int(bits_str)
+        local_dir = self.store.local_path(hf_path)
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "Auto-calibrating shard quant (%s-bit) for %s "
+            "(this may take several minutes)...",
+            bits,
+            hf_path,
+        )
+        try:
+            output_dir = calibrate_model_shard(
+                model_path=str(local_dir),
+                num_samples=64,
+                calibration_dataset="c4",
+                bits=bits,
+                max_tokens_per_head=2048,
+            )
+        except Exception as exc:
+            raise ShardCalibrationMissingError(
+                f"Auto-calibration failed for {hf_path}: {exc}. "
+                f"Run 'olmlx shard prepare {hf_path}' manually."
+            ) from exc
+        shard_path = Path(output_dir)
+        if shard_path.exists() and (shard_path / "shard_config.json").exists():
+            logger.info("Auto-calibration complete for %s", hf_path)
+            return shard_path
+        raise ShardCalibrationMissingError(
+            f"Auto-calibration completed but shard data not found at "
+            f"{shard_path}. Run 'olmlx shard prepare {hf_path}' manually."
         )
 
     def _is_flash_enabled(self, flash_config: ResolvedFlashConfig) -> bool:
