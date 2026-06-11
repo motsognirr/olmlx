@@ -176,7 +176,7 @@ class TestCycleTrainingBatches:
 
     def test_yields_padded_batches_with_pivot_lo(self):
         it = cycle_training_batches(
-            self._seqs(), batch_size=2, pad_token_id=0, min_len=10
+            self._seqs(), batch_size=2, pad_token_id=0, block_size=4
         )
         ids, pivot_lo = next(it)
         assert ids.shape[0] == 2
@@ -187,14 +187,29 @@ class TestCycleTrainingBatches:
 
     def test_filters_short_sequences(self):
         seqs = [(list(range(2, 8)), 2)] + self._seqs()
-        it = cycle_training_batches(seqs, batch_size=2, pad_token_id=0, min_len=10)
+        it = cycle_training_batches(seqs, batch_size=2, pad_token_id=0, block_size=4)
         for _ in range(6):
             ids, _ = next(it)
-            assert ids.shape[1] >= 10
+            assert ids.shape[1] >= 9  # 2*block_size + 1
+
+    def test_filters_long_prompt_short_response_sequences(self):
+        # 50 tokens total but a 48-token prompt: passes the global
+        # 2*block_size+1 length floor yet can never yield a window once
+        # pivot_lo applies (needs len >= plen + block_size + 1 = 53).
+        # Including it would drag the whole bucket's pivot_lo up and get
+        # the batch silently skipped by _select_pivots.
+        bad = (list(range(2, 52)), 48)
+        it = cycle_training_batches(
+            [bad] + self._seqs(), batch_size=2, pad_token_id=0, block_size=4
+        )
+        for _ in range(6):  # two epochs of the 3 remaining buckets
+            ids, pivot_lo = next(it)
+            assert pivot_lo <= 9  # the bad row's plen=48 never appears
+            assert int((ids[0] != 0).sum().item()) != 50
 
     def test_cycles_forever(self):
         it = cycle_training_batches(
-            self._seqs(), batch_size=2, pad_token_id=0, min_len=10
+            self._seqs(), batch_size=2, pad_token_id=0, block_size=4
         )
         got = [next(it) for _ in range(10)]  # > 3 batches/epoch
         assert len(got) == 10
@@ -203,7 +218,7 @@ class TestCycleTrainingBatches:
         # 5 usable sequences, batch_size 2 -> 3 buckets/epoch; the tail
         # bucket is topped up by replication instead of dropping seq 5.
         seqs = self._seqs()[:5]
-        it = cycle_training_batches(seqs, batch_size=2, pad_token_id=0, min_len=10)
+        it = cycle_training_batches(seqs, batch_size=2, pad_token_id=0, block_size=4)
         rows_seen: set[int] = set()
         for _ in range(3):  # one epoch
             ids, _ = next(it)
@@ -214,7 +229,7 @@ class TestCycleTrainingBatches:
 
     def test_single_sequence_fills_batch_by_replication(self):
         seqs = [(list(range(2, 42)), 5)]
-        it = cycle_training_batches(seqs, batch_size=4, pad_token_id=0, min_len=10)
+        it = cycle_training_batches(seqs, batch_size=4, pad_token_id=0, block_size=4)
         ids, pivot_lo = next(it)
         assert ids.shape == (4, 40)
         assert pivot_lo == 5

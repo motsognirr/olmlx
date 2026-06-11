@@ -607,6 +607,11 @@ def _select_pivots(
     This also preserves the monkey-patch behaviour the existing
     ``test_target_hidden_slice_excludes_pending_position`` test relies
     on.
+
+    ``min_pivot`` raises the lower bound of the pivot range exactly as
+    in ``_select_pivot`` (the self-generate path threads each batch's
+    ``pivot_lo`` here to keep windows out of the prompt region); ``0``
+    preserves the legacy range bit-exactly.
     """
     if num_windows <= 0:
         raise ValueError(f"num_windows must be >= 1, got {num_windows}")
@@ -1034,7 +1039,7 @@ def prepare_dflash_draft(
             sequences,
             batch_size,
             pad_token_id=sequences_pad,
-            min_len=2 * block_size + 1,
+            block_size=block_size,
         )
     elif use_precomputed is not None:
         from olmlx.engine.dflash.precompute import (

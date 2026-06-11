@@ -231,28 +231,46 @@ def cycle_training_batches(
     batch_size: int,
     *,
     pad_token_id: int,
-    min_len: int,
+    block_size: int,
     seed: int = 0,
 ) -> Iterator[tuple[mx.array, int]]:
     """Yield ``(input_ids, pivot_lo)`` batches forever, reshuffling each epoch.
 
-    Sequences shorter than ``min_len`` are dropped; the rest are sorted
-    by length and packed into fixed same-size buckets (padding waste
-    stays minimal and every row in a batch shares a similar pivot
-    range). A partial tail bucket is topped up by replicating its own
-    rows (same convention as ``stream_training_batches``) rather than
-    dropped — otherwise up to ``batch_size - 1`` generated sequences
-    would silently never be trained on. ``pivot_lo`` is the max prompt
-    length within the batch so the trainer can restrict windows to the
-    response region. The iterator is infinite — the training loop's
-    ``steps`` budget is the termination condition, which is how
-    multi-epoch training falls out naturally.
+    Two per-sequence filters apply before bucketing:
+
+    - the global floor ``len >= 2 * block_size + 1`` (the trainer's
+      minimum window size), and
+    - the prompt-aware floor ``len >= prompt_len + block_size + 1`` — a
+      long-prompt/short-response sequence can pass the global floor yet
+      never yield a valid window once the per-batch ``pivot_lo``
+      (response-region restriction) applies; worse, it drags the whole
+      bucket's ``pivot_lo`` up so ``_select_pivots`` silently skips the
+      batch for every row in it.
+
+    The survivors are sorted by length and packed into fixed same-size
+    buckets (padding waste stays minimal and every row in a batch shares
+    a similar pivot range). A partial tail bucket is topped up by
+    replicating its own rows (same convention as
+    ``stream_training_batches``) rather than dropped — otherwise up to
+    ``batch_size - 1`` generated sequences would silently never be
+    trained on. ``pivot_lo`` is the max prompt length within the batch
+    so the trainer can restrict windows to the response region. The
+    iterator is infinite — the training loop's ``steps`` budget is the
+    termination condition, which is how multi-epoch training falls out
+    naturally.
     """
-    usable = [(s, plen) for s, plen in sequences if len(s) >= min_len]
+    usable = [
+        (s, plen)
+        for s, plen in sequences
+        if len(s) >= 2 * block_size + 1 and len(s) >= plen + block_size + 1
+    ]
     if not usable:
         raise ValueError(
-            f"No self-generated sequences of at least {min_len} tokens; "
-            "increase --selfgen-max-new or check the prompt stream."
+            f"No self-generated sequences usable for block_size="
+            f"{block_size}: each needs at least 2*block_size + 1 = "
+            f"{2 * block_size + 1} tokens AND block_size + 1 = "
+            f"{block_size + 1} tokens past its prompt. Increase "
+            "--selfgen-max-new or check the prompt stream."
         )
     usable.sort(key=lambda sp: len(sp[0]))
     buckets: list[tuple[list[list[int]], int]] = []
