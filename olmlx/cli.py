@@ -2600,6 +2600,7 @@ def cmd_shard_prepare(args):
     print(f"  Calibration dataset: {dataset_label}")
     print(f"  Calibration samples: {args.samples}")
     print(f"  Max tokens per head: {args.max_tokens}")
+    print(f"  K rank energy: {args.k_energy}")
     print()
 
     from olmlx.engine.shardquant_calibrate import calibrate_model_shard
@@ -2611,6 +2612,7 @@ def cmd_shard_prepare(args):
         bits=args.bits,
         max_tokens_per_head=args.max_tokens,
         progress_callback=_flash_progress,
+        k_energy=args.k_energy,
     )
 
     print("\nShard calibration complete!")
@@ -3737,6 +3739,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8192,
         help="Max tokens to collect per head (default: 8192)",
+    )
+    shard_prepare_p.add_argument(
+        "--k-energy",
+        type=float,
+        default=0.999,
+        help=(
+            "Fraction of eigenvalue energy the kept K rank must capture "
+            "(default: 0.999). Lower trades K quality for bytes."
+        ),
     )
 
     # Bench (benchmarking)

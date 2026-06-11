@@ -59,12 +59,16 @@ class ShardKVCache(_BaseCache):
         v_codebooks: mx.array,
         sink_size: int = SINK_TOKENS,
         window_size: int = WINDOW_TOKENS,
+        k_mean: mx.array | None = None,
     ):
         self.rope_spec = rope_spec
         self.k_basis = k_basis
         self.k_rank = k_rank
         self.k_codebook = k_codebook
         self.k_bits = k_bits
+        # (H, D) per-head mean of unit-normalized calibration keys; None
+        # for Tier-1 (un-centered) calibration artifacts.
+        self.k_mean = k_mean
         self.v_rotation = v_rotation
         self.v_codebooks = v_codebooks
         self.sink_size = sink_size
@@ -129,7 +133,12 @@ class ShardKVCache(_BaseCache):
         if self.rope_spec is not None:
             k = rope_transform(k, self.rope_spec, start, inverse=True)
         k_packed, k_norms = shard_compress_keys(
-            k, self.k_basis, self.k_rank, self.k_codebook, self.k_bits
+            k,
+            self.k_basis,
+            self.k_rank,
+            self.k_codebook,
+            self.k_bits,
+            mean=self.k_mean,
         )
         v_idx, v_norms = shard_compress_values(v, self.v_rotation, self.v_codebooks)
         self._append_middle(k_packed, k_norms, v_idx, v_norms)
@@ -141,24 +150,35 @@ class ShardKVCache(_BaseCache):
             and self._v_mid is not None
             and self._v_mid_norms is not None
         )
+        # Decompress the FULL capacity-aligned buffers, not [: mid_len]
+        # slices: the middle grows one token per decode step, and a
+        # per-step shape change would force a fresh mx.compile trace of
+        # the decompress kernels on every step.  Capacity changes only
+        # every `step` tokens, so traces are reused.  Padding slots have
+        # zero norms (or trimmed-stale values), produce garbage tokens
+        # that the final [:m] slice drops, and cost at most `step - 1`
+        # tokens of overcompute.
         m = self._mid_len
         k = shard_decompress_keys(
-            self._k_mid[..., :m, :],
-            self._k_mid_norms[..., :m, :],
+            self._k_mid,
+            self._k_mid_norms,
             self.k_basis,
             self.k_rank,
             self.k_codebook,
             self.k_bits,
+            mean=self.k_mean,
+            dtype=dtype,
         )
         if self.rope_spec is not None:
             k = rope_transform(k, self.rope_spec, self._sink_len())
         v = shard_decompress_values(
-            self._v_mid[..., :m, :],
-            self._v_mid_norms[..., :m, :],
+            self._v_mid,
+            self._v_mid_norms,
             self.v_rotation,
             self.v_codebooks,
+            dtype=dtype,
         )
-        return k.astype(dtype), v.astype(dtype)
+        return k[..., :m, :], v[..., :m, :]
 
     # -- _BaseCache interface -----------------------------------------------
 
@@ -362,6 +382,7 @@ def make_shard_cache(model: Any, calibration_dir: Path, bits: int) -> list:
                 k_bits=bits,
                 v_rotation=entry["v_rotation"],
                 v_codebooks=entry["v_codebooks"],
+                k_mean=entry.get("k_mean"),
             )
         )
         quantized += 1
