@@ -104,9 +104,7 @@ class TestFindShardDir:
             SpectralCalibrationMissingError,
         )
 
-        assert issubclass(
-            ShardCalibrationMissingError, SpectralCalibrationMissingError
-        )
+        assert issubclass(ShardCalibrationMissingError, SpectralCalibrationMissingError)
 
 
 class TestCliShardPrepare:

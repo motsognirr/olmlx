@@ -453,8 +453,7 @@ def collect_kv_vectors(
                 if tokens_collected[(layer_idx, h, "value")] < max_tokens_per_head:
                     v_h = cached_values[0, h, :, :]  # (seq, head_dim)
                     remaining = (
-                        max_tokens_per_head
-                        - tokens_collected[(layer_idx, h, "value")]
+                        max_tokens_per_head - tokens_collected[(layer_idx, h, "value")]
                     )
                     v_h = v_h[:remaining]
                     kv_collectors[layer_idx][h]["value"].append(v_h)
@@ -511,8 +510,8 @@ def calibrate_model(
     if progress_callback:
         progress_callback("Loading model", 0.0)
 
-    model, tokenizer, inner, head_dim, n_kv_heads, num_layers = (
-        _load_calibration_model(model_path)
+    model, tokenizer, inner, head_dim, n_kv_heads, num_layers = _load_calibration_model(
+        model_path
     )
 
     if progress_callback:

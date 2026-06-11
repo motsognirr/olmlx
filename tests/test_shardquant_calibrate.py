@@ -99,9 +99,7 @@ class _FakeModel:
         n_kv = self._backbone.args.num_key_value_heads
         rng = np.random.RandomState(seq)
         for entry in cache:
-            keys = mx.array(
-                rng.randn(1, n_kv, seq, self._head_dim).astype(np.float32)
-            )
+            keys = mx.array(rng.randn(1, n_kv, seq, self._head_dim).astype(np.float32))
             values = mx.array(
                 rng.randn(1, n_kv, seq, self._head_dim).astype(np.float32)
             )
@@ -203,8 +201,7 @@ class TestCalibrateModelShard:
         assert ko.shape == (1, 2, 100, 8)
         assert vo.shape == (1, 2, 100, 8)
         cos = np.sum(np.array(ko) * np.array(k), -1) / (
-            np.linalg.norm(np.array(ko), axis=-1)
-            * np.linalg.norm(np.array(k), axis=-1)
+            np.linalg.norm(np.array(ko), axis=-1) * np.linalg.norm(np.array(k), axis=-1)
             + 1e-9
         )
         assert cos.mean() > 0.7  # random data has no low-rank structure; loose bound

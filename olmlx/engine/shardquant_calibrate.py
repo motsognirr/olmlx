@@ -158,8 +158,8 @@ def calibrate_model_shard(
     if progress_callback:
         progress_callback("Loading model", 0.0)
 
-    model, tokenizer, inner, head_dim, n_kv_heads, num_layers = (
-        _load_calibration_model(model_path)
+    model, tokenizer, inner, head_dim, n_kv_heads, num_layers = _load_calibration_model(
+        model_path
     )
 
     if progress_callback:

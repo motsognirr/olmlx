@@ -44,9 +44,7 @@ class TestRopeSpec:
         for offset in (0, 5):
             expected = rope(x, offset=offset)
             got = rope_transform(x, spec, offset)
-            np.testing.assert_allclose(
-                np.array(got), np.array(expected), atol=1e-4
-            )
+            np.testing.assert_allclose(np.array(got), np.array(expected), atol=1e-4)
 
     def test_matches_nn_rope_traditional(self):
         from olmlx.engine.shardquant import rope_transform
@@ -187,9 +185,7 @@ class TestProductVQ:
         assert idx.shape == (1, 1, 1000, P)
         assert idx.dtype == mx.uint8
         recon = vq_gather(idx, cbs)
-        np.testing.assert_allclose(
-            np.array(recon).reshape(1000, P, g), data, atol=1e-4
-        )
+        np.testing.assert_allclose(np.array(recon).reshape(1000, P, g), data, atol=1e-4)
 
     def test_quality_on_gaussian_data(self):
         """256 centroids on unit-sphere-ish 2-dim subvectors: high cosine sim."""

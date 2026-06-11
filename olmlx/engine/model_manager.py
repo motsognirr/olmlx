@@ -257,6 +257,10 @@ def _is_serializable_cache(cache: list) -> bool:
 #   private dequant side buffers that ``flatten_cache_state`` doesn't see.
 # - ``spectral:`` deepcopies cleanly via the default walk (no ``mx.Dtype``
 #   attribute, no out-of-state side buffers).
+# - ``shard:`` likewise deepcopies via the default walk: ShardKVCache keeps
+#   no ``mx.Dtype`` attribute and exposes every mutable array (sink, window,
+#   packed middle, norms) through ``state``, so the flatten + ``mx.eval``
+#   pass materializes its in-place-write graphs before the copy.
 # Kept as the registration point for any future kv-quant cache class
 # that proves unsafe — mirrors ``_EXCLUDED_MIXED_LAYER_PAIRS``.  Disk-save
 # remains gated separately by ``_is_serializable_cache`` because that path
@@ -2443,9 +2447,7 @@ class ModelManager(SpeculativeLoaderMixin):
             f"{spectral_path}. Run 'olmlx spectral prepare {hf_path}' manually."
         )
 
-    def _find_shard_dir(
-        self, hf_path: str, kv_cache_quant: str | None
-    ) -> Path | None:
+    def _find_shard_dir(self, hf_path: str, kv_cache_quant: str | None) -> Path | None:
         """Return the shard calibration directory if shard quant is configured."""
         if kv_cache_quant is None or not kv_cache_quant.startswith("shard:"):
             return None
@@ -2521,8 +2523,7 @@ class ModelManager(SpeculativeLoaderMixin):
 
         method, bits_str = kv_cache_quant.split(":")
         assert method == "shard", (
-            f"_auto_calibrate_shard called with non-shard quant: "
-            f"{kv_cache_quant!r}"
+            f"_auto_calibrate_shard called with non-shard quant: {kv_cache_quant!r}"
         )
         bits = int(bits_str)
         local_dir = self.store.local_path(hf_path)

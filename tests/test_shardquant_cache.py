@@ -83,12 +83,8 @@ class TestShardKVCacheBasics:
         cache = _make_cache(sink=4, window=8)
         ks, vs, (k, v) = _feed(cache, 40)
         # First sink tokens exact
-        np.testing.assert_array_equal(
-            np.array(k[..., :4, :]), np.array(ks[..., :4, :])
-        )
-        np.testing.assert_array_equal(
-            np.array(v[..., :4, :]), np.array(vs[..., :4, :])
-        )
+        np.testing.assert_array_equal(np.array(k[..., :4, :]), np.array(ks[..., :4, :]))
+        np.testing.assert_array_equal(np.array(v[..., :4, :]), np.array(vs[..., :4, :]))
         # Last window tokens exact
         np.testing.assert_array_equal(
             np.array(k[..., -8:, :]), np.array(ks[..., -8:, :])
@@ -123,14 +119,10 @@ class TestShardKVCacheBasics:
         c1.update_and_fetch(ks[..., :30, :], vs[..., :30, :])
         k1 = v1 = None
         for i in range(30, 34):
-            k1, v1 = c1.update_and_fetch(
-                ks[..., i : i + 1, :], vs[..., i : i + 1, :]
-            )
+            k1, v1 = c1.update_and_fetch(ks[..., i : i + 1, :], vs[..., i : i + 1, :])
         out = None
         for i in range(34):
-            out = c2.update_and_fetch(
-                ks[..., i : i + 1, :], vs[..., i : i + 1, :]
-            )
+            out = c2.update_and_fetch(ks[..., i : i + 1, :], vs[..., i : i + 1, :])
         k2, v2 = out
         np.testing.assert_allclose(
             np.array(k1, dtype=np.float32),
@@ -161,9 +153,7 @@ class TestShardKVCacheTrim:
         assert cache.offset == 7
         k, v = cache.update_and_fetch(ks[..., 7:8, :], vs[..., 7:8, :])
         assert k.shape[2] == 8
-        np.testing.assert_array_equal(
-            np.array(k[..., :8, :]), np.array(ks[..., :8, :])
-        )
+        np.testing.assert_array_equal(np.array(k[..., :8, :]), np.array(ks[..., :8, :]))
 
     def test_trim_into_middle(self):
         cache = _make_cache(sink=4, window=8)
@@ -174,9 +164,7 @@ class TestShardKVCacheTrim:
         k, v = cache.update_and_fetch(ks[..., 20:21, :], vs[..., 20:21, :])
         assert k.shape[2] == 21
         # Sink still exact
-        np.testing.assert_array_equal(
-            np.array(k[..., :4, :]), np.array(ks[..., :4, :])
-        )
+        np.testing.assert_array_equal(np.array(k[..., :4, :]), np.array(ks[..., :4, :]))
 
     def test_trim_to_empty(self):
         cache = _make_cache()
@@ -228,9 +216,7 @@ class TestShardKVCacheStateAndCopy:
         (the TurboQuant pickle failure mode)."""
         cache = _make_cache()
         _feed(cache, 40)
-        assert not any(
-            isinstance(v, mx.Dtype) for v in cache.__dict__.values()
-        )
+        assert not any(isinstance(v, mx.Dtype) for v in cache.__dict__.values())
 
 
 class TestMakeShardCache:
@@ -243,9 +229,7 @@ class TestMakeShardCache:
         sample /= np.linalg.norm(sample, axis=-1, keepdims=True)
         v_rot = make_v_rotation(D)
         return {
-            "k_basis": mx.array(
-                np.stack([_random_orthogonal(D, h) for h in range(H)])
-            ),
+            "k_basis": mx.array(np.stack([_random_orthogonal(D, h) for h in range(H)])),
             "k_rank": D // 2,
             "k_codebook": fit_codebook(
                 mx.array(rng.randn(2048).astype(np.float32) * 0.3), bits=bits
