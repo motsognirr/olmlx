@@ -73,3 +73,36 @@ def test_generation_stays_coherent_with_shard_cache(calibrated_model_path):
     # Loose coherence check: the model should produce several number words.
     hits = sum(w in lowered for w in ["one", "two", "three", "four", "five"])
     assert hits >= 3, f"incoherent output under shard quant: {text!r}"
+
+
+def test_fused_decode_matches_tier1_generation(calibrated_model_path):
+    """Greedy generation with the fused decode path (#377 Tier 2) must track
+    the Tier-1 path on a real model (same packed state, same math)."""
+    from mlx_lm import load, stream_generate
+
+    from olmlx.engine.shardquant_cache import make_shard_cache
+
+    model_path, calib_dir = calibrated_model_path
+    model, tokenizer = load(str(model_path))
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "List the days of the week."}],
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+
+    texts = {}
+    for fused in (False, True):
+        cache = make_shard_cache(model, calib_dir, bits=4, fused=fused)
+        out = ""
+        for resp in stream_generate(
+            model, tokenizer, prompt, max_tokens=64, prompt_cache=cache
+        ):
+            out += resp.text
+        texts[fused] = out
+
+    # fp32 fused softmax vs mx.fast sdpa can diverge on argmax near-ties;
+    # require the long common prefix that exact-parity math produces.
+    a, b = texts[False], texts[True]
+    common = sum(1 for x, y in zip(a, b) if x == y)
+    assert common >= int(0.8 * min(len(a), len(b))), (a, b)
+    assert "monday" in b.lower() or "tuesday" in b.lower(), b

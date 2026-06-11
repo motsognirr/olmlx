@@ -89,6 +89,10 @@ def _make_cache(mode: str, model, model_dir: Path, bits: int) -> list:
         from olmlx.engine.shardquant_cache import make_shard_cache
 
         return make_shard_cache(model, model_dir / "shard", bits=bits)
+    if mode == "shard-fused":
+        from olmlx.engine.shardquant_cache import make_shard_cache
+
+        return make_shard_cache(model, model_dir / "shard", bits=bits, fused=True)
     raise ValueError(mode)
 
 
@@ -116,7 +120,7 @@ def _reconstruction(model, model_dir: Path, modes: list[str], bits: int, kv_ref)
 
     results: dict[str, dict[str, float]] = {}
     for mode in modes:
-        if mode == "fp16":
+        if mode in ("fp16", "shard-fused"):  # fused stores the same bytes as shard
             continue
         cache = _make_cache(mode, model, model_dir, bits)
         cos_k, cos_v, mid_k, mid_v = [], [], [], []
@@ -154,8 +158,8 @@ def main() -> None:
     ap.add_argument("--samples", type=int, default=32)
     ap.add_argument(
         "--modes",
-        default="fp16,turboquant,spectral,shard",
-        help="comma-separated subset of fp16,turboquant,spectral,shard",
+        default="fp16,turboquant,spectral,shard,shard-fused",
+        help="comma-separated subset of fp16,turboquant,spectral,shard,shard-fused",
     )
     args = ap.parse_args()
     modes = args.modes.split(",")
