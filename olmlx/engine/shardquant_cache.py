@@ -59,12 +59,16 @@ class ShardKVCache(_BaseCache):
         v_codebooks: mx.array,
         sink_size: int = SINK_TOKENS,
         window_size: int = WINDOW_TOKENS,
+        k_mean: mx.array | None = None,
     ):
         self.rope_spec = rope_spec
         self.k_basis = k_basis
         self.k_rank = k_rank
         self.k_codebook = k_codebook
         self.k_bits = k_bits
+        # (H, D) per-head mean of unit-normalized calibration keys; None
+        # for Tier-1 (un-centered) calibration artifacts.
+        self.k_mean = k_mean
         self.v_rotation = v_rotation
         self.v_codebooks = v_codebooks
         self.sink_size = sink_size
@@ -129,7 +133,12 @@ class ShardKVCache(_BaseCache):
         if self.rope_spec is not None:
             k = rope_transform(k, self.rope_spec, start, inverse=True)
         k_packed, k_norms = shard_compress_keys(
-            k, self.k_basis, self.k_rank, self.k_codebook, self.k_bits
+            k,
+            self.k_basis,
+            self.k_rank,
+            self.k_codebook,
+            self.k_bits,
+            mean=self.k_mean,
         )
         v_idx, v_norms = shard_compress_values(v, self.v_rotation, self.v_codebooks)
         self._append_middle(k_packed, k_norms, v_idx, v_norms)
@@ -149,6 +158,7 @@ class ShardKVCache(_BaseCache):
             self.k_rank,
             self.k_codebook,
             self.k_bits,
+            mean=self.k_mean,
         )
         if self.rope_spec is not None:
             k = rope_transform(k, self.rope_spec, self._sink_len())
@@ -362,6 +372,7 @@ def make_shard_cache(model: Any, calibration_dir: Path, bits: int) -> list:
                 k_bits=bits,
                 v_rotation=entry["v_rotation"],
                 v_codebooks=entry["v_codebooks"],
+                k_mean=entry.get("k_mean"),
             )
         )
         quantized += 1

@@ -37,7 +37,6 @@ from olmlx.engine.spectralquant_calibrate import (
     _load_calibration_model,
     collect_kv_vectors,
     compute_covariance,
-    compute_d_eff,
     eigendecompose,
 )
 
@@ -45,6 +44,30 @@ logger = logging.getLogger(__name__)
 
 _SHARD_DEFAULT_MAX_TOKENS_PER_HEAD = 8192
 _SHARD_DEFAULT_NUM_SAMPLES = 256
+
+#: Fraction of eigenvalue energy the kept rank must capture.  Replaces the
+#: participation ratio, which collapses to ~2 under a single dominant
+#: eigenvalue and discards a heavy tail that still carries real signal
+#: (measured as a 0.64-vs-0.99 K-cosine gap by scripts/shard_ab_bench.py).
+#: 0.999 because truncation — not 4-bit quantization — dominates the
+#: reconstruction error on Qwen3-family keys (rank sweep in #377): at 0.99
+#: the kept rank lands ~50/128 and cosine plateaus at ~0.93, while the
+#: quantizer alone reaches ~0.99.  Lower it per-calibration via --k-energy
+#: to trade K quality for bytes.
+_SHARD_RANK_ENERGY = 0.999
+
+
+def _rank_from_eigenvalues(
+    eigenvalues: mx.array, energy: float = _SHARD_RANK_ENERGY
+) -> int:
+    """Smallest rank whose leading eigenvalues capture ``energy``."""
+    ev = np.array(eigenvalues.astype(mx.float32))
+    total = float(ev.sum())
+    if total <= 0.0:
+        return len(ev)
+    cum = np.cumsum(ev) / total
+    return int(np.searchsorted(cum, energy) + 1)
+
 
 #: layer_idx -> calibration entry
 ShardCalibration = dict[int, dict[str, Any]]
@@ -73,6 +96,8 @@ def save_shard_calibration(
         tensors[f"{prefix}_k_codebook"] = np.array(entry["k_codebook"])
         tensors[f"{prefix}_v_rotation"] = np.array(entry["v_rotation"])
         tensors[f"{prefix}_v_codebooks"] = np.array(entry["v_codebooks"])
+        if entry.get("k_mean") is not None:
+            tensors[f"{prefix}_k_mean"] = np.array(entry["k_mean"])
         if entry["rope_freqs"] is not None:
             tensors[f"{prefix}_rope_freqs"] = np.array(entry["rope_freqs"])
 
@@ -97,10 +122,14 @@ def load_shard_calibration(
         layer = int(layer_str)
         prefix = f"layer_{layer}"
         freqs_np = tensors.get(f"{prefix}_rope_freqs")
+        # Tier-1 artifacts have no k_mean (un-centered pipeline) and a
+        # shared 1-D codebook; both load as-is for backward compatibility.
+        mean_np = tensors.get(f"{prefix}_k_mean")
         result[layer] = {
             "k_basis": mx.array(tensors[f"{prefix}_k_basis"]),
             "k_rank": layer_cfg["k_rank"],
             "k_codebook": mx.array(tensors[f"{prefix}_k_codebook"]),
+            "k_mean": mx.array(mean_np) if mean_np is not None else None,
             "v_rotation": mx.array(tensors[f"{prefix}_v_rotation"]),
             "v_codebooks": mx.array(tensors[f"{prefix}_v_codebooks"]),
             "rope_freqs": mx.array(freqs_np) if freqs_np is not None else None,
@@ -141,6 +170,7 @@ def calibrate_model_shard(
     bits: int = 4,
     max_tokens_per_head: int = _SHARD_DEFAULT_MAX_TOKENS_PER_HEAD,
     progress_callback: Any | None = None,
+    k_energy: float = _SHARD_RANK_ENERGY,
 ) -> Path:
     """Run shard calibration on a model. Returns the shard directory."""
     import gc
@@ -148,6 +178,8 @@ def calibrate_model_shard(
 
     if bits not in (2, 4, 8):
         raise ValueError(f"shard calibration supports bits in {{2,4,8}}, got {bits}")
+    if not 0.0 < k_energy <= 1.0:
+        raise ValueError(f"k_energy must be in (0, 1], got {k_energy}")
     group_size = 8 // bits
 
     if output_dir is None:
@@ -215,9 +247,16 @@ def calibrate_model_shard(
             )
 
         # --- K: per-head no-RoPE PCA -----------------------------------
+        # Pipeline (matches shard_compress_keys exactly): unit-normalize,
+        # subtract the per-head mean, eigendecompose the centered
+        # covariance, keep the smallest rank capturing _SHARD_RANK_ENERGY,
+        # fit one Lloyd-Max codebook per head on its own centered
+        # coefficients (a shared codebook lets a wide-scale head dominate
+        # the fit and crush the others).
         bases = []
+        means = []
         ranks = []
-        coeff_pool = []
+        coeff_per_head = []
         for h in range(n_kv_heads):
             chunks = head_chunks[h]["key"]
             if not chunks:
@@ -228,17 +267,21 @@ def calibrate_model_shard(
                 mx.array(1e-8),
             )
             k_unit = k_nope / norms
-            eigenvalues, eigenvectors = eigendecompose(compute_covariance(k_unit))
+            mean_h = mx.mean(k_unit, axis=0)
+            centered = k_unit - mean_h
+            eigenvalues, eigenvectors = eigendecompose(compute_covariance(centered))
             basis = eigenvectors.T  # rows = eigenvectors, descending variance
             bases.append(basis)
-            ranks.append(compute_d_eff(eigenvalues))
-            coeff_pool.append(k_unit @ basis.T)
+            means.append(mean_h)
+            ranks.append(_rank_from_eigenvalues(eigenvalues, k_energy))
+            coeff_per_head.append(centered @ basis.T)
         if len(bases) < n_kv_heads:
             logger.debug("Layer %d: incomplete per-head K data, skipping", layer_idx)
             continue
         k_rank = max(ranks)
-        kept = mx.concatenate([c[:, :k_rank] for c in coeff_pool], axis=0)
-        k_codebook = fit_codebook(kept.reshape(-1), bits=bits)
+        k_codebook = mx.stack(
+            [fit_codebook(c[:, :k_rank].reshape(-1), bits=bits) for c in coeff_per_head]
+        )  # (H, 2**bits)
 
         # --- V: pooled rotation + PQ ------------------------------------
         v_chunks = []
@@ -259,6 +302,7 @@ def calibrate_model_shard(
             "k_basis": mx.stack(bases),  # (H, D, D)
             "k_rank": int(k_rank),
             "k_codebook": k_codebook,
+            "k_mean": mx.stack(means),  # (H, D)
             "v_rotation": v_rotation,
             "v_codebooks": v_codebooks,
             "rope_freqs": rope_spec.freqs if rope_spec is not None else None,

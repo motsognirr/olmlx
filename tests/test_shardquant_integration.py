@@ -117,6 +117,7 @@ class TestCliShardPrepare:
             bits=4,
             calibration_dataset=None,
             max_tokens=1024,
+            k_energy=0.999,
         )
         store = MagicMock()
         store.registry.resolve.return_value = None
@@ -137,6 +138,7 @@ class TestCliShardPrepare:
             bits=4,
             max_tokens_per_head=1024,
             progress_callback=cli._flash_progress,
+            k_energy=0.999,
         )
 
     def test_parser_accepts_shard_prepare(self):

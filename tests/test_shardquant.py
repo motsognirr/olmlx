@@ -373,6 +373,140 @@ class TestKeyCompress:
         assert cos.mean() > 0.9
 
 
+class TestKeyCompressMeanCentering:
+    def test_mean_offset_data_survives_truncation(self):
+        """Keys with a large common mean + low-rank variation must
+        reconstruct well under rank truncation when the per-head mean is
+        stored and re-added. Without centering, truncating in the
+        centered-covariance eigenbasis drops the mean direction — the
+        dominant component of every key — which is the root cause of the
+        K-quality gap measured by scripts/shard_ab_bench.py."""
+        from olmlx.engine.shardquant import (
+            shard_compress_keys,
+            shard_decompress_keys,
+        )
+        from olmlx.engine.spectralquant import fit_codebook
+
+        B, H, S, D, R = 1, 1, 400, 16, 3
+        rng = np.random.RandomState(13)
+        mu = rng.randn(D).astype(np.float32) * 3.0  # dominant common mean
+        Q = _random_orthogonal(D, 17)
+        variation = rng.randn(S, R).astype(np.float32) @ Q[:R, :] * 0.5
+        data = (mu[None, :] + variation).astype(np.float32)
+        x = mx.array(data.reshape(B, H, S, D))
+
+        # Calibration-style: unit-normalize, mean-center, eigenbasis of the
+        # centered data (here: Q's rows already span the variation).
+        xn = data / np.linalg.norm(data, axis=-1, keepdims=True)
+        mean = xn.mean(axis=0)
+        centered = xn - mean
+        cov = centered.T @ centered / S
+        w, vecs = np.linalg.eigh(cov)
+        basis = vecs[:, ::-1].T.astype(np.float32)  # rows = eigvecs desc
+        coeffs = centered @ basis.T
+        cb = fit_codebook(mx.array(coeffs[:, :R].reshape(-1)), bits=4)
+        basis_mx = mx.array(basis.reshape(1, D, D))
+        mean_mx = mx.array(mean.reshape(1, D))
+
+        packed, norms = shard_compress_keys(
+            x, basis_mx, rank=R, codebook=cb, bits=4, mean=mean_mx
+        )
+        recon = shard_decompress_keys(
+            packed,
+            norms,
+            basis_mx,
+            rank=R,
+            codebook=cb,
+            bits=4,
+            mean=mean_mx,
+            dtype=x.dtype,
+        )
+        cos = np.sum(np.array(recon) * data.reshape(B, H, S, D), -1) / (
+            np.linalg.norm(np.array(recon), axis=-1)
+            * np.linalg.norm(data.reshape(B, H, S, D), axis=-1)
+        )
+        assert cos.mean() > 0.98, f"mean-centered truncation cosine {cos.mean()}"
+
+    def test_mean_none_matches_legacy_behavior(self):
+        """mean=None must reproduce the un-centered pipeline bit-for-bit
+        (backward compatibility with Tier-1 calibration artifacts)."""
+        from olmlx.engine.shardquant import (
+            shard_compress_keys,
+            shard_decompress_keys,
+        )
+        from olmlx.engine.spectralquant import fit_codebook
+
+        D = 8
+        basis = mx.array(_random_orthogonal(D, 3).reshape(1, D, D))
+        mx.random.seed(21)
+        x = mx.random.normal((1, 1, 20, D))
+        cb = fit_codebook(mx.random.normal((2000,)) * 0.4, bits=4)
+        p1, n1 = shard_compress_keys(x, basis, rank=D, codebook=cb, bits=4)
+        p2, n2 = shard_compress_keys(x, basis, rank=D, codebook=cb, bits=4, mean=None)
+        np.testing.assert_array_equal(np.array(p1), np.array(p2))
+        r1 = shard_decompress_keys(p1, n1, basis, rank=D, codebook=cb, bits=4)
+        r2 = shard_decompress_keys(
+            p2, n2, basis, rank=D, codebook=cb, bits=4, mean=None
+        )
+        np.testing.assert_array_equal(np.array(r1), np.array(r2))
+
+
+class TestPerHeadCodebooks:
+    def test_scalar_assign_per_head_matches_naive(self):
+        from olmlx.engine.shardquant import scalar_assign
+
+        rng = np.random.RandomState(23)
+        H, K = 3, 16
+        codebooks = mx.array(np.sort(rng.randn(H, K), axis=-1).astype(np.float32))
+        y = mx.array(rng.randn(2, H, 600, 5).astype(np.float32))
+        idx = scalar_assign(y, codebooks)
+        assert idx.dtype == mx.uint8
+        yn = np.array(y)
+        cbn = np.array(codebooks)
+        expected = np.stack(
+            [
+                np.argmin(np.abs(yn[:, h, ..., None] - cbn[h]), axis=-1)
+                for h in range(H)
+            ],
+            axis=1,
+        )
+        np.testing.assert_array_equal(np.array(idx), expected)
+
+    def test_compress_keys_routes_codebook_per_head(self):
+        """Head h must quantize against codebook[h]: give head 1 a useless
+        all-zeros codebook and verify head 0's reconstruction is unaffected
+        while head 1's collapses. A shared-codebook implementation (or one
+        indexing codebook[0] for every head) cannot produce this split."""
+        from olmlx.engine.shardquant import (
+            shard_compress_keys,
+            shard_decompress_keys,
+        )
+        from olmlx.engine.spectralquant import fit_codebook
+
+        B, H, S, D = 1, 2, 200, 8
+        basis = mx.array(np.stack([_random_orthogonal(D, 30 + h) for h in range(H)]))
+        rng = np.random.RandomState(31)
+        x = mx.array(rng.randn(B, H, S, D).astype(np.float32))
+        x32 = np.array(x)
+        xn = x32 / np.linalg.norm(x32, axis=-1, keepdims=True)
+        y = np.einsum("bhsd,hrd->bhsr", xn, np.array(basis))
+        good = fit_codebook(mx.array(y[:, 0].reshape(-1)), bits=4)
+        cbs = mx.stack([good, mx.zeros((16,), dtype=mx.float32)])
+        assert cbs.shape == (H, 16)
+        packed, norms = shard_compress_keys(x, basis, rank=D, codebook=cbs, bits=4)
+        recon = shard_decompress_keys(
+            packed, norms, basis, rank=D, codebook=cbs, bits=4
+        )
+        rn = np.array(recon)
+        cos0 = np.sum(rn[:, 0] * x32[:, 0], -1) / (
+            np.linalg.norm(rn[:, 0], axis=-1) * np.linalg.norm(x32[:, 0], axis=-1)
+            + 1e-9
+        )
+        assert cos0.mean() > 0.95, f"head 0 cosine {cos0.mean()}"
+        # Head 1's all-zero codebook reconstructs to (numerically) zero.
+        assert np.abs(rn[:, 1]).max() < 1e-5
+
+
 class TestValueCompress:
     def test_roundtrip_quality(self):
         from olmlx.engine.shardquant import (

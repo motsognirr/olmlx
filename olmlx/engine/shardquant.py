@@ -240,12 +240,16 @@ def scalar_assign(y: mx.array, codebook: mx.array) -> mx.array:
     """Nearest-centroid index per element, chunked over the seq axis.
 
     Args:
-        y: (..., S, R) coefficients.
-        codebook: (K,) sorted centroids.
+        y: (..., S, R) coefficients; with a per-head codebook the head axis
+           must be axis -3, i.e. (B, H, S, R).
+        codebook: (K,) shared centroids, or (H, K) per-head centroids.
 
     Returns:
         (..., S, R) uint8 indices.
     """
+    if codebook.ndim == 2:
+        # (H, K) -> (H, 1, 1, K): broadcasts against (..., H, S, R, 1).
+        codebook = codebook[:, None, None, :]
     chunks = []
     S = y.shape[-2]
     for s0 in range(0, S, _ASSIGN_SEQ_CHUNK):
@@ -253,6 +257,19 @@ def scalar_assign(y: mx.array, codebook: mx.array) -> mx.array:
         dists = mx.abs(yc[..., None] - codebook)
         chunks.append(mx.argmin(dists, axis=-1).astype(mx.uint8))
     return mx.concatenate(chunks, axis=-2) if len(chunks) > 1 else chunks[0]
+
+
+def _codebook_gather(idx: mx.array, codebook: mx.array) -> mx.array:
+    """Centroid lookup for (K,) shared or (H, K) per-head codebooks.
+
+    idx: (B, H, S, R) uint8 indices -> (B, H, S, R) float32 values.
+    """
+    if codebook.ndim == 1:
+        return codebook[idx.astype(mx.uint32)]
+    h, k = codebook.shape
+    flat = codebook.reshape(h * k)
+    offsets = (mx.arange(h, dtype=mx.uint32) * k)[None, :, None, None]
+    return flat[idx.astype(mx.uint32) + offsets]
 
 
 _NORM_EPS = 1e-8
@@ -272,21 +289,31 @@ def shard_compress_keys(
     rank: int,
     codebook: mx.array,
     bits: int,
+    mean: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
-    """Compress (already de-roped) keys: normalize -> per-head project ->
-    rank-truncate -> scalar quantize -> bit-pack.
+    """Compress (already de-roped) keys: normalize -> subtract per-head
+    mean -> per-head project -> rank-truncate -> scalar quantize -> pack.
+
+    Mean-centering is load-bearing for rank truncation: the basis comes
+    from a *centered* covariance, so truncating un-centered projections
+    drops the mean direction — the dominant component of every key.
 
     Args:
         keys: (B, H, S, D) de-roped keys.
         basis: (H, D, D), rows = eigenvectors.
         rank: kept leading coefficients.
-        codebook: (2**bits,) Lloyd-Max centroids for the kept coefficients.
+        codebook: (2**bits,) shared or (H, 2**bits) per-head Lloyd-Max
+            centroids for the kept coefficients.
+        mean: (H, D) per-head mean of the unit-normalized calibration keys,
+            or None for legacy (un-centered) artifacts.
 
     Returns:
         (packed, norms): packed uint8 indices (B, H, S, packed_rank) +
         float32 norms (B, H, S, 1).
     """
     xn, norms = _normalize(keys)
+    if mean is not None:
+        xn = xn - mean[None, :, None, :].astype(mx.float32)
     y = mx.matmul(xn, mx.swapaxes(basis, -1, -2))  # (B,H,S,D) @ (H,D,D)^T
     idx = scalar_assign(y[..., :rank], codebook)
     return pack_indices(idx, bits), norms
@@ -299,16 +326,20 @@ def shard_decompress_keys(
     rank: int,
     codebook: mx.array,
     bits: int,
+    mean: mx.array | None = None,
     dtype: mx.Dtype | None = None,
 ) -> mx.array:
     """Inverse of shard_compress_keys (still in the no-RoPE basis)."""
     idx = unpack_indices(packed, bits, rank)
-    y = codebook[idx.astype(mx.uint32)]
+    y = _codebook_gather(idx, codebook)
     d = basis.shape[-1]
     if rank < d:
         pad = mx.zeros((*y.shape[:-1], d - rank), dtype=y.dtype)
         y = mx.concatenate([y, pad], axis=-1)
-    x = mx.matmul(y, basis) * norms
+    x = mx.matmul(y, basis)
+    if mean is not None:
+        x = x + mean[None, :, None, :].astype(x.dtype)
+    x = x * norms
     return x.astype(dtype) if dtype is not None else x
 
 

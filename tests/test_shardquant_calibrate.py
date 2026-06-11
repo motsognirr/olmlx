@@ -29,7 +29,10 @@ def _entry(D=8, H=2, bits=4, rope=True):
     return {
         "k_basis": mx.array(np.stack([orth(h) for h in range(H)])),
         "k_rank": 5,
-        "k_codebook": mx.array(np.sort(rng.randn(1 << bits)).astype(np.float32)),
+        "k_codebook": mx.array(
+            np.sort(rng.randn(H, 1 << bits), axis=-1).astype(np.float32)
+        ),
+        "k_mean": mx.array(rng.randn(H, D).astype(np.float32) * 0.1),
         "v_rotation": mx.array(orth(99)),
         "v_codebooks": mx.array(rng.randn(D // g, 256, g).astype(np.float32)),
         "rope_freqs": mx.array(rng.rand(D // 2).astype(np.float32)) if rope else None,
@@ -55,6 +58,10 @@ class TestSaveLoad:
             np.array(e["k_basis"]), np.array(calibration[0]["k_basis"]), atol=1e-6
         )
         assert e["k_rank"] == 5
+        np.testing.assert_allclose(
+            np.array(e["k_mean"]), np.array(calibration[0]["k_mean"]), atol=1e-7
+        )
+        assert e["k_codebook"].shape == (2, 16)
         assert e["v_codebooks"].shape == (4, 256, 2)
         np.testing.assert_allclose(
             np.array(e["rope_freqs"]),
@@ -159,7 +166,8 @@ class TestCalibrateModelShard:
         # Per-head bases (the review-comment correction): (H, D, D)
         assert e["k_basis"].shape == (2, 8, 8)
         assert 1 <= e["k_rank"] <= 8
-        assert e["k_codebook"].shape == (16,)  # 2^4
+        assert e["k_codebook"].shape == (2, 16)  # per-head, 2^4 each
+        assert e["k_mean"].shape == (2, 8)  # per-head mean of unit keys
         assert e["v_rotation"].shape == (8, 8)
         assert e["v_codebooks"].shape == (4, 256, 2)  # g = 8//4 = 2
         # RoPE detected from the fake attn and stored
@@ -179,7 +187,106 @@ class TestCalibrateModelShard:
         calibration, meta = shc.load_shard_calibration(out)
         assert meta["bits"] == 2
         assert calibration[0]["v_codebooks"].shape == (2, 256, 4)  # g = 4
-        assert calibration[0]["k_codebook"].shape == (4,)  # 2^2
+        assert calibration[0]["k_codebook"].shape == (2, 4)  # per-head, 2^2
+
+    def test_rank_by_cumulative_energy(self):
+        """Low-rank data picks a small rank that still captures the energy
+        threshold; the participation ratio collapsed to ~2 under a dominant
+        eigenvalue and discarded real signal (the K-quality gap measured by
+        scripts/shard_ab_bench.py)."""
+        # 3 strong directions + faint isotropic noise: a 0.99 threshold
+        # keeps just the strong directions.
+        ev = np.concatenate([[10.0, 5.0, 2.0], np.full(13, 0.01)])
+        assert shc._rank_from_eigenvalues(mx.array(ev.astype(np.float32)), 0.99) <= 6
+        # Heavy-tailed spectrum: one dominant + meaningful tail. The
+        # participation ratio would say ~2; the energy rule keeps the tail.
+        ev2 = np.concatenate([[100.0], np.full(15, 1.0)])
+        r2 = shc._rank_from_eigenvalues(mx.array(ev2.astype(np.float32)))
+        assert r2 >= 12, f"energy rank {r2} discarded a meaningful tail"
+
+    def test_k_energy_knob_threads_through(self, tmp_path):
+        """A looser k_energy must produce a lower rank than the default."""
+        out_default = _run_calibration(tmp_path / "a")
+        cal_default, _ = shc.load_shard_calibration(out_default)
+
+        # Re-run with a very loose threshold via the public kwarg.
+        backbone = _FakeBackbone(2, 2, 8)
+        model = _FakeModel(backbone, 8)
+        texts = ["one two three four five six seven eight nine ten"] * 4
+        patches = [
+            patch(
+                "olmlx.engine.flash.prepare.load_model_with_strict_fallback",
+                return_value=(model, MagicMock()),
+            ),
+            patch("olmlx.engine.flash.prepare._get_backbone", return_value=backbone),
+            patch(
+                "olmlx.engine.flash.prepare._get_c4_calibration_data",
+                return_value=texts,
+            ),
+            patch(
+                "olmlx.engine.flash.prepare._get_calibration_data", return_value=texts
+            ),
+            patch(
+                "olmlx.engine.flash.prepare._encode_tokens",
+                side_effect=lambda tok, text: list(range(len(text.split()))),
+            ),
+            patch("olmlx.engine.turboquant_cache._detect_head_dim", return_value=8),
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                side_effect=lambda owner: [KVCache() for _ in range(2)],
+            ),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            out_loose = shc.calibrate_model_shard(
+                "fake/model",
+                output_dir=tmp_path / "b" / "shard",
+                num_samples=4,
+                bits=4,
+                k_energy=0.5,
+            )
+        finally:
+            for p in patches:
+                p.stop()
+        cal_loose, _ = shc.load_shard_calibration(out_loose)
+        assert cal_loose[0]["k_rank"] < cal_default[0]["k_rank"]
+
+    def test_load_tier1_artifacts_backward_compatible(self, tmp_path):
+        """Tier-1 calibrations (shared 1-D k_codebook, no k_mean) must load
+        with k_mean=None so the runtime falls back to the un-centered path
+        instead of KeyError-ing on every model calibrated before this."""
+        import safetensors.numpy
+
+        import json as _json
+
+        d = tmp_path / "shard"
+        d.mkdir()
+        rng = np.random.RandomState(0)
+        tensors = {
+            "layer_0_k_basis": rng.randn(2, 8, 8).astype(np.float32),
+            "layer_0_k_codebook": np.sort(rng.randn(16)).astype(np.float32),
+            "layer_0_v_rotation": rng.randn(8, 8).astype(np.float32),
+            "layer_0_v_codebooks": rng.randn(4, 256, 2).astype(np.float32),
+        }
+        safetensors.numpy.save_file(tensors, str(d / "calibration.safetensors"))
+        (d / "shard_config.json").write_text(
+            _json.dumps(
+                {
+                    "meta": {"bits": 4},
+                    "layers": {
+                        "0": {
+                            "k_rank": 5,
+                            "rope_dims": None,
+                            "rope_traditional": False,
+                        }
+                    },
+                }
+            )
+        )
+        loaded, _ = shc.load_shard_calibration(d)
+        assert loaded[0]["k_mean"] is None
+        assert loaded[0]["k_codebook"].shape == (16,)
 
     def test_compress_decompress_with_real_artifacts(self, tmp_path):
         """The calibration output drives an actual cache round trip."""
