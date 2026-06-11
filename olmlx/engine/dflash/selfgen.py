@@ -239,11 +239,14 @@ def cycle_training_batches(
     Sequences shorter than ``min_len`` are dropped; the rest are sorted
     by length and packed into fixed same-size buckets (padding waste
     stays minimal and every row in a batch shares a similar pivot
-    range). ``pivot_lo`` is the max prompt length within the batch so
-    the trainer can restrict windows to the response region. The
-    iterator is infinite — the training loop's ``steps`` budget is the
-    termination condition, which is how multi-epoch training falls out
-    naturally.
+    range). A partial tail bucket is topped up by replicating its own
+    rows (same convention as ``stream_training_batches``) rather than
+    dropped — otherwise up to ``batch_size - 1`` generated sequences
+    would silently never be trained on. ``pivot_lo`` is the max prompt
+    length within the batch so the trainer can restrict windows to the
+    response region. The iterator is infinite — the training loop's
+    ``steps`` budget is the termination condition, which is how
+    multi-epoch training falls out naturally.
     """
     usable = [(s, plen) for s, plen in sequences if len(s) >= min_len]
     if not usable:
@@ -253,16 +256,13 @@ def cycle_training_batches(
         )
     usable.sort(key=lambda sp: len(sp[0]))
     buckets: list[tuple[list[list[int]], int]] = []
-    for i in range(0, len(usable) - batch_size + 1, batch_size):
+    for i in range(0, len(usable), batch_size):
         rows = usable[i : i + batch_size]
-        m = max(len(s) for s, _ in rows)
-        padded = [s + [pad_token_id] * (m - len(s)) for s, _ in rows]
-        buckets.append((padded, max(plen for _, plen in rows)))
-    if not buckets:
-        # Fewer usable sequences than one batch: replicate to fill.
-        rows = list(usable)
+        # Top up a partial tail bucket (also the fewer-sequences-than-
+        # one-batch case) by cycling its own rows.
+        orig = len(rows)
         while len(rows) < batch_size:
-            rows.append(rows[len(rows) % len(usable)])
+            rows.append(rows[len(rows) % orig])
         m = max(len(s) for s, _ in rows)
         padded = [s + [pad_token_id] * (m - len(s)) for s, _ in rows]
         buckets.append((padded, max(plen for _, plen in rows)))

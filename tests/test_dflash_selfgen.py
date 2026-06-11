@@ -199,6 +199,26 @@ class TestCycleTrainingBatches:
         got = [next(it) for _ in range(10)]  # > 3 batches/epoch
         assert len(got) == 10
 
+    def test_partial_tail_batch_is_replicated_not_dropped(self):
+        # 5 usable sequences, batch_size 2 -> 3 buckets/epoch; the tail
+        # bucket is topped up by replication instead of dropping seq 5.
+        seqs = self._seqs()[:5]
+        it = cycle_training_batches(seqs, batch_size=2, pad_token_id=0, min_len=10)
+        rows_seen: set[int] = set()
+        for _ in range(3):  # one epoch
+            ids, _ = next(it)
+            for r in range(ids.shape[0]):
+                rows_seen.add(int((ids[r] != 0).sum().item()))
+        # every distinct sequence length appears -> nothing was dropped
+        assert rows_seen == {len(s) for s, _ in seqs}
+
+    def test_single_sequence_fills_batch_by_replication(self):
+        seqs = [(list(range(2, 42)), 5)]
+        it = cycle_training_batches(seqs, batch_size=4, pad_token_id=0, min_len=10)
+        ids, pivot_lo = next(it)
+        assert ids.shape == (4, 40)
+        assert pivot_lo == 5
+
 
 # ---------------------------------------------------------------------------
 # min_pivot plumbing

@@ -2780,6 +2780,16 @@ def cmd_dflash_prepare(args):
         raise SystemExit(
             f"--train-windows-per-step must be >= 1, got {args.train_windows_per_step}"
         )
+    if args.self_generate and args.use_precomputed:
+        # ``prepare_dflash_draft`` re-checks this, but only after
+        # ``ensure_downloaded`` — reject here so the user doesn't pay a
+        # multi-GB target download before seeing the error.
+        raise SystemExit(
+            "--self-generate and --use-precomputed are mutually exclusive: "
+            "self-generation runs the target online, while precomputed "
+            "shards were captured over a different token stream. Pass one "
+            "or the other."
+        )
 
     store = _create_store()
     _resolved = store.registry.resolve(args.model)

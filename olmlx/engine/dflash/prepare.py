@@ -492,12 +492,16 @@ def _select_pivot(
 ) -> int | None:
     """Pick a pivot inside the right-padded prefix shared by every batch row.
 
-    Returns ``None`` when no row has at least ``2 * block_size + 1`` real
-    tokens in its prefix — the caller should skip the batch in that case
-    rather than forcing a degenerate pivot. The pivot range is
-    ``[block_size, min_real_len - block_size - 1]`` (inclusive) so that
-    every row has both a real ``pending`` token at position ``p`` and
-    real targets at positions ``p+1..p+block_size``.
+    Returns ``None`` when the pivot range is empty — the caller should
+    skip the batch in that case rather than forcing a degenerate pivot.
+    The pivot range is ``[max(block_size, min_pivot), min_real_len -
+    block_size - 1]`` (inclusive) so that every row has both a real
+    ``pending`` token at position ``p`` and real targets at positions
+    ``p+1..p+block_size``. With ``min_pivot=0`` (the legacy default)
+    the empty-range condition reduces to "no row has at least
+    ``2 * block_size + 1`` real tokens"; with ``min_pivot > block_size``
+    it additionally requires ``min_real_len >= min_pivot + block_size +
+    1``.
 
     Scans from the right to find the trailing-pad boundary (reversed
     argmax for the first non-pad position) rather than counting
@@ -1147,12 +1151,15 @@ def prepare_dflash_draft(
                 logger.error(
                     "DFlash training aborted: %d consecutive batches "
                     "skipped without a real gradient update before "
-                    "reaching %d/%d steps. Every batch had at least one "
-                    "row shorter than 2*block_size + 1 = %d real tokens. "
+                    "reaching %d/%d steps. Every batch's pivot range "
+                    "was empty: no row had 2*block_size + 1 = %d real "
+                    "tokens (self-generate batches additionally need "
+                    "pivot_lo + block_size + 1 tokens past the prompt). "
                     "Likely causes: a dataset of uniformly short sequences, "
-                    "a misconfigured --block-size, or a tokenizer whose "
-                    "pad token coincides with the loader's actual pad. "
-                    "Inspect the dataset or lower --block-size.",
+                    "a misconfigured --block-size, too-small "
+                    "--selfgen-max-new, or a tokenizer whose pad token "
+                    "coincides with the loader's actual pad. Inspect the "
+                    "dataset or lower --block-size.",
                     consecutive_skips,
                     real_step,
                     steps,
@@ -1253,13 +1260,15 @@ def prepare_dflash_draft(
                     min_pivot=pivot_lo,
                 )
                 if pivot_list is None:
-                    # Every row was shorter than 2*block_size + 1 real
-                    # tokens; no window fits. Skip the batch.
+                    # Empty pivot range: no row has 2*block_size + 1
+                    # real tokens (or, with pivot_lo, enough tokens past
+                    # the prompt region). No window fits — skip.
                     logger.debug(
-                        "skipping all-padding batch before real step %d "
-                        "(no row has %d+ real tokens)",
+                        "skipping batch before real step %d: empty pivot "
+                        "range (need %d+ real tokens, pivot_lo=%d)",
                         real_step + 1,
-                        2 * block_size + 1,
+                        max(block_size, pivot_lo) + block_size + 1,
+                        pivot_lo,
                     )
                     consecutive_skips += 1
                     continue
@@ -1355,9 +1364,11 @@ def prepare_dflash_draft(
     if real_step == 0:
         logger.warning(
             "No real gradient steps completed for %s — every batch was "
-            "skipped (each row had fewer than %d real tokens). The saved "
-            "checkpoint is essentially the random init. Check the dataset "
-            "and --block-size (currently %d).",
+            "skipped (empty pivot range: each row had fewer than %d real "
+            "tokens, or — for self-generate batches — too few tokens past "
+            "the prompt region). The saved checkpoint is essentially the "
+            "random init. Check the dataset and --block-size (currently "
+            "%d).",
             model_path,
             2 * block_size + 1,
             block_size,
