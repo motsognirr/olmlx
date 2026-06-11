@@ -58,6 +58,44 @@ class TestKScoreKernel:
         assert mx.allclose(got, want, atol=2e-3, rtol=1e-3)
 
 
+class TestVAccumKernel:
+    @pytest.mark.parametrize("bits", [2, 4, 8])
+    def test_matches_reference(self, bits):
+        from olmlx.engine.shardquant_fused import shard_middle_weighted_v_ref
+        from olmlx.engine.shardquant_kernels import shard_middle_weighted_v_kernel
+
+        D, H, G = 64, 2, 3
+        cache = _make_cache(D=D, H=H, bits=bits)
+        _feed(cache, 80, D=D, H=H, step=7)
+        m = cache._mid_len
+        se = 10
+        mx.random.seed(9)
+        w_full = mx.softmax(mx.random.normal((1, H, G, se + m)), axis=-1)
+
+        want = shard_middle_weighted_v_ref(w_full[..., se:], cache)
+        got = shard_middle_weighted_v_kernel(w_full, se, cache)
+        assert got.shape == want.shape
+        assert mx.allclose(got, want, atol=2e-4, rtol=1e-3), float(
+            mx.abs(got - want).max()
+        )
+
+    def test_multi_chunk_partials(self, monkeypatch):
+        # Force several j-chunks so the partial-sum reduction is exercised.
+        from olmlx.engine import shardquant_kernels as sk
+        from olmlx.engine.shardquant_fused import shard_middle_weighted_v_ref
+
+        monkeypatch.setattr(sk, "_V_JCHUNK", 16)
+        D, H = 64, 2
+        cache = _make_cache(D=D, H=H, bits=4)
+        _feed(cache, 120, D=D, H=H, step=8)
+        m = cache._mid_len
+        mx.random.seed(10)
+        w_full = mx.softmax(mx.random.normal((1, H, 2, 5 + m)), axis=-1)
+        want = shard_middle_weighted_v_ref(w_full[..., 5:], cache)
+        got = sk.shard_middle_weighted_v_kernel(w_full, 5, cache)
+        assert mx.allclose(got, want, atol=2e-4, rtol=1e-3)
+
+
 class TestKernelGate:
     def test_supported_predicate(self):
         from olmlx.engine.shardquant_kernels import kernels_supported
