@@ -207,6 +207,22 @@ class TestCycleTrainingBatches:
             assert pivot_lo <= 9  # the bad row's plen=48 never appears
             assert int((ids[0] != 0).sum().item()) != 50
 
+    def test_pivot_lo_clamped_to_keep_pivot_range_nonempty(self):
+        # Each row clears its OWN prompt (len >= plen + block_size + 1),
+        # but a length-distribution gap can pair a long-prompt row with
+        # a shorter row in one bucket: max(plen)=80 > 60 - 4 - 1, so an
+        # unclamped pivot_lo would empty the pivot range and skip the
+        # batch. The bucket floor is clamped to shortest - block_size - 1.
+        seqs = [
+            (list(range(2, 102)), 80),  # len 100, plen 80 (80+5 <= 100)
+            (list(range(2, 62)), 5),  # len 60, plen 5
+        ]
+        it = cycle_training_batches(seqs, batch_size=2, pad_token_id=0, block_size=4)
+        ids, pivot_lo = next(it)
+        assert pivot_lo == 60 - 4 - 1
+        # the clamped floor leaves a valid pivot range for _select_pivots
+        assert _select_pivots(ids, 0, 4, 2, min_pivot=pivot_lo) is not None
+
     def test_cycles_forever(self):
         it = cycle_training_batches(
             self._seqs(), batch_size=2, pad_token_id=0, block_size=4

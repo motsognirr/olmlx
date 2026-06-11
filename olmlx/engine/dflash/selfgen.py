@@ -283,7 +283,18 @@ def cycle_training_batches(
             rows.append(rows[len(rows) % orig])
         m = max(len(s) for s, _ in rows)
         padded = [s + [pad_token_id] * (m - len(s)) for s, _ in rows]
-        buckets.append((padded, max(plen for _, plen in rows)))
+        # Clamp the bucket's pivot floor so the pivot range can never be
+        # empty: the per-sequence filter guarantees each row clears its
+        # OWN prompt by block_size + 1 tokens, but the bucket floor is
+        # the max prompt length across rows, and sorted-by-length
+        # bucketing can still pair a long-prompt row with a shorter row
+        # when the length distribution has gaps — ``_select_pivots``
+        # would then skip the whole batch. Clamping trades that silent
+        # skip for a few windows that may overlap the long-prompt row's
+        # prompt region (the pre-pivot_lo behavior for that row alone).
+        shortest = min(len(s) for s, _ in rows)
+        pivot_lo = min(max(plen for _, plen in rows), shortest - block_size - 1)
+        buckets.append((padded, pivot_lo))
     rng = random.Random(seed)
     while True:
         rng.shuffle(buckets)
