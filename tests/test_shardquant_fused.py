@@ -160,3 +160,117 @@ class TestFusedCacheMode:
         sig = inspect.signature(make_shard_cache)
         assert "fused" in sig.parameters
         assert sig.parameters["fused"].default is False
+
+
+class TestSdpaPatch:
+    def _model_with_module(self):
+        """A fake mlx-lm-style model: layers whose class module defines a
+        module-global scaled_dot_product_attention."""
+        import sys
+        import types
+
+        mod = types.ModuleType("fake_mlx_model_mod")
+
+        calls = []
+
+        def sdpa(queries, keys, values, cache, scale, mask, sinks=None):
+            calls.append((queries, keys, values, cache, scale, mask, sinks))
+            return queries
+
+        mod.scaled_dot_product_attention = sdpa
+        mod._calls = calls
+
+        class Layer:
+            pass
+
+        Layer.__module__ = mod.__name__
+        sys.modules[mod.__name__] = mod
+
+        class Model:
+            layers = [Layer(), Layer()]
+
+        return Model(), mod
+
+    def test_install_patches_and_is_idempotent(self):
+        from olmlx.engine.shardquant_fused import install_fused_sdpa
+
+        model, mod = self._model_with_module()
+        orig = mod.scaled_dot_product_attention
+        assert install_fused_sdpa(model) == 1
+        assert mod.scaled_dot_product_attention is not orig
+        patched = mod.scaled_dot_product_attention
+        assert install_fused_sdpa(model) == 1
+        assert mod.scaled_dot_product_attention is patched  # no double wrap
+
+    def test_non_handle_calls_delegate_to_original(self):
+        from olmlx.engine.shardquant_fused import install_fused_sdpa
+
+        model, mod = self._model_with_module()
+        install_fused_sdpa(model)
+        q = mx.zeros((1, 2, 1, 8))
+        out = mod.scaled_dot_product_attention(
+            q, q, q, cache=None, scale=1.0, mask=None
+        )
+        assert out is q and len(mod._calls) == 1
+
+    def test_handle_dispatches_to_fused_path(self):
+        from olmlx.engine.shardquant_cache import ShardFusedKV
+        from olmlx.engine.shardquant_fused import install_fused_sdpa
+
+        model, mod = self._model_with_module()
+        install_fused_sdpa(model)
+        D, H, nq = 64, 2, 4
+        cache = _make_cache(D=D, H=H)
+        cache.fused = True
+        _feed(cache, 30, D=D, H=H, step=10)
+        k1 = mx.random.normal((1, H, 1, D)).astype(mx.float16)
+        h, _ = cache.update_and_fetch(k1, k1)
+        assert isinstance(h, ShardFusedKV)
+        q = _grouped_q(nq, D)
+        out = mod.scaled_dot_product_attention(
+            q, h, h, cache=cache, scale=D**-0.5, mask=None
+        )
+        assert isinstance(out, mx.array) and out.shape == (1, nq, 1, D)
+        assert len(mod._calls) == 0  # did not delegate
+
+    def test_handle_with_sinks_falls_back_via_materialize(self):
+        from olmlx.engine.shardquant_fused import install_fused_sdpa
+
+        model, mod = self._model_with_module()
+        install_fused_sdpa(model)
+        D, H = 64, 2
+        cache = _make_cache(D=D, H=H)
+        cache.fused = True
+        _feed(cache, 30, D=D, H=H, step=10)
+        k1 = mx.random.normal((1, H, 1, D)).astype(mx.float16)
+        h, _ = cache.update_and_fetch(k1, k1)
+        q = _grouped_q(4, D)
+        mod.scaled_dot_product_attention(
+            q, h, h, cache=cache, scale=1.0, mask=None, sinks=mx.zeros((4,))
+        )
+        # Delegated to the original with materialized arrays.
+        _, keys, _values, *_ = mod._calls[-1]
+        assert isinstance(keys, mx.array)
+        assert keys.shape[2] == cache.offset
+
+    def test_unpatched_consumer_fails_loud(self):
+        D, H = 64, 2
+        cache = _make_cache(D=D, H=H)
+        cache.fused = True
+        _feed(cache, 30, D=D, H=H, step=10)
+        k1 = mx.random.normal((1, H, 1, D)).astype(mx.float16)
+        h, _ = cache.update_and_fetch(k1, k1)
+        q = _grouped_q(4, D)
+        with pytest.raises((TypeError, ValueError)):
+            mx.fast.scaled_dot_product_attention(q, h, h, scale=1.0, mask=None)
+
+    def test_install_returns_zero_without_module_sdpa(self):
+        from olmlx.engine.shardquant_fused import install_fused_sdpa
+
+        class Layer:
+            pass  # module = tests.* — has no scaled_dot_product_attention
+
+        class Model:
+            layers = [Layer()]
+
+        assert install_fused_sdpa(Model()) == 0

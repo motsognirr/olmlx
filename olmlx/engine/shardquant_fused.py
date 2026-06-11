@@ -9,6 +9,9 @@ fallback for unsupported configurations — identical math, Tier-1 cost.
 
 from __future__ import annotations
 
+import functools
+import logging
+import sys
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
@@ -16,11 +19,16 @@ import mlx.core as mx
 if TYPE_CHECKING:
     from olmlx.engine.shardquant_cache import ShardFusedKV, ShardKVCache
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "fused_sdpa_decode",
+    "install_fused_sdpa",
     "shard_middle_scores_ref",
     "shard_middle_weighted_v_ref",
 ]
+
+_PATCH_MARKER = "_olmlx_shard_fused_patch"
 
 
 def shard_middle_scores_ref(qg: mx.array, cache: ShardKVCache) -> mx.array:
@@ -109,3 +117,54 @@ def fused_sdpa_decode(
     se = s_exact.shape[-1]
     out = w[..., :se] @ v_e + _middle_weighted_v(w[..., se:], cache, backend)
     return out.reshape(B, nq, L, D).astype(queries.dtype)
+
+
+def _fused_wrapper(orig):
+    @functools.wraps(orig)
+    def wrapper(
+        queries, keys, values, cache=None, scale=1.0, mask=None, sinks=None, **kwargs
+    ):
+        from olmlx.engine.shardquant_cache import ShardFusedKV
+
+        if not isinstance(keys, ShardFusedKV):
+            return orig(queries, keys, values, cache, scale, mask, sinks=sinks, **kwargs)
+        handle = keys
+        if sinks is not None or mask is not None:
+            # Not fuse-eligible (attention sinks / explicit mask):
+            # materialize the Tier-1 view and delegate — correct, slower.
+            k, v = handle.cache.materialize(queries.dtype)
+            return orig(queries, k, v, cache, scale, mask, sinks=sinks, **kwargs)
+        return fused_sdpa_decode(queries, handle, scale)
+
+    setattr(wrapper, _PATCH_MARKER, True)
+    wrapper._olmlx_orig = orig
+    return wrapper
+
+
+def install_fused_sdpa(model) -> int:
+    """Swap each layer-defining module's ``scaled_dot_product_attention``
+    for the handle-aware wrapper.
+
+    mlx-lm model modules bind the function as a module global at import
+    time (``from .base import scaled_dot_product_attention``), so the swap
+    must happen on each model module, not on ``mlx_lm.models.base``.
+    Idempotent; the wrapper delegates every non-handle call to the
+    original, so it is inert for non-shard models sharing the module.
+
+    Returns the number of modules carrying the patch (0 = fused mode
+    cannot work for this model — the caller must demote to Tier-1).
+    """
+    patched = 0
+    seen: set[int] = set()
+    for layer in getattr(model, "layers", []):
+        mod = sys.modules.get(type(layer).__module__)
+        if mod is None or id(mod) in seen:
+            continue
+        seen.add(id(mod))
+        fn = getattr(mod, "scaled_dot_product_attention", None)
+        if fn is None:
+            continue
+        if not getattr(fn, _PATCH_MARKER, False):
+            mod.scaled_dot_product_attention = _fused_wrapper(fn)
+        patched += 1
+    return patched

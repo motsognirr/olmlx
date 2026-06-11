@@ -378,6 +378,17 @@ def make_shard_cache(
 
     calibration, meta = load_shard_calibration(Path(calibration_dir))
 
+    if fused:
+        from olmlx.engine.shardquant_fused import install_fused_sdpa
+
+        if install_fused_sdpa(model) == 0:
+            logger.warning(
+                "Shard fused decode requested but no attention module "
+                "exposes scaled_dot_product_attention; falling back to "
+                "the Tier-1 dequantize-on-read path."
+            )
+            fused = False
+
     # _find_shard_dir raises on mismatch for the server path; warn here for
     # direct callers (mirrors make_spectral_cache).
     cal_bits = meta.get("bits")
