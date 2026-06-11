@@ -26,6 +26,10 @@ __all__ = [
     "vq_assign",
     "vq_gather",
     "scalar_assign",
+    "shard_compress_keys",
+    "shard_decompress_keys",
+    "shard_compress_values",
+    "shard_decompress_values",
     "pack_indices",
     "unpack_indices",
 ]
@@ -249,3 +253,97 @@ def scalar_assign(y: mx.array, codebook: mx.array) -> mx.array:
         dists = mx.abs(yc[..., None] - codebook)
         chunks.append(mx.argmin(dists, axis=-1).astype(mx.uint8))
     return mx.concatenate(chunks, axis=-2) if len(chunks) > 1 else chunks[0]
+
+
+_NORM_EPS = 1e-8
+
+
+def _normalize(x: mx.array) -> tuple[mx.array, mx.array]:
+    """Unit-sphere normalize; returns (normalized float32, float32 norms)."""
+    x32 = x.astype(mx.float32)
+    norms = mx.sqrt(mx.sum(x32 * x32, axis=-1, keepdims=True))
+    eps = mx.array(_NORM_EPS, dtype=mx.float32)
+    return x32 / mx.maximum(norms, eps), norms
+
+
+def shard_compress_keys(
+    keys: mx.array,
+    basis: mx.array,
+    rank: int,
+    codebook: mx.array,
+    bits: int,
+) -> tuple[mx.array, mx.array]:
+    """Compress (already de-roped) keys: normalize -> per-head project ->
+    rank-truncate -> scalar quantize -> bit-pack.
+
+    Args:
+        keys: (B, H, S, D) de-roped keys.
+        basis: (H, D, D), rows = eigenvectors.
+        rank: kept leading coefficients.
+        codebook: (2**bits,) Lloyd-Max centroids for the kept coefficients.
+
+    Returns:
+        (packed, norms): packed uint8 indices (B, H, S, packed_rank) +
+        float32 norms (B, H, S, 1).
+    """
+    xn, norms = _normalize(keys)
+    y = mx.matmul(xn, mx.swapaxes(basis, -1, -2))  # (B,H,S,D) @ (H,D,D)^T
+    idx = scalar_assign(y[..., :rank], codebook)
+    return pack_indices(idx, bits), norms
+
+
+def shard_decompress_keys(
+    packed: mx.array,
+    norms: mx.array,
+    basis: mx.array,
+    rank: int,
+    codebook: mx.array,
+    bits: int,
+    dtype: mx.Dtype | None = None,
+) -> mx.array:
+    """Inverse of shard_compress_keys (still in the no-RoPE basis)."""
+    idx = unpack_indices(packed, bits, rank)
+    y = codebook[idx.astype(mx.uint32)]
+    d = basis.shape[-1]
+    if rank < d:
+        pad = mx.zeros((*y.shape[:-1], d - rank), dtype=y.dtype)
+        y = mx.concatenate([y, pad], axis=-1)
+    x = mx.matmul(y, basis) * norms
+    return x.astype(dtype) if dtype is not None else x
+
+
+def shard_compress_values(
+    values: mx.array,
+    rotation: mx.array,
+    codebooks: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Compress values: normalize -> rotate -> product VQ.
+
+    Args:
+        values: (B, H, S, D).
+        rotation: (D, D) orthonormal (rows = basis).
+        codebooks: (P, K, g) with P * g == D.
+
+    Returns:
+        (idx, norms): uint8 indices (B, H, S, P) + float32 norms (B, H, S, 1).
+    """
+    p, _, g = codebooks.shape
+    xn, norms = _normalize(values)
+    rotated = xn @ rotation.T
+    sub = rotated.reshape(*rotated.shape[:-1], p, g)
+    return vq_assign(sub, codebooks), norms
+
+
+def shard_decompress_values(
+    idx: mx.array,
+    norms: mx.array,
+    rotation: mx.array,
+    codebooks: mx.array,
+    dtype: mx.Dtype | None = None,
+) -> mx.array:
+    """Inverse of shard_compress_values."""
+    sub = vq_gather(idx, codebooks)
+    d = rotation.shape[0]
+    rotated = sub.reshape(*sub.shape[:-2], d)
+    x = (rotated @ rotation) * norms
+    return x.astype(dtype) if dtype is not None else x

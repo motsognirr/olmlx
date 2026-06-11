@@ -216,6 +216,136 @@ class TestProductVQ:
         assert np.isfinite(np.array(cbs)).all()
 
 
+def _random_orthogonal(dim, seed):
+    rng = np.random.RandomState(seed)
+    q, _ = np.linalg.qr(rng.randn(dim, dim).astype(np.float32))
+    return q
+
+
+class TestKeyCompress:
+    def test_roundtrip_high_quality_full_rank_8bit(self):
+        """Full rank + 8-bit: reconstruction within scalar-quant error."""
+        from olmlx.engine.shardquant import (
+            shard_compress_keys,
+            shard_decompress_keys,
+        )
+        from olmlx.engine.spectralquant import fit_codebook
+
+        B, H, S, D = 1, 2, 50, 32
+        basis = mx.array(
+            np.stack([_random_orthogonal(D, h) for h in range(H)])
+        )  # (H, D, D)
+        mx.random.seed(5)
+        x = mx.random.normal((B, H, S, D))
+        # Codebook fit on the actual rotated coefficients.
+        x32 = x.astype(mx.float32)
+        xn = x32 / mx.sqrt(mx.sum(x32 * x32, axis=-1, keepdims=True))
+        y = mx.matmul(xn, mx.swapaxes(basis, -1, -2))
+        cb = fit_codebook(y.reshape(-1), bits=8)
+
+        packed, norms = shard_compress_keys(x, basis, rank=D, codebook=cb, bits=8)
+        assert norms.shape == (B, H, S, 1)
+        recon = shard_decompress_keys(
+            packed, norms, basis, rank=D, codebook=cb, bits=8, dtype=x.dtype
+        )
+        assert recon.shape == x.shape
+        cos = np.sum(np.array(recon) * np.array(x), -1) / (
+            np.linalg.norm(np.array(recon), axis=-1)
+            * np.linalg.norm(np.array(x), axis=-1)
+        )
+        assert cos.mean() > 0.99
+
+    def test_rank_truncation_on_low_rank_data(self):
+        """Data living in an r-dim subspace survives rank-r truncation."""
+        from olmlx.engine.shardquant import (
+            shard_compress_keys,
+            shard_decompress_keys,
+        )
+        from olmlx.engine.spectralquant import fit_codebook
+
+        B, H, S, D, R = 1, 1, 200, 16, 4
+        rng = np.random.RandomState(7)
+        Q = _random_orthogonal(D, 9)
+        coeffs = rng.randn(S, R).astype(np.float32)
+        data = coeffs @ Q[:R, :]  # rows of Q span the subspace
+        x = mx.array(data.reshape(B, H, S, D))
+        basis = mx.array(Q.reshape(1, D, D))  # rows = basis vectors
+        xn = np.array(x) / np.linalg.norm(np.array(x), axis=-1, keepdims=True)
+        y = mx.array(xn) @ mx.array(Q.T)
+        cb = fit_codebook(mx.array(np.array(y)[..., :R].reshape(-1)), bits=4)
+
+        packed, norms = shard_compress_keys(x, basis, rank=R, codebook=cb, bits=4)
+        # Packed coefficient payload is rank-sized, not head_dim-sized.
+        assert packed.shape[-1] == R // 2  # 4-bit pack: 2 per byte
+        recon = shard_decompress_keys(
+            packed, norms, basis, rank=R, codebook=cb, bits=4, dtype=x.dtype
+        )
+        cos = np.sum(np.array(recon) * np.array(x), -1) / (
+            np.linalg.norm(np.array(recon), axis=-1)
+            * np.linalg.norm(np.array(x), axis=-1)
+        )
+        assert cos.mean() > 0.9
+
+    def test_per_head_bases_are_independent(self):
+        """Head h must be projected with basis[h], not basis[0]."""
+        from olmlx.engine.shardquant import (
+            shard_compress_keys,
+            shard_decompress_keys,
+        )
+        from olmlx.engine.spectralquant import fit_codebook
+
+        D = 8
+        basis = mx.array(
+            np.stack([np.eye(D, dtype=np.float32), _random_orthogonal(D, 1)])
+        )
+        mx.random.seed(8)
+        x = mx.random.normal((1, 2, 30, D))
+        cb = fit_codebook(mx.random.normal((4000,)) * 0.35, bits=8)
+        packed, norms = shard_compress_keys(x, basis, rank=D, codebook=cb, bits=8)
+        recon = shard_decompress_keys(
+            packed, norms, basis, rank=D, codebook=cb, bits=8, dtype=x.dtype
+        )
+        for h in range(2):
+            cos = np.sum(np.array(recon)[0, h] * np.array(x)[0, h], -1) / (
+                np.linalg.norm(np.array(recon)[0, h], axis=-1)
+                * np.linalg.norm(np.array(x)[0, h], axis=-1)
+            )
+            assert cos.mean() > 0.95, f"head {h} mis-projected"
+
+
+class TestValueCompress:
+    def test_roundtrip_quality(self):
+        from olmlx.engine.shardquant import (
+            fit_vq_codebooks,
+            make_v_rotation,
+            shard_compress_values,
+            shard_decompress_values,
+        )
+
+        B, H, S, D, g = 1, 2, 300, 16, 2
+        R = make_v_rotation(D)
+        mx.random.seed(9)
+        x = mx.random.normal((B, H, S, D)).astype(mx.float16)
+        x32 = np.array(x, dtype=np.float32).reshape(-1, D)
+        xn = x32 / np.linalg.norm(x32, axis=-1, keepdims=True)
+        rotated = xn @ np.array(R).T
+        cbs = fit_vq_codebooks(rotated, group_size=g, seed=0)
+
+        idx, norms = shard_compress_values(x, R, cbs)
+        assert idx.shape == (B, H, S, D // g)
+        assert idx.dtype == mx.uint8
+        recon = shard_decompress_values(idx, norms, R, cbs, dtype=x.dtype)
+        assert recon.shape == x.shape
+        assert recon.dtype == x.dtype
+        cos = np.sum(
+            np.array(recon, dtype=np.float32) * x32.reshape(B, H, S, D), -1
+        ) / (
+            np.linalg.norm(np.array(recon, dtype=np.float32), axis=-1)
+            * np.linalg.norm(x32.reshape(B, H, S, D), axis=-1)
+        )
+        assert cos.mean() > 0.9
+
+
 class TestScalarAssign:
     def test_matches_naive_argmin(self):
         from olmlx.engine.shardquant import scalar_assign
