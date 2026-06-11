@@ -340,6 +340,38 @@ class TestKeyCompress:
             )
             assert cos.mean() > 0.95, f"head {h} mis-projected"
 
+    def test_odd_rank_roundtrip(self):
+        """Rank not a multiple of the pack width: the spectral packers pad
+        the tail and unpack slices it back, so an odd rank must round-trip
+        without corrupting the coefficient count."""
+        from olmlx.engine.shardquant import (
+            shard_compress_keys,
+            shard_decompress_keys,
+        )
+        from olmlx.engine.spectralquant import fit_codebook
+
+        B, H, S, D, R = 1, 2, 40, 16, 5  # 5 is odd; 4-bit packs 2/byte
+        basis = mx.array(np.stack([_random_orthogonal(D, 20 + h) for h in range(H)]))
+        rng = np.random.RandomState(11)
+        coeffs = rng.randn(H, S, R).astype(np.float32)
+        data = np.einsum("hsr,hrd->hsd", coeffs, np.array(basis)[:, :R, :])
+        x = mx.array(data.reshape(B, H, S, D))
+        xn = data / np.linalg.norm(data, axis=-1, keepdims=True)
+        y = np.einsum("hsd,hrd->hsr", xn, np.array(basis)[:, :R, :])
+        cb = fit_codebook(mx.array(y.reshape(-1)), bits=4)
+
+        packed, norms = shard_compress_keys(x, basis, rank=R, codebook=cb, bits=4)
+        assert packed.shape[-1] == (R + 1) // 2  # padded to 3 bytes
+        recon = shard_decompress_keys(
+            packed, norms, basis, rank=R, codebook=cb, bits=4, dtype=x.dtype
+        )
+        assert recon.shape == x.shape
+        cos = np.sum(np.array(recon) * data.reshape(B, H, S, D), -1) / (
+            np.linalg.norm(np.array(recon), axis=-1)
+            * np.linalg.norm(data.reshape(B, H, S, D), axis=-1)
+        )
+        assert cos.mean() > 0.9
+
 
 class TestValueCompress:
     def test_roundtrip_quality(self):

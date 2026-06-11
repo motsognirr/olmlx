@@ -165,6 +165,46 @@ class TestShardKVCacheTrim:
         assert k.shape[2] == 21
         # Sink still exact
         np.testing.assert_array_equal(np.array(k[..., :4, :]), np.array(ks[..., :4, :]))
+        # The retained middle prefix must reconstruct the same tokens it
+        # held before the trim: positions (and thus the RoPE re-application
+        # offsets) are anchored to sink_len + mid index, which trimming
+        # from the end does not shift.
+        mid = np.array(k[..., 4:12, :], dtype=np.float32)
+        ref = np.array(ks[..., 4:12, :], dtype=np.float32)
+        cos = np.sum(mid * ref, -1) / (
+            np.linalg.norm(mid, axis=-1) * np.linalg.norm(ref, axis=-1) + 1e-9
+        )
+        assert cos.mean() > 0.85, f"post-trim middle cosine {cos.mean()}"
+
+    def test_trim_then_refill_overwrites_stale_middle(self):
+        """After trimming into the middle, newly spilled tokens must
+        overwrite the stale compressed entries (and be re-roped at the
+        correct absolute offsets), not resurrect them."""
+        cache = _make_cache(sink=4, window=8)
+        ks, vs, _ = _feed(cache, 40)
+        cache.trim(20)  # offset 20 = 4 sink + 16 middle + 0 window
+        # Refill positions 20..39 with *different* tokens.
+        mx.random.seed(7)
+        ks2 = mx.random.normal((1, 2, 20, 16)).astype(mx.float16)
+        vs2 = mx.random.normal((1, 2, 20, 16)).astype(mx.float16)
+        k = v = None
+        for i in range(20):
+            k, v = cache.update_and_fetch(
+                ks2[..., i : i + 1, :], vs2[..., i : i + 1, :]
+            )
+        assert cache.offset == 40
+        full_ref = np.concatenate(
+            [np.array(ks[..., :20, :]), np.array(ks2)], axis=2
+        ).astype(np.float32)
+        got = np.array(k, dtype=np.float32)
+        # Compressed region (everything but sink and final window) must
+        # track the *new* stream, including across the trim boundary.
+        cos = np.sum(got[..., 4:-8, :] * full_ref[..., 4:-8, :], -1) / (
+            np.linalg.norm(got[..., 4:-8, :], axis=-1)
+            * np.linalg.norm(full_ref[..., 4:-8, :], axis=-1)
+            + 1e-9
+        )
+        assert cos.mean() > 0.85, f"post-trim refill cosine {cos.mean()}"
 
     def test_trim_to_empty(self):
         cache = _make_cache()
@@ -286,6 +326,17 @@ class TestMakeShardCache:
         caches = make_shard_cache(Model(), tmp_path, bits=4)
         assert caches[0] is ssm
         assert isinstance(caches[1], ShardKVCache)
+
+    def test_none_calibration_dir_raises_with_remedy(self):
+        """A store-less manager leaves shard_calibration_dir as None; the
+        factory must fail with the prepare command, not Path(None)."""
+        from olmlx.engine.shardquant_cache import make_shard_cache
+
+        class Model:
+            layers = [object()]
+
+        with pytest.raises(ValueError, match="olmlx shard prepare"):
+            make_shard_cache(Model(), None, bits=4)
 
     def test_missing_layer_calibration_falls_back(self, tmp_path, monkeypatch):
         from mlx_lm.models.cache import KVCache

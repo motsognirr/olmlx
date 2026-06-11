@@ -301,6 +301,15 @@ def make_shard_cache(model: Any, calibration_dir: Path, bits: int) -> list:
     """
     from olmlx.engine.shardquant_calibrate import load_shard_calibration
 
+    if calibration_dir is None:
+        # Reachable when ModelManager has no store (_find_shard_dir returns
+        # None instead of raising); fail with the remedy rather than an
+        # opaque Path(None) TypeError downstream.
+        raise ValueError(
+            "Shard KV quant configured but no calibration directory was "
+            "resolved. Run 'olmlx shard prepare <model>' and retry."
+        )
+
     calibration, meta = load_shard_calibration(Path(calibration_dir))
 
     # _find_shard_dir raises on mismatch for the server path; warn here for
