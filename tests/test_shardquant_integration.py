@@ -107,3 +107,45 @@ class TestFindShardDir:
         assert issubclass(
             ShardCalibrationMissingError, SpectralCalibrationMissingError
         )
+
+
+class TestCliShardPrepare:
+    def test_shard_prepare_invokes_calibration(self, tmp_path):
+        from olmlx import cli
+
+        args = SimpleNamespace(
+            model="org/model",
+            samples=8,
+            bits=4,
+            calibration_dataset=None,
+            max_tokens=1024,
+        )
+        store = MagicMock()
+        store.registry.resolve.return_value = None
+        store.ensure_downloaded.return_value = tmp_path
+        with (
+            patch.object(cli, "_create_store", return_value=store),
+            patch.object(cli, "_configure_logging"),
+            patch(
+                "olmlx.engine.shardquant_calibrate.calibrate_model_shard",
+                return_value=tmp_path / "shard",
+            ) as cal,
+        ):
+            cli.cmd_shard_prepare(args)
+        cal.assert_called_once_with(
+            model_path=str(tmp_path),
+            num_samples=8,
+            calibration_dataset=None,
+            bits=4,
+            max_tokens_per_head=1024,
+            progress_callback=cli._flash_progress,
+        )
+
+    def test_parser_accepts_shard_prepare(self):
+        from olmlx.cli import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(["shard", "prepare", "org/model", "--bits", "8"])
+        assert args.bits == 8
+        assert args.model == "org/model"
+        assert args.shard_command == "prepare"
