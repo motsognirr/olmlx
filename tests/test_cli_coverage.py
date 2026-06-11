@@ -230,6 +230,24 @@ class TestDflashPrepareValidation:
         with pytest.raises(SystemExit, match="train-windows-per-step must be >= 1"):
             cmd_dflash_prepare(args)
 
+    def test_self_generate_rejects_use_precomputed_before_download(self):
+        # The function-level guard in prepare_dflash_draft fires only
+        # after ensure_downloaded(); the CLI must reject the combination
+        # before paying a multi-GB target download.
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "dflash",
+                "prepare",
+                "some/model",
+                "--self-generate",
+                "--use-precomputed",
+                "/tmp/shards",
+            ]
+        )
+        with pytest.raises(SystemExit, match="mutually exclusive"):
+            cmd_dflash_prepare(args)
+
 
 class TestEaglePrepareValidation:
     def _args(self, **overrides):

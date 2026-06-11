@@ -488,15 +488,20 @@ def _select_pivot(
     input_ids: mx.array,
     pad_token_id: int,
     block_size: int,
+    min_pivot: int = 0,
 ) -> int | None:
     """Pick a pivot inside the right-padded prefix shared by every batch row.
 
-    Returns ``None`` when no row has at least ``2 * block_size + 1`` real
-    tokens in its prefix — the caller should skip the batch in that case
-    rather than forcing a degenerate pivot. The pivot range is
-    ``[block_size, min_real_len - block_size - 1]`` (inclusive) so that
-    every row has both a real ``pending`` token at position ``p`` and
-    real targets at positions ``p+1..p+block_size``.
+    Returns ``None`` when the pivot range is empty — the caller should
+    skip the batch in that case rather than forcing a degenerate pivot.
+    The pivot range is ``[max(block_size, min_pivot), min_real_len -
+    block_size - 1]`` (inclusive) so that every row has both a real
+    ``pending`` token at position ``p`` and real targets at positions
+    ``p+1..p+block_size``. With ``min_pivot=0`` (the legacy default)
+    the empty-range condition reduces to "no row has at least
+    ``2 * block_size + 1`` real tokens"; with ``min_pivot > block_size``
+    it additionally requires ``min_real_len >= min_pivot + block_size +
+    1``.
 
     Scans from the right to find the trailing-pad boundary (reversed
     argmax for the first non-pad position) rather than counting
@@ -519,6 +524,12 @@ def _select_pivot(
     invalid windows) but loses one valid pivot slot per such row. We
     accept that conservatism rather than carry per-row metadata about
     "true" sequence length through the loader.
+
+    ``min_pivot`` raises the lower bound of the pivot range (used by the
+    self-generate path to keep windows out of the prompt region, whose
+    dataset-text tokens the draft cannot and should not learn to
+    predict). ``0`` preserves the legacy ``[block_size, …]`` range
+    bit-exactly.
 
     Costs one CPU sync per call (``min().item()``) — unavoidable because
     Python's ``random.randint`` requires a host int. We accept that
@@ -556,9 +567,11 @@ def _select_pivot(
     )
     real_lens = mx.array(seq_len, dtype=mx.int32) - trailing_pads
     min_real = int(real_lens.min().item())
-    if min_real < 2 * block_size + 1:
+    lo = max(block_size, min_pivot)
+    hi = min_real - block_size - 1  # inclusive
+    if hi < lo:
         return None
-    return random.randint(block_size, min_real - block_size - 1)
+    return random.randint(lo, hi)
 
 
 def _select_pivots(
@@ -566,6 +579,7 @@ def _select_pivots(
     pad_token_id: int,
     block_size: int,
     num_windows: int,
+    min_pivot: int = 0,
 ) -> list[int] | None:
     """Pick up to ``num_windows`` non-overlapping pivots in the shared
     unpadded prefix via slot-and-jitter placement.
@@ -593,11 +607,16 @@ def _select_pivots(
     This also preserves the monkey-patch behaviour the existing
     ``test_target_hidden_slice_excludes_pending_position`` test relies
     on.
+
+    ``min_pivot`` raises the lower bound of the pivot range exactly as
+    in ``_select_pivot`` (the self-generate path threads each batch's
+    ``pivot_lo`` here to keep windows out of the prompt region); ``0``
+    preserves the legacy range bit-exactly.
     """
     if num_windows <= 0:
         raise ValueError(f"num_windows must be >= 1, got {num_windows}")
     if num_windows == 1:
-        p = _select_pivot(input_ids, pad_token_id, block_size)
+        p = _select_pivot(input_ids, pad_token_id, block_size, min_pivot=min_pivot)
         return None if p is None else [p]
 
     # Replicate the trailing-pad detection from _select_pivot. We can't
@@ -615,11 +634,11 @@ def _select_pivots(
     )
     real_lens = mx.array(seq_len, dtype=mx.int32) - trailing_pads
     min_real = int(real_lens.min().item())
-    if min_real < 2 * block_size + 1:
-        return None
 
-    lo = block_size
+    lo = max(block_size, min_pivot)
     hi = min_real - block_size - 1  # inclusive
+    if hi < lo:
+        return None
     range_size = hi - lo + 1
 
     # Cap num_windows by what actually fits non-overlapping. Each
@@ -697,8 +716,13 @@ def prepare_dflash_draft(
     position_decay_gamma: float | None = None,
     train_windows_per_step: int = 1,
     use_precomputed: str | Path | None = None,
+    self_generate: bool = False,
+    selfgen_num_seqs: int = 1500,
+    selfgen_max_new: int = 640,
+    selfgen_group_size: int = 16,
     _target_loader: Callable[[str], tuple[Any, Any]] | None = None,
     _batch_iterator: Any = None,
+    _prompt_iter: Any = None,
 ) -> Path:
     """Train a DFlash draft model and write it to disk.
 
@@ -731,6 +755,17 @@ def prepare_dflash_draft(
     from this directory instead of running the target each step. Skips
     target instantiation entirely.
 
+    ``self_generate``: build the training set from responses GENERATED
+    BY THE TARGET (greedy) instead of ground-truth dataset text — the
+    upstream recipe ("for better target alignment"). Dataset prompts
+    are chat-templated, the target greedy-decodes ``selfgen_max_new``
+    tokens per prompt (batched, ``selfgen_group_size`` rows at a time),
+    and training windows are restricted to the response region via the
+    per-batch ``pivot_lo``. Empirically decisive for acceptance:
+    ground-truth training produced ~0.4% acceptance drafts. The
+    sequence set is cycled (reshuffled per epoch) until ``steps`` is
+    exhausted. Incompatible with ``use_precomputed``.
+
     ``_target_loader`` and ``_batch_iterator`` are injection hooks for
     tests so the trainer can run without downloading a multi-GB target
     and without hitting the network. In normal use the trainer
@@ -741,6 +776,17 @@ def prepare_dflash_draft(
             "--distill requires running the target online for vocab-size "
             "logits and is incompatible with --use-precomputed (which "
             "stores hidden states only). Re-run with one or the other."
+        )
+    if self_generate and use_precomputed is not None:
+        raise ValueError(
+            "self_generate builds its training set by running the target "
+            "online and is incompatible with use_precomputed (whose shards "
+            "were captured over a different token stream). Re-run with one "
+            "or the other."
+        )
+    if self_generate and _batch_iterator is not None:
+        raise ValueError(
+            "self_generate and _batch_iterator are mutually exclusive batch sources."
         )
     if not 0.0 <= distill_alpha <= 1.0:
         raise ValueError(f"distill_alpha must be in [0, 1], got {distill_alpha}")
@@ -951,6 +997,55 @@ def prepare_dflash_draft(
     # ``_batch_iterator`` test hook bypasses both real data sources.
     if _batch_iterator is not None:
         batches = _batch_iterator
+    elif self_generate:
+        from olmlx.engine.dflash.selfgen import (
+            cycle_training_batches,
+            generate_training_sequences,
+            iter_dataset_prompts,
+        )
+
+        prompts = (
+            _prompt_iter
+            if _prompt_iter is not None
+            else iter_dataset_prompts(
+                tokenizer,
+                dataset=dataset or "HuggingFaceH4/ultrachat_200k",
+                split=dataset_split or "train_sft",
+            )
+        )
+        logger.info(
+            "Self-generating %d training sequences with the target "
+            "(max_new=%d, group_size=%d) — one-time cost before training.",
+            selfgen_num_seqs,
+            selfgen_max_new,
+            selfgen_group_size,
+        )
+        sequences = generate_training_sequences(
+            target,
+            tokenizer,
+            prompts=prompts,
+            num_seqs=selfgen_num_seqs,
+            max_new=selfgen_max_new,
+            group_size=selfgen_group_size,
+            progress_callback=progress_callback,
+        )
+        # ``sequences_pad`` is the id the cycling batcher right-pads
+        # with; 0 is the fallback when the tokenizer exposes neither pad
+        # nor eos (reachable with an explicit ``mask_token_id``).
+        sequences_pad = pad_for_pivot if pad_for_pivot is not None else 0
+        batches = cycle_training_batches(
+            sequences,
+            batch_size,
+            pad_token_id=sequences_pad,
+            block_size=block_size,
+        )
+        # The batches above are right-padded with ``sequences_pad``, so
+        # the training loop must take the pad-aware ``_select_pivots``
+        # path even when the tokenizer itself reported no pad token —
+        # the inline unpadded sampler would otherwise let pivots land
+        # inside the padding region and (with ``pad_for_loss`` also
+        # ``None`` here) train the draft on pad targets unmasked.
+        pad_for_pivot = sequences_pad
     elif use_precomputed is not None:
         from olmlx.engine.dflash.precompute import (
             iter_precomputed_shards,
@@ -1066,12 +1161,15 @@ def prepare_dflash_draft(
                 logger.error(
                     "DFlash training aborted: %d consecutive batches "
                     "skipped without a real gradient update before "
-                    "reaching %d/%d steps. Every batch had at least one "
-                    "row shorter than 2*block_size + 1 = %d real tokens. "
+                    "reaching %d/%d steps. Every batch's pivot range "
+                    "was empty: no row had 2*block_size + 1 = %d real "
+                    "tokens (self-generate batches additionally need "
+                    "pivot_lo + block_size + 1 tokens past the prompt). "
                     "Likely causes: a dataset of uniformly short sequences, "
-                    "a misconfigured --block-size, or a tokenizer whose "
-                    "pad token coincides with the loader's actual pad. "
-                    "Inspect the dataset or lower --block-size.",
+                    "a misconfigured --block-size, too-small "
+                    "--selfgen-max-new, or a tokenizer whose pad token "
+                    "coincides with the loader's actual pad. Inspect the "
+                    "dataset or lower --block-size.",
                     consecutive_skips,
                     real_step,
                     steps,
@@ -1087,7 +1185,16 @@ def prepare_dflash_draft(
             # ``_select_pivot`` below may reject the batch entirely. Running
             # the target before the pivot check would burn a full forward pass
             # for every pad-only batch.
-            if isinstance(batch, tuple):
+            pivot_lo = 0
+            if isinstance(batch, tuple) and isinstance(batch[1], int):
+                # ``(input_ids, pivot_lo)`` batches from the
+                # self-generate path: the int is the batch's max prompt
+                # length, restricting training windows to the response
+                # region. The target still runs online, so distillation
+                # composes fine with this shape.
+                input_ids, pivot_lo = batch
+                precomputed_hidden = None
+            elif isinstance(batch, tuple):
                 # Tuple batches come from precomputed shards or a
                 # ``_batch_iterator`` test hook; neither carries logits,
                 # so distillation can't run. The
@@ -1125,7 +1232,7 @@ def prepare_dflash_draft(
             #   the MLX-side trailing-pad detection.
             seq = input_ids.shape[1]
             if pad_for_pivot is None:
-                lo = block_size
+                lo = max(block_size, pivot_lo)
                 hi_inclusive = seq - block_size - 1
                 if hi_inclusive < lo:
                     raise ValueError(
@@ -1160,15 +1267,18 @@ def prepare_dflash_draft(
                     pad_for_pivot,
                     block_size,
                     train_windows_per_step,
+                    min_pivot=pivot_lo,
                 )
                 if pivot_list is None:
-                    # Every row was shorter than 2*block_size + 1 real
-                    # tokens; no window fits. Skip the batch.
+                    # Empty pivot range: no row has 2*block_size + 1
+                    # real tokens (or, with pivot_lo, enough tokens past
+                    # the prompt region). No window fits — skip.
                     logger.debug(
-                        "skipping all-padding batch before real step %d "
-                        "(no row has %d+ real tokens)",
+                        "skipping batch before real step %d: empty pivot "
+                        "range (need %d+ real tokens, pivot_lo=%d)",
                         real_step + 1,
-                        2 * block_size + 1,
+                        max(block_size, pivot_lo) + block_size + 1,
+                        pivot_lo,
                     )
                     consecutive_skips += 1
                     continue
@@ -1264,9 +1374,11 @@ def prepare_dflash_draft(
     if real_step == 0:
         logger.warning(
             "No real gradient steps completed for %s — every batch was "
-            "skipped (each row had fewer than %d real tokens). The saved "
-            "checkpoint is essentially the random init. Check the dataset "
-            "and --block-size (currently %d).",
+            "skipped (empty pivot range: each row had fewer than %d real "
+            "tokens, or — for self-generate batches — too few tokens past "
+            "the prompt region). The saved checkpoint is essentially the "
+            "random init. Check the dataset and --block-size (currently "
+            "%d).",
             model_path,
             2 * block_size + 1,
             block_size,

@@ -928,8 +928,8 @@ class TestSliceMatchesInferenceConvention:
         observed_pivots: list[int] = []
         original_select = prepare_mod._select_pivot
 
-        def recording_select(input_ids, pad_token_id, block_size):
-            p = original_select(input_ids, pad_token_id, block_size)
+        def recording_select(input_ids, pad_token_id, block_size, min_pivot=0):
+            p = original_select(input_ids, pad_token_id, block_size, min_pivot)
             if p is not None:
                 observed_pivots.append(p)
             return p
