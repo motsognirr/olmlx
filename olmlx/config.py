@@ -181,6 +181,12 @@ class Settings(BaseSettings):
     # overrides live on ``ModelConfig`` in ``olmlx.engine.registry``.
     kv_cache_quant: str | None = None
 
+    # Fused Metal decode path for shard KV quant (#377 Tier 2): attention
+    # over the compressed middle is computed from the packed form (no FP16
+    # middle materialization). Kill switch; unsupported configurations fall
+    # back to the Tier-1 dequantize-on-read path automatically.
+    shard_fused: bool = True
+
     # Auto-run spectral/shard calibration when the configured KV quant
     # needs calibration data that is missing. Uses the default calibration
     # dataset (c4) and 64 samples. Set to ``true`` to avoid manual

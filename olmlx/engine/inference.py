@@ -1328,7 +1328,9 @@ def _make_shard_prompt_cache(
     from olmlx.engine.shardquant_cache import make_shard_cache
 
     cache_model = _get_model_for_cache(model, is_vlm)
-    return make_shard_cache(cache_model, calibration_dir, bits=bits)
+    return make_shard_cache(
+        cache_model, calibration_dir, bits=bits, fused=settings.shard_fused
+    )
 
 
 def _parse_kv_cache_quant(spec: str) -> tuple[str, int]:

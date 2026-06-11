@@ -276,6 +276,19 @@ class TestSdpaPatch:
         assert install_fused_sdpa(Model()) == 0
 
 
+class TestConfig:
+    def test_shard_fused_setting_defaults_on(self):
+        from olmlx.config import Settings
+
+        assert Settings().shard_fused is True
+
+    def test_shard_fused_env_override(self, monkeypatch):
+        from olmlx.config import Settings
+
+        monkeypatch.setenv("OLMLX_SHARD_FUSED", "false")
+        assert Settings().shard_fused is False
+
+
 class TestEndToEndDecodeParity:
     @pytest.mark.parametrize("backend", ["ref", "auto"])
     def test_multi_step_decode_matches_tier1(self, backend):
