@@ -282,6 +282,32 @@ def _build_draft_config(
         and rope_params_outer.get("rope_theta") is not None
     ):
         rope_theta = float(rope_params_outer["rope_theta"])
+    elif isinstance(rope_params_inner, dict):
+        # Per-attention-type rope_parameters (Gemma4): the dict's values are
+        # per-layer-kind sub-configs, each carrying their own rope_theta.
+        # Prefer "full_attention" (the draft is all-full-attention by default);
+        # fall back to any sub-dict that has rope_theta.
+        _found: float | None = None
+        for _key in ("full_attention", "sliding_attention"):
+            _sub = rope_params_inner.get(_key)
+            if isinstance(_sub, dict) and _sub.get("rope_theta") is not None:
+                _found = float(_sub["rope_theta"])
+                break
+        if _found is None:
+            for _sub in rope_params_inner.values():
+                if isinstance(_sub, dict) and _sub.get("rope_theta") is not None:
+                    _found = float(_sub["rope_theta"])
+                    break
+        if _found is not None:
+            rope_theta = _found
+        else:
+            rope_theta = 10000.0
+            logger.error(
+                "No 'rope_theta' found at the top level or under "
+                "'rope_parameters' in the target config — falling back to "
+                "10000.0. Long-context targets (Qwen3.5+, Qwen3.6) typically "
+                "use ~10_000_000; verify the target's config.json."
+            )
     else:
         # ``logger.error`` rather than just ``warning``: the fallback
         # value is off by 1000× for modern long-context targets
