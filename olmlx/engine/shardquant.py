@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 
 from olmlx.engine.spectralquant import pack_indices, unpack_indices
 
@@ -20,6 +21,11 @@ __all__ = [
     "RopeSpec",
     "detect_rope_spec",
     "rope_transform",
+    "make_v_rotation",
+    "fit_vq_codebooks",
+    "vq_assign",
+    "vq_gather",
+    "scalar_assign",
     "pack_indices",
     "unpack_indices",
 ]
@@ -123,3 +129,123 @@ def rope_transform(
     if spec.dims < x.shape[-1]:
         rotated = mx.concatenate([rotated, x32[..., spec.dims :]], axis=-1)
     return rotated.astype(x.dtype)
+
+
+def make_v_rotation(dim: int, seed: int = 0) -> mx.array:
+    """Orthonormal rotation for the V path.
+
+    Sylvester-Hadamard (scaled 1/sqrt(dim)) when ``dim`` is a power of two,
+    otherwise a seeded random orthogonal matrix via QR.  The matrix is
+    persisted in the calibration artifacts, so the runtime never needs to
+    re-derive it — one uniform code path either way.
+    """
+    if dim > 0 and (dim & (dim - 1)) == 0:
+        h = np.array([[1.0]], dtype=np.float64)
+        while h.shape[0] < dim:
+            h = np.block([[h, h], [h, -h]])
+        return mx.array((h / np.sqrt(dim)).astype(np.float32))
+    rng = np.random.RandomState(seed)
+    q, _ = np.linalg.qr(rng.randn(dim, dim).astype(np.float32))
+    return mx.array(q.astype(np.float32))
+
+
+def fit_vq_codebooks(
+    data: np.ndarray,
+    group_size: int,
+    n_centroids: int = VQ_CENTROIDS,
+    max_iter: int = 25,
+    seed: int = 0,
+) -> mx.array:
+    """Fit per-position product-VQ codebooks via plain numpy k-means.
+
+    Args:
+        data: (N, D) rotated value vectors; D % group_size == 0.
+        group_size: subvector length g.
+
+    Returns:
+        (D // group_size, n_centroids, group_size) float32 codebooks.
+    """
+    n, d = data.shape
+    if d % group_size != 0:
+        raise ValueError(f"dim {d} not divisible by group_size {group_size}")
+    p = d // group_size
+    sub = data.reshape(n, p, group_size).astype(np.float32)
+    rng = np.random.RandomState(seed)
+    codebooks = np.empty((p, n_centroids, group_size), dtype=np.float32)
+
+    for j in range(p):
+        pts = sub[:, j, :]  # (N, g)
+        init_idx = rng.randint(0, n, size=n_centroids)
+        cent = pts[init_idx].copy()
+        for _ in range(max_iter):
+            # (N, K) squared distances via expansion; K*g is small.
+            d2 = (
+                (pts**2).sum(-1, keepdims=True)
+                - 2.0 * pts @ cent.T
+                + (cent**2).sum(-1)[None, :]
+            )
+            assign = d2.argmin(axis=1)
+            new_cent = cent.copy()
+            moved = 0.0
+            for k in range(n_centroids):
+                mask = assign == k
+                if mask.any():
+                    nc = pts[mask].mean(axis=0)
+                    moved = max(moved, float(np.abs(nc - new_cent[k]).max()))
+                    new_cent[k] = nc
+                else:
+                    # Re-seed empty clusters to a random point.
+                    new_cent[k] = pts[rng.randint(0, n)]
+            cent = new_cent
+            if moved < 1e-6:
+                break
+        codebooks[j] = cent
+    return mx.array(codebooks)
+
+
+def vq_assign(x: mx.array, codebooks: mx.array) -> mx.array:
+    """Assign each subvector to its nearest centroid.
+
+    Args:
+        x: (..., S, P, g) subvectors.
+        codebooks: (P, K, g).
+
+    Returns:
+        (..., S, P) uint8 indices.
+    """
+    c_sq = mx.sum(codebooks * codebooks, axis=-1)  # (P, K)
+    chunks = []
+    S = x.shape[-3]
+    for s0 in range(0, S, _ASSIGN_SEQ_CHUNK):
+        xc = x[..., s0 : s0 + _ASSIGN_SEQ_CHUNK, :, :].astype(mx.float32)
+        # ||x - c||^2 = ||x||^2 - 2 x.c + ||c||^2 ; ||x||^2 constant in argmin.
+        scores = c_sq - 2.0 * mx.einsum("...pg,pkg->...pk", xc, codebooks)
+        chunks.append(mx.argmin(scores, axis=-1).astype(mx.uint8))
+    return mx.concatenate(chunks, axis=-2) if len(chunks) > 1 else chunks[0]
+
+
+def vq_gather(idx: mx.array, codebooks: mx.array) -> mx.array:
+    """Inverse of vq_assign: (..., S, P) uint8 -> (..., S, P, g) float32."""
+    p, k, g = codebooks.shape
+    flat = codebooks.reshape(p * k, g)
+    flat_idx = idx.astype(mx.uint32) + mx.arange(p, dtype=mx.uint32) * k
+    return flat[flat_idx]
+
+
+def scalar_assign(y: mx.array, codebook: mx.array) -> mx.array:
+    """Nearest-centroid index per element, chunked over the seq axis.
+
+    Args:
+        y: (..., S, R) coefficients.
+        codebook: (K,) sorted centroids.
+
+    Returns:
+        (..., S, R) uint8 indices.
+    """
+    chunks = []
+    S = y.shape[-2]
+    for s0 in range(0, S, _ASSIGN_SEQ_CHUNK):
+        yc = y[..., s0 : s0 + _ASSIGN_SEQ_CHUNK, :].astype(mx.float32)
+        dists = mx.abs(yc[..., None] - codebook)
+        chunks.append(mx.argmin(dists, axis=-1).astype(mx.uint8))
+    return mx.concatenate(chunks, axis=-2) if len(chunks) > 1 else chunks[0]
