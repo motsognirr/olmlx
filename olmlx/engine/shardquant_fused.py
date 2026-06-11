@@ -69,16 +69,14 @@ def shard_middle_weighted_v_ref(w: mx.array, cache: ShardKVCache) -> mx.array:
     return (wn @ vec) @ cache.v_rotation
 
 
-def _middle_scores(qg: mx.array, cache: ShardKVCache, backend: str) -> mx.array:
-    if backend in ("ref", "auto"):
-        return shard_middle_scores_ref(qg, cache)
-    raise ValueError(f"unknown backend {backend!r}")
+def _use_kernels(cache: ShardKVCache, head_dim: int, backend: str) -> bool:
+    if backend == "ref":
+        return False
+    if backend != "auto":
+        raise ValueError(f"unknown backend {backend!r}")
+    from olmlx.engine.shardquant_kernels import kernels_supported
 
-
-def _middle_weighted_v(w: mx.array, cache: ShardKVCache, backend: str) -> mx.array:
-    if backend in ("ref", "auto"):
-        return shard_middle_weighted_v_ref(w, cache)
-    raise ValueError(f"unknown backend {backend!r}")
+    return kernels_supported(cache, head_dim)
 
 
 def fused_sdpa_decode(
@@ -110,12 +108,26 @@ def fused_sdpa_decode(
     k_e = handle.k_exact.astype(mx.float32)
     v_e = handle.v_exact.astype(mx.float32)
     s_exact = qg @ k_e.swapaxes(-1, -2)  # (B, Hk, grp, S_e)
-    s_mid = _middle_scores(qg, cache, backend)  # (B, Hk, grp, m)
+
+    use_kernels = _use_kernels(cache, D, backend)
+    if use_kernels:
+        from olmlx.engine.shardquant_kernels import (
+            shard_middle_scores_kernel,
+            shard_middle_weighted_v_kernel,
+        )
+
+        s_mid = shard_middle_scores_kernel(qg, cache)
+    else:
+        s_mid = shard_middle_scores_ref(qg, cache)
 
     s = mx.concatenate([s_exact, s_mid], axis=-1) * scale
     w = mx.softmax(s, axis=-1)
     se = s_exact.shape[-1]
-    out = w[..., :se] @ v_e + _middle_weighted_v(w[..., se:], cache, backend)
+    if use_kernels:
+        mid_v = shard_middle_weighted_v_kernel(w, se, cache)
+    else:
+        mid_v = shard_middle_weighted_v_ref(w[..., se:], cache)
+    out = w[..., :se] @ v_e + mid_v
     return out.reshape(B, nq, L, D).astype(queries.dtype)
 
 

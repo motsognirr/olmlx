@@ -274,3 +274,41 @@ class TestSdpaPatch:
             layers = [Layer()]
 
         assert install_fused_sdpa(Model()) == 0
+
+
+class TestEndToEndDecodeParity:
+    @pytest.mark.parametrize("backend", ["ref", "auto"])
+    def test_multi_step_decode_matches_tier1(self, backend):
+        """Drive 24 decode steps on forked caches; fused output must track
+        the Tier-1 materialized path at every step (middle grows each step,
+        so capacity growth, rope positions, and handle reuse are all
+        exercised)."""
+        from olmlx.engine.shardquant_cache import ShardFusedKV
+        from olmlx.engine.shardquant_fused import fused_sdpa_decode
+
+        if backend == "auto" and not mx.metal.is_available():
+            pytest.skip("auto backend needs Metal for the kernel path")
+
+        D, H, nq = 64, 2, 4
+        scale = D**-0.5
+        fused = _make_cache(D=D, H=H, bits=4, rank=48)
+        _feed(fused, 40, D=D, H=H, step=8)
+        tier1 = copy.deepcopy(fused)
+        fused.fused = True
+
+        for step in range(24):
+            mx.random.seed(100 + step)
+            k1 = mx.random.normal((1, H, 1, D)).astype(mx.float16)
+            v1 = mx.random.normal((1, H, 1, D)).astype(mx.float16)
+            q = mx.random.normal((1, nq, 1, D)).astype(mx.float16)
+
+            k_full, v_full = tier1.update_and_fetch(k1, v1)
+            want = _manual_sdpa_f32(q, k_full, v_full, scale)
+
+            h, _ = fused.update_and_fetch(k1, v1)
+            assert isinstance(h, ShardFusedKV)
+            got = fused_sdpa_decode(q, h, scale, backend=backend)
+            assert mx.allclose(got.astype(mx.float32), want, atol=3e-3), (
+                f"step {step}: "
+                f"{float(mx.abs(got.astype(mx.float32) - want).max())}"
+            )
