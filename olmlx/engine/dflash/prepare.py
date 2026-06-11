@@ -350,6 +350,7 @@ def _build_draft_config(
         # ``rope_scaling`` is a dict — falsy only when ``None`` or
         # ``{}`` (and ``{}`` carries no useful information either).
         rope_scaling=text_cfg.get("rope_scaling") or target_cfg.get("rope_scaling"),
+        final_logit_softcapping=text_cfg.get("final_logit_softcapping"),
     )
 
 
