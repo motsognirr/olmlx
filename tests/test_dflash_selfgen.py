@@ -330,6 +330,56 @@ class TestPrepareSelfGenerate:
         cfg = json.loads((out / "config.json").read_text())
         assert cfg["dflash_config"]["mask_token_id"] == 0  # pad id
 
+    def test_self_generate_no_pad_tokenizer_uses_padded_pivot_path(
+        self, tmp_path, monkeypatch
+    ):
+        """A tokenizer with neither pad nor eos (explicit mask_token_id)
+        leaves ``pad_for_pivot`` None — but the selfgen batcher right-pads
+        with 0, so the loop must still use the pad-aware ``_select_pivots``
+        (the inline unpadded sampler would let pivots land inside padding
+        and train the draft on pad tokens unmasked)."""
+        from olmlx.engine.dflash import prepare as prepare_mod
+        from tests.test_dflash_prepare import _MockTokenizer, _Target
+
+        _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
+
+        class _NoPadTokenizer(_MockTokenizer):
+            pad_token_id = None
+            eos_token_id = None
+
+        def loader(_path):
+            return _Target(64, 16, 4), _NoPadTokenizer(vocab_size=64, seq_len=64)
+
+        calls: list[int] = []
+        orig = prepare_mod._select_pivots
+
+        def spy(input_ids, pad, bs, k, min_pivot=0):
+            calls.append(pad)
+            return orig(input_ids, pad, bs, k, min_pivot=min_pivot)
+
+        monkeypatch.setattr(prepare_mod, "_select_pivots", spy)
+
+        # Mixed-length prompts force real right-padding in the buckets.
+        prompts = [[(7 * i + j) % 60 + 2 for j in range(4 + (i % 3))] for i in range(8)]
+        prepare_dflash_draft(
+            model_path=tmp_path,
+            steps=2,
+            batch_size=2,
+            seq_len=64,
+            block_size=4,
+            num_hidden_layers=1,
+            num_target_layers=2,
+            output_dir=tmp_path / "out",
+            _target_loader=loader,
+            self_generate=True,
+            selfgen_num_seqs=8,
+            selfgen_max_new=24,
+            mask_token_id=63,
+            _prompt_iter=iter(prompts),
+        )
+        # the pad-aware selector ran, with the batcher's pad id (0)
+        assert calls and all(p == 0 for p in calls)
+
     def test_self_generate_rejects_precomputed(self, tmp_path):
         _write_target_config(tmp_path, vocab_size=64, hidden_size=16)
         with pytest.raises(ValueError, match="self_generate.*use_precomputed"):

@@ -1029,11 +1029,9 @@ def prepare_dflash_draft(
             group_size=selfgen_group_size,
             progress_callback=progress_callback,
         )
-        # ``pad_for_pivot`` is the same pad id the cycling batcher uses,
-        # so trailing-pad pivot detection stays consistent. Falls back
-        # to 0 only when the tokenizer exposes neither pad nor eos (the
-        # mask_token_id derivation below would raise for that case
-        # anyway before training starts).
+        # ``sequences_pad`` is the id the cycling batcher right-pads
+        # with; 0 is the fallback when the tokenizer exposes neither pad
+        # nor eos (reachable with an explicit ``mask_token_id``).
         sequences_pad = pad_for_pivot if pad_for_pivot is not None else 0
         batches = cycle_training_batches(
             sequences,
@@ -1041,6 +1039,13 @@ def prepare_dflash_draft(
             pad_token_id=sequences_pad,
             block_size=block_size,
         )
+        # The batches above are right-padded with ``sequences_pad``, so
+        # the training loop must take the pad-aware ``_select_pivots``
+        # path even when the tokenizer itself reported no pad token —
+        # the inline unpadded sampler would otherwise let pivots land
+        # inside the padding region and (with ``pad_for_loss`` also
+        # ``None`` here) train the draft on pad targets unmasked.
+        pad_for_pivot = sequences_pad
     elif use_precomputed is not None:
         from olmlx.engine.dflash.precompute import (
             iter_precomputed_shards,
