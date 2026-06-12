@@ -374,10 +374,12 @@ class BatchScheduler:
                         seq = active.get(r.uid)
                         if seq is None:
                             continue
-                        self._tokens_total += 1
                         # Mirror mlx-lm's batch_generate: the EOS step's
-                        # token is not part of the output.
+                        # token is not part of the output. The counter
+                        # matches too, so olmlx_batch_aggregate_tokens_total
+                        # agrees with the eval_count-based token metrics.
                         if r.finish_reason != "stop":
+                            self._tokens_total += 1
                             seq.emit({"type": "token", "token": r.token})
                         if r.finish_reason is not None:
                             done: dict[str, Any] = {

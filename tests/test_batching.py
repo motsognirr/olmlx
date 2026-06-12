@@ -771,8 +771,9 @@ class TestSchedulerStats:
         await _collect(await sched.submit(BatchRequest(tokens=[2], max_tokens=8)))
         s = sched.stats()
         assert s["batch_inserts"] == 2
-        # Every generation response counts: 2 steps per period.
-        assert s["batch_tokens"] == 4
+        # Emitted tokens only — the EOS step is excluded, matching the
+        # consumer-side eval_count (1 emitted token per period).
+        assert s["batch_tokens"] == 2
         assert s["batch_active_sequences"] == 0
         assert s["batch_queued"] == 0
 
