@@ -139,7 +139,9 @@ def _fused_wrapper(orig):
         from olmlx.engine.shardquant_cache import ShardFusedKV
 
         if not isinstance(keys, ShardFusedKV):
-            return orig(queries, keys, values, cache, scale, mask, sinks=sinks, **kwargs)
+            return orig(
+                queries, keys, values, cache, scale, mask, sinks=sinks, **kwargs
+            )
         handle = keys
         if sinks is not None or mask is not None:
             # Not fuse-eligible (attention sinks / explicit mask):

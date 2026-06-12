@@ -242,12 +242,7 @@ class ShardKVCache(_BaseCache):
         # 4. Fused decode handoff (#377 Tier 2): single new token, B == 1,
         # and a compressed middle to attend over.  The exact regions ride
         # on the handle; the patched sdpa reads the middle from the cache.
-        if (
-            self.fused
-            and num_steps == 1
-            and keys.shape[0] == 1
-            and self._mid_len > 0
-        ):
+        if self.fused and num_steps == 1 and keys.shape[0] == 1 and self._mid_len > 0:
             assert self._k_sink is not None and self._k_win is not None
             handle = ShardFusedKV(
                 cache=self,

@@ -181,7 +181,16 @@ _V_ACCUM_SRC = r"""
 def _k_scores_kernel(bits: int):
     return mx.fast.metal_kernel(
         name=f"olmlx_shard_k_scores_b{bits}",
-        input_names=["q", "kcodes", "knorms", "basis", "cb", "kmean", "freqs", "params"],
+        input_names=[
+            "q",
+            "kcodes",
+            "knorms",
+            "basis",
+            "cb",
+            "kmean",
+            "freqs",
+            "params",
+        ],
         output_names=["scores"],
         source=_K_SCORES_SRC,
     )

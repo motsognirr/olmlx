@@ -322,6 +322,5 @@ class TestEndToEndDecodeParity:
             assert isinstance(h, ShardFusedKV)
             got = fused_sdpa_decode(q, h, scale, backend=backend)
             assert mx.allclose(got.astype(mx.float32), want, atol=3e-3), (
-                f"step {step}: "
-                f"{float(mx.abs(got.astype(mx.float32) - want).max())}"
+                f"step {step}: {float(mx.abs(got.astype(mx.float32) - want).max())}"
             )

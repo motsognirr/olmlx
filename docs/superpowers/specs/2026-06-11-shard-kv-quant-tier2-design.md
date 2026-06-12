@@ -27,9 +27,14 @@ v1 — can be a follow-up once the two-kernel layout is proven.
 
 **B. Two slim Metal kernels + MLX softmax (chosen).**
 - Kernel 1 (`shard_k_scores`): packed K codes + norms → per-q-head score row
-  over the middle. Reconstructs each key *in registers* (gather → `c @ U_h` →
+  over the middle. Reconstructs keys *in registers* (gather → `c @ U_h` →
   `+ mean` → `× norm` → re-rope at its absolute position) and dots with the
   roped query. Writes only the `(n_q_heads, mid_len)` fp32 score tile.
+  **As shipped:** each simdgroup reconstructs 4 consecutive tokens together,
+  loading each basis element once and applying it to all 4 staged coefficient
+  vectors — without that amortization the kernel loses to Tier-1's dequant
+  GEMM (measured: a one-token-per-simdgroup layout was ~equal at 32k and
+  slower below).
 - Kernel 2 (`shard_v_accumulate`): softmax weights + packed V codes + norms →
   weighted sum in *rotated* space; the orthonormal un-rotation is linear so it
   folds outside the sum (`Σ wⱼnⱼ(ṽⱼ @ R) = (Σ wⱼnⱼṽⱼ) @ R` — one D×D matmul
@@ -123,8 +128,9 @@ kernel being applicable.
 `Settings.shard_fused: bool = True` (`OLMLX_SHARD_FUSED`) — kill switch.
 Default ON: shard is already opt-in (env + calibration), Tier 2 is strictly a
 faster evaluation of the same math, and parity is enforced by tests. Threaded
-`model_manager → make_shard_cache(model, dir, bits, fused=…)`. Per-model
-override at top level of `models.json` like other promoted shard knobs.
+`inference._make_shard_prompt_cache → make_shard_cache(model, dir, bits,
+fused=…)`. Global env knob only in v1; a per-model `models.json` override is
+deferred until a need shows up.
 
 ## Composition / safety
 
