@@ -492,12 +492,12 @@ class TestWebSearch:
     async def test_web_search_missing_dependency(self, manager):
         with patch(
             "olmlx.chat.builtin_tools._web_search_impl",
-            side_effect=ImportError("No module named 'duckduckgo_search'"),
+            side_effect=ImportError("No module named 'ddgs'"),
         ):
             result = await manager.call_tool("web_search", {"query": "test"})
         assert isinstance(result, ToolError)
         assert result.tool_name == "web_search"
-        assert "duckduckgo" in result.message.lower()
+        assert "ddgs" in result.message.lower()
 
 
 class TestSessionIntegration:

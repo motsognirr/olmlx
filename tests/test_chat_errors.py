@@ -127,7 +127,7 @@ class TestBuiltinErrorFormat:
     async def test_web_search_import_error_returns_tool_error(self):
         mgr = BuiltinToolManager(ChatConfig(model_name="x"))
         result = await mgr.call_tool("web_search", {"query": "test"})
-        # duckduckgo-search may or may not be installed
+        # ddgs may or may not be installed
         if isinstance(result, ToolError):
             assert result.tool_name == "web_search"
         else:

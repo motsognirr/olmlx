@@ -12,6 +12,13 @@ dependencies = [
     # bounds only after re-verifying that copy and the GDN linearity
     # assumption against the new release.
     "mlx-lm>=0.31.1,<0.32",
+    # mlx is pinned explicitly (normally it would ride mlx-lm's pin) because
+    # 0.31.2 made streams thread-local: an array lazily bound to a stream
+    # created on another thread can no longer be mx.eval'd cross-thread
+    # ("There is no Stream(gpu, N) in current thread"). olmlx's snapshot /
+    # disk-spill / prefetcher paths all eval on worker threads (#284 family),
+    # so 0.31.2 fails 16 tests. Lift this only after adapting those paths (#499).
+    "mlx>=0.31.1,<0.31.2",
     "huggingface-hub>=0.20",
     "jinja2>=3.0",
     "pydantic>=2.0",
@@ -34,7 +41,9 @@ dependencies = [
 olmlx = "olmlx.__main__:main"
 
 [project.optional-dependencies]
-search = ["duckduckgo-search>=6.0"]
+# duckduckgo-search was renamed to ddgs in mid-2025; the old name is
+# unmaintained (final release 8.1.1) and its scraping breaks without updates.
+search = ["ddgs>=9.0"]
 otel = [
     "opentelemetry-sdk>=1.27",
     "opentelemetry-exporter-otlp-proto-http>=1.27",

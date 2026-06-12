@@ -37,8 +37,8 @@ _WEB_FETCH_MAX_CHARS = 10_000
 
 
 def _web_search_impl(query: str, max_results: int = 5) -> list[dict]:
-    """Run a web search via duckduckgo-search. Raises ImportError if not installed."""
-    from duckduckgo_search import DDGS  # type: ignore[import-not-found]
+    """Run a web search via ddgs. Raises ImportError if not installed."""
+    from ddgs import DDGS  # type: ignore[import-not-found]
 
     with DDGS() as ddgs:
         return list(ddgs.text(query, max_results=max_results))
@@ -664,7 +664,7 @@ async def _handle_web_search(args: dict) -> str | ToolError:
         results = await asyncio.to_thread(_web_search_impl, query, max_results)
     except ImportError:
         return ToolError(
-            message="Error: duckduckgo-search is not installed. Install it with: pip install duckduckgo-search",
+            message="Error: ddgs is not installed. Install it with: pip install ddgs",
             tool_name="web_search",
             is_user_error=False,
         )
@@ -816,7 +816,7 @@ _TOOL_DEFS: list[dict] = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web using DuckDuckGo. Requires optional duckduckgo-search package.",
+            "description": "Search the web using DuckDuckGo. Requires optional ddgs package.",
             "parameters": {
                 "type": "object",
                 "properties": {
