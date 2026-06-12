@@ -1,0 +1,713 @@
+"""Phase 0 tests for continuous batching (docs/batching-plan.md).
+
+Covers the shared rope-bug workaround (`engine/ropefix.py`), the
+batch-convertible cache probe (`engine/batching.py`), and the batching
+settings. The scheduler itself is Phase 1.
+"""
+
+import asyncio
+import threading
+
+import mlx.core as mx
+import pytest
+from mlx_lm.models.cache import (
+    ArraysCache,
+    CacheList,
+    KVCache,
+    RotatingKVCache,
+)
+
+from olmlx.config import Settings
+
+
+# ---------------------------------------------------------------------------
+# safe_rope_patch — promoted to engine/ropefix.py
+# ---------------------------------------------------------------------------
+
+
+class TestRopefix:
+    def _rope_kwargs(self):
+        return dict(traditional=False, base=10000.0, scale=1.0, offset=7)
+
+    def test_importable_from_ropefix(self):
+        from olmlx.engine.ropefix import safe_rope_patch  # noqa: F401
+
+    def test_selfgen_reexport_is_same_object(self):
+        """Old importers (`dflash.selfgen`) must keep working."""
+        from olmlx.engine.dflash.selfgen import safe_rope_patch as old
+        from olmlx.engine.ropefix import safe_rope_patch as new
+
+        assert old is new
+
+    def test_batched_decode_rope_matches_per_row_reference(self):
+        """The patched call must equal per-row (B=1) reference output for
+        the buggy B>1, L==1 shape."""
+        from olmlx.engine.ropefix import safe_rope_patch
+
+        B, H, L, D = 3, 2, 1, 8
+        mx.random.seed(0)
+        x = mx.random.normal((B, H, L, D))
+        rows = [x[i : i + 1] for i in range(B)]
+        kwargs = self._rope_kwargs()
+        with safe_rope_patch():
+            batched = mx.fast.rope(x, D, **kwargs)
+            refs = [mx.fast.rope(r, D, **kwargs) for r in rows]
+        for i in range(B):
+            assert mx.allclose(batched[i : i + 1], refs[i], atol=1e-5).item()
+
+    def test_vector_offset_passes_through(self):
+        """Per-row offset vectors (BatchKVCache's decode shape) cannot be
+        folded and are *correct* on the unpatched kernel — the patch must
+        leave them alone."""
+        from olmlx.engine.ropefix import safe_rope_patch
+
+        B, H, L, D = 3, 2, 1, 8
+        x = mx.random.normal((B, H, L, D))
+        offsets = mx.array([5, 12, 60])
+        kwargs = dict(traditional=False, base=10000.0, scale=1.0)
+        refs = mx.concatenate(
+            [
+                mx.fast.rope(x[i : i + 1], D, offset=int(offsets[i].item()), **kwargs)
+                for i in range(B)
+            ]
+        )
+        with safe_rope_patch():
+            patched = mx.fast.rope(x, D, offset=offsets, **kwargs)
+        assert mx.allclose(patched, refs, atol=1e-5).item()
+
+    def test_prefill_shape_passes_through(self):
+        """L > 1 (prefill) must hit the original kernel path unchanged."""
+        from olmlx.engine.ropefix import safe_rope_patch
+
+        x = mx.random.normal((2, 2, 5, 8))
+        kwargs = self._rope_kwargs()
+        ref = mx.fast.rope(x, 8, **kwargs)
+        with safe_rope_patch():
+            patched = mx.fast.rope(x, 8, **kwargs)
+        assert mx.allclose(ref, patched, atol=1e-6).item()
+
+    def test_patch_restored_on_exit(self):
+        from olmlx.engine.ropefix import safe_rope_patch
+
+        orig = mx.fast.rope
+        with safe_rope_patch():
+            assert mx.fast.rope is not orig
+        assert mx.fast.rope is orig
+
+    def test_patch_restored_on_exception(self):
+        from olmlx.engine.ropefix import safe_rope_patch
+
+        orig = mx.fast.rope
+        with pytest.raises(RuntimeError):
+            with safe_rope_patch():
+                raise RuntimeError("boom")
+        assert mx.fast.rope is orig
+
+    @pytest.mark.skipif(
+        not mx.metal.is_available(), reason="Metal-kernel bug; CPU path is fine"
+    )
+    def test_rope_bug_still_present_remove_patch_when_this_fails(self):
+        """Removal gate for safe_rope_patch (#499).
+
+        Asserts the mlx B>1/L==1 ``mx.fast.rope`` corruption still
+        reproduces on the unpatched kernel. When an mlx upgrade fixes it,
+        this test FAILS — that is the signal to delete engine/ropefix.py,
+        drop the patch from its holders, and delete this test.
+        """
+        B, H, L, D = 4, 2, 1, 64
+        mx.random.seed(1)
+        x = mx.random.normal((B, H, L, D))
+        kwargs = dict(traditional=False, base=10000.0, scale=1.0, offset=33)
+        direct = mx.fast.rope(x, D, **kwargs)
+        refs = mx.concatenate(
+            [mx.fast.rope(x[i : i + 1], D, **kwargs) for i in range(B)]
+        )
+        assert not mx.allclose(direct, refs, atol=1e-4).item(), (
+            "mx.fast.rope now matches per-row reference at B>1/L==1 — the "
+            "mlx bug appears fixed; remove safe_rope_patch and this test"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cache probe — mirrors mlx-lm's _make_cache convertibility rules
+# ---------------------------------------------------------------------------
+
+
+class TestCacheProbe:
+    def test_plain_kvcache_convertible(self):
+        from olmlx.engine.batching import caches_batch_convertible
+
+        assert caches_batch_convertible([KVCache(), KVCache()])
+
+    def test_arrays_cache_convertible(self):
+        from olmlx.engine.batching import caches_batch_convertible
+
+        assert caches_batch_convertible([ArraysCache(size=2)])
+
+    def test_rotating_without_keep_convertible(self):
+        from olmlx.engine.batching import caches_batch_convertible
+
+        assert caches_batch_convertible([RotatingKVCache(max_size=512)])
+
+    def test_rotating_with_keep_not_convertible(self):
+        from olmlx.engine.batching import caches_batch_convertible
+
+        assert not caches_batch_convertible(
+            [RotatingKVCache(max_size=512, keep=4)]
+        )
+
+    def test_kvcache_subclass_not_convertible(self):
+        """mlx-lm uses an exact ``type(c) is KVCache`` check — subclasses
+        (olmlx's quantized caches) are rejected, so the probe must be too."""
+        from olmlx.engine.batching import caches_batch_convertible
+
+        class FancyKVCache(KVCache):
+            pass
+
+        assert not caches_batch_convertible([FancyKVCache()])
+
+    def test_unknown_cache_not_convertible(self):
+        from olmlx.engine.batching import caches_batch_convertible
+
+        class WeirdCache:
+            pass
+
+        assert not caches_batch_convertible([KVCache(), WeirdCache()])
+
+    def test_cache_list_recurses(self):
+        from olmlx.engine.batching import caches_batch_convertible
+
+        ok = CacheList(KVCache(), RotatingKVCache(max_size=64))
+        bad = CacheList(KVCache(), RotatingKVCache(max_size=64, keep=2))
+        assert caches_batch_convertible([ok])
+        assert not caches_batch_convertible([bad])
+
+    def test_empty_is_not_convertible(self):
+        """No layers → nothing to batch; treat as not eligible."""
+        from olmlx.engine.batching import caches_batch_convertible
+
+        assert not caches_batch_convertible([])
+
+    def test_mock_caches_not_convertible(self):
+        """A MagicMock is truthy but iterates empty — it must not pass the
+        probes vacuously (it routed mocked-settings inference tests onto
+        the batched path and hung the suite)."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.batching import (
+            caches_batch_convertible,
+            caches_plain_kv,
+        )
+
+        assert not caches_batch_convertible(MagicMock())
+        assert not caches_plain_kv(MagicMock())
+
+
+# ---------------------------------------------------------------------------
+# BatchScheduler (fake generator; no MLX work)
+# ---------------------------------------------------------------------------
+
+
+class _Resp:
+    """Duck-typed stand-in for mlx-lm's batch Response objects."""
+
+    def __init__(self, uid, *, token=None, finish_reason=None, progress=None):
+        self.uid = uid
+        self.token = token
+        self.finish_reason = finish_reason
+        self.progress = progress
+
+
+class FakeGen:
+    """Scripted BatchGenerator: each insert consumes the next output script.
+
+    A script is a list of (token, finish_reason) steps. The first next()
+    tick after insert emits a prompt-progress response; subsequent ticks
+    emit one generation response per active sequence.
+    """
+
+    def __init__(self, scripts):
+        self.scripts = list(scripts)
+        self.inserted = 0
+        self.next_calls = 0
+        self.active = {}  # uid -> {"steps": [...], "progressed": bool}
+        self.removed = []
+        self.closed = False
+        self.on_next = None  # optional hook called at the top of next()
+
+    def insert(self, prompts, max_tokens, samplers=None, logits_processors=None):
+        uids = []
+        for _ in prompts:
+            uid = self.inserted
+            self.active[uid] = {
+                "steps": list(self.scripts[self.inserted]),
+                "progressed": False,
+            }
+            self.inserted += 1
+            uids.append(uid)
+        return uids
+
+    def next(self):
+        self.next_calls += 1
+        if self.on_next is not None:
+            self.on_next(self)
+        prompt_rs, gen_rs = [], []
+        for uid, st in list(self.active.items()):
+            if not st["progressed"]:
+                st["progressed"] = True
+                prompt_rs.append(_Resp(uid, progress=(7, 7)))
+                continue
+            token, reason = st["steps"].pop(0)
+            gen_rs.append(_Resp(uid, token=token, finish_reason=reason))
+            if reason is not None:
+                del self.active[uid]
+        return prompt_rs, gen_rs
+
+    def remove(self, uids, return_prompt_caches=False):
+        for uid in uids:
+            self.active.pop(uid, None)
+            self.removed.append(uid)
+        return {}
+
+    def close(self):
+        self.closed = True
+
+
+class _GpuLog:
+    """Records acquire/release ordering for assertions."""
+
+    def __init__(self):
+        self.events = []
+
+    async def acquire(self):
+        self.events.append("acquire")
+
+    def release(self):
+        self.events.append("release")
+
+
+def _make_scheduler(scripts, *, exclusive_pending=None, gens=None, on_next=None):
+    from olmlx.engine.batching import BatchScheduler
+
+    gpu = _GpuLog()
+    made = gens if gens is not None else []
+
+    def factory():
+        gen = FakeGen(scripts)
+        gen.on_next = on_next
+        made.append(gen)
+        return gen
+
+    sched = BatchScheduler(
+        generator_factory=factory,
+        acquire_gpu=gpu.acquire,
+        release_gpu=gpu.release,
+        exclusive_pending=exclusive_pending,
+        name="test",
+    )
+    return sched, gpu, made
+
+
+async def _collect(seq):
+    events = []
+    while True:
+        ev = await asyncio.wait_for(seq.out.get(), timeout=5.0)
+        events.append(ev)
+        if ev["type"] in ("done", "error"):
+            return events
+
+
+def _tokens(events):
+    return [ev["token"] for ev in events if ev["type"] == "token"]
+
+
+class TestBatchScheduler:
+    async def test_single_request_round_trip(self):
+        from olmlx.engine.batching import BatchRequest
+
+        sched, gpu, gens = _make_scheduler(
+            [[(10, None), (11, None), (0, "stop")]]
+        )
+        seq = await sched.submit(BatchRequest(tokens=[1, 2, 3], max_tokens=8))
+        events = await _collect(seq)
+        # EOS-step token is not emitted; progress precedes tokens.
+        assert _tokens(events) == [10, 11]
+        assert events[0]["type"] == "progress"
+        assert events[-1] == {"type": "done", "reason": "stop"}
+        assert gpu.events == ["acquire", "release"]
+        assert gens[0].closed
+
+    async def test_length_finish_emits_final_token(self):
+        from olmlx.engine.batching import BatchRequest
+
+        sched, _, _ = _make_scheduler([[(5, None), (6, "length")]])
+        seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=2))
+        events = await _collect(seq)
+        assert _tokens(events) == [5, 6]
+        assert events[-1]["reason"] == "length"
+
+    async def test_concurrent_requests_share_one_busy_period(self):
+        from olmlx.engine.batching import BatchRequest
+
+        gate = threading.Event()
+
+        # Block the first tick until both requests are in.
+        def hold(gen):
+            if gen.next_calls == 1:
+                gate.wait(timeout=5.0)
+
+        sched, gpu, gens = _make_scheduler(
+            [
+                [(10, None), (11, None), (0, "stop")],
+                [(20, "length")],
+            ],
+            on_next=hold,
+        )
+        seq1 = await sched.submit(BatchRequest(tokens=[1], max_tokens=8))
+        seq2 = await sched.submit(BatchRequest(tokens=[2], max_tokens=8))
+        gate.set()
+        ev1, ev2 = await asyncio.gather(_collect(seq1), _collect(seq2))
+        assert _tokens(ev1) == [10, 11]
+        assert _tokens(ev2) == [20]
+        # One busy period: single acquire/release pair.
+        assert gpu.events == ["acquire", "release"]
+        assert len(gens) == 1
+
+    async def test_new_request_after_drain_starts_new_period(self):
+        from olmlx.engine.batching import BatchRequest
+
+        sched, gpu, gens = _make_scheduler(
+            [[(1, "length")], [(2, "length")]],
+        )
+        await _collect(await sched.submit(BatchRequest(tokens=[1], max_tokens=1)))
+        # Fresh generator per busy period: second submit consumes script
+        # index 0 of a NEW FakeGen, so give it the same script shape.
+        await _collect(await sched.submit(BatchRequest(tokens=[2], max_tokens=1)))
+        assert gpu.events == ["acquire", "release", "acquire", "release"]
+        assert len(gens) == 2
+        assert all(g.closed for g in gens)
+
+    async def test_cancel_frees_slot_and_emits_cancelled(self):
+        from olmlx.engine.batching import BatchRequest, BatchScheduler
+
+        gate = threading.Event()
+        long_script = [(i, None) for i in range(100)] + [(0, "stop")]
+
+        # Hold the generator at tick 3 until the test has cancelled, so the
+        # instant fake can't race through the whole script first.
+        def hold_for_cancel(gen):
+            if gen.next_calls == 3:
+                gate.wait(timeout=5.0)
+
+        sched, _, gens = _make_scheduler([long_script], on_next=hold_for_cancel)
+        seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=200))
+        # Wait for generation to demonstrably start (first token).
+        while True:
+            ev = await asyncio.wait_for(seq.out.get(), timeout=5.0)
+            if ev["type"] == "token":
+                break
+        BatchScheduler.cancel(seq)
+        gate.set()
+        events = await _collect(seq)
+        assert events[-1] == {"type": "done", "reason": "cancelled"}
+        assert gens[0].removed == [0]
+
+    async def test_worker_error_fails_active_and_queued(self):
+        from olmlx.engine.batching import BatchRequest
+
+        gens = []
+
+        def boom_first_gen_only(gen):
+            if gen is gens[0]:
+                raise RuntimeError("metal exploded")
+
+        sched, gpu, _ = _make_scheduler(
+            [[(1, None), (2, "stop")]], gens=gens, on_next=boom_first_gen_only
+        )
+        seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=8))
+        events = await _collect(seq)
+        assert events[-1]["type"] == "error"
+        assert "metal exploded" in str(events[-1]["exc"])
+        # Lock released despite the failure; generator closed.
+        assert gpu.events == ["acquire", "release"]
+        assert gens[0].closed
+        # Scheduler survives: a new request gets a fresh generator and
+        # completes normally.
+        events2 = await _collect(
+            await sched.submit(BatchRequest(tokens=[2], max_tokens=8))
+        )
+        assert events2[-1] == {"type": "done", "reason": "stop"}
+        assert _tokens(events2) == [1]
+        assert len(gens) == 2
+
+    async def test_pause_latches_mid_period(self):
+        """A request arriving after the exclusive flag rises stays in the
+        inbox for the whole busy period (admission latched shut)."""
+        from olmlx.engine.batching import BatchRequest, BatchSequence
+
+        flag = {"up": False}
+        loop = asyncio.get_running_loop()
+        seq2 = BatchSequence(BatchRequest(tokens=[2], max_tokens=8), loop)
+        holder = {}
+
+        def hook(gen):
+            if gen.next_calls == 2 and not holder.get("injected"):
+                # Exclusive waiter appears, then a second batched request
+                # lands mid-period — straight into the inbox, bypassing
+                # submit() so the timing is deterministic.
+                holder["injected"] = True
+                flag["up"] = True
+                holder["sched"]._inbox.put(seq2)
+
+        sched, _, gens = _make_scheduler(
+            [[(10, None), (11, None), (0, "stop")], [(99, "length")]],
+            exclusive_pending=lambda: flag["up"],
+            on_next=hook,
+        )
+        holder["sched"] = sched
+
+        seq1 = await sched.submit(BatchRequest(tokens=[1], max_tokens=8))
+        ev1 = await _collect(seq1)
+        assert _tokens(ev1) == [10, 11]
+        # seq2 was never admitted into period 1...
+        assert gens[0].inserted == 1
+        # ...and is served in period 2 once the exclusive flag clears
+        # (manager re-arms because the inbox is non-empty). Each period
+        # gets a fresh FakeGen, so seq2 consumes script index 0 again.
+        flag["up"] = False
+        ev2 = await _collect(seq2)
+        assert _tokens(ev2) == [10, 11]
+        assert len(gens) == 2
+        assert gens[1].inserted == 1
+
+    def test_rebinds_after_event_loop_close(self):
+        """One event loop per test (pytest-asyncio) means a scheduler can
+        outlive its loop on the LoadedModel. A submit from a fresh loop
+        must rebind — the stale-manager variant hung the suite forever."""
+        from olmlx.engine.batching import BatchRequest
+
+        sched, gpu, gens = _make_scheduler([[(1, "length")]])
+
+        async def round_trip():
+            seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=1))
+            return await _collect(seq)
+
+        loop_a = asyncio.new_event_loop()
+        try:
+            ev1 = loop_a.run_until_complete(round_trip())
+        finally:
+            loop_a.close()
+        loop_b = asyncio.new_event_loop()
+        try:
+            ev2 = loop_b.run_until_complete(round_trip())
+        finally:
+            loop_b.close()
+        assert ev1[-1] == {"type": "done", "reason": "length"}
+        assert ev2[-1] == {"type": "done", "reason": "length"}
+        assert gpu.events == ["acquire", "release", "acquire", "release"]
+
+    def test_rejects_use_from_other_loop_while_bound_loop_alive(self):
+        """Cross-loop use while the bound loop is still alive (merely not
+        running) is a programming error, not a rebind."""
+        from olmlx.engine.batching import BatchRequest
+
+        sched, _, _ = _make_scheduler([[(1, "length")]])
+
+        async def round_trip():
+            seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=1))
+            return await _collect(seq)
+
+        async def submit_other():
+            await sched.submit(BatchRequest(tokens=[1], max_tokens=1))
+
+        loop_a = asyncio.new_event_loop()
+        try:
+            loop_a.run_until_complete(round_trip())  # binds to loop_a
+            loop_b = asyncio.new_event_loop()
+            try:
+                with pytest.raises(
+                    RuntimeError, match="different running event loop"
+                ):
+                    loop_b.run_until_complete(submit_other())
+            finally:
+                loop_b.close()
+        finally:
+            loop_a.close()
+
+    async def test_close_cancels_queued_and_stops_manager(self):
+        from olmlx.engine.batching import BatchRequest
+
+        sched, gpu, _ = _make_scheduler([[(1, "stop")]])
+        # Close with a queued item before any manager run is forced.
+        seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=1))
+        sched.close()
+        events = await _collect(seq)
+        assert events[-1]["reason"] == "cancelled" or events[-1]["type"] == "done"
+        with pytest.raises(RuntimeError):
+            await sched.submit(BatchRequest(tokens=[1], max_tokens=1))
+        # Manager exits (possibly after finishing an in-flight period).
+        if sched._manager_task is not None:
+            await asyncio.wait_for(sched._manager_task, timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# Eligibility predicate
+# ---------------------------------------------------------------------------
+
+
+def _eligible_lm(**overrides):
+    """A LoadedModel-shaped stub that passes every eligibility check."""
+    from types import SimpleNamespace
+
+    base = dict(
+        name="stub",
+        is_vlm=False,
+        is_whisper=False,
+        is_tts=False,
+        is_reranker=False,
+        is_distributed=False,
+        is_flash=False,
+        is_flash_moe=False,
+        is_speculative=False,
+        kv_cache_quant=None,
+        template_caps=SimpleNamespace(has_channel_format=False),
+        batch_convertible=True,  # preset: skip the model probe
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+class TestBatchEligible:
+    @pytest.fixture(autouse=True)
+    def _batching_on(self, monkeypatch):
+        from olmlx.config import settings
+
+        monkeypatch.setattr(settings, "batching", True)
+
+    def _eligible(self, lm, gen_kwargs=None, **kw):
+        from olmlx.engine.inference import _batch_eligible
+
+        defaults = dict(images=None, audio=None, grammar_active=False)
+        defaults.update(kw)
+        return _batch_eligible(lm, gen_kwargs or {}, **defaults)
+
+    def test_eligible_baseline(self):
+        assert self._eligible(_eligible_lm())
+
+    def test_disabled_by_default(self, monkeypatch):
+        from olmlx.config import settings
+
+        monkeypatch.setattr(settings, "batching", False)
+        assert not self._eligible(_eligible_lm())
+
+    def test_mock_settings_do_not_enable(self, monkeypatch):
+        """Tests across the suite patch inference.settings with a
+        MagicMock; its truthy .batching must not engage the batch path."""
+        from unittest.mock import MagicMock
+
+        from olmlx.engine import inference
+
+        monkeypatch.setattr(inference, "settings", MagicMock())
+        assert not self._eligible(_eligible_lm())
+
+    def test_mock_model_probe_is_false(self):
+        """A Mock model's make_cache() iterates empty — the probe must
+        memoize False, never True."""
+        from unittest.mock import MagicMock
+
+        lm = _eligible_lm(batch_convertible=None, model=MagicMock())
+        assert not self._eligible(lm)
+        assert lm.batch_convertible is False
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "is_vlm",
+            "is_whisper",
+            "is_tts",
+            "is_reranker",
+            "is_distributed",
+            "is_flash",
+            "is_flash_moe",
+            "is_speculative",
+        ],
+    )
+    def test_model_kind_flags_disqualify(self, flag):
+        assert not self._eligible(_eligible_lm(**{flag: True}))
+
+    def test_kv_quant_disqualifies(self):
+        assert not self._eligible(_eligible_lm(kv_cache_quant="turboquant:4"))
+
+    def test_images_audio_disqualify(self):
+        assert not self._eligible(_eligible_lm(), images=["img"])
+        assert not self._eligible(_eligible_lm(), audio=["clip"])
+
+    def test_grammar_disqualifies(self):
+        assert not self._eligible(_eligible_lm(), grammar_active=True)
+
+    def test_seed_disqualifies(self):
+        assert not self._eligible(_eligible_lm(), {"seed": 42})
+
+    def test_channel_format_disqualifies(self):
+        from types import SimpleNamespace
+
+        lm = _eligible_lm(
+            template_caps=SimpleNamespace(has_channel_format=True)
+        )
+        assert not self._eligible(lm)
+
+    def test_probe_failure_memoized_false(self):
+        # batch_convertible=None forces the probe; the stub has no .model
+        # so _make_prompt_cache_for_lm raises → memoized False.
+        lm = _eligible_lm(batch_convertible=None)
+        assert not self._eligible(lm)
+        assert lm.batch_convertible is False
+
+    def test_probe_result_memoized(self):
+        lm = _eligible_lm(batch_convertible=False)
+        assert not self._eligible(lm)
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+
+class TestBatchingSettings:
+    def test_defaults(self, monkeypatch):
+        for var in (
+            "OLMLX_BATCHING",
+            "OLMLX_BATCH_COMPLETION_SIZE",
+            "OLMLX_BATCH_PREFILL_SIZE",
+            "OLMLX_BATCH_PREFILL_STEP",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        s = Settings()
+        assert s.batching is False
+        assert s.batch_completion_size == 8
+        assert s.batch_prefill_size == 4
+        assert s.batch_prefill_step == 2048
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_BATCHING", "true")
+        monkeypatch.setenv("OLMLX_BATCH_COMPLETION_SIZE", "16")
+        monkeypatch.setenv("OLMLX_BATCH_PREFILL_SIZE", "2")
+        monkeypatch.setenv("OLMLX_BATCH_PREFILL_STEP", "1024")
+        s = Settings()
+        assert s.batching is True
+        assert s.batch_completion_size == 16
+        assert s.batch_prefill_size == 2
+        assert s.batch_prefill_step == 1024
+
+    @pytest.mark.parametrize(
+        "var",
+        [
+            "OLMLX_BATCH_COMPLETION_SIZE",
+            "OLMLX_BATCH_PREFILL_SIZE",
+            "OLMLX_BATCH_PREFILL_STEP",
+        ],
+    )
+    def test_sizes_reject_zero(self, monkeypatch, var):
+        monkeypatch.setenv(var, "0")
+        with pytest.raises(ValueError):
+            Settings()

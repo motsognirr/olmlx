@@ -2548,6 +2548,352 @@ async def _store_prompt_cache_after_generation(
         )
 
 
+def _batch_eligible(
+    lm: LoadedModel,
+    gen_kwargs: dict,
+    *,
+    images: list[str] | None,
+    audio: list[str] | None,
+    grammar_active: bool,
+) -> bool:
+    """Route a streaming chat request to the batch engine? (plan §3)
+
+    v1 policy: opt-in (``OLMLX_BATCHING``), text-only dense models on
+    plain ``KVCache`` layers. Everything else — VLM/audio kinds,
+    speculative, distributed, flash, KV-quant, grammar, per-request seed
+    (global PRNG → batched reproducibility impossible), gpt-oss channel
+    format — stays on the exclusive-lock path unchanged.
+    """
+    # Identity check, not truthiness: tests patch ``inference.settings``
+    # with a MagicMock whose every attribute is truthy — that must never
+    # switch a mocked request onto the batched path.
+    if settings.batching is not True:
+        return False
+    if (
+        lm.is_vlm
+        or lm.is_whisper
+        or lm.is_tts
+        or lm.is_reranker
+        or lm.is_distributed
+        or lm.is_flash
+        or lm.is_flash_moe
+        or lm.is_speculative
+    ):
+        return False
+    if lm.kv_cache_quant is not None:
+        return False
+    if images or audio:
+        return False
+    if grammar_active:
+        return False
+    if gen_kwargs.get("seed") is not None:
+        return False
+    if lm.template_caps.has_channel_format:
+        return False
+    if lm.batch_convertible is None:
+        try:
+            from olmlx.engine.batching import caches_plain_kv
+
+            lm.batch_convertible = caches_plain_kv(_make_prompt_cache_for_lm(lm))
+        except Exception:
+            logger.debug(
+                "batch cache probe failed for %s", lm.name, exc_info=True
+            )
+            lm.batch_convertible = False
+        if not lm.batch_convertible:
+            logger.info(
+                "Model %s is not batch-eligible (cache layout); using the "
+                "exclusive path",
+                lm.name,
+            )
+    return bool(lm.batch_convertible)
+
+
+def _get_batch_scheduler(lm: LoadedModel) -> Any:
+    """Lazily create the per-model BatchScheduler.
+
+    The lock callables injected here are the scheduler's only coupling to
+    this module: one untimed FIFO acquisition per busy period (per-request
+    queue timeouts are enforced consumer-side in
+    ``_stream_completion_batched``), with the same deferred-cleanup
+    handshake and boundary syncs as the exclusive paths.
+    """
+    if lm.batch_scheduler is not None:
+        return lm.batch_scheduler
+
+    from olmlx.engine.batching import BatchScheduler
+
+    model = lm.model
+    stop_tokens = [[t] for t in lm.tokenizer.eos_token_ids]
+    completion_size = settings.batch_completion_size
+    prefill_size = settings.batch_prefill_size
+    prefill_step = settings.batch_prefill_step
+    sync_mode = lm.sync_mode
+
+    def factory() -> Any:
+        from mlx_lm.generate import BatchGenerator
+
+        return BatchGenerator(
+            model,
+            stop_tokens=stop_tokens,
+            completion_batch_size=completion_size,
+            prefill_batch_size=prefill_size,
+            prefill_step_size=prefill_step,
+        )
+
+    async def acquire_gpu() -> None:
+        await _await_deferred_cleanup()
+        # 0 disables the acquire timeout: the manager waits FIFO behind
+        # exclusive requests; batched requests time out individually.
+        await _acquire_inference_lock(0)
+        try:
+            await _await_deferred_cleanup()
+            _lock_boundary_sync(sync_mode)
+        except BaseException:
+            _get_inference_lock().release()
+            raise
+
+    def release_gpu() -> None:
+        try:
+            _lock_boundary_sync(sync_mode)
+        except ValueError:
+            # Unknown sync mode mid-teardown: still sync before releasing
+            # (mirrors _stream_completion's exit path).
+            logger.error("exit _lock_boundary_sync failed in batch release")
+            _safe_sync()
+        finally:
+            _get_inference_lock().release()
+
+    lm.batch_scheduler = BatchScheduler(
+        generator_factory=factory,
+        acquire_gpu=acquire_gpu,
+        release_gpu=release_gpu,
+        exclusive_pending=lambda: _queue_depth > 0,
+        name=lm.name,
+    )
+    return lm.batch_scheduler
+
+
+async def _drain_to_terminal(seq: Any) -> None:
+    """Consume events until the worker confirms the sequence left the
+    batch (done/error). Keeps the model pinned via the caller's
+    _inference_ref until no forward pass can still involve it."""
+    while True:
+        event = await seq.out.get()
+        if event["type"] in ("done", "error"):
+            return
+
+
+async def _stream_completion_batched(
+    lm: LoadedModel,
+    prompt: str | list[int],
+    max_tokens: int,
+    gen_kwargs: dict,
+    stats: TimingStats,
+    *,
+    keep_alive: str | None = None,
+    prompt_tokens: list[int] | None = None,
+) -> AsyncGenerator[dict, None]:
+    """Batched counterpart of ``_stream_completion`` (plan §2/§4).
+
+    Submits to the per-model BatchScheduler instead of taking the
+    inference lock for the whole request; yields the same chunk dicts so
+    routers are unchanged. Phase 1 scope: fresh prefill (no prompt-cache
+    reuse), no grammar, no channel filter (excluded by eligibility).
+    """
+    from olmlx.engine.batching import BatchRequest
+
+    stop_sequences: list[str] | None = gen_kwargs.pop("stop", None)
+    if prompt_tokens is not None:
+        tokens = list(prompt_tokens)
+    elif isinstance(prompt, str):
+        tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
+    else:
+        tokens = list(prompt)
+
+    scheduler = _get_batch_scheduler(lm)
+    seq = await scheduler.submit(
+        BatchRequest(
+            tokens=tokens,
+            max_tokens=max_tokens,
+            sampler=gen_kwargs.get("sampler"),
+            logits_processors=gen_kwargs.get("logits_processors"),
+        )
+    )
+
+    detokenizer = lm.tokenizer.detokenizer  # fresh streaming instance
+    stats.prompt_eval_count = len(tokens)
+
+    queue_timeout = (
+        lm.inference_queue_timeout
+        if lm.inference_queue_timeout is not None
+        else settings.inference_queue_timeout
+    )
+    inf_timeout = (
+        lm.inference_timeout
+        if lm.inference_timeout is not None
+        else settings.inference_timeout
+    )
+
+    accumulated_text = ""
+    stop_hit = False
+    timed_out = False
+    generation_complete = False
+    terminal_seen = False
+    start_ns = time.monotonic_ns()
+    first_token_ns: int | None = None
+    last_token_ns: int | None = None
+
+    def _scan_stop(piece: str) -> tuple[str, bool]:
+        """Append *piece* to the accumulated text and truncate at the
+        earliest stop-sequence match (same semantics as the exclusive
+        path's inline scan)."""
+        nonlocal accumulated_text
+        if not stop_sequences:
+            return piece, False
+        prev_len = len(accumulated_text)
+        accumulated_text += piece
+        stop_idx = -1
+        for stop_seq in stop_sequences:
+            idx = accumulated_text.find(stop_seq)
+            if idx != -1 and (stop_idx == -1 or idx < stop_idx):
+                stop_idx = idx
+        if stop_idx == -1:
+            return piece, False
+        return (
+            accumulated_text[prev_len:stop_idx] if prev_len < stop_idx else ""
+        ), True
+
+    try:
+        with _inference_ref(lm, keep_alive=keep_alive):
+            try:
+                inf_start = time.monotonic()
+                awaiting_first = True
+                cancelling = False
+                while True:
+                    if awaiting_first and queue_timeout and queue_timeout > 0:
+                        try:
+                            event = await asyncio.wait_for(
+                                seq.out.get(), queue_timeout
+                            )
+                        except (asyncio.TimeoutError, TimeoutError):
+                            raise ServerBusyError(
+                                "Server busy: batch queue timeout after "
+                                f"{queue_timeout}s"
+                            ) from None
+                    else:
+                        event = await seq.out.get()
+                    awaiting_first = False
+                    etype = event["type"]
+                    if etype == "progress":
+                        continue
+                    if etype == "error":
+                        terminal_seen = True
+                        exc = event["exc"]
+                        raise RuntimeError(
+                            f"Batched generation failed: {exc}"
+                        ) from exc
+                    if etype == "done":
+                        terminal_seen = True
+                        if event["reason"] == "cancelled" and not cancelling:
+                            # Scheduler closed under us (model unload).
+                            raise RuntimeError(
+                                "Batched generation cancelled (model "
+                                "unloading)"
+                            )
+                        if not cancelling:
+                            detokenizer.finalize()
+                            tail = detokenizer.last_segment
+                            if tail and not stop_hit:
+                                tail, stop_hit = _scan_stop(tail)
+                                if tail:
+                                    yield {"text": tail, "done": False}
+                        break
+                    # token
+                    if cancelling:
+                        continue
+                    last_token_ns = time.monotonic_ns()
+                    if first_token_ns is None:
+                        first_token_ns = last_token_ns
+                    stats.eval_count += 1
+                    detokenizer.add_token(event["token"])
+                    piece = detokenizer.last_segment
+                    if piece:
+                        piece, stop_hit = _scan_stop(piece)
+                        if piece:
+                            yield {"text": piece, "done": False}
+                    if stop_hit:
+                        scheduler.cancel(seq)
+                        cancelling = True
+                        continue
+                    if (
+                        inf_timeout is not None
+                        and (time.monotonic() - inf_start) > inf_timeout
+                    ):
+                        logger.warning(
+                            "Inference timeout after %.1fs (limit: %.1fs)",
+                            time.monotonic() - inf_start,
+                            inf_timeout,
+                        )
+                        timed_out = True
+                        scheduler.cancel(seq)
+                        cancelling = True
+            finally:
+                if not terminal_seen:
+                    # Client disconnect / consumer exception: free the
+                    # batch slot and wait (bounded) for the worker to
+                    # confirm removal before dropping the model pin.
+                    scheduler.cancel(seq)
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(_drain_to_terminal(seq), 30.0)
+
+        end_ns = time.monotonic_ns()
+        stats.total_duration = end_ns - start_ns
+        if first_token_ns is not None:
+            stats.prompt_eval_duration = first_token_ns - start_ns
+            if last_token_ns is not None:
+                stats.eval_duration = max(last_token_ns - first_token_ns, 0)
+        generation_complete = True
+        logger.info(
+            "Batched generation complete: %d prompt tokens, %d tokens "
+            "generated, %.2fs total",
+            stats.prompt_eval_count,
+            stats.eval_count,
+            stats.total_duration / 1e9,
+        )
+
+        done_chunk: dict = {"text": "", "done": True, "stats": stats}
+        if timed_out:
+            done_chunk["done_reason"] = "timeout"
+        elif stop_hit:
+            done_chunk["done_reason"] = "stop"
+        try:
+            _metrics.observe_inference(lm.name, surface_var.get(), stats)
+        except Exception:
+            logger.debug(
+                "metrics: observe_inference failed (batched)", exc_info=True
+            )
+        yield done_chunk
+    finally:
+        if not generation_complete:
+            exc_type = sys.exc_info()[0]
+            # ServerBusyError = queue timeout, not an inference error —
+            # the exclusive path raises it before its metered section.
+            if exc_type is not None and not issubclass(
+                exc_type,
+                (GeneratorExit, asyncio.CancelledError, ServerBusyError),
+            ):
+                try:
+                    _metrics.observe_inference(
+                        lm.name, surface_var.get(), stats, error=True
+                    )
+                except Exception:
+                    logger.debug(
+                        "metrics: error observe failed (batched)",
+                        exc_info=True,
+                    )
+
+
 async def _stream_completion(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -2567,6 +2913,24 @@ async def _stream_completion(
     tokenizer: Any = None,
     template_kwargs: dict | None = None,
 ) -> AsyncGenerator[dict, None]:
+    # Continuous batching (docs/batching-plan.md): eligible requests join
+    # the per-model batch instead of serializing on the inference lock.
+    # Phase 1 batched scope skips prompt-cache reuse (fresh prefill).
+    if _batch_eligible(
+        lm, gen_kwargs, images=images, audio=audio, grammar_active=grammar_active
+    ):
+        async for chunk in _stream_completion_batched(
+            lm,
+            prompt,
+            max_tokens,
+            gen_kwargs,
+            stats,
+            keep_alive=keep_alive,
+            prompt_tokens=prompt_tokens,
+        ):
+            yield chunk
+        return
+
     # Use explicit acquire/release instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
     global _queue_depth
