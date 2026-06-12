@@ -109,23 +109,22 @@ def fused_sdpa_decode(
     v_e = handle.v_exact.astype(mx.float32)
     s_exact = qg @ k_e.swapaxes(-1, -2)  # (B, Hk, grp, S_e)
 
-    use_kernels = _use_kernels(cache, D, backend)
-    if use_kernels:
+    if _use_kernels(cache, D, backend):
         from olmlx.engine.shardquant_kernels import (
             shard_middle_scores_kernel,
             shard_middle_weighted_v_kernel,
         )
 
         s_mid = shard_middle_scores_kernel(qg, cache)
-    else:
-        s_mid = shard_middle_scores_ref(qg, cache)
-
-    s = mx.concatenate([s_exact, s_mid], axis=-1) * scale
-    w = mx.softmax(s, axis=-1)
-    se = s_exact.shape[-1]
-    if use_kernels:
+        s = mx.concatenate([s_exact, s_mid], axis=-1) * scale
+        w = mx.softmax(s, axis=-1)
+        se = s_exact.shape[-1]
         mid_v = shard_middle_weighted_v_kernel(w, se, cache)
     else:
+        s_mid = shard_middle_scores_ref(qg, cache)
+        s = mx.concatenate([s_exact, s_mid], axis=-1) * scale
+        w = mx.softmax(s, axis=-1)
+        se = s_exact.shape[-1]
         mid_v = shard_middle_weighted_v_ref(w[..., se:], cache)
     out = w[..., :se] @ v_e + mid_v
     return out.reshape(B, nq, L, D).astype(queries.dtype)

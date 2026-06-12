@@ -24,7 +24,7 @@ callers fall back to the reference path (identical math, Tier-1 cost).
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
@@ -178,7 +178,7 @@ _V_ACCUM_SRC = r"""
 
 
 @lru_cache(maxsize=8)
-def _k_scores_kernel(bits: int):
+def _k_scores_kernel(bits: int) -> Any:  # mx.fast.metal_kernel returns `object`
     return mx.fast.metal_kernel(
         name=f"olmlx_shard_k_scores_b{bits}",
         input_names=[
@@ -197,7 +197,7 @@ def _k_scores_kernel(bits: int):
 
 
 @lru_cache(maxsize=1)
-def _v_accum_kernel():
+def _v_accum_kernel() -> Any:  # mx.fast.metal_kernel returns `object`
     return mx.fast.metal_kernel(
         name="olmlx_shard_v_accum",
         input_names=["w", "vcodes", "vnorms", "vcb", "params"],
