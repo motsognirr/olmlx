@@ -2849,6 +2849,31 @@ async def _setup_batched_prompt_cache(
     return res
 
 
+async def _restore_taken_cache(
+    lm: LoadedModel, cache_id: str, cache_setup: _BatchedCacheSetup | None
+) -> None:
+    """Give a taken prompt-cache entry back to the store.
+
+    Used when a batched request fails before/without consuming its
+    seeded prefix (batch queue timeout, preflight MemoryError) so a
+    retry still gets the prefix — the exclusive path never loses the
+    entry in those cases (its queue timeout fires before cache setup;
+    its preflight re-stores the trimmed cache before evicting to disk).
+    The trimmed object covers exactly ``history_tokens`` and is only
+    ever *read* by the batch (merge copies), so re-storing is safe even
+    if the sequence was admitted before being swept.
+    """
+    if cache_setup is None or not cache_setup.cache:
+        return
+    await lm.prompt_cache_store.async_set(
+        cache_id,
+        CachedPromptState(
+            tokens=list(cache_setup.history_tokens or []),
+            cache=cache_setup.cache,
+        ),
+    )
+
+
 async def _stream_completion_batched(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -2888,9 +2913,15 @@ async def _stream_completion_batched(
 
     # New-KV estimate covers only what this sequence will prefill; a
     # reused prefix is already-resident memory moved out of the store.
-    # On failure the taken entry is dropped, which is also what the
-    # MemoryError remediation wants (free KV).
-    _batched_kv_preflight(lm, len(submit_tokens), max_tokens)
+    # On rejection, restore the taken entry — exclusive-path parity: its
+    # preflight re-stores the trimmed cache (then spills under pressure)
+    # so a retry keeps the prefix; the 503'd request frees its KV either
+    # way (the store's own pressure machinery handles residency).
+    try:
+        _batched_kv_preflight(lm, len(submit_tokens), max_tokens)
+    except MemoryError:
+        await _restore_taken_cache(lm, cache_id, cache_setup)
+        raise
 
     scheduler = _get_batch_scheduler(lm)
     detokenizer = lm.tokenizer.detokenizer  # fresh streaming instance
@@ -2947,22 +2978,7 @@ async def _stream_completion_batched(
                         try:
                             event = await asyncio.wait_for(seq.out.get(), queue_timeout)
                         except (asyncio.TimeoutError, TimeoutError):
-                            # Give the taken cache entry back so a retry
-                            # still gets its prefix (the exclusive path's
-                            # queue timeout fires before cache setup, so
-                            # it never loses the entry). The trimmed
-                            # object covers exactly history_tokens and is
-                            # only ever *read* by the batch (merge
-                            # copies), so re-storing is safe even if the
-                            # sequence was admitted before the sweep.
-                            if cache_setup is not None and cache_setup.cache:
-                                await lm.prompt_cache_store.async_set(
-                                    cache_id,
-                                    CachedPromptState(
-                                        tokens=list(cache_setup.history_tokens or []),
-                                        cache=cache_setup.cache,
-                                    ),
-                                )
+                            await _restore_taken_cache(lm, cache_id, cache_setup)
                             raise ServerBusyError(
                                 "Server busy: batch queue timeout after "
                                 f"{queue_timeout}s"

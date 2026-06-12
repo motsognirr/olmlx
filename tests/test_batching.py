@@ -1057,6 +1057,42 @@ class TestConsumerCacheRoundTrip:
         # Post-trim coverage: the prefix the trimmed cache represents.
         assert restored.tokens == [1, 2, 3]
 
+    async def test_preflight_memory_error_restores_taken_entry(self, monkeypatch):
+        """A preflight rejection (503) must not eat the cache entry —
+        exclusive-path parity: its preflight re-stores the trimmed cache
+        so a retry still gets the prefix."""
+        from olmlx.engine import inference
+        from olmlx.engine.model_manager import CachedPromptState
+        from olmlx.utils.timing import TimingStats
+
+        lm = _consumer_lm()
+        seed_cache = [TrimmableFakeCache("seed")]
+        lm.prompt_cache_store.set(
+            "cid", CachedPromptState(tokens=[1, 2, 3], cache=seed_cache)
+        )
+
+        def reject(*a, **k):
+            raise MemoryError("KV cache too large")
+
+        monkeypatch.setattr(inference, "_batched_kv_preflight", reject)
+
+        with pytest.raises(MemoryError):
+            async for _ in inference._stream_completion_batched(
+                lm,
+                [1, 2, 3, 4],
+                32,
+                {},
+                TimingStats(),
+                use_prompt_cache=True,
+                cache_id="cid",
+            ):
+                pass
+
+        restored = lm.prompt_cache_store.peek("cid")
+        assert restored is not None
+        assert restored.cache is seed_cache
+        assert restored.tokens == [1, 2, 3]
+
     async def test_no_prompt_cache_keeps_phase1_behavior(self, monkeypatch):
         lm = _consumer_lm()
         sched, _, gens = _make_scheduler([[(10, "length")]])
