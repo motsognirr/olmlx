@@ -111,12 +111,24 @@ def caches_plain_kv(caches: list[Any]) -> bool:
 
 @dataclass
 class BatchRequest:
-    """Per-request inputs for a batched sequence."""
+    """Per-request inputs for a batched sequence.
+
+    ``cache``/``history_tokens`` seed the sequence with a pre-computed
+    per-layer KV cache (moved out of the prompt-cache store) covering
+    ``history_tokens``; ``tokens`` is then only the uncovered suffix.
+    ``return_cache`` asks the worker to hand the sequence's final
+    per-layer cache back in the ``done`` event (eager-evaluated on the
+    worker thread, so it is safe to cross to the event loop — the #284
+    hazard family).
+    """
 
     tokens: list[int]
     max_tokens: int
     sampler: Callable[..., Any] | None = None
     logits_processors: list[Any] | None = None
+    cache: list[Any] | None = None
+    history_tokens: list[int] | None = None
+    return_cache: bool = False
 
 
 class BatchSequence:
@@ -126,8 +138,16 @@ class BatchSequence:
 
     - ``{"type": "progress", "processed": int, "total": int}`` — prefill
     - ``{"type": "token", "token": int}`` — one generated token
-    - ``{"type": "done", "reason": "stop" | "length" | "cancelled"}``
+    - ``{"type": "done", "reason": "stop" | "length" | "cancelled"}`` —
+      carries ``cache`` (per-layer list) and ``tokens`` (full token
+      history including generated) when the request asked for the cache
+      back and it was extractable
     - ``{"type": "error", "exc": BaseException}``
+
+    ``want_cache`` starts as ``request.return_cache``; the consumer
+    clears it before cancelling for timeout/disconnect so the worker
+    skips the (wasted) extraction. Plain bool write — single consumer
+    writer, worker reader; a stale read only costs one extra extraction.
     """
 
     def __init__(self, request: BatchRequest, loop: asyncio.AbstractEventLoop):
@@ -135,6 +155,7 @@ class BatchSequence:
         self.loop = loop
         self.out: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.cancelled = threading.Event()
+        self.want_cache = request.return_cache
 
     def emit(self, event: dict[str, Any]) -> None:
         """Deliver an event to the consumer; safe from any thread."""
@@ -172,6 +193,21 @@ class BatchScheduler:
         self._wakeup: asyncio.Event | None = None
         self._manager_task: asyncio.Task[None] | None = None
         self._closing = False
+        # Occupancy/throughput counters for /api/ps and Prometheus.
+        # Written only by the worker thread (single writer); read from the
+        # event loop — plain ints are safe under that discipline.
+        self._active_count = 0
+        self._inserts_total = 0
+        self._tokens_total = 0
+
+    def stats(self) -> dict[str, int]:
+        """Point-in-time occupancy + cumulative counters (plan §8)."""
+        return {
+            "batch_active_sequences": self._active_count,
+            "batch_queued": self._inbox.qsize(),
+            "batch_inserts": self._inserts_total,
+            "batch_tokens": self._tokens_total,
+        }
 
     # -- consumer side (event loop) ------------------------------------
 
@@ -320,6 +356,7 @@ class BatchScheduler:
                         for seq in active.values():
                             seq.cancelled.set()
                     self._sweep_cancelled(gen, active)
+                    self._active_count = len(active)
                     if not active:
                         break
                     prompt_responses, gen_responses = gen.next()
@@ -337,13 +374,22 @@ class BatchScheduler:
                         seq = active.get(r.uid)
                         if seq is None:
                             continue
+                        self._tokens_total += 1
                         # Mirror mlx-lm's batch_generate: the EOS step's
                         # token is not part of the output.
                         if r.finish_reason != "stop":
                             seq.emit({"type": "token", "token": r.token})
                         if r.finish_reason is not None:
-                            seq.emit({"type": "done", "reason": r.finish_reason})
+                            done: dict[str, Any] = {
+                                "type": "done",
+                                "reason": r.finish_reason,
+                            }
+                            cache = getattr(r, "prompt_cache", None)
+                            if seq.want_cache and cache is not None:
+                                self._attach_cache(done, cache, r.all_tokens)
+                            seq.emit(done)
                             del active[r.uid]
+                    self._active_count = len(active)
         except BaseException as exc:  # noqa: BLE001 — fan failure out to consumers
             # A worker exception poisons the whole batch (shared forward
             # pass). Fail active AND queued sequences — retrying the
@@ -353,6 +399,7 @@ class BatchScheduler:
                 seq.emit({"type": "error", "exc": exc})
             self._fail_inbox(exc)
         finally:
+            self._active_count = 0
             if gen is not None:
                 try:
                     # Synchronizes generation_stream and restores the wired
@@ -360,6 +407,23 @@ class BatchScheduler:
                     gen.close()
                 except Exception:
                     logger.exception("batch[%s]: generator close failed", self._name)
+
+    @staticmethod
+    def _attach_cache(done: dict[str, Any], cache: list[Any], tokens: Any) -> None:
+        """Materialize an extracted per-sequence cache and attach it to a
+        done event.
+
+        ``BatchKVCache.extract`` builds the B=1 cache as a lazy slice
+        graph on the worker's stream; eager-evaluate it *here* (on the
+        worker thread, which owns the GPU) so the consumer never
+        materializes a cross-thread lazy graph when it re-stores or
+        reuses the cache (#284 hazard family).
+        """
+        import mlx.core as mx
+
+        mx.eval([c.state for c in cache])
+        done["cache"] = cache
+        done["tokens"] = list(tokens)
 
     def _admit(self, gen: Any, active: dict[int, BatchSequence]) -> Any:
         while True:
@@ -376,19 +440,31 @@ class BatchScheduler:
             uid = gen.insert(
                 [list(req.tokens)],
                 [req.max_tokens],
+                # A None entry means "fresh cache" to mlx-lm; a seeded
+                # entry is the store's trimmed per-layer list, with
+                # all_tokens conveying the tokens it already covers.
+                caches=[req.cache],
+                all_tokens=[list(req.history_tokens or [])],
                 samplers=[req.sampler],
                 # None entries break GenerationBatch's per-sequence
                 # iteration when any *other* sequence has processors.
                 logits_processors=[req.logits_processors or []],
             )[0]
             active[uid] = seq
+            self._inserts_total += 1
 
-    @staticmethod
-    def _sweep_cancelled(gen: Any, active: dict[int, BatchSequence]) -> None:
+    def _sweep_cancelled(self, gen: Any, active: dict[int, BatchSequence]) -> None:
         gone = [uid for uid, seq in active.items() if seq.cancelled.is_set()]
         if not gone:
             return
-        gen.remove(gone)
+        want_cache = any(active[uid].want_cache for uid in gone)
+        caches = gen.remove(gone, return_prompt_caches=want_cache)
         for uid in gone:
             seq = active.pop(uid)
-            seq.emit({"type": "done", "reason": "cancelled"})
+            done: dict[str, Any] = {"type": "done", "reason": "cancelled"}
+            extracted = caches.get(uid) if caches else None
+            if seq.want_cache and extracted is not None:
+                cache, tokens = extracted
+                if cache is not None:
+                    self._attach_cache(done, cache, tokens)
+            seq.emit(done)

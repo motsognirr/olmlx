@@ -167,3 +167,31 @@ class TestStatusRouter:
                 assert "cache_id_hits" in model["cache_metrics"]
         finally:
             manager._loaded.pop("qwen3:second", None)
+
+    @pytest.mark.asyncio
+    async def test_api_ps_includes_batch_metrics(self, app_client):
+        """ps surfaces continuous-batching occupancy when a scheduler exists
+        (batching plan Phase 2 §8) and an empty dict otherwise."""
+        lm = app_client._transport.app.state.model_manager._loaded["qwen3:latest"]
+
+        class _FakeScheduler:
+            def stats(self):
+                return {
+                    "batch_active_sequences": 3,
+                    "batch_queued": 1,
+                    "batch_inserts": 9,
+                    "batch_tokens": 250,
+                }
+
+        lm.batch_scheduler = _FakeScheduler()
+        try:
+            resp = await app_client.get("/api/ps")
+            assert resp.status_code == 200
+            model = resp.json()["models"][0]
+            assert model["batch_metrics"]["batch_active_sequences"] == 3
+            assert model["batch_metrics"]["batch_inserts"] == 9
+        finally:
+            lm.batch_scheduler = None
+
+        resp = await app_client.get("/api/ps")
+        assert resp.json()["models"][0]["batch_metrics"] == {}

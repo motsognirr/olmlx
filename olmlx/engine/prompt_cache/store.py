@@ -393,6 +393,28 @@ class PromptCacheStore:
             self.metrics.cache_id_misses += 1
         return loaded
 
+    def take(self, cache_id: str) -> CachedPromptState | None:
+        """Remove and return the in-memory entry (move semantics).
+
+        Memory tier only — the disk fallback lives in ``async_take``.
+        Used by the batched path (batching plan Phase 2): its consumers
+        are not serialized by the inference lock, so the exclusive
+        path's get-then-remove sequence would leave an await window in
+        which a concurrent request could grab the same mutable cache
+        object. The pop here is synchronous on the loop thread.
+
+        Metrics-neutral: the radix path that calls this has already
+        counted a radix hit via ``find_by_prefix``, and ``async_take``
+        owns hit/miss accounting for the cache_id path.
+        """
+        assert_loop_thread("PromptCacheStore.take")
+        state = self._entries.pop(cache_id, None)
+        if state is None:
+            return None
+        self._radix.remove(state.tokens, cache_id)
+        self.metrics.bytes_in_ram -= _estimate_state_bytes(state)
+        return state
+
     def _set_in_memory(
         self, cache_id: str, state: CachedPromptState
     ) -> tuple[str | None, CachedPromptState | None]:
@@ -655,6 +677,36 @@ class PromptCacheStore:
         # at the same path was just rewritten by _save_to_disk — removing
         # it here would lose the entry from both tiers.
         if disk_path is not None and cache_id in self._entries:
+            await asyncio.to_thread(self._unlink_and_refresh, disk_path)
+        self.metrics.cache_id_hits += 1
+        return loaded
+
+    async def async_take(self, cache_id: str) -> CachedPromptState | None:
+        """``take()`` with a disk-tier fallback (read + unlink in a thread).
+
+        The entry leaves the store entirely. Concurrent disk takes of the
+        same id are safe: each caller deserializes its own state object,
+        and the unlink is idempotent.
+        """
+        assert_loop_thread("PromptCacheStore.async_take")
+        state = self.take(cache_id)
+        if state is not None:
+            if self._disk_enabled:
+                # Defensive: a stale disk copy must not resurrect the
+                # entry after this move.
+                await asyncio.to_thread(
+                    self._unlink_and_refresh, self._disk_file_path(cache_id)
+                )
+            self.metrics.cache_id_hits += 1
+            return state
+        if not self._disk_enabled:
+            self.metrics.cache_id_misses += 1
+            return None
+        loaded, disk_path = await self._to_thread_traced(self._read_from_disk, cache_id)
+        if loaded is None:
+            self.metrics.cache_id_misses += 1
+            return None
+        if disk_path is not None:
             await asyncio.to_thread(self._unlink_and_refresh, disk_path)
         self.metrics.cache_id_hits += 1
         return loaded

@@ -218,6 +218,45 @@ def test_collector_safe_when_no_stores():
     assert "olmlx_loaded_models 1.0" in body
 
 
+class _FakeBatchScheduler:
+    def __init__(self, active=2, inserts=7, tokens=120, queued=1):
+        self._stats = {
+            "batch_active_sequences": active,
+            "batch_queued": queued,
+            "batch_inserts": inserts,
+            "batch_tokens": tokens,
+        }
+
+    def stats(self):
+        return dict(self._stats)
+
+
+def test_collector_emits_batch_metrics():
+    reg = CollectorRegistry()
+    lm = _FakeLoadedModel("b1")
+    lm.batch_scheduler = _FakeBatchScheduler()
+    reg.register(metrics.OlmlxStatsCollector(_FakeManager([lm])))
+    body = generate_latest(reg).decode()
+    assert 'olmlx_batch_active_sequences{model="b1"} 2.0' in body
+    assert 'olmlx_batch_inserts_total{model="b1"} 7.0' in body
+    assert 'olmlx_batch_aggregate_tokens_total{model="b1"} 120.0' in body
+
+
+def test_collector_batch_counters_survive_scheduler_recreation():
+    """Counters fold through the accumulator: a recreated scheduler
+    (model evicted/reloaded) restarting from a low value must not make
+    the exported total go backwards."""
+    reg = CollectorRegistry()
+    lm = _FakeLoadedModel("b2")
+    lm.batch_scheduler = _FakeBatchScheduler(inserts=10, tokens=100)
+    reg.register(metrics.OlmlxStatsCollector(_FakeManager([lm])))
+    generate_latest(reg)
+    lm.batch_scheduler = _FakeBatchScheduler(inserts=2, tokens=20)  # reset
+    body = generate_latest(reg).decode()
+    assert 'olmlx_batch_inserts_total{model="b2"} 12.0' in body
+    assert 'olmlx_batch_aggregate_tokens_total{model="b2"} 120.0' in body
+
+
 # --- Task 6: HTTP helpers ---
 def test_surface_for_path():
     assert metrics.surface_for_path("/api/chat") == "ollama"

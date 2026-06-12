@@ -209,11 +209,33 @@ class TestCacheProbe:
 class _Resp:
     """Duck-typed stand-in for mlx-lm's batch Response objects."""
 
-    def __init__(self, uid, *, token=None, finish_reason=None, progress=None):
+    def __init__(
+        self,
+        uid,
+        *,
+        token=None,
+        finish_reason=None,
+        progress=None,
+        prompt_cache=None,
+        all_tokens=None,
+    ):
         self.uid = uid
         self.token = token
         self.finish_reason = finish_reason
         self.progress = progress
+        self.prompt_cache = prompt_cache
+        self.all_tokens = all_tokens
+
+
+class FakeCache:
+    """Per-layer cache stand-in; ``state`` keeps mx.eval happy (empty tree)."""
+
+    def __init__(self, tag=None):
+        self.tag = tag
+
+    @property
+    def state(self):
+        return ()
 
 
 class FakeGen:
@@ -221,29 +243,54 @@ class FakeGen:
 
     A script is a list of (token, finish_reason) steps. The first next()
     tick after insert emits a prompt-progress response; subsequent ticks
-    emit one generation response per active sequence.
+    emit one generation response per active sequence. Mirrors mlx-lm's
+    token bookkeeping: per-uid ``all_tokens`` = history + prompt + every
+    generated step token (including the finish-step token), and finished
+    responses carry the extracted per-sequence cache.
     """
 
     def __init__(self, scripts):
         self.scripts = list(scripts)
         self.inserted = 0
         self.next_calls = 0
-        self.active = {}  # uid -> {"steps": [...], "progressed": bool}
+        self.active = {}  # uid -> {"steps": [...], "progressed": bool, ...}
         self.removed = []
         self.closed = False
         self.on_next = None  # optional hook called at the top of next()
+        self.insert_calls = []  # kwargs of every insert, for assertions
 
-    def insert(self, prompts, max_tokens, samplers=None, logits_processors=None):
+    def insert(
+        self,
+        prompts,
+        max_tokens,
+        caches=None,
+        all_tokens=None,
+        samplers=None,
+        logits_processors=None,
+    ):
+        self.insert_calls.append(
+            {
+                "prompts": [list(p) for p in prompts],
+                "caches": caches,
+                "all_tokens": all_tokens,
+            }
+        )
         uids = []
-        for _ in prompts:
+        for i, p in enumerate(prompts):
             uid = self.inserted
+            history = list(all_tokens[i]) if all_tokens else []
             self.active[uid] = {
                 "steps": list(self.scripts[self.inserted]),
                 "progressed": False,
+                "tokens": history + list(p),
             }
             self.inserted += 1
             uids.append(uid)
         return uids
+
+    def _extract(self, uid):
+        st = self.active[uid]
+        return [FakeCache(f"extracted-{uid}")], list(st["tokens"])
 
     def next(self):
         self.next_calls += 1
@@ -256,16 +303,31 @@ class FakeGen:
                 prompt_rs.append(_Resp(uid, progress=(7, 7)))
                 continue
             token, reason = st["steps"].pop(0)
-            gen_rs.append(_Resp(uid, token=token, finish_reason=reason))
+            st["tokens"].append(token)
             if reason is not None:
+                cache, tokens = self._extract(uid)
+                gen_rs.append(
+                    _Resp(
+                        uid,
+                        token=token,
+                        finish_reason=reason,
+                        prompt_cache=cache,
+                        all_tokens=tokens,
+                    )
+                )
                 del self.active[uid]
+            else:
+                gen_rs.append(_Resp(uid, token=token, finish_reason=None))
         return prompt_rs, gen_rs
 
     def remove(self, uids, return_prompt_caches=False):
+        caches = {}
         for uid in uids:
+            if return_prompt_caches and uid in self.active:
+                caches[uid] = self._extract(uid)
             self.active.pop(uid, None)
             self.removed.append(uid)
-        return {}
+        return caches
 
     def close(self):
         self.closed = True
@@ -586,6 +648,486 @@ class TestBatchScheduler:
 
 
 # ---------------------------------------------------------------------------
+# Scheduler cache round trip (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerCacheRoundTrip:
+    async def test_done_carries_cache_and_tokens_when_requested(self):
+        from olmlx.engine.batching import BatchRequest
+
+        sched, _, _ = _make_scheduler([[(10, None), (0, "stop")]])
+        seq = await sched.submit(
+            BatchRequest(tokens=[1, 2, 3], max_tokens=8, return_cache=True)
+        )
+        events = await _collect(seq)
+        done = events[-1]
+        assert done["type"] == "done" and done["reason"] == "stop"
+        assert isinstance(done["cache"][0], FakeCache)
+        # mlx-lm semantics: all_tokens = prompt + every step token,
+        # including the finish-step (EOS) token.
+        assert done["tokens"] == [1, 2, 3, 10, 0]
+
+    async def test_done_omits_cache_by_default(self):
+        from olmlx.engine.batching import BatchRequest
+
+        sched, _, _ = _make_scheduler([[(10, None), (0, "stop")]])
+        seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=8))
+        events = await _collect(seq)
+        assert "cache" not in events[-1]
+        assert "tokens" not in events[-1]
+
+    async def test_pre_seeded_cache_and_history_reach_insert(self):
+        from olmlx.engine.batching import BatchRequest
+
+        sched, _, gens = _make_scheduler([[(9, "length")]])
+        cache = [FakeCache("seed")]
+        seq = await sched.submit(
+            BatchRequest(
+                tokens=[4, 5],
+                max_tokens=8,
+                cache=cache,
+                history_tokens=[1, 2, 3],
+                return_cache=True,
+            )
+        )
+        events = await _collect(seq)
+        call = gens[0].insert_calls[0]
+        assert call["caches"] == [cache]
+        assert call["all_tokens"] == [[1, 2, 3]]
+        # Done tokens cover history + suffix + generated.
+        assert events[-1]["tokens"] == [1, 2, 3, 4, 5, 9]
+
+    async def test_fresh_request_inserts_none_cache(self):
+        from olmlx.engine.batching import BatchRequest
+
+        sched, _, gens = _make_scheduler([[(9, "length")]])
+        await _collect(await sched.submit(BatchRequest(tokens=[1], max_tokens=8)))
+        call = gens[0].insert_calls[0]
+        assert call["caches"] == [None]
+        assert call["all_tokens"] == [[]]
+
+    async def test_cancel_with_want_cache_returns_cache(self):
+        from olmlx.engine.batching import BatchRequest, BatchScheduler
+
+        gate = threading.Event()
+        long_script = [(i, None) for i in range(100)] + [(0, "stop")]
+
+        def hold(gen):
+            if gen.next_calls == 3:
+                gate.wait(timeout=5.0)
+
+        sched, _, _ = _make_scheduler([long_script], on_next=hold)
+        seq = await sched.submit(
+            BatchRequest(tokens=[1], max_tokens=200, return_cache=True)
+        )
+        while True:
+            ev = await asyncio.wait_for(seq.out.get(), timeout=5.0)
+            if ev["type"] == "token":
+                break
+        BatchScheduler.cancel(seq)
+        gate.set()
+        events = await _collect(seq)
+        done = events[-1]
+        assert done["reason"] == "cancelled"
+        assert isinstance(done["cache"][0], FakeCache)
+        assert done["tokens"][0] == 1  # prompt prefix preserved
+
+    async def test_cancel_after_want_cache_cleared_omits_cache(self):
+        from olmlx.engine.batching import BatchRequest, BatchScheduler
+
+        gate = threading.Event()
+        long_script = [(i, None) for i in range(100)] + [(0, "stop")]
+
+        def hold(gen):
+            if gen.next_calls == 3:
+                gate.wait(timeout=5.0)
+
+        sched, _, _ = _make_scheduler([long_script], on_next=hold)
+        seq = await sched.submit(
+            BatchRequest(tokens=[1], max_tokens=200, return_cache=True)
+        )
+        while True:
+            ev = await asyncio.wait_for(seq.out.get(), timeout=5.0)
+            if ev["type"] == "token":
+                break
+        # Consumer declines the cache (timeout / disconnect path).
+        seq.want_cache = False
+        BatchScheduler.cancel(seq)
+        gate.set()
+        events = await _collect(seq)
+        assert events[-1]["reason"] == "cancelled"
+        assert "cache" not in events[-1]
+
+
+class TestSchedulerStats:
+    async def test_counters_after_drain(self):
+        from olmlx.engine.batching import BatchRequest
+
+        # Sequential submits → two busy periods, each with a fresh FakeGen
+        # consuming script index 0 (2 steps each).
+        sched, _, _ = _make_scheduler([[(10, None), (0, "stop")]])
+        await _collect(await sched.submit(BatchRequest(tokens=[1], max_tokens=8)))
+        await _collect(await sched.submit(BatchRequest(tokens=[2], max_tokens=8)))
+        s = sched.stats()
+        assert s["batch_inserts"] == 2
+        # Every generation response counts: 2 steps per period.
+        assert s["batch_tokens"] == 4
+        assert s["batch_active_sequences"] == 0
+        assert s["batch_queued"] == 0
+
+    async def test_active_gauge_nonzero_mid_period(self):
+        from olmlx.engine.batching import BatchRequest
+
+        gate = threading.Event()
+        observed = {}
+
+        def hold(gen):
+            if gen.next_calls == 3:
+                observed["active"] = holder["sched"].stats()["batch_active_sequences"]
+                gate.wait(timeout=5.0)
+
+        holder = {}
+        sched, _, _ = _make_scheduler(
+            [[(i, None) for i in range(50)] + [(0, "stop")]], on_next=hold
+        )
+        holder["sched"] = sched
+        seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=100))
+        while True:
+            ev = await asyncio.wait_for(seq.out.get(), timeout=5.0)
+            if ev["type"] == "token":
+                break
+        gate.set()
+        await _collect(seq)
+        assert observed["active"] == 1
+        assert sched.stats()["batch_active_sequences"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Consumer round trip (Phase 2): _stream_completion_batched + prompt cache
+# ---------------------------------------------------------------------------
+
+
+class FakeDetok:
+    """Streaming-detokenizer stand-in: each token decodes to ``<id>``."""
+
+    def __init__(self):
+        self.last_segment = ""
+
+    def add_token(self, t):
+        self.last_segment = f"<{t}>"
+
+    def finalize(self):
+        self.last_segment = ""
+
+
+class FakeTokenizer:
+    @property
+    def detokenizer(self):
+        return FakeDetok()
+
+
+class TrimmableFakeCache(FakeCache):
+    """FakeCache that satisfies mlx-lm's trim_prompt_cache contract."""
+
+    def __init__(self, tag=None):
+        super().__init__(tag)
+        self.trimmed = 0
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        self.trimmed += n
+        return n
+
+
+def _consumer_lm():
+    from olmlx.engine.model_manager import LoadedModel
+    from olmlx.engine.prompt_cache.store import PromptCacheStore
+
+    return LoadedModel(
+        name="consumer-test",
+        hf_path="x",
+        model=object(),
+        tokenizer=FakeTokenizer(),
+        prompt_cache_store=PromptCacheStore(max_slots=4),
+        supports_cache_persistence=True,
+    )
+
+
+async def _run_batched(lm, sched, monkeypatch, prompt, gen_kwargs=None, **kw):
+    """Drive _stream_completion_batched against a scheduler; return chunks."""
+    from olmlx.engine import inference
+    from olmlx.utils.timing import TimingStats
+
+    monkeypatch.setattr(inference, "_get_batch_scheduler", lambda _lm: sched)
+    monkeypatch.setattr(inference, "_batched_kv_preflight", lambda *a, **k: None)
+    chunks = []
+    async for chunk in inference._stream_completion_batched(
+        lm, prompt, 32, gen_kwargs or {}, TimingStats(), **kw
+    ):
+        chunks.append(chunk)
+    return chunks
+
+
+class TestConsumerCacheRoundTrip:
+    async def test_fresh_request_stores_prompt_plus_generated(self, monkeypatch):
+        lm = _consumer_lm()
+        sched, _, _ = _make_scheduler([[(10, None), (0, "stop")]])
+        chunks = await _run_batched(
+            lm, sched, monkeypatch, [1, 2, 3], use_prompt_cache=True, cache_id="cid"
+        )
+        assert chunks[0] == {
+            "cache_info": True,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 3,
+        }
+        assert [c["text"] for c in chunks[1:-1]] == ["<10>"]
+        assert chunks[-1]["done"] is True
+        stored = lm.prompt_cache_store.peek("cid")
+        assert stored is not None
+        # mlx-lm semantics: stored tokens = prompt + generated (incl. the
+        # finish-step EOS token).
+        assert stored.tokens == [1, 2, 3, 10, 0]
+
+    async def test_prefix_hit_seeds_sequence_and_restores(self, monkeypatch):
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = _consumer_lm()
+        seed_cache = [TrimmableFakeCache("seed")]
+        lm.prompt_cache_store.set(
+            "cid", CachedPromptState(tokens=[1, 2, 3, 10, 0], cache=seed_cache)
+        )
+        sched, _, gens = _make_scheduler([[(20, "length")]])
+        chunks = await _run_batched(
+            lm,
+            sched,
+            monkeypatch,
+            [1, 2, 3, 10, 0, 7, 8],
+            use_prompt_cache=True,
+            cache_id="cid",
+        )
+        assert chunks[0] == {
+            "cache_info": True,
+            "cache_read_tokens": 5,
+            "cache_creation_tokens": 2,
+        }
+        call = gens[0].insert_calls[0]
+        assert call["prompts"] == [[7, 8]]
+        assert call["caches"] == [seed_cache]
+        assert call["all_tokens"] == [[1, 2, 3, 10, 0]]
+        stored = lm.prompt_cache_store.peek("cid")
+        assert stored is not None
+        assert stored.tokens == [1, 2, 3, 10, 0, 7, 8, 20]
+
+    async def test_exact_match_trims_one_and_resubmits_last_token(self, monkeypatch):
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = _consumer_lm()
+        seed_cache = [TrimmableFakeCache("seed")]
+        lm.prompt_cache_store.set(
+            "cid", CachedPromptState(tokens=[1, 2, 3], cache=seed_cache)
+        )
+        sched, _, gens = _make_scheduler([[(9, "length")]])
+        chunks = await _run_batched(
+            lm, sched, monkeypatch, [1, 2, 3], use_prompt_cache=True, cache_id="cid"
+        )
+        # Exact match backs up one position (the sequence needs a token).
+        assert chunks[0]["cache_read_tokens"] == 2
+        assert seed_cache[0].trimmed == 1
+        assert gens[0].insert_calls[0]["prompts"] == [[3]]
+
+    async def test_move_semantics_entry_leaves_store_during_flight(self, monkeypatch):
+        """The taken entry must not be reachable while the sequence runs
+        (no shared mutable cache object across lockless consumers)."""
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = _consumer_lm()
+        lm.prompt_cache_store.set(
+            "cid",
+            CachedPromptState(tokens=[1, 2, 3], cache=[TrimmableFakeCache()]),
+        )
+        observed = {}
+        gate = threading.Event()
+
+        def spy(gen):
+            if gen.next_calls == 2:
+                observed["mid_flight"] = lm.prompt_cache_store.peek("cid")
+                gate.set()
+
+        sched, _, _ = _make_scheduler([[(9, None), (0, "stop")]], on_next=spy)
+        await _run_batched(
+            lm, sched, monkeypatch, [1, 2, 3, 4], use_prompt_cache=True, cache_id="cid"
+        )
+        assert gate.wait(timeout=5.0)
+        assert observed["mid_flight"] is None
+        # ...and it is back after the round trip.
+        assert lm.prompt_cache_store.peek("cid") is not None
+
+    async def test_stop_sequence_cancellation_still_stores(self, monkeypatch):
+        lm = _consumer_lm()
+        long_script = [(i, None) for i in range(10, 60)] + [(0, "stop")]
+        sched, _, _ = _make_scheduler([long_script])
+        chunks = await _run_batched(
+            lm,
+            sched,
+            monkeypatch,
+            [1, 2],
+            gen_kwargs={"stop": ["<12>"]},
+            use_prompt_cache=True,
+            cache_id="cid",
+        )
+        assert chunks[-1]["done_reason"] == "stop"
+        text = "".join(c.get("text", "") for c in chunks[:-1] if not c.get("cache_info"))
+        assert text == "<10><11>"
+        stored = lm.prompt_cache_store.peek("cid")
+        assert stored is not None
+        assert stored.tokens[:2] == [1, 2]
+
+    async def test_disconnect_does_not_store(self, monkeypatch):
+        from olmlx.engine import inference
+        from olmlx.utils.timing import TimingStats
+
+        lm = _consumer_lm()
+        long_script = [(i, None) for i in range(10, 60)] + [(0, "stop")]
+        sched, _, _ = _make_scheduler([long_script])
+        monkeypatch.setattr(inference, "_get_batch_scheduler", lambda _lm: sched)
+        monkeypatch.setattr(inference, "_batched_kv_preflight", lambda *a, **k: None)
+        agen = inference._stream_completion_batched(
+            lm, [1, 2], 100, {}, TimingStats(), use_prompt_cache=True, cache_id="cid"
+        )
+        async for chunk in agen:
+            if chunk.get("text"):
+                break
+        await agen.aclose()
+        assert lm.prompt_cache_store.peek("cid") is None
+
+    async def test_queue_timeout_restores_taken_entry(self, monkeypatch):
+        """A batch queue timeout (503) must not eat the cache entry — the
+        exclusive path's queue timeout fires before cache setup, so a
+        retry there still gets its prefix; match that."""
+        from olmlx.engine import inference
+        from olmlx.engine.batching import BatchSequence
+        from olmlx.engine.model_manager import CachedPromptState
+        from olmlx.utils.timing import TimingStats
+
+        lm = _consumer_lm()
+        lm.inference_queue_timeout = 0.05
+        seed_cache = [TrimmableFakeCache("seed")]
+        lm.prompt_cache_store.set(
+            "cid", CachedPromptState(tokens=[1, 2, 3], cache=seed_cache)
+        )
+
+        class _StalledScheduler:
+            """Accepts the submit but never produces events (saturated
+            batch); cancel responds so the disconnect drain terminates."""
+
+            async def submit(self, req):
+                return BatchSequence(req, asyncio.get_running_loop())
+
+            @staticmethod
+            def cancel(seq):
+                seq.cancelled.set()
+                seq.out.put_nowait({"type": "done", "reason": "cancelled"})
+
+        monkeypatch.setattr(
+            inference, "_get_batch_scheduler", lambda _lm: _StalledScheduler()
+        )
+        monkeypatch.setattr(inference, "_batched_kv_preflight", lambda *a, **k: None)
+
+        with pytest.raises(inference.ServerBusyError):
+            async for _ in inference._stream_completion_batched(
+                lm,
+                [1, 2, 3, 4],
+                32,
+                {},
+                TimingStats(),
+                use_prompt_cache=True,
+                cache_id="cid",
+            ):
+                pass
+
+        restored = lm.prompt_cache_store.peek("cid")
+        assert restored is not None
+        assert restored.cache is seed_cache
+        # Post-trim coverage: the prefix the trimmed cache represents.
+        assert restored.tokens == [1, 2, 3]
+
+    async def test_no_prompt_cache_keeps_phase1_behavior(self, monkeypatch):
+        lm = _consumer_lm()
+        sched, _, gens = _make_scheduler([[(10, "length")]])
+        chunks = await _run_batched(lm, sched, monkeypatch, [1, 2, 3])
+        # No cache_info chunk, nothing stored.
+        assert not any(c.get("cache_info") for c in chunks)
+        assert len(lm.prompt_cache_store) == 0
+        assert gens[0].insert_calls[0]["caches"] == [None]
+
+    async def test_non_persistable_model_reports_but_skips_store(self, monkeypatch):
+        lm = _consumer_lm()
+        lm.supports_cache_persistence = False
+        sched, _, gens = _make_scheduler([[(10, "length")]])
+        chunks = await _run_batched(
+            lm, sched, monkeypatch, [1, 2, 3], use_prompt_cache=True, cache_id="cid"
+        )
+        assert chunks[0]["cache_info"] is True
+        assert chunks[0]["cache_creation_tokens"] == 3
+        assert len(lm.prompt_cache_store) == 0
+        assert gens[0].insert_calls[0]["caches"] == [None]
+
+
+class TestFullCompletionBatched:
+    async def test_aggregates_stream_into_result_dict(self, monkeypatch):
+        from olmlx.engine import inference
+        from olmlx.utils.timing import TimingStats
+
+        lm = _consumer_lm()
+        lm.batch_convertible = True
+        sched, _, _ = _make_scheduler([[(10, None), (11, None), (0, "stop")]])
+        monkeypatch.setattr(inference, "_get_batch_scheduler", lambda _lm: sched)
+        monkeypatch.setattr(inference, "_batched_kv_preflight", lambda *a, **k: None)
+        monkeypatch.setattr(inference.settings, "batching", True)
+
+        stats = TimingStats()
+        result = await inference._full_completion(
+            lm,
+            [1, 2, 3],
+            32,
+            {},
+            stats,
+            use_prompt_cache=True,
+            prompt_tokens=[1, 2, 3],
+            cache_id="cid",
+        )
+        assert result["text"] == "<10><11>"
+        assert result["done"] is True
+        assert result["stats"] is stats
+        assert result["cache_read_tokens"] == 0
+        assert result["cache_creation_tokens"] == 3
+        # Round trip reached the store from the non-streaming path too.
+        assert lm.prompt_cache_store.peek("cid") is not None
+
+    async def test_stop_sequence_sets_finish_reason(self, monkeypatch):
+        from olmlx.engine import inference
+        from olmlx.utils.timing import TimingStats
+
+        lm = _consumer_lm()
+        lm.batch_convertible = True
+        long_script = [(i, None) for i in range(10, 60)] + [(0, "stop")]
+        sched, _, _ = _make_scheduler([long_script])
+        monkeypatch.setattr(inference, "_get_batch_scheduler", lambda _lm: sched)
+        monkeypatch.setattr(inference, "_batched_kv_preflight", lambda *a, **k: None)
+        monkeypatch.setattr(inference.settings, "batching", True)
+
+        result = await inference._full_completion(
+            lm, [1, 2], 100, {"stop": ["<12>"]}, TimingStats()
+        )
+        assert result["text"] == "<10><11>"
+        assert result["finish_reason"] == "stop"
+        assert result["done_reason"] == "stop"
+
+
+# ---------------------------------------------------------------------------
 # Batched KV preflight
 # ---------------------------------------------------------------------------
 
@@ -682,7 +1224,7 @@ class TestBatchEligible:
     def _eligible(self, lm, gen_kwargs=None, **kw):
         from olmlx.engine.inference import _batch_eligible
 
-        defaults = dict(max_tokens=64, images=None, audio=None, grammar_active=False)
+        defaults = dict(max_tokens=64, images=None, audio=None)
         defaults.update(kw)
         return _batch_eligible(lm, gen_kwargs or {}, **defaults)
 
@@ -737,8 +1279,13 @@ class TestBatchEligible:
         assert not self._eligible(_eligible_lm(), images=["img"])
         assert not self._eligible(_eligible_lm(), audio=["clip"])
 
-    def test_grammar_disqualifies(self):
-        assert not self._eligible(_eligible_lm(), grammar_active=True)
+    def test_grammar_processors_do_not_disqualify(self):
+        """Phase 2 lifts the grammar exclusion: per-sequence processors
+        ride logits_processors into the batch (GenerationBatch._step
+        calls them with [1, vocab] rows + per-sequence token history)."""
+        assert self._eligible(
+            _eligible_lm(), {"logits_processors": [lambda toks, logits: logits]}
+        )
 
     def test_seed_disqualifies(self):
         assert not self._eligible(_eligible_lm(), {"seed": 42})
