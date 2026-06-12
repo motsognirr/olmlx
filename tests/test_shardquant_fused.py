@@ -144,6 +144,18 @@ class TestFusedCacheMode:
         assert mx.allclose(h.k_exact[..., :sink, :], k_full[..., :sink, :])
         assert mx.allclose(h.k_exact[..., sink:, :], k_full[..., sink + m :, :])
 
+    def test_zero_sink_demotes_to_materialize(self):
+        # sink_size=0 leaves _k_sink None forever; fused mode must demote
+        # to the materialized path instead of crashing (only reachable via
+        # direct construction — make_shard_cache keeps the defaults).
+        D, H = 64, 2
+        cache = self._fused_cache(D=D, H=H, sink=0, window=8)
+        _feed(cache, 30, D=D, H=H, step=10)
+        assert cache._mid_len > 0
+        k1 = mx.random.normal((1, H, 1, D)).astype(mx.float16)
+        k, v = cache.update_and_fetch(k1, k1)
+        assert isinstance(k, mx.array) and k.shape[2] == cache.offset
+
     def test_trim_and_state_unaffected_by_fused_flag(self):
         D, H = 64, 2
         cache = self._fused_cache(D=D, H=H)
