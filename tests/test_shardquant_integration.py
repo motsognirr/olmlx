@@ -22,7 +22,10 @@ class TestPromptCacheDispatch:
         ) as mk:
             result = inference._make_prompt_cache_for_lm(lm)
         assert result == ["sentinel"]
-        mk.assert_called_once_with(lm.model, Path("/tmp/fake-shard"), bits=4)
+        # fused mirrors Settings.shard_fused (#377 Tier 2, default on).
+        mk.assert_called_once_with(
+            lm.model, Path("/tmp/fake-shard"), bits=4, fused=True
+        )
 
     def test_spectral_dispatch_unchanged(self):
         from olmlx.engine import inference
