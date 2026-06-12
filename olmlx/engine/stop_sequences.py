@@ -49,9 +49,7 @@ class StopScanner:
         return (self._text[prev_len:stop_idx] if prev_len < stop_idx else ""), True
 
 
-def truncate_at_stop(
-    text: str, stop_sequences: list[str] | None
-) -> tuple[str, bool]:
+def truncate_at_stop(text: str, stop_sequences: list[str] | None) -> tuple[str, bool]:
     """Whole-text variant for the non-streaming path.
 
     Returns (text truncated at the earliest match, whether one matched).

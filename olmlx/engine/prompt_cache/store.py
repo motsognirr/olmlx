@@ -702,11 +702,18 @@ class PromptCacheStore:
         if not self._disk_enabled:
             self.metrics.cache_id_misses += 1
             return None
+        gen_before = self._evict_generation
         loaded, disk_path = await self._to_thread_traced(self._read_from_disk, cache_id)
         if loaded is None:
             self.metrics.cache_id_misses += 1
             return None
-        if disk_path is not None:
+        # A bulk eviction during the await (memory pressure) may have just
+        # rewritten this id's file with a *fresh* in-memory state that now
+        # lives only on disk; unlinking would destroy its sole copy. Keep
+        # the file in that case — the worst outcome of skipping the unlink
+        # is a benign stale-read later, never data loss. (Same generation
+        # guard as async_get's re-insert path.)
+        if disk_path is not None and self._evict_generation == gen_before:
             await asyncio.to_thread(self._unlink_and_refresh, disk_path)
         self.metrics.cache_id_hits += 1
         return loaded

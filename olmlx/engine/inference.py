@@ -2959,9 +2959,7 @@ async def _stream_completion_batched(
                                 await lm.prompt_cache_store.async_set(
                                     cache_id,
                                     CachedPromptState(
-                                        tokens=list(
-                                            cache_setup.history_tokens or []
-                                        ),
+                                        tokens=list(cache_setup.history_tokens or []),
                                         cache=cache_setup.cache,
                                     ),
                                 )

@@ -979,7 +979,9 @@ class TestConsumerCacheRoundTrip:
             cache_id="cid",
         )
         assert chunks[-1]["done_reason"] == "stop"
-        text = "".join(c.get("text", "") for c in chunks[:-1] if not c.get("cache_info"))
+        text = "".join(
+            c.get("text", "") for c in chunks[:-1] if not c.get("cache_info")
+        )
         assert text == "<10><11>"
         stored = lm.prompt_cache_store.peek("cid")
         assert stored is not None

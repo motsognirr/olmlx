@@ -182,6 +182,25 @@ class TestTake:
         assert unlinked == [fake_path]
         assert store.metrics.cache_id_hits == 1
 
+    async def test_async_take_skips_unlink_after_bulk_eviction(self, tmp_path):
+        """A bulk eviction during the threaded disk read may have just
+        rewritten this id's file with a fresher state whose only copy is
+        now on disk — the unlink must be skipped so it survives."""
+        store = PromptCacheStore(max_slots=4, disk_path=tmp_path, model_name="m")
+        disk_state = _make_state(7)
+        fake_path = tmp_path / "m" / "a.safetensors"
+        unlinked = []
+
+        def read_with_concurrent_eviction(cid):
+            store._evict_generation += 1
+            return (disk_state, fake_path)
+
+        store._read_from_disk = read_with_concurrent_eviction
+        store._unlink_and_refresh = lambda p: unlinked.append(p)
+        got = await store.async_take("a")
+        assert got is disk_state
+        assert unlinked == []
+
     async def test_async_take_memory_hit_unlinks_stale_disk_copy(self, tmp_path):
         store = PromptCacheStore(max_slots=4, disk_path=tmp_path, model_name="m")
         unlinked = []
