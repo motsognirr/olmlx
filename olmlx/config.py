@@ -305,6 +305,19 @@ class Settings(BaseSettings):
     tree_width: Annotated[int, Field(ge=1)] = 2
     tree_max_nodes: Annotated[int, Field(ge=3)] = 8
 
+    # Continuous batching of concurrent text-chat requests via mlx-lm's
+    # BatchGenerator (docs/batching-plan.md). Opt-in; eligible requests
+    # (plain-KVCache text LLMs — no VLM/speculative/KV-quant/grammar/seed)
+    # join a per-model batch instead of queueing on the inference lock.
+    # ``batch_completion_size`` caps concurrent decoding sequences;
+    # ``batch_prefill_size`` caps sequences in chunked prefill;
+    # ``batch_prefill_step`` is the prefill chunk size (matches
+    # inference.py's _PREFILL_CHUNK).
+    batching: bool = False
+    batch_completion_size: Annotated[int, Field(ge=1)] = 8
+    batch_prefill_size: Annotated[int, Field(ge=1)] = 4
+    batch_prefill_step: Annotated[int, Field(ge=1)] = 2048
+
     # Flash inference (LLM in a Flash). Primary, user-facing knobs.
     # Advanced tuning (window size, IO threads, cache budget, predictor
     # rank, buffer modes) lives on ``ExperimentalSettings`` and the

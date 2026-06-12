@@ -504,6 +504,11 @@ class LoadedModel:
     is_reranker: bool = False
     speculative_decoder: Any = None
     weight_store: Any = None
+    # Continuous-batching scheduler (engine/batching.py), created lazily on
+    # the first batch-eligible request. None for ineligible/idle models.
+    batch_scheduler: Any = None
+    # Memoized result of the batch cache-probe (None = not yet probed).
+    batch_convertible: bool | None = None
     template_caps: TemplateCaps = field(default_factory=TemplateCaps)
     loaded_at: float = field(default_factory=time.time)
     expires_at: float | None = None
@@ -800,6 +805,16 @@ class ModelManager(SpeculativeLoaderMixin):
                 lm.speculative_decoder = None
             except Exception as exc:
                 logger.exception("Error closing speculative decoder for %s", lm.name)
+                errors.append(exc)
+        if lm.batch_scheduler is not None:
+            # Idle by the active_refs contract (no in-flight sequences when
+            # a model is closed); close() cancels anything queued and lets
+            # the manager task exit.
+            try:
+                lm.batch_scheduler.close()
+                lm.batch_scheduler = None
+            except Exception as exc:
+                logger.exception("Error closing batch scheduler for %s", lm.name)
                 errors.append(exc)
         # Free GPU memory held by prompt caches.  CachedPromptState entries
         # hold per-layer KV cache buffers (deepest GPU consumer besides

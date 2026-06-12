@@ -12,12 +12,6 @@ per-position argmax routinely disagrees with the target's.
 
 This module provides that data path:
 
-- ``safe_rope_patch``: context manager working around an mlx 0.31.x
-  Metal bug where ``mx.fast.rope`` returns corrupt values for batch
-  rows >= 1 when called with B > 1 at L == 1 (the batched single-token
-  decode shape). Folding the batch dim into the heads dim is exact
-  (RoPE rotates along the position axis only) and sidesteps the broken
-  kernel path.
 - ``iter_dataset_prompts``: stream chat-templated prompt token lists
   from a HuggingFace dataset (ultrachat-style ``prompt`` field or the
   first user message of ``messages``), with the same synthetic-prompt
@@ -37,12 +31,14 @@ import logging
 import random
 from collections import defaultdict
 from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any
 
 import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
 
+# Re-exported for old importers; the patch lives in engine/ropefix.py now
+# that the batch scheduler shares it (docs/batching-plan.md Phase 0).
+from olmlx.engine.ropefix import safe_rope_patch  # noqa: F401
 from olmlx.engine.dflash.training_data import (
     _FALLBACK_PROMPTS,
     DEFAULT_DATASET,
@@ -51,33 +47,6 @@ from olmlx.engine.dflash.training_data import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-@contextmanager
-def safe_rope_patch() -> Iterator[None]:
-    """Work around mlx 0.31.x ``mx.fast.rope`` corrupting batch rows >= 1
-    for B > 1, L == 1 inputs (the batched decode shape).
-
-    Folds the batch dim into the heads dim before the kernel call —
-    exact because RoPE only rotates along the position axis (-2). Only
-    the buggy shape is redirected; prefill (L > 1) and unbatched calls
-    go straight through. The patch is process-global while active, so
-    hold it only around the generation loop.
-    """
-    orig = mx.fast.rope
-
-    def _folded(x: mx.array, dims: int, *args: Any, **kwargs: Any) -> mx.array:
-        if getattr(x, "ndim", 0) == 4 and x.shape[0] > 1 and x.shape[2] == 1:
-            B, H, L, D = x.shape
-            out = orig(x.reshape(1, B * H, L, D), dims, *args, **kwargs)
-            return out.reshape(B, H, L, D)
-        return orig(x, dims, *args, **kwargs)
-
-    mx.fast.rope = _folded
-    try:
-        yield
-    finally:
-        mx.fast.rope = orig
 
 
 def iter_dataset_prompts(
