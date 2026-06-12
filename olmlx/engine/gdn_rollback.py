@@ -82,7 +82,7 @@ _GATED_DELTA_UPDATE_EXPECTED_PARAMS: tuple[str, ...] = (
 
 # **Sync point** (#468): sha256 of the *dedented* ``inspect.getsource``
 # of the upstream functions whose exact behavior this module copies or
-# depends on, as verified against mlx-lm 0.31.2:
+# depends on, as verified against mlx-lm 0.31.2 and 0.31.3 (byte-identical):
 #
 # - ``GatedDeltaNet.__call__`` — ``_capturing_gdn_call`` is a verbatim
 #   copy of it; any upstream edit (even a comment) means the copy must

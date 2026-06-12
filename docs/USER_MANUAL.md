@@ -415,7 +415,7 @@ When enabled (default), the chat session provides these tools without any MCP co
 | `glob` | `pattern`, `path?` | Find files by glob pattern (max 500 results) |
 | `grep` | `pattern`, `path?` | Regex search in files (max 50 KB output) |
 | `bash` | `command`, `timeout?` | Run a shell command (default 120s timeout, max 100 KB output) |
-| `web_search` | `query`, `max_results?` | DuckDuckGo search (requires `duckduckgo-search` package) |
+| `web_search` | `query`, `max_results?` | DuckDuckGo search (requires `ddgs` package) |
 | `web_fetch` | `url` | Fetch a URL as text (max 10K chars, HTML stripped) |
 | `create_plan` | `content` | Write a markdown plan to `~/.olmlx/plans/plan.md` |
 | `update_plan` | `content` | Overwrite an existing plan |
