@@ -152,9 +152,7 @@ class TestCacheProbe:
     def test_rotating_with_keep_not_convertible(self):
         from olmlx.engine.batching import caches_batch_convertible
 
-        assert not caches_batch_convertible(
-            [RotatingKVCache(max_size=512, keep=4)]
-        )
+        assert not caches_batch_convertible([RotatingKVCache(max_size=512, keep=4)])
 
     def test_kvcache_subclass_not_convertible(self):
         """mlx-lm uses an exact ``type(c) is KVCache`` check — subclasses
@@ -325,9 +323,7 @@ class TestBatchScheduler:
     async def test_single_request_round_trip(self):
         from olmlx.engine.batching import BatchRequest
 
-        sched, gpu, gens = _make_scheduler(
-            [[(10, None), (11, None), (0, "stop")]]
-        )
+        sched, gpu, gens = _make_scheduler([[(10, None), (11, None), (0, "stop")]])
         seq = await sched.submit(BatchRequest(tokens=[1, 2, 3], max_tokens=8))
         events = await _collect(seq)
         # EOS-step token is not emitted; progress precedes tokens.
@@ -525,9 +521,7 @@ class TestBatchScheduler:
             loop_a.run_until_complete(round_trip())  # binds to loop_a
             loop_b = asyncio.new_event_loop()
             try:
-                with pytest.raises(
-                    RuntimeError, match="different running event loop"
-                ):
+                with pytest.raises(RuntimeError, match="different running event loop"):
                     loop_b.run_until_complete(submit_other())
             finally:
                 loop_b.close()
@@ -651,9 +645,7 @@ class TestBatchEligible:
     def test_channel_format_disqualifies(self):
         from types import SimpleNamespace
 
-        lm = _eligible_lm(
-            template_caps=SimpleNamespace(has_channel_format=True)
-        )
+        lm = _eligible_lm(template_caps=SimpleNamespace(has_channel_format=True))
         assert not self._eligible(lm)
 
     def test_probe_failure_memoized_false(self):

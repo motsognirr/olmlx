@@ -336,9 +336,7 @@ class BatchScheduler:
                     # limit — the Metal barrier the lock release relies on.
                     gen.close()
                 except Exception:
-                    logger.exception(
-                        "batch[%s]: generator close failed", self._name
-                    )
+                    logger.exception("batch[%s]: generator close failed", self._name)
 
     def _admit(self, gen: Any, active: dict[int, BatchSequence]) -> Any:
         while True:

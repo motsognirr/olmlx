@@ -2596,9 +2596,7 @@ def _batch_eligible(
 
             lm.batch_convertible = caches_plain_kv(_make_prompt_cache_for_lm(lm))
         except Exception:
-            logger.debug(
-                "batch cache probe failed for %s", lm.name, exc_info=True
-            )
+            logger.debug("batch cache probe failed for %s", lm.name, exc_info=True)
             lm.batch_convertible = False
         if not lm.batch_convertible:
             logger.info(
@@ -2773,9 +2771,7 @@ async def _stream_completion_batched(
                 while True:
                     if awaiting_first and queue_timeout and queue_timeout > 0:
                         try:
-                            event = await asyncio.wait_for(
-                                seq.out.get(), queue_timeout
-                            )
+                            event = await asyncio.wait_for(seq.out.get(), queue_timeout)
                         except (asyncio.TimeoutError, TimeoutError):
                             raise ServerBusyError(
                                 "Server busy: batch queue timeout after "
@@ -2790,16 +2786,13 @@ async def _stream_completion_batched(
                     if etype == "error":
                         terminal_seen = True
                         exc = event["exc"]
-                        raise RuntimeError(
-                            f"Batched generation failed: {exc}"
-                        ) from exc
+                        raise RuntimeError(f"Batched generation failed: {exc}") from exc
                     if etype == "done":
                         terminal_seen = True
                         if event["reason"] == "cancelled" and not cancelling:
                             # Scheduler closed under us (model unload).
                             raise RuntimeError(
-                                "Batched generation cancelled (model "
-                                "unloading)"
+                                "Batched generation cancelled (model unloading)"
                             )
                         if not cancelling:
                             detokenizer.finalize()
@@ -2870,9 +2863,7 @@ async def _stream_completion_batched(
         try:
             _metrics.observe_inference(lm.name, surface_var.get(), stats)
         except Exception:
-            logger.debug(
-                "metrics: observe_inference failed (batched)", exc_info=True
-            )
+            logger.debug("metrics: observe_inference failed (batched)", exc_info=True)
         yield done_chunk
     finally:
         if not generation_complete:
