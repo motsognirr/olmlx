@@ -219,6 +219,12 @@ def kernels_supported(cache: ShardKVCache, head_dim: int) -> bool:
         return False
     if cache.k_bits not in (2, 4, 8):
         return False
+    # The K kernel strides the basis by h·D·D: calibration stores the FULL
+    # (H, D, D) eigenbasis (rank truncation slices *coefficients*, never
+    # basis rows).  Decline anything else so a future truncated-basis
+    # layout falls back to the reference path instead of striding wrong.
+    if tuple(cache.k_basis.shape[-2:]) != (head_dim, head_dim):
+        return False
     spec = cache.rope_spec
     if spec is not None:
         if spec.traditional:

@@ -110,3 +110,9 @@ class TestKernelGate:
         # head_dim not a multiple of 32 → unsupported.
         odd = _make_cache(D=48, H=H, bits=4)
         assert not kernels_supported(odd, 48)
+        # Truncated stored basis (hypothetical future layout) → unsupported:
+        # the kernel strides by h·D·D, which assumes the full (H, D, D)
+        # eigenbasis that calibration ships today.
+        trunc = _make_cache(D=D, H=H, bits=4, rank=24)
+        trunc.k_basis = trunc.k_basis[:, :24, :]
+        assert not kernels_supported(trunc, D)
