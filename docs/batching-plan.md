@@ -307,7 +307,12 @@ Live (`tests/live/test_batching_real.py`, `real_model`):
   interleaving).
 - **Phase 2 — integration**: prompt-cache store move/extract round trip;
   non-streaming path; grammar per-sequence (after verifying xgrammar processor
-  shape handling in `GenerationBatch._step`); `/api/ps` + metrics.
+  shape handling in `GenerationBatch._step`); `/api/ps` + metrics. Also from
+  the PR #507 review: extract shared lock entry/exit helpers so
+  `acquire_gpu`/`release_gpu` and `_inference_locked` stop duplicating the
+  #284 lock-boundary protocol (deferred from Phase 1 — touching the exclusive
+  lock path in the same PR was judged riskier than the duplication), and
+  consolidate the stop-sequence scan (third copy in `_scan_stop`).
 - **Phase 3 — hardening**: admission control vs `OLMLX_MEMORY_LIMIT_FRACTION`;
   fairness guard tuning; docs (USER_MANUAL); consider default-on per-model.
 - **Phase 4 — extensions** (separate decisions): hybrid `ArraysCache` (GDN)
@@ -331,6 +336,17 @@ Live (`tests/live/test_batching_real.py`, `real_model`):
 - **Starvation in reverse**: the fairness guard means heavy exclusive traffic
   (e.g. KV-quant model in rotation) can keep collapsing the batch; acceptable
   for v1, revisit with drain-and-switch in Phase 4.
+- **No consumer backpressure** (PR #507 review): the per-sequence event
+  bridge is an unbounded queue — a stalled-but-connected SSE client lets the
+  worker decode its sequence to max_tokens while event dicts accumulate
+  (vs CancellableStream's bounded Queue(32)). Phase 3: consumer-lag
+  threshold → cancel, mirroring the exclusive path's bounded-buffer
+  semantics.
+- **Batched timing semantics differ**: `prompt_eval_duration` (TTFT) on the
+  batched path includes batch-queue wait and co-tenant prefill interleave,
+  and `eval_duration` is wall time shared with co-batched sequences — they
+  measure user-perceived latency, not isolated model speed. The exclusive
+  path's mlx-derived numbers remain the per-model benchmark reference.
 - **Lock-holder restructuring**: the scheduler holding `_inference_lock`
   long-term changes `_queue_depth` log semantics ("queued" now often means
   "joining the batch"); adjust the log line so operators aren't misled.

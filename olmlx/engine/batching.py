@@ -47,6 +47,7 @@ import asyncio
 import logging
 import queue
 import threading
+import time
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -134,7 +135,6 @@ class BatchSequence:
         self.loop = loop
         self.out: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.cancelled = threading.Event()
-        self.uid: int | None = None
 
     def emit(self, event: dict[str, Any]) -> None:
         """Deliver an event to the consumer; safe from any thread."""
@@ -202,14 +202,19 @@ class BatchScheduler:
         self._wakeup.set()
         return seq
 
-    def _cancel_inbox(self) -> None:
+    def _drain_inbox(
+        self, make_event: Callable[[BatchSequence], dict[str, Any]]
+    ) -> None:
         try:
             while True:
                 seq = self._inbox.get_nowait()
                 seq.cancelled.set()
-                seq.emit({"type": "done", "reason": "cancelled"})
+                seq.emit(make_event(seq))
         except queue.Empty:
             pass
+
+    def _cancel_inbox(self) -> None:
+        self._drain_inbox(lambda _seq: {"type": "done", "reason": "cancelled"})
 
     @staticmethod
     def cancel(seq: BatchSequence) -> None:
@@ -254,8 +259,31 @@ class BatchScheduler:
                     raise
                 logger.exception("batch[%s]: GPU acquisition failed", self._name)
                 continue
+            worker = asyncio.ensure_future(asyncio.to_thread(self._worker))
             try:
-                await asyncio.to_thread(self._worker)
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # Manager cancelled (shutdown). The worker thread cannot
+                # be interrupted — signal drain and hold the lock until
+                # it actually exits; releasing early would let the next
+                # holder run Metal work concurrently with the still-
+                # ticking worker (the #284 hazard class).
+                self._closing = True
+                deadline = time.monotonic() + 30.0
+                while not worker.done():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.error(
+                            "batch[%s]: worker did not exit within 30s of "
+                            "cancellation; releasing the lock anyway",
+                            self._name,
+                        )
+                        break
+                    try:
+                        await asyncio.wait({worker}, timeout=remaining)
+                    except asyncio.CancelledError:
+                        continue
+                raise
             finally:
                 self._release_gpu()
             # Items may remain (fairness pause or arrivals during drain);
@@ -264,12 +292,7 @@ class BatchScheduler:
                 self._wakeup.set()
 
     def _fail_inbox(self, exc: BaseException) -> None:
-        try:
-            while True:
-                seq = self._inbox.get_nowait()
-                seq.emit({"type": "error", "exc": exc})
-        except queue.Empty:
-            pass
+        self._drain_inbox(lambda _seq: {"type": "error", "exc": exc})
 
     # -- worker (dedicated thread, holds the GPU) ------------------------
 
@@ -358,7 +381,6 @@ class BatchScheduler:
                 # iteration when any *other* sequence has processors.
                 logits_processors=[req.logits_processors or []],
             )[0]
-            seq.uid = uid
             active[uid] = seq
 
     @staticmethod

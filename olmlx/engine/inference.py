@@ -2552,6 +2552,7 @@ def _batch_eligible(
     lm: LoadedModel,
     gen_kwargs: dict,
     *,
+    max_tokens: int,
     images: list[str] | None,
     audio: list[str] | None,
     grammar_active: bool,
@@ -2568,6 +2569,12 @@ def _batch_eligible(
     # with a MagicMock whose every attribute is truthy — that must never
     # switch a mocked request onto the batched path.
     if settings.batching is not True:
+        return False
+    # Ollama num_predict -1/-2 mean "unlimited"; mlx-lm's BatchGenerator
+    # checks ``generated >= max_tokens``, which is instantly true for a
+    # negative value (one-token response). stream_generate's ``n ==
+    # max_tokens`` treats them as infinite, so those requests stay there.
+    if max_tokens <= 0:
         return False
     if (
         lm.is_vlm
@@ -2640,10 +2647,20 @@ def _get_batch_scheduler(lm: LoadedModel) -> Any:
         )
 
     async def acquire_gpu() -> None:
+        global _queue_depth
         await _await_deferred_cleanup()
-        # 0 disables the acquire timeout: the manager waits FIFO behind
-        # exclusive requests; batched requests time out individually.
-        await _acquire_inference_lock(0)
+        # Count the waiting manager in _queue_depth so OTHER models'
+        # running batch workers see it via their exclusive_pending latch
+        # and drain — otherwise a busy model starves every other model's
+        # batched requests (they never bump the depth on their own).
+        _queue_depth += 1
+        try:
+            # 0 disables the acquire timeout: the manager waits FIFO
+            # behind exclusive requests; batched requests time out
+            # individually consumer-side.
+            await _acquire_inference_lock(0)
+        finally:
+            _queue_depth -= 1
         try:
             await _await_deferred_cleanup()
             _lock_boundary_sync(sync_mode)
@@ -2682,6 +2699,42 @@ async def _drain_to_terminal(seq: Any) -> None:
             return
 
 
+def _batched_kv_preflight(lm: LoadedModel, num_tokens: int, max_tokens: int) -> None:
+    """Per-request KV admission for the batched path.
+
+    The exclusive path's ``_kv_cache_preflight_check`` can't run here (its
+    remediation mutates prompt-cache state under the inference lock, which
+    a batched consumer doesn't hold), but the pure estimate half can:
+    reject a request whose own KV would blow ``OLMLX_MEMORY_LIMIT_FRACTION``
+    with a MemoryError (→ HTTP 503) instead of risking the uncatchable
+    Metal OOM. Aggregate (cross-sequence) admission is Phase 3 (plan §10).
+    """
+    total_physical = memory_utils.get_system_memory_bytes()
+    if total_physical <= 0 or num_tokens <= 0:
+        return
+    memory_limit = int(total_physical * settings.memory_limit_fraction)
+    try:
+        kv_bytes = estimate_kv_cache_bytes(
+            lm.model,
+            num_tokens + max(max_tokens, 0),
+            kv_cache_quant=lm.kv_cache_quant,
+        )
+        current_metal = memory_utils.get_metal_memory()
+    except Exception:
+        logger.warning(
+            "Batched KV pre-flight check skipped — OOM protection inactive",
+            exc_info=True,
+        )
+        return
+    if current_metal + kv_bytes > memory_limit:
+        available_gb = max(0.0, (memory_limit - current_metal) / 1024**3)
+        raise MemoryError(
+            f"KV cache for {num_tokens + max(max_tokens, 0)} tokens estimated "
+            f"at {kv_bytes / 1024**3:.1f} GB, but only {available_gb:.1f} GB "
+            "available — prompt too long, reduce context or use a smaller model"
+        )
+
+
 async def _stream_completion_batched(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -2709,16 +2762,9 @@ async def _stream_completion_batched(
     else:
         tokens = list(prompt)
 
-    scheduler = _get_batch_scheduler(lm)
-    seq = await scheduler.submit(
-        BatchRequest(
-            tokens=tokens,
-            max_tokens=max_tokens,
-            sampler=gen_kwargs.get("sampler"),
-            logits_processors=gen_kwargs.get("logits_processors"),
-        )
-    )
+    _batched_kv_preflight(lm, len(tokens), max_tokens)
 
+    scheduler = _get_batch_scheduler(lm)
     detokenizer = lm.tokenizer.detokenizer  # fresh streaming instance
     stats.prompt_eval_count = len(tokens)
 
@@ -2736,7 +2782,6 @@ async def _stream_completion_batched(
     accumulated_text = ""
     stop_hit = False
     timed_out = False
-    generation_complete = False
     terminal_seen = False
     start_ns = time.monotonic_ns()
     first_token_ns: int | None = None
@@ -2753,7 +2798,11 @@ async def _stream_completion_batched(
         accumulated_text += piece
         stop_idx = -1
         for stop_seq in stop_sequences:
-            idx = accumulated_text.find(stop_seq)
+            # A match ending in the new piece must start within
+            # len(stop_seq)-1 of the boundary; anything earlier was
+            # caught (and truncated at) a previous call. Bounding the
+            # search start keeps the scan O(piece), not O(generation).
+            idx = accumulated_text.find(stop_seq, max(0, prev_len - len(stop_seq) + 1))
             if idx != -1 and (stop_idx == -1 or idx < stop_idx):
                 stop_idx = idx
         if stop_idx == -1:
@@ -2762,12 +2811,20 @@ async def _stream_completion_batched(
             accumulated_text[prev_len:stop_idx] if prev_len < stop_idx else ""
         ), True
 
+    seq: Any = None
     try:
         with _inference_ref(lm, keep_alive=keep_alive):
             try:
+                seq = await scheduler.submit(
+                    BatchRequest(
+                        tokens=tokens,
+                        max_tokens=max_tokens,
+                        sampler=gen_kwargs.get("sampler"),
+                        logits_processors=gen_kwargs.get("logits_processors"),
+                    )
+                )
                 inf_start = time.monotonic()
                 awaiting_first = True
-                cancelling = False
                 while True:
                     if awaiting_first and queue_timeout and queue_timeout > 0:
                         try:
@@ -2785,25 +2842,31 @@ async def _stream_completion_batched(
                         continue
                     if etype == "error":
                         terminal_seen = True
-                        exc = event["exc"]
-                        raise RuntimeError(f"Batched generation failed: {exc}") from exc
+                        # Re-raise the worker's exception with its original
+                        # type so the app-level handlers keep their mapping
+                        # (MemoryError → 503, ValueError → 422); a generic
+                        # wrapper would turn every failure into a 500.
+                        raise event["exc"]
                     if etype == "done":
                         terminal_seen = True
-                        if event["reason"] == "cancelled" and not cancelling:
+                        if event["reason"] == "cancelled" and not (
+                            stop_hit or timed_out
+                        ):
                             # Scheduler closed under us (model unload).
                             raise RuntimeError(
                                 "Batched generation cancelled (model unloading)"
                             )
-                        if not cancelling:
+                        if not (stop_hit or timed_out):
                             detokenizer.finalize()
                             tail = detokenizer.last_segment
-                            if tail and not stop_hit:
+                            if tail:
                                 tail, stop_hit = _scan_stop(tail)
                                 if tail:
                                     yield {"text": tail, "done": False}
                         break
                     # token
-                    if cancelling:
+                    if stop_hit or timed_out:
+                        # Already cancelled; drain to the terminal event.
                         continue
                     last_token_ns = time.monotonic_ns()
                     if first_token_ns is None:
@@ -2817,7 +2880,6 @@ async def _stream_completion_batched(
                             yield {"text": piece, "done": False}
                     if stop_hit:
                         scheduler.cancel(seq)
-                        cancelling = True
                         continue
                     if (
                         inf_timeout is not None
@@ -2830,9 +2892,8 @@ async def _stream_completion_batched(
                         )
                         timed_out = True
                         scheduler.cancel(seq)
-                        cancelling = True
             finally:
-                if not terminal_seen:
+                if seq is not None and not terminal_seen:
                     # Client disconnect / consumer exception: free the
                     # batch slot and wait (bounded) for the worker to
                     # confirm removal before dropping the model pin.
@@ -2846,7 +2907,6 @@ async def _stream_completion_batched(
             stats.prompt_eval_duration = first_token_ns - start_ns
             if last_token_ns is not None:
                 stats.eval_duration = max(last_token_ns - first_token_ns, 0)
-        generation_complete = True
         logger.info(
             "Batched generation complete: %d prompt tokens, %d tokens "
             "generated, %.2fs total",
@@ -2866,23 +2926,24 @@ async def _stream_completion_batched(
             logger.debug("metrics: observe_inference failed (batched)", exc_info=True)
         yield done_chunk
     finally:
-        if not generation_complete:
-            exc_type = sys.exc_info()[0]
-            # ServerBusyError = queue timeout, not an inference error —
-            # the exclusive path raises it before its metered section.
-            if exc_type is not None and not issubclass(
-                exc_type,
-                (GeneratorExit, asyncio.CancelledError, ServerBusyError),
-            ):
-                try:
-                    _metrics.observe_inference(
-                        lm.name, surface_var.get(), stats, error=True
-                    )
-                except Exception:
-                    logger.debug(
-                        "metrics: error observe failed (batched)",
-                        exc_info=True,
-                    )
+        exc_type = sys.exc_info()[0]
+        # Normal completion leaves no exception; a consumer closing the
+        # generator after the done chunk raises GeneratorExit (excluded).
+        # ServerBusyError = queue timeout, not an inference error — the
+        # exclusive path raises it before its metered section.
+        if exc_type is not None and not issubclass(
+            exc_type,
+            (GeneratorExit, asyncio.CancelledError, ServerBusyError),
+        ):
+            try:
+                _metrics.observe_inference(
+                    lm.name, surface_var.get(), stats, error=True
+                )
+            except Exception:
+                logger.debug(
+                    "metrics: error observe failed (batched)",
+                    exc_info=True,
+                )
 
 
 async def _stream_completion(
@@ -2908,7 +2969,12 @@ async def _stream_completion(
     # the per-model batch instead of serializing on the inference lock.
     # Phase 1 batched scope skips prompt-cache reuse (fresh prefill).
     if _batch_eligible(
-        lm, gen_kwargs, images=images, audio=audio, grammar_active=grammar_active
+        lm,
+        gen_kwargs,
+        max_tokens=max_tokens,
+        images=images,
+        audio=audio,
+        grammar_active=grammar_active,
     ):
         async for chunk in _stream_completion_batched(
             lm,

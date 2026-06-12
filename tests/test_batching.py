@@ -424,7 +424,13 @@ class TestBatchScheduler:
         events = await _collect(seq)
         assert events[-1]["type"] == "error"
         assert "metal exploded" in str(events[-1]["exc"])
-        # Lock released despite the failure; generator closed.
+        # Lock released despite the failure (the error event can reach the
+        # consumer a beat before the manager's finally runs — wait for it);
+        # generator closed.
+        for _ in range(200):
+            if "release" in gpu.events:
+                break
+            await asyncio.sleep(0.01)
         assert gpu.events == ["acquire", "release"]
         assert gens[0].closed
         # Scheduler survives: a new request gets a fresh generator and
@@ -528,6 +534,41 @@ class TestBatchScheduler:
         finally:
             loop_a.close()
 
+    async def test_manager_cancellation_holds_lock_until_worker_exits(self):
+        """Cancelling the manager task (shutdown) must NOT release the GPU
+        while the worker thread is still running — the lock is held until
+        the worker drains, then released and CancelledError propagates."""
+        from olmlx.engine.batching import BatchRequest
+
+        running = threading.Event()
+        gate = threading.Event()
+        long_script = [(i, None) for i in range(1000)] + [(0, "stop")]
+
+        def hold(gen):
+            running.set()
+            if gen.next_calls >= 2:
+                gate.wait(timeout=5.0)
+                gate.clear()
+
+        sched, gpu, gens = _make_scheduler([long_script], on_next=hold)
+        seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=2000))
+        await asyncio.to_thread(running.wait, 5.0)
+
+        assert sched._manager_task is not None
+        sched._manager_task.cancel()
+        # Give the cancellation a moment to land; the worker is blocked at
+        # the gate, so the lock must still be held.
+        await asyncio.sleep(0.05)
+        assert "release" not in gpu.events
+        # Unblock the worker: it observes _closing, drains, and exits; the
+        # manager then releases and finishes cancelled.
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(sched._manager_task, timeout=5.0)
+        assert gpu.events == ["acquire", "release"]
+        events = await _collect(seq)
+        assert events[-1] == {"type": "done", "reason": "cancelled"}
+
     async def test_close_cancels_queued_and_stops_manager(self):
         from olmlx.engine.batching import BatchRequest
 
@@ -542,6 +583,66 @@ class TestBatchScheduler:
         # Manager exits (possibly after finishing an in-flight period).
         if sched._manager_task is not None:
             await asyncio.wait_for(sched._manager_task, timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# Batched KV preflight
+# ---------------------------------------------------------------------------
+
+
+class TestBatchedKvPreflight:
+    def _lm(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(model=object(), kv_cache_quant=None)
+
+    def test_rejects_when_over_limit(self, monkeypatch):
+        from olmlx.engine import inference
+
+        monkeypatch.setattr(
+            inference.memory_utils, "get_system_memory_bytes", lambda: 100 * 1024**3
+        )
+        monkeypatch.setattr(
+            inference.memory_utils, "get_metal_memory", lambda: 80 * 1024**3
+        )
+        monkeypatch.setattr(
+            inference,
+            "estimate_kv_cache_bytes",
+            lambda model, n, kv_cache_quant=None: 30 * 1024**3,
+        )
+        with pytest.raises(MemoryError, match="prompt too long"):
+            inference._batched_kv_preflight(self._lm(), 50_000, 1024)
+
+    def test_allows_when_fits(self, monkeypatch):
+        from olmlx.engine import inference
+
+        monkeypatch.setattr(
+            inference.memory_utils, "get_system_memory_bytes", lambda: 100 * 1024**3
+        )
+        monkeypatch.setattr(
+            inference.memory_utils, "get_metal_memory", lambda: 10 * 1024**3
+        )
+        monkeypatch.setattr(
+            inference,
+            "estimate_kv_cache_bytes",
+            lambda model, n, kv_cache_quant=None: 5 * 1024**3,
+        )
+        inference._batched_kv_preflight(self._lm(), 50_000, 1024)
+
+    def test_estimator_failure_degrades_open(self, monkeypatch):
+        """Estimation failure must not block requests (matches the
+        exclusive preflight's warn-and-continue)."""
+        from olmlx.engine import inference
+
+        monkeypatch.setattr(
+            inference.memory_utils, "get_system_memory_bytes", lambda: 100 * 1024**3
+        )
+
+        def boom(model, n, kv_cache_quant=None):
+            raise RuntimeError("no estimate")
+
+        monkeypatch.setattr(inference, "estimate_kv_cache_bytes", boom)
+        inference._batched_kv_preflight(self._lm(), 50_000, 1024)
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +682,7 @@ class TestBatchEligible:
     def _eligible(self, lm, gen_kwargs=None, **kw):
         from olmlx.engine.inference import _batch_eligible
 
-        defaults = dict(images=None, audio=None, grammar_active=False)
+        defaults = dict(max_tokens=64, images=None, audio=None, grammar_active=False)
         defaults.update(kw)
         return _batch_eligible(lm, gen_kwargs or {}, **defaults)
 
@@ -641,6 +742,14 @@ class TestBatchEligible:
 
     def test_seed_disqualifies(self):
         assert not self._eligible(_eligible_lm(), {"seed": 42})
+
+    @pytest.mark.parametrize("mt", [0, -1, -2])
+    def test_nonpositive_max_tokens_disqualifies(self, mt):
+        """Ollama num_predict -1/-2 mean unlimited; BatchGenerator's
+        ``generated >= max_tokens`` would finish after one token, so these
+        must stay on the exclusive path (stream_generate treats them as
+        infinite)."""
+        assert not self._eligible(_eligible_lm(), max_tokens=mt)
 
     def test_channel_format_disqualifies(self):
         from types import SimpleNamespace
