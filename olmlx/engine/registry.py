@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import math
 import os
 import tempfile
 import threading
@@ -586,11 +587,16 @@ class ModelConfig:
         if self.batch_fairness_quantum is not None and (
             isinstance(self.batch_fairness_quantum, bool)
             or not isinstance(self.batch_fairness_quantum, (int, float))
+            or not math.isfinite(self.batch_fairness_quantum)
             or self.batch_fairness_quantum < 0
         ):
+            # Reject NaN/Infinity too (json.loads accepts those literals): a
+            # non-finite quantum makes ``held >= quantum`` never true in the
+            # worker, silently disabling the fairness latch and starving
+            # exclusive requests.
             raise ValueError(
-                "'batch_fairness_quantum' must be a non-negative number or None, "
-                f"got {self.batch_fairness_quantum!r}"
+                "'batch_fairness_quantum' must be a finite non-negative number "
+                f"or None, got {self.batch_fairness_quantum!r}"
             )
 
     def resolved_speculative(self) -> SpeculativeConfig:

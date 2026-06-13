@@ -1867,6 +1867,14 @@ class TestBatchingSettings:
         with pytest.raises(ValueError):
             Settings()
 
+    @pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
+    def test_fairness_quantum_rejects_non_finite(self, monkeypatch, bad):
+        # +inf passes Field(ge=0) but would disable the fairness latch
+        # (held >= inf is never true); allow_inf_nan=False rejects it.
+        monkeypatch.setenv("OLMLX_BATCH_FAIRNESS_QUANTUM", bad)
+        with pytest.raises(ValueError):
+            Settings()
+
     @pytest.mark.parametrize(
         "var",
         [

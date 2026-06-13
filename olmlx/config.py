@@ -341,7 +341,10 @@ class Settings(BaseSettings):
     # a throughput floor that bounds the *extra* admission window imposed on
     # the waiting exclusive request to `batch_fairness_quantum`. 0.0 (default)
     # = latch immediately (today's behavior). Per-model overridable.
-    batch_fairness_quantum: Annotated[float, Field(ge=0)] = 0.0
+    # ``allow_inf_nan=False``: a non-finite quantum would make ``held >=
+    # quantum`` never true, silently disabling the fairness latch and
+    # starving exclusive requests (Field(ge=0) alone admits +inf).
+    batch_fairness_quantum: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
 
     # Flash inference (LLM in a Flash). Primary, user-facing knobs.
     # Advanced tuning (window size, IO threads, cache budget, predictor

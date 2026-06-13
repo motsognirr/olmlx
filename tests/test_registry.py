@@ -828,6 +828,16 @@ class TestModelConfig:
                 {"hf_path": "org/model", "batch_fairness_quantum": bad}
             )
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_batch_fairness_quantum_rejects_non_finite(self, bad):
+        """NaN/Infinity (json.loads accepts those literals) must be rejected:
+        a non-finite quantum makes ``held >= quantum`` never true, silently
+        disabling the fairness latch and starving exclusive requests."""
+        with pytest.raises(ValueError, match="batch_fairness_quantum"):
+            ModelConfig.from_entry(
+                {"hf_path": "org/model", "batch_fairness_quantum": bad}
+            )
+
     def test_batch_fairness_quantum_round_trip(self):
         mc = ModelConfig(hf_path="org/model", batch_fairness_quantum=2.5)
         entry = mc.to_entry()
