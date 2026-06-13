@@ -355,6 +355,8 @@ def _make_scheduler(
     consumer_lag_limit=0,
     kv_headroom=None,
     kv_estimate=None,
+    fairness_quantum=0.0,
+    now=None,
 ):
     from olmlx.engine.batching import BatchScheduler
 
@@ -375,6 +377,8 @@ def _make_scheduler(
         consumer_lag_limit=consumer_lag_limit,
         kv_headroom=kv_headroom,
         kv_estimate=kv_estimate,
+        fairness_quantum=fairness_quantum,
+        now=now,
         name="test",
     )
     return sched, gpu, made
@@ -549,6 +553,87 @@ class TestBatchScheduler:
         assert gens[0].inserted == 1
         # ...and is served in period 2 once the exclusive flag clears
         # (manager re-arms because the inbox is non-empty). Each period
+        # gets a fresh FakeGen, so seq2 consumes script index 0 again.
+        flag["up"] = False
+        ev2 = await _collect(seq2)
+        assert _tokens(ev2) == [10, 11]
+        assert len(gens) == 2
+        assert gens[1].inserted == 1
+
+    async def test_fairness_quantum_keeps_admitting_within_window(self):
+        """With a fairness quantum, an exclusive waiter does NOT instantly
+        collapse the batch: while the period's held time is below the
+        quantum, the worker keeps admitting inbox requests so batched
+        throughput survives interleaved exclusive traffic. The clock is
+        pinned below the quantum the whole time, so the pause never latches."""
+        from olmlx.engine.batching import BatchRequest, BatchSequence
+
+        flag = {"up": False}
+        loop = asyncio.get_running_loop()
+        seq2 = BatchSequence(BatchRequest(tokens=[2], max_tokens=8), loop)
+        holder = {}
+
+        def hook(gen):
+            if gen.next_calls == 2 and not holder.get("injected"):
+                holder["injected"] = True
+                flag["up"] = True  # exclusive waiter appears mid-period
+                holder["sched"]._inbox.put(seq2)
+
+        sched, _, gens = _make_scheduler(
+            [[(10, None), (11, None), (0, "stop")], [(99, "length")]],
+            exclusive_pending=lambda: flag["up"],
+            on_next=hook,
+            fairness_quantum=100.0,
+            now=lambda: 0.0,  # held == 0 < quantum forever → never latch
+        )
+        holder["sched"] = sched
+
+        seq1 = await sched.submit(BatchRequest(tokens=[1], max_tokens=8))
+        ev1 = await _collect(seq1)
+        ev2 = await _collect(seq2)
+        # Both ran in ONE busy period (contrast test_pause_latches_mid_period,
+        # where quantum=0 keeps seq2 out): a single FakeGen, two inserts.
+        assert _tokens(ev1) == [10, 11]
+        assert _tokens(ev2) == [99]
+        assert len(gens) == 1
+        assert gens[0].inserted == 2
+        assert sched.stats()["batch_fairness_pauses"] == 0
+
+    async def test_fairness_quantum_latches_once_elapsed(self):
+        """Once the period's held time reaches the quantum, the guard
+        latches exactly as the un-tuned (quantum=0) path does: the
+        mid-period request stays in the inbox for a second period, and the
+        fairness-pause counter ticks."""
+        from olmlx.engine.batching import BatchRequest, BatchSequence
+
+        flag = {"up": False}
+        clock = {"t": 0.0}
+        loop = asyncio.get_running_loop()
+        seq2 = BatchSequence(BatchRequest(tokens=[2], max_tokens=8), loop)
+        holder = {}
+
+        def hook(gen):
+            if gen.next_calls == 2 and not holder.get("injected"):
+                holder["injected"] = True
+                flag["up"] = True
+                clock["t"] = 200.0  # held now exceeds the quantum
+                holder["sched"]._inbox.put(seq2)
+
+        sched, _, gens = _make_scheduler(
+            [[(10, None), (11, None), (0, "stop")], [(99, "length")]],
+            exclusive_pending=lambda: flag["up"],
+            on_next=hook,
+            fairness_quantum=100.0,
+            now=lambda: clock["t"],
+        )
+        holder["sched"] = sched
+
+        seq1 = await sched.submit(BatchRequest(tokens=[1], max_tokens=8))
+        ev1 = await _collect(seq1)
+        assert _tokens(ev1) == [10, 11]
+        assert gens[0].inserted == 1  # seq2 not admitted in period 1
+        assert sched.stats()["batch_fairness_pauses"] == 1
+        # seq2 served in period 2 once the exclusive flag clears. Period 2
         # gets a fresh FakeGen, so seq2 consumes script index 0 again.
         flag["up"] = False
         ev2 = await _collect(seq2)
@@ -1485,6 +1570,95 @@ class TestBatchedKvPreflight:
 
 
 # ---------------------------------------------------------------------------
+# Scheduler factory — per-model batch-size resolution
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerFactorySizes:
+    def _scheduler_lm(self, **overrides):
+        from types import SimpleNamespace
+
+        base = dict(
+            name="stub",
+            model=object(),
+            tokenizer=SimpleNamespace(eos_token_ids=[0]),
+            sync_mode=None,
+            batch_scheduler=None,
+            batch_completion_size=None,
+            batch_prefill_size=None,
+            batch_prefill_step=None,
+            batch_fairness_quantum=None,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def _capture(self, lm, monkeypatch):
+        """Run ``_get_batch_scheduler`` with ``BatchGenerator`` /
+        ``BatchScheduler`` stubbed; return ``(generator_kwargs,
+        scheduler_kwargs)`` — the kwargs the factory passes to
+        ``BatchGenerator`` and the kwargs ``_get_batch_scheduler`` passes to
+        ``BatchScheduler``."""
+        import importlib
+
+        from olmlx.engine import batching, inference
+
+        # ``mlx_lm.generate`` the attribute is the generate() function (the
+        # package re-exports it), shadowing the submodule — import the real
+        # module object so the patch lands where the factory looks it up.
+        mlx_generate = importlib.import_module("mlx_lm.generate")
+
+        gen_kwargs: dict = {}
+        sched_kwargs: dict = {}
+
+        def fake_generator(model, **kwargs):
+            gen_kwargs.update(kwargs)
+            return object()
+
+        class FakeScheduler:
+            def __init__(self, *, generator_factory, **kw):
+                self.generator_factory = generator_factory
+                sched_kwargs.update(kw)
+
+        monkeypatch.setattr(mlx_generate, "BatchGenerator", fake_generator)
+        monkeypatch.setattr(batching, "BatchScheduler", FakeScheduler)
+        sched = inference._get_batch_scheduler(lm)
+        sched.generator_factory()
+        return gen_kwargs, sched_kwargs
+
+    def test_defaults_fall_back_to_settings(self, monkeypatch):
+        from olmlx.config import settings
+
+        monkeypatch.setattr(settings, "batch_completion_size", 8)
+        monkeypatch.setattr(settings, "batch_prefill_size", 4)
+        monkeypatch.setattr(settings, "batch_prefill_step", 2048)
+        monkeypatch.setattr(settings, "batch_fairness_quantum", 0.0)
+        gen_kwargs, sched_kwargs = self._capture(self._scheduler_lm(), monkeypatch)
+        assert gen_kwargs["completion_batch_size"] == 8
+        assert gen_kwargs["prefill_batch_size"] == 4
+        assert gen_kwargs["prefill_step_size"] == 2048
+        assert sched_kwargs["fairness_quantum"] == 0.0
+
+    def test_per_model_sizes_override_settings(self, monkeypatch):
+        from olmlx.config import settings
+
+        monkeypatch.setattr(settings, "batch_completion_size", 8)
+        monkeypatch.setattr(settings, "batch_prefill_size", 4)
+        monkeypatch.setattr(settings, "batch_prefill_step", 2048)
+        monkeypatch.setattr(settings, "batch_fairness_quantum", 0.0)
+        lm = self._scheduler_lm(
+            batch_completion_size=16,
+            batch_prefill_size=2,
+            batch_prefill_step=1024,
+            batch_fairness_quantum=3.0,
+        )
+        gen_kwargs, sched_kwargs = self._capture(lm, monkeypatch)
+        assert gen_kwargs["completion_batch_size"] == 16
+        assert gen_kwargs["prefill_batch_size"] == 2
+        assert gen_kwargs["prefill_step_size"] == 1024
+        assert sched_kwargs["fairness_quantum"] == 3.0
+
+
+# ---------------------------------------------------------------------------
 # Eligibility predicate
 # ---------------------------------------------------------------------------
 
@@ -1506,6 +1680,7 @@ def _eligible_lm(**overrides):
         kv_cache_quant=None,
         template_caps=SimpleNamespace(has_channel_format=False),
         batch_convertible=True,  # preset: skip the model probe
+        batching=None,  # per-model override; None defers to settings.batching
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -1533,6 +1708,34 @@ class TestBatchEligible:
 
         monkeypatch.setattr(settings, "batching", False)
         assert not self._eligible(_eligible_lm())
+
+    def test_per_model_override_enables_when_global_off(self, monkeypatch):
+        """A model with ``batching=True`` batches even when OLMLX_BATCHING
+        is off — 'default-on per-model' without flipping the global."""
+        from olmlx.config import settings
+
+        monkeypatch.setattr(settings, "batching", False)
+        assert self._eligible(_eligible_lm(batching=True))
+
+    def test_per_model_override_disables_when_global_on(self):
+        """A model with ``batching=False`` opts out even when the global
+        toggle is on (fixture sets settings.batching=True)."""
+        assert not self._eligible(_eligible_lm(batching=False))
+
+    def test_per_model_none_defers_to_global(self, monkeypatch):
+        """``batching=None`` (default) follows the global setting both ways."""
+        from olmlx.config import settings
+
+        assert self._eligible(_eligible_lm(batching=None))
+        monkeypatch.setattr(settings, "batching", False)
+        assert not self._eligible(_eligible_lm(batching=None))
+
+    def test_per_model_override_still_respects_mechanical_eligibility(self):
+        """The per-model toggle replaces only the opt-in gate; a genuinely
+        incompatible model (here KV-quant) never batches even with True."""
+        assert not self._eligible(
+            _eligible_lm(batching=True, kv_cache_quant="turboquant:4")
+        )
 
     def test_mock_settings_do_not_enable(self, monkeypatch):
         """Tests across the suite patch inference.settings with a
@@ -1626,6 +1829,7 @@ class TestBatchingSettings:
             "OLMLX_BATCH_PREFILL_SIZE",
             "OLMLX_BATCH_PREFILL_STEP",
             "OLMLX_BATCH_CONSUMER_LAG_LIMIT",
+            "OLMLX_BATCH_FAIRNESS_QUANTUM",
         ):
             monkeypatch.delenv(var, raising=False)
         s = Settings()
@@ -1634,6 +1838,7 @@ class TestBatchingSettings:
         assert s.batch_prefill_size == 4
         assert s.batch_prefill_step == 2048
         assert s.batch_consumer_lag_limit == 2048
+        assert s.batch_fairness_quantum == 0.0
 
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv("OLMLX_BATCHING", "true")
@@ -1652,6 +1857,23 @@ class TestBatchingSettings:
         # 0 disables backpressure cancellation (unlike the size knobs).
         monkeypatch.setenv("OLMLX_BATCH_CONSUMER_LAG_LIMIT", "0")
         assert Settings().batch_consumer_lag_limit == 0
+
+    def test_fairness_quantum_env_override(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_BATCH_FAIRNESS_QUANTUM", "2.5")
+        assert Settings().batch_fairness_quantum == 2.5
+
+    def test_fairness_quantum_rejects_negative(self, monkeypatch):
+        monkeypatch.setenv("OLMLX_BATCH_FAIRNESS_QUANTUM", "-1")
+        with pytest.raises(ValueError):
+            Settings()
+
+    @pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
+    def test_fairness_quantum_rejects_non_finite(self, monkeypatch, bad):
+        # +inf passes Field(ge=0) but would disable the fairness latch
+        # (held >= inf is never true); allow_inf_nan=False rejects it.
+        monkeypatch.setenv("OLMLX_BATCH_FAIRNESS_QUANTUM", bad)
+        with pytest.raises(ValueError):
+            Settings()
 
     @pytest.mark.parametrize(
         "var",

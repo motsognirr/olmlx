@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import math
 import os
 import tempfile
 import threading
@@ -366,6 +367,23 @@ class ModelConfig:
     #: the registry continues to benefit from caching. ``None`` means defer to
     #: the global ``settings.prompt_cache`` (default behaviour).
     prompt_cache: bool | None = None
+    #: Per-model override for continuous batching (``OLMLX_BATCHING``). When
+    #: set, fully replaces the global opt-in gate for this model — enable
+    #: batching for a known-good dense model without flipping the global
+    #: default ("default-on per-model"), or opt one model out. ``None``
+    #: defers to ``settings.batching``. Mechanical eligibility (plain
+    #: ``KVCache``, no VLM/speculative/KV-quant/…) still applies on top.
+    batching: bool | None = None
+    #: Per-model overrides for the batch-size knobs (``OLMLX_BATCH_*``).
+    #: Each ``None`` defers to the corresponding global setting; a set value
+    #: must be a positive int (mirrors the ``Field(ge=1)`` constraint).
+    batch_completion_size: int | None = None
+    batch_prefill_size: int | None = None
+    batch_prefill_step: int | None = None
+    #: Per-model override for the batch fairness quantum in seconds
+    #: (``OLMLX_BATCH_FAIRNESS_QUANTUM``). A non-negative number; ``None``
+    #: defers to the global setting.
+    batch_fairness_quantum: float | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -547,6 +565,38 @@ class ModelConfig:
         if self.prompt_cache is not None and not isinstance(self.prompt_cache, bool):
             raise ValueError(
                 f"'prompt_cache' must be a bool or None, got {self.prompt_cache!r}"
+            )
+        if self.batching is not None and not isinstance(self.batching, bool):
+            raise ValueError(
+                f"'batching' must be a bool or None, got {self.batching!r}"
+            )
+        # Positive-int knobs (mirror the global ``Field(ge=1)`` constraints).
+        # ``bool`` is an ``int`` subclass, so reject it explicitly.
+        for _name in (
+            "batch_completion_size",
+            "batch_prefill_size",
+            "batch_prefill_step",
+        ):
+            _val = getattr(self, _name)
+            if _val is not None and (
+                isinstance(_val, bool) or not isinstance(_val, int) or _val < 1
+            ):
+                raise ValueError(
+                    f"'{_name}' must be a positive integer or None, got {_val!r}"
+                )
+        if self.batch_fairness_quantum is not None and (
+            isinstance(self.batch_fairness_quantum, bool)
+            or not isinstance(self.batch_fairness_quantum, (int, float))
+            or not math.isfinite(self.batch_fairness_quantum)
+            or self.batch_fairness_quantum < 0
+        ):
+            # Reject NaN/Infinity too (json.loads accepts those literals): a
+            # non-finite quantum makes ``held >= quantum`` never true in the
+            # worker, silently disabling the fairness latch and starving
+            # exclusive requests.
+            raise ValueError(
+                "'batch_fairness_quantum' must be a finite non-negative number "
+                f"or None, got {self.batch_fairness_quantum!r}"
             )
 
     def resolved_speculative(self) -> SpeculativeConfig:
@@ -881,6 +931,11 @@ class ModelConfig:
             flash_speculative_tokens = entry.get("flash_speculative_tokens")
             enable_thinking_raw = entry.get("enable_thinking")
             prompt_cache_raw = entry.get("prompt_cache")
+            batching_raw = entry.get("batching")
+            batch_completion_size_raw = entry.get("batch_completion_size")
+            batch_prefill_size_raw = entry.get("batch_prefill_size")
+            batch_prefill_step_raw = entry.get("batch_prefill_step")
+            batch_fairness_quantum_raw = entry.get("batch_fairness_quantum")
 
             kv_cache_quant_raw = entry.get("kv_cache_quant")
             if kv_cache_quant_raw is not None:
@@ -947,6 +1002,11 @@ class ModelConfig:
                 flash_speculative_tokens=flash_speculative_tokens,
                 enable_thinking=enable_thinking_raw,
                 prompt_cache=prompt_cache_raw,
+                batching=batching_raw,
+                batch_completion_size=batch_completion_size_raw,
+                batch_prefill_size=batch_prefill_size_raw,
+                batch_prefill_step=batch_prefill_step_raw,
+                batch_fairness_quantum=batch_fairness_quantum_raw,
                 _extra=extra,
             )
         raise TypeError(
@@ -986,6 +1046,11 @@ class ModelConfig:
             and self.flash_speculative_tokens is None
             and self.enable_thinking is None
             and self.prompt_cache is None
+            and self.batching is None
+            and self.batch_completion_size is None
+            and self.batch_prefill_size is None
+            and self.batch_prefill_step is None
+            and self.batch_fairness_quantum is None
             and not self._extra
         ):
             return self.hf_path
@@ -1053,6 +1118,16 @@ class ModelConfig:
             result["enable_thinking"] = self.enable_thinking
         if self.prompt_cache is not None:
             result["prompt_cache"] = self.prompt_cache
+        if self.batching is not None:
+            result["batching"] = self.batching
+        if self.batch_completion_size is not None:
+            result["batch_completion_size"] = self.batch_completion_size
+        if self.batch_prefill_size is not None:
+            result["batch_prefill_size"] = self.batch_prefill_size
+        if self.batch_prefill_step is not None:
+            result["batch_prefill_step"] = self.batch_prefill_step
+        if self.batch_fairness_quantum is not None:
+            result["batch_fairness_quantum"] = self.batch_fairness_quantum
         # Filter known keys defensively — from_entry() already excludes them,
         # but _extra can be set directly via ModelConfig construction.
         result.update(

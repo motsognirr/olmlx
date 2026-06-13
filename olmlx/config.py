@@ -332,6 +332,19 @@ class Settings(BaseSettings):
     # request's own KV) is always enforced; this gates the cross-sequence
     # sum. Disable to fall back to admit-all (per-request preflight only).
     batch_kv_admission: bool = True
+    # Fairness quantum (seconds). When an exclusive (non-batched) request
+    # starts waiting on the inference lock, the batch worker normally stops
+    # admitting new sequences at once and drains so the waiter isn't starved.
+    # Under interleaved mixed traffic that collapses the batch to one
+    # sequence. This quantum guarantees the batch at least this many seconds
+    # of admission-open service per busy period before it latches the pause —
+    # a throughput floor that bounds the *extra* admission window imposed on
+    # the waiting exclusive request to `batch_fairness_quantum`. 0.0 (default)
+    # = latch immediately (today's behavior). Per-model overridable.
+    # ``allow_inf_nan=False``: a non-finite quantum would make ``held >=
+    # quantum`` never true, silently disabling the fairness latch and
+    # starving exclusive requests (Field(ge=0) alone admits +inf).
+    batch_fairness_quantum: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
 
     # Flash inference (LLM in a Flash). Primary, user-facing knobs.
     # Advanced tuning (window size, IO threads, cache budget, predictor

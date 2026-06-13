@@ -205,12 +205,24 @@ class BatchScheduler:
         consumer_lag_limit: int = 0,
         kv_headroom: Callable[[], int] | None = None,
         kv_estimate: Callable[[BatchRequest], int] | None = None,
+        fairness_quantum: float = 0.0,
+        now: Callable[[], float] | None = None,
         name: str = "",
     ):
         self._generator_factory = generator_factory
         self._acquire_gpu = acquire_gpu
         self._release_gpu = release_gpu
         self._exclusive_pending = exclusive_pending or (lambda: False)
+        # Fairness quantum (plan §11). When an exclusive request is waiting,
+        # the worker normally latches admission shut at once and drains. That
+        # collapses the batch to one sequence under interleaved mixed traffic.
+        # With ``fairness_quantum > 0`` the worker keeps admitting until it has
+        # held the lock at least this many seconds this busy period, giving the
+        # batch a throughput floor; the extra wait imposed on the exclusive
+        # request is bounded by the quantum. 0.0 = latch immediately (the
+        # un-tuned behavior). ``now`` is injectable for deterministic tests.
+        self._fairness_quantum = fairness_quantum
+        self._now = now or time.monotonic
         # 0 disables backpressure cancellation; otherwise a sequence whose
         # consumer falls more than this many events behind is dropped from
         # the batch so a stalled-but-connected client can't pin a slot and
@@ -238,6 +250,9 @@ class BatchScheduler:
         self._active_count = 0
         self._inserts_total = 0
         self._tokens_total = 0
+        # Times the worker latched the fairness pause (yielded the lock to a
+        # waiting exclusive request). Single-writer (worker thread).
+        self._fairness_pauses = 0
 
     def stats(self) -> dict[str, int]:
         """Point-in-time occupancy + cumulative counters (plan §8)."""
@@ -246,6 +261,7 @@ class BatchScheduler:
             "batch_queued": self._inbox.qsize(),
             "batch_inserts": self._inserts_total,
             "batch_tokens": self._tokens_total,
+            "batch_fairness_pauses": self._fairness_pauses,
         }
 
     # -- consumer side (event loop) ------------------------------------
@@ -381,14 +397,30 @@ class BatchScheduler:
         # would pointlessly toggle the wired limit and sync the stream.
         gen: Any = None
         paused = False
+        period_start = self._now()
         try:
             with safe_rope_patch():
                 while True:
                     # Latch: once an exclusive request is waiting on the
-                    # lock, stop admitting for the rest of this busy
-                    # period (it can only unblock after our release).
+                    # lock, stop admitting for the rest of this busy period
+                    # (it can only unblock after our release). The fairness
+                    # quantum delays this until the batch has had a minimum
+                    # service slice, so steady exclusive traffic can't
+                    # collapse it to one sequence (plan §11). ``held`` only
+                    # grows, so the latch always fires within ``quantum`` of
+                    # the waiter appearing — exclusive is never starved.
                     if not paused and self._exclusive_pending():
-                        paused = True
+                        held = self._now() - period_start
+                        if held >= self._fairness_quantum:
+                            paused = True
+                            self._fairness_pauses += 1
+                            logger.info(
+                                "batch[%s]: yielding lock to exclusive "
+                                "waiter after %.2fs service, %d running",
+                                self._name,
+                                held,
+                                len(active),
+                            )
                     if not paused and not self._closing:
                         gen = self._admit(gen, active)
                     if self._closing:

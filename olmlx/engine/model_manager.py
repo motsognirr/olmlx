@@ -563,6 +563,17 @@ class LoadedModel:
     # MoE-quantized targets where chunked prefill triggers GatedDeltaNet
     # numerical drift across expert-routing thresholds).
     prompt_cache: bool | None = None
+    # Per-model override for continuous batching. ``_batch_eligible``
+    # consults this in place of ``settings.batching`` when set; None defers
+    # to the global toggle. Mechanical eligibility (cache layout, model
+    # kind, KV-quant, …) still applies on top. The batch-size knobs below
+    # likewise override ``settings.batch_*`` in ``_get_batch_scheduler``
+    # when set; None means inherit the global value.
+    batching: bool | None = None
+    batch_completion_size: int | None = None
+    batch_prefill_size: int | None = None
+    batch_prefill_step: int | None = None
+    batch_fairness_quantum: float | None = None
 
     def __post_init__(self):
         if self.prompt_cache_store is None:
@@ -1516,6 +1527,11 @@ class ModelManager(SpeculativeLoaderMixin):
                         sync_mode=model_config.sync_mode,
                         enable_thinking=model_config.enable_thinking,
                         prompt_cache=model_config.prompt_cache,
+                        batching=model_config.batching,
+                        batch_completion_size=model_config.batch_completion_size,
+                        batch_prefill_size=model_config.batch_prefill_size,
+                        batch_prefill_step=model_config.batch_prefill_step,
+                        batch_fairness_quantum=model_config.batch_fairness_quantum,
                     )
                     # Register before probe so concurrent callers see the
                     # model while the probe's async Metal flush releases the

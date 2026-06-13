@@ -736,6 +736,116 @@ class TestModelConfig:
         round_trip = ModelConfig.from_entry(entry)
         assert round_trip.prompt_cache is False
 
+    def test_batching_default_none(self):
+        """``batching`` defaults to None (global OLMLX_BATCHING applies)."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model"})
+        assert mc.batching is None
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_batching_parsed(self, value):
+        """``batching`` parses bool from a dict entry."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model", "batching": value})
+        assert mc.batching is value
+
+    def test_batching_non_bool_rejected(self):
+        """Non-bool batching raises ValueError."""
+        with pytest.raises(ValueError, match="batching"):
+            ModelConfig.from_entry({"hf_path": "org/model", "batching": "on"})
+
+    def test_batching_round_trip(self):
+        """``batching`` survives to_entry → from_entry."""
+        mc = ModelConfig(hf_path="org/model", batching=True)
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["batching"] is True
+        round_trip = ModelConfig.from_entry(entry)
+        assert round_trip.batching is True
+
+    def test_batching_compacts_when_none(self):
+        """A model with only batching=None still serializes to a string."""
+        mc = ModelConfig(hf_path="org/model")
+        assert mc.to_entry() == "org/model"
+
+    def test_batch_sizes_default_none(self):
+        """The per-model batch-size knobs default to None (globals apply)."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model"})
+        assert mc.batch_completion_size is None
+        assert mc.batch_prefill_size is None
+        assert mc.batch_prefill_step is None
+
+    @pytest.mark.parametrize(
+        "key", ["batch_completion_size", "batch_prefill_size", "batch_prefill_step"]
+    )
+    def test_batch_sizes_parsed(self, key):
+        """The batch-size knobs parse a positive int from a dict entry."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model", key: 16})
+        assert getattr(mc, key) == 16
+
+    @pytest.mark.parametrize(
+        "key", ["batch_completion_size", "batch_prefill_size", "batch_prefill_step"]
+    )
+    @pytest.mark.parametrize("bad", [0, -1, 1.5, True, "8"])
+    def test_batch_sizes_reject_non_positive_int(self, key, bad):
+        """The batch-size knobs reject zero/negative/non-int (mirrors the
+        ``Field(ge=1)`` constraint on the global settings)."""
+        with pytest.raises(ValueError, match=key):
+            ModelConfig.from_entry({"hf_path": "org/model", key: bad})
+
+    def test_batch_sizes_round_trip(self):
+        """The batch-size knobs survive to_entry → from_entry."""
+        mc = ModelConfig(
+            hf_path="org/model",
+            batch_completion_size=16,
+            batch_prefill_size=2,
+            batch_prefill_step=1024,
+        )
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["batch_completion_size"] == 16
+        assert entry["batch_prefill_size"] == 2
+        assert entry["batch_prefill_step"] == 1024
+        round_trip = ModelConfig.from_entry(entry)
+        assert round_trip.batch_completion_size == 16
+        assert round_trip.batch_prefill_size == 2
+        assert round_trip.batch_prefill_step == 1024
+
+    def test_batch_fairness_quantum_default_none(self):
+        mc = ModelConfig.from_entry({"hf_path": "org/model"})
+        assert mc.batch_fairness_quantum is None
+
+    @pytest.mark.parametrize("value", [0, 0.5, 2, 3.0])
+    def test_batch_fairness_quantum_parsed(self, value):
+        """A non-negative number (int or float) parses."""
+        mc = ModelConfig.from_entry(
+            {"hf_path": "org/model", "batch_fairness_quantum": value}
+        )
+        assert mc.batch_fairness_quantum == value
+
+    @pytest.mark.parametrize("bad", [-0.1, -1, "2", True])
+    def test_batch_fairness_quantum_rejects_invalid(self, bad):
+        with pytest.raises(ValueError, match="batch_fairness_quantum"):
+            ModelConfig.from_entry(
+                {"hf_path": "org/model", "batch_fairness_quantum": bad}
+            )
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_batch_fairness_quantum_rejects_non_finite(self, bad):
+        """NaN/Infinity (json.loads accepts those literals) must be rejected:
+        a non-finite quantum makes ``held >= quantum`` never true, silently
+        disabling the fairness latch and starving exclusive requests."""
+        with pytest.raises(ValueError, match="batch_fairness_quantum"):
+            ModelConfig.from_entry(
+                {"hf_path": "org/model", "batch_fairness_quantum": bad}
+            )
+
+    def test_batch_fairness_quantum_round_trip(self):
+        mc = ModelConfig(hf_path="org/model", batch_fairness_quantum=2.5)
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["batch_fairness_quantum"] == 2.5
+        round_trip = ModelConfig.from_entry(entry)
+        assert round_trip.batch_fairness_quantum == 2.5
+
 
 class TestRegistryModelConfig:
     def test_load_mixed_format(self, tmp_path, monkeypatch):
