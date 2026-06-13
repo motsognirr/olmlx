@@ -333,10 +333,10 @@ Live (`tests/live/test_batching_real.py`, `real_model`):
 - **Phase 3 — hardening** (in progress): consumer backpressure (done —
   `OLMLX_BATCH_CONSUMER_LAG_LIMIT`, drop-the-laggard, see §11) and user
   docs (done — USER_MANUAL "Continuous Batching"). Per-request KV admission
-  vs `OLMLX_MEMORY_LIMIT_FRACTION` already landed in Phase 2
-  (`_batched_kv_preflight`); remaining: aggregate (cross-sequence) admission
-  accounting for `gen.prompt_cache_nbytes`, fairness-guard tuning, and
-  default-on per-model.
+  vs `OLMLX_MEMORY_LIMIT_FRACTION` landed in Phase 2 (`_batched_kv_preflight`);
+  aggregate (cross-sequence) admission **done** (`OLMLX_BATCH_KV_ADMISSION`,
+  default on — see §11). Remaining: fairness-guard tuning and default-on
+  per-model.
 - **Phase 4 — extensions** (separate decisions): hybrid `ArraysCache` (GDN)
   models behind a flag; batch-capable KV-quant caches (upstream-shaped work);
   drain-and-switch policy for multi-model juggling; `insert_segments` +
@@ -381,6 +381,29 @@ Live (`tests/live/test_batching_real.py`, `real_model`):
   cancel (which still raises). Unlike CancellableStream's bounded
   `Queue(32)` *blocking* backpressure, a batch can't block one slow reader
   without stalling its co-tenants, so the v1 policy is drop-the-laggard.
+- **Aggregate KV admission** (Phase 3, **resolved**): per-request
+  `_batched_kv_preflight` rejects a single request whose own KV would blow
+  `OLMLX_MEMORY_LIMIT_FRACTION`, but N consumers each pass it concurrently
+  against the *same* pre-admission Metal reading and can collectively
+  oversubscribe (none sees the others' not-yet-allocated KV). The worker
+  closes the gap in `_admit` (`OLMLX_BATCH_KV_ADMISSION`, default on): it
+  measures headroom once per tick (`limit − get_metal_memory()`, which nets
+  out resident sequences' KV) and accumulates a `promised` total for
+  sequences admitted earlier in the *same* tick whose prefill hasn't run yet
+  (so their bytes aren't in the Metal reading). A candidate that would push
+  `promised + estimate` over headroom is **deferred** — re-queued to the
+  inbox tail, admission stops for the tick — and retried once a co-tenant
+  finishes and headroom recovers (backpressure, not rejection: the whole
+  point of batching is to admit when memory frees). An **empty batch always
+  admits its first sequence** regardless of estimate — that lone request's
+  fit is the per-request preflight's job, and gating it here would deadlock
+  (nothing would ever free KV). The estimate is plain-fp16
+  `estimate_kv_cache_bytes(suffix + max_tokens)` (batched eligibility
+  excludes KV-quant; a reused prefix is already-resident, not re-counted).
+  Because deferred sequences live in the real inbox (not worker-local
+  state), a fairness pause that ends the busy period leaves them for the
+  manager's `inbox-not-empty → re-arm` to pick up next period — no
+  stranding.
 - **Batched timing semantics differ**: `prompt_eval_duration` (TTFT) on the
   batched path includes batch-queue wait and co-tenant prefill interleave,
   and `eval_duration` is wall time shared with co-batched sequences — they

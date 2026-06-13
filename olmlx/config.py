@@ -323,6 +323,15 @@ class Settings(BaseSettings):
     # decodes to max_tokens unread (the unbounded per-sequence event queue
     # has no flow control of its own). 0 disables the cut-off.
     batch_consumer_lag_limit: Annotated[int, Field(ge=0)] = 2048
+    # Aggregate (cross-sequence) KV admission (plan §10). When on, the batch
+    # worker only admits a queued sequence while the batch's projected KV
+    # stays under ``memory_limit_fraction`` of system RAM (per-sequence KV
+    # estimate vs current Metal headroom); an over-budget request waits in
+    # the inbox until a co-tenant frees its slot, instead of all admitting at
+    # once and risking an uncatchable Metal OOM. Per-request admission (one
+    # request's own KV) is always enforced; this gates the cross-sequence
+    # sum. Disable to fall back to admit-all (per-request preflight only).
+    batch_kv_admission: bool = True
 
     # Flash inference (LLM in a Flash). Primary, user-facing knobs.
     # Advanced tuning (window size, IO threads, cache budget, predictor
