@@ -2693,6 +2693,7 @@ def _get_batch_scheduler(lm: LoadedModel) -> Any:
         acquire_gpu=acquire_gpu,
         release_gpu=release_gpu,
         exclusive_pending=lambda: _queue_depth > 0,
+        consumer_lag_limit=settings.batch_consumer_lag_limit,
         name=lm.name,
     )
     return lm.batch_scheduler
@@ -2941,6 +2942,7 @@ async def _stream_completion_batched(
     stop_scanner = StopScanner(stop_sequences)
     stop_hit = False
     timed_out = False
+    lagged = False
     terminal_seen = False
     start_ns = time.monotonic_ns()
     first_token_ns: int | None = None
@@ -2986,6 +2988,7 @@ async def _stream_completion_batched(
                     else:
                         event = await seq.out.get()
                     awaiting_first = False
+                    seq.note_consumed()  # keep the backpressure lag honest
                     etype = event["type"]
                     if etype == "progress":
                         continue
@@ -2998,14 +3001,24 @@ async def _stream_completion_batched(
                         raise event["exc"]
                     if etype == "done":
                         terminal_seen = True
-                        if event["reason"] == "cancelled" and not (
-                            stop_hit or timed_out
+                        # A lag cancellation (worker dropped a slow consumer
+                        # — plan §11) is a benign truncation, not the
+                        # model-unload cancel; end the stream cleanly.
+                        lagged = event.get("truncated") == "lag"
+                        if lagged:
+                            logger.warning(
+                                "Batched generation truncated: consumer lag "
+                                "exceeded the backpressure limit"
+                            )
+                        if (
+                            event["reason"] == "cancelled"
+                            and not (stop_hit or timed_out or lagged)
                         ):
                             # Scheduler closed under us (model unload).
                             raise RuntimeError(
                                 "Batched generation cancelled (model unloading)"
                             )
-                        if not (stop_hit or timed_out):
+                        if not (stop_hit or timed_out or lagged):
                             detokenizer.finalize()
                             tail = detokenizer.last_segment
                             if tail:
@@ -3024,6 +3037,7 @@ async def _stream_completion_batched(
                         if (
                             ev_cache is not None
                             and not timed_out
+                            and not lagged
                             and len(event.get("tokens") or []) >= len(tokens)
                         ):
                             all_toks = event["tokens"]
