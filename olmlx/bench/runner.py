@@ -324,11 +324,11 @@ def run_bench(
         # Run worker subprocess (or server for distributed scenarios)
         if scenario.server_mode:
             prompt_results = _run_server_scenario(
-                model, scenario, prompts_data, max_tokens
+                model, model_path, scenario, prompts_data, max_tokens
             )
         else:
             prompt_results = _run_worker(
-                model, scenario, prompts_data, max_tokens, worker_timeout
+                model, model_path, scenario, prompts_data, max_tokens, worker_timeout
             )
 
         # Grade in the parent (the worker only returns raw output_text).
@@ -433,6 +433,7 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
 
 def _run_worker(
     model: str,
+    model_path: Path,
     scenario: Scenario,
     prompts_data: list[dict],
     max_tokens: int | None,
@@ -444,8 +445,11 @@ def _run_worker(
         results_path = Path(tmpdir) / "results.json"
         prompts_path.write_text(json.dumps(prompts_data))
 
-        # Build env: inherit current env + scenario overrides
+        # Build env: inherit current env + dynamic model-path-aware overrides
+        # (e.g. OLMLX_SPECULATIVE_DRAFT_MODEL for dflash) + static overrides.
         env = os.environ.copy()
+        if scenario.env_override_fn is not None:
+            env.update(scenario.env_override_fn(model_path))
         env.update(scenario.env_overrides)
 
         port = _find_free_port()
@@ -564,6 +568,7 @@ def _wait_for_server(port: int, proc: subprocess.Popen, timeout: float) -> bool:
 
 def _run_server_scenario(
     model: str,
+    model_path: Path,
     scenario: Scenario,
     prompts_data: list[dict],
     max_tokens: int | None,
@@ -578,6 +583,8 @@ def _run_server_scenario(
     port = _get_server_port(scenario)
 
     env = os.environ.copy()
+    if scenario.env_override_fn is not None:
+        env.update(scenario.env_override_fn(model_path))
     env.update(scenario.env_overrides)
 
     cmd = [sys.executable, "-m", "olmlx", "serve", "--port", str(port)]

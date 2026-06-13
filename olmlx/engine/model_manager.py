@@ -3032,11 +3032,15 @@ class ModelManager(SpeculativeLoaderMixin):
                 if (
                     spec_enabled
                     and spec_config.strategy in _FLASH_MOE_INCOMPATIBLE_STRATEGIES
+                    and spec_config.strategy != "dflash"
                 ):
+                    # dflash has native VLM support via is_vlm=True in
+                    # _load_dflash_decoder (hooks into language_model.layers);
+                    # image requests already skip speculative at request time.
                     raise ValueError(
                         f"speculative_strategy={spec_config.strategy!r} is not "
                         "supported on VLM targets. Use "
-                        "speculative_strategy='classic' or "
+                        "speculative_strategy='classic', 'dflash', or "
                         "'self_speculative', or remove the speculative "
                         "settings."
                     )
@@ -3048,7 +3052,9 @@ class ModelManager(SpeculativeLoaderMixin):
                         "speculative instead"
                     )
                 if spec_enabled:
-                    if spec_config.strategy == "pld":
+                    if spec_config.strategy == "dflash":
+                        decoder = self._load_dflash_decoder(model, spec_config)
+                    elif spec_config.strategy == "pld":
                         decoder = self._load_pld_decoder(
                             model, spec_config, is_vlm=True
                         )
