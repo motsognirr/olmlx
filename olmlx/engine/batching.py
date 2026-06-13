@@ -167,12 +167,16 @@ class BatchSequence:
 
     def emit(self, event: dict[str, Any]) -> None:
         """Deliver an event to the consumer; safe from any thread."""
-        self._emitted += 1
         try:
             self.loop.call_soon_threadsafe(self.out.put_nowait, event)
         except RuntimeError:
-            # Event loop closed (shutdown) — the consumer is gone.
-            pass
+            # Event loop closed (shutdown) — the consumer is gone. Don't
+            # count an event the consumer can never pull, or the lag would
+            # stay permanently inflated.
+            return
+        # Only after the put is scheduled: ``_emitted`` must mean "events
+        # the consumer will see", or backpressure lag drifts.
+        self._emitted += 1
 
     def note_consumed(self) -> None:
         """Consumer ack — call once per event pulled from ``out``."""
