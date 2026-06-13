@@ -346,7 +346,9 @@ class _GpuLog:
         self.events.append("release")
 
 
-def _make_scheduler(scripts, *, exclusive_pending=None, gens=None, on_next=None):
+def _make_scheduler(
+    scripts, *, exclusive_pending=None, gens=None, on_next=None, consumer_lag_limit=0
+):
     from olmlx.engine.batching import BatchScheduler
 
     gpu = _GpuLog()
@@ -363,6 +365,7 @@ def _make_scheduler(scripts, *, exclusive_pending=None, gens=None, on_next=None)
         acquire_gpu=gpu.acquire,
         release_gpu=gpu.release,
         exclusive_pending=exclusive_pending,
+        consumer_lag_limit=consumer_lag_limit,
         name="test",
     )
     return sched, gpu, made
@@ -804,6 +807,96 @@ class TestSchedulerStats:
         assert sched.stats()["batch_active_sequences"] == 0
 
 
+class TestBackpressure:
+    async def test_lagging_consumer_dropped(self):
+        """A consumer that never acks events lets lag grow past the limit;
+        the worker drops the sequence instead of decoding to max_tokens."""
+        from olmlx.engine.batching import BatchRequest
+
+        long_script = [(i, None) for i in range(500)] + [(0, "stop")]
+        # _collect drains seq.out but never calls note_consumed(), so the
+        # worker's lag == its own emitted count and crosses the limit fast.
+        sched, _, gens = _make_scheduler([long_script], consumer_lag_limit=3)
+        seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=500))
+        events = await _collect(seq)
+        done = events[-1]
+        assert done["type"] == "done"
+        assert done["reason"] == "cancelled"
+        assert done["truncated"] == "lag"
+        assert gens[0].removed == [0]
+        # Cut off near the limit — nowhere near the 500-token script.
+        assert len(_tokens(events)) <= 4
+
+    async def test_lag_cancel_omits_cache(self):
+        """A lag-dropped sequence is incomplete, so its KV is not returned
+        even when the request asked for it (want_cache cleared)."""
+        from olmlx.engine.batching import BatchRequest
+
+        long_script = [(i, None) for i in range(500)] + [(0, "stop")]
+        sched, _, _ = _make_scheduler([long_script], consumer_lag_limit=3)
+        seq = await sched.submit(
+            BatchRequest(tokens=[1], max_tokens=500, return_cache=True)
+        )
+        events = await _collect(seq)
+        assert events[-1]["truncated"] == "lag"
+        assert "cache" not in events[-1]
+
+    async def test_lag_counter_tracks_emitted_minus_consumed(self):
+        from olmlx.engine.batching import BatchRequest, BatchSequence
+
+        loop = asyncio.get_running_loop()
+        seq = BatchSequence(BatchRequest(tokens=[1], max_tokens=1), loop)
+        assert seq.lag() == 0
+        seq.emit({"type": "token", "token": 1})
+        seq.emit({"type": "token", "token": 2})
+        assert seq.lag() == 2
+        seq.note_consumed()
+        assert seq.lag() == 1
+
+    async def test_acking_consumer_runs_to_completion(self):
+        """A consumer that acks each event keeps lag at zero, so even a
+        tiny limit never trips. The worker is throttled one event per tick
+        (modelling real decode latency) so the unthrottled fake can't burst
+        past the acks."""
+        from olmlx.engine.batching import BatchRequest
+
+        tick = threading.Event()
+
+        def throttle(_gen):
+            tick.wait(timeout=5.0)
+            tick.clear()
+
+        sched, _, gens = _make_scheduler(
+            [[(10, None), (11, None), (0, "stop")]],
+            consumer_lag_limit=1,
+            on_next=throttle,
+        )
+        seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=8))
+        events = []
+        while True:
+            tick.set()  # release one worker tick
+            ev = await asyncio.wait_for(seq.out.get(), timeout=5.0)
+            seq.note_consumed()
+            events.append(ev)
+            if ev["type"] in ("done", "error"):
+                break
+        assert _tokens(events) == [10, 11]
+        assert events[-1] == {"type": "done", "reason": "stop"}
+        assert gens[0].removed == []
+
+    async def test_disabled_limit_never_cancels(self):
+        from olmlx.engine.batching import BatchRequest
+
+        sched, _, gens = _make_scheduler(
+            [[(10, None), (11, None), (0, "stop")]], consumer_lag_limit=0
+        )
+        seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=8))
+        events = await _collect(seq)  # never acks, but limit is off
+        assert _tokens(events) == [10, 11]
+        assert events[-1]["reason"] == "stop"
+        assert gens[0].removed == []
+
+
 # ---------------------------------------------------------------------------
 # Consumer round trip (Phase 2): _stream_completion_batched + prompt cache
 # ---------------------------------------------------------------------------
@@ -855,6 +948,28 @@ def _consumer_lm():
         prompt_cache_store=PromptCacheStore(max_slots=4),
         supports_cache_persistence=True,
     )
+
+
+class _ScriptedScheduler:
+    """Minimal scheduler whose submit() returns a sequence pre-loaded with
+    a fixed event list — for driving consumer-side terminal handling
+    without a worker thread."""
+
+    def __init__(self, events):
+        self._events = events
+        self.cancelled: list = []
+
+    async def submit(self, request):
+        from olmlx.engine.batching import BatchSequence
+
+        loop = asyncio.get_running_loop()
+        seq = BatchSequence(request, loop)
+        for ev in self._events:
+            seq.out.put_nowait(ev)
+        return seq
+
+    def cancel(self, seq):
+        self.cancelled.append(seq)
 
 
 async def _run_batched(lm, sched, monkeypatch, prompt, gen_kwargs=None, **kw):
@@ -1114,6 +1229,42 @@ class TestConsumerCacheRoundTrip:
         assert len(lm.prompt_cache_store) == 0
         assert gens[0].insert_calls[0]["caches"] == [None]
 
+    async def test_lag_truncation_ends_cleanly_and_skips_store(self, monkeypatch):
+        """A lag-cancelled terminal (``truncated == 'lag'``) ends the stream
+        gracefully — no model-unload RuntimeError — and stores nothing
+        (incomplete generation, parity with the timeout path)."""
+        lm = _consumer_lm()
+        events = [
+            {"type": "token", "token": 10},
+            {"type": "token", "token": 11},
+            {"type": "done", "reason": "cancelled", "truncated": "lag"},
+        ]
+        sched = _ScriptedScheduler(events)
+        chunks = await _run_batched(
+            lm, sched, monkeypatch, [1, 2], use_prompt_cache=True, cache_id="cid"
+        )
+        assert chunks[-1]["done"] is True
+        text = "".join(c.get("text", "") for c in chunks if c.get("text"))
+        assert text == "<10><11>"
+        assert lm.prompt_cache_store.peek("cid") is None
+
+    async def test_unload_cancel_still_raises(self, monkeypatch):
+        """A plain cancelled terminal (no ``truncated`` marker) is the
+        model-unload path and must still raise — lag handling didn't
+        soften it."""
+        from olmlx.engine import inference
+        from olmlx.utils.timing import TimingStats
+
+        lm = _consumer_lm()
+        sched = _ScriptedScheduler([{"type": "done", "reason": "cancelled"}])
+        monkeypatch.setattr(inference, "_get_batch_scheduler", lambda _lm: sched)
+        monkeypatch.setattr(inference, "_batched_kv_preflight", lambda *a, **k: None)
+        with pytest.raises(RuntimeError, match="model unloading"):
+            async for _ in inference._stream_completion_batched(
+                lm, [1, 2], 32, {}, TimingStats()
+            ):
+                pass
+
 
 class TestFullCompletionBatched:
     async def test_aggregates_stream_into_result_dict(self, monkeypatch):
@@ -1367,6 +1518,7 @@ class TestBatchingSettings:
             "OLMLX_BATCH_COMPLETION_SIZE",
             "OLMLX_BATCH_PREFILL_SIZE",
             "OLMLX_BATCH_PREFILL_STEP",
+            "OLMLX_BATCH_CONSUMER_LAG_LIMIT",
         ):
             monkeypatch.delenv(var, raising=False)
         s = Settings()
@@ -1374,17 +1526,25 @@ class TestBatchingSettings:
         assert s.batch_completion_size == 8
         assert s.batch_prefill_size == 4
         assert s.batch_prefill_step == 2048
+        assert s.batch_consumer_lag_limit == 2048
 
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv("OLMLX_BATCHING", "true")
         monkeypatch.setenv("OLMLX_BATCH_COMPLETION_SIZE", "16")
         monkeypatch.setenv("OLMLX_BATCH_PREFILL_SIZE", "2")
         monkeypatch.setenv("OLMLX_BATCH_PREFILL_STEP", "1024")
+        monkeypatch.setenv("OLMLX_BATCH_CONSUMER_LAG_LIMIT", "256")
         s = Settings()
         assert s.batching is True
         assert s.batch_completion_size == 16
         assert s.batch_prefill_size == 2
         assert s.batch_prefill_step == 1024
+        assert s.batch_consumer_lag_limit == 256
+
+    def test_lag_limit_zero_allowed(self, monkeypatch):
+        # 0 disables backpressure cancellation (unlike the size knobs).
+        monkeypatch.setenv("OLMLX_BATCH_CONSUMER_LAG_LIMIT", "0")
+        assert Settings().batch_consumer_lag_limit == 0
 
     @pytest.mark.parametrize(
         "var",

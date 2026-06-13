@@ -156,14 +156,35 @@ class BatchSequence:
         self.out: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.cancelled = threading.Event()
         self.want_cache = request.return_cache
+        # Backpressure (plan §11): the worker can outrun a slow/stalled
+        # consumer because ``out`` is unbounded. ``_emitted`` (worker
+        # writer) minus ``_consumed`` (consumer writer) is the outstanding
+        # event lag; each is single-writer so plain-int reads are torn-free
+        # under the GIL (the same discipline as the scheduler counters).
+        self._emitted = 0
+        self._consumed = 0
+        self.lagged = False
 
     def emit(self, event: dict[str, Any]) -> None:
         """Deliver an event to the consumer; safe from any thread."""
         try:
             self.loop.call_soon_threadsafe(self.out.put_nowait, event)
         except RuntimeError:
-            # Event loop closed (shutdown) — the consumer is gone.
-            pass
+            # Event loop closed (shutdown) — the consumer is gone. Don't
+            # count an event the consumer can never pull, or the lag would
+            # stay permanently inflated.
+            return
+        # Only after the put is scheduled: ``_emitted`` must mean "events
+        # the consumer will see", or backpressure lag drifts.
+        self._emitted += 1
+
+    def note_consumed(self) -> None:
+        """Consumer ack — call once per event pulled from ``out``."""
+        self._consumed += 1
+
+    def lag(self) -> int:
+        """Outstanding (emitted-but-unconsumed) events, worker's view."""
+        return self._emitted - self._consumed
 
 
 class BatchScheduler:
@@ -181,12 +202,18 @@ class BatchScheduler:
         acquire_gpu: Callable[[], Awaitable[None]],
         release_gpu: Callable[[], None],
         exclusive_pending: Callable[[], bool] | None = None,
+        consumer_lag_limit: int = 0,
         name: str = "",
     ):
         self._generator_factory = generator_factory
         self._acquire_gpu = acquire_gpu
         self._release_gpu = release_gpu
         self._exclusive_pending = exclusive_pending or (lambda: False)
+        # 0 disables backpressure cancellation; otherwise a sequence whose
+        # consumer falls more than this many events behind is dropped from
+        # the batch so a stalled-but-connected client can't pin a slot and
+        # decode to max_tokens unread (plan §11).
+        self._consumer_lag_limit = consumer_lag_limit
         self._name = name
         self._inbox: queue.Queue[BatchSequence] = queue.Queue()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -355,6 +382,7 @@ class BatchScheduler:
                     if self._closing:
                         for seq in active.values():
                             seq.cancelled.set()
+                    self._sweep_lagging(active)
                     self._sweep_cancelled(gen, active)
                     self._active_count = len(active)
                     if not active:
@@ -455,6 +483,29 @@ class BatchScheduler:
             active[uid] = seq
             self._inserts_total += 1
 
+    def _sweep_lagging(self, active: dict[int, BatchSequence]) -> None:
+        """Flag sequences whose consumer has fallen too far behind.
+
+        Marks them cancelled (the next ``_sweep_cancelled`` removes them
+        from the batch) and clears ``want_cache`` — a partly-consumed
+        stream is incomplete, so its KV must not re-enter the prompt cache
+        (parity with the timeout invalidate path)."""
+        limit = self._consumer_lag_limit
+        if limit <= 0:
+            return
+        for seq in active.values():
+            if not seq.cancelled.is_set() and seq.lag() > limit:
+                logger.warning(
+                    "batch[%s]: dropping sequence — consumer lag %d > %d "
+                    "(stalled client); freeing the slot",
+                    self._name,
+                    seq.lag(),
+                    limit,
+                )
+                seq.lagged = True
+                seq.want_cache = False
+                seq.cancelled.set()
+
     def _sweep_cancelled(self, gen: Any, active: dict[int, BatchSequence]) -> None:
         gone = [uid for uid, seq in active.items() if seq.cancelled.is_set()]
         if not gone:
@@ -464,6 +515,8 @@ class BatchScheduler:
         for uid in gone:
             seq = active.pop(uid)
             done: dict[str, Any] = {"type": "done", "reason": "cancelled"}
+            if seq.lagged:
+                done["truncated"] = "lag"
             extracted = caches.get(uid) if caches else None
             if seq.want_cache and extracted is not None:
                 cache, tokens = extracted

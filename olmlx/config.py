@@ -317,6 +317,12 @@ class Settings(BaseSettings):
     batch_completion_size: Annotated[int, Field(ge=1)] = 8
     batch_prefill_size: Annotated[int, Field(ge=1)] = 4
     batch_prefill_step: Annotated[int, Field(ge=1)] = 2048
+    # Backpressure (plan §11): a batched sequence whose SSE consumer falls
+    # more than this many events behind the worker is dropped from the
+    # batch — a stalled-but-connected client otherwise pins a slot and
+    # decodes to max_tokens unread (the unbounded per-sequence event queue
+    # has no flow control of its own). 0 disables the cut-off.
+    batch_consumer_lag_limit: Annotated[int, Field(ge=0)] = 2048
 
     # Flash inference (LLM in a Flash). Primary, user-facing knobs.
     # Advanced tuning (window size, IO threads, cache budget, predictor

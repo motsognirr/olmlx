@@ -1,6 +1,8 @@
 # Implementation Plan: Continuous Batching via mlx-lm `BatchGenerator`
 
-Status: **Phases 0–2 implemented** (engine/ropefix.py, engine/batching.py,
+Status: **Phases 0–2 implemented; Phase 3 in progress** (consumer
+backpressure + USER_MANUAL docs landed — see §10/§11). (engine/ropefix.py,
+engine/batching.py,
 inference.py `_batch_eligible` / `_get_batch_scheduler` /
 `_stream_completion_batched` / `_full_completion_batched` /
 `_setup_batched_prompt_cache`, settings, LoadedModel fields + teardown;
@@ -328,8 +330,13 @@ Live (`tests/live/test_batching_real.py`, `real_model`):
   helpers (used by `_inference_locked`, `_stream_completion`, and the batch
   scheduler's `acquire_gpu`/`release_gpu`), and one `StopScanner`
   (`engine/stop_sequences.py`) replacing the three inline copies.
-- **Phase 3 — hardening**: admission control vs `OLMLX_MEMORY_LIMIT_FRACTION`;
-  fairness guard tuning; docs (USER_MANUAL); consider default-on per-model.
+- **Phase 3 — hardening** (in progress): consumer backpressure (done —
+  `OLMLX_BATCH_CONSUMER_LAG_LIMIT`, drop-the-laggard, see §11) and user
+  docs (done — USER_MANUAL "Continuous Batching"). Per-request KV admission
+  vs `OLMLX_MEMORY_LIMIT_FRACTION` already landed in Phase 2
+  (`_batched_kv_preflight`); remaining: aggregate (cross-sequence) admission
+  accounting for `gen.prompt_cache_nbytes`, fairness-guard tuning, and
+  default-on per-model.
 - **Phase 4 — extensions** (separate decisions): hybrid `ArraysCache` (GDN)
   models behind a flag; batch-capable KV-quant caches (upstream-shaped work);
   drain-and-switch policy for multi-model juggling; `insert_segments` +
@@ -359,12 +366,21 @@ Live (`tests/live/test_batching_real.py`, `real_model`):
 - **Starvation in reverse**: the fairness guard means heavy exclusive traffic
   (e.g. KV-quant model in rotation) can keep collapsing the batch; acceptable
   for v1, revisit with drain-and-switch in Phase 4.
-- **No consumer backpressure** (PR #507 review): the per-sequence event
-  bridge is an unbounded queue — a stalled-but-connected SSE client lets the
-  worker decode its sequence to max_tokens while event dicts accumulate
-  (vs CancellableStream's bounded Queue(32)). Phase 3: consumer-lag
-  threshold → cancel, mirroring the exclusive path's bounded-buffer
-  semantics.
+- **Consumer backpressure** (PR #507 review; **resolved, Phase 3**): the
+  per-sequence event bridge is still an unbounded `asyncio.Queue`, but the
+  worker now drops a sequence whose unconsumed backlog exceeds
+  `OLMLX_BATCH_CONSUMER_LAG_LIMIT` (default 2048; `0` disables). Lag is
+  `BatchSequence._emitted` (worker writer) minus `_consumed` (consumer
+  writer, bumped via `note_consumed()` after every `out.get()`) — each is
+  single-writer so plain-int reads are torn-free under the GIL, the same
+  discipline as the scheduler counters. `_sweep_lagging` flags over-limit
+  sequences (sets `lagged`, clears `want_cache`) and `_sweep_cancelled`
+  removes them with a `{"truncated": "lag"}` done event; the consumer
+  treats that as a benign truncation (ends cleanly, stores nothing —
+  parity with the timeout invalidate path) rather than the model-unload
+  cancel (which still raises). Unlike CancellableStream's bounded
+  `Queue(32)` *blocking* backpressure, a batch can't block one slow reader
+  without stalling its co-tenants, so the v1 policy is drop-the-laggard.
 - **Batched timing semantics differ**: `prompt_eval_duration` (TTFT) on the
   batched path includes batch-queue wait and co-tenant prefill interleave,
   and `eval_duration` is wall time shared with co-batched sequences — they

@@ -1327,6 +1327,11 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_LOG_LEVEL` | string | `INFO` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `OLMLX_TRACING` | bool | `false` | Enable OpenTelemetry tracing (requires `uv sync --extra otel`). Endpoint/sampler/etc. configured via native `OTEL_*` env vars. See "Distributed Tracing" above |
 | `OLMLX_INFERENCE_QUEUE_TIMEOUT` | float/None | `300.0` | Max seconds to wait for inference lock (5 min). `None` = no timeout |
+| `OLMLX_BATCHING` | bool | `false` | Enable continuous batching of concurrent chat requests (see "Continuous Batching"). Eligible requests share one decode loop instead of serializing on the lock |
+| `OLMLX_BATCH_COMPLETION_SIZE` | int | `8` | Max sequences decoding concurrently in a batch |
+| `OLMLX_BATCH_PREFILL_SIZE` | int | `4` | Max sequences in chunked prefill at once |
+| `OLMLX_BATCH_PREFILL_STEP` | int | `2048` | Prefill chunk size (tokens) for batched requests |
+| `OLMLX_BATCH_CONSUMER_LAG_LIMIT` | int | `2048` | Drop a batched sequence whose unconsumed event backlog exceeds this (stalled client backpressure). `0` disables |
 | `OLMLX_MAX_TOKENS_LIMIT` | int | `131072` | Maximum tokens allowed per request |
 | `OLMLX_CORS_ORIGINS` | list | `["http://localhost:*", "http://127.0.0.1:*"]` | Allowed CORS origins |
 | `OLMLX_ANTHROPIC_MODELS` | dict | `{}` | Claude model name->local model mapping for the Anthropic endpoint |
@@ -1551,6 +1556,31 @@ Parsers are tried in order; the first successful match is used. Tool calls are c
 ### Inference Concurrency
 
 A single global inference lock prevents concurrent Metal command buffer submission across all models. This sacrifices parallelism for stability on Apple Silicon — concurrent Metal operations can cause GPU crashes. The lock uses a configurable queue timeout (`OLMLX_INFERENCE_QUEUE_TIMEOUT`, default 300s) and returns HTTP 503 with `Retry-After` when the queue is full.
+
+### Continuous Batching (Experimental)
+
+By default, concurrent chat requests serialize on the inference lock: request N waits for request N-1 to finish. **Continuous batching** (`OLMLX_BATCHING=true`, off by default) instead lets eligible requests *share a single decode loop* on one model. Because decode on Apple Silicon is memory-bandwidth-bound, B sequences decode for roughly the cost of one — aggregate throughput scales with concurrency, and a newly arriving request's prefill interleaves with the running decodes instead of queueing behind them. Greedy output is bit-for-bit identical to the serial path. Measured on an M-series machine (Qwen3-4B-4bit, ~100-token generations): ~80 tok/s single stream → ~120 at 2 concurrent, ~135 at 4, ~142 at 8. **Per-request** decode speed drops as the batch fills (the bandwidth is shared); **aggregate** throughput is what rises.
+
+This is the right tool when you drive a model with many parallel requests — e.g. Claude-Code-style subagents or a fan-out script hitting one local model. A single sequential client sees no benefit (and pays nothing).
+
+**Eligibility.** A request is batched only when *all* hold; otherwise it transparently falls back to the exclusive-lock path:
+
+- `OLMLX_BATCHING=true`
+- A text LLM on a plain-`KVCache` layout (dense full-attention models — Qwen3 dense, Llama-family, etc.)
+- No images/audio, no VLM/Whisper/TTS/reranker/embeddings
+- KV quantization off, not distributed, not flash / flash-MoE, not speculative
+- No per-request `seed` (a batched global PRNG can't keep the reproducibility promise)
+- Not a gpt-oss channel-format model
+
+Grammar / JSON-schema (`response_format`, `format`) and prompt-cache reuse **do** work under batching. Hybrid linear-attention (GDN / `ArraysCache`) models stay on the exclusive path for now.
+
+**Fairness.** Non-batchable work (embeddings, a KV-quant model, a different model) still acquires the lock normally. When such a request starts waiting, the batch stops admitting new sequences, lets its in-flight sequences finish, and hands the lock over — so exclusive traffic is never starved. A steady stream of batched requests therefore yields to a waiting exclusive request at the next drain.
+
+**Backpressure.** A stalled-but-connected client (slow SSE reader) can't pin a batch slot forever: if its unconsumed event backlog exceeds `OLMLX_BATCH_CONSUMER_LAG_LIMIT` (default 2048; `0` disables), the worker drops that sequence from the batch and ends its stream, freeing the slot for live requests. A client reading at any reasonable pace never approaches the limit.
+
+Tuning knobs: `OLMLX_BATCH_COMPLETION_SIZE` (max concurrently *decoding* sequences, default 8), `OLMLX_BATCH_PREFILL_SIZE` (max sequences in chunked prefill, default 4), `OLMLX_BATCH_PREFILL_STEP` (prefill chunk size, default 2048). All are per-model overridable at the top level of `models.json`.
+
+> **Timing note:** on the batched path, `prompt_eval_duration` includes batch-queue wait and co-tenant prefill interleave, and `eval_duration` is wall time shared across co-batched sequences. These reflect user-perceived latency, not isolated single-model speed — use the exclusive path (or `bench run`) for per-model benchmarking.
 
 ### Error Handling
 
