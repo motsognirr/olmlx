@@ -21,23 +21,7 @@ import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.models.cache import make_prompt_cache
 
-# mlx 0.31.1: mx.fast.rope CORRUPTS rows >= 1 when called with batch > 1
-# at L == 1 (decode shape) — minimal repro in scripts/dflash_diagnose
-# work; rows 1..B-1 of batched greedy decode go degenerate. Fold the
-# batch dim into the heads dim (RoPE rotates along axis -2 only, so the
-# fold is exact) before calling the original kernel.
-_orig_rope = mx.fast.rope
-
-
-def _safe_rope(x, dims, *args, **kwargs):
-    if x.ndim == 4 and x.shape[0] > 1:
-        B, H, L, D = x.shape
-        out = _orig_rope(x.reshape(1, B * H, L, D), dims, *args, **kwargs)
-        return out.reshape(B, H, L, D)
-    return _orig_rope(x, dims, *args, **kwargs)
-
-
-mx.fast.rope = _safe_rope
+from olmlx.engine.ropefix import safe_rope_patch
 
 
 def main() -> None:
@@ -105,32 +89,33 @@ def main() -> None:
             flush=True,
         )
 
-    for ex in stream:
-        if written >= args.num_seqs:
-            break
-        prompt = ex.get("prompt")
-        if not prompt or not isinstance(prompt, str):
-            continue
-        text = tok.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        ids = tok.encode(text, add_special_tokens=False)
-        if len(ids) > args.max_prompt_tokens:
-            continue
-        groups[len(ids)].append(ids)
-        if len(groups[len(ids)]) >= args.batch:
-            run_batch(groups.pop(len(ids)))
+    with safe_rope_patch():
+        for ex in stream:
+            if written >= args.num_seqs:
+                break
+            prompt = ex.get("prompt")
+            if not prompt or not isinstance(prompt, str):
+                continue
+            text = tok.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            ids = tok.encode(text, add_special_tokens=False)
+            if len(ids) > args.max_prompt_tokens:
+                continue
+            groups[len(ids)].append(ids)
+            if len(groups[len(ids)]) >= args.batch:
+                run_batch(groups.pop(len(ids)))
 
-    # Flush remaining groups (largest first) until quota.
-    for length in sorted(groups, key=lambda k: -len(groups[k])):
-        if written >= args.num_seqs:
-            break
-        rows = groups[length]
-        while rows and written < args.num_seqs:
-            run_batch(rows[: args.batch])
-            rows = rows[args.batch :]
+        # Flush remaining groups (largest first) until quota.
+        for length in sorted(groups, key=lambda k: -len(groups[k])):
+            if written >= args.num_seqs:
+                break
+            rows = groups[length]
+            while rows and written < args.num_seqs:
+                run_batch(rows[: args.batch])
+                rows = rows[args.batch :]
 
     out_f.close()
     print(f"wrote {written} sequences to {out_path}")
