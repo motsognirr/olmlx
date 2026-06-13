@@ -2592,10 +2592,14 @@ def _batch_eligible(
     included on the first call), which is exactly the
     ``GrammarLogitsProcessor`` contract on the exclusive path.
     """
-    # Identity check, not truthiness: tests patch ``inference.settings``
-    # with a MagicMock whose every attribute is truthy — that must never
-    # switch a mocked request onto the batched path.
-    if settings.batching is not True:
+    # Per-model override (models.json ``batching``) replaces the global
+    # opt-in gate; None defers to ``OLMLX_BATCHING`` — "default-on per-model"
+    # without flipping the global default. Identity check, not truthiness:
+    # tests patch ``inference.settings`` with a MagicMock whose every
+    # attribute is truthy (and ``lm.batching`` is None there), which must
+    # never switch a mocked request onto the batched path.
+    batching = lm.batching if lm.batching is not None else settings.batching
+    if batching is not True:
         return False
     # Ollama num_predict -1/-2 mean "unlimited"; mlx-lm's BatchGenerator
     # checks ``generated >= max_tokens``, which is instantly true for a
@@ -2655,9 +2659,27 @@ def _get_batch_scheduler(lm: LoadedModel) -> Any:
 
     model = lm.model
     stop_tokens = [[t] for t in lm.tokenizer.eos_token_ids]
-    completion_size = settings.batch_completion_size
-    prefill_size = settings.batch_prefill_size
-    prefill_step = settings.batch_prefill_step
+    # Per-model batch-size overrides (models.json) fall back to the globals.
+    completion_size = (
+        lm.batch_completion_size
+        if lm.batch_completion_size is not None
+        else settings.batch_completion_size
+    )
+    prefill_size = (
+        lm.batch_prefill_size
+        if lm.batch_prefill_size is not None
+        else settings.batch_prefill_size
+    )
+    prefill_step = (
+        lm.batch_prefill_step
+        if lm.batch_prefill_step is not None
+        else settings.batch_prefill_step
+    )
+    fairness_quantum = (
+        lm.batch_fairness_quantum
+        if lm.batch_fairness_quantum is not None
+        else settings.batch_fairness_quantum
+    )
     sync_mode = lm.sync_mode
 
     def factory() -> Any:
@@ -2718,6 +2740,7 @@ def _get_batch_scheduler(lm: LoadedModel) -> Any:
         consumer_lag_limit=settings.batch_consumer_lag_limit,
         kv_headroom=kv_headroom if admission else None,
         kv_estimate=kv_estimate if admission else None,
+        fairness_quantum=fairness_quantum,
         name=lm.name,
     )
     return lm.batch_scheduler

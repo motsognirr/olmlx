@@ -219,12 +219,13 @@ def test_collector_safe_when_no_stores():
 
 
 class _FakeBatchScheduler:
-    def __init__(self, active=2, inserts=7, tokens=120, queued=1):
+    def __init__(self, active=2, inserts=7, tokens=120, queued=1, fairness_pauses=3):
         self._stats = {
             "batch_active_sequences": active,
             "batch_queued": queued,
             "batch_inserts": inserts,
             "batch_tokens": tokens,
+            "batch_fairness_pauses": fairness_pauses,
         }
 
     def stats(self):
@@ -240,6 +241,7 @@ def test_collector_emits_batch_metrics():
     assert 'olmlx_batch_active_sequences{model="b1"} 2.0' in body
     assert 'olmlx_batch_inserts_total{model="b1"} 7.0' in body
     assert 'olmlx_batch_aggregate_tokens_total{model="b1"} 120.0' in body
+    assert 'olmlx_batch_fairness_pauses_total{model="b1"} 3.0' in body
 
 
 def test_collector_batch_counters_survive_scheduler_recreation():

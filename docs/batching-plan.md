@@ -1,7 +1,8 @@
 # Implementation Plan: Continuous Batching via mlx-lm `BatchGenerator`
 
-Status: **Phases 0–2 implemented; Phase 3 in progress** (consumer
-backpressure + USER_MANUAL docs landed — see §10/§11). (engine/ropefix.py,
+Status: **Phases 0–3 implemented** (Phase 3 = consumer backpressure,
+aggregate KV admission, per-model batching config, and fairness-guard
+tuning — see §10/§11). (engine/ropefix.py,
 engine/batching.py,
 inference.py `_batch_eligible` / `_get_batch_scheduler` /
 `_stream_completion_batched` / `_full_completion_batched` /
@@ -330,13 +331,32 @@ Live (`tests/live/test_batching_real.py`, `real_model`):
   helpers (used by `_inference_locked`, `_stream_completion`, and the batch
   scheduler's `acquire_gpu`/`release_gpu`), and one `StopScanner`
   (`engine/stop_sequences.py`) replacing the three inline copies.
-- **Phase 3 — hardening** (in progress): consumer backpressure (done —
+- **Phase 3 — hardening** (done): consumer backpressure (done —
   `OLMLX_BATCH_CONSUMER_LAG_LIMIT`, drop-the-laggard, see §11) and user
   docs (done — USER_MANUAL "Continuous Batching"). Per-request KV admission
   vs `OLMLX_MEMORY_LIMIT_FRACTION` landed in Phase 2 (`_batched_kv_preflight`);
   aggregate (cross-sequence) admission **done** (`OLMLX_BATCH_KV_ADMISSION`,
-  default on — see §11). Remaining: fairness-guard tuning and default-on
-  per-model.
+  default on — see §11). Per-model config **done**: a `batching: bool` at
+  the top of a `models.json` entry overrides the global `OLMLX_BATCHING`
+  opt-in for that model ("default-on per-model" — enable batching for one
+  known-good dense model without flipping the global, or opt a model out;
+  mechanical eligibility still applies on top), and `batch_completion_size`
+  / `batch_prefill_size` / `batch_prefill_step` are likewise per-model
+  overridable (resolved in `_get_batch_scheduler`, `ModelConfig` →
+  `LoadedModel` → `_batch_eligible` mirroring the `prompt_cache`/
+  `enable_thinking` override plumbing). Fairness-guard tuning **done**:
+  `OLMLX_BATCH_FAIRNESS_QUANTUM` (seconds, default `0.0` = today's
+  immediate yield; per-model overridable) gives the batch a minimum
+  admission-open service window per busy period before it latches the
+  exclusive-pending pause — a throughput floor under interleaved mixed
+  traffic, bounding the *extra* wait imposed on the exclusive waiter to one
+  quantum (`held` only grows, so the latch always fires within a quantum —
+  exclusive is never starved). Observability: a `batch_fairness_pauses`
+  counter (`/api/ps` + `olmlx_batch_fairness_pauses_total`) plus an info log
+  on each yield, so the formerly-misleading `_queue_depth` "queued"
+  semantics (a depth of 1 behind a batch means "waiting for K sequences to
+  drain") are now visible from the batch side. The deep "starvation in
+  reverse" fix (drain-and-switch, mid-generation preemption) stays Phase 4.
 - **Phase 4 — extensions** (separate decisions): hybrid `ArraysCache` (GDN)
   models behind a flag; batch-capable KV-quant caches (upstream-shaped work);
   drain-and-switch policy for multi-model juggling; `insert_segments` +
@@ -363,9 +383,15 @@ Live (`tests/live/test_batching_real.py`, `real_model`):
 - **Detokenizer fidelity**: streaming detokenizers differ subtly from
   `stream_generate`'s text deltas (e.g. byte-level BPE boundary handling);
   parity test #4 covers it.
-- **Starvation in reverse**: the fairness guard means heavy exclusive traffic
-  (e.g. KV-quant model in rotation) can keep collapsing the batch; acceptable
-  for v1, revisit with drain-and-switch in Phase 4.
+- **Starvation in reverse** (partially mitigated, Phase 3): the fairness
+  guard means heavy exclusive traffic (e.g. KV-quant model in rotation) can
+  keep collapsing the batch. `OLMLX_BATCH_FAIRNESS_QUANTUM` (Phase 3) softens
+  this — a non-zero quantum guarantees each busy period a minimum admission
+  window, so under interleaved traffic the batch holds a duty cycle instead
+  of collapsing to one sequence, at the cost of bounded extra exclusive
+  latency. It does not preempt a running sequence, so it cannot bound the
+  *drain* tail; the full fix (drain-and-switch / mid-generation preemption)
+  stays Phase 4. Default `0.0` keeps the immediate-yield behavior.
 - **Consumer backpressure** (PR #507 review; **resolved, Phase 3**): the
   per-sequence event bridge is still an unbounded `asyncio.Queue`, but the
   worker now drops a sequence whose unconsumed backlog exceeds
@@ -409,6 +435,11 @@ Live (`tests/live/test_batching_real.py`, `real_model`):
   and `eval_duration` is wall time shared with co-batched sequences — they
   measure user-perceived latency, not isolated model speed. The exclusive
   path's mlx-derived numbers remain the per-model benchmark reference.
-- **Lock-holder restructuring**: the scheduler holding `_inference_lock`
-  long-term changes `_queue_depth` log semantics ("queued" now often means
-  "joining the batch"); adjust the log line so operators aren't misled.
+- **Lock-holder restructuring** (resolved, Phase 3): the scheduler holding
+  `_inference_lock` long-term changes `_queue_depth` log semantics ("queued"
+  now often means "waiting for a whole batch to drain"). The batch manager
+  already logs its own acquisition via a batch-specific `queued_log`; Phase 3
+  adds an info log on each fairness yield (`"yielding lock to exclusive
+  waiter after %.2fs service, %d running"`) and the `batch_fairness_pauses`
+  counter, so an operator seeing a depth-1 "queued" line on an exclusive
+  request can correlate it with the batch that's draining ahead of it.

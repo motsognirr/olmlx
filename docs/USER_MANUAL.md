@@ -1333,6 +1333,7 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_BATCH_PREFILL_STEP` | int | `2048` | Prefill chunk size (tokens) for batched requests |
 | `OLMLX_BATCH_CONSUMER_LAG_LIMIT` | int | `2048` | Drop a batched sequence whose unconsumed event backlog exceeds this (stalled client backpressure). `0` disables |
 | `OLMLX_BATCH_KV_ADMISSION` | bool | `true` | Hold a queued batched sequence in the inbox until the batch's combined KV fits under `OLMLX_MEMORY_LIMIT_FRACTION` (cross-sequence OOM guard). Disable to admit on per-request check only |
+| `OLMLX_BATCH_FAIRNESS_QUANTUM` | float | `0.0` | Minimum seconds of admission-open service the batch keeps before yielding the lock to a waiting exclusive request. `0.0` yields immediately; raise to protect batched throughput under interleaved traffic |
 | `OLMLX_MAX_TOKENS_LIMIT` | int | `131072` | Maximum tokens allowed per request |
 | `OLMLX_CORS_ORIGINS` | list | `["http://localhost:*", "http://127.0.0.1:*"]` | Allowed CORS origins |
 | `OLMLX_ANTHROPIC_MODELS` | dict | `{}` | Claude model name->local model mapping for the Anthropic endpoint |
@@ -1575,13 +1576,21 @@ This is the right tool when you drive a model with many parallel requests — e.
 
 Grammar / JSON-schema (`response_format`, `format`) and prompt-cache reuse **do** work under batching. Hybrid linear-attention (GDN / `ArraysCache`) models stay on the exclusive path for now.
 
-**Fairness.** Non-batchable work (embeddings, a KV-quant model, a different model) still acquires the lock normally. When such a request starts waiting, the batch stops admitting new sequences, lets its in-flight sequences finish, and hands the lock over — so exclusive traffic is never starved. A steady stream of batched requests therefore yields to a waiting exclusive request at the next drain.
+**Per-model opt-in.** `OLMLX_BATCHING` is the global default. To turn batching on for one known-good model without flipping it on for everything, set `"batching": true` at the top level of that model's `models.json` entry; set `"batching": false` to opt a specific model out while the global default is on. A per-model value fully overrides the global toggle for that model (mechanical eligibility — cache layout, model kind, KV-quant — still applies on top). `None`/absent inherits `OLMLX_BATCHING`.
+
+```json
+{
+  "qwen3-dense:latest": { "hf_path": "Qwen/Qwen3-8B-MLX", "batching": true }
+}
+```
+
+**Fairness.** Non-batchable work (embeddings, a KV-quant model, a different model) still acquires the lock normally. When such a request starts waiting, the batch stops admitting new sequences, lets its in-flight sequences finish, and hands the lock over — so exclusive traffic is never starved. A steady stream of batched requests therefore yields to a waiting exclusive request at the next drain. By default the batch yields *immediately* on the first waiter, which under heavily interleaved mixed traffic can collapse the batch to a single sequence. `OLMLX_BATCH_FAIRNESS_QUANTUM` (seconds, default `0.0`) sets a minimum service window: the batch keeps admitting until it has held the lock for at least that long this busy period before yielding, giving batched throughput a floor at the cost of bounding the *extra* wait imposed on the exclusive request to one quantum. Raise it (e.g. `1`–`2`) when a background fan-out workload shares a model with occasional latency-tolerant exclusive requests; leave it `0` for interactive mixed traffic. The `olmlx_batch_fairness_pauses_total` metric (and `batch_fairness_pauses` on `/api/ps`) counts how often the batch yielded, so you can see whether the guard is firing.
 
 **Backpressure.** A stalled-but-connected client (slow SSE reader) can't pin a batch slot forever: if its unconsumed event backlog exceeds `OLMLX_BATCH_CONSUMER_LAG_LIMIT` (default 2048; `0` disables), the worker drops that sequence from the batch and ends its stream, freeing the slot for live requests. A client reading at any reasonable pace never approaches the limit.
 
 **Memory admission.** Many concurrent requests can't oversubscribe GPU memory: the worker only admits a queued sequence while the batch's *combined* KV-cache estimate stays under `OLMLX_MEMORY_LIMIT_FRACTION` of system RAM (`OLMLX_BATCH_KV_ADMISSION`, default on). A request that would push the batch over the limit waits in the queue until a running sequence finishes and frees its KV, rather than admitting and risking an uncatchable Metal OOM. A lone request is always admitted (its own fit is checked separately, and rejected with HTTP 503 if it alone is too large).
 
-Tuning knobs: `OLMLX_BATCH_COMPLETION_SIZE` (max concurrently *decoding* sequences, default 8), `OLMLX_BATCH_PREFILL_SIZE` (max sequences in chunked prefill, default 4), `OLMLX_BATCH_PREFILL_STEP` (prefill chunk size, default 2048). All are per-model overridable at the top level of `models.json`.
+Tuning knobs: `OLMLX_BATCH_COMPLETION_SIZE` (max concurrently *decoding* sequences, default 8), `OLMLX_BATCH_PREFILL_SIZE` (max sequences in chunked prefill, default 4), `OLMLX_BATCH_PREFILL_STEP` (prefill chunk size, default 2048), `OLMLX_BATCH_FAIRNESS_QUANTUM` (fairness service window in seconds, default 0.0). All are per-model overridable at the top level of `models.json` (alongside the `batching` toggle).
 
 > **Timing note:** on the batched path, `prompt_eval_duration` includes batch-queue wait and co-tenant prefill interleave, and `eval_duration` is wall time shared across co-batched sequences. These reflect user-perceived latency, not isolated single-model speed — use the exclusive path (or `bench run`) for per-model benchmarking.
 
