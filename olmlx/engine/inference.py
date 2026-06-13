@@ -3010,9 +3010,8 @@ async def _stream_completion_batched(
                                 "Batched generation truncated: consumer lag "
                                 "exceeded the backpressure limit"
                             )
-                        if (
-                            event["reason"] == "cancelled"
-                            and not (stop_hit or timed_out or lagged)
+                        if event["reason"] == "cancelled" and not (
+                            stop_hit or timed_out or lagged
                         ):
                             # Scheduler closed under us (model unload).
                             raise RuntimeError(
