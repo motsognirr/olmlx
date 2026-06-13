@@ -126,6 +126,34 @@ def _requires_speculative_draft(_model_path: Path) -> str | None:
     )
 
 
+def _requires_dflash(model_path: Path) -> str | None:
+    """Skip if no dflash draft is available for the model.
+
+    Accepts a locally prepared dflash draft at ``model_path/dflash/``
+    (produced by ``olmlx dflash prepare``) OR the global
+    ``OLMLX_SPECULATIVE_DRAFT_MODEL`` env var.
+    """
+    if os.environ.get("OLMLX_SPECULATIVE_DRAFT_MODEL") or os.environ.get(
+        "OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL"
+    ):
+        return None
+    local = model_path / "dflash"
+    if local.is_dir() and (local / "config.json").exists():
+        return None
+    return (
+        f"No dflash draft found at {local} and OLMLX_SPECULATIVE_DRAFT_MODEL "
+        "is not set. Run: olmlx dflash prepare <model>"
+    )
+
+
+def _dflash_env_overrides(model_path: Path) -> dict[str, str]:
+    """Return OLMLX_SPECULATIVE_DRAFT_MODEL pointing to the local dflash dir."""
+    local = model_path / "dflash"
+    if local.is_dir() and (local / "config.json").exists():
+        return {"OLMLX_SPECULATIVE_DRAFT_MODEL": str(local)}
+    return {}
+
+
 def _requires_distributed(_model_path: Path) -> str | None:
     """Skip if no valid hostfile exists for distributed inference."""
     if not _DEFAULT_HOSTFILE.exists():
@@ -142,6 +170,9 @@ def _requires_distributed(_model_path: Path) -> str | None:
     return None
 
 
+EnvOverrideFn = Callable[[Path], dict[str, str]]
+
+
 @dataclass(frozen=True)
 class Scenario:
     name: str
@@ -149,6 +180,9 @@ class Scenario:
     env_overrides: dict[str, str] = field(default_factory=dict)
     should_skip: SkipCheck = _no_skip
     server_mode: bool = False  # True = launch olmlx serve + hit via HTTP
+    # Optional per-run dynamic env overrides (called with model_path before
+    # static env_overrides are applied; excluded from __eq__/__hash__).
+    env_override_fn: EnvOverrideFn | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict:
         return {
@@ -231,6 +265,16 @@ SCENARIOS: list[Scenario] = [
         ),
         env_overrides={"OLMLX_SPECULATIVE": "true"},
         should_skip=_requires_speculative_draft,
+    ),
+    Scenario(
+        name="dflash",
+        description="DFlash block-diffusion speculative decoding",
+        env_overrides={
+            "OLMLX_SPECULATIVE": "true",
+            "OLMLX_SPECULATIVE_STRATEGY": "dflash",
+        },
+        should_skip=_requires_dflash,
+        env_override_fn=_dflash_env_overrides,
     ),
     Scenario(
         name="self-speculative",

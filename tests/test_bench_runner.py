@@ -1,6 +1,7 @@
 """Tests for olmlx.bench.runner."""
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 
@@ -85,7 +86,12 @@ class TestRunWorker:
             patch("olmlx.bench.runner.os.killpg"),
         ):
             results = _run_worker(
-                "test-model", scenario, prompts_data, None, worker_timeout=600.0
+                "test-model",
+                Path("/tmp/model"),
+                scenario,
+                prompts_data,
+                None,
+                worker_timeout=600.0,
             )
 
         assert len(results) == 1
@@ -105,7 +111,9 @@ class TestRunWorker:
             ),
             patch("olmlx.bench.runner.os.killpg"),
         ):
-            _run_worker("model", scenario, [], None, worker_timeout=600.0)
+            _run_worker(
+                "model", Path("/tmp/model"), scenario, [], None, worker_timeout=600.0
+            )
 
         assert captured["kwargs"].get("start_new_session") is True
 
@@ -122,7 +130,9 @@ class TestRunWorker:
             ),
             patch("olmlx.bench.runner.os.killpg"),
         ):
-            results = _run_worker("model", scenario, [], None, worker_timeout=600.0)
+            results = _run_worker(
+                "model", Path("/tmp/model"), scenario, [], None, worker_timeout=600.0
+            )
 
         assert len(results) == 1
         assert results[0].prompt_name == "__worker_error__"
@@ -139,7 +149,9 @@ class TestRunWorker:
             ),
             patch("olmlx.bench.runner.os.killpg"),
         ):
-            results = _run_worker("model", scenario, [], None, worker_timeout=600.0)
+            results = _run_worker(
+                "model", Path("/tmp/model"), scenario, [], None, worker_timeout=600.0
+            )
 
         assert len(results) == 1
         assert "timed out" in results[0].error.lower()
@@ -157,7 +169,9 @@ class TestRunWorker:
             ),
             patch("olmlx.bench.runner.os.killpg"),
         ):
-            results = _run_worker("model", scenario, [], None, worker_timeout=600.0)
+            results = _run_worker(
+                "model", Path("/tmp/model"), scenario, [], None, worker_timeout=600.0
+            )
 
         assert len(results) == 1
         assert "timed out" in results[0].error.lower()
@@ -184,7 +198,9 @@ class TestRunWorker:
                 side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig)),
             ),
         ):
-            _run_worker("model", scenario, [], None, worker_timeout=600.0)
+            _run_worker(
+                "model", Path("/tmp/model"), scenario, [], None, worker_timeout=600.0
+            )
 
         # The group led by the worker pid is killed.
         assert killpg_calls, "expected the worker process group to be killed"
@@ -205,7 +221,9 @@ class TestRunWorker:
                 side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig)),
             ),
         ):
-            _run_worker("model", scenario, [], None, worker_timeout=600.0)
+            _run_worker(
+                "model", Path("/tmp/model"), scenario, [], None, worker_timeout=600.0
+            )
 
         assert killpg_calls, "process group should be reaped on every path"
 
@@ -225,7 +243,9 @@ class TestRunWorker:
             ),
             patch("olmlx.bench.runner.os.killpg"),
         ):
-            _run_worker("model", scenario, [], None, worker_timeout=600.0)
+            _run_worker(
+                "model", Path("/tmp/model"), scenario, [], None, worker_timeout=600.0
+            )
 
         assert captured["kwargs"]["env"].get("OLMLX_KV_CACHE_QUANT") == "turboquant:4"
 
@@ -241,7 +261,14 @@ class TestRunWorker:
             ),
             patch("olmlx.bench.runner.os.killpg"),
         ):
-            _run_worker("model", scenario, [], max_tokens=64, worker_timeout=600.0)
+            _run_worker(
+                "model",
+                Path("/tmp/model"),
+                scenario,
+                [],
+                max_tokens=64,
+                worker_timeout=600.0,
+            )
 
         assert "--max-tokens" in captured["cmd"]
         assert "64" in captured["cmd"]
@@ -421,7 +448,9 @@ class TestRunServerScenario:
         fake_proc.communicate.return_value = (b"", b"startup error")
 
         with patch("olmlx.bench.runner.subprocess.Popen", return_value=fake_proc):
-            results = _run_server_scenario("model", scenario, [], None)
+            results = _run_server_scenario(
+                "model", Path("/tmp/model"), scenario, [], None
+            )
 
         assert len(results) == 1
         assert results[0].prompt_name == "__server_error__"
@@ -458,6 +487,7 @@ class TestRunServerScenario:
         ):
             results = _run_server_scenario(
                 "model",
+                Path("/tmp/model"),
                 scenario,
                 [{"name": "factual", "category": "factual", "messages": []}],
                 None,
@@ -488,7 +518,7 @@ class TestRunServerScenario:
             return fake_proc
 
         with patch("olmlx.bench.runner.subprocess.Popen", side_effect=capture_popen):
-            _run_server_scenario("model", scenario, [], None)
+            _run_server_scenario("model", Path("/tmp/model"), scenario, [], None)
 
         assert captured_env.get("OLMLX_DISTRIBUTED") == "true"
         assert captured_env.get("OLMLX_KV_CACHE_QUANT") == "turboquant:4"

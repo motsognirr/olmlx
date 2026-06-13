@@ -499,6 +499,106 @@ class TestDraftConfigDerivation:
         )
         assert cfg.rope_theta == 10000000.0
 
+    def test_rope_theta_from_per_attention_type_rope_parameters(self):
+        """Gemma4 uses rope_parameters keyed by attention type.
+
+        The existing cascade checks rope_params_inner.get("rope_theta"), which
+        returns None when the dict is {"full_attention": {...}, "sliding_attention":
+        {...}}. The fix must walk the sub-dicts and prefer "full_attention".
+        """
+        from olmlx.engine.dflash.prepare import _build_draft_config
+
+        target_cfg = {
+            "model_type": "gemma4",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
+            "text_config": {
+                "vocab_size": 262144,
+                "hidden_size": 5376,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 16,
+                "head_dim": 256,
+                "intermediate_size": 21504,
+                "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 131072,
+                "final_logit_softcapping": 30.0,
+                "rope_parameters": {
+                    "full_attention": {
+                        "rope_theta": 1000000.0,
+                        "rope_type": "proportional",
+                        "partial_rotary_factor": 0.25,
+                    },
+                    "sliding_attention": {
+                        "rope_theta": 10000.0,
+                        "rope_type": "default",
+                    },
+                },
+            },
+        }
+        cfg = _build_draft_config(
+            target_cfg,
+            target_layer_ids=[12, 24, 36, 48, 59],
+            num_hidden_layers=5,
+            block_size=16,
+            mask_token_id=1,
+        )
+        # full_attention is preferred when present
+        assert cfg.rope_theta == 1000000.0
+
+    def test_final_logit_softcapping_propagated_from_target(self):
+        """_build_draft_config must propagate final_logit_softcapping (Gemma4 = 30.0).
+
+        The field is in text_config; the fix adds it to the DraftConfig(...) call.
+        DraftConfig.final_logit_softcapping defaults to None so without the fix
+        the draft skips softcapping at both train and infer time.
+        """
+        from olmlx.engine.dflash.prepare import _build_draft_config
+
+        target_cfg = {
+            "vocab_size": 262144,
+            "hidden_size": 5376,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 16,
+            "head_dim": 256,
+            "intermediate_size": 21504,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": 131072,
+            "final_logit_softcapping": 30.0,
+        }
+        cfg = _build_draft_config(
+            target_cfg,
+            target_layer_ids=[1, 8, 15, 22, 29],
+            num_hidden_layers=5,
+            block_size=16,
+            mask_token_id=1,
+        )
+        assert cfg.final_logit_softcapping == 30.0
+
+    def test_final_logit_softcapping_absent_stays_none(self):
+        """Models without softcapping must produce DraftConfig.final_logit_softcapping=None."""
+        from olmlx.engine.dflash.prepare import _build_draft_config
+
+        target_cfg = {
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "intermediate_size": 11008,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 1000000.0,
+            "max_position_embeddings": 32768,
+        }
+        cfg = _build_draft_config(
+            target_cfg,
+            target_layer_ids=[5, 11, 17, 23],
+            num_hidden_layers=4,
+            block_size=4,
+            mask_token_id=0,
+        )
+        assert cfg.final_logit_softcapping is None
+
 
 class _FakeDraft:
     """Stand-in for ``DFlashDraftModel`` that returns pre-baked logits.
