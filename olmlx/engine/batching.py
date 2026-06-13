@@ -203,6 +203,8 @@ class BatchScheduler:
         release_gpu: Callable[[], None],
         exclusive_pending: Callable[[], bool] | None = None,
         consumer_lag_limit: int = 0,
+        kv_headroom: Callable[[], int] | None = None,
+        kv_estimate: Callable[[BatchRequest], int] | None = None,
         name: str = "",
     ):
         self._generator_factory = generator_factory
@@ -214,6 +216,16 @@ class BatchScheduler:
         # the batch so a stalled-but-connected client can't pin a slot and
         # decode to max_tokens unread (plan §11).
         self._consumer_lag_limit = consumer_lag_limit
+        # Aggregate (cross-sequence) KV admission (plan §10). Both must be
+        # set for the gate to act: ``kv_headroom()`` is the bytes available
+        # for *new* KV right now (memory ceiling minus current Metal use, so
+        # it already nets out resident sequences' caches), and
+        # ``kv_estimate(req)`` is the KV a request will allocate. The worker
+        # admits while the batch's projected KV stays under headroom; an
+        # over-budget request waits in the inbox until a co-tenant frees its
+        # slot. When either is None the gate is off (Phase 1 behavior).
+        self._kv_headroom = kv_headroom
+        self._kv_estimate = kv_estimate
         self._name = name
         self._inbox: queue.Queue[BatchSequence] = queue.Queue()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -456,6 +468,17 @@ class BatchScheduler:
         done["tokens"] = list(tokens)
 
     def _admit(self, gen: Any, active: dict[int, BatchSequence]) -> Any:
+        # Aggregate KV admission (plan §10): measure headroom once per tick
+        # (it nets out resident KV) and accumulate ``promised`` for sequences
+        # admitted in THIS tick whose prefill hasn't run yet — their bytes
+        # aren't in the Metal reading headroom is derived from. Bind both
+        # callbacks to locals so the gate's None-narrowing holds inside the
+        # loop (the gate acts only when both are configured).
+        kv_headroom = self._kv_headroom
+        kv_estimate = self._kv_estimate
+        gate = kv_headroom is not None and kv_estimate is not None
+        headroom = kv_headroom() if kv_headroom is not None else 0
+        promised = 0
         while True:
             try:
                 seq = self._inbox.get_nowait()
@@ -464,6 +487,20 @@ class BatchScheduler:
             if seq.cancelled.is_set():
                 seq.emit({"type": "done", "reason": "cancelled"})
                 continue
+            # An empty batch always admits at least one sequence: that lone
+            # request's fit is the per-request preflight's job, and gating it
+            # here would deadlock (nothing will ever free KV). Once the batch
+            # is non-empty, defer an over-budget request — re-queue it (to the
+            # inbox tail) and stop admitting this tick; it retries when a
+            # co-tenant finishes and headroom recovers. ``promised`` always
+            # accumulates the admitted estimate (even the first, bypassed
+            # one) so later candidates this tick account for it.
+            if gate and kv_estimate is not None:
+                est = kv_estimate(seq.request)
+                if (active or promised) and promised + est > headroom:
+                    self._inbox.put(seq)
+                    return gen
+                promised += est
             if gen is None:
                 gen = self._generator_factory()
             req = seq.request

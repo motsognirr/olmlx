@@ -347,7 +347,14 @@ class _GpuLog:
 
 
 def _make_scheduler(
-    scripts, *, exclusive_pending=None, gens=None, on_next=None, consumer_lag_limit=0
+    scripts,
+    *,
+    exclusive_pending=None,
+    gens=None,
+    on_next=None,
+    consumer_lag_limit=0,
+    kv_headroom=None,
+    kv_estimate=None,
 ):
     from olmlx.engine.batching import BatchScheduler
 
@@ -366,6 +373,8 @@ def _make_scheduler(
         release_gpu=gpu.release,
         exclusive_pending=exclusive_pending,
         consumer_lag_limit=consumer_lag_limit,
+        kv_headroom=kv_headroom,
+        kv_estimate=kv_estimate,
         name="test",
     )
     return sched, gpu, made
@@ -895,6 +904,104 @@ class TestBackpressure:
         assert _tokens(events) == [10, 11]
         assert events[-1]["reason"] == "stop"
         assert gens[0].removed == []
+
+
+# ---------------------------------------------------------------------------
+# Aggregate (cross-sequence) KV admission (plan §10, Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class TestKvAdmission:
+    async def test_oversubscribing_request_waits_until_kv_frees(self):
+        """A second request that would push projected KV over the ceiling is
+        deferred (kept in the inbox) until the first finishes, all within one
+        busy period — not bounced to a new acquire/release cycle."""
+        from olmlx.engine.batching import BatchRequest
+
+        gate = threading.Event()
+        active_peaks = []
+
+        def hold_and_record(gen):
+            active_peaks.append(len(gen.active))
+            if gen.next_calls == 1:
+                gate.wait(timeout=5.0)
+
+        gens: list = []
+
+        # Headroom nets out resident KV: each resident sequence holds the
+        # whole budget, so a second can never co-reside. Mirrors the real
+        # ``budget - get_metal_memory()`` callback shrinking as KV allocates.
+        def kv_headroom():
+            resident = len(gens[0].active) if gens else 0
+            return 1000 - 1000 * resident
+
+        def kv_estimate(req):
+            return 1000
+
+        sched, gpu, _ = _make_scheduler(
+            [
+                [(10, None), (11, None), (0, "stop")],  # req1: 3 ticks resident
+                [(20, "length")],  # req2: must wait for req1 to free KV
+            ],
+            on_next=hold_and_record,
+            gens=gens,
+            kv_headroom=kv_headroom,
+            kv_estimate=kv_estimate,
+        )
+        seq1 = await sched.submit(BatchRequest(tokens=[1], max_tokens=8))
+        seq2 = await sched.submit(BatchRequest(tokens=[2], max_tokens=8))
+        gate.set()
+        ev1, ev2 = await asyncio.gather(_collect(seq1), _collect(seq2))
+        assert _tokens(ev1) == [10, 11]
+        assert _tokens(ev2) == [20]
+        # The gate never let two sequences co-reside...
+        assert max(active_peaks) == 1
+        # ...yet req2 was served from the inbox in the SAME busy period.
+        assert gpu.events == ["acquire", "release"]
+        assert len(gens) == 1
+
+    async def test_lone_oversized_request_still_admitted(self):
+        """The aggregate gate never deadlocks an empty batch: a single request
+        bigger than current headroom is admitted anyway (the per-request
+        preflight is what rejects a genuinely-too-large prompt)."""
+        from olmlx.engine.batching import BatchRequest
+
+        sched, _, gens = _make_scheduler(
+            [[(5, "length")]],
+            kv_headroom=lambda: 10,
+            kv_estimate=lambda req: 1_000_000,
+        )
+        ev = await _collect(await sched.submit(BatchRequest(tokens=[1], max_tokens=4)))
+        assert _tokens(ev) == [5]
+
+    async def test_ample_headroom_admits_concurrently(self):
+        """With headroom to spare, the gate is transparent — both requests
+        share one batch (same as the no-gate path)."""
+        from olmlx.engine.batching import BatchRequest
+
+        gate = threading.Event()
+        active_peaks = []
+
+        def hold_and_record(gen):
+            active_peaks.append(len(gen.active))
+            if gen.next_calls == 1:
+                gate.wait(timeout=5.0)
+
+        sched, gpu, gens = _make_scheduler(
+            [[(10, None), (0, "stop")], [(20, "length")]],
+            on_next=hold_and_record,
+            kv_headroom=lambda: 10**9,
+            kv_estimate=lambda req: 1000,
+        )
+        seq1 = await sched.submit(BatchRequest(tokens=[1], max_tokens=8))
+        seq2 = await sched.submit(BatchRequest(tokens=[2], max_tokens=8))
+        gate.set()
+        ev1, ev2 = await asyncio.gather(_collect(seq1), _collect(seq2))
+        assert _tokens(ev1) == [10]
+        assert _tokens(ev2) == [20]
+        assert max(active_peaks) == 2
+        assert gpu.events == ["acquire", "release"]
+        assert len(gens) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -1332,6 +1332,7 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_BATCH_PREFILL_SIZE` | int | `4` | Max sequences in chunked prefill at once |
 | `OLMLX_BATCH_PREFILL_STEP` | int | `2048` | Prefill chunk size (tokens) for batched requests |
 | `OLMLX_BATCH_CONSUMER_LAG_LIMIT` | int | `2048` | Drop a batched sequence whose unconsumed event backlog exceeds this (stalled client backpressure). `0` disables |
+| `OLMLX_BATCH_KV_ADMISSION` | bool | `true` | Hold a queued batched sequence in the inbox until the batch's combined KV fits under `OLMLX_MEMORY_LIMIT_FRACTION` (cross-sequence OOM guard). Disable to admit on per-request check only |
 | `OLMLX_MAX_TOKENS_LIMIT` | int | `131072` | Maximum tokens allowed per request |
 | `OLMLX_CORS_ORIGINS` | list | `["http://localhost:*", "http://127.0.0.1:*"]` | Allowed CORS origins |
 | `OLMLX_ANTHROPIC_MODELS` | dict | `{}` | Claude model name->local model mapping for the Anthropic endpoint |
@@ -1577,6 +1578,8 @@ Grammar / JSON-schema (`response_format`, `format`) and prompt-cache reuse **do*
 **Fairness.** Non-batchable work (embeddings, a KV-quant model, a different model) still acquires the lock normally. When such a request starts waiting, the batch stops admitting new sequences, lets its in-flight sequences finish, and hands the lock over — so exclusive traffic is never starved. A steady stream of batched requests therefore yields to a waiting exclusive request at the next drain.
 
 **Backpressure.** A stalled-but-connected client (slow SSE reader) can't pin a batch slot forever: if its unconsumed event backlog exceeds `OLMLX_BATCH_CONSUMER_LAG_LIMIT` (default 2048; `0` disables), the worker drops that sequence from the batch and ends its stream, freeing the slot for live requests. A client reading at any reasonable pace never approaches the limit.
+
+**Memory admission.** Many concurrent requests can't oversubscribe GPU memory: the worker only admits a queued sequence while the batch's *combined* KV-cache estimate stays under `OLMLX_MEMORY_LIMIT_FRACTION` of system RAM (`OLMLX_BATCH_KV_ADMISSION`, default on). A request that would push the batch over the limit waits in the queue until a running sequence finishes and frees its KV, rather than admitting and risking an uncatchable Metal OOM. A lone request is always admitted (its own fit is checked separately, and rejected with HTTP 503 if it alone is too large).
 
 Tuning knobs: `OLMLX_BATCH_COMPLETION_SIZE` (max concurrently *decoding* sequences, default 8), `OLMLX_BATCH_PREFILL_SIZE` (max sequences in chunked prefill, default 4), `OLMLX_BATCH_PREFILL_STEP` (prefill chunk size, default 2048). All are per-model overridable at the top level of `models.json`.
 

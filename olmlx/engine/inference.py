@@ -2688,12 +2688,36 @@ def _get_batch_scheduler(lm: LoadedModel) -> Any:
     def release_gpu() -> None:
         _exit_inference_lock(sync_mode, context="batch release")
 
+    # Aggregate (cross-sequence) KV admission (plan §10). The worker calls
+    # these on its own thread (which owns the GPU): ``kv_headroom`` is the
+    # bytes free for new KV right now — the memory ceiling minus current
+    # Metal use, so resident sequences are already netted out — and
+    # ``kv_estimate`` is one request's new-KV cost (suffix prefill +
+    # generated; a reused prefix is already-resident memory). Batched
+    # eligibility excludes KV-quant, so the estimate is plain fp16.
+    def kv_headroom() -> int:
+        total_physical = memory_utils.get_system_memory_bytes()
+        if total_physical <= 0:
+            return 1 << 62  # memory unknown — gate self-disables
+        limit = int(total_physical * settings.memory_limit_fraction)
+        return limit - memory_utils.get_metal_memory()
+
+    def kv_estimate(request: Any) -> int:
+        n = len(request.tokens) + max(request.max_tokens, 0)
+        try:
+            return estimate_kv_cache_bytes(model, n)
+        except Exception:
+            return 0  # estimate unavailable — admit (per-request gate stands)
+
+    admission = settings.batch_kv_admission
     lm.batch_scheduler = BatchScheduler(
         generator_factory=factory,
         acquire_gpu=acquire_gpu,
         release_gpu=release_gpu,
         exclusive_pending=lambda: _queue_depth > 0,
         consumer_lag_limit=settings.batch_consumer_lag_limit,
+        kv_headroom=kv_headroom if admission else None,
+        kv_estimate=kv_estimate if admission else None,
         name=lm.name,
     )
     return lm.batch_scheduler
@@ -2717,7 +2741,10 @@ def _batched_kv_preflight(lm: LoadedModel, num_tokens: int, max_tokens: int) -> 
     a batched consumer doesn't hold), but the pure estimate half can:
     reject a request whose own KV would blow ``OLMLX_MEMORY_LIMIT_FRACTION``
     with a MemoryError (→ HTTP 503) instead of risking the uncatchable
-    Metal OOM. Aggregate (cross-sequence) admission is Phase 3 (plan §10).
+    Metal OOM. Aggregate (cross-sequence) admission — keeping the *sum* of
+    co-tenant KV under the ceiling — is the batch worker's job via the
+    scheduler's ``kv_headroom``/``kv_estimate`` gate (``OLMLX_BATCH_KV_ADMISSION``,
+    plan §10/§11); this per-request check still stands as the first line.
     """
     total_physical = memory_utils.get_system_memory_bytes()
     if total_physical <= 0 or num_tokens <= 0:
