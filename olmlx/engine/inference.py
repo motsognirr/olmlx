@@ -84,6 +84,7 @@ from olmlx.engine.chat_templating import (
     _NATIVE_TOOL_HINT as _NATIVE_TOOL_HINT,
 )
 from olmlx.context import surface_var
+from olmlx.engine.stop_sequences import StopScanner, truncate_at_stop
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils import metrics as _metrics
 from olmlx.utils import tracing as _tracing
@@ -996,6 +997,72 @@ async def _acquire_inference_lock(timeout_override: float | None = None):
         await lock.acquire()
 
 
+async def _enter_inference_lock(
+    timeout_override: float | None = None,
+    *,
+    sync_mode: SyncMode | None = None,
+    queued_log: str = "Request queued for inference lock (queue depth: %d)",
+) -> None:
+    """Shared lock-entry protocol (#284 boundary discipline).
+
+    Deferred-cleanup handshake, queue-depth accounting, FIFO acquire,
+    post-acquire deferred-cleanup re-check (TOCTOU window: a deferred
+    cleanup task may have been created between the pre-check and the
+    acquire), then a Metal boundary sync so any pending GPU work from the
+    previous lock holder completes before the caller starts new work.
+
+    On any failure the lock is left released. Callers that complete the
+    entry successfully own the lock and must pair with
+    ``_exit_inference_lock``.
+    """
+    global _queue_depth
+    lock = _get_inference_lock()
+    await _await_deferred_cleanup()
+    _queue_depth += 1
+    if _queue_depth > 1:
+        logger.info(queued_log, _queue_depth)
+    try:
+        await _acquire_inference_lock(timeout_override)
+    finally:
+        _queue_depth -= 1
+    try:
+        await _await_deferred_cleanup()
+        _lock_boundary_sync(sync_mode)
+    except BaseException:
+        # BaseException (not ValueError): this handler re-raises, so
+        # KeyboardInterrupt / SystemExit from mx.synchronize must be
+        # caught here long enough to release the lock before they
+        # propagate. Asymmetric with _exit_inference_lock, which narrows
+        # to ValueError because it suppresses (the broader catch there
+        # would silently swallow shutdown signals).
+        lock.release()
+        raise
+
+
+def _exit_inference_lock(
+    sync_mode: SyncMode | None = None, *, context: str = ""
+) -> None:
+    """Shared lock-exit protocol: Metal boundary sync, then release.
+
+    Runs inside ``finally`` blocks, so an unknown sync mode must not
+    raise (it would mask the in-flight exception): fall back to
+    ``_safe_sync()`` so unknown modes fail-safe (sync anyway) instead of
+    fail-open (no sync). Narrowed to ValueError so KeyboardInterrupt /
+    SystemExit from mx.synchronize still propagate during shutdown.
+    """
+    try:
+        _lock_boundary_sync(sync_mode)
+    except ValueError:
+        logger.error(
+            "exit _lock_boundary_sync failed%s",
+            f" in {context}" if context else "",
+            exc_info=True,
+        )
+        _safe_sync()
+    finally:
+        _get_inference_lock().release()
+
+
 @contextlib.asynccontextmanager
 async def _inference_locked(
     timeout_override: float | None = None,
@@ -1008,56 +1075,11 @@ async def _inference_locked(
     ``_lock_boundary_sync``). ``None`` defers to the global
     ``settings.sync_mode``.
     """
-    global _queue_depth
-    lock = _get_inference_lock()
-    await _await_deferred_cleanup()
-    _queue_depth += 1
-    if _queue_depth > 1:
-        logger.info("Request queued for inference lock (queue depth: %d)", _queue_depth)
-    try:
-        await _acquire_inference_lock(timeout_override)
-    except BaseException:
-        _queue_depth -= 1
-        raise
-    _queue_depth -= 1
-    # Re-check after acquiring — a deferred cleanup task may have been
-    # created between the pre-check and acquire (TOCTOU window).
-    try:
-        await _await_deferred_cleanup()
-    except BaseException:
-        lock.release()
-        raise
-    # Sync the default Metal stream so any pending GPU work from the previous
-    # inference completes before we start a new one.
-    try:
-        _lock_boundary_sync(sync_mode)
-    except BaseException:
-        # BaseException (not ValueError): this handler re-raises, so
-        # KeyboardInterrupt / SystemExit from mx.synchronize must be
-        # caught here long enough to release the lock before they
-        # propagate. Asymmetric with the exit handler below, which
-        # narrows to ValueError because it suppresses (the broader catch
-        # there would silently swallow shutdown signals).
-        lock.release()
-        raise
+    await _enter_inference_lock(timeout_override, sync_mode=sync_mode)
     try:
         yield
     finally:
-        # Sync again on exit to ensure this inference's GPU work is fully
-        # complete before releasing the lock to the next caller.
-        try:
-            _lock_boundary_sync(sync_mode)
-        except ValueError:
-            # Do NOT re-raise: that would mask any exception propagating
-            # from the yield body. Fall back to _safe_sync() so unknown
-            # modes fail-safe (sync anyway) instead of fail-open (no sync).
-            # Narrow to ValueError (not BaseException) so KeyboardInterrupt /
-            # SystemExit from mx.synchronize still propagate — those must
-            # not be silently swallowed during shutdown.
-            logger.error("exit _lock_boundary_sync failed", exc_info=True)
-            _safe_sync()
-        finally:
-            lock.release()
+        _exit_inference_lock(sync_mode, context="_inference_locked")
 
 
 @contextlib.contextmanager
@@ -2555,15 +2577,20 @@ def _batch_eligible(
     max_tokens: int,
     images: list[str] | None,
     audio: list[str] | None,
-    grammar_active: bool,
 ) -> bool:
-    """Route a streaming chat request to the batch engine? (plan §3)
+    """Route a chat request to the batch engine? (plan §3)
 
-    v1 policy: opt-in (``OLMLX_BATCHING``), text-only dense models on
-    plain ``KVCache`` layers. Everything else — VLM/audio kinds,
-    speculative, distributed, flash, KV-quant, grammar, per-request seed
-    (global PRNG → batched reproducibility impossible), gpt-oss channel
-    format — stays on the exclusive-lock path unchanged.
+    Policy: opt-in (``OLMLX_BATCHING``), text-only dense models on plain
+    ``KVCache`` layers. Everything else — VLM/audio kinds, speculative,
+    distributed, flash, KV-quant, per-request seed (global PRNG →
+    batched reproducibility impossible), gpt-oss channel format — stays
+    on the exclusive-lock path unchanged.
+
+    Grammar requests batch as of Phase 2: ``GenerationBatch._step``
+    calls each sequence's processors with that sequence's ``[1, vocab]``
+    logits row and a per-sequence ``TokenBuffer`` token history (prompt
+    included on the first call), which is exactly the
+    ``GrammarLogitsProcessor`` contract on the exclusive path.
     """
     # Identity check, not truthiness: tests patch ``inference.settings``
     # with a MagicMock whose every attribute is truthy — that must never
@@ -2590,8 +2617,6 @@ def _batch_eligible(
     if lm.kv_cache_quant is not None:
         return False
     if images or audio:
-        return False
-    if grammar_active:
         return False
     if gen_kwargs.get("seed") is not None:
         return False
@@ -2647,37 +2672,21 @@ def _get_batch_scheduler(lm: LoadedModel) -> Any:
         )
 
     async def acquire_gpu() -> None:
-        global _queue_depth
-        await _await_deferred_cleanup()
-        # Count the waiting manager in _queue_depth so OTHER models'
-        # running batch workers see it via their exclusive_pending latch
-        # and drain — otherwise a busy model starves every other model's
-        # batched requests (they never bump the depth on their own).
-        _queue_depth += 1
-        try:
-            # 0 disables the acquire timeout: the manager waits FIFO
-            # behind exclusive requests; batched requests time out
-            # individually consumer-side.
-            await _acquire_inference_lock(0)
-        finally:
-            _queue_depth -= 1
-        try:
-            await _await_deferred_cleanup()
-            _lock_boundary_sync(sync_mode)
-        except BaseException:
-            _get_inference_lock().release()
-            raise
+        # The shared entry counts the waiting manager in _queue_depth so
+        # OTHER models' running batch workers see it via their
+        # exclusive_pending latch and drain — otherwise a busy model
+        # starves every other model's batched requests (they never bump
+        # the depth on their own). Timeout 0 disables the acquire
+        # timeout: the manager waits FIFO behind exclusive requests;
+        # batched requests time out individually consumer-side.
+        await _enter_inference_lock(
+            0,
+            sync_mode=sync_mode,
+            queued_log="Batch manager queued for inference lock (queue depth: %d)",
+        )
 
     def release_gpu() -> None:
-        try:
-            _lock_boundary_sync(sync_mode)
-        except ValueError:
-            # Unknown sync mode mid-teardown: still sync before releasing
-            # (mirrors _stream_completion's exit path).
-            logger.error("exit _lock_boundary_sync failed in batch release")
-            _safe_sync()
-        finally:
-            _get_inference_lock().release()
+        _exit_inference_lock(sync_mode, context="batch release")
 
     lm.batch_scheduler = BatchScheduler(
         generator_factory=factory,
@@ -2735,6 +2744,136 @@ def _batched_kv_preflight(lm: LoadedModel, num_tokens: int, max_tokens: int) -> 
         )
 
 
+@dataclasses.dataclass
+class _BatchedCacheSetup:
+    """Result of batched prompt-cache setup.
+
+    ``suffix_tokens`` is what the sequence prefills; on a hit, ``cache``
+    + ``history_tokens`` seed it with the reused prefix. ``store`` is
+    True when this model participates in cross-request storage (the
+    worker is then asked to hand the final KV back via the done event).
+    """
+
+    suffix_tokens: list[int]
+    cache: list[Any] | None = None
+    history_tokens: list[int] | None = None
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    store: bool = False
+
+
+async def _setup_batched_prompt_cache(
+    lm: LoadedModel, tokens: list[int], cache_id: str
+) -> _BatchedCacheSetup:
+    """Prompt-cache lookup for the batched path (plan §4 item 2).
+
+    Move semantics: the entry is *taken* out of the store (``async_take``)
+    so a concurrent request can never share the mutable cache object —
+    batched consumers are not serialized by the inference lock, so the
+    exclusive path's get-then-remove sequence (Bug #123) is not
+    race-free here. The cache re-enters the store when the sequence
+    finishes (the worker hands it back via the done event).
+
+    The trim runs on the event loop, but eligibility restricts the
+    batched path to plain ``KVCache`` layers whose trim is offset
+    bookkeeping only (no Metal work) — it cannot race the batch worker's
+    GPU stream.
+    """
+    res = _BatchedCacheSetup(
+        suffix_tokens=list(tokens), cache_creation_tokens=len(tokens)
+    )
+    # Persistence can still be off for probe-failure models even though
+    # the batch probe passed; those keep Phase 1 behavior (fresh prefill,
+    # nothing stored). Checkpoint-persistence models can't reach here
+    # (their caches are not plain KVCache), checked for symmetry.
+    if (
+        not lm.supports_cache_persistence
+        or not lm.supports_cache_trim
+        or lm.uses_checkpoint_persistence
+    ):
+        return res
+    res.store = True
+    state = await lm.prompt_cache_store.async_take(cache_id)
+    if state is None and settings.prompt_cache_radix:
+        # Sibling-prefix takeover (issue #365): take the matched entry
+        # directly under its old id — it will be re-stored under the new
+        # cache_id at finish, which is what takeover would have done.
+        found = lm.prompt_cache_store.find_by_prefix(
+            tokens,
+            min_prefix_tokens=settings.prompt_cache_radix_min_prefix_tokens,
+        )
+        if found is not None:
+            old_cache_id, _, prefix_len_hint = found
+            state = lm.prompt_cache_store.take(old_cache_id)
+            if state is not None:
+                logger.info(
+                    "Radix prefix hit (batched): %d tokens reused from "
+                    "cache_id=%s → %s",
+                    prefix_len_hint,
+                    old_cache_id,
+                    cache_id,
+                )
+    if state is None:
+        return res
+    prefix_len = _find_common_prefix(tokens, state.tokens)
+    # Back up one position on exact match so the sequence still has a
+    # token to prefill (same rule as the exclusive path); a hit that
+    # would leave suffix_start == 0 is useless — the taken entry is
+    # simply dropped (the exclusive path's remove-on-miss equivalent).
+    suffix_start = min(prefix_len, len(tokens) - 1) if tokens else 0
+    if suffix_start <= 0:
+        return res
+    trim_amount = len(state.tokens) - suffix_start
+    if trim_amount > 0:
+        trimmed = trim_prompt_cache(state.cache, trim_amount)
+        if trimmed != trim_amount:
+            logger.warning(
+                "Batched prompt cache trim incomplete (asked for %d, got "
+                "%d); discarding and prefilling fresh",
+                trim_amount,
+                trimmed,
+            )
+            return res
+    res.cache = state.cache
+    res.history_tokens = list(tokens[:suffix_start])
+    res.suffix_tokens = list(tokens[suffix_start:])
+    res.cache_read_tokens = suffix_start
+    res.cache_creation_tokens = len(tokens) - suffix_start
+    logger.info(
+        "Prompt cache hit (batched): %d prefix tokens reused, %d new "
+        "tokens to process (was %d total)",
+        suffix_start,
+        len(res.suffix_tokens),
+        len(tokens),
+    )
+    return res
+
+
+async def _restore_taken_cache(
+    lm: LoadedModel, cache_id: str, cache_setup: _BatchedCacheSetup | None
+) -> None:
+    """Give a taken prompt-cache entry back to the store.
+
+    Used when a batched request fails before/without consuming its
+    seeded prefix (batch queue timeout, preflight MemoryError) so a
+    retry still gets the prefix — the exclusive path never loses the
+    entry in those cases (its queue timeout fires before cache setup;
+    its preflight re-stores the trimmed cache before evicting to disk).
+    The trimmed object covers exactly ``history_tokens`` and is only
+    ever *read* by the batch (merge copies), so re-storing is safe even
+    if the sequence was admitted before being swept.
+    """
+    if cache_setup is None or not cache_setup.cache:
+        return
+    await lm.prompt_cache_store.async_set(
+        cache_id,
+        CachedPromptState(
+            tokens=list(cache_setup.history_tokens or []),
+            cache=cache_setup.cache,
+        ),
+    )
+
+
 async def _stream_completion_batched(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -2744,13 +2883,16 @@ async def _stream_completion_batched(
     *,
     keep_alive: str | None = None,
     prompt_tokens: list[int] | None = None,
+    use_prompt_cache: bool = False,
+    cache_id: str = "",
 ) -> AsyncGenerator[dict, None]:
     """Batched counterpart of ``_stream_completion`` (plan §2/§4).
 
     Submits to the per-model BatchScheduler instead of taking the
     inference lock for the whole request; yields the same chunk dicts so
-    routers are unchanged. Phase 1 scope: fresh prefill (no prompt-cache
-    reuse), no grammar, no channel filter (excluded by eligibility).
+    routers are unchanged. Phase 2 adds the prompt-cache round trip
+    (take → seed the sequence → re-store from the done event) and
+    per-sequence grammar; no channel filter (excluded by eligibility).
     """
     from olmlx.engine.batching import BatchRequest
 
@@ -2762,7 +2904,24 @@ async def _stream_completion_batched(
     else:
         tokens = list(prompt)
 
-    _batched_kv_preflight(lm, len(tokens), max_tokens)
+    cache_setup: _BatchedCacheSetup | None = None
+    if use_prompt_cache and make_prompt_cache is not None:
+        cache_setup = await _setup_batched_prompt_cache(lm, tokens, cache_id)
+        submit_tokens = cache_setup.suffix_tokens
+    else:
+        submit_tokens = tokens
+
+    # New-KV estimate covers only what this sequence will prefill; a
+    # reused prefix is already-resident memory moved out of the store.
+    # On rejection, restore the taken entry — exclusive-path parity: its
+    # preflight re-stores the trimmed cache (then spills under pressure)
+    # so a retry keeps the prefix; the 503'd request frees its KV either
+    # way (the store's own pressure machinery handles residency).
+    try:
+        _batched_kv_preflight(lm, len(submit_tokens), max_tokens)
+    except MemoryError:
+        await _restore_taken_cache(lm, cache_id, cache_setup)
+        raise
 
     scheduler = _get_batch_scheduler(lm)
     detokenizer = lm.tokenizer.detokenizer  # fresh streaming instance
@@ -2779,7 +2938,7 @@ async def _stream_completion_batched(
         else settings.inference_timeout
     )
 
-    accumulated_text = ""
+    stop_scanner = StopScanner(stop_sequences)
     stop_hit = False
     timed_out = False
     terminal_seen = False
@@ -2787,40 +2946,29 @@ async def _stream_completion_batched(
     first_token_ns: int | None = None
     last_token_ns: int | None = None
 
-    def _scan_stop(piece: str) -> tuple[str, bool]:
-        """Append *piece* to the accumulated text and truncate at the
-        earliest stop-sequence match (same semantics as the exclusive
-        path's inline scan)."""
-        nonlocal accumulated_text
-        if not stop_sequences:
-            return piece, False
-        prev_len = len(accumulated_text)
-        accumulated_text += piece
-        stop_idx = -1
-        for stop_seq in stop_sequences:
-            # A match ending in the new piece must start within
-            # len(stop_seq)-1 of the boundary; anything earlier was
-            # caught (and truncated at) a previous call. Bounding the
-            # search start keeps the scan O(piece), not O(generation).
-            idx = accumulated_text.find(stop_seq, max(0, prev_len - len(stop_seq) + 1))
-            if idx != -1 and (stop_idx == -1 or idx < stop_idx):
-                stop_idx = idx
-        if stop_idx == -1:
-            return piece, False
-        return (
-            accumulated_text[prev_len:stop_idx] if prev_len < stop_idx else ""
-        ), True
-
     seq: Any = None
     try:
+        # Start of the response body — mirrors the exclusive path's
+        # cache_info yield (routers surface read/creation counts).
+        if cache_setup is not None:
+            yield {
+                "cache_info": True,
+                "cache_read_tokens": cache_setup.cache_read_tokens,
+                "cache_creation_tokens": cache_setup.cache_creation_tokens,
+            }
         with _inference_ref(lm, keep_alive=keep_alive):
             try:
                 seq = await scheduler.submit(
                     BatchRequest(
-                        tokens=tokens,
+                        tokens=submit_tokens,
                         max_tokens=max_tokens,
                         sampler=gen_kwargs.get("sampler"),
                         logits_processors=gen_kwargs.get("logits_processors"),
+                        cache=cache_setup.cache if cache_setup else None,
+                        history_tokens=(
+                            cache_setup.history_tokens if cache_setup else None
+                        ),
+                        return_cache=bool(cache_setup and cache_setup.store),
                     )
                 )
                 inf_start = time.monotonic()
@@ -2830,6 +2978,7 @@ async def _stream_completion_batched(
                         try:
                             event = await asyncio.wait_for(seq.out.get(), queue_timeout)
                         except (asyncio.TimeoutError, TimeoutError):
+                            await _restore_taken_cache(lm, cache_id, cache_setup)
                             raise ServerBusyError(
                                 "Server busy: batch queue timeout after "
                                 f"{queue_timeout}s"
@@ -2860,9 +3009,33 @@ async def _stream_completion_batched(
                             detokenizer.finalize()
                             tail = detokenizer.last_segment
                             if tail:
-                                tail, stop_hit = _scan_stop(tail)
+                                tail, stop_hit = stop_scanner.feed(tail)
                                 if tail:
                                     yield {"text": tail, "done": False}
+                        # Re-store the sequence's KV under cache_id. The
+                        # worker ships the cache only when asked
+                        # (return_cache) and skips it on timeout/disconnect
+                        # (want_cache cleared) — a stop-hit cancellation is
+                        # a *successful* completion and keeps it. The
+                        # prefix-length guard skips storage for a sequence
+                        # cancelled mid-prefill (partial KV shorter than
+                        # the prompt).
+                        ev_cache = event.get("cache")
+                        if (
+                            ev_cache is not None
+                            and not timed_out
+                            and len(event.get("tokens") or []) >= len(tokens)
+                        ):
+                            all_toks = event["tokens"]
+                            generated = list(all_toks[len(tokens) :])
+                            await _store_prompt_cache_after_generation(
+                                lm,
+                                {"prompt_cache": ev_cache},
+                                tokens,
+                                generated,
+                                len(generated),
+                                cache_id,
+                            )
                         break
                     # token
                     if stop_hit or timed_out:
@@ -2875,7 +3048,7 @@ async def _stream_completion_batched(
                     detokenizer.add_token(event["token"])
                     piece = detokenizer.last_segment
                     if piece:
-                        piece, stop_hit = _scan_stop(piece)
+                        piece, stop_hit = stop_scanner.feed(piece)
                         if piece:
                             yield {"text": piece, "done": False}
                     if stop_hit:
@@ -2891,12 +3064,17 @@ async def _stream_completion_batched(
                             inf_timeout,
                         )
                         timed_out = True
+                        # The generation is incomplete; don't pay for the
+                        # cache extraction (parity with the exclusive
+                        # path's invalidate-on-incomplete).
+                        seq.want_cache = False
                         scheduler.cancel(seq)
             finally:
                 if seq is not None and not terminal_seen:
                     # Client disconnect / consumer exception: free the
                     # batch slot and wait (bounded) for the worker to
                     # confirm removal before dropping the model pin.
+                    seq.want_cache = False
                     scheduler.cancel(seq)
                     with contextlib.suppress(Exception):
                         await asyncio.wait_for(_drain_to_terminal(seq), 30.0)
@@ -2967,14 +3145,12 @@ async def _stream_completion(
 ) -> AsyncGenerator[dict, None]:
     # Continuous batching (docs/batching-plan.md): eligible requests join
     # the per-model batch instead of serializing on the inference lock.
-    # Phase 1 batched scope skips prompt-cache reuse (fresh prefill).
     if _batch_eligible(
         lm,
         gen_kwargs,
         max_tokens=max_tokens,
         images=images,
         audio=audio,
-        grammar_active=grammar_active,
     ):
         async for chunk in _stream_completion_batched(
             lm,
@@ -2984,44 +3160,19 @@ async def _stream_completion(
             stats,
             keep_alive=keep_alive,
             prompt_tokens=prompt_tokens,
+            use_prompt_cache=use_prompt_cache,
+            cache_id=cache_id,
         ):
             yield chunk
         return
 
-    # Use explicit acquire/release instead of `async with` to prevent
+    # Use explicit enter/exit instead of `async with` to prevent
     # CancelledError from releasing the lock before cleanup completes.
-    global _queue_depth
-    lock = _get_inference_lock()
-    await _await_deferred_cleanup()
-    _queue_depth += 1
-    if _queue_depth > 1:
-        logger.info(
-            "Streaming request queued for inference lock (queue depth: %d)",
-            _queue_depth,
-        )
-    try:
-        await _acquire_inference_lock(lm.inference_queue_timeout)
-    except BaseException:
-        _queue_depth -= 1
-        raise
-    _queue_depth -= 1
-    # Re-check after acquiring — a deferred cleanup task may have been
-    # created between the pre-check and acquire (TOCTOU window).
-    try:
-        await _await_deferred_cleanup()
-    except BaseException:
-        lock.release()
-        raise
-    # Sync default stream before starting — same purpose as _inference_locked entry.
-    try:
-        _lock_boundary_sync(lm.sync_mode)
-    except BaseException:
-        # BaseException (re-raise path): see _inference_locked entry for
-        # the rationale. Summary: must release the lock on any exception,
-        # including KeyboardInterrupt / SystemExit, so the shutdown
-        # signal can propagate without leaving the lock held.
-        lock.release()
-        raise
+    await _enter_inference_lock(
+        lm.inference_queue_timeout,
+        sync_mode=lm.sync_mode,
+        queued_log="Streaming request queued for inference lock (queue depth: %d)",
+    )
 
     # Everything after lock acquisition must be in try/finally so the lock is
     # always released — even if the generator is closed at a yield point
@@ -3246,7 +3397,7 @@ async def _stream_completion(
             with Timer() as eval_timer:
                 inf_start = time.monotonic()
                 token = None
-                accumulated_text = ""
+                stop_scanner = StopScanner(stop_sequences)
                 async for token in stream:
                     # Always accumulate for prompt cache (raw stream, not filtered)
                     stats.eval_count = token.generation_tokens
@@ -3268,35 +3419,17 @@ async def _stream_completion(
                             token.generation_tokens,
                         )
 
-                    # Check stop sequences against the full decoded text so far.
-                    # Must be done before yielding so we can truncate the current token.
-                    # Use the earliest (minimum-index) match across all stop sequences.
-                    stop_match_idx = -1
+                    # Check stop sequences before yielding so the current
+                    # token can be truncated at the earliest match.
                     if stop_sequences:
-                        accumulated_text += token.text or ""
-                        for stop_seq in stop_sequences:
-                            idx = accumulated_text.find(stop_seq)
-                            if idx != -1 and (
-                                stop_match_idx == -1 or idx < stop_match_idx
-                            ):
-                                stop_match_idx = idx
-                        if stop_match_idx != -1:
-                            prev_len = len(accumulated_text) - len(token.text or "")
-                            text_before_stop = accumulated_text[:stop_match_idx]
-                            token_part = (
-                                text_before_stop[prev_len:]
-                                if prev_len < stop_match_idx
-                                else ""
-                            )
+                        token_part, stop_hit = stop_scanner.feed(token.text or "")
+                        if stop_hit:
                             if token_part:
                                 if channel_filter is None:
                                     yield {"text": token_part, "done": False}
                                 elif channel_filter.should_yield(token_part):
                                     yield {"text": token_part, "done": False}
-                            stop_hit = True
-
-                    if stop_hit:
-                        break
+                            break
 
                     # Yield text only if the filter allows it (or no filter).
                     # When channel filter is active, always include raw_text so
@@ -3464,23 +3597,58 @@ async def _stream_completion(
             # Normal path — thread exited, safe to clean up and release.
             # Delete temp audio files now that the worker thread is done.
             cleanup_temp_audio(_audio_temps)
-            try:
-                _lock_boundary_sync(lm.sync_mode)
-            except ValueError:
-                # Don't re-raise: a stream-body exception is already mid-
-                # propagation through the outer finally, and masking it
-                # with an unknown-mode ValueError would erase the cause.
-                # Fall back to _safe_sync() so we still sync before
-                # releasing the lock. Narrow to ValueError so interrupt
-                # signals (KeyboardInterrupt / SystemExit) from
-                # mx.synchronize propagate instead of being swallowed.
-                logger.error(
-                    "exit _lock_boundary_sync failed in _stream_completion",
-                    exc_info=True,
-                )
-                _safe_sync()
-            finally:
-                lock.release()
+            _exit_inference_lock(lm.sync_mode, context="_stream_completion")
+
+
+async def _full_completion_batched(
+    lm: LoadedModel,
+    prompt: str | list[int],
+    max_tokens: int,
+    gen_kwargs: dict,
+    stats: TimingStats,
+    *,
+    use_prompt_cache: bool = False,
+    prompt_tokens: list[int] | None = None,
+    cache_id: str = "",
+    keep_alive: str | None = None,
+) -> dict:
+    """Non-streaming batched completion (plan §4 item 6).
+
+    Internally consumes ``_stream_completion_batched`` (the
+    ``collect_stream`` pattern) and aggregates the same result-dict shape
+    as ``_full_completion``: stop sequences, prompt-cache round trip and
+    metrics all happen inside the stream. Unlike the exclusive
+    non-streaming path, ``inference_timeout`` IS enforced — the batch
+    worker can drop a sequence at any tick, so cancellation is safe.
+    """
+    text_parts: list[str] = []
+    result: dict = {"text": "", "done": True, "stats": stats}
+    async for chunk in _stream_completion_batched(
+        lm,
+        prompt,
+        max_tokens,
+        gen_kwargs,
+        stats,
+        keep_alive=keep_alive,
+        prompt_tokens=prompt_tokens,
+        use_prompt_cache=use_prompt_cache,
+        cache_id=cache_id,
+    ):
+        if chunk.get("cache_info"):
+            result["cache_read_tokens"] = chunk.get("cache_read_tokens", 0)
+            result["cache_creation_tokens"] = chunk.get("cache_creation_tokens", 0)
+        elif chunk.get("done"):
+            reason = chunk.get("done_reason")
+            if reason:
+                # Routers map done_reason themselves (timeout → "length");
+                # finish_reason mirrors the exclusive path's stop marker.
+                result["done_reason"] = reason
+                if reason == "stop":
+                    result["finish_reason"] = "stop"
+        else:
+            text_parts.append(chunk.get("text") or "")
+    result["text"] = "".join(text_parts)
+    return result
 
 
 async def _full_completion(
@@ -3503,6 +3671,28 @@ async def _full_completion(
     tokenizer: Any = None,
     template_kwargs: dict | None = None,
 ) -> dict:
+    # Continuous batching (plan §4 item 6): eligible non-streaming
+    # requests internally consume the batched stream and aggregate —
+    # stop sequences stay in gen_kwargs for the stream to handle.
+    if _batch_eligible(
+        lm,
+        gen_kwargs,
+        max_tokens=max_tokens,
+        images=images,
+        audio=audio,
+    ):
+        return await _full_completion_batched(
+            lm,
+            prompt,
+            max_tokens,
+            gen_kwargs,
+            stats,
+            use_prompt_cache=use_prompt_cache,
+            prompt_tokens=prompt_tokens,
+            cache_id=cache_id,
+            keep_alive=keep_alive,
+        )
+
     # inference_timeout is not enforced for non-streaming: the GPU thread
     # cannot be safely cancelled (releasing the lock while Metal is still
     # running causes concurrent command buffer access).  Streaming handles
@@ -3639,14 +3829,8 @@ async def _full_completion(
                                 exc_info=True,
                             )
     if stop_sequences and result_dict:
-        text = result_dict.get("text", "")
-        earliest = -1
-        for stop_seq in stop_sequences:
-            idx = text.find(stop_seq)
-            if idx != -1 and (earliest == -1 or idx < earliest):
-                earliest = idx
-        if earliest != -1:
-            text = text[:earliest]
+        text, hit = truncate_at_stop(result_dict.get("text", ""), stop_sequences)
+        if hit:
             result_dict["finish_reason"] = "stop"
         result_dict["text"] = text
     return result_dict

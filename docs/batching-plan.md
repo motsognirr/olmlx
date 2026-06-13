@@ -1,13 +1,19 @@
 # Implementation Plan: Continuous Batching via mlx-lm `BatchGenerator`
 
-Status: **Phases 0–1 implemented** (engine/ropefix.py, engine/batching.py,
+Status: **Phases 0–2 implemented** (engine/ropefix.py, engine/batching.py,
 inference.py `_batch_eligible` / `_get_batch_scheduler` /
-`_stream_completion_batched`, settings, LoadedModel fields + teardown;
+`_stream_completion_batched` / `_full_completion_batched` /
+`_setup_batched_prompt_cache`, settings, LoadedModel fields + teardown;
 tests/test_batching.py + tests/live/test_batching_real.py). Measured on this
 machine (M-series, Qwen3-4B-4bit, ~100-token chat generations, prefill
 included): 80 tok/s single stream → 120 aggregate at 2 concurrent (1.49×),
 135 at 4 (1.68×), 142 at 8 (1.76×); exact greedy parity with the exclusive
-path at 3-way concurrency. Phases 2+ remain.
+path at 3-way concurrency. Phase 2 adds the prompt-cache round trip
+(move semantics via `PromptCacheStore.take`/`async_take`, re-store from the
+worker's done event), the non-streaming path, per-sequence grammar, batch
+occupancy on `/api/ps` + `olmlx_batch_*` Prometheus metrics, and the two
+PR #507 refactors (shared `_enter_inference_lock`/`_exit_inference_lock`,
+one `StopScanner`). Phases 3+ remain.
 
 Two integration landmines surfaced by the full suite, both fixed with
 regression tests: (1) Mock vacuity — a `MagicMock` model's `make_cache()` is
@@ -169,7 +175,7 @@ exclusive path runs untouched:
 | KV quant off for this model | `_make_cache` rejects custom cache classes |
 | cache probe passes | one-time per model: every `make_cache()` element ∈ {KVCache, ArraysCache, RotatingKVCache(keep==0), CacheList} |
 | no `seed` in options | global PRNG; reproducibility promise can't be kept in a batch |
-| no grammar (v1; lifted in Phase 2) | xgrammar processor batch behavior unverified |
+| ~~no grammar~~ (lifted in Phase 2) | per-sequence processor calls verified — see §11 |
 | not gpt-oss channel-format (v1) | usually rotating-cache w/ keep anyway; channel filter untested against batched detok |
 | same model as currently scheduled | one BatchGenerator per model; cross-model → exclusive path waits for drain |
 
@@ -305,14 +311,23 @@ Live (`tests/live/test_batching_real.py`, `real_model`):
   `OLMLX_BATCHING=true` opt-in. Even `completion_batch_size=8` with fresh
   prefills delivers the two headline wins (aggregate throughput + prefill
   interleaving).
-- **Phase 2 — integration**: prompt-cache store move/extract round trip;
-  non-streaming path; grammar per-sequence (after verifying xgrammar processor
-  shape handling in `GenerationBatch._step`); `/api/ps` + metrics. Also from
-  the PR #507 review: extract shared lock entry/exit helpers so
-  `acquire_gpu`/`release_gpu` and `_inference_locked` stop duplicating the
-  #284 lock-boundary protocol (deferred from Phase 1 — touching the exclusive
-  lock path in the same PR was judged riskier than the duplication), and
-  consolidate the stop-sequence scan (third copy in `_scan_stop`).
+- **Phase 2 — integration** (done): prompt-cache store move/extract round
+  trip (`_setup_batched_prompt_cache` takes the entry out of the store —
+  `take`/`async_take`, no shared mutable cache across lockless consumers —
+  seeds the sequence via `insert(caches=…, all_tokens=…)`, and the worker
+  hands the final KV back in the done event, eager-evaluated on the worker
+  thread per #284; stop-hit cancellations still store, timeout/disconnect
+  invalidate); non-streaming path (`_full_completion_batched` drains the
+  batched stream — and gains inference_timeout enforcement, which the
+  exclusive non-streaming path can't do); grammar per-sequence (verified:
+  `GenerationBatch._step` calls per-sequence processors with `[1, vocab]`
+  rows + per-sequence `TokenBuffer` history, prompt included on first call
+  — exactly the `GrammarLogitsProcessor` contract; live JSON-mode batch
+  test); `/api/ps` `batch_metrics` + `olmlx_batch_*` metrics. Also from the
+  PR #507 review: shared `_enter_inference_lock`/`_exit_inference_lock`
+  helpers (used by `_inference_locked`, `_stream_completion`, and the batch
+  scheduler's `acquire_gpu`/`release_gpu`), and one `StopScanner`
+  (`engine/stop_sequences.py`) replacing the three inline copies.
 - **Phase 3 — hardening**: admission control vs `OLMLX_MEMORY_LIMIT_FRACTION`;
   fairness guard tuning; docs (USER_MANUAL); consider default-on per-model.
 - **Phase 4 — extensions** (separate decisions): hybrid `ArraysCache` (GDN)
@@ -322,11 +337,19 @@ Live (`tests/live/test_batching_real.py`, `real_model`):
 
 ## 11. Risks / open questions
 
-- **xgrammar in batch**: does `GenerationBatch._step` call per-sequence
-  processors with `[1, vocab]` rows and that sequence's token history? Needs a
-  read + test before Phase 2 lifts the grammar exclusion.
-- **`BatchKVCache.extract` padding semantics**: load-bearing for prompt-cache
-  round-tripping (test #7 gates it).
+- **xgrammar in batch** (resolved, Phase 2): `GenerationBatch._step` calls
+  per-sequence processors with `logits[e:e+1]` (`[1, vocab]`) and a
+  per-sequence `TokenBuffer` context seeded with the sequence's full token
+  history (prompt included — `PromptProcessingBatch.prompt()` appends the
+  prompt to `self.tokens` before the generation transition). That matches
+  `GrammarLogitsProcessor`'s first-call-is-prompt contract exactly. The
+  context is an `mx.array` (not a list) — the processor's `len()`/slice/
+  iterate usage handles both. Gated by the live JSON-mode batch test.
+- **`BatchKVCache.extract` padding semantics** (resolved, Phase 2): extract
+  slices `[idx, :, left_padding[idx]:_idx]` through `mx.contiguous` and
+  resets `offset = keys.shape[2]` — a clean B=1 prefix. The live round-trip
+  test stores from a mixed-length batch (real left-padding) and reuses at
+  exact greedy parity with the exclusive path.
 - **Hybrid models**: mlx-lm batches `ArraysCache` mechanically, but olmlx has
   a documented history of GDN/Metal-stream corruption (#284/#396). Keep out of
   v1; admit only with dedicated long-prompt parity tests.

@@ -72,6 +72,12 @@ async def ps(request: Request):
         if vlm_store is not None:
             cache_metrics = {**cache_metrics, **vlm_store.metrics()}
 
+        # Continuous-batching occupancy (batching plan §8).
+        batch_metrics: dict[str, int] = {}
+        scheduler = getattr(lm, "batch_scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "stats"):
+            batch_metrics = scheduler.stats()
+
         models.append(
             RunningModel(
                 name=lm.name,
@@ -88,6 +94,7 @@ async def ps(request: Request):
                 size_vram=size,
                 active_refs=lm.active_refs,
                 cache_metrics=cache_metrics,
+                batch_metrics=batch_metrics,
             )
         )
     return PsResponse(models=models)

@@ -13,6 +13,7 @@ class RunningModel(BaseModel):
     size_vram: int = 0
     active_refs: int = 0
     cache_metrics: dict[str, int] = {}
+    batch_metrics: dict[str, int] = {}
 
 
 class PsResponse(BaseModel):
