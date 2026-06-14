@@ -96,22 +96,34 @@ class SpeculativeLoaderMixin:
         return hf_path
 
     @staticmethod
-    def _check_vocab_match(target: Any, draft: Any) -> None:
-        """Raise ValueError if target and draft vocab sizes differ."""
+    def _check_vocab_match(
+        target: Any,
+        draft: Any,
+        *,
+        secondary_label: str = "Draft model",
+        feature: str = "Speculative decoding",
+    ) -> None:
+        """Raise ValueError if target and secondary-model vocab sizes differ.
+
+        ``secondary_label`` / ``feature`` tailor the error text for non-draft
+        callers (e.g. proxy-tuning's expert / anti-expert) so the message names
+        the right model and decode mode.
+        """
         target_vocab = getattr(getattr(target, "args", None), "vocab_size", None)
         draft_vocab = getattr(getattr(draft, "args", None), "vocab_size", None)
         if target_vocab is None or draft_vocab is None:
             logger.warning(
-                "Could not verify vocab compatibility: target_vocab=%s draft_vocab=%s",
+                "Could not verify vocab compatibility: target_vocab=%s %s_vocab=%s",
                 target_vocab,
+                secondary_label.lower(),
                 draft_vocab,
             )
             return
         if target_vocab != draft_vocab:
             raise ValueError(
-                f"Draft model vocab_size ({draft_vocab}) does not match "
+                f"{secondary_label} vocab_size ({draft_vocab}) does not match "
                 f"target model vocab_size ({target_vocab}). "
-                f"Speculative decoding requires matching vocabularies."
+                f"{feature} requires matching vocabularies."
             )
 
     def _load_dflash_decoder(
@@ -822,8 +834,18 @@ class SpeculativeLoaderMixin:
         )
 
         # Hard floor: integer vocab_size must match across all three models.
-        self._check_vocab_match(target_model, expert_model)
-        self._check_vocab_match(target_model, antiexpert_model)
+        self._check_vocab_match(
+            target_model,
+            expert_model,
+            secondary_label="Expert model",
+            feature="Proxy-tuning",
+        )
+        self._check_vocab_match(
+            target_model,
+            antiexpert_model,
+            secondary_label="Anti-expert model",
+            feature="Proxy-tuning",
+        )
         # Stronger check: token->id mapping identity (catches same-size,
         # different-mapping vocabularies that the size check misses).
         check_vocab_identity(
