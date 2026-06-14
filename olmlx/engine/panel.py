@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from olmlx.engine.grammar import GrammarSpec
 from olmlx.engine.inference import generate_chat
@@ -384,5 +384,8 @@ async def _panel_stream(
         enable_thinking,
         stream=True,
     )
-    async for chunk in judge_stream:
+    # ``_judge_answer`` calls ``generate_chat`` with a runtime ``stream`` bool,
+    # so the overload can't narrow the return to the async-generator branch.
+    # We pass ``stream=True`` here, so the result is always an async generator.
+    async for chunk in cast("AsyncGenerator[dict, None]", judge_stream):
         yield chunk
