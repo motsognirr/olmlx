@@ -25,6 +25,7 @@ olmlx/
 │   ├── speculative_loaders.py
 │   ├── spec_decoder_base.py  # SpecDecoderBase: shared mechanics for all speculative strategies
 │   ├── speculative.py  # classic + PLD decoders
+│   ├── proxy_tuning.py # Decode-time logit arithmetic (base + α·(expert−antiexpert))
 │   ├── grammar.py      # xgrammar JSON-mode / JSON-Schema logits processor
 │   ├── chat_templating.py
 │   ├── tool_parser.py  # Qwen/Mistral/Llama/DeepSeek/MiniMax/bare-JSON
@@ -76,6 +77,8 @@ olmlx/
 **Flash prefetcher teardown order** — Prefetcher must be closed before the weight store on model unload. Prefetch tasks submit work into the store's thread pool; reversing the order leaves in-flight tasks referencing a closed store.
 
 **Panel coordinator routes through generate_chat** — `engine/panel.py` is a per-turn reconciler that rides the client's tool loop: it returns a `generate_chat`-shaped result whose text is either the judge's prose or canonical Qwen `<tool_call>` blocks, so both routers' existing `parse_model_output` paths handle it unchanged. Every classifier/panelist/judge call MUST go through `generate_chat` — never call MLX directly — or the Metal-stream/inference-lock handling is bypassed. Panels need `max_loaded_models ≥ members + judge + classifier` to avoid reload thrash.
+
+**Proxy-tuning is a non-exactness-preserving speculative strategy** — `engine/proxy_tuning.py`'s `ProxyTuningDecoder` registers as `speculative_strategy="proxy_tuning"` to reuse the speculative lifecycle/stream/dispatch plumbing, but it *alters* the output distribution (`base + α·(expert − antiexpert)`), so it deliberately has no draft→verify→accept and no cache trimming — every model advances over the same committed tokens. Expert/anti-expert are loaded **inline by the loader** (held by the decoder, not in `ModelManager._loaded`), so no `max_loaded_models` bump is needed — unlike the panel coordinator. All three models must share one exact tokenizer/vocabulary (`check_vocab_identity` enforces token-mapping equality, stricter than `_check_vocab_match`'s size-only test). v1 is **dense-only** (no GDN capture installed); grammar disables it per-request like every other speculative strategy.
 
 ## Development
 
