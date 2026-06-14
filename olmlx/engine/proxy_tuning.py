@@ -31,7 +31,10 @@ from typing import Any
 
 import mlx.core as mx
 
+from mlx_lm.models.cache import make_prompt_cache
+
 from olmlx.engine.spec_decoder_base import SpecDecoderBase
+from olmlx.engine.speculative import _eval_cache, _prefill_last_logit
 
 logger = logging.getLogger(__name__)
 
@@ -106,3 +109,70 @@ def check_vocab_identity(
             f"three models (base, expert, anti-expert) must share one exact "
             f"tokenizer — use models from the same family and tokenizer revision."
         )
+
+
+class ProxyTuningDecoder(SpecDecoderBase):
+    """Decode-time logit-arithmetic steering with three models.
+
+    Holds three independent ``(model, KV-cache)`` pairs — base, expert,
+    anti-expert. Each decode step forwards the single pending token through all
+    three, combines their last-position logits via :func:`combine_proxy_logits`,
+    and greedily argmaxes the result. Every model advances over the same
+    committed token sequence, so the caches stay aligned with no trimming.
+
+    Installs **no** layer hooks, **no** draft bind, and **no** GDN capture
+    (dense-only v1), so the base-class ``reset()`` teardown is effectively a
+    no-op beyond clearing the caches in :meth:`_reset_state`.
+
+    Implements the speculative decoder protocol (``prefill() -> int``,
+    ``step() -> (list[int], int)``) so it slots into ``speculative_stream``
+    unchanged. ``num_draft`` is always 0 (proxy-tuning does not speculate; one
+    token per step at ``base + 2*small`` forward cost).
+
+    Not thread-safe: one decoder instance serves one request at a time.
+    """
+
+    def __init__(
+        self,
+        base_model: Any,
+        expert_model: Any,
+        antiexpert_model: Any,
+        *,
+        alpha: float = 1.0,
+    ):
+        super().__init__()
+        self._base = base_model
+        self._expert = expert_model
+        self._antiexpert = antiexpert_model
+        # Base teardown reference for the inherited reset() path. We never call
+        # _install_layer_hooks/_bind_draft, so _patched/_bound stay False and
+        # reset() never actually touches _target — but set it for correctness.
+        self._target = base_model
+        self._alpha = float(alpha)
+
+        # Per-request state (populated by prefill, cleared by _reset_state).
+        self._base_cache: list | None = None
+        self._expert_cache: list | None = None
+        self._antiexpert_cache: list | None = None
+        self._pending_token: int | None = None
+
+    def _reset_state(self) -> None:
+        self._base_cache = None
+        self._expert_cache = None
+        self._antiexpert_cache = None
+        self._pending_token = None
+
+    def _stats_extra(self) -> dict[str, Any]:
+        return {"alpha": self._alpha}
+
+    def _prefill_impl(
+        self,
+        prompt: mx.array,
+        *,
+        segmented: Any = None,
+        cancel_event: threading.Event | None = None,
+    ) -> int:
+        raise NotImplementedError  # implemented in Task 4
+
+    def _step_impl(self) -> tuple[list[int], int]:
+        raise NotImplementedError  # implemented in Task 5

@@ -6,7 +6,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from olmlx.engine.proxy_tuning import check_vocab_identity, combine_proxy_logits
+from olmlx.engine.proxy_tuning import (
+    ProxyTuningDecoder,
+    check_vocab_identity,
+    combine_proxy_logits,
+)
 
 
 def test_combine_proxy_logits_basic():
@@ -69,3 +73,64 @@ def test_check_vocab_identity_warns_when_unavailable(caplog):
             _NoVocab(), _NoVocab(), reference_label="base", other_label="expert"
         )
     assert any("vocab" in r.message.lower() for r in caplog.records)
+
+
+class _StubModel(nn.Module):
+    """Returns a fixed last-position logit vector on every forward.
+
+    ``make_cache`` returns ``[]`` so ``make_prompt_cache(model)`` produces an
+    empty cache the stub ignores — keeps the test off real attention/KV code.
+    The decoder only reads ``out[0, -1, :]``, so broadcasting the fixed vector
+    across all positions is sufficient and deterministic.
+    """
+
+    def __init__(self, vocab_size: int, logit_vec: mx.array):
+        super().__init__()
+        self._vocab_size = vocab_size
+        self._logit_vec = logit_vec
+        self.calls = 0
+
+    def make_cache(self) -> list:
+        return []
+
+    def __call__(self, tokens: mx.array, cache: Any = None) -> mx.array:
+        self.calls += 1
+        seq = tokens.shape[1]
+        return mx.broadcast_to(
+            self._logit_vec.reshape(1, 1, -1), (1, seq, self._vocab_size)
+        )
+
+
+def _make_decoder(vocab=4, base=None, expert=None, anti=None, alpha=1.0):
+    base = base if base is not None else mx.zeros((vocab,))
+    expert = expert if expert is not None else mx.zeros((vocab,))
+    anti = anti if anti is not None else mx.zeros((vocab,))
+    return ProxyTuningDecoder(
+        base_model=_StubModel(vocab, base),
+        expert_model=_StubModel(vocab, expert),
+        antiexpert_model=_StubModel(vocab, anti),
+        alpha=alpha,
+    )
+
+
+def test_decoder_construction_sets_target_and_alpha():
+    dec = _make_decoder(alpha=2.0)
+    assert dec._alpha == 2.0
+    # _target must be the base model (base teardown reference; never patched).
+    assert dec._target is dec._base
+    assert dec._patched is False
+    assert dec._bound is False
+    assert dec._capture is None
+
+
+def test_reset_clears_caches_and_pending():
+    dec = _make_decoder()
+    dec._base_cache = ["x"]
+    dec._expert_cache = ["y"]
+    dec._antiexpert_cache = ["z"]
+    dec._pending_token = 3
+    dec.reset()
+    assert dec._base_cache is None
+    assert dec._expert_cache is None
+    assert dec._antiexpert_cache is None
+    assert dec._pending_token is None
