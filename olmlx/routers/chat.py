@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 from olmlx.config import settings
 from olmlx.engine.grammar import parse_response_format
 from olmlx.engine.inference import generate_chat
+from olmlx.engine.panel import panel_generate_chat
 from olmlx.engine.tool_parser import (
     fill_missing_required_args,
     parse_model_output,
@@ -174,8 +175,14 @@ async def chat(req: ChatRequest, request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    dispatch = (
+        panel_generate_chat
+        if request.app.state.registry.is_panel(req.model)
+        else generate_chat
+    )
+
     if req.stream:
-        result = await generate_chat(
+        result = await dispatch(
             manager,
             req.model,
             messages,
@@ -290,7 +297,7 @@ async def chat(req: ChatRequest, request: Request):
             media_type="application/x-ndjson",
         )
     else:
-        result = await generate_chat(
+        result = await dispatch(
             manager,
             req.model,
             messages,

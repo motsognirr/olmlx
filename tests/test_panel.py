@@ -403,3 +403,8 @@ class TestRouterDispatch:
         from olmlx.routers import openai as openai_router
 
         assert hasattr(openai_router, "panel_generate_chat")
+
+    def test_ollama_router_imports_panel_dispatch(self):
+        from olmlx.routers import chat as chat_router
+
+        assert hasattr(chat_router, "panel_generate_chat")
