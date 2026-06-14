@@ -17,10 +17,10 @@ from olmlx.config import FlashMoeConfig, SyncMode, settings
 from olmlx.utils.loop_affinity import assert_loop_thread
 
 SpeculativeStrategy = Literal[
-    "classic", "dflash", "eagle", "pld", "self_speculative", "mtp"
+    "classic", "dflash", "eagle", "pld", "self_speculative", "mtp", "proxy_tuning"
 ]
 _VALID_SPECULATIVE_STRATEGIES: frozenset[str] = frozenset(
-    ("classic", "dflash", "eagle", "pld", "self_speculative", "mtp")
+    ("classic", "dflash", "eagle", "pld", "self_speculative", "mtp", "proxy_tuning")
 )
 # Strategies that consume target hidden states / run a feature-conditioned
 # verify forward and therefore can't compose with flash_moe's per-token expert
@@ -28,7 +28,7 @@ _VALID_SPECULATIVE_STRATEGIES: frozenset[str] = frozenset(
 # (cli). Defined here — the lightweight registry module both consumers import —
 # so CLI pre-flight checks don't pull in the heavy model_manager import chain.
 _FLASH_MOE_INCOMPATIBLE_STRATEGIES: frozenset[str] = frozenset(
-    ("dflash", "eagle", "mtp")
+    ("dflash", "eagle", "mtp", "proxy_tuning")
 )
 
 logger = logging.getLogger(__name__)
@@ -300,6 +300,11 @@ class SpeculativeConfig(NamedTuple):
     #: Number of layers to skip during self_speculative draft. ``None``
     #: means "use the strategy default" — L//4 at load time.
     layers_skip: int | None = None
+    #: Proxy-tuning model paths + steering strength. Populated only when
+    #: ``strategy == "proxy_tuning"``; otherwise left at their defaults.
+    proxy_expert_model: str | None = None
+    proxy_antiexpert_model: str | None = None
+    proxy_alpha: float = 1.0
 
 
 @dataclass
@@ -686,6 +691,9 @@ class ModelConfig:
                     f"global Settings produced a window smaller than the "
                     f"largest n-gram)."
                 )
+        proxy_expert_model = settings.speculative_proxy_expert_model
+        proxy_antiexpert_model = settings.speculative_proxy_antiexpert_model
+        proxy_alpha = settings.speculative_proxy_alpha
         if not enabled:
             return SpeculativeConfig(
                 enabled=False,
@@ -696,6 +704,9 @@ class ModelConfig:
                 pld_min_ngram=pld_min_ngram,
                 pld_lookup_window=pld_lookup_window,
                 layers_skip=layers_skip,
+                proxy_expert_model=proxy_expert_model,
+                proxy_antiexpert_model=proxy_antiexpert_model,
+                proxy_alpha=proxy_alpha,
             )
         draft = (
             self.speculative_draft_model
@@ -711,6 +722,9 @@ class ModelConfig:
             pld_min_ngram=pld_min_ngram,
             pld_lookup_window=pld_lookup_window,
             layers_skip=layers_skip,
+            proxy_expert_model=proxy_expert_model,
+            proxy_antiexpert_model=proxy_antiexpert_model,
+            proxy_alpha=proxy_alpha,
         )
 
     def resolved_kv_cache_quant(self) -> str | None:
