@@ -130,25 +130,58 @@ class TestToolCallUnion:
 
 
 class TestJudgePrompt:
-    def test_appends_candidates_as_final_user_turn(self):
+    def test_flattens_request_and_candidates(self):
         original = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "What is 2+2?"},
         ]
         out = build_judge_messages(original, ["qwen3", "mistral"], ["four", "4"])
-        # Original messages preserved as a prefix (not mutated).
-        assert out[:2] == original
-        assert original[-1]["content"] == "What is 2+2?"  # input untouched
-        judge_turn = out[-1]
-        assert judge_turn["role"] == "user"
-        assert "qwen3" in judge_turn["content"]
-        assert "mistral" in judge_turn["content"]
-        assert "four" in judge_turn["content"]
-        assert "4" in judge_turn["content"]
+        # Flattened to a short fixed prompt (system + user), not a conversation
+        # replay; original is not mutated.
+        assert all(m["role"] in ("system", "user") for m in out)
+        assert original[-1]["content"] == "What is 2+2?"
+        blob = " ".join(m["content"] for m in out)
+        assert "What is 2+2?" in blob  # request
+        assert "qwen3" in blob and "mistral" in blob  # candidate labels
+        assert "four" in blob and "4" in blob  # candidate answers
+
+    def test_does_not_replay_agentic_turns(self):
+        # The whole point of the fix: a tool-heavy conversation must NOT be
+        # replayed as assistant(tool_calls)/tool turns, which primes the judge
+        # to keep calling tools. It must be flattened into a clean prompt that
+        # still carries the tool results.
+        original = [
+            {"role": "user", "content": "read the config"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path": "config.py"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "PREFIX=OLMLX_"},
+        ]
+        out = build_judge_messages(original, ["m1"], ["the prefix is OLMLX_"])
+        # No assistant tool_calls and no tool-role messages leak through.
+        assert not any("tool_calls" in m for m in out)
+        assert not any(m["role"] == "tool" for m in out)
+        blob = " ".join(m["content"] for m in out)
+        assert "read the config" in blob  # request preserved
+        assert "PREFIX=OLMLX_" in blob  # tool RESULT preserved
+        assert "read_file" in blob  # which call produced it
+        assert "the prefix is OLMLX_" in blob  # candidate
 
     def test_handles_empty_candidate_answer(self):
         out = build_judge_messages([{"role": "user", "content": "q"}], ["m1"], [""])
-        assert "m1" in out[-1]["content"]
+        blob = " ".join(m["content"] for m in out)
+        assert "q" in blob and "m1" in blob
 
 
 def _make_panel():

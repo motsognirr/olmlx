@@ -29,6 +29,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _message_text(content: object) -> str:
+    """Extract plain text from a message ``content`` (str or content-parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
 def first_user_text(messages: list[dict]) -> str:
     """Return the first user message's text (stable routing key).
 
@@ -37,19 +51,8 @@ def first_user_text(messages: list[dict]) -> str:
     no stored server state.
     """
     for msg in messages:
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = [
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            ]
-            return "\n".join(p for p in parts if p)
-        return ""
+        if msg.get("role") == "user":
+            return _message_text(msg.get("content"))
     return ""
 
 
@@ -98,13 +101,36 @@ def merge_tool_calls(per_panelist: list[list[dict]]) -> list[dict]:
 
 
 _JUDGE_INSTRUCTION = (
-    "You are the judge for a panel of models that all answered the "
-    "conversation above. Several candidate answers are listed below. "
-    "Synthesize ONE best final answer for the user. Ground every claim in "
-    "the tool results already present in this conversation; do not call "
-    "tools or invent new facts. Reconcile disagreements and prefer "
-    "grounded, specific answers. Output only the final answer."
+    "You are the judge for a panel of models that answered a user request. "
+    "Below are the user's request, any tool results gathered while answering, "
+    "and each panelist's candidate answer. Synthesize ONE best final answer "
+    "for the user, grounded in the tool results. Do NOT call tools, do NOT "
+    "continue any tool sequence, and do NOT invent facts. Reconcile "
+    "disagreements and prefer grounded, specific answers. Output ONLY the "
+    "final answer prose for the user."
 )
+
+
+def _flatten_tool_results(messages: list[dict]) -> list[str]:
+    """Pair each tool-result message with the call that produced it.
+
+    Returns ``["name(args) -> result", ...]`` in conversation order, so the
+    judge sees the gathered evidence without the agentic turn structure.
+    """
+    labels: dict[str, str] = {}
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            for call in msg.get("tool_calls") or []:
+                cid = call.get("id")
+                fn = call.get("function") or {}
+                if cid:
+                    labels[cid] = f"{fn.get('name', '?')}({fn.get('arguments', '')})"
+    results = []
+    for msg in messages:
+        if msg.get("role") == "tool":
+            label = labels.get(msg.get("tool_call_id") or "", "tool")
+            results.append(f"{label} -> {_message_text(msg.get('content'))}")
+    return results
 
 
 def build_judge_messages(
@@ -112,17 +138,38 @@ def build_judge_messages(
     member_names: list[str],
     answers: list[str],
 ) -> list[dict]:
-    """Original conversation + a final user turn carrying the candidates.
+    """Flatten the panel run into a clean summarize-and-answer prompt.
 
-    ``original_messages`` is not mutated (a new list is returned). The
-    judge sees the full conversation — including any tool results the
-    client executed — so it can verify groundedness.
+    Returns a short ``[system, user]`` message list carrying the user's
+    request, the tool results gathered during the loop, and the panelists'
+    candidate answers — NOT a replay of the agentic assistant/tool turns.
+    Replaying the raw conversation primes agentic models (notably gpt-oss) to
+    keep calling tools and emit reasoning instead of a final answer. The judge
+    still sees every tool result, so groundedness is preserved.
+    ``original_messages`` is not mutated.
     """
-    candidates = []
-    for name, answer in zip(member_names, answers):
-        candidates.append(f"--- Candidate from {name} ---\n{answer.strip()}")
-    content = _JUDGE_INSTRUCTION + "\n\n" + "\n\n".join(candidates)
-    return [*original_messages, {"role": "user", "content": content}]
+    request = "\n\n".join(
+        t
+        for t in (
+            _message_text(m.get("content"))
+            for m in original_messages
+            if m.get("role") == "user"
+        )
+        if t
+    )
+    tool_results = _flatten_tool_results(original_messages)
+    candidates = "\n\n".join(
+        f"--- Candidate from {name} ---\n{answer.strip()}"
+        for name, answer in zip(member_names, answers)
+    )
+    sections = [f"## User request\n{request}"]
+    if tool_results:
+        sections.append("## Tool results gathered\n" + "\n\n".join(tool_results))
+    sections.append("## Panel candidate answers\n" + candidates)
+    return [
+        {"role": "system", "content": _JUDGE_INSTRUCTION},
+        {"role": "user", "content": "\n\n".join(sections)},
+    ]
 
 
 def serialize_tool_calls_qwen(tool_uses: list[dict]) -> str:
