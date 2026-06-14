@@ -9,7 +9,9 @@ from olmlx.engine.registry import (
     _FLASH_MOE_INCOMPATIBLE_STRATEGIES,
     _VALID_SPECULATIVE_STRATEGIES,
     ModelConfig,
+    SpeculativeConfig,
 )
+from olmlx.engine.speculative_loaders import SpeculativeLoaderMixin
 
 
 def test_proxy_tuning_is_valid_strategy():
@@ -101,3 +103,35 @@ def test_resolved_speculative_carries_proxy_fields(monkeypatch):
 
 def test_proxy_tuning_incompatible_with_flash_moe():
     assert "proxy_tuning" in _FLASH_MOE_INCOMPATIBLE_STRATEGIES
+
+
+class _LoaderHarness(SpeculativeLoaderMixin):
+    """Minimal carrier so we can call mixin methods without a full ModelManager."""
+
+    store = None
+
+
+def test_load_proxy_tuning_requires_expert_and_antiexpert():
+    harness = _LoaderHarness()
+    cfg = SpeculativeConfig(
+        enabled=True,
+        draft_model=None,
+        num_tokens=None,
+        strategy="proxy_tuning",
+        proxy_expert_model=None,  # missing
+        proxy_antiexpert_model="org/anti",
+    )
+    with pytest.raises(ValueError, match="proxy"):
+        harness._load_proxy_tuning_decoder(object(), object(), cfg)
+
+
+def test_load_proxy_tuning_rejects_disabled_config():
+    harness = _LoaderHarness()
+    cfg = SpeculativeConfig(
+        enabled=False,
+        draft_model=None,
+        num_tokens=None,
+        strategy="proxy_tuning",
+    )
+    with pytest.raises(RuntimeError, match="enabled=False"):
+        harness._load_proxy_tuning_decoder(object(), object(), cfg)

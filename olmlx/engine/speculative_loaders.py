@@ -764,3 +764,84 @@ class SpeculativeLoaderMixin:
             num_early_layers=num_early_layers,
             num_speculative_tokens=num_tokens,
         )
+
+    def _load_proxy_tuning_decoder(
+        self,
+        target_model: Any,
+        target_tokenizer: Any,
+        spec_config: SpeculativeConfig,
+    ) -> Any:
+        """Load expert + anti-expert and build a ProxyTuningDecoder.
+
+        The base model is the already-loaded ``target_model``; the small expert
+        (``M+``) and anti-expert (``M-``) are loaded inline here via mlx-lm —
+        the same pattern ``_load_speculative_decoder`` uses for the draft model.
+        They are held by the returned decoder (not registered in the model
+        manager), so they coexist with the base for the decoder's lifetime
+        without a ``max_loaded_models`` bump.
+
+        All three models must share one exact tokenizer/vocabulary: we hard-fail
+        on a ``vocab_size`` mismatch and additionally verify token-mapping
+        identity via the tokenizers when available.
+        """
+        from olmlx.engine.proxy_tuning import ProxyTuningDecoder, check_vocab_identity
+
+        if not spec_config.enabled:
+            raise RuntimeError(
+                "_load_proxy_tuning_decoder called with spec_config.enabled=False"
+            )
+        expert_path = spec_config.proxy_expert_model
+        antiexpert_path = spec_config.proxy_antiexpert_model
+        if not expert_path or not antiexpert_path:
+            raise ValueError(
+                "speculative_strategy='proxy_tuning' requires both "
+                "speculative_proxy_expert_model and "
+                "speculative_proxy_antiexpert_model to be set "
+                "(OLMLX_SPECULATIVE_PROXY_EXPERT_MODEL / "
+                "OLMLX_SPECULATIVE_PROXY_ANTIEXPERT_MODEL)."
+            )
+
+        import mlx_lm
+
+        # Imported at call time to avoid the circular import (this module is
+        # imported by model_manager to build ModelManager).
+        from olmlx.engine.model_manager import _load_with_model_type_fallback
+
+        logger.info(
+            "Loading proxy-tuning expert %s and anti-expert %s",
+            expert_path,
+            antiexpert_path,
+        )
+        expert_load_path = self._resolve_draft_path(expert_path)
+        antiexpert_load_path = self._resolve_draft_path(antiexpert_path)
+        expert_model, expert_tokenizer = _load_with_model_type_fallback(
+            mlx_lm, expert_load_path, lazy=False
+        )
+        antiexpert_model, antiexpert_tokenizer = _load_with_model_type_fallback(
+            mlx_lm, antiexpert_load_path, lazy=False
+        )
+
+        # Hard floor: integer vocab_size must match across all three models.
+        self._check_vocab_match(target_model, expert_model)
+        self._check_vocab_match(target_model, antiexpert_model)
+        # Stronger check: token->id mapping identity (catches same-size,
+        # different-mapping vocabularies that the size check misses).
+        check_vocab_identity(
+            target_tokenizer,
+            expert_tokenizer,
+            reference_label="base",
+            other_label="expert",
+        )
+        check_vocab_identity(
+            target_tokenizer,
+            antiexpert_tokenizer,
+            reference_label="base",
+            other_label="anti-expert",
+        )
+
+        return ProxyTuningDecoder(
+            base_model=target_model,
+            expert_model=expert_model,
+            antiexpert_model=antiexpert_model,
+            alpha=spec_config.proxy_alpha,
+        )
