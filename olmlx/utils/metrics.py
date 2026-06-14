@@ -177,6 +177,7 @@ _STRATEGY_BY_CLASS = {
     "EagleDecoder": "eagle",
     "MTPDecoder": "mtp",
     "SelfSpeculativeDecoder": "self",
+    "ProxyTuningDecoder": "proxy_tuning",
 }
 
 

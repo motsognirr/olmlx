@@ -191,3 +191,31 @@ def test_alpha_changes_winner():
     assert dec0.prefill(mx.array([[1, 2]])) == 0
     dec1 = _make_decoder(vocab=3, base=base, expert=expert, anti=anti, alpha=1.0)
     assert dec1.prefill(mx.array([[1, 2]])) == 2
+
+
+def test_multi_step_decode_advances_and_counts():
+    # Fixed per-model logits → every step yields the same winning index, but the
+    # caches must advance and _stats_steps must increment across calls.
+    base = mx.array([3.0, 0.0, 0.0])
+    expert = mx.array([0.0, 0.0, 5.0])
+    anti = mx.array([0.0, 5.0, 0.0])
+    dec = _make_decoder(vocab=3, base=base, expert=expert, anti=anti, alpha=1.0)
+    dec.prefill(mx.array([[7, 8, 9]]))
+    base_calls_after_prefill = dec._base.calls
+    out = [dec.step() for _ in range(3)]
+    assert out == [([2], 0), ([2], 0), ([2], 0)]
+    assert dec._stats_steps == 3
+    # Each step issues exactly one forward per model.
+    assert dec._base.calls == base_calls_after_prefill + 3
+
+
+def test_stats_summary_exposes_alpha():
+    dec = _make_decoder(alpha=1.5)
+    summary = dec.stats_summary()
+    assert summary["alpha"] == 1.5
+
+
+def test_strategy_label_is_proxy_tuning():
+    from olmlx.engine.spec_decoder_base import _strategy_label_for
+
+    assert _strategy_label_for(ProxyTuningDecoder) == "proxy_tuning"
