@@ -134,3 +134,30 @@ def test_reset_clears_caches_and_pending():
     assert dec._expert_cache is None
     assert dec._antiexpert_cache is None
     assert dec._pending_token is None
+
+
+def test_prefill_returns_combined_argmax():
+    # base favors idx 0, expert favors idx 2, antiexpert favors idx 1.
+    # combined = base + (expert - antiexpert):
+    #   idx0: 3 + (0-0) = 3
+    #   idx1: 0 + (0-5) = -5
+    #   idx2: 0 + (5-0) = 5   <- argmax
+    base = mx.array([3.0, 0.0, 0.0])
+    expert = mx.array([0.0, 0.0, 5.0])
+    anti = mx.array([0.0, 5.0, 0.0])
+    dec = _make_decoder(vocab=3, base=base, expert=expert, anti=anti, alpha=1.0)
+    prompt = mx.array([[7, 8, 9]])  # any 3-token prompt
+    first = dec.prefill(prompt)
+    assert first == 2
+    assert dec._pending_token == 2
+    # All three caches must be populated.
+    assert dec._base_cache is not None
+    assert dec._expert_cache is not None
+    assert dec._antiexpert_cache is not None
+
+
+def test_prefill_single_token_prompt():
+    base = mx.array([0.0, 9.0])
+    dec = _make_decoder(vocab=2, base=base)
+    first = dec.prefill(mx.array([[5]]))
+    assert first == 1

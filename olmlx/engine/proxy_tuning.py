@@ -172,7 +172,45 @@ class ProxyTuningDecoder(SpecDecoderBase):
         segmented: Any = None,
         cancel_event: threading.Event | None = None,
     ) -> int:
-        raise NotImplementedError  # implemented in Task 4
+        """Prefill all three models over ``prompt`` and return the first token.
+
+        Each model gets its own fresh KV cache. ``_prefill_last_logit`` (reused
+        from the speculative module) sub-chunks the prefix so a long prompt
+        cannot OOM Metal, and returns the model's final-position ``(vocab,)``
+        logit. The three logits are combined and argmaxed for the first token.
+        ``segmented`` is accepted and ignored — proxy-tuning has no cross-request
+        snapshot store in v1.
+
+        Runs on the default stream (no ``mx.stream`` wrapper), the same stream
+        ``step()`` decodes on — consistent with the speculative path's
+        single-stream invariant.
+        """
+        self._base_cache = make_prompt_cache(self._base)
+        self._expert_cache = make_prompt_cache(self._expert)
+        self._antiexpert_cache = make_prompt_cache(self._antiexpert)
+
+        base_logit = _prefill_last_logit(
+            self._base, prompt, self._base_cache, cancel_event=cancel_event
+        )
+        expert_logit = _prefill_last_logit(
+            self._expert, prompt, self._expert_cache, cancel_event=cancel_event
+        )
+        antiexpert_logit = _prefill_last_logit(
+            self._antiexpert, prompt, self._antiexpert_cache, cancel_event=cancel_event
+        )
+        combined = combine_proxy_logits(
+            base_logit, expert_logit, antiexpert_logit, self._alpha
+        )
+        # Materialize the combined logit and every cache's final-token write
+        # before decode begins — keeps the per-model lazy graphs from chaining
+        # across step() boundaries.
+        first_token = int(mx.argmax(combined).item())
+        _eval_cache(self._base_cache)
+        _eval_cache(self._expert_cache)
+        _eval_cache(self._antiexpert_cache)
+
+        self._pending_token = first_token
+        return first_token
 
     def _step_impl(self) -> tuple[list[int], int]:
         raise NotImplementedError  # implemented in Task 5
