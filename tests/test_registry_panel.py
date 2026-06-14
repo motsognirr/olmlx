@@ -37,6 +37,26 @@ class TestPanelConfig:
         with pytest.raises(ValueError, match="classifier"):
             PanelConfig.from_entry("p:latest", entry)
 
+    def test_from_entry_rejects_non_string_member(self):
+        entry = {
+            "type": "panel",
+            "classifier": "c",
+            "judge": "j",
+            "routes": {"default": ["ok", 42]},
+        }
+        with pytest.raises(ValueError, match="default"):
+            PanelConfig.from_entry("p:latest", entry)
+
+    def test_from_entry_rejects_empty_member_list(self):
+        entry = {
+            "type": "panel",
+            "classifier": "c",
+            "judge": "j",
+            "routes": {"default": []},
+        }
+        with pytest.raises(ValueError, match="default"):
+            PanelConfig.from_entry("p:latest", entry)
+
     def test_all_member_names_unions_routes(self):
         pc = PanelConfig.from_entry(
             "p:latest",

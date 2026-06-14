@@ -1230,9 +1230,7 @@ class PanelConfig:
                 f"panel {name!r}: 'classifier' must be a non-empty model name"
             )
         if not judge or not isinstance(judge, str):
-            raise ValueError(
-                f"panel {name!r}: 'judge' must be a non-empty model name"
-            )
+            raise ValueError(f"panel {name!r}: 'judge' must be a non-empty model name")
         if not isinstance(routes, dict) or not routes:
             raise ValueError(f"panel {name!r}: 'routes' must be a non-empty object")
         for key, members in routes.items():
