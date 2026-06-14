@@ -1042,7 +1042,8 @@ def _audit_speculative_config(
                 exc_info=True,
             )
             continue
-        if enabled and not draft and strategy != "self_speculative":
+        _draftless = {"self_speculative", "pld"}
+        if enabled and not draft and strategy not in _draftless:
             bad.append(name)
         elif not enabled and mc.speculative_draft_model:
             # Use the raw per-model field rather than the resolved
