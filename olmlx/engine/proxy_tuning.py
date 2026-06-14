@@ -236,6 +236,10 @@ class ProxyTuningDecoder(SpecDecoderBase):
         combined = combine_proxy_logits(
             base_logit, expert_logit, antiexpert_logit, self._alpha
         )
+        # ``.item()`` forces ``combined``, which transitively materializes all
+        # three forwards and their KV-cache writes — so no separate
+        # ``_eval_cache`` is needed here (unlike prefill, which evals before the
+        # first decode to bound the lazy graph).
         next_token = int(mx.argmax(combined).item())
 
         self._stats_steps += 1
