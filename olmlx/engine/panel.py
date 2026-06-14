@@ -17,8 +17,10 @@ import logging
 from typing import TYPE_CHECKING
 
 from olmlx.engine.grammar import GrammarSpec
+from olmlx.engine.inference import generate_chat
 
 if TYPE_CHECKING:
+    from olmlx.engine.model_manager import ModelManager
     from olmlx.engine.registry import PanelConfig
 
 logger = logging.getLogger(__name__)
@@ -138,3 +140,47 @@ def serialize_tool_calls_qwen(tool_uses: list[dict]) -> str:
         payload = payload.replace("</tool_call>", "<\\/tool_call>")
         blocks.append(f"<tool_call>\n{payload}\n</tool_call>")
     return "\n".join(blocks)
+
+
+_CLASSIFIER_SYSTEM = (
+    "You are a request router. Classify the user's request into exactly "
+    'one category. Respond ONLY with JSON of the form {"route": "<category>"}.'
+)
+
+
+async def classify(
+    manager: "ModelManager",
+    panel: "PanelConfig",
+    user_text: str,
+    keep_alive: int | str | None = None,
+) -> list[str]:
+    """Route the request to a member list via the classifier model.
+
+    The classifier output is grammar-constrained to the route keys; any
+    parse failure falls back to the 'default' route.
+    """
+    categories = ", ".join(sorted(panel.routes))
+    messages = [
+        {
+            "role": "system",
+            "content": f"{_CLASSIFIER_SYSTEM} Categories: {categories}.",
+        },
+        {"role": "user", "content": user_text},
+    ]
+    result = await generate_chat(
+        manager,
+        panel.classifier,
+        messages,
+        tools=None,
+        stream=False,
+        keep_alive=keep_alive,
+        max_tokens=32,
+        grammar_spec=route_grammar(panel),
+    )
+    text = (result.get("text") or "").strip()
+    try:
+        route = json.loads(text).get("route", "default")
+    except (json.JSONDecodeError, AttributeError):
+        logger.warning("Panel classifier returned non-JSON %r; using default", text)
+        route = "default"
+    return select_members(route, panel)

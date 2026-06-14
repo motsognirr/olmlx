@@ -1,5 +1,8 @@
 """Tests for olmlx.engine.panel."""
 
+import pytest
+
+from olmlx.engine import panel as panel_mod
 from olmlx.engine.grammar import GrammarSpec
 from olmlx.engine.panel import (
     build_judge_messages,
@@ -146,3 +149,65 @@ class TestJudgePrompt:
     def test_handles_empty_candidate_answer(self):
         out = build_judge_messages([{"role": "user", "content": "q"}], ["m1"], [""])
         assert "m1" in out[-1]["content"]
+
+
+def _make_panel():
+    from olmlx.engine.registry import PanelConfig
+
+    return PanelConfig.from_entry(
+        "p:latest",
+        {
+            "type": "panel",
+            "classifier": "c",
+            "judge": "j",
+            "routes": {"code": ["qa", "qb"], "default": ["da", "db"]},
+        },
+    )
+
+
+def _fake_generate_chat_factory(responses: dict):
+    """Return an async generate_chat stub keyed by model name -> text."""
+
+    async def _fake(
+        manager,
+        model_name,
+        messages,
+        options=None,
+        tools=None,
+        stream=False,
+        keep_alive=None,
+        max_tokens=512,
+        cache_id="",
+        enable_thinking=None,
+        grammar_spec=None,
+    ):
+        text = responses[model_name]
+        return {"text": text, "done": True, "stats": None}
+
+    return _fake
+
+
+class TestClassify:
+    @pytest.mark.asyncio
+    async def test_classify_returns_route_members(self, monkeypatch):
+        monkeypatch.setattr(
+            panel_mod,
+            "generate_chat",
+            _fake_generate_chat_factory({"c": '{"route": "code"}'}),
+        )
+        members = await panel_mod.classify(
+            manager=None, panel=_make_panel(), user_text="write a function"
+        )
+        assert members == ["qa", "qb"]
+
+    @pytest.mark.asyncio
+    async def test_classify_bad_json_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setattr(
+            panel_mod,
+            "generate_chat",
+            _fake_generate_chat_factory({"c": "not json at all"}),
+        )
+        members = await panel_mod.classify(
+            manager=None, panel=_make_panel(), user_text="hi"
+        )
+        assert members == ["da", "db"]
