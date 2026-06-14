@@ -211,3 +211,51 @@ class TestClassify:
             manager=None, panel=_make_panel(), user_text="hi"
         )
         assert members == ["da", "db"]
+
+
+class TestRunPanel:
+    @pytest.mark.asyncio
+    async def test_returns_union_when_any_panelist_wants_tools(self, monkeypatch):
+        # da proposes a tool call (Qwen format), db answers in prose.
+        responses = {
+            "c": '{"route": "default"}',
+            "da": '<tool_call>\n{"name": "search", "arguments": {"q": "x"}}\n</tool_call>',
+            "db": "I think the answer is 42.",
+        }
+        monkeypatch.setattr(
+            panel_mod, "generate_chat", _fake_generate_chat_factory(responses)
+        )
+        answers, merged = await panel_mod._run_panel(
+            manager=None,
+            panel=_make_panel(),
+            messages=[{"role": "user", "content": "find x"}],
+            tools=[{"type": "function", "function": {"name": "search"}}],
+            options=None,
+            keep_alive=None,
+            max_tokens=128,
+            enable_thinking=None,
+        )
+        assert merged == [{"name": "search", "input": {"q": "x"}}]
+
+    @pytest.mark.asyncio
+    async def test_returns_answers_when_no_tools_requested(self, monkeypatch):
+        responses = {
+            "c": '{"route": "default"}',
+            "da": "Answer A",
+            "db": "Answer B",
+        }
+        monkeypatch.setattr(
+            panel_mod, "generate_chat", _fake_generate_chat_factory(responses)
+        )
+        answers, merged = await panel_mod._run_panel(
+            manager=None,
+            panel=_make_panel(),
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            options=None,
+            keep_alive=None,
+            max_tokens=128,
+            enable_thinking=None,
+        )
+        assert merged == []
+        assert answers == (["da", "db"], ["Answer A", "Answer B"])

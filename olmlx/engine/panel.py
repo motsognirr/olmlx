@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from olmlx.engine.grammar import GrammarSpec
 from olmlx.engine.inference import generate_chat
+from olmlx.engine.tool_parser import parse_model_output
 
 if TYPE_CHECKING:
     from olmlx.engine.model_manager import ModelManager
@@ -184,3 +185,54 @@ async def classify(
         logger.warning("Panel classifier returned non-JSON %r; using default", text)
         route = "default"
     return select_members(route, panel)
+
+
+async def _run_panel(
+    manager: "ModelManager",
+    panel: "PanelConfig",
+    messages: list[dict],
+    tools: list[dict] | None,
+    options: dict | None,
+    keep_alive: int | str | None,
+    max_tokens: int,
+    enable_thinking: bool | None,
+) -> tuple[tuple[list[str], list[str]], list[dict]]:
+    """Route, run each panelist once, and reconcile this turn.
+
+    Returns ``((member_names, answers), merged_tool_uses)``. When any
+    panelist proposes tool calls, ``merged_tool_uses`` is their deduped
+    union and ``answers`` is unused by the caller (the turn is a tool
+    turn). When none do, ``merged_tool_uses`` is empty and the caller
+    runs the judge over ``answers``.
+
+    Any panelist/classifier failure propagates (fail the request).
+    """
+    user_text = first_user_text(messages)
+    members = await classify(manager, panel, user_text, keep_alive)
+
+    has_tools = bool(tools)
+    answers: list[str] = []
+    per_panelist_tools: list[list[dict]] = []
+    for member in members:
+        result = await generate_chat(
+            manager,
+            member,
+            messages,
+            options=options,
+            tools=tools,
+            stream=False,
+            keep_alive=keep_alive,
+            max_tokens=max_tokens,
+            enable_thinking=enable_thinking,
+        )
+        parse_text = result.get("raw_text") or result.get("text") or ""
+        _thinking, visible, tool_uses = parse_model_output(
+            parse_text,
+            has_tools,
+            thinking_expected=bool(result.get("thinking_expected")),
+        )
+        answers.append(visible)
+        per_panelist_tools.append(tool_uses)
+
+    merged = merge_tool_calls(per_panelist_tools)
+    return (members, answers), merged
