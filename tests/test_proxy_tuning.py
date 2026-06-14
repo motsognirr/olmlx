@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -58,9 +60,7 @@ def test_check_vocab_identity_raises_on_token_mapping_diff():
     tok_a = _FakeTokenizer({"a": 0, "b": 1, "c": 2})
     tok_b = _FakeTokenizer({"a": 0, "b": 2, "c": 1})
     with pytest.raises(ValueError, match="vocab"):
-        check_vocab_identity(
-            tok_a, tok_b, reference_label="base", other_label="expert"
-        )
+        check_vocab_identity(tok_a, tok_b, reference_label="base", other_label="expert")
 
 
 def test_check_vocab_identity_warns_when_unavailable(caplog):
@@ -161,3 +161,33 @@ def test_prefill_single_token_prompt():
     dec = _make_decoder(vocab=2, base=base)
     first = dec.prefill(mx.array([[5]]))
     assert first == 1
+
+
+def test_step_returns_combined_argmax():
+    base = mx.array([3.0, 0.0, 0.0])
+    expert = mx.array([0.0, 0.0, 5.0])
+    anti = mx.array([0.0, 5.0, 0.0])
+    dec = _make_decoder(vocab=3, base=base, expert=expert, anti=anti, alpha=1.0)
+    dec.prefill(mx.array([[7, 8, 9]]))
+    accepted, num_draft = dec.step()
+    assert accepted == [2]
+    assert num_draft == 0
+    assert dec._pending_token == 2
+    assert dec._stats_steps == 1
+
+
+def test_step_before_prefill_raises():
+    dec = _make_decoder()
+    with pytest.raises(RuntimeError, match="prefill"):
+        dec.step()
+
+
+def test_alpha_changes_winner():
+    # With alpha=0 the base wins (idx0); with alpha=1 the delta flips it to idx2.
+    base = mx.array([1.0, 0.0, 0.0])
+    expert = mx.array([0.0, 0.0, 10.0])
+    anti = mx.array([0.0, 0.0, 0.0])
+    dec0 = _make_decoder(vocab=3, base=base, expert=expert, anti=anti, alpha=0.0)
+    assert dec0.prefill(mx.array([[1, 2]])) == 0
+    dec1 = _make_decoder(vocab=3, base=base, expert=expert, anti=anti, alpha=1.0)
+    assert dec1.prefill(mx.array([[1, 2]])) == 2

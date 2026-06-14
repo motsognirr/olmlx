@@ -34,7 +34,7 @@ import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
 
 from olmlx.engine.spec_decoder_base import SpecDecoderBase
-from olmlx.engine.speculative import _eval_cache, _prefill_last_logit
+from olmlx.engine.speculative import _eval_cache, _logits, _prefill_last_logit
 
 logger = logging.getLogger(__name__)
 
@@ -213,4 +213,31 @@ class ProxyTuningDecoder(SpecDecoderBase):
         return first_token
 
     def _step_impl(self) -> tuple[list[int], int]:
-        raise NotImplementedError  # implemented in Task 5
+        """One proxy-tuning decode step: forward the pending token through all
+        three models, combine logits, greedy-argmax the next token.
+
+        Returns ``([next_token], 0)`` — proxy-tuning emits exactly one token per
+        step and never speculates (``num_draft == 0``). Must be called after
+        :meth:`prefill`.
+        """
+        if self._base_cache is None or self._pending_token is None:
+            raise RuntimeError(
+                "ProxyTuningDecoder.step() called before prefill(); "
+                "call prefill(prompt) first"
+            )
+
+        tok = mx.array([[self._pending_token]])
+        base_logit = _logits(self._base(tok, cache=self._base_cache))[0, -1, :]
+        expert_logit = _logits(self._expert(tok, cache=self._expert_cache))[0, -1, :]
+        antiexpert_logit = _logits(self._antiexpert(tok, cache=self._antiexpert_cache))[
+            0, -1, :
+        ]
+
+        combined = combine_proxy_logits(
+            base_logit, expert_logit, antiexpert_logit, self._alpha
+        )
+        next_token = int(mx.argmax(combined).item())
+
+        self._stats_steps += 1
+        self._pending_token = next_token
+        return [next_token], 0
