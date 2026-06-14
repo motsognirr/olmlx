@@ -49,3 +49,60 @@ def combine_proxy_logits(
     ``alpha == 0`` reduces to the unsteered base distribution.
     """
     return base + alpha * (expert - antiexpert)
+
+
+def _safe_get_vocab(tokenizer: Any) -> dict[str, int] | None:
+    """Return ``tokenizer.get_vocab()`` as a dict, or ``None`` if unavailable.
+
+    mlx-lm's ``TokenizerWrapper`` forwards attribute access to the underlying
+    HuggingFace tokenizer, so ``get_vocab()`` works on the wrapper too. Any
+    failure (no method, raises) yields ``None`` so the caller can fall back to
+    the loader's ``vocab_size`` check rather than hard-failing on an exotic
+    tokenizer.
+    """
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if not callable(get_vocab):
+        return None
+    try:
+        vocab = get_vocab()
+    except Exception:  # noqa: BLE001 — any failure -> fall back to size check
+        return None
+    return vocab if isinstance(vocab, dict) else None
+
+
+def check_vocab_identity(
+    reference_tokenizer: Any,
+    other_tokenizer: Any,
+    *,
+    reference_label: str,
+    other_label: str,
+) -> None:
+    """Raise ``ValueError`` if two tokenizers map tokens differently.
+
+    Proxy-tuning adds logits across models position-by-position; a token id
+    that means different things in two models silently corrupts the output.
+    This is stricter than a ``vocab_size`` comparison (two vocabularies can
+    match on size yet differ in mapping). When either tokenizer does not expose
+    ``get_vocab()``, this warns and returns — the loader's ``vocab_size`` guard
+    is the hard floor in that case.
+    """
+    ref_vocab = _safe_get_vocab(reference_tokenizer)
+    other_vocab = _safe_get_vocab(other_tokenizer)
+    if ref_vocab is None or other_vocab is None:
+        logger.warning(
+            "Could not verify tokenizer/vocab identity for proxy-tuning "
+            "(%s or %s tokenizer has no usable get_vocab()); relying on the "
+            "vocab_size check only. A token-mapping mismatch would corrupt "
+            "the combined logits.",
+            reference_label,
+            other_label,
+        )
+        return
+    if ref_vocab != other_vocab:
+        raise ValueError(
+            f"Proxy-tuning requires identical vocabularies: the {other_label} "
+            f"tokenizer's token->id mapping differs from the {reference_label} "
+            f"tokenizer's (sizes {len(other_vocab)} vs {len(ref_vocab)}). All "
+            f"three models (base, expert, anti-expert) must share one exact "
+            f"tokenizer — use models from the same family and tokenizer revision."
+        )
