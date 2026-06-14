@@ -2,6 +2,7 @@
 
 from olmlx.engine.grammar import GrammarSpec
 from olmlx.engine.panel import (
+    build_judge_messages,
     first_user_text,
     merge_tool_calls,
     route_grammar,
@@ -123,3 +124,25 @@ class TestToolCallUnion:
 
     def test_merge_no_panelists(self):
         assert merge_tool_calls([]) == []
+
+
+class TestJudgePrompt:
+    def test_appends_candidates_as_final_user_turn(self):
+        original = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "What is 2+2?"},
+        ]
+        out = build_judge_messages(original, ["qwen3", "mistral"], ["four", "4"])
+        # Original messages preserved as a prefix (not mutated).
+        assert out[:2] == original
+        assert original[-1]["content"] == "What is 2+2?"  # input untouched
+        judge_turn = out[-1]
+        assert judge_turn["role"] == "user"
+        assert "qwen3" in judge_turn["content"]
+        assert "mistral" in judge_turn["content"]
+        assert "four" in judge_turn["content"]
+        assert "4" in judge_turn["content"]
+
+    def test_handles_empty_candidate_answer(self):
+        out = build_judge_messages([{"role": "user", "content": "q"}], ["m1"], [""])
+        assert "m1" in out[-1]["content"]

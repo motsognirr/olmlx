@@ -92,6 +92,34 @@ def merge_tool_calls(per_panelist: list[list[dict]]) -> list[dict]:
     return merged
 
 
+_JUDGE_INSTRUCTION = (
+    "You are the judge for a panel of models that all answered the "
+    "conversation above. Several candidate answers are listed below. "
+    "Synthesize ONE best final answer for the user. Ground every claim in "
+    "the tool results already present in this conversation; do not call "
+    "tools or invent new facts. Reconcile disagreements and prefer "
+    "grounded, specific answers. Output only the final answer."
+)
+
+
+def build_judge_messages(
+    original_messages: list[dict],
+    member_names: list[str],
+    answers: list[str],
+) -> list[dict]:
+    """Original conversation + a final user turn carrying the candidates.
+
+    ``original_messages`` is not mutated (a new list is returned). The
+    judge sees the full conversation — including any tool results the
+    client executed — so it can verify groundedness.
+    """
+    candidates = []
+    for name, answer in zip(member_names, answers):
+        candidates.append(f"--- Candidate from {name} ---\n{answer.strip()}")
+    content = _JUDGE_INSTRUCTION + "\n\n" + "\n\n".join(candidates)
+    return [*original_messages, {"role": "user", "content": content}]
+
+
 def serialize_tool_calls_qwen(tool_uses: list[dict]) -> str:
     """Render tool calls as canonical Qwen ``<tool_call>`` blocks.
 
