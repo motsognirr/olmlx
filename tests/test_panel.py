@@ -3,10 +3,13 @@
 from olmlx.engine.grammar import GrammarSpec
 from olmlx.engine.panel import (
     first_user_text,
+    merge_tool_calls,
     route_grammar,
     select_members,
+    serialize_tool_calls_qwen,
 )
 from olmlx.engine.registry import PanelConfig
+from olmlx.engine.tool_parser import parse_model_output
 
 
 def _panel() -> PanelConfig:
@@ -60,3 +63,40 @@ class TestRoutingHelpers:
 
     def test_select_members_unknown_route_falls_back_to_default(self):
         assert select_members("nonsense", _panel()) == ["qwen3", "mistral"]
+
+
+class TestToolCallUnion:
+    def test_merge_dedupes_identical_calls(self):
+        # Two panelists; one shared identical call, one unique each.
+        per_panelist = [
+            [
+                {"name": "search", "input": {"q": "x"}, "_span": (0, 1)},
+                {"name": "read", "input": {"path": "a"}},
+            ],
+            [
+                {"name": "search", "input": {"q": "x"}},
+                {"name": "read", "input": {"path": "b"}},
+            ],
+        ]
+        merged = merge_tool_calls(per_panelist)
+        # search{q:x} collapses to one; read{a} and read{b} both kept.
+        assert merged == [
+            {"name": "search", "input": {"q": "x"}},
+            {"name": "read", "input": {"path": "a"}},
+            {"name": "read", "input": {"path": "b"}},
+        ]
+        # _span must be stripped.
+        assert all("_span" not in tc for tc in merged)
+
+    def test_merge_empty(self):
+        assert merge_tool_calls([[], []]) == []
+
+    def test_serialize_round_trips_through_parser(self):
+        merged = [
+            {"name": "search", "input": {"q": "x"}},
+            {"name": "read", "input": {"path": "a"}},
+        ]
+        text = serialize_tool_calls_qwen(merged)
+        _thinking, _visible, tool_uses = parse_model_output(text, has_tools=True)
+        reparsed = [{"name": tu["name"], "input": tu["input"]} for tu in tool_uses]
+        assert reparsed == merged

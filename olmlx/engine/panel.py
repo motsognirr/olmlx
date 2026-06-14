@@ -12,6 +12,7 @@ Metal-stream / inference-lock handling is reused. Never touch MLX here.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -63,3 +64,43 @@ def route_grammar(panel: "PanelConfig") -> GrammarSpec:
 def select_members(route_key: str, panel: "PanelConfig") -> list[str]:
     """Members for *route_key*, falling back to the 'default' route."""
     return panel.routes.get(route_key, panel.routes["default"])
+
+
+def _tool_key(tool_use: dict) -> str:
+    """Stable dedup key: name + canonicalized arguments."""
+    args = tool_use.get("input") or {}
+    return tool_use["name"] + "\0" + json.dumps(args, sort_keys=True)
+
+
+def merge_tool_calls(per_panelist: list[list[dict]]) -> list[dict]:
+    """Deduped union of every panelist's proposed tool calls.
+
+    Identical ``(name, arguments)`` collapse to one execution; different
+    arguments both run. Insertion order is preserved (first panelist
+    first). The internal ``_span`` key from ``parse_model_output`` is
+    stripped. Tool-call IDs are assigned downstream by the routers.
+    """
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for panelist_calls in per_panelist:
+        for call in panelist_calls:
+            key = _tool_key(call)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append({"name": call["name"], "input": call.get("input") or {}})
+    return merged
+
+
+def serialize_tool_calls_qwen(tool_uses: list[dict]) -> str:
+    """Render tool calls as canonical Qwen ``<tool_call>`` blocks.
+
+    The routers re-parse this text via ``parse_model_output`` (the Qwen
+    parser maps ``arguments`` -> ``input``), so the panel's tool turn is
+    transparent to both the OpenAI and Ollama routers.
+    """
+    blocks = []
+    for tu in tool_uses:
+        payload = json.dumps({"name": tu["name"], "arguments": tu.get("input") or {}})
+        blocks.append(f"<tool_call>\n{payload}\n</tool_call>")
+    return "\n".join(blocks)
