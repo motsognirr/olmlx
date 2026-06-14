@@ -1205,6 +1205,57 @@ def validate_hf_path(hf_path: str) -> None:
         raise ValueError(f"HuggingFace path {hf_path!r} must be in 'owner/repo' format")
 
 
+@dataclass(frozen=True)
+class PanelConfig:
+    """A ``type: "panel"`` entry from models.json.
+
+    A panel is not a loadable model: it has no weights. ``classifier``,
+    ``judge`` and the per-route member lists all reference other
+    models.json entries by name. See engine/panel.py for the coordinator
+    that executes a panel.
+    """
+
+    name: str
+    classifier: str
+    judge: str
+    routes: dict[str, list[str]]
+
+    @classmethod
+    def from_entry(cls, name: str, entry: dict) -> "PanelConfig":
+        classifier = entry.get("classifier")
+        judge = entry.get("judge")
+        routes = entry.get("routes")
+        if not classifier or not isinstance(classifier, str):
+            raise ValueError(
+                f"panel {name!r}: 'classifier' must be a non-empty model name"
+            )
+        if not judge or not isinstance(judge, str):
+            raise ValueError(
+                f"panel {name!r}: 'judge' must be a non-empty model name"
+            )
+        if not isinstance(routes, dict) or not routes:
+            raise ValueError(f"panel {name!r}: 'routes' must be a non-empty object")
+        for key, members in routes.items():
+            if (
+                not isinstance(members, list)
+                or not members
+                or not all(isinstance(m, str) and m for m in members)
+            ):
+                raise ValueError(
+                    f"panel {name!r}: route {key!r} must be a non-empty list "
+                    "of model names"
+                )
+        if "default" not in routes:
+            raise ValueError(f"panel {name!r}: 'routes' must contain a 'default' key")
+        return cls(name=name, classifier=classifier, judge=judge, routes=dict(routes))
+
+    def all_member_names(self) -> set[str]:
+        names: set[str] = set()
+        for members in self.routes.values():
+            names.update(members)
+        return names
+
+
 class ModelRegistry:
     """Resolves Ollama model names to HuggingFace paths via config file."""
 
