@@ -339,6 +339,50 @@ async def panel_generate_chat(
     )
 
 
-async def _panel_stream(*args, **kwargs):  # replaced in Task 9
-    raise NotImplementedError
-    yield {}  # pragma: no cover  (makes this an async generator)
+async def _panel_stream(
+    manager: "ModelManager",
+    panel: "PanelConfig",
+    messages: list[dict],
+    options: dict | None,
+    tools: list[dict] | None,
+    keep_alive: int | str | None,
+    max_tokens: int,
+    enable_thinking: bool | None,
+) -> AsyncGenerator[dict, None]:
+    """Streaming coordinator.
+
+    The panel compute runs *inside* the generator (during iteration) so
+    the router's keepalive wrapper stays active. A tool turn yields the
+    Qwen blocks as one text chunk; a final turn proxies the judge's token
+    stream straight through.
+    """
+    (member_names, answers), merged = await _run_panel(
+        manager,
+        panel,
+        messages,
+        tools,
+        options,
+        keep_alive,
+        max_tokens,
+        enable_thinking,
+    )
+    if merged:
+        raw = serialize_tool_calls_qwen(merged)
+        yield {"text": raw}
+        yield {"text": "", "done": True, "raw_text": raw, "done_reason": "stop"}
+        return
+
+    judge_stream = await _judge_answer(
+        manager,
+        panel,
+        messages,
+        member_names,
+        answers,
+        options,
+        keep_alive,
+        max_tokens,
+        enable_thinking,
+        stream=True,
+    )
+    async for chunk in judge_stream:
+        yield chunk

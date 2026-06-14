@@ -309,3 +309,90 @@ class TestPanelGenerateChatNonStream:
             stream=False,
         )
         assert result["text"] == "Reconciled final answer."
+
+
+def _fake_generate_chat_streaming_factory(responses: dict, stream_models: set):
+    """generate_chat stub: dict for non-stream models, async-gen for streamed ones."""
+
+    async def _fake(
+        manager,
+        model_name,
+        messages,
+        options=None,
+        tools=None,
+        stream=False,
+        keep_alive=None,
+        max_tokens=512,
+        cache_id="",
+        enable_thinking=None,
+        grammar_spec=None,
+    ):
+        text = responses[model_name]
+        if stream and model_name in stream_models:
+
+            async def _gen():
+                yield {"text": text}
+                yield {"done": True, "done_reason": "stop"}
+
+            return _gen()
+        return {"text": text, "done": True, "stats": None}
+
+    return _fake
+
+
+async def _drain(agen) -> list[dict]:
+    return [chunk async for chunk in agen]
+
+
+class TestPanelGenerateChatStream:
+    @pytest.mark.asyncio
+    async def test_stream_tool_turn_emits_qwen_text_then_done(self, monkeypatch):
+        responses = {
+            "c": '{"route": "default"}',
+            "da": '<tool_call>\n{"name": "search", "arguments": {"q": "x"}}\n</tool_call>',
+            "db": "prose",
+        }
+        monkeypatch.setattr(
+            panel_mod,
+            "generate_chat",
+            _fake_generate_chat_streaming_factory(responses, stream_models=set()),
+        )
+        monkeypatch.setattr(panel_mod, "_resolve_panel", lambda m, n: _make_panel())
+        agen = await panel_mod.panel_generate_chat(
+            manager=None,
+            model_name="p:latest",
+            messages=[{"role": "user", "content": "find x"}],
+            tools=[{"type": "function", "function": {"name": "search"}}],
+            stream=True,
+        )
+        chunks = await _drain(agen)
+        full = "".join(c.get("text", "") for c in chunks)
+        _t, _v, tool_uses = parse_model_output(full, has_tools=True)
+        assert [tu["name"] for tu in tool_uses] == ["search"]
+        assert chunks[-1].get("done") is True
+
+    @pytest.mark.asyncio
+    async def test_stream_final_turn_proxies_judge_stream(self, monkeypatch):
+        responses = {
+            "c": '{"route": "default"}',
+            "da": "A",
+            "db": "B",
+            "j": "Final synthesized answer.",
+        }
+        monkeypatch.setattr(
+            panel_mod,
+            "generate_chat",
+            _fake_generate_chat_streaming_factory(responses, stream_models={"j"}),
+        )
+        monkeypatch.setattr(panel_mod, "_resolve_panel", lambda m, n: _make_panel())
+        agen = await panel_mod.panel_generate_chat(
+            manager=None,
+            model_name="p:latest",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            stream=True,
+        )
+        chunks = await _drain(agen)
+        full = "".join(c.get("text", "") for c in chunks)
+        assert full == "Final synthesized answer."
+        assert chunks[-1].get("done") is True
