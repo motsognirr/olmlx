@@ -4187,6 +4187,7 @@ async def generate_chat(
     max_tokens: int = ...,
     cache_id: str = ...,
     enable_thinking: bool | None = ...,
+    reasoning_effort: str | None = ...,
     grammar_spec: GrammarSpec | None = ...,
 ) -> AsyncGenerator[dict, None]: ...
 
@@ -4204,6 +4205,7 @@ async def generate_chat(
     max_tokens: int = ...,
     cache_id: str = ...,
     enable_thinking: bool | None = ...,
+    reasoning_effort: str | None = ...,
     grammar_spec: GrammarSpec | None = ...,
 ) -> dict: ...
 
@@ -4220,6 +4222,7 @@ async def generate_chat(
     max_tokens: int = ...,
     cache_id: str = ...,
     enable_thinking: bool | None = ...,
+    reasoning_effort: str | None = ...,
     grammar_spec: GrammarSpec | None = ...,
 ) -> AsyncGenerator[dict, None] | dict: ...
 
@@ -4235,6 +4238,7 @@ async def generate_chat(
     max_tokens: int = 512,
     cache_id: str = "",
     enable_thinking: bool | None = None,
+    reasoning_effort: str | None = None,
     grammar_spec: GrammarSpec | None = None,
 ) -> AsyncGenerator[dict, None] | dict:
     """Generate a chat completion."""
@@ -4257,6 +4261,11 @@ async def generate_chat(
         # See issue #400.
         if enable_thinking is None and lm.enable_thinking is not None:
             enable_thinking = lm.enable_thinking
+
+        # Per-model default reasoning level (gpt-oss / Harmony) applies when the
+        # caller didn't pass one. An explicit caller value still wins.
+        if reasoning_effort is None and lm.reasoning_effort is not None:
+            reasoning_effort = lm.reasoning_effort
 
         images = _extract_images(messages)
         audio = _extract_audio(messages)
@@ -4363,6 +4372,7 @@ async def generate_chat(
                 tools,
                 caps=lm.template_caps,
                 enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
             )
             if tools:
                 logger.info("Chat prompt with %d tools", len(tools))

@@ -355,6 +355,7 @@ async def _judge_wants_gather(
         keep_alive=keep_alive,
         max_tokens=16,
         enable_thinking=False,
+        reasoning_effort="low",
         grammar_spec=_decision_grammar(),
     )
     text = (result.get("text") or "").strip()
@@ -445,6 +446,10 @@ async def _judge_answer(
         keep_alive=keep_alive,
         max_tokens=max_tokens,
         enable_thinking=enable_thinking,
+        # The judge summarizes; keep channel-format reasoners (gpt-oss) terse so
+        # they emit a clean final answer instead of spending the token budget in
+        # the analysis channel. No-op for non-reasoning judges.
+        reasoning_effort="low",
     )
 
 

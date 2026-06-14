@@ -59,6 +59,20 @@ class TestDetectCaps:
         assert caps.supports_enable_thinking is True
         assert caps.has_thinking_tags is True
 
+    def test_reasoning_effort_template(self):
+        # gpt-oss / Harmony style: a reasoning_effort variable, no enable_thinking.
+        tok = MagicMock()
+        tok.chat_template = "Reasoning: {{ reasoning_effort }}{{ messages }}"
+        caps = detect_caps(tok)
+        assert caps.supports_reasoning_effort is True
+        assert caps.supports_enable_thinking is False
+
+    def test_no_reasoning_effort_by_default(self):
+        tok = MagicMock()
+        tok.chat_template = "{% if enable_thinking %}<think>{% endif %}{{ messages }}"
+        caps = detect_caps(tok)
+        assert caps.supports_reasoning_effort is False
+
     def test_qwen_style_template(self):
         tok = MagicMock()
         tok.chat_template = (

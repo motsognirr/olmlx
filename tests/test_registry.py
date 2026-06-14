@@ -697,6 +697,27 @@ class TestModelConfig:
         with pytest.raises(ValueError, match="enable_thinking"):
             ModelConfig.from_entry({"hf_path": "org/model", "enable_thinking": "yes"})
 
+    def test_reasoning_effort_default_none(self):
+        mc = ModelConfig.from_entry({"hf_path": "org/model"})
+        assert mc.reasoning_effort is None
+
+    @pytest.mark.parametrize("value", ["low", "medium", "high"])
+    def test_reasoning_effort_parsed(self, value):
+        mc = ModelConfig.from_entry({"hf_path": "org/model", "reasoning_effort": value})
+        assert mc.reasoning_effort == value
+
+    def test_reasoning_effort_invalid_rejected(self):
+        with pytest.raises(ValueError, match="reasoning_effort"):
+            ModelConfig.from_entry(
+                {"hf_path": "org/model", "reasoning_effort": "turbo"}
+            )
+
+    def test_reasoning_effort_round_trip(self):
+        mc = ModelConfig(hf_path="org/model", reasoning_effort="low")
+        entry = mc.to_entry()
+        assert entry["reasoning_effort"] == "low"
+        assert ModelConfig.from_entry(entry).reasoning_effort == "low"
+
     def test_enable_thinking_round_trip(self):
         """``enable_thinking`` survives to_entry → from_entry."""
         mc = ModelConfig(hf_path="org/model", enable_thinking=False)

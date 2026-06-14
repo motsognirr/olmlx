@@ -11,6 +11,9 @@ logger = logging.getLogger(__name__)
 class TemplateCaps:
     supports_tools: bool = False
     supports_enable_thinking: bool = False
+    #: Channel-format reasoners (gpt-oss / Harmony) take a ``reasoning_effort``
+    #: kwarg ("low"/"medium"/"high") instead of a boolean ``enable_thinking``.
+    supports_reasoning_effort: bool = False
     has_thinking_tags: bool = False
     has_channel_format: bool = False
     uses_tool_responses: bool = False
@@ -53,11 +56,13 @@ def detect_caps(tokenizer: Any) -> TemplateCaps:
         # AST-based detection: only match actual template variables
         supports_tools = "tools" in variables
         supports_enable_thinking = "enable_thinking" in variables
+        supports_reasoning_effort = "reasoning_effort" in variables
     else:
         # Fallback: substring matching (for malformed templates)
         logger.debug("Jinja2 parsing failed, falling back to substring matching")
         supports_tools = "tools" in tpl
         supports_enable_thinking = "enable_thinking" in tpl
+        supports_reasoning_effort = "reasoning_effort" in tpl
 
     # has_thinking_tags checks for literal output, not a variable — keep string check
     has_thinking_tags = "<think>" in tpl or "thinking" in tpl.lower()
@@ -90,6 +95,7 @@ def detect_caps(tokenizer: Any) -> TemplateCaps:
     return TemplateCaps(
         supports_tools=supports_tools,
         supports_enable_thinking=supports_enable_thinking,
+        supports_reasoning_effort=supports_reasoning_effort,
         has_thinking_tags=has_thinking_tags,
         has_channel_format=has_channel_format,
         uses_tool_responses=uses_tool_responses,

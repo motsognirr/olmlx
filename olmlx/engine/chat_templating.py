@@ -176,6 +176,7 @@ def _apply_chat_template(
     *,
     tokenize: bool = False,
     enable_thinking: bool | None = None,
+    reasoning_effort: str | None = None,
 ) -> Any:
     """Core chat template application.
 
@@ -199,6 +200,12 @@ def _apply_chat_template(
         kwargs["enable_thinking"] = _resolve_thinking_active(
             caps, tools, enable_thinking
         )
+
+    # Channel-format reasoners (gpt-oss / Harmony) use ``reasoning_effort``
+    # instead of the boolean ``enable_thinking``. Only pass it when the template
+    # declares the variable and a level was requested.
+    if caps.supports_reasoning_effort and reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
 
     try:
         return tokenizer.apply_chat_template(messages, **kwargs)
@@ -228,6 +235,7 @@ def apply_chat_template_text(
     caps: TemplateCaps | None = None,
     *,
     enable_thinking: bool | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     """Apply chat template for text-only models (mlx-lm), returning prompt text."""
     return _apply_chat_template(
@@ -237,6 +245,7 @@ def apply_chat_template_text(
         caps,
         tokenize=False,
         enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
     )
 
 

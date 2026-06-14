@@ -212,6 +212,7 @@ def _fake_generate_chat_factory(responses: dict):
         max_tokens=512,
         cache_id="",
         enable_thinking=None,
+        reasoning_effort=None,
         grammar_spec=None,
     ):
         text = responses[model_name]
@@ -431,6 +432,28 @@ class TestPanelGenerateChatNonStream:
         assert result["done"] is True
 
     @pytest.mark.asyncio
+    async def test_judge_synthesis_uses_low_reasoning_effort(self, monkeypatch):
+        # The judge call must request reasoning_effort="low" so channel-format
+        # reasoners (gpt-oss) stay terse instead of leaking analysis.
+        captured = {}
+
+        async def _capture(manager, model_name, messages, **kwargs):
+            if model_name == "j":  # judge synthesis
+                captured.update(kwargs)
+            return {"text": "final", "done": True, "stats": None}
+
+        monkeypatch.setattr(panel_mod, "generate_chat", _capture)
+        monkeypatch.setattr(panel_mod, "_resolve_panel", lambda m, n: _make_panel())
+        await panel_mod.panel_generate_chat(
+            manager=None,
+            model_name="p:latest",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            stream=False,
+        )
+        assert captured.get("reasoning_effort") == "low"
+
+    @pytest.mark.asyncio
     async def test_final_turn_returns_judge_answer(self, monkeypatch):
         responses = {
             "c": '{"route": "default"}',
@@ -468,6 +491,7 @@ def _fake_generate_chat_streaming_factory(responses: dict, stream_models: set):
         max_tokens=512,
         cache_id="",
         enable_thinking=None,
+        reasoning_effort=None,
         grammar_spec=None,
     ):
         text = responses[model_name]
@@ -614,6 +638,7 @@ class TestFailurePropagation:
             max_tokens=512,
             cache_id="",
             enable_thinking=None,
+            reasoning_effort=None,
             grammar_spec=None,
         ):
             if model_name == raise_on:
