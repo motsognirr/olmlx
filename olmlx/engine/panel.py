@@ -239,8 +239,126 @@ async def _run_panel(
         answers.append(visible)
         per_panelist_tools.append(tool_uses)
 
-    merged = merge_tool_calls(per_panelist_tools)
+    merged = await _resolve_tool_turn(
+        manager,
+        panel,
+        messages,
+        members,
+        answers,
+        per_panelist_tools,
+        options,
+        keep_alive,
+    )
     return (members, answers), merged
+
+
+def _decision_grammar() -> GrammarSpec:
+    """Constrain the judge's stop decision to ``{"action": "answer"|"gather"}``."""
+    return GrammarSpec(
+        kind="json_schema",
+        schema={
+            "type": "object",
+            "properties": {"action": {"type": "string", "enum": ["answer", "gather"]}},
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    )
+
+
+_JUDGE_DECISION_SYSTEM = (
+    "You are the controller for a panel of models answering the conversation "
+    "above. Some panelists proposed tool calls to gather more information. "
+    "Decide whether there is already enough grounded information to write a "
+    "final answer, or whether the proposed tools should be run first. Respond "
+    'ONLY with JSON {"action": "answer"} or {"action": "gather"}.'
+)
+
+
+async def _judge_wants_gather(
+    manager: "ModelManager",
+    panel: "PanelConfig",
+    messages: list[dict],
+    members: list[str],
+    answers: list[str],
+    per_panelist_tools: list[list[dict]],
+    options: dict | None,
+    keep_alive: int | str | None,
+) -> bool:
+    """Ask the judge whether to gather more via tools (True) or finalize.
+
+    Any parse failure defaults to finalize (``False``) — the ``"judge"`` stop
+    condition exists to curb runaway tool loops, so an unreadable decision
+    should stop rather than keep gathering.
+    """
+    states = []
+    for name, answer, tools in zip(members, answers, per_panelist_tools):
+        if tools:
+            names = ", ".join(t["name"] for t in tools)
+            states.append(f"- {name}: proposes tool calls [{names}]")
+        else:
+            states.append(f"- {name}: ready to answer: {answer.strip()[:200]}")
+    content = _JUDGE_DECISION_SYSTEM + "\n\nPanelist states:\n" + "\n".join(states)
+    result = await generate_chat(
+        manager,
+        panel.judge,
+        [*messages, {"role": "user", "content": content}],
+        tools=None,
+        stream=False,
+        options=options,
+        keep_alive=keep_alive,
+        max_tokens=16,
+        enable_thinking=False,
+        grammar_spec=_decision_grammar(),
+    )
+    text = (result.get("text") or "").strip()
+    try:
+        action = json.loads(text).get("action", "answer")
+    except (json.JSONDecodeError, AttributeError):
+        logger.warning("Panel judge decision returned non-JSON %r; finalizing", text)
+        action = "answer"
+    return action == "gather"
+
+
+async def _resolve_tool_turn(
+    manager: "ModelManager",
+    panel: "PanelConfig",
+    messages: list[dict],
+    members: list[str],
+    answers: list[str],
+    per_panelist_tools: list[list[dict]],
+    options: dict | None,
+    keep_alive: int | str | None,
+) -> list[dict]:
+    """Apply the panel's ``stop_condition`` to decide this turn's output.
+
+    Returns the deduped union of proposed tool calls to emit a tool turn, or
+    ``[]`` to finalize (let the judge synthesize). When no panelist proposes
+    tools, every condition finalizes.
+    """
+    wanting = sum(1 for tools in per_panelist_tools if tools)
+    if wanting == 0:
+        return []
+    cond = panel.stop_condition
+    if cond == "majority":
+        ready = len(per_panelist_tools) - wanting
+        if ready > len(per_panelist_tools) / 2:
+            return []
+        return merge_tool_calls(per_panelist_tools)
+    if cond == "judge":
+        if await _judge_wants_gather(
+            manager,
+            panel,
+            messages,
+            members,
+            answers,
+            per_panelist_tools,
+            options,
+            keep_alive,
+        ):
+            return merge_tool_calls(per_panelist_tools)
+        return []
+    # "all" (default): emit the union whenever any panelist wants tools.
+    return merge_tool_calls(per_panelist_tools)
 
 
 def _resolve_panel(manager: "ModelManager", model_name: str) -> "PanelConfig":

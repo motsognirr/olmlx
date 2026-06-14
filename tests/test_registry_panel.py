@@ -7,6 +7,30 @@ import pytest
 from olmlx.engine.registry import ModelRegistry, PanelConfig
 
 
+class TestPanelStopCondition:
+    def _entry(self, **extra):
+        return {
+            "type": "panel",
+            "classifier": "c",
+            "judge": "j",
+            "routes": {"default": ["a"]},
+            **extra,
+        }
+
+    def test_defaults_to_all(self):
+        pc = PanelConfig.from_entry("p:latest", self._entry())
+        assert pc.stop_condition == "all"
+
+    def test_accepts_majority_and_judge(self):
+        for cond in ("all", "majority", "judge"):
+            pc = PanelConfig.from_entry("p:latest", self._entry(stop_condition=cond))
+            assert pc.stop_condition == cond
+
+    def test_rejects_unknown_stop_condition(self):
+        with pytest.raises(ValueError, match="stop_condition"):
+            PanelConfig.from_entry("p:latest", self._entry(stop_condition="bogus"))
+
+
 class TestPanelConfig:
     def test_from_entry_parses_fields(self):
         entry = {

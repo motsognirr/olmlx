@@ -1219,12 +1219,23 @@ class PanelConfig:
     classifier: str
     judge: str
     routes: dict[str, list[str]]
+    #: When to stop issuing tool calls and let the judge synthesize. ``"all"``
+    #: (default) finalizes only when no panelist proposes tools; ``"majority"``
+    #: finalizes once a majority of panelists are ready; ``"judge"`` asks the
+    #: judge each turn. See engine/panel.py.
+    stop_condition: str = "all"
 
     @classmethod
     def from_entry(cls, name: str, entry: dict) -> "PanelConfig":
         classifier = entry.get("classifier")
         judge = entry.get("judge")
         routes = entry.get("routes")
+        stop_condition = entry.get("stop_condition", "all")
+        if stop_condition not in ("all", "majority", "judge"):
+            raise ValueError(
+                f"panel {name!r}: 'stop_condition' must be one of "
+                f"'all', 'majority', 'judge'; got {stop_condition!r}"
+            )
         if not classifier or not isinstance(classifier, str):
             raise ValueError(
                 f"panel {name!r}: 'classifier' must be a non-empty model name"
@@ -1245,7 +1256,13 @@ class PanelConfig:
                 )
         if "default" not in routes:
             raise ValueError(f"panel {name!r}: 'routes' must contain a 'default' key")
-        return cls(name=name, classifier=classifier, judge=judge, routes=dict(routes))
+        return cls(
+            name=name,
+            classifier=classifier,
+            judge=judge,
+            routes=dict(routes),
+            stop_condition=stop_condition,
+        )
 
     def all_member_names(self) -> set[str]:
         names: set[str] = set()

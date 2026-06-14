@@ -277,6 +277,100 @@ class TestRunPanel:
         assert answers == (["da", "db"], ["Answer A", "Answer B"])
 
 
+_TOOL = '<tool_call>\n{"name": "search", "arguments": {"q": "x"}}\n</tool_call>'
+
+
+def _panel_with_stop(cond):
+    from olmlx.engine.registry import PanelConfig
+
+    return PanelConfig.from_entry(
+        "p:latest",
+        {
+            "type": "panel",
+            "classifier": "c",
+            "judge": "j",
+            "routes": {"default": ["da", "db", "dc"]},
+            "stop_condition": cond,
+        },
+    )
+
+
+class TestStopConditions:
+    async def _run(self, monkeypatch, cond, responses):
+        monkeypatch.setattr(
+            panel_mod, "generate_chat", _fake_generate_chat_factory(responses)
+        )
+        (_members, _answers), merged = await panel_mod._run_panel(
+            manager=None,
+            panel=_panel_with_stop(cond),
+            messages=[{"role": "user", "content": "q"}],
+            tools=[{"type": "function", "function": {"name": "search"}}],
+            options=None,
+            keep_alive=None,
+            max_tokens=128,
+            enable_thinking=None,
+        )
+        return merged
+
+    @pytest.mark.asyncio
+    async def test_all_emits_on_any_tool(self, monkeypatch):
+        # 1 of 3 wants tools -> "all" still emits the union.
+        responses = {"c": '{"route": "default"}', "da": _TOOL, "db": "x", "dc": "y"}
+        merged = await self._run(monkeypatch, "all", responses)
+        assert [t["name"] for t in merged] == ["search"]
+
+    @pytest.mark.asyncio
+    async def test_majority_finalizes_when_majority_ready(self, monkeypatch):
+        # 1 of 3 wants tools, 2 ready -> majority finalizes (no tools emitted).
+        responses = {"c": '{"route": "default"}', "da": _TOOL, "db": "x", "dc": "y"}
+        merged = await self._run(monkeypatch, "majority", responses)
+        assert merged == []
+
+    @pytest.mark.asyncio
+    async def test_majority_gathers_when_majority_want_tools(self, monkeypatch):
+        # 2 of 3 want tools, 1 ready -> majority gathers (emit union).
+        responses = {"c": '{"route": "default"}', "da": _TOOL, "db": _TOOL, "dc": "y"}
+        merged = await self._run(monkeypatch, "majority", responses)
+        assert [t["name"] for t in merged] == ["search"]
+
+    @pytest.mark.asyncio
+    async def test_judge_gather_emits_tools(self, monkeypatch):
+        responses = {
+            "c": '{"route": "default"}',
+            "da": _TOOL,
+            "db": "x",
+            "dc": "y",
+            "j": '{"action": "gather"}',
+        }
+        merged = await self._run(monkeypatch, "judge", responses)
+        assert [t["name"] for t in merged] == ["search"]
+
+    @pytest.mark.asyncio
+    async def test_judge_answer_finalizes(self, monkeypatch):
+        responses = {
+            "c": '{"route": "default"}',
+            "da": _TOOL,
+            "db": "x",
+            "dc": "y",
+            "j": '{"action": "answer"}',
+        }
+        merged = await self._run(monkeypatch, "judge", responses)
+        assert merged == []
+
+    @pytest.mark.asyncio
+    async def test_judge_bad_json_finalizes(self, monkeypatch):
+        # Unparseable judge decision defaults to finalize (curb runaway loops).
+        responses = {
+            "c": '{"route": "default"}',
+            "da": _TOOL,
+            "db": "x",
+            "dc": "y",
+            "j": "not json",
+        }
+        merged = await self._run(monkeypatch, "judge", responses)
+        assert merged == []
+
+
 class TestPanelGenerateChatNonStream:
     @pytest.mark.asyncio
     async def test_tool_turn_returns_qwen_blocks(self, monkeypatch):
